@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::fields::validate_request_headers;
 use crate::forward::{HttpRequest, PendingDispatch};
 use crate::http11::RequestOutcome;
+use crate::priority::Priority;
 
 /// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over a private backbone).
 pub enum H2Io<'a> {
@@ -277,6 +278,9 @@ struct H2Stream {
     resp_sent: usize,
     /// Pending backend request: set by maybe_dispatch when backend is async.
     pending: bool,
+    /// The RFC 9218 priority this request asked for. The flush sends this
+    /// stream's response in the order it names.
+    priority: Priority,
 }
 
 impl H2Stream {
@@ -291,21 +295,35 @@ impl H2Stream {
             resp_body: None,
             resp_sent: 0,
             pending: false,
+            priority: Priority::default(),
         }
     }
 
-    /// Whether the flush has a frame to add for this stream: its response is
-    /// queued, and either no body is left (an empty body still needs its
-    /// END_STREAM, and a body that has fully left is reaped the same way) or
-    /// both send windows allow more DATA. `Some(0)` is that END_STREAM, which
-    /// carries no DATA and so needs no window.
+    /// Whether the send windows allow another DATA frame for this stream's
+    /// response. False once the body has fully left, and while either window
+    /// is spent.
     fn sendable(&self, conn_send_window: i32) -> Option<usize> {
         let body = self.resp_body.as_ref()?;
         let remaining = body.len() - self.resp_sent;
-        if remaining == 0 {
-            return Some(0);
+        (remaining > 0 && conn_send_window > 0 && self.send_window > 0).then_some(remaining)
+    }
+
+    /// Whether the whole response body has been framed, so only its empty
+    /// END_STREAM is still owed.
+    fn finished(&self) -> bool {
+        self.resp_body
+            .as_ref()
+            .is_some_and(|body| self.resp_sent == body.len())
+    }
+
+    /// Record the RFC 9218 priority this request asked for.
+    fn record_priority(&mut self, headers: &[(String, String)]) {
+        if let Some((_, value)) = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("priority"))
+        {
+            self.priority = crate::priority::parse(value.as_bytes());
         }
-        (conn_send_window > 0 && self.send_window > 0).then_some(remaining)
     }
 }
 
@@ -330,6 +348,10 @@ pub struct Http2Conn {
     /// collecting the ids into a `Vec` every time: a stream may be reaped
     /// while it is being visited, and an ordered map stays valid across that.
     streams: BTreeMap<u32, H2Stream>,
+    /// The last incremental stream served. Incremental responses of one
+    /// urgency take turns from here, so one frame each leaves in stream-id
+    /// order without the others waiting behind it.
+    flush_cursor: u32,
     hpack_dec: hpack::Decoder<'static>,
     hpack_enc: hpack::Encoder<'static>,
 
@@ -423,6 +445,7 @@ impl Http2Conn {
             recv_buf: Vec::with_capacity(16_384),
             send_buf: Vec::with_capacity(16_384),
             streams: BTreeMap::new(),
+            flush_cursor: 0,
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
             last_stream_id: 0,
@@ -466,7 +489,7 @@ impl Http2Conn {
             || self
                 .streams
                 .values()
-                .any(|stream| stream.sendable(self.conn_send_window).is_some())
+                .any(|stream| stream.finished() || stream.sendable(self.conn_send_window).is_some())
     }
 
     /// Drive one step: pump I/O, parse frames, dispatch requests. Returns
@@ -882,6 +905,9 @@ impl Http2Conn {
             TYPE_CONTINUATION => {
                 self.handle_continuation(stream_id, flags, payload, state, on_request, client_ip)?
             }
+            // PRIORITY_UPDATE (RFC 9218 section 7, type 0x10) is ignored along
+            // with every other unknown type: this trial measures the header
+            // alone.
             _ => {}
         }
         Ok(true)
@@ -1478,6 +1504,9 @@ impl Http2Conn {
                 }
             }
             let stream = self.streams.get_mut(&stream_id).unwrap();
+            if !is_trailers {
+                stream.record_priority(&block);
+            }
             stream.headers.extend(block);
             stream.headers_done = true;
         } else {
@@ -1521,6 +1550,7 @@ impl Http2Conn {
             self.header_block_buf.clear();
             self.check_hpack_block(&all)?;
             if let Some(stream) = self.streams.get_mut(&stream_id) {
+                let is_trailers = stream.headers_done;
                 let dec = &mut self.hpack_dec;
                 // Can't call decode_hpack with self.hpack_dec while stream borrowed.
                 // Decode into a temp vec and extend.
@@ -1529,6 +1559,9 @@ impl Http2Conn {
                 if list_size > MAX_HEADER_LIST_SIZE {
                     self.refuse_oversize_header_list(stream_id);
                     return Ok(());
+                }
+                if !is_trailers {
+                    stream.record_priority(&tmp);
                 }
                 stream.headers.extend(tmp);
                 stream.headers_done = true;
@@ -1872,72 +1905,113 @@ impl Http2Conn {
     /// kernel at once, so the next writable event picks up where this one
     /// stopped and m6, rather than the kernel, decides what leaves first.
     ///
-    /// Each stream is visited once, in ascending stream id: the walk starts at
-    /// the lowest id and continues after the last one visited, so the ordered
-    /// map can be walked without collecting the ids into a `Vec` first and a
-    /// stream can be reaped on the way without invalidating the walk.
+    /// The next frame comes from the lowest urgency that has a response ready
+    /// (RFC 9218 section 10). Within it the responses are taken in stream-id
+    /// order: a non-incremental response is sent to its end before the next
+    /// one starts, and an incremental response takes one frame and yields to
+    /// its peers, because the client can use the beginning as it arrives.
     fn flush_pending_streams(&mut self) {
         let max = self.peer_max_frame as usize;
-        let mut after = 0;
+        self.flush_finished_streams();
+        while self.send_buf.len() < SEND_QUEUE_BYTES {
+            let Some(stream_id) = self.next_sendable_stream() else {
+                break;
+            };
+            if self
+                .streams
+                .get(&stream_id)
+                .is_some_and(|stream| stream.priority.incremental)
+            {
+                self.frame_data(stream_id, max);
+            } else {
+                self.flush_stream(stream_id, max);
+            }
+            self.flush_cursor = stream_id;
+        }
+    }
+
+    /// Send the empty END_STREAM that ends a response already fully framed,
+    /// and reap the stream. It runs before this flush frames any body DATA, so
+    /// a response completed by this flush is ended by the next one: the peer's
+    /// end of its request may still be arriving, and reaping the stream now
+    /// would refuse a frame the RFC says must be accepted.
+    fn flush_finished_streams(&mut self) {
         while self.send_buf.len() < SEND_QUEUE_BYTES {
             let Some(stream_id) = self
                 .streams
-                .range((Excluded(after), Unbounded))
-                .find(|(_, s)| s.sendable(self.conn_send_window).is_some())
+                .iter()
+                .find(|(_, stream)| stream.finished())
                 .map(|(&stream_id, _)| stream_id)
             else {
                 break;
             };
-            self.flush_stream(stream_id, max);
-            after = stream_id;
+            self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
+            self.close_stream_remembering_window(stream_id);
         }
     }
 
+    /// The stream whose DATA goes next: the lowest urgency with a response the
+    /// windows allow, taken in stream-id order after the last stream served.
+    /// A non-incremental response already in flight keeps the turn until its
+    /// body ends, because the client cannot use any of it before then. One at
+    /// a lower urgency than the lowest ready stream does not: urgency decides
+    /// first.
+    fn next_sendable_stream(&self) -> Option<u32> {
+        let urgency = (0..=7).find(|&urgency| {
+            self.streams.values().any(|stream| {
+                stream.priority.urgency == urgency
+                    && stream.sendable(self.conn_send_window).is_some()
+            })
+        })?;
+        let in_flight = self.streams.get(&self.flush_cursor);
+        if in_flight.is_some_and(|stream| {
+            stream.priority.urgency == urgency
+                && !stream.priority.incremental
+                && stream.sendable(self.conn_send_window).is_some()
+        }) {
+            return Some(self.flush_cursor);
+        }
+        let next = |(_, stream): &(&u32, &H2Stream)| {
+            stream.priority.urgency == urgency && stream.sendable(self.conn_send_window).is_some()
+        };
+        self.streams
+            .range((Excluded(self.flush_cursor), Unbounded))
+            .find(next)
+            .or_else(|| self.streams.iter().find(next))
+            .map(|(&stream_id, _)| stream_id)
+    }
+
     /// Frame one stream's response: one DATA frame per iteration, stopping when
-    /// its END_STREAM has gone out, its window is spent, or the queue is full.
-    /// A stream whose body has fully left is ended by a later visit, not this
-    /// one, because its end of the request may still be arriving.
+    /// its window is spent or the queue is full.
     fn flush_stream(&mut self, stream_id: u32, max: usize) {
         while self.send_buf.len() < SEND_QUEUE_BYTES
             && self
                 .streams
                 .get(&stream_id)
                 .is_some_and(|s| s.sendable(self.conn_send_window).is_some())
-            && self.frame_data(stream_id, max)
-        {}
+        {
+            self.frame_data(stream_id, max);
+        }
     }
 
-    /// Append one DATA frame for `stream_id`, or the empty END_STREAM that
-    /// ends a stream whose body has fully left. Returns whether the visit
-    /// continues, false once the END_STREAM has gone out. The caller
+    /// Append one DATA frame for `stream_id`, whose body has bytes left that
+    /// the windows allow. The last frame carries END_STREAM. The caller
     /// guarantees the stream is sendable.
-    fn frame_data(&mut self, stream_id: u32, max: usize) -> bool {
+    fn frame_data(&mut self, stream_id: u32, max: usize) {
         let (to_send, is_last) = {
             let s = match self.streams.get(&stream_id) {
                 Some(s) => s,
-                None => return false,
+                None => return,
             };
             let body = match &s.resp_body {
                 Some(b) => b,
-                None => return false, // not dispatched yet
+                None => return, // not dispatched yet
             };
             let remaining = body.len() - s.resp_sent;
-            if remaining == 0 {
-                // Empty body, or a body that has fully left: the empty
-                // END_STREAM ends it and the stream is reaped.
-                (0usize, true)
-            } else {
-                let window = (self.conn_send_window.min(s.send_window) as usize).min(max);
-                let n = remaining.min(window);
-                (n, s.resp_sent + n == body.len())
-            }
+            let window = (self.conn_send_window.min(s.send_window) as usize).min(max);
+            let n = remaining.min(window);
+            (n, s.resp_sent + n == body.len())
         };
-
-        if to_send == 0 && is_last {
-            self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
-            self.close_stream_remembering_window(stream_id);
-            return false;
-        }
 
         // Send the chunk straight from the buffered body. `append_frame`
         // borrows only `send_buf`, which is disjoint from the `streams` borrow
@@ -1996,7 +2070,6 @@ impl Http2Conn {
                 s.state = StreamState::HalfClosedLocal;
             }
         }
-        !is_last
     }
 
     // ── Frame encoding helpers ────────────────────────────────────────────────
@@ -4270,7 +4343,7 @@ mod header_list_size_tests {
 /// The bounded send queue and RFC 9218 send order.
 #[cfg(test)]
 mod tests {
-    use super::frame_validation_tests::open_stream;
+    use super::frame_validation_tests::{frame, open_stream, open_stream_with_header};
     use super::stream_state_tests::sent_frames;
     use super::*;
 
@@ -4281,14 +4354,50 @@ mod tests {
     pub(super) fn data_frames_across_flushes(c: &mut Http2Conn) -> Vec<(u32, Vec<u8>)> {
         let mut frames = Vec::new();
         loop {
-            let before = frames.len();
             frames.extend(sent_frames(&c.send_buf, TYPE_DATA));
             c.send_buf.clear();
+            let before = frames.len();
             c.flush_pending_streams();
+            frames.extend(sent_frames(&c.send_buf, TYPE_DATA));
+            c.send_buf.clear();
             if frames.len() == before {
                 return frames;
             }
         }
+    }
+
+    /// One connection with `streams` request streams open, each carrying the
+    /// given `priority` header and answered with a body of `len` bytes. The
+    /// connection's send window starts spent, so no DATA is framed until the
+    /// test opens it; each stream's own window fits its whole body.
+    fn conn_with_streams(streams: &[(u32, &str, usize)]) -> Http2Conn {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.peer_initial_window = 1 << 20;
+        c.conn_send_window = 0;
+        for &(stream_id, priority, len) in streams {
+            let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+                RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string())
+            };
+            c.recv_buf
+                .extend_from_slice(&open_stream_with_header(stream_id, "priority", priority));
+            c.process_frame(&mut (), &mut on_request, "127.0.0.1")
+                .expect("a valid request");
+        }
+        c.send_buf.clear();
+        c
+    }
+
+    /// The order in which the responses started leaving: the stream id of each
+    /// non-empty DATA frame, with consecutive repeats collapsed.
+    fn responses_started_in_order(c: &mut Http2Conn) -> Vec<u32> {
+        let mut order: Vec<u32> = Vec::new();
+        for (stream_id, payload) in data_frames_across_flushes(c) {
+            if !payload.is_empty() && order.last() != Some(&stream_id) {
+                order.push(stream_id);
+            }
+        }
+        order
     }
 
     /// One request whose handler answers `len` bytes on `stream_id`.
@@ -4325,6 +4434,61 @@ mod tests {
         assert!(
             !sent_frames(&c.send_buf, TYPE_DATA).is_empty(),
             "the flush must still frame the next DATA"
+        );
+    }
+
+    /// RFC 9218 10: responses leave in urgency order. Within one urgency a
+    /// non-incremental response is finished before the next one at that
+    /// urgency starts, in stream-id order, because the client cannot use it
+    /// until it is complete.
+    #[test]
+    fn urgent_stream_leaves_first() {
+        // Urgencies 5, 5, 1 and 3 in stream-id order, each body several frames.
+        let mut c = conn_with_streams(&[
+            (1, "u=5", 64 * 1024),
+            (3, "u=5", 64 * 1024),
+            (5, "u=1", 64 * 1024),
+            (7, "u=3", 64 * 1024),
+        ]);
+        // One WINDOW_UPDATE opens the connection for all of the bodies.
+        c.recv_buf.extend_from_slice(&frame(
+            TYPE_WINDOW_UPDATE,
+            0,
+            0,
+            &(1u32 << 20).to_be_bytes(),
+        ));
+        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| {
+            RequestOutcome::Ready(200, vec![], vec![], String::new())
+        };
+        c.process_frame(&mut (), &mut on_request, "127.0.0.1")
+            .expect("a window update is legal");
+
+        assert_eq!(
+            responses_started_in_order(&mut c),
+            vec![5, 7, 1, 3],
+            "the most urgent response must start first, then urgency 3, then \
+             the two at urgency 5 in stream-id order"
+        );
+    }
+
+    /// RFC 9218 10: incremental responses of the same urgency share the
+    /// connection, one frame each in turn, because the client can use the
+    /// beginning of each as it arrives.
+    #[test]
+    fn incremental_streams_interleave() {
+        let mut c = conn_with_streams(&[(1, "u=0, i", 64 * 1024), (3, "u=0, i", 64 * 1024)]);
+        c.conn_send_window = 1 << 20;
+
+        let frames: Vec<u32> = data_frames_across_flushes(&mut c)
+            .into_iter()
+            .filter(|(_, payload)| !payload.is_empty())
+            .map(|(stream_id, _)| stream_id)
+            .collect();
+        assert_eq!(frames.len(), 8, "two 64 KiB bodies, four frames each");
+        assert_eq!(
+            frames,
+            vec![1, 3, 1, 3, 1, 3, 1, 3],
+            "incremental responses must take one frame each in turn"
         );
     }
 }

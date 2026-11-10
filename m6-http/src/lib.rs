@@ -14,6 +14,7 @@ pub mod http11;
 pub mod http2;
 pub mod perf_ab;
 pub mod pool;
+pub mod priority;
 pub mod probe;
 pub mod rate_limit;
 pub mod redirect;

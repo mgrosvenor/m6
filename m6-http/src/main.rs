@@ -134,6 +134,7 @@ use m6_http_lib::http11::{
     MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::PoolManager;
+use m6_http_lib::priority;
 use m6_http_lib::router::RouteTable;
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 
@@ -213,8 +214,9 @@ struct PendingRequest {
 /// finish it once quiche reports the stream writable again.
 enum PendingH3Response {
     /// The HEADERS frame itself was blocked — nothing has reached the client
-    /// yet, so both header and body still need sending.
-    Headers(Vec<quiche::h3::Header>, Bytes),
+    /// yet, so both header and body still need sending, at the priority the
+    /// request asked for.
+    Headers(Vec<quiche::h3::Header>, Bytes, priority::Priority),
     /// HEADERS already sent; body is blocked at the given offset.
     Body(Bytes, usize),
 }
@@ -1260,6 +1262,16 @@ fn after_conn_drive(
     }
 }
 
+/// The RFC 9218 priority a request asked for, from its header list.
+fn request_priority<'a>(headers: impl Iterator<Item = (&'a [u8], &'a [u8])>) -> priority::Priority {
+    headers
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(b"priority"))
+        .map_or_else(priority::Priority::default, |(_, value)| {
+            priority::parse(value)
+        })
+}
+
 /// Write a finished response straight into the waiting stream, in this turn.
 fn write_waiter(
     waiter: Waiter,
@@ -1267,6 +1279,7 @@ fn write_waiter(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     method: &str,
+    priority: priority::Priority,
     cx: &mut CompletionCtx<'_>,
 ) {
     match waiter {
@@ -1305,6 +1318,7 @@ fn write_waiter(
                 send_h3_response(
                     stream,
                     qconn,
+                    priority,
                     status,
                     &headers,
                     Bytes::from(body),
@@ -1328,9 +1342,15 @@ fn complete_waiter(
     cx: &mut CompletionCtx<'_>,
 ) {
     let method = &ctx.req.method;
+    let priority = request_priority(
+        ctx.req
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+    );
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
-            write_waiter(waiter, status, headers, body, method, cx);
+            write_waiter(waiter, status, headers, body, method, priority, cx);
         }
         Completion::Pending { id, ctx } => {
             park(cx.state, id, ctx, waiter);
@@ -2188,6 +2208,11 @@ fn handle_h3_request(
         Some(r) => r,
         None => return,
     };
+    let priority = request_priority(
+        req.headers
+            .iter()
+            .map(|header| (header.name(), header.value())),
+    );
 
     // ── Phase 0: malformed-request check ─────────────────────────────────────
     // RFC 9114 4.1.2: a malformed request MUST be treated as a stream error of
@@ -2261,7 +2286,15 @@ fn handle_h3_request(
         // latency, and costs nothing on the reads that make up the page load.
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            425,
+            &headers,
+            Bytes::new(),
+            false,
+        );
         debug!(
             stream_id,
             method = %String::from_utf8_lossy(method_bytes),
@@ -2292,6 +2325,7 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 status,
                 &headers,
                 Bytes::from(body),
@@ -2317,6 +2351,7 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 301,
                 &www_redirect_headers(location),
                 Bytes::new(),
@@ -2345,7 +2380,15 @@ fn handle_h3_request(
     if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 504, &headers, Bytes::new(), false);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            504,
+            &headers,
+            Bytes::new(),
+            false,
+        );
         return;
     }
 
@@ -2372,7 +2415,15 @@ fn handle_h3_request(
     if in_early_data && !matches!(looked_up, m6_http_lib::cache::Lookup::Fresh(..)) {
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            425,
+            &headers,
+            Bytes::new(),
+            false,
+        );
         debug!(
             stream_id,
             path = path_str,
@@ -2421,7 +2472,15 @@ fn handle_h3_request(
             // Same rule as the h1/h2 paths; see the note there.
             let mut headers: Vec<(String, String)> = Vec::new();
             set_date(&mut headers);
-            send_h3_response(stream_id, qconn, 412, &headers, Bytes::new(), false);
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                412,
+                &headers,
+                Bytes::new(),
+                false,
+            );
             return;
         }
         if precond == Precondition::NotModified {
@@ -2457,7 +2516,15 @@ fn handle_h3_request(
                 cache_hit = true,
                 "request complete"
             );
-            send_h3_response(stream_id, qconn, 304, &headers, Bytes::new(), false);
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                304,
+                &headers,
+                Bytes::new(),
+                false,
+            );
             return;
         }
 
@@ -2506,6 +2573,7 @@ fn handle_h3_request(
         send_h3_response(
             stream_id,
             qconn,
+            priority,
             cached.status,
             resp_headers,
             cached.body,
@@ -2578,6 +2646,7 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 status,
                 &resp_headers,
                 Bytes::from(body),
@@ -2620,9 +2689,15 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[pos..]
 }
 
+/// The quiche form of a request's RFC 9218 priority.
+fn quiche_priority(priority: priority::Priority) -> quiche::h3::Priority {
+    quiche::h3::Priority::new(priority.urgency, priority.incremental)
+}
+
 fn send_h3_response(
     stream_id: u64,
     qconn: &mut QuicConn,
+    priority: priority::Priority,
     status: u16,
     headers: &[(String, String)],
     body: Bytes,
@@ -2680,7 +2755,13 @@ fn send_h3_response(
     }
 
     let fin = body.is_empty();
-    match h3.send_response(&mut qconn.conn, stream_id, &h3_headers, fin) {
+    match h3.send_response_with_priority(
+        &mut qconn.conn,
+        stream_id,
+        &h3_headers,
+        &quiche_priority(priority),
+        fin,
+    ) {
         Ok(()) => {}
         Err(quiche::h3::Error::StreamBlocked) => {
             // Not an error, just no flow-control credit yet — previously this
@@ -2691,9 +2772,10 @@ fn send_h3_response(
             // this routinely; Chrome's more conservative concurrency mostly
             // didn't. Save it and let drain_writable() retry once this stream
             // reports writable again.
-            qconn
-                .partial_responses
-                .insert(stream_id, PendingH3Response::Headers(h3_headers, body));
+            qconn.partial_responses.insert(
+                stream_id,
+                PendingH3Response::Headers(h3_headers, body, priority),
+            );
             return;
         }
         Err(e) => {
@@ -4478,9 +4560,15 @@ fn drain_writable(qconn: &mut QuicConn) {
             None => continue,
         };
         match pending {
-            PendingH3Response::Headers(headers, body) => {
+            PendingH3Response::Headers(headers, body, priority) => {
                 let fin = body.is_empty();
-                match h3.send_response(&mut qconn.conn, stream_id, &headers, fin) {
+                match h3.send_response_with_priority(
+                    &mut qconn.conn,
+                    stream_id,
+                    &headers,
+                    &quiche_priority(priority),
+                    fin,
+                ) {
                     Ok(()) => {
                         if !body.is_empty() {
                             match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
@@ -4502,9 +4590,10 @@ fn drain_writable(qconn: &mut QuicConn) {
                     }
                     Err(quiche::h3::Error::StreamBlocked) => {
                         // Still no credit — put it back for the next writable report.
-                        qconn
-                            .partial_responses
-                            .insert(stream_id, PendingH3Response::Headers(headers, body));
+                        qconn.partial_responses.insert(
+                            stream_id,
+                            PendingH3Response::Headers(headers, body, priority),
+                        );
                     }
                     Err(e) => warn!("h3 drain_writable send_response error: {}", e),
                 }
