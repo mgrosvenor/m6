@@ -206,7 +206,7 @@ The merge rules, in order:
 
 1. Each key has one file, Table 1 in §3.3.
 2. A key in the other file, an unknown key or section in either file, or a system config with no `[node]` stops m6-http at start with exit 2, and the error names the key and the file it belongs in.
-3. A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
+3. `tls_cert`, `tls_key`, `[auth] public_key` and `metrics_token_file` are absolute paths, and a relative one is a startup error, exit 2.
 4. An absolute path is used as given.
 5. Validation runs after both files are read.
 6. When both arguments name one file, every key is read from it, `[node]` included.
@@ -268,7 +268,7 @@ Take from it that App `[log]` is the one key with two homes, and every other key
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
-| `[health]` metrics_token_file | System config | A credential path. A relative path resolves against the site directory |
+| `[health]` metrics_token_file | System config | A credential path, absolute |
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
@@ -415,7 +415,7 @@ Error responses are never cached regardless of mode.
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `backend` | string | no | Name of a declared `[[backend]]`. Checked when given. Verification does not use it |
-| `public_key` | string | yes | Path to m6-auth's public key for local JWT verification |
+| `public_key` | string | yes | Absolute path to m6-auth's public key for local JWT verification |
 
 `[auth]` sits in the system config only.
 A config that only verifies tokens needs `public_key` alone.
@@ -431,7 +431,7 @@ The monitoring endpoints, answered inside m6-http ahead of routing, the cache an
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_token_file` | string | none | System config only. The legacy gate. A file holding a bearer string. A file that is missing or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
+| `metrics_token_file` | string | none | System config only. The legacy gate. A file holding a bearer string. An absolute path. A file that is missing or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
 | `metrics_require` | string | none | System config only. `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
 | `metrics_peers` | list of strings | none | System config only. IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
@@ -576,6 +576,7 @@ Exit 2 on:
 - `[auth]` in `site.toml` (it belongs in the system config)
 - A key in the file it does not belong to, or a key or section m6-http does not know
 - A system config with no `[node]`
+- `tls_cert`, `tls_key`, `[auth] public_key` or `metrics_token_file` given as a relative path
 - `metrics_token_file` missing, empty, or set together with `metrics_require`
 - `--log-level` unrecognised
 - `cache` on a `[[route]]` or `[[route_group]]`
@@ -611,8 +612,8 @@ domain = "localhost"
 
 [server]
 bind     = "127.0.0.1:8443"
-tls_cert = "localhost.pem"
-tls_key  = "localhost-key.pem"
+tls_cert = "/tmp/m6/dev/dev.pem"
+tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [[backend]]
 name    = "m6-html"

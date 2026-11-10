@@ -619,10 +619,11 @@ fn a_relative_storage_path_exits_2() {
 fn a_relative_private_key_exits_2() {
     let env = TestEnv::new();
     let db = env.dir.path().join("data/auth.db").display().to_string();
+    let pubkey = env.dir.path().join("keys/auth.pub").display().to_string();
     std::fs::write(
         env.dir.path().join("m6-auth.conf"),
         format!(
-            "[storage]\npath = \"{db}\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"keys/auth.pub\"\n"
+            "[storage]\npath = \"{db}\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"{pubkey}\"\n"
         ),
     )
     .expect("write config");
