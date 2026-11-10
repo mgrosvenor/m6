@@ -1722,6 +1722,9 @@ impl Http2Conn {
                     ctx,
                 });
             }
+            RequestOutcome::Cached { .. } => {
+                unreachable!("h2 dispatches an owned request, which returns Ready")
+            }
         }
     }
 

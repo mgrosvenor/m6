@@ -127,8 +127,9 @@ use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    make_tls_server_config, ConnDrive, H2cListener, Http11Listener, RequestOutcome,
-    H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
+    make_tls_server_config, ConnDrive, H2cListener, HitHeaders, Http11Listener, ParseResult,
+    RequestHead, RequestOutcome, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE,
+    READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::PoolManager;
 use m6_http_lib::router::RouteTable;
@@ -319,6 +320,14 @@ struct ServerState {
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
     /// correction, a VM resuming) cannot make uptime jump or go negative.
     started: std::time::Instant,
+    /// Reused buffer a cache lookup builds its key into, so a lookup never
+    /// allocates. Capacity 512 matches the old stack buffer's bound.
+    lookup_key_buf: String,
+    /// The `alt-svc` header line, formatted once at start into `ServerState`.
+    alt_svc_line: std::sync::Arc<[u8]>,
+    /// The `link` header line advertising the site description, when configured.
+    /// `None` means the site configures none, so no line is written.
+    describedby_line: Option<std::sync::Arc<[u8]>>,
 }
 
 /// One cache entry to fetch in the background.
@@ -640,41 +649,70 @@ struct EventLoopIo {
 
 // ── Request dispatch (shared by the TLS and h2c listeners) ──────────────────
 
-/// Handle one parsed request: rate limit, redirect, cache, then the backend.
-/// `h2c` marks the cleartext listener, which is always HTTP/2 and carries the
-/// internal interface class.
-fn on_request_impl(
+/// What routing a request resolves to: a cached hit, an immediate answer, or a
+/// miss that must go to a backend.
+enum Routed {
+    Cached {
+        status: u16,
+        entry: CachedResponse,
+        age: std::time::Duration,
+        cache_state: &'static str,
+        set_cookie: Option<String>,
+    },
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String),
+    Miss {
+        start: std::time::Instant,
+        version: HttpVersion,
+        iface: Iface,
+    },
+}
+
+/// Rate limit, redirect and cache lookup, shared by the owned (h2, body) and
+/// borrowed (h1) paths. The request fields are borrowed, so a cached hit never
+/// materialises an owned request. Stats and analytics run here; the caller
+/// writes the outcome in the shape its protocol wants.
+fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     state: &mut ServerState,
-    req: &forward::HttpRequest,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    version: &str,
+    headers: &H,
     client_ip: &str,
-    quic_port: u16,
-    registry: &m6_core::mio::Registry,
     h2c: bool,
-) -> RequestOutcome {
-    let ua = analytics::header(&req.headers, "user-agent");
-    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
-        return blocked;
+) -> Routed {
+    let ua = analytics::header(headers, "user-agent");
+    if let Some(blocked) = check_rate_limit(state, client_ip, path, ua) {
+        let RequestOutcome::Ready(s, h, b, n) = blocked else {
+            unreachable!("check_rate_limit returns Ready")
+        };
+        return Routed::Ready(s, h, b, n);
     }
-    if let Some(redirect) = www_redirect(req, &state.config) {
-        return redirect;
+    let host = m6_core::headers::get(headers, "host");
+    if let Some(location) = www_redirect_location(host, path, query, &state.config) {
+        return Routed::Ready(
+            301,
+            www_redirect_headers(location),
+            Vec::new(),
+            "www-redirect".to_string(),
+        );
     }
-    let enc_str = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+    let enc_str = m6_core::headers::get(headers, "accept-encoding").unwrap_or("");
     let start = std::time::Instant::now();
 
-    let cacheable = !state.route_table.requires_auth(&req.path)
-        && m6_http_lib::cache::method_may_read_cache(&req.method);
-    let mut key_buf = [0u8; 512];
-    let lookup_key = make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
+    let cacheable = !state.route_table.requires_auth(path)
+        && m6_http_lib::cache::method_may_read_cache(method);
+    let lookup_key = make_lookup_key(path, query, enc_str, &mut state.lookup_key_buf);
+    let req_cc = m6_http_lib::cache::RequestDirectives::parse(headers);
     let looked_up = if cacheable {
         state.cache.lookup_with(lookup_key, &req_cc)
     } else {
         m6_http_lib::cache::Lookup::Miss
     };
     if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
-        let mut headers: Vec<(String, String)> = Vec::new();
-        set_date(&mut headers);
-        return RequestOutcome::Ready(504, headers, Vec::new(), "cache".to_string());
+        let mut hdrs: Vec<(String, String)> = Vec::new();
+        set_date(&mut hdrs);
+        return Routed::Ready(504, hdrs, Vec::new(), "cache".to_string());
     }
     let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) {
         "STALE"
@@ -683,22 +721,22 @@ fn on_request_impl(
     };
     if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
-            path: req.path.clone(),
-            query: req.query.clone(),
+            path: path.to_string(),
+            query: query.map(str::to_string),
             enc: enc_str.to_string(),
         });
     }
-    let (version, iface) = if h2c {
+    let (http_version, iface) = if h2c {
         (HttpVersion::Http2, state.h2c_iface)
     } else {
-        (HttpVersion::from_wire(&req.version), state.tls_iface)
+        (HttpVersion::from_wire(version), state.tls_iface)
     };
     if let m6_http_lib::cache::Lookup::Fresh(cached, age)
     | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
     {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        let chan = Channel::new(version, iface);
-        let precond = evaluate_preconditions(&cached.headers, &req.headers, &req.method);
+        let chan = Channel::new(http_version, iface);
+        let precond = evaluate_preconditions(&cached.headers, headers, method);
         state.stats.record(
             elapsed_ns,
             true,
@@ -711,32 +749,32 @@ fn on_request_impl(
             "cache",
         );
         if precond == Precondition::Failed {
-            let mut headers: Vec<(String, String)> = Vec::new();
-            set_date(&mut headers);
+            let mut hdrs: Vec<(String, String)> = Vec::new();
+            set_date(&mut hdrs);
             analytics::finish_response(
                 state.config.analytics.enabled,
-                &mut headers,
-                &req.headers,
+                &mut hdrs,
+                headers,
                 &analytics::Event {
                     node: &state.config.node.name,
-                    path: &req.path,
+                    path,
                     status: 412,
                     cache_state,
                     client_ip,
                     latency_ns: Some(elapsed_ns),
                 },
             );
-            return RequestOutcome::Ready(412, headers, Vec::new(), "cache".to_string());
+            return Routed::Ready(412, hdrs, Vec::new(), "cache".to_string());
         }
         if precond == Precondition::NotModified {
-            let mut headers = not_modified_headers(&cached.headers);
-            set_vary_accept_encoding(&mut headers, true);
-            set_age(&mut headers, age);
-            set_date(&mut headers);
+            let mut hdrs = not_modified_headers(&cached.headers);
+            set_vary_accept_encoding(&mut hdrs, true);
+            set_age(&mut hdrs, age);
+            set_date(&mut hdrs);
             debug!(
-                path = %req.path,
+                path = %path,
                 status = 304,
-                version = %req.version,
+                version = %version,
                 backend = "cache",
                 latency_ns = elapsed_ns,
                 cache_hit = true,
@@ -744,70 +782,176 @@ fn on_request_impl(
             );
             analytics::finish_response(
                 state.config.analytics.enabled,
-                &mut headers,
-                &req.headers,
+                &mut hdrs,
+                headers,
                 &analytics::Event {
                     node: &state.config.node.name,
-                    path: &req.path,
+                    path,
                     status: 304,
                     cache_state,
                     client_ip,
                     latency_ns: Some(elapsed_ns),
                 },
             );
-            return RequestOutcome::Ready(304, headers, Vec::new(), "cache".to_string());
+            return Routed::Ready(304, hdrs, Vec::new(), "cache".to_string());
         }
-        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-        set_alt_svc(&mut headers, quic_port);
-        set_vary_accept_encoding(&mut headers, true);
-        set_age(&mut headers, age);
-        set_describedby_link(&mut headers, &state.config.site.describedby);
         debug!(
-            path = %req.path,
+            path = %path,
             status = cached.status,
-            version = %req.version,
+            version = %version,
             backend = "cache",
             latency_ns = elapsed_ns,
             cache_hit = true,
             "request complete"
         );
-        analytics::finish_response(
+        let set_cookie = analytics::record(
             state.config.analytics.enabled,
-            &mut headers,
-            &req.headers,
+            headers,
             &analytics::Event {
                 node: &state.config.node.name,
-                path: &req.path,
+                path,
                 status: cached.status,
                 cache_state,
                 client_ip,
                 latency_ns: Some(elapsed_ns),
             },
-        );
-        return RequestOutcome::Ready(
-            cached.status,
-            headers,
-            cached.body.to_vec(),
-            "cache".to_string(),
-        );
+        )
+        .filter(|_| analytics::is_html_response(&cached.headers));
+        return Routed::Cached {
+            status: cached.status,
+            entry: cached,
+            age,
+            cache_state,
+            set_cookie,
+        };
     }
+    Routed::Miss {
+        start,
+        version: http_version,
+        iface,
+    }
+}
 
-    let mut outcome = handle_request(
-        req,
-        client_ip,
-        enc_str,
+/// Handle one owned request: h2 (which builds its request in `http2.rs`) and
+/// the h1 body path. On a hit it returns the owned `Ready` form, keeping the
+/// h2 allocation profile unchanged.
+fn on_request_impl(
+    state: &mut ServerState,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::mio::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    match route_request(
         state,
-        false,
-        h2c && state.h2c_iface == Iface::Internal,
-        registry,
-    );
-    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
-        set_alt_svc(headers, quic_port);
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
-        let chan = Channel::new(version, iface);
-        state.stats.record(elapsed_ns, false, status, chan, backend);
+        &req.method,
+        &req.path,
+        req.query.as_deref(),
+        &req.version,
+        &req.headers[..],
+        client_ip,
+        h2c,
+    ) {
+        Routed::Cached {
+            status,
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => {
+            let mut headers = (*entry.headers).clone();
+            set_alt_svc(&mut headers, quic_port);
+            set_vary_accept_encoding(&mut headers, true);
+            set_age(&mut headers, age);
+            set_describedby_link(&mut headers, &state.config.site.describedby);
+            if let Some(sc) = set_cookie {
+                headers.push(("Set-Cookie".to_string(), sc));
+            }
+            RequestOutcome::Ready(status, headers, entry.body.to_vec(), "cache".to_string())
+        }
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let mut outcome = handle_request(
+                req,
+                client_ip,
+                enc,
+                state,
+                false,
+                h2c && state.h2c_iface == Iface::Internal,
+                registry,
+            );
+            if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
+                set_alt_svc(headers, quic_port);
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                let chan = Channel::new(version, iface);
+                state.stats.record(elapsed_ns, false, status, chan, backend);
+            }
+            outcome
+        }
     }
-    outcome
+}
+
+/// Handle a borrowed h1 head (the bodyless fast path). On a hit it returns the
+/// shared `Cached` form so `drive_h1` writes it with no allocation.
+fn on_request_head(
+    state: &mut ServerState,
+    head: &m6_core::h1::RequestHead<'_>,
+    buf: &[u8],
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::mio::Registry,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        head.method,
+        head.path,
+        head.query,
+        head.version,
+        head.headers,
+        client_ip,
+        false,
+    ) {
+        Routed::Cached {
+            status,
+            entry,
+            age,
+            cache_state,
+            set_cookie,
+        } => RequestOutcome::Cached {
+            status,
+            entry,
+            age,
+            cache_state,
+            set_cookie,
+        },
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let req = match m6_core::h1::materialize(head, buf) {
+                ParseResult::Complete(r) => r,
+                // The head was parsed complete and carries no body.
+                _ => unreachable!("bodyless head materializes"),
+            };
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let mut outcome = handle_request(&req, client_ip, enc, state, false, false, registry);
+            if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
+                set_alt_svc(headers, quic_port);
+                let elapsed_ns = start.elapsed().as_nanos() as u64;
+                let chan = Channel::new(version, iface);
+                state.stats.record(elapsed_ns, false, status, chan, backend);
+            }
+            outcome
+        }
+    }
 }
 
 // ── Token and slot helpers ────────────────────────────────────────────────────
@@ -928,17 +1072,25 @@ fn drive_conn_token(
         _ => return ConnOutcome::Gone,
     };
     let (slot, is_h2c) = source;
-    let mut on_request = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
+    let hit = HitHeaders {
+        alt_svc: state.alt_svc_line.clone(),
+        describedby: state.describedby_line.clone(),
+    };
+    let mut on_head = |state: &mut ServerState,
+                       head: &RequestHead<'_>,
+                       buf: &[u8],
+                       ip: &str| on_request_head(state, head, buf, ip, quic_port, registry);
+    let mut on_h2 = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
         on_request_impl(state, req, ip, quic_port, registry, is_h2c)
     };
     let mut drive = if is_h2c {
         match h2c.as_mut() {
-            Some(h) => h.drive_one(slot, state, &mut on_request, registry),
+            Some(h) => h.drive_one(slot, state, &mut on_h2, registry),
             None => return ConnOutcome::Closed,
         }
     } else {
         match tcp.as_mut() {
-            Some(t) => t.drive_one(slot, state, &mut on_request, registry),
+            Some(t) => t.drive_one(slot, state, &mut on_head, &mut on_h2, &hit, registry),
             None => return ConnOutcome::Closed,
         }
     };
@@ -1666,8 +1818,7 @@ fn event_loop(
 
         // Drain one background fetch per loop iteration.
         if let Some(r) = state.prefetch_queue.pop_front() {
-            let mut kbuf = [0u8; 512];
-            let lk = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut kbuf);
+            let lk = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut state.lookup_key_buf);
             if state.cache.get(lk).is_none() {
                 let synth = synth_refresh_request(&r);
                 match handle_request(
@@ -1681,6 +1832,9 @@ fn event_loop(
                 ) {
                     RequestOutcome::Ready(..) => {
                         debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
+                    }
+                    RequestOutcome::Cached { .. } => {
+                        unreachable!("a background fetch is a miss, never a cached hit")
                     }
                     RequestOutcome::Pending { id, ctx } => {
                         if state.url_pending.len() < MAX_REFRESH_QUEUE {
@@ -2131,8 +2285,7 @@ fn handle_h3_request(
     let cacheable = !state.route_table.requires_auth(path_str)
         && m6_http_lib::cache::method_may_read_cache(method_str);
 
-    let mut key_buf = [0u8; 512];
-    let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut key_buf);
+    let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut state.lookup_key_buf);
 
     let req_cc = m6_http_lib::cache::RequestDirectives::parse(&owned_headers_for_cc(&req.headers));
     let looked_up = if cacheable {
@@ -2382,6 +2535,9 @@ fn handle_h3_request(
                 http_req.method.eq_ignore_ascii_case("HEAD"),
             );
         }
+        RequestOutcome::Cached { .. } => {
+            unreachable!("h3 handles its own cache hit inline, not through handle_request")
+        }
         RequestOutcome::Pending { id, ctx } => {
             // Store who waits in the upstream's slot; the completion writes the
             // response straight into this stream.
@@ -2569,17 +2725,6 @@ fn www_redirect_headers(location: String) -> Vec<(String, String)> {
         ("Location".to_string(), location),
         ("Content-Length".to_string(), "0".to_string()),
     ]
-}
-
-fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<RequestOutcome> {
-    let host = m6_core::headers::get(&req.headers[..], "host");
-    let location = www_redirect_location(host, &req.path, req.query.as_deref(), config)?;
-    Some(RequestOutcome::Ready(
-        301,
-        www_redirect_headers(location),
-        vec![],
-        "www-redirect".to_string(),
-    ))
 }
 
 /// Build the synthetic GET used for a background cache fill.
@@ -3590,6 +3735,9 @@ fn apply_error_mode(
             match dispatch_custom_error_async(status, req, client_ip, state, registry, ctx) {
                 Some(RequestOutcome::Ready(s, h, b, n)) => ErrorOutcome::Ready(s, h, b, n),
                 Some(RequestOutcome::Pending { id, ctx }) => ErrorOutcome::Pending { id, ctx },
+                Some(RequestOutcome::Cached { .. }) => {
+                    unreachable!("a custom error page is never a cached hit")
+                }
                 None => {
                     warn!(error_path = %error_path, "custom error: cannot fetch the error page, falling back to internal");
                     let reason = error::status_reason(status);
@@ -4716,6 +4864,17 @@ fn run(args: Vec<String>) -> i32 {
         Iface::External
     };
     let backend_timeout_secs = config.server.backend_timeout_secs;
+    let quic_port = udp.local_addr().map(|a| a.port()).unwrap_or(8443);
+    let alt_svc_line = std::sync::Arc::<[u8]>::from(
+        format!("alt-svc: h3=\":{quic_port}\"; ma=86400").into_bytes(),
+    );
+    let describedby_line = if config.site.describedby.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::<[u8]>::from(
+            format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
+        ))
+    };
     let mut state = ServerState {
         config,
         route_table,
@@ -4748,6 +4907,9 @@ fn run(args: Vec<String>) -> i32 {
         rate_limiter: RateLimiter::new(),
         error_pages: HashMap::new(),
         started: std::time::Instant::now(),
+        lookup_key_buf: String::with_capacity(512),
+        alt_svc_line,
+        describedby_line,
     };
 
     if state.config.server.warm_on_start {
@@ -5015,8 +5177,8 @@ mod refresh_request_tests {
 
             // ...must be the same string the entry is keyed on. Both sides of
             // the comparison are built the way the event loop builds them.
-            let mut a = [0u8; 512];
-            let mut b = [0u8; 512];
+            let mut a = String::with_capacity(512);
+            let mut b = String::with_capacity(512);
             let key_from_refresh = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut a);
             let key_from_request = make_lookup_key(&req.path, req.query.as_deref(), sent, &mut b);
             assert_eq!(

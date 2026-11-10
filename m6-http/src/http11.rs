@@ -30,6 +30,7 @@ use tracing::warn;
 
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
 use crate::http2::{H2Io, Http2Conn};
+use crate::cache::CachedResponse;
 use m6_core::event::{Slots, Taken};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Interest, Registry, Token};
@@ -40,6 +41,18 @@ use m6_core::mio::{Interest, Registry, Token};
 pub enum RequestOutcome {
     /// Response is available immediately (cache hit, socket backend, auth error, etc.)
     Ready(u16, Vec<(String, String)>, Vec<u8>, String),
+    /// A fresh or stale cache hit, carried as a shared entry so the HTTP/1.1
+    /// writer can emit it without copying the headers or the body. The other
+    /// protocols convert it back to `Ready` with their owned header form.
+    Cached {
+        status: u16,
+        entry: CachedResponse,
+        age: std::time::Duration,
+        cache_state: &'static str,
+        /// A freshly-minted analytics session cookie, when the response is HTML
+        /// and this visit has no session yet. None for a returning visitor.
+        set_cookie: Option<String>,
+    },
     /// Backend I/O dispatched. The caller parks the request by reporting the
     /// `UpstreamId` and the request context back through `ConnDrive`, so the
     /// loop's owner can store the waiter in that upstream's slot.
@@ -436,15 +449,18 @@ impl Http11Listener {
 
     /// Drive one connection. Returns what happened, so the loop can manage the
     /// pending dispatches, the timeouts and the descriptor's interest.
-    pub fn drive_one<S, F>(
+    pub fn drive_one<S, FH, FO>(
         &mut self,
         key: usize,
         state: &mut S,
-        on_request: &mut F,
+        on_head: &mut FH,
+        on_owned: &mut FO,
+        hit: &HitHeaders,
         registry: &Registry,
     ) -> ConnDrive
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
+        FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
     {
         let mut drive = ConnDrive {
             pending: std::mem::take(&mut self.pending),
@@ -454,7 +470,7 @@ impl Http11Listener {
             handshake: None,
         };
         let conn = self.conns.get_mut(key);
-        drive_conn(conn, self.max_requests, state, on_request, &mut drive);
+        drive_conn(conn, self.max_requests, state, on_head, on_owned, hit, &mut drive);
         if let Some(ns) = conn.handshake_ns.take() {
             drive.handshake = Some(HandshakeSample {
                 elapsed_ns: ns,
@@ -515,7 +531,10 @@ impl Http11Listener {
         };
         h1.state = H1State::Writing { buf, pos: 0 };
         let mut unit = ();
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_head = |_: &mut (), _: &RequestHead<'_>, _: &[u8], _: &str| -> RequestOutcome {
+            unreachable!("a completed h1 connection is not reading a request")
+        };
+        let mut on_owned = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
         };
         if let Some(tls) = conn.tls.as_mut() {
@@ -527,7 +546,9 @@ impl Http11Listener {
                 h1,
                 &conn.client_ip,
                 &mut unit,
-                &mut on_request,
+                &mut on_head,
+                &mut on_owned,
+                None,
                 &mut drive,
             );
         } else {
@@ -538,7 +559,9 @@ impl Http11Listener {
                 h1,
                 &conn.client_ip,
                 &mut unit,
-                &mut on_request,
+                &mut on_head,
+                &mut on_owned,
+                None,
                 &mut drive,
             );
         }
@@ -1099,14 +1122,17 @@ pub enum H2cAccept {
 
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<S, F>(
+fn drive_conn<S, FH, FO>(
     conn: &mut Conn,
     max_requests: u32,
     state: &mut S,
-    on_request: &mut F,
+    on_head: &mut FH,
+    on_owned: &mut FO,
+    hit: &HitHeaders,
     drive: &mut ConnDrive,
 ) where
-    F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+    FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
+    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -1121,7 +1147,9 @@ fn drive_conn<S, F>(
             h1,
             &conn.client_ip,
             state,
-            on_request,
+            on_head,
+            on_owned,
+            Some(hit),
             drive,
         );
         return;
@@ -1136,7 +1164,7 @@ fn drive_conn<S, F>(
             },
             &conn.client_ip,
             state,
-            on_request,
+            on_owned,
             &mut drive.pending,
         );
         drive.moved |= moved;
@@ -1242,7 +1270,7 @@ fn drive_conn<S, F>(
                 },
                 &conn.client_ip,
                 state,
-                on_request,
+                on_owned,
                 &mut drive.pending,
             );
             drive.moved |= moved;
@@ -1271,7 +1299,9 @@ fn drive_conn<S, F>(
         h1,
         &conn.client_ip,
         state,
-        on_request,
+        on_head,
+        on_owned,
+        Some(hit),
         drive,
     );
 }
@@ -1354,15 +1384,18 @@ impl H1Io<'_> {
     }
 }
 
-fn drive_h1<S, F>(
+fn drive_h1<S, FH, FO>(
     io: &mut H1Io<'_>,
     h1: &mut H1Conn,
     client_ip: &str,
     state: &mut S,
-    on_request: &mut F,
+    on_head: &mut FH,
+    on_owned: &mut FO,
+    hit: Option<&HitHeaders>,
     drive: &mut ConnDrive,
 ) where
-    F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+    FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
+    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
 {
     loop {
         match &h1.state {
@@ -1420,12 +1453,17 @@ fn drive_h1<S, F>(
                 // read event, so a body arriving in N chunks was copied O(N²)
                 // bytes in total — at the 20 MiB cap, tens of GB of memcpy for
                 // a single upload.
+                // Parse the head under an immutable borrow of the input buffer.
+                // A bodyless request routes on the borrowed head, so a cached
+                // hit never materialises an owned request. A body request, or a
+                // bodyless miss, falls back to the owned parser.
+                let mut head_buf = [httparse::EMPTY_HEADER; 64];
                 let parsed = match &h1.state {
-                    H1State::Reading { buf } => parse_request(buf),
+                    H1State::Reading { buf } => parse_head(buf, &mut head_buf),
                     _ => break,
                 };
                 match parsed {
-                    ParseResult::Incomplete => {
+                    HeadResult::Incomplete => {
                         // The head may be complete even though the message is
                         // not, and a client that sent `Expect: 100-continue`
                         // is holding its body back until we answer. Saying
@@ -1462,7 +1500,7 @@ fn drive_h1<S, F>(
                         }
                         continue;
                     }
-                    ParseResult::Error => {
+                    HeadResult::Error => {
                         let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                         h1.state = H1State::Writing {
                             buf: resp.to_vec(),
@@ -1470,42 +1508,117 @@ fn drive_h1<S, F>(
                         };
                         continue;
                     }
-                    ParseResult::Complete(mut req) => {
-                        // Strip proxy-owned headers before anything reads them.
-                        //
-                        // The parser used to do this inline, which made it
-                        // impure and unshareable: a backend has no proxy
-                        // headers to strip, and ingress policy is not parsing.
-                        // Moving it here is correct, but it has to actually
-                        // happen -- `finding_2_forged_x_auth_claims_must_not_
-                        // survive_ingress` and its sibling caught the gap the
-                        // moment the call was missing, which is what those
-                        // tests are for.
-                        crate::forward::strip_untrusted_inbound(&mut req.headers);
-                        h1.keep_alive = wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
-                        match on_request(state, &req, client_ip) {
-                            RequestOutcome::Ready(status, resp_headers, body, _) => {
-                                // No 103 Early Hints here. See issue #93 and the
-                                // note in http2.rs where the h2 version lived.
-                                let mut buf = Vec::new();
-                                buf.extend_from_slice(&build_response(
-                                    status,
-                                    &resp_headers,
-                                    &body,
-                                    &req.method,
-                                    h1.keep_alive,
-                                ));
-                                h1.state = H1State::Writing { buf, pos: 0 };
-                                continue;
+                    HeadResult::Complete(head) => {
+                        if head.has_body() {
+                            // A body request routes through the owned parser,
+                            // which waits for the full body and carries it.
+                            let owned = match &h1.state {
+                                H1State::Reading { buf } => parse_request(buf),
+                                _ => break,
+                            };
+                            match owned {
+                                ParseResult::Incomplete => {
+                                    if dry {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                ParseResult::Error => {
+                                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                    h1.state = H1State::Writing {
+                                        buf: resp.to_vec(),
+                                        pos: 0,
+                                    };
+                                    continue;
+                                }
+                                ParseResult::Complete(mut req) => {
+                                    // Strip proxy-owned headers before anything
+                                    // reads them. See the note on the parser.
+                                    crate::forward::strip_untrusted_inbound(&mut req.headers);
+                                    h1.keep_alive =
+                                        wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
+                                    match on_owned(state, &req, client_ip) {
+                                        RequestOutcome::Ready(status, resp_headers, body, _) => {
+                                            let mut out = Vec::new();
+                                            out.extend_from_slice(&build_response(
+                                                status,
+                                                &resp_headers,
+                                                &body,
+                                                &req.method,
+                                                h1.keep_alive,
+                                            ));
+                                            h1.state = H1State::Writing { buf: out, pos: 0 };
+                                            continue;
+                                        }
+                                        RequestOutcome::Pending { id, ctx } => {
+                                            drive.pending.push(PendingDispatch {
+                                                stream: None,
+                                                id,
+                                                ctx,
+                                            });
+                                            h1.state = H1State::WaitingBackend;
+                                            break; // the upstream's completion resumes this connection
+                                        }
+                                        RequestOutcome::Cached { .. } => unreachable!(
+                                            "the owned path returns Ready, not Cached"
+                                        ),
+                                    }
+                                }
                             }
-                            RequestOutcome::Pending { id, ctx } => {
-                                drive.pending.push(PendingDispatch {
-                                    stream: None,
-                                    id,
-                                    ctx,
-                                });
-                                h1.state = H1State::WaitingBackend;
-                                break; // the upstream's completion resumes this connection
+                        } else {
+                            // Bodyless fast path: route on the borrowed head.
+                            let method = head.method;
+                            let keep_alive = wants_keep_alive_head(head.version, head.headers)
+                                && h1.served + 1 < h1.max_requests;
+                            let buf = match &h1.state {
+                                H1State::Reading { buf } => &buf[..],
+                                _ => break,
+                            };
+                            match on_head(state, &head, buf, client_ip) {
+                                RequestOutcome::Cached {
+                                    entry,
+                                    age,
+                                    set_cookie,
+                                    ..
+                                } => {
+                                    let hit = hit.expect("cached hit carries hit headers");
+                                    let mut out = Vec::new();
+                                    write_cached_h1(
+                                        &mut out,
+                                        &entry,
+                                        age,
+                                        hit,
+                                        set_cookie.as_deref(),
+                                        method,
+                                        keep_alive,
+                                    );
+                                    h1.keep_alive = keep_alive;
+                                    h1.state = H1State::Writing { buf: out, pos: 0 };
+                                    continue;
+                                }
+                                RequestOutcome::Ready(status, resp_headers, body, _) => {
+                                    let mut out = Vec::new();
+                                    out.extend_from_slice(&build_response(
+                                        status,
+                                        &resp_headers,
+                                        &body,
+                                        method,
+                                        keep_alive,
+                                    ));
+                                    h1.keep_alive = keep_alive;
+                                    h1.state = H1State::Writing { buf: out, pos: 0 };
+                                    continue;
+                                }
+                                RequestOutcome::Pending { id, ctx } => {
+                                    drive.pending.push(PendingDispatch {
+                                        stream: None,
+                                        id,
+                                        ctx,
+                                    });
+                                    h1.keep_alive = keep_alive;
+                                    h1.state = H1State::WaitingBackend;
+                                    break; // the upstream's completion resumes this connection
+                                }
                             }
                         }
                     }
@@ -1599,6 +1712,11 @@ fn finish_response(h1: &mut H1Conn) -> bool {
 /// reverse: it closes unless the client asked to keep it. Anything older, or a
 /// version we do not recognise, closes.
 fn wants_keep_alive(req: &HttpRequest) -> bool {
+    wants_keep_alive_head(&req.version, &req.headers[..])
+}
+
+/// The borrowed form of [`wants_keep_alive`], for a parsed request head.
+fn wants_keep_alive_head(version: &str, headers: &(impl m6_core::http::HeaderSource + ?Sized)) -> bool {
     // EVERY `Connection` field line, not just the first. RFC 9110 5.3: repeated
     // field lines are equivalent to one comma-joined value, so a request
     // carrying `Connection: keep-alive` and `Connection: close` means
@@ -1608,16 +1726,17 @@ fn wants_keep_alive(req: &HttpRequest) -> bool {
     // which `test_hop_by_hop_stripped` caught immediately: it sends both, and
     // its client then waited for a close that never came.
     let has = |tok: &str| {
-        // `get_all`: Connection may be sent as several field lines, and taking
+        // `find_all`: Connection may be sent as several field lines, and taking
         // only the first would miss a token in the second.
-        m6_core::headers::get_all(&req.headers[..], "connection")
+        headers
+            .find_all("connection")
             .flat_map(|v| v.split(','))
             .any(|t| t.trim().eq_ignore_ascii_case(tok))
     };
 
-    if req.version.eq_ignore_ascii_case("HTTP/1.1") {
+    if version.eq_ignore_ascii_case("HTTP/1.1") {
         !has("close")
-    } else if req.version.eq_ignore_ascii_case("HTTP/1.0") {
+    } else if version.eq_ignore_ascii_case("HTTP/1.0") {
         has("keep-alive")
     } else {
         false
@@ -1708,7 +1827,7 @@ pub(crate) fn drain_tls_plaintext(
 // h1spec (27/32 against 15, 15 and 14), which is why it is the one that
 // survived -- but it survived by being *moved*, not duplicated, and leaving
 // the original here would have kept two copies free to drift apart again.
-pub use m6_core::h1::{parse_request, ParseResult};
+pub use m6_core::h1::{parse_head, parse_request, HeadResult, ParseResult, RequestHead};
 
 // ── Response serialiser ───────────────────────────────────────────────────────
 
@@ -1837,6 +1956,152 @@ fn status_reason(status: u16) -> &'static str {
         // described nothing. Reason phrases are advisory, but an incorrect one
         // is worse than a terse one.
         _ => "Unknown",
+    }
+}
+
+// ── Cached-hit writer ─────────────────────────────────────────────────────────
+
+/// The start-time header lines a cached hit writes straight into the output
+/// buffer, held by `ServerState` as shared slices. Each value is formatted once
+/// at start, so replaying a hit copies bytes, not strings. `Arc` so a drive can
+/// hold them beside the mutable `ServerState` borrow for the connection table.
+pub struct HitHeaders {
+    /// The full `alt-svc` line, without the trailing CRLF.
+    pub alt_svc: Arc<[u8]>,
+    /// The full `link` line advertising the site description, when configured.
+    pub describedby: Option<Arc<[u8]>>,
+}
+
+/// Write a cached HTTP/1.1 response straight into `out`, allocating nothing.
+///
+/// This is the cached-hit half of [`build_response`]: the same bytes, but the
+/// head is written into a reused output buffer and the body is borrowed from
+/// the cache entry's `Bytes` rather than copied. The order matches
+/// `build_response` after the hit path's `set_alt_svc`,
+/// `set_vary_accept_encoding`, `set_age` and `set_describedby_link`.
+pub fn write_cached_h1(
+    out: &mut Vec<u8>,
+    entry: &CachedResponse,
+    age: std::time::Duration,
+    extra: &HitHeaders,
+    set_cookie: Option<&str>,
+    method: &str,
+    keep_alive: bool,
+) {
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let is_html = crate::analytics::is_html_response(&entry.headers[..]);
+    let write_describedby = extra.describedby.is_some() && is_html;
+
+    // Vary is merged (or left alone on `Vary: *`) exactly as
+    // `set_vary_accept_encoding(.., true)` does, so the two writers agree. The
+    // field list is bounded at 8: a response naming more vary dimensions is not
+    // one a real backend produces, and beyond the bound the writer still emits
+    // the fields, only without deduplicating them.
+    let mut vary_fields: [&str; 8] = [""; 8];
+    let mut nfields = 0usize;
+    let mut vary_star = false;
+    for (k, v) in entry.headers.iter() {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        if v.trim() == "*" {
+            vary_star = true;
+            break;
+        }
+        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if nfields < vary_fields.len()
+                && !vary_fields[..nfields].iter().any(|e| e.eq_ignore_ascii_case(f))
+            {
+                vary_fields[nfields] = f;
+                nfields += 1;
+            }
+        }
+    }
+    let has_accept_encoding = vary_fields[..nfields]
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case("accept-encoding"));
+
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(itoa::Buffer::new().format(entry.status).as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(status_reason(entry.status).as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    // Cached headers, except the ones this writer emits itself.
+    for (k, v) in entry.headers.iter() {
+        if k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("alt-svc")
+            || k.eq_ignore_ascii_case("age")
+        {
+            continue;
+        }
+        if !vary_star && k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        if write_describedby
+            && k.eq_ignore_ascii_case("link")
+            && v.to_ascii_lowercase().contains("rel=\"describedby\"")
+        {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    out.extend_from_slice(&extra.alt_svc[..]);
+    out.extend_from_slice(b"\r\n");
+
+    if !vary_star {
+        out.extend_from_slice(b"vary: ");
+        for (i, f) in vary_fields[..nfields].iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(f.as_bytes());
+        }
+        if !has_accept_encoding {
+            if nfields > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(b"Accept-Encoding");
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+
+    out.extend_from_slice(b"age: ");
+    out.extend_from_slice(itoa::Buffer::new().format(age.as_secs()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    if let (true, Some(describedby)) = (write_describedby, extra.describedby.as_deref()) {
+        out.extend_from_slice(describedby);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    if let Some(set_cookie) = set_cookie {
+        out.extend_from_slice(b"set-cookie: ");
+        out.extend_from_slice(set_cookie.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    crate::security::write_h1_headers(out, &entry.headers[..]);
+
+    if status_may_have_content_length(entry.status) {
+        out.extend_from_slice(b"content-length: ");
+        out.extend_from_slice(itoa::Buffer::new().format(entry.body.len()).as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    if keep_alive && status_may_have_content_length(entry.status) {
+        out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
+    } else {
+        out.extend_from_slice(b"connection: close\r\n\r\n");
+    }
+
+    if !is_head {
+        out.extend_from_slice(&entry.body);
     }
 }
 

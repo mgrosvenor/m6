@@ -494,7 +494,14 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
         HeadResult::Error => return ParseResult::Error,
         HeadResult::Complete(h) => h,
     };
+    materialize(&head, buf)
+}
 
+/// Copy a parsed head into an owned [`RawRequest`], reading and framing the
+/// body. The borrowed half of the parser: a caller that already ran
+/// [`parse_head`] (the HTTP/1.1 fast path) calls this on the miss, so the
+/// head is not parsed twice.
+pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
     let method = head.method.to_string();
     let path = head.path.to_string();
     let query = head.query.map(str::to_string);

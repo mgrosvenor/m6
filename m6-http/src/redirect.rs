@@ -32,7 +32,7 @@
 //! So this is now the same `Http11Listener` as `:443`, bound without TLS, and
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
-use crate::http11::{Http11Listener, RequestOutcome};
+use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
 use m6_core::event::{raise_open_file_limit, Signals, Timeouts};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
@@ -71,11 +71,20 @@ fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
 /// Both used to be answered with 400, which says the request was malformed
 /// when it was not.
 fn redirect_for(req: &HttpRequest) -> RequestOutcome {
+    redirect_head(&req.method, &req.path, req.query.as_deref(), &req.headers[..])
+}
+
+fn redirect_head(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &(impl m6_core::http::HeaderSource + ?Sized),
+) -> RequestOutcome {
     // RFC 9110 9.3.6: CONNECT establishes a tunnel through a proxy. This is an
     // origin server and will not be one, so the method is refused -- 405, the
     // answer for a method this resource does not support, with `Allow` naming
     // the ones it does (RFC 9110 15.5.6 requires that field).
-    if req.method.eq_ignore_ascii_case("CONNECT") {
+    if method.eq_ignore_ascii_case("CONNECT") {
         return ready(
             405,
             vec![
@@ -88,7 +97,7 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     // RFC 9110 9.3.7: `OPTIONS *` asks about the server rather than any
     // resource, so there is no target to send anywhere. Answering for the
     // server is the whole point of the form.
-    if req.method.eq_ignore_ascii_case("OPTIONS") && req.path == "*" {
+    if method.eq_ignore_ascii_case("OPTIONS") && path == "*" {
         return ready(
             200,
             vec![
@@ -98,7 +107,7 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         );
     }
 
-    let host = m6_core::headers::get(&req.headers[..], "host")
+    let host = m6_core::headers::get(headers, "host")
         .map(str::trim)
         .unwrap_or("");
 
@@ -107,9 +116,9 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     // `https://example.com/x` and every query parameter on an http:// link was
     // silently dropped -- a versioned asset URL, a tracking parameter, a form
     // GET. Found by a test written for the OPTIONS/CONNECT work above.
-    let target = match req.query.as_deref() {
-        Some(q) => format!("{}?{}", req.path, q),
-        None => req.path.clone(),
+    let target = match query {
+        Some(q) => format!("{}?{}", path, q),
+        None => path.to_string(),
     };
     let target = target.as_str();
 
@@ -162,7 +171,14 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         crate::http11::INITIAL_CONNECTIONS,
         Duration::from_secs(crate::http11::READ_TIMEOUT_SECS),
     );
-    let mut on_request = |_: &mut (), req: &HttpRequest, _: &str| redirect_for(req);
+    let mut on_head = |_: &mut (), head: &RequestHead<'_>, _: &[u8], _: &str| {
+        redirect_head(head.method, head.path, head.query, head.headers)
+    };
+    let mut on_owned = |_: &mut (), req: &HttpRequest, _: &str| redirect_for(req);
+    let hit = HitHeaders {
+        alt_svc: std::sync::Arc::from(&[] as &[u8]),
+        describedby: None,
+    };
 
     info!(bind = %bind, "HTTP->HTTPS redirect listener started");
 
@@ -228,7 +244,14 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                     }
                 }
                 Token(k) => {
-                    let drive = listener.drive_one(k, &mut (), &mut on_request, poll.registry());
+                    let drive = listener.drive_one(
+                        k,
+                        &mut (),
+                        &mut on_head,
+                        &mut on_owned,
+                        &hit,
+                        poll.registry(),
+                    );
                     if drive.restarted {
                         read_timeouts.touch(Token(k), now);
                     }
