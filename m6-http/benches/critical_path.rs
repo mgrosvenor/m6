@@ -88,7 +88,7 @@ fn report_percentiles<F: FnMut()>(label: &str, n: usize, mut f: F) {
 fn bench_make_lookup_key(c: &mut Criterion) {
     let mut group = c.benchmark_group("make_lookup_key");
     group.sample_size(100_000);
-    let mut buf = [0u8; 512];
+    let mut buf = String::with_capacity(512);
     group.bench_function("make_lookup_key", |b| {
         b.iter(|| {
             let key = make_lookup_key(
@@ -111,7 +111,7 @@ fn bench_cache_hit(c: &mut Criterion) {
     group.sample_size(100_000);
     group.bench_function("cache_hit", |b| {
         b.iter(|| {
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let key = make_lookup_key(black_box(path), None, black_box(enc), &mut buf);
             black_box(cache.get(key))
         })
@@ -127,7 +127,7 @@ fn bench_cache_miss(c: &mut Criterion) {
     group.sample_size(100_000);
     group.bench_function("cache_miss", |b| {
         b.iter(|| {
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let key = make_lookup_key(black_box("/not/in/cache"), None, black_box("br"), &mut buf);
             black_box(cache.get(key))
         })
@@ -222,7 +222,7 @@ fn bench_full_cache_hit_path(c: &mut Criterion) {
             }
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let enc_str = std::str::from_utf8(enc).unwrap_or("");
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let key = make_lookup_key(path_str, None, enc_str, &mut buf);
             black_box(cache.get(key))
         })
@@ -385,7 +385,7 @@ fn bench_chunked_body_accumulation(c: &mut Criterion) {
 fn bench_lookup_key_query_cost(c: &mut Criterion) {
     let mut group = c.benchmark_group("lookup_key_query_cost");
     group.sample_size(100_000);
-    let mut buf = [0u8; 512];
+    let mut buf = String::with_capacity(512);
 
     // Shape the pre-fix key had: path + encoding only.
     group.bench_function("no_query", |b| {
@@ -473,7 +473,7 @@ fn main() {
     );
 
     {
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         report_percentiles("make_lookup_key", N, || {
             let key = make_lookup_key(
                 black_box("/blog/hello-world"),
@@ -488,7 +488,7 @@ fn main() {
     {
         let (cache, path, enc) = make_cache_with_entry();
         report_percentiles("cache_hit", N, || {
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let key = make_lookup_key(black_box(path), None, black_box(enc), &mut buf);
             black_box(cache.get(key));
         });
@@ -497,7 +497,7 @@ fn main() {
     {
         let (cache, _, _) = make_cache_with_entry();
         report_percentiles("cache_miss", N, || {
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let key = make_lookup_key(black_box("/not/in/cache"), None, black_box("br"), &mut buf);
             black_box(cache.get(key));
         });
@@ -565,7 +565,7 @@ fn main() {
             }
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let enc_str = std::str::from_utf8(enc).unwrap_or("");
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let key = make_lookup_key(path_str, None, enc_str, &mut buf);
             black_box(cache.get(key));
         });

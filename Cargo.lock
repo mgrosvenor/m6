@@ -1883,6 +1883,7 @@ dependencies = [
  "http",
  "httparse",
  "httpdate",
+ "itoa",
  "jsonwebtoken",
  "libc",
  "m6-core",

@@ -1,10 +1,13 @@
-//! Non-blocking HTTP/1.1 and HTTP/2 over TLS (rustls) integrated into the epoll loop.
+//! Non-blocking HTTP/1.1 and HTTP/2 over TLS (rustls), driven by a service's
+//! own `mio` loop one connection at a time.
 //!
 //! Design:
-//! - `TcpListener` registered with TOKEN_TCP.
-//! - `accept_pending()` drains new connections, eagerly advances the TLS handshake,
-//!   and registers each fd with the poll.
-//! - After the TLS handshake, the negotiated ALPN protocol determines the handler:
+//! - Each listener is registered under its own fixed token and accepts only
+//!   when that token fires.
+//! - Every accepted connection is registered under its own token and lives in
+//!   a `Slots` table the service owns, so one turn drives one connection.
+//! - After the TLS handshake, the negotiated ALPN protocol determines the
+//!   handler:
 //!
 //!   ```text
 //!   "h2"       → Http2Conn  (multiplexed streams, full H2 framing)
@@ -12,8 +15,10 @@
 //!                wants_keep_alive(&req) && served + 1 < max_requests)
 //!   ```
 //!
-//! - `drive_all()` is called after every epoll wakeup (for any TOKEN_TCP event)
-//!   and drives every active connection one step forward.
+//! The loop is edge-triggered, so each turn reads and writes until the socket
+//! would block. A connection waiting on a backend channel is parked and driven
+//! once per iteration by the service's loop, because a channel has no
+//! descriptor that fires when its reply arrives.
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -23,8 +28,11 @@ use std::time::Instant;
 use rustls::ServerConnection;
 use tracing::warn;
 
-use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
+use crate::cache::CachedResponse;
+use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
 use crate::http2::{H2Io, Http2Conn};
+use m6_core::event::{Slots, Taken};
+use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Interest, Registry, Token};
 
 // ── Request outcome ───────────────────────────────────────────────────────────
@@ -33,13 +41,21 @@ use m6_core::mio::{Interest, Registry, Token};
 pub enum RequestOutcome {
     /// Response is available immediately (cache hit, socket backend, auth error, etc.)
     Ready(u16, Vec<(String, String)>, Vec<u8>, String),
-    /// Backend I/O dispatched; poll `rx` with `try_recv()`.
-    ///
-    /// `ctx` is boxed so the enum stays small: `Pending` is created and consumed
-    /// within one loop iteration, never stored in bulk, while `Ready` is the
-    /// common, allocation-light path.
+    /// A fresh or stale cache hit, carried as a shared entry so the HTTP/1.1
+    /// writer can emit it without copying the headers or the body. The other
+    /// protocols convert it back to `Ready` with their owned header form.
+    Cached {
+        entry: CachedResponse,
+        age: std::time::Duration,
+        /// A freshly-minted analytics session cookie, when the response is HTML
+        /// and this visit has no session yet. None for a returning visitor.
+        set_cookie: Option<String>,
+    },
+    /// Backend I/O dispatched. The caller parks the request by reporting the
+    /// `UpstreamId` and the request context back through `ConnDrive`, so the
+    /// loop's owner can store the waiter in that upstream's slot.
     Pending {
-        rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        id: UpstreamId,
         ctx: Box<PendingUrlContext>,
     },
 }
@@ -65,7 +81,7 @@ enum ConnKind {
 
 /// One completed handshake, for the caller that owns the stats.
 ///
-/// `drive_all` returns these rather than recording them itself: the listener has
+/// `drive_one` returns these rather than recording them itself: the listener has
 /// no stats handle, and giving it one would couple the transport to the metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct HandshakeSample {
@@ -87,21 +103,20 @@ pub struct HandshakeSample {
     pub resumed: bool,
 }
 
-struct Conn {
-    /// Handshake duration, set once when TLS completes and taken by `drive_all`.
+pub struct Conn {
+    /// Handshake duration, set once when TLS completes and taken by `drive_one`.
     ///
     /// Recorded here rather than passed out through a callback because
     /// `drive_conn` is a free function over one connection and knows nothing
-    /// about the stats. The alternative was a third generic parameter threaded
-    /// through `drive_all` and its three call sites, one of which is the :80
-    /// redirector that has no stats at all.
+    /// about the stats.
     handshake_ns: Option<u64>,
     /// Whether that handshake negotiated h2. `None` means h1 or no ALPN.
     handshake_h2: bool,
     /// Whether that handshake resumed a session rather than doing full key
     /// exchange. Stamped at the same moment as `handshake_ns`.
     handshake_resumed: bool,
-    stream: TcpStream,
+    /// `None` while the slot is free, so a free slot costs no live descriptor.
+    stream: Option<TcpStream>,
     /// Client address, captured once at accept. Reading it here avoids a
     /// `peer_addr()` syscall and a `String` allocation per request-path drive.
     client_ip: String,
@@ -110,14 +125,89 @@ struct Conn {
     /// one, so `:80` runs this code rather than a second implementation.
     tls: Option<ServerConnection>,
     kind: ConnKind,
+    /// The `mio` token this connection's descriptor is registered under.
+    token: Token,
+    /// What the poll currently waits for, so `reregister` runs only on change.
+    registered_interest: Interest,
+}
+
+/// What one connection's turn reports to the loop that owns the timeouts and
+/// the pending dispatches.
+pub struct ConnDrive {
+    /// Requests this turn dispatched to a backend: the loop stores each one's
+    /// waiter in the upstream slot it names.
+    pub pending: Vec<PendingDispatch>,
+    /// The connection is finished: deregister, free its token and close it.
+    pub done: bool,
+    /// An HTTP/1.1 request window began: touch the read timeout.
+    pub restarted: bool,
+    /// HTTP/2 frames were received: touch the h2 idle timeout.
+    pub moved: bool,
+    /// A handshake completed this turn, for the stats owner.
+    pub handshake: Option<HandshakeSample>,
 }
 
 impl Conn {
+    /// The descriptor to register with the poll. Panics on a free slot.
+    pub fn raw_fd(&self) -> RawFd {
+        self.stream.as_ref().expect("occupied slot").as_raw_fd()
+    }
+
+    pub fn set_token(&mut self, token: Token) {
+        self.token = token;
+    }
+
+    pub fn set_interest(&mut self, interest: Interest) {
+        self.registered_interest = interest;
+    }
+
+    fn empty() -> Conn {
+        Conn {
+            handshake_ns: None,
+            handshake_h2: false,
+            handshake_resumed: false,
+            stream: None,
+            client_ip: String::new(),
+            tls: None,
+            kind: ConnKind::Handshake {
+                created: Instant::now(),
+            },
+            token: Token(usize::MAX),
+            registered_interest: Interest::READABLE,
+        }
+    }
+
     fn is_done(&self) -> bool {
         match &self.kind {
             ConnKind::Http1(c) => matches!(c.state, H1State::Done),
             ConnKind::Http2(c) => c.is_done(),
             ConnKind::Handshake { .. } => false,
+        }
+    }
+
+    /// The interest this connection should be registered with next.
+    fn interest(&self) -> Interest {
+        match &self.kind {
+            ConnKind::Handshake { .. } => {
+                let mut i = Interest::READABLE;
+                if self.tls.as_ref().is_some_and(|t| t.wants_write()) {
+                    i |= Interest::WRITABLE;
+                }
+                i
+            }
+            ConnKind::Http1(h1) => match h1.state {
+                H1State::Reading { .. } => Interest::READABLE,
+                H1State::WaitingBackend => Interest::READABLE,
+                H1State::Writing { .. } => Interest::READABLE | Interest::WRITABLE,
+                H1State::Done => Interest::READABLE,
+            },
+            ConnKind::Http2(h2) => {
+                let mut i = Interest::READABLE;
+                if h2.has_pending_send() || self.tls.as_ref().is_some_and(|t| t.wants_write()) {
+                    i |= Interest::WRITABLE;
+                }
+                i
+            }
         }
     }
 }
@@ -128,13 +218,10 @@ enum H1State {
     Reading {
         buf: Vec<u8>,
     },
-    WaitingBackend {
-        rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        /// Boxed: this context is much larger than the read and write buffers
-        /// the other variants hold, and an inline copy sized every H1 state,
-        /// including `Done`, to match it.
-        ctx: Box<PendingUrlContext>,
-    },
+    /// A request was dispatched to a backend; the upstream's completion writes
+    /// the response straight into this connection, so no receiver or context is
+    /// parked here.
+    WaitingBackend,
     Writing {
         buf: Vec<u8>,
         pos: usize,
@@ -163,7 +250,7 @@ struct H1Conn {
 
 /// Idle timeout for an HTTP/1.1 connection, measured from the start of the
 /// current request rather than from when the connection opened.
-pub(crate) const READ_TIMEOUT_SECS: u64 = 30;
+pub const READ_TIMEOUT_SECS: u64 = 30;
 
 /// Most requests a single HTTP/1.1 connection may serve before it is closed.
 ///
@@ -177,7 +264,7 @@ pub(crate) const READ_TIMEOUT_SECS: u64 = 30;
 /// rationale for a cap.
 pub const DEFAULT_MAX_REQUESTS_PER_CONN: u32 = 100;
 /// Idle timeout for HTTP/2 connections (reused across many requests).
-pub(crate) const H2_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const H2_IDLE_TIMEOUT_SECS: u64 = 300;
 /// 20 MiB — above m6-render's own 16 MiB multipart body cap, so oversized
 /// uploads get a clean rejection from the backend (which has read full,
 /// valid HTTP framing) rather than a mid-stream connection drop here.
@@ -191,10 +278,16 @@ pub struct Http11Listener {
     /// h2 needs ALPN, which needs TLS, and h3 needs QUIC, which mandates it.
     /// A browser following an `http://` link speaks HTTP/1.1 and nothing else.
     tls_config: Option<Arc<rustls::ServerConfig>>,
-    conns: Vec<Conn>,
+    conns: Slots<Conn>,
     /// `[server] max_requests_per_connection`, copied into each connection.
     max_requests: u32,
+    /// Reused buffer a drive reports its pending dispatches through, so a turn
+    /// that parks a request allocates nothing.
+    pending: Vec<PendingDispatch>,
 }
+
+/// The connection table's starting size, shared by every owner in the process.
+pub const INITIAL_CONNECTIONS: usize = 1024;
 
 /// Resolve a `host:port` bind string to one address.
 ///
@@ -214,19 +307,28 @@ impl Http11Listener {
         addr: &str,
         tls_config: Arc<rustls::ServerConfig>,
         max_requests: u32,
+        initial: usize,
+        ceiling: usize,
     ) -> anyhow::Result<Self> {
-        Self::bind_maybe_tls(addr, Some(tls_config), max_requests)
+        Self::bind_maybe_tls(addr, Some(tls_config), max_requests, initial, ceiling)
     }
 
     /// Bind a plaintext HTTP/1.1 listener, for the `:80` half of the pair.
-    pub fn bind_plain(addr: &str, max_requests: u32) -> anyhow::Result<Self> {
-        Self::bind_maybe_tls(addr, None, max_requests)
+    pub fn bind_plain(
+        addr: &str,
+        max_requests: u32,
+        initial: usize,
+        ceiling: usize,
+    ) -> anyhow::Result<Self> {
+        Self::bind_maybe_tls(addr, None, max_requests, initial, ceiling)
     }
 
     fn bind_maybe_tls(
         addr: &str,
         tls_config: Option<Arc<rustls::ServerConfig>>,
         max_requests: u32,
+        initial: usize,
+        ceiling: usize,
     ) -> anyhow::Result<Self> {
         // SO_REUSEADDR, which `TcpListener::bind` does not set. Without it a
         // restart inside the TIME_WAIT window cannot rebind, and m6-http treats
@@ -237,8 +339,9 @@ impl Http11Listener {
         Ok(Http11Listener {
             listener,
             tls_config,
-            conns: Vec::new(),
+            conns: Slots::new(initial, ceiling, Conn::empty),
             max_requests,
+            pending: Vec::with_capacity(8),
         })
     }
 
@@ -250,9 +353,29 @@ impl Http11Listener {
         self.listener.local_addr()
     }
 
-    /// Drain pending `accept()` calls; register each new fd with the poll.
-    /// Eagerly starts the TLS handshake so the ServerHello is sent immediately.
-    pub fn accept_pending(&mut self, registry: &Registry, token: Token) {
+    /// A free slot in this listener's connection table.
+    pub fn take_slot(&mut self) -> Option<Taken> {
+        self.conns.take()
+    }
+
+    pub fn slot_mut(&mut self, key: usize) -> &mut Conn {
+        self.conns.get_mut(key)
+    }
+
+    pub fn free_slot(&mut self, key: usize) {
+        self.conns.free(key);
+    }
+
+    /// Whether the connection table is at its ceiling, so accepting should stop.
+    pub fn is_full(&self) -> bool {
+        self.conns.is_full()
+    }
+
+    /// Accept one connection, building its `Conn` (stream, TLS, kind). `None`
+    /// when no connection is pending. The caller allocates the token and the
+    /// slot, sets `conn.token` and `conn.registered_interest`, registers the descriptor,
+    /// and stores the `Conn` back into the slot.
+    pub fn accept_one(&mut self) -> Option<Conn> {
         loop {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
@@ -279,20 +402,13 @@ impl Http11Listener {
                             // handling for how that's dealt with instead.
                             tls.set_buffer_limit(Some(MAX_REQUEST_BYTES));
                             // Eagerly start handshake: ClientHello is already buffered on loopback.
-                            let _ = advance_tls(&mut tls, &stream);
+                            let _ = advance_tls(&mut tls, &stream, None);
                             Some(tls)
                         }
                         // Plaintext: no handshake and no ALPN, so the connection
                         // is HTTP/1.1 from its first byte.
                         None => None,
                     };
-                    registry
-                        .register(
-                            &mut m6_core::mio::unix::SourceFd(&stream.as_raw_fd()),
-                            token,
-                            Interest::READABLE,
-                        )
-                        .ok();
                     let client_ip = peer.ip().to_string();
                     let kind = if tls.is_some() {
                         ConnKind::Handshake {
@@ -308,75 +424,268 @@ impl Http11Listener {
                             expect_handled: false,
                         })
                     };
-                    self.conns.push(Conn {
+                    return Some(Conn {
                         handshake_ns: None,
                         handshake_h2: false,
                         handshake_resumed: false,
-                        stream,
+                        stream: Some(stream),
                         client_ip,
                         tls,
                         kind,
+                        token: Token(usize::MAX),
+                        registered_interest: Interest::READABLE,
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
                 Err(e) => {
                     warn!("tcp accept: {e}");
-                    break;
+                    return None;
                 }
             }
         }
     }
 
-    /// Drive all active connections. Done connections are deregistered and dropped.
-    pub fn drive_all<F, G>(
+    /// Drive one connection. Returns what happened, so the loop can manage the
+    /// pending dispatches, the timeouts and the descriptor's interest.
+    pub fn drive_one<S, FH, FO>(
         &mut self,
-        mut on_request: F,
-        mut on_response: G,
+        key: usize,
+        state: &mut S,
+        on_head: &mut FH,
+        on_owned: &mut FO,
+        hit: &HitHeaders,
         registry: &Registry,
-    ) -> Vec<HandshakeSample>
+    ) -> ConnDrive
     where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
+        FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
     {
-        // `Vec::new()` does not allocate until something is pushed, and most
-        // wakeups complete no handshake at all, so the common path here is free.
-        let mut handshakes = Vec::new();
-        for conn in &mut self.conns {
-            drive_conn(conn, self.max_requests, &mut on_request, &mut on_response);
-            if let Some(ns) = conn.handshake_ns.take() {
-                handshakes.push(HandshakeSample {
-                    elapsed_ns: ns,
-                    is_h2: conn.handshake_h2,
-                    resumed: conn.handshake_resumed,
-                });
+        let mut drive = ConnDrive {
+            pending: std::mem::take(&mut self.pending),
+            done: false,
+            restarted: false,
+            moved: false,
+            handshake: None,
+        };
+        let conn = self.conns.get_mut(key);
+        drive_conn(
+            conn,
+            self.max_requests,
+            state,
+            on_head,
+            on_owned,
+            hit,
+            &mut drive,
+        );
+        if let Some(ns) = conn.handshake_ns.take() {
+            drive.handshake = Some(HandshakeSample {
+                elapsed_ns: ns,
+                is_h2: conn.handshake_h2,
+                resumed: conn.handshake_resumed,
+            });
+        }
+        drive.done = conn.is_done();
+        if !drive.done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
             }
         }
-        for conn in &self.conns {
-            if conn.is_done() {
-                registry
-                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.stream.as_raw_fd()))
-                    .ok();
+        drive
+    }
+
+    /// Give back the pending-dispatch buffer the last drive took, cleared, so
+    /// the next drive reuses it rather than allocating.
+    pub fn return_pending(&mut self, mut pending: Vec<PendingDispatch>) {
+        pending.clear();
+        self.pending = pending;
+    }
+
+    /// Write a finished backend response into the HTTP/1.1 connection that was
+    /// waiting on it and drive the write now, so the first bytes leave in this
+    /// turn. A connection that is no longer waiting (closed, or reused by a
+    /// newer connection) is a no-op, so a stale completion drops its result.
+    pub fn complete_h1(
+        &mut self,
+        key: usize,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        method: &str,
+        registry: &Registry,
+    ) -> ConnDrive {
+        let mut drive = ConnDrive {
+            pending: Vec::new(),
+            done: false,
+            restarted: false,
+            moved: false,
+            handshake: None,
+        };
+        let conn = self.conns.get_mut(key);
+        let keep_alive = match &conn.kind {
+            ConnKind::Http1(h1) if matches!(h1.state, H1State::WaitingBackend) => h1.keep_alive,
+            _ => return drive,
+        };
+        let buf = build_response(status, headers, &body, method, keep_alive);
+        let ConnKind::Http1(h1) = &mut conn.kind else {
+            return drive;
+        };
+        h1.state = H1State::Writing { buf, pos: 0 };
+        let mut unit = ();
+        let mut on_head = |_: &mut (), _: &RequestHead<'_>, _: &[u8], _: &str| -> RequestOutcome {
+            unreachable!("a completed h1 connection is not reading a request")
+        };
+        let mut on_owned = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+            unreachable!("a completed h1 connection is not reading a request")
+        };
+        if let Some(tls) = conn.tls.as_mut() {
+            drive_h1(
+                &mut H1Io::Tls {
+                    tls,
+                    stream: conn.stream.as_ref().expect("tls stream"),
+                },
+                h1,
+                &conn.client_ip,
+                &mut unit,
+                &mut on_head,
+                &mut on_owned,
+                None,
+                &mut drive,
+            );
+        } else {
+            drive_h1(
+                &mut H1Io::Plain {
+                    stream: conn.stream.as_ref().expect("plaintext stream"),
+                },
+                h1,
+                &conn.client_ip,
+                &mut unit,
+                &mut on_head,
+                &mut on_owned,
+                None,
+                &mut drive,
+            );
+        }
+        drive.done = conn.is_done();
+        if !drive.done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
             }
         }
-        self.conns.retain(|c| !c.is_done());
-        handshakes
+        drive
+    }
+
+    /// Write a finished backend response into a waiting HTTP/2 stream on a TLS
+    /// connection and flush now, so the first bytes leave in this turn. Returns
+    /// whether the connection is now done and must be closed.
+    pub fn complete_h2(
+        &mut self,
+        key: usize,
+        stream_id: u32,
+        response: (u16, Vec<(String, String)>, Vec<u8>),
+        method: &str,
+        registry: &Registry,
+    ) -> bool {
+        let (status, headers, body) = response;
+        let conn = self.conns.get_mut(key);
+        let done = {
+            let ConnKind::Http2(h2) = &mut conn.kind else {
+                return false;
+            };
+            {
+                let mut io = H2Io::Tls {
+                    tls: conn.tls.as_mut().expect("tls path"),
+                    stream: conn.stream.as_ref().expect("tls stream"),
+                };
+                h2.complete_stream(&mut io, stream_id, status, headers, body, method);
+            }
+            h2.is_done()
+        };
+        if !done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
+            }
+        }
+        done
+    }
+
+    /// Deregister and close one connection, freeing its slot for the next one.
+    pub fn close_one(&mut self, key: usize, registry: &Registry) {
+        let conn = self.conns.get_mut(key);
+        if let Some(stream) = conn.stream.take() {
+            registry.deregister(&mut SourceFd(&stream.as_raw_fd())).ok();
+        }
+        *conn = Conn::empty();
+        self.conns.free(key);
     }
 }
 
 // ── H2C (HTTP/2 cleartext) listener ──────────────────────────────────────────
 
-struct H2cPlainConn {
-    stream: TcpStream,
-    h2: Http2Conn,
+pub struct H2cPlainConn {
+    /// `None` while the slot is free.
+    stream: Option<TcpStream>,
+    /// Boxed so a free slot costs no `Http2Conn` (which holds two 16 KiB
+    /// buffers). Allocated once at ALPN selection, not per request.
+    h2: Option<Box<Http2Conn>>,
     client_ip: String,
+    token: Token,
+    registered_interest: Interest,
+}
+
+impl H2cPlainConn {
+    /// The descriptor to register with the poll. Panics on a free slot.
+    pub fn raw_fd(&self) -> RawFd {
+        self.stream.as_ref().expect("occupied slot").as_raw_fd()
+    }
+
+    pub fn set_token(&mut self, token: Token) {
+        self.token = token;
+    }
+
+    pub fn set_interest(&mut self, interest: Interest) {
+        self.registered_interest = interest;
+    }
+
+    fn empty() -> H2cPlainConn {
+        H2cPlainConn {
+            stream: None,
+            h2: None,
+            client_ip: String::new(),
+            token: Token(usize::MAX),
+            registered_interest: Interest::READABLE,
+        }
+    }
+
+    fn interest(&self) -> Interest {
+        let mut i = Interest::READABLE;
+        if self.h2.as_ref().is_some_and(|h| h.has_pending_send()) {
+            i |= Interest::WRITABLE;
+        }
+        i
+    }
 }
 
 pub struct H2cListener {
     listener: TcpListener,
-    conns: Vec<H2cPlainConn>,
+    conns: Slots<H2cPlainConn>,
     /// The peers this listener accepts, when it is internal
     /// (`[server] internal_binds`). `None`: not internal, every peer served
     /// and none trusted to forward a client address. `Some`: only these peers
@@ -390,13 +699,16 @@ pub struct H2cListener {
     /// edge-triggered, so the listener will not be reported again for them:
     /// the loop reads this and drains before its next wait.
     accept_again: bool,
+    /// Reused buffer a drive reports its pending dispatches through, so a turn
+    /// that parks a request allocates nothing.
+    pending: Vec<PendingDispatch>,
 }
 
 /// The most connections one `accept_pending` call handles. A peer that
 /// connects and closes in a loop would otherwise keep the single event loop
 /// in `accept` and starve the other listeners. What is left stays in the
 /// kernel queue and the poll wakes this listener again.
-const MAX_ACCEPTS_PER_WAKE: usize = 64;
+pub const MAX_ACCEPTS_PER_WAKE: usize = 64;
 
 /// The fewest seconds between two log lines for one refused peer, and the
 /// length of the window that `REFUSAL_LOG_MAX_LINES` and the summary line use.
@@ -567,7 +879,12 @@ fn admit(
 }
 
 impl H2cListener {
-    pub fn bind(addr: &str, internal_peers: Option<Vec<std::net::IpAddr>>) -> anyhow::Result<Self> {
+    pub fn bind(
+        addr: &str,
+        internal_peers: Option<Vec<std::net::IpAddr>>,
+        initial: usize,
+        ceiling: usize,
+    ) -> anyhow::Result<Self> {
         let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
         listener.set_nonblocking(true)?;
 
@@ -582,10 +899,11 @@ impl H2cListener {
 
         Ok(H2cListener {
             listener,
-            conns: Vec::new(),
+            conns: Slots::new(initial, ceiling, H2cPlainConn::empty),
             peers: internal_peers,
             refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
             accept_again: false,
+            pending: Vec::with_capacity(8),
         })
     }
 
@@ -597,155 +915,277 @@ impl H2cListener {
         self.listener.local_addr()
     }
 
-    pub fn accept_pending(&mut self, registry: &Registry, token: Token) {
-        let handled = self.accept_up_to(registry, token, MAX_ACCEPTS_PER_WAKE);
-        self.accept_again = handled == MAX_ACCEPTS_PER_WAKE;
-    }
-
     /// Whether a capped accept left connections in the kernel queue.
     pub fn accept_again(&self) -> bool {
         self.accept_again
     }
 
-    /// Handle at most `max` pending connections, refused ones included, and
-    /// return how many it handled.
-    fn accept_up_to(&mut self, registry: &Registry, token: Token, max: usize) -> usize {
+    pub fn set_accept_again(&mut self, again: bool) {
+        self.accept_again = again;
+    }
+
+    /// A free slot in this listener's connection table.
+    pub fn take_slot(&mut self) -> Option<Taken> {
+        self.conns.take()
+    }
+
+    pub fn slot_mut(&mut self, key: usize) -> &mut H2cPlainConn {
+        self.conns.get_mut(key)
+    }
+
+    pub fn free_slot(&mut self, key: usize) {
+        self.conns.free(key);
+    }
+
+    /// Accept one connection, refusing a peer not on the internal list.
+    pub fn accept_one(&mut self) -> H2cAccept {
+        match self.listener.accept() {
+            Ok((stream, peer)) => {
+                let Some(trust) = admit(self.peers.as_deref(), peer.ip()) else {
+                    let verdict = self.refusals.record(peer.ip(), Instant::now());
+                    if let Some(s) = verdict.summary {
+                        warn!(
+                            other_refusals = s.other_refusals,
+                            other_addresses = s.other_addresses,
+                            sample = ?s.sample,
+                            over_limit = s.over_limit,
+                            "h2c: refused connections in the last interval that no line named, \
+                             from addresses beyond the tracked peers or past the line limit"
+                        );
+                    }
+                    if let Some(suppressed) = verdict.peer_line {
+                        warn!(
+                            peer = %peer.ip(),
+                            suppressed,
+                            "h2c: refused a connection from a peer not in [server] internal_peers"
+                        );
+                    }
+                    drop(stream);
+                    return H2cAccept::Refused;
+                };
+                if let Err(e) = stream.set_nonblocking(true) {
+                    warn!("h2c set_nonblocking: {e}");
+                    drop(stream);
+                    return H2cAccept::Refused;
+                }
+                stream.set_nodelay(true).ok();
+                let h2 = match trust {
+                    crate::forward::ForwardedTrust::Backbone => {
+                        Http2Conn::new().trusting_forwarded_for()
+                    }
+                    crate::forward::ForwardedTrust::Never => Http2Conn::new(),
+                };
+                H2cAccept::Admitted(H2cPlainConn {
+                    stream: Some(stream),
+                    h2: Some(Box::new(h2)),
+                    client_ip: peer.ip().to_string(),
+                    token: Token(usize::MAX),
+                    registered_interest: Interest::READABLE,
+                })
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => H2cAccept::WouldBlock,
+            Err(e) => {
+                warn!("h2c accept: {e}");
+                H2cAccept::WouldBlock
+            }
+        }
+    }
+
+    /// Accept and admit up to `max` connections, refused ones included. Each
+    /// admitted connection is handed to `store`, which allocates its token and
+    /// slot; it returns `false` to stop early. Returns how many were handled.
+    pub fn accept_up_to(
+        &mut self,
+        max: usize,
+        mut store: impl FnMut(&mut H2cListener, H2cPlainConn) -> bool,
+    ) -> usize {
         let mut handled = 0;
         while handled < max {
-            match self.listener.accept() {
-                Ok((stream, peer)) => {
+            match self.accept_one() {
+                H2cAccept::Admitted(conn) => {
                     handled += 1;
-                    let Some(trust) = admit(self.peers.as_deref(), peer.ip()) else {
-                        let verdict = self.refusals.record(peer.ip(), Instant::now());
-                        if let Some(s) = verdict.summary {
-                            warn!(
-                                other_refusals = s.other_refusals,
-                                other_addresses = s.other_addresses,
-                                sample = ?s.sample,
-                                over_limit = s.over_limit,
-                                "h2c: refused connections in the last interval that no line named, \
-                                 from addresses beyond the tracked peers or past the line limit"
-                            );
-                        }
-                        if let Some(suppressed) = verdict.peer_line {
-                            warn!(
-                                peer = %peer.ip(),
-                                suppressed,
-                                "h2c: refused a connection from a peer not in [server] internal_peers"
-                            );
-                        }
-                        drop(stream);
-                        continue;
-                    };
-                    if let Err(e) = stream.set_nonblocking(true) {
-                        warn!("h2c set_nonblocking: {e}");
-                        continue;
+                    if !store(self, conn) {
+                        break;
                     }
-                    stream.set_nodelay(true).ok();
-                    registry
-                        .register(
-                            &mut m6_core::mio::unix::SourceFd(&stream.as_raw_fd()),
-                            token,
-                            Interest::READABLE,
-                        )
-                        .ok();
-                    let h2 = match trust {
-                        crate::forward::ForwardedTrust::Backbone => {
-                            Http2Conn::new().trusting_forwarded_for()
-                        }
-                        crate::forward::ForwardedTrust::Never => Http2Conn::new(),
-                    };
-                    self.conns.push(H2cPlainConn {
-                        stream,
-                        h2,
-                        client_ip: peer.ip().to_string(),
-                    });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    warn!("h2c accept: {e}");
-                    break;
-                }
+                H2cAccept::Refused => handled += 1,
+                H2cAccept::WouldBlock => break,
             }
         }
         handled
     }
 
-    pub fn drive_all<F, G>(&mut self, mut on_request: F, mut on_response: G, registry: &Registry)
+    /// Drive one cleartext HTTP/2 connection.
+    pub fn drive_one<S, F>(
+        &mut self,
+        key: usize,
+        state: &mut S,
+        on_request: &mut F,
+        registry: &Registry,
+    ) -> ConnDrive
     where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
     {
-        for conn in &mut self.conns {
-            conn.h2.drive(
-                H2Io::Plain {
-                    stream: &conn.stream,
-                },
-                &conn.client_ip,
-                &mut on_request,
-                &mut on_response,
-            );
-        }
-        for conn in &self.conns {
-            if conn.h2.is_done() {
-                registry
-                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.stream.as_raw_fd()))
-                    .ok();
+        let mut drive = ConnDrive {
+            pending: std::mem::take(&mut self.pending),
+            done: false,
+            restarted: false,
+            moved: false,
+            handshake: None,
+        };
+        let conn = self.conns.get_mut(key);
+        let moved = conn.h2.as_mut().expect("h2c slot is occupied").drive(
+            H2Io::Plain {
+                stream: conn.stream.as_ref().expect("h2c stream"),
+            },
+            &conn.client_ip,
+            state,
+            on_request,
+            &mut drive.pending,
+        );
+        drive.moved = moved;
+        drive.done = conn.h2.as_ref().expect("h2c slot").is_done();
+        if !drive.done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
             }
         }
-        self.conns.retain(|c| !c.h2.is_done());
+        drive
     }
+
+    /// Give back the pending-dispatch buffer the last drive took, cleared, so
+    /// the next drive reuses it rather than allocating.
+    pub fn return_pending(&mut self, mut pending: Vec<PendingDispatch>) {
+        pending.clear();
+        self.pending = pending;
+    }
+
+    /// Write a finished backend response into a waiting HTTP/2 stream on a
+    /// cleartext connection and flush now, so the first bytes leave this turn.
+    /// Returns whether the connection is now done and must be closed.
+    pub fn complete_h2(
+        &mut self,
+        key: usize,
+        stream_id: u32,
+        response: (u16, Vec<(String, String)>, Vec<u8>),
+        method: &str,
+        registry: &Registry,
+    ) -> bool {
+        let (status, headers, body) = response;
+        let conn = self.conns.get_mut(key);
+        let done = {
+            let Some(h2) = conn.h2.as_mut() else {
+                return false;
+            };
+            {
+                let mut io = H2Io::Plain {
+                    stream: conn.stream.as_ref().expect("h2c stream"),
+                };
+                h2.complete_stream(&mut io, stream_id, status, headers, body, method);
+            }
+            h2.is_done()
+        };
+        if !done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
+            }
+        }
+        done
+    }
+
+    /// Deregister and close one connection, freeing its slot for the next one.
+    pub fn close_one(&mut self, key: usize, registry: &Registry) {
+        let conn = self.conns.get_mut(key);
+        if let Some(stream) = conn.stream.take() {
+            registry.deregister(&mut SourceFd(&stream.as_raw_fd())).ok();
+        }
+        *conn = H2cPlainConn::empty();
+        self.conns.free(key);
+    }
+}
+
+/// What one `H2cListener::accept_one` call found.
+pub enum H2cAccept {
+    /// A connection admitted and built, ready to be registered and stored.
+    Admitted(H2cPlainConn),
+    /// A connection accepted and refused (peer not on the internal list).
+    Refused,
+    /// No connection was pending.
+    WouldBlock,
 }
 
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<F, G>(conn: &mut Conn, max_requests: u32, on_request: &mut F, on_response: &mut G)
-where
-    F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-    G: FnMut(
-        std::io::Result<HttpResponse>,
-        &PendingUrlContext,
-    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+fn drive_conn<S, FH, FO>(
+    conn: &mut Conn,
+    max_requests: u32,
+    state: &mut S,
+    on_head: &mut FH,
+    on_owned: &mut FO,
+    hit: &HitHeaders,
+    drive: &mut ConnDrive,
+) where
+    FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
+    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
-    let Some(tls) = conn.tls.as_mut() else {
+    if conn.tls.is_none() {
         let ConnKind::Http1(h1) = &mut conn.kind else {
             return;
         };
         drive_h1(
             &mut H1Io::Plain {
-                stream: &conn.stream,
+                stream: conn.stream.as_ref().expect("plaintext stream"),
             },
             h1,
             &conn.client_ip,
-            on_request,
-            on_response,
-        );
-        return;
-    };
-    // Borrow ends here; the TLS paths below re-borrow through `conn`.
-    let _ = tls;
-
-    // HTTP/2: stream and tls are in conn; pass them by reference.
-    if let ConnKind::Http2(h2) = &mut conn.kind {
-        h2.drive(
-            H2Io::Tls {
-                tls: conn.tls.as_mut().expect("tls path"),
-                stream: &conn.stream,
-            },
-            &conn.client_ip,
-            on_request,
-            on_response,
+            state,
+            on_head,
+            on_owned,
+            Some(hit),
+            drive,
         );
         return;
     }
 
-    // Pump TLS I/O for H1 / still-handshaking connections.
-    let tls_failed = advance_tls(conn.tls.as_mut().expect("tls path"), &conn.stream).is_err();
+    // HTTP/2: stream and tls are in conn; pass them by reference.
+    if let ConnKind::Http2(h2) = &mut conn.kind {
+        let moved = h2.drive(
+            H2Io::Tls {
+                tls: conn.tls.as_mut().expect("tls path"),
+                stream: conn.stream.as_ref().expect("tls stream"),
+            },
+            &conn.client_ip,
+            state,
+            on_owned,
+            &mut drive.pending,
+        );
+        drive.moved |= moved;
+        return;
+    }
+
+    // Pump TLS I/O for the handshake phase. Once the handshake completes the
+    // connection is HTTP/1.1 or HTTP/2, and the H1 request path pumps its own
+    // ciphertext through `drive_h1`.
+    let tls_failed = advance_tls(
+        conn.tls.as_mut().expect("tls path"),
+        conn.stream.as_ref().expect("tls stream"),
+        None,
+    )
+    .is_err();
 
     // ── Stamp the handshake BEFORE deciding the connection is unusable ────────
     //
@@ -829,15 +1269,17 @@ where
             let ConnKind::Http2(h2) = &mut conn.kind else {
                 return;
             };
-            h2.drive(
+            let moved = h2.drive(
                 H2Io::Tls {
                     tls: conn.tls.as_mut().expect("tls path"),
-                    stream: &conn.stream,
+                    stream: conn.stream.as_ref().expect("tls stream"),
                 },
                 &conn.client_ip,
-                on_request,
-                on_response,
+                state,
+                on_owned,
+                &mut drive.pending,
             );
+            drive.moved |= moved;
             return;
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
@@ -858,12 +1300,15 @@ where
     drive_h1(
         &mut H1Io::Tls {
             tls: conn.tls.as_mut().expect("tls path"),
-            stream: &conn.stream,
+            stream: conn.stream.as_ref().expect("tls stream"),
         },
         h1,
         &conn.client_ip,
-        on_request,
-        on_response,
+        state,
+        on_head,
+        on_owned,
+        Some(hit),
+        drive,
     );
 }
 
@@ -895,17 +1340,6 @@ enum H1Io<'a> {
 }
 
 impl H1Io<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            // rustls' plaintext reader can legitimately yield Ok(0) mid-stream
-            // when a processed TLS record carries no application data (e.g. a
-            // TLS 1.3 post-handshake NewSessionTicket). That does NOT mean the
-            // peer closed; genuine closure is detected in `advance`.
-            H1Io::Tls { tls, .. } => tls.reader().read(buf),
-            H1Io::Plain { stream } => (&mut &**stream).read(buf),
-        }
-    }
-
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             H1Io::Tls { tls, .. } => tls.writer().write(buf),
@@ -913,74 +1347,143 @@ impl H1Io<'_> {
         }
     }
 
-    /// Pump the transport. For TLS that is the record layer; for plaintext
-    /// there is nothing between the buffer and the socket, so it is a no-op.
-    fn advance(&mut self) -> io::Result<()> {
+    /// Whether rustls still holds encrypted bytes to flush, so the connection
+    /// asks for write readiness rather than finishing.
+    fn wants_write(&self) -> bool {
         match self {
-            H1Io::Tls { tls, stream } => advance_tls(tls, stream),
+            H1Io::Tls { tls, .. } => tls.wants_write(),
+            H1Io::Plain { .. } => false,
+        }
+    }
+
+    /// Flush pending TLS ciphertext to the socket, without pulling ciphertext.
+    ///
+    /// The write path only owes bytes outward; `read_tls` would be a wasted
+    /// `recvfrom` (a WouldBlock on a socket that has nothing for us) once per
+    /// response. `write_tls` alone drains rustls's outgoing buffer.
+    fn flush_write(&mut self) -> io::Result<()> {
+        match self {
+            H1Io::Tls { tls, stream } => drain_writes(tls, stream),
             H1Io::Plain { .. } => Ok(()),
         }
     }
 
-    /// Whether a `read` returning 0 means the peer is gone.
-    ///
-    /// For plaintext it does: a raw socket returns 0 only at EOF. For TLS it
-    /// does not, per the note in `read`.
-    fn zero_read_is_eof(&self) -> bool {
-        matches!(self, H1Io::Plain { .. })
+    /// Read request bytes into `tmp`, pulling TLS ciphertext from the socket as
+    /// needed so a body larger than rustls's plaintext buffer is read in one
+    /// turn. `buf` is the request buffer, the overflow target. Returns `Ok(n)`
+    /// with `n` bytes in `tmp`, `WouldBlock` when the socket has no more, or
+    /// `UnexpectedEof`/another error.
+    fn read_pumped(&mut self, buf: &mut Vec<u8>, tmp: &mut [u8]) -> io::Result<usize> {
+        match self {
+            H1Io::Plain { stream } => (&mut &**stream).read(tmp),
+            H1Io::Tls { tls, stream } => loop {
+                match tls.reader().read(tmp) {
+                    Ok(0) => {}
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+                match advance_tls(tls, stream, Some(buf))? {
+                    true => {}
+                    false => return Err(io::Error::new(io::ErrorKind::WouldBlock, "would block")),
+                }
+            },
+        }
     }
 }
 
-fn drive_h1<F, G>(
+/// Answer a request's `Expect` field from the buffered bytes, once per request.
+///
+/// RFC 9110 10.1.1: a client that sent `Expect: 100-continue` holds its body
+/// back until the server answers. This must run on every incomplete read, not
+/// only when the head is still arriving, or a request whose head is complete but
+/// whose body has not arrived stalls until the client times out. Returns `true`
+/// when a final 417 was queued, so the caller stops reading and switches to
+/// writing.
+fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
+    if h1.expect_handled {
+        return false;
+    }
+    let Some(exp) = (match &h1.state {
+        H1State::Reading { buf } => m6_core::h1::expectation(buf),
+        _ => None,
+    }) else {
+        // Head still arriving; nothing to conclude yet.
+        return false;
+    };
+    match exp {
+        m6_core::h1::Expectation::None => h1.expect_handled = true,
+        m6_core::h1::Expectation::Continue => {
+            h1.expect_handled = true;
+            let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
+            let _ = io.flush_write();
+        }
+        m6_core::h1::Expectation::Unsupported => {
+            h1.expect_handled = true;
+            let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            h1.state = H1State::Writing {
+                buf: resp.to_vec(),
+                pos: 0,
+            };
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)] // transport, connection, state and the two dispatch closures
+fn drive_h1<S, FH, FO>(
     io: &mut H1Io<'_>,
     h1: &mut H1Conn,
     client_ip: &str,
-    on_request: &mut F,
-    on_response: &mut G,
+    state: &mut S,
+    on_head: &mut FH,
+    on_owned: &mut FO,
+    hit: Option<&HitHeaders>,
+    drive: &mut ConnDrive,
 ) where
-    F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-    G: FnMut(
-        std::io::Result<HttpResponse>,
-        &PendingUrlContext,
-    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+    FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
+    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
 {
-    if h1.created.elapsed().as_secs() > READ_TIMEOUT_SECS {
-        h1.state = H1State::Done;
-        return;
-    }
     loop {
         match &h1.state {
             H1State::Reading { .. } => {
                 let mut tmp = [0u8; 4096];
-                let n = match io.read(&mut tmp) {
-                    // Over TLS, Ok(0) does not mean the peer closed -- see
-                    // H1Io::read. Over plaintext it does, and the request
-                    // already buffered must still be answered: a client that
-                    // half-closes after sending is entitled to its response.
-                    // Falling through to the parse below is what `redirect.rs`
-                    // failed to do.
-                    Ok(0) if io.zero_read_is_eof() => {
-                        let H1State::Reading { buf } = &h1.state else {
-                            break;
-                        };
-                        if buf.is_empty() {
+                // Read, parse and answer until the socket would block or the
+                // request is dispatched elsewhere. The poll is edge-triggered,
+                // so a turn that stops with unread bytes in the socket would
+                // never be reported again: keep reading while the socket yields
+                // data. `dry` says the socket has no more for this turn.
+                let mut dry = false;
+                {
+                    let H1State::Reading { buf } = &mut h1.state else {
+                        break;
+                    };
+                    match io.read_pumped(buf, &mut tmp) {
+                        // Plaintext EOF: a peer that half-closed after sending
+                        // is still owed its response. Parse what is buffered.
+                        Ok(0) => {
+                            if buf.is_empty() {
+                                h1.state = H1State::Done;
+                                return;
+                            }
+                            dry = true;
+                        }
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            dry = true;
+                        }
+                        Err(_) => {
                             h1.state = H1State::Done;
                             return;
                         }
-                        break;
                     }
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        h1.state = H1State::Done;
-                        return;
-                    }
-                };
+                }
                 let H1State::Reading { buf } = &mut h1.state else {
                     break;
                 };
-                buf.extend_from_slice(&tmp[..n]);
                 if buf.len() > MAX_REQUEST_BYTES {
                     let resp = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     h1.state = H1State::Writing {
@@ -998,45 +1501,32 @@ fn drive_h1<F, G>(
                 // read event, so a body arriving in N chunks was copied O(N²)
                 // bytes in total — at the 20 MiB cap, tens of GB of memcpy for
                 // a single upload.
+                // Parse the head under an immutable borrow of the input buffer.
+                // A bodyless request routes on the borrowed head, so a cached
+                // hit never materialises an owned request. A body request, or a
+                // bodyless miss, falls back to the owned parser.
+                let mut head_buf = [httparse::EMPTY_HEADER; 64];
                 let parsed = match &h1.state {
-                    H1State::Reading { buf } => parse_request(buf),
+                    H1State::Reading { buf } => parse_head(buf, &mut head_buf),
                     _ => break,
                 };
                 match parsed {
-                    ParseResult::Incomplete => {
+                    HeadResult::Incomplete => {
                         // The head may be complete even though the message is
-                        // not, and a client that sent `Expect: 100-continue`
-                        // is holding its body back until we answer. Saying
-                        // nothing is a deadlock the client breaks by timing
-                        // out: curl waits a full second, then sends anyway.
-                        if !h1.expect_handled {
-                            let exp = match &h1.state {
-                                H1State::Reading { buf } => m6_core::h1::expectation(buf),
-                                _ => None,
-                            };
-                            match exp {
-                                // Head still arriving; nothing to conclude yet.
-                                None => {}
-                                Some(m6_core::h1::Expectation::None) => h1.expect_handled = true,
-                                Some(m6_core::h1::Expectation::Continue) => {
-                                    h1.expect_handled = true;
-                                    let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
-                                    let _ = io.advance();
-                                }
-                                Some(m6_core::h1::Expectation::Unsupported) => {
-                                    h1.expect_handled = true;
-                                    let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                    h1.state = H1State::Writing {
-                                        buf: resp.to_vec(),
-                                        pos: 0,
-                                    };
-                                    continue;
-                                }
-                            }
+                        // not, and a client that sent `Expect: 100-continue` is
+                        // holding its body back until we answer. `handle_expect`
+                        // answers it once and returns true when a final 417 was
+                        // queued, so the loop switches to writing.
+                        if handle_expect(h1, io) {
+                            continue;
                         }
-                        break;
+                        // More request bytes may already be buffered: read on.
+                        if dry {
+                            break;
+                        }
+                        continue;
                     }
-                    ParseResult::Error => {
+                    HeadResult::Error => {
                         let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                         h1.state = H1State::Writing {
                             buf: resp.to_vec(),
@@ -1044,81 +1534,150 @@ fn drive_h1<F, G>(
                         };
                         continue;
                     }
-                    ParseResult::Complete(mut req) => {
-                        // Strip proxy-owned headers before anything reads them.
-                        //
-                        // The parser used to do this inline, which made it
-                        // impure and unshareable: a backend has no proxy
-                        // headers to strip, and ingress policy is not parsing.
-                        // Moving it here is correct, but it has to actually
-                        // happen -- `finding_2_forged_x_auth_claims_must_not_
-                        // survive_ingress` and its sibling caught the gap the
-                        // moment the call was missing, which is what those
-                        // tests are for.
-                        crate::forward::strip_untrusted_inbound(&mut req.headers);
-                        h1.keep_alive = wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
-                        match on_request(&req, client_ip) {
-                            RequestOutcome::Ready(status, resp_headers, body, _) => {
-                                // No 103 Early Hints here. See issue #93 and the
-                                // note in http2.rs where the h2 version lived.
-                                let mut buf = Vec::new();
-                                buf.extend_from_slice(&build_response(
-                                    status,
-                                    &resp_headers,
-                                    &body,
-                                    &req.method,
-                                    h1.keep_alive,
-                                ));
-                                h1.state = H1State::Writing { buf, pos: 0 };
-                                continue;
+                    HeadResult::Complete(head) => {
+                        if head.has_body() {
+                            // A body request routes through the owned parser,
+                            // which waits for the full body and carries it.
+                            let owned = match &h1.state {
+                                H1State::Reading { buf } => parse_request(buf),
+                                _ => break,
+                            };
+                            match owned {
+                                ParseResult::Incomplete => {
+                                    // The head is complete and the body is not:
+                                    // answer `Expect: 100-continue` here too, so
+                                    // a client holding its body does not stall.
+                                    if handle_expect(h1, io) {
+                                        continue;
+                                    }
+                                    if dry {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                ParseResult::Error => {
+                                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                    h1.state = H1State::Writing {
+                                        buf: resp.to_vec(),
+                                        pos: 0,
+                                    };
+                                    continue;
+                                }
+                                ParseResult::Complete(mut req) => {
+                                    // Strip proxy-owned headers before anything
+                                    // reads them. See the note on the parser.
+                                    crate::forward::strip_untrusted_inbound(&mut req.headers);
+                                    h1.keep_alive =
+                                        wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
+                                    match on_owned(state, &req, client_ip) {
+                                        RequestOutcome::Ready(status, resp_headers, body, _) => {
+                                            let mut out = Vec::new();
+                                            out.extend_from_slice(&build_response(
+                                                status,
+                                                &resp_headers,
+                                                &body,
+                                                &req.method,
+                                                h1.keep_alive,
+                                            ));
+                                            h1.state = H1State::Writing { buf: out, pos: 0 };
+                                            continue;
+                                        }
+                                        RequestOutcome::Pending { id, ctx } => {
+                                            drive.pending.push(PendingDispatch {
+                                                stream: None,
+                                                id,
+                                                ctx,
+                                            });
+                                            h1.state = H1State::WaitingBackend;
+                                            break; // the upstream's completion resumes this connection
+                                        }
+                                        RequestOutcome::Cached { .. } => {
+                                            unreachable!("the owned path returns Ready, not Cached")
+                                        }
+                                    }
+                                }
                             }
-                            RequestOutcome::Pending { rx, ctx } => {
-                                h1.state = H1State::WaitingBackend { rx, ctx };
-                                break; // nothing more to do; poll next iteration
+                        } else {
+                            // Bodyless fast path: route on the borrowed head.
+                            let method = head.method;
+                            let keep_alive = wants_keep_alive_head(head.version, head.headers)
+                                && h1.served + 1 < h1.max_requests;
+                            let buf = match &h1.state {
+                                H1State::Reading { buf } => &buf[..],
+                                _ => break,
+                            };
+                            match on_head(state, &head, buf, client_ip) {
+                                RequestOutcome::Cached {
+                                    entry,
+                                    age,
+                                    set_cookie,
+                                    ..
+                                } => {
+                                    let hit = hit.expect("cached hit carries hit headers");
+                                    let mut out = Vec::new();
+                                    write_cached_h1(
+                                        &mut out,
+                                        &entry,
+                                        age,
+                                        hit,
+                                        set_cookie.as_deref(),
+                                        method,
+                                        keep_alive,
+                                    );
+                                    h1.keep_alive = keep_alive;
+                                    h1.state = H1State::Writing { buf: out, pos: 0 };
+                                    continue;
+                                }
+                                RequestOutcome::Ready(status, resp_headers, body, _) => {
+                                    let mut out = Vec::new();
+                                    out.extend_from_slice(&build_response(
+                                        status,
+                                        &resp_headers,
+                                        &body,
+                                        method,
+                                        keep_alive,
+                                    ));
+                                    h1.keep_alive = keep_alive;
+                                    h1.state = H1State::Writing { buf: out, pos: 0 };
+                                    continue;
+                                }
+                                RequestOutcome::Pending { id, ctx } => {
+                                    drive.pending.push(PendingDispatch {
+                                        stream: None,
+                                        id,
+                                        ctx,
+                                    });
+                                    h1.keep_alive = keep_alive;
+                                    h1.state = H1State::WaitingBackend;
+                                    break; // the upstream's completion resumes this connection
+                                }
                             }
                         }
                     }
                 }
             }
-            H1State::WaitingBackend { .. } => {
-                use std::sync::mpsc::TryRecvError;
-                // Move state out so we can destructure and replace.
-                let old = std::mem::replace(&mut h1.state, H1State::Done);
-                let H1State::WaitingBackend { rx, ctx } = old else {
-                    break;
-                };
-                let http_result = match rx.try_recv() {
-                    Ok(r) => r,
-                    Err(TryRecvError::Empty) => {
-                        h1.state = H1State::WaitingBackend { rx, ctx }; // put back
-                        break;
-                    }
-                    Err(TryRecvError::Disconnected) => Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "url backend thread died",
-                    )),
-                };
-                let (status, resp_headers, body, _) = on_response(http_result, &ctx);
-                let mut buf = Vec::new();
-                buf.extend_from_slice(&build_response(
-                    status,
-                    &resp_headers,
-                    &body,
-                    &ctx.req.method,
-                    h1.keep_alive,
-                ));
-                h1.state = H1State::Writing { buf, pos: 0 };
-                // pump TLS to start sending immediately
-                if io.advance().is_err() {
-                    h1.state = H1State::Done;
-                    return;
-                }
-                continue; // fall through to Writing
+            H1State::WaitingBackend => {
+                // The upstream's own token completes this connection directly;
+                // there is nothing to poll here.
+                break;
             }
             H1State::Writing { buf, pos } => {
+                // Flush any ciphertext still pending from a previous turn: a
+                // full socket stopped the flush but the response is not done.
+                if io.wants_write() {
+                    if io.flush_write().is_err() {
+                        h1.state = H1State::Done;
+                        return;
+                    }
+                    if io.wants_write() {
+                        break; // still flushing; a writable event resumes
+                    }
+                }
                 let remaining = &buf[*pos..];
                 if remaining.is_empty() {
-                    finish_response(h1);
+                    if finish_response(h1) {
+                        drive.restarted = true;
+                    }
                     return;
                 }
                 match io.write(remaining) {
@@ -1138,15 +1697,20 @@ fn drive_h1<F, G>(
                         return;
                     }
                 }
-                if io.advance().is_err() {
+                if io.flush_write().is_err() {
                     h1.state = H1State::Done;
                     return;
+                }
+                if io.wants_write() {
+                    break; // ciphertext still pending; writable resumes
                 }
                 let H1State::Writing { buf, pos } = &h1.state else {
                     break;
                 };
                 if *pos >= buf.len() {
-                    finish_response(h1);
+                    if finish_response(h1) {
+                        drive.restarted = true;
+                    }
                     return;
                 }
                 break;
@@ -1159,17 +1723,18 @@ fn drive_h1<F, G>(
 /// End of a response: either close, or go back to reading for the next one.
 ///
 /// Returning to `Reading` with an empty buffer is what makes the connection
-/// persistent. The idle clock restarts here, so the timeout measures time
-/// since the last request rather than the age of the connection -- otherwise a
-/// long-lived healthy connection would be reaped mid-request.
-fn finish_response(h1: &mut H1Conn) {
+/// persistent. Returns whether it returned to `Reading`, so the loop restarts
+/// the read timeout for the next request.
+fn finish_response(h1: &mut H1Conn) -> bool {
     h1.served = h1.served.saturating_add(1);
     if h1.keep_alive && h1.served < h1.max_requests {
         h1.state = H1State::Reading { buf: Vec::new() };
         h1.created = Instant::now();
         h1.expect_handled = false;
+        true
     } else {
         h1.state = H1State::Done;
+        false
     }
 }
 
@@ -1179,6 +1744,14 @@ fn finish_response(h1: &mut H1Conn) {
 /// reverse: it closes unless the client asked to keep it. Anything older, or a
 /// version we do not recognise, closes.
 fn wants_keep_alive(req: &HttpRequest) -> bool {
+    wants_keep_alive_head(&req.version, &req.headers[..])
+}
+
+/// The borrowed form of [`wants_keep_alive`], for a parsed request head.
+fn wants_keep_alive_head(
+    version: &str,
+    headers: &(impl m6_core::http::HeaderSource + ?Sized),
+) -> bool {
     // EVERY `Connection` field line, not just the first. RFC 9110 5.3: repeated
     // field lines are equivalent to one comma-joined value, so a request
     // carrying `Connection: keep-alive` and `Connection: close` means
@@ -1188,52 +1761,41 @@ fn wants_keep_alive(req: &HttpRequest) -> bool {
     // which `test_hop_by_hop_stripped` caught immediately: it sends both, and
     // its client then waited for a close that never came.
     let has = |tok: &str| {
-        // `get_all`: Connection may be sent as several field lines, and taking
+        // `find_all`: Connection may be sent as several field lines, and taking
         // only the first would miss a token in the second.
-        m6_core::headers::get_all(&req.headers[..], "connection")
+        headers
+            .find_all("connection")
             .flat_map(|v| v.split(','))
             .any(|t| t.trim().eq_ignore_ascii_case(tok))
     };
 
-    if req.version.eq_ignore_ascii_case("HTTP/1.1") {
+    if version.eq_ignore_ascii_case("HTTP/1.1") {
         !has("close")
-    } else if req.version.eq_ignore_ascii_case("HTTP/1.0") {
+    } else if version.eq_ignore_ascii_case("HTTP/1.0") {
         has("keep-alive")
     } else {
         false
     }
 }
 
-/// Pump encrypted bytes between socket and rustls.
-fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
-    loop {
-        match tls.read_tls(&mut &*stream) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-            Ok(_) => {
-                tls.process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            // rustls caps its incoming-plaintext buffer at a fixed 16 KiB
-            // (not application-configurable — set_buffer_limit only covers
-            // the *outgoing* buffers) as backpressure: read_tls refuses to
-            // pull more ciphertext until the caller drains already-decoded
-            // plaintext via reader(). For any body over ~16 KiB this trips
-            // on every advance_tls call. It isn't a real error — stop
-            // pumping ciphertext for this round exactly like WouldBlock;
-            // drive_h1 drains the reader right after we return, and the next
-            // iteration drives the connection again (the loop drives every
-            // connection every iteration), so the leftover data is read then.
-            Err(e)
-                if e.kind() == io::ErrorKind::Other
-                    && e.to_string().contains("received plaintext buffer full") =>
-            {
-                break
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    loop {
+/// Pump encrypted bytes between the socket and rustls.
+///
+/// `overflow`, when given, is the connection's request buffer. rustls caps its
+/// incoming-plaintext buffer at a fixed 16 KiB (not application-configurable,
+/// `set_buffer_limit` only covers the *outgoing* buffers) as backpressure:
+/// `read_tls` refuses to pull more ciphertext until the caller drains the
+/// decoded plaintext. The socket is edge-triggered, so it is reported once per
+/// change: stopping here with ciphertext still in the kernel would leave it
+/// unread forever. The overflow buffer is drained and reading continues in the
+/// same turn.
+///
+/// Returns whether any ciphertext was read, so a caller can loop until the
+/// socket would block.
+/// Flush rustls's outgoing ciphertext to the socket until it is empty or the
+/// socket would block. Shared by the read path (`advance_tls`) and the
+/// write-only path (`H1Io::flush_write`).
+fn drain_writes(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
+    while tls.wants_write() {
         match tls.write_tls(&mut &*stream) {
             Ok(0) => break,
             Ok(_) => {}
@@ -1244,6 +1806,62 @@ fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()>
     Ok(())
 }
 
+fn advance_tls(
+    tls: &mut ServerConnection,
+    stream: &TcpStream,
+    mut overflow: Option<&mut Vec<u8>>,
+) -> io::Result<bool> {
+    let mut progress = false;
+    loop {
+        match tls.read_tls(&mut &*stream) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+            Ok(_) => {
+                progress = true;
+                tls.process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e)
+                if e.kind() == io::ErrorKind::Other
+                    && e.to_string().contains("received plaintext buffer full") =>
+            {
+                match &mut overflow {
+                    Some(buf) => {
+                        if drain_tls_plaintext(tls, buf)? == 0 {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    drain_writes(tls, stream)?;
+    Ok(progress)
+}
+
+/// Drain rustls's decoded plaintext into `into`. Returns how many bytes moved.
+/// Shared with the h2 engine so both paths read the reader the same way.
+pub(crate) fn drain_tls_plaintext(
+    tls: &mut ServerConnection,
+    into: &mut Vec<u8>,
+) -> io::Result<usize> {
+    let mut tmp = [0u8; 4096];
+    let mut drained = 0;
+    loop {
+        match tls.reader().read(&mut tmp) {
+            Ok(0) => return Ok(drained),
+            Ok(n) => {
+                into.extend_from_slice(&tmp[..n]);
+                drained += n;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(drained),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 // ── HTTP/1.1 request parser ───────────────────────────────────────────────────
 // The HTTP/1.1 parser lives in `m6_core::h1`: one implementation, used by the
 // edge, by m6-file, by m6-render and by m6-auth-server.
@@ -1252,7 +1870,7 @@ fn advance_tls(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()>
 // h1spec (27/32 against 15, 15 and 14), which is why it is the one that
 // survived -- but it survived by being *moved*, not duplicated, and leaving
 // the original here would have kept two copies free to drift apart again.
-pub use m6_core::h1::{parse_request, ParseResult};
+pub use m6_core::h1::{parse_head, parse_request, HeadResult, ParseResult, RequestHead};
 
 // ── Response serialiser ───────────────────────────────────────────────────────
 
@@ -1381,6 +1999,230 @@ fn status_reason(status: u16) -> &'static str {
         // described nothing. Reason phrases are advisory, but an incorrect one
         // is worse than a terse one.
         _ => "Unknown",
+    }
+}
+
+// ── Cached-hit writer ─────────────────────────────────────────────────────────
+
+/// The start-time header lines a cached hit writes straight into the output
+/// buffer, held by `ServerState` as shared slices. Each value is formatted once
+/// at start, so replaying a hit copies bytes, not strings. `Arc` so a drive can
+/// hold them beside the mutable `ServerState` borrow for the connection table.
+pub struct HitHeaders {
+    /// The full `alt-svc` line, without the trailing CRLF.
+    pub alt_svc: Arc<[u8]>,
+    /// The full `link` line advertising the site description, when configured.
+    pub describedby: Option<Arc<[u8]>>,
+}
+
+/// The merged `Vary` field list for a response, deduplicated case-insensitively
+/// and with `Accept-Encoding` appended when absent. Allocation-free: the dedup
+/// rescans the header list, so a response naming any number of vary dimensions
+/// is handled. [`VaryMerge::is_star`] is true when a `Vary: *` is present, which
+/// the caller must replay as-is instead of merging.
+pub struct VaryMerge<'a> {
+    headers: &'a [(String, String)],
+    star: bool,
+    next: usize,
+    phase: u8,
+    has_accept_encoding: bool,
+}
+
+impl<'a> VaryMerge<'a> {
+    pub fn new(headers: &'a [(String, String)]) -> Self {
+        let star = headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.split(',').any(|f| f.trim() == "*"));
+        VaryMerge {
+            headers,
+            star,
+            next: 0,
+            phase: 0,
+            has_accept_encoding: false,
+        }
+    }
+
+    /// Whether the response carries `Vary: *`, which is replayed unchanged.
+    pub fn is_star(&self) -> bool {
+        self.star
+    }
+}
+
+impl<'a> Iterator for VaryMerge<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.star {
+            return None;
+        }
+        loop {
+            match self.phase {
+                0 => match vary_field_at(self.headers, self.next) {
+                    None => self.phase = 1,
+                    Some(field) => {
+                        self.next += 1;
+                        if vary_earlier(self.headers, self.next - 1, field) {
+                            continue;
+                        }
+                        if field.eq_ignore_ascii_case("accept-encoding") {
+                            self.has_accept_encoding = true;
+                        }
+                        return Some(field);
+                    }
+                },
+                1 => {
+                    self.phase = 2;
+                    return if self.has_accept_encoding {
+                        None
+                    } else {
+                        Some("Accept-Encoding")
+                    };
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// The vary field at flattened index `idx`, or `None` past the last one.
+fn vary_field_at(headers: &[(String, String)], idx: usize) -> Option<&str> {
+    let mut i = 0usize;
+    for (k, v) in headers {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if i == idx {
+                return Some(f);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Whether an equal field appears before the vary field at flattened index `upto`.
+fn vary_earlier(headers: &[(String, String)], upto: usize, field: &str) -> bool {
+    let mut i = 0usize;
+    for (k, v) in headers {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        for g in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if i == upto {
+                return false;
+            }
+            if g.eq_ignore_ascii_case(field) {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Write a cached HTTP/1.1 response straight into `out`, allocating nothing.
+///
+/// This is the cached-hit half of [`build_response`]: the same bytes, but the
+/// head is written into a reused output buffer and the body is borrowed from
+/// the cache entry's `Bytes` rather than copied. The order matches
+/// `build_response` after the hit path's `set_alt_svc`,
+/// `set_vary_accept_encoding`, `set_age` and `set_describedby_link`.
+pub fn write_cached_h1(
+    out: &mut Vec<u8>,
+    entry: &CachedResponse,
+    age: std::time::Duration,
+    extra: &HitHeaders,
+    set_cookie: Option<&str>,
+    method: &str,
+    keep_alive: bool,
+) {
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let is_html = crate::analytics::is_html_response(&entry.headers[..]);
+    let write_describedby = extra.describedby.is_some() && is_html;
+
+    // Vary is merged (or left alone on `Vary: *`) exactly as
+    // `set_vary_accept_encoding(.., true)` does, so the two writers agree.
+    let vary = VaryMerge::new(&entry.headers[..]);
+    let vary_star = vary.is_star();
+
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(itoa::Buffer::new().format(entry.status).as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(status_reason(entry.status).as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    // Cached headers, except the ones this writer emits itself.
+    for (k, v) in entry.headers.iter() {
+        if k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("alt-svc")
+            || k.eq_ignore_ascii_case("age")
+        {
+            continue;
+        }
+        if !vary_star && k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        if write_describedby
+            && k.eq_ignore_ascii_case("link")
+            && v.as_bytes()
+                .windows(b"rel=\"describedby\"".len())
+                .any(|w| w.eq_ignore_ascii_case(b"rel=\"describedby\""))
+        {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    out.extend_from_slice(&extra.alt_svc[..]);
+    out.extend_from_slice(b"\r\n");
+
+    if !vary_star {
+        out.extend_from_slice(b"vary: ");
+        for (i, f) in vary.enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(f.as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+
+    out.extend_from_slice(b"age: ");
+    out.extend_from_slice(itoa::Buffer::new().format(age.as_secs()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    if let (true, Some(describedby)) = (write_describedby, extra.describedby.as_deref()) {
+        out.extend_from_slice(describedby);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    if let Some(set_cookie) = set_cookie {
+        out.extend_from_slice(b"set-cookie: ");
+        out.extend_from_slice(set_cookie.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    crate::security::write_h1_headers(out, &entry.headers[..]);
+
+    if status_may_have_content_length(entry.status) {
+        out.extend_from_slice(b"content-length: ");
+        out.extend_from_slice(itoa::Buffer::new().format(entry.body.len()).as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    if keep_alive && status_may_have_content_length(entry.status) {
+        out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
+    } else {
+        out.extend_from_slice(b"connection: close\r\n\r\n");
+    }
+
+    if !is_head {
+        out.extend_from_slice(&entry.body);
     }
 }
 
@@ -1927,6 +2769,122 @@ mod keep_alive_tests {
 #[cfg(test)]
 #[allow(
     clippy::disallowed_methods,
+    reason = "test code: a blocking TcpStream::connect drives the connection from outside"
+)]
+mod expect_tests {
+    use super::*;
+
+    fn h1_with_head(buf: Vec<u8>) -> H1Conn {
+        H1Conn {
+            state: H1State::Reading { buf },
+            created: Instant::now(),
+            keep_alive: false,
+            served: 0,
+            max_requests: 100,
+            expect_handled: false,
+        }
+    }
+
+    /// RFC 9110 10.1.1: a client that sends `Expect: 100-continue` holds its body
+    /// back until the server answers. The answer must fire on the body-incomplete
+    /// read too, not only while the head is still arriving.
+    #[test]
+    fn expect_100_continue_is_answered_before_the_body_arrives() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        let mut h1 = h1_with_head(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+                .to_vec(),
+        );
+        let mut io = H1Io::Plain { stream: &server };
+        assert!(!handle_expect(&mut h1, &mut io));
+        let mut got = [0u8; 64];
+        let n = client.read(&mut got).unwrap();
+        assert_eq!(&got[..n], m6_core::h1::CONTINUE_RESPONSE);
+    }
+
+    /// An unsupported expectation answers a final 417 and marks it handled, so a
+    /// later read does not answer twice.
+    #[test]
+    fn an_unsupported_expectation_queues_a_417() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        let mut h1 = h1_with_head(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: bogus\r\n\r\n".to_vec(),
+        );
+        let mut io = H1Io::Plain { stream: &server };
+        assert!(handle_expect(&mut h1, &mut io));
+        assert!(h1.expect_handled);
+        assert!(matches!(h1.state, H1State::Writing { .. }));
+    }
+}
+
+#[cfg(test)]
+mod vary_merge_tests {
+    use super::VaryMerge;
+
+    fn hdrs(vary: &[&str]) -> Vec<(String, String)> {
+        vary.iter()
+            .map(|v| ("Vary".to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn merged(vary: &[&str]) -> Vec<String> {
+        VaryMerge::new(&hdrs(vary)).map(str::to_string).collect()
+    }
+
+    /// The merge deduplicates case-insensitively, keeps field order, and appends
+    /// `Accept-Encoding` when absent.
+    #[test]
+    fn deduplicates_and_appends_accept_encoding() {
+        assert_eq!(
+            merged(&["Accept-Encoding, Cookie", "cookie, User-Agent"]),
+            vec!["Accept-Encoding", "Cookie", "User-Agent"]
+        );
+        assert_eq!(merged(&[]), vec!["Accept-Encoding"]);
+    }
+
+    /// More than eight vary dimensions must all survive: the writer used to cap
+    /// the list at 8 and silently drop the rest, which would let a downstream
+    /// shared cache share a response it should not.
+    #[test]
+    fn more_than_eight_fields_survive() {
+        let fields = [
+            "A",
+            "B",
+            "C",
+            "D",
+            "E",
+            "F",
+            "G",
+            "H",
+            "Cookie",
+            "User-Agent",
+        ];
+        let mut want: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        want.push("Accept-Encoding".to_string());
+        assert_eq!(merged(&[&fields.join(", ")]), want);
+    }
+
+    /// `Vary: *` means unpredictable and must be replayed as-is, never narrowed.
+    #[test]
+    fn star_is_replayed_as_is() {
+        let h = hdrs(&["*", "Accept-Encoding"]);
+        let merge = VaryMerge::new(&h);
+        assert!(merge.is_star());
+        assert_eq!(merge.collect::<Vec<_>>(), Vec::<&str>::new());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 mod h2c_admit_tests {
@@ -1935,7 +2893,6 @@ mod h2c_admit_tests {
         REFUSAL_LOG_MAX_PEERS,
     };
     use crate::forward::ForwardedTrust;
-    use m6_core::mio::Token;
     use std::net::{IpAddr, TcpStream};
     use std::time::Instant;
 
@@ -2134,15 +3091,13 @@ mod h2c_admit_tests {
     #[test]
     fn accept_returns_after_the_cap_with_more_pending() {
         // 127.0.0.1 is not listed, so every connection is refused.
-        let mut l = H2cListener::bind("127.0.0.1:0", Some(vec![ip("10.9.9.9")])).unwrap();
+        let mut l = H2cListener::bind("127.0.0.1:0", Some(vec![ip("10.9.9.9")]), 8, 8).unwrap();
         let addr = l.local_addr().unwrap();
-        let poll = m6_core::mio::Poll::new().unwrap();
-        let registry = poll.registry();
         let clients: Vec<TcpStream> = (0..12).map(|_| TcpStream::connect(addr).unwrap()).collect();
-        assert_eq!(l.accept_up_to(registry, Token(1), 5), 5);
-        assert_eq!(l.accept_up_to(registry, Token(1), 5), 5);
-        assert_eq!(l.accept_up_to(registry, Token(1), 5), 2);
-        assert_eq!(l.accept_up_to(registry, Token(1), 5), 0);
+        assert_eq!(l.accept_up_to(5, |_, _| true), 5);
+        assert_eq!(l.accept_up_to(5, |_, _| true), 5);
+        assert_eq!(l.accept_up_to(5, |_, _| true), 2);
+        assert_eq!(l.accept_up_to(5, |_, _| true), 0);
         drop(clients);
     }
 }

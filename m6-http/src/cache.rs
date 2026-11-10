@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 /// In-memory response cache with atomic Arc swap.
+use m6_core::http::HeaderSource;
 use std::borrow::Borrow;
 
 /// A cached HTTP response.
@@ -112,43 +113,37 @@ pub fn method_may_write_cache(method: &str) -> bool {
     method == "GET"
 }
 
-/// Build a zero-allocation lookup key into a caller-supplied stack buffer.
+/// Build a zero-allocation lookup key into a caller-supplied `String` buffer.
 ///
 /// Returns a `&str` slice into `buf` that equals the `CacheKey` for the given
 /// `path` + `query` + `encoding` triple. If the combined length exceeds 512
-/// bytes an empty string is returned, which never matches a stored key — so an
-/// over-long request simply misses the cache rather than colliding with an
-/// unrelated entry.
+/// bytes an empty string is returned before anything is pushed, which never
+/// matches a stored key, so an over-long request simply misses the cache rather
+/// than colliding with an unrelated entry.
 ///
-/// `buf` must be a `&mut [u8; 512]` on the caller's stack.
+/// The caller reuses `buf` across requests, sized with capacity 512 at start,
+/// so a lookup never grows it: `clear` and `push_str` write into the reserved
+/// space. The text form removes the `unsafe` byte-slice conversion the stack
+/// buffer needed.
 pub fn make_lookup_key<'a>(
     path: &str,
     query: Option<&str>,
     encoding: &str,
-    buf: &'a mut [u8; 512],
+    buf: &'a mut String,
 ) -> &'a str {
     let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
     let query = query.unwrap_or("");
     let needed = path_stripped.len() + query.len() + encoding.len() + 2;
-    if needed <= buf.len() {
-        let mut at = 0;
-        buf[at..at + path_stripped.len()].copy_from_slice(path_stripped.as_bytes());
-        at += path_stripped.len();
-        buf[at] = b'\x01';
-        at += 1;
-        buf[at..at + query.len()].copy_from_slice(query.as_bytes());
-        at += query.len();
-        buf[at] = b'\x01';
-        at += 1;
-        buf[at..at + encoding.len()].copy_from_slice(encoding.as_bytes());
-        // SAFETY: `path_stripped`, `query` and `encoding` are valid UTF-8 (they
-        // came from `&str`), and the separator byte `\x01` is valid ASCII. The
-        // slice `buf[..needed]` is therefore valid UTF-8.
-        unsafe { std::str::from_utf8_unchecked(&buf[..needed]) }
-    } else {
-        // Fallback: key longer than 512 bytes — miss the cache.
-        ""
+    if needed > 512 {
+        return "";
     }
+    buf.clear();
+    buf.push_str(path_stripped);
+    buf.push('\x01');
+    buf.push_str(query);
+    buf.push('\x01');
+    buf.push_str(encoding);
+    buf.as_str()
 }
 
 /// How far ahead of the advertised lifetime this cache refreshes an entry.
@@ -1073,29 +1068,27 @@ pub struct RequestDirectives {
 }
 
 impl RequestDirectives {
-    pub fn parse(req_headers: &[(String, String)]) -> Self {
+    pub fn parse(req_headers: &(impl HeaderSource + ?Sized)) -> Self {
         let mut d = Self::default();
         let mut saw_cache_control = false;
-        for (name, value) in req_headers {
-            if name.eq_ignore_ascii_case("cache-control") {
-                saw_cache_control = true;
-                // split_directives already handles quoted values and the
-                // commas that can appear inside them (`no-cache="Set-Cookie"`
-                // is legal), so this must not re-split on '='.
-                for (k, v) in split_directives(value) {
-                    let secs = || v.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
-                    match k.to_ascii_lowercase().as_str() {
-                        "no-cache" => d.no_cache = true,
-                        "no-store" => d.no_store = true,
-                        "max-age" => d.max_age = secs(),
-                        "min-fresh" => d.min_fresh = secs(),
-                        // Bare `max-stale` means unlimited; with a value it is
-                        // bounded. The nested Option distinguishes them, which
-                        // a plain Option<u64> could not.
-                        "max-stale" => d.max_stale = Some(secs()),
-                        "only-if-cached" => d.only_if_cached = true,
-                        _ => {}
-                    }
+        for value in req_headers.find_all("cache-control") {
+            saw_cache_control = true;
+            // split_directives already handles quoted values and the
+            // commas that can appear inside them (`no-cache="Set-Cookie"`
+            // is legal), so this must not re-split on '='.
+            for (k, v) in split_directives(value) {
+                let secs = || v.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
+                match k.to_ascii_lowercase().as_str() {
+                    "no-cache" => d.no_cache = true,
+                    "no-store" => d.no_store = true,
+                    "max-age" => d.max_age = secs(),
+                    "min-fresh" => d.min_fresh = secs(),
+                    // Bare `max-stale` means unlimited; with a value it is
+                    // bounded. The nested Option distinguishes them, which
+                    // a plain Option<u64> could not.
+                    "max-stale" => d.max_stale = Some(secs()),
+                    "only-if-cached" => d.only_if_cached = true,
+                    _ => {}
                 }
             }
         }
@@ -1104,11 +1097,10 @@ impl RequestDirectives {
         // Cache-Control is absent, because Cache-Control is the authority when
         // both are present.
         if !saw_cache_control {
-            for (name, value) in req_headers {
-                if name.eq_ignore_ascii_case("pragma")
-                    && value
-                        .split(',')
-                        .any(|t| t.trim().eq_ignore_ascii_case("no-cache"))
+            for value in req_headers.find_all("pragma") {
+                if value
+                    .split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("no-cache"))
                 {
                     d.no_cache = true;
                 }
@@ -1163,8 +1155,8 @@ mod tests {
     /// comment, so the next caller meets it as a failing assumption.
     #[test]
     fn a_url_passed_whole_as_a_path_keys_the_same_as_the_unversioned_url() {
-        let mut a = [0u8; 512];
-        let mut b = [0u8; 512];
+        let mut a = String::with_capacity(512);
+        let mut b = String::with_capacity(512);
         assert_eq!(
             make_lookup_key("/a.css?v=1", None, "", &mut a),
             make_lookup_key("/a.css", None, "", &mut b),
@@ -1172,8 +1164,8 @@ mod tests {
         );
 
         // Split properly, and the two are distinct, which is the whole point.
-        let mut c = [0u8; 512];
-        let mut d = [0u8; 512];
+        let mut c = String::with_capacity(512);
+        let mut d = String::with_capacity(512);
         assert_ne!(
             make_lookup_key("/a.css", Some("v=1"), "", &mut c),
             make_lookup_key("/a.css", None, "", &mut d)
@@ -1273,13 +1265,13 @@ mod tests {
         cache.insert(key.clone(), resp);
 
         // Lookup via make_lookup_key (zero-alloc path)
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key("/hello", None, "", &mut buf);
         assert!(cache.get(lk).is_some());
         assert_eq!(cache.get(lk).unwrap().body, b"world" as &[u8]);
 
         // Also check legacy CacheKey::new-based borrow lookup
-        let mut buf2 = [0u8; 512];
+        let mut buf2 = String::with_capacity(512);
         let lk2 = make_lookup_key("/hello", None, "", &mut buf2);
         assert!(cache.get(lk2).is_some());
     }
@@ -1299,13 +1291,13 @@ mod tests {
     }
 
     fn get_path(cache: &Cache, path: &str) -> Option<CachedResponse> {
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key(path, None, "", &mut buf);
         cache.get(lk)
     }
 
     fn lookup_path(cache: &Cache, path: &str) -> Lookup {
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key(path, None, "", &mut buf);
         cache.lookup(lk)
     }
@@ -1478,15 +1470,15 @@ mod tests {
 
         cache.evict_path("/page");
 
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert!(cache
             .get(make_lookup_key("/page", None, "gzip", &mut buf))
             .is_none());
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert!(cache
             .get(make_lookup_key("/page", None, "br", &mut buf))
             .is_none());
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert!(cache
             .get(make_lookup_key("/other", None, "", &mut buf))
             .is_some());
@@ -1506,7 +1498,7 @@ mod tests {
         // evict with query — should still evict
         cache.evict_path("/page?x=1");
 
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key("/page", None, "", &mut buf);
         assert!(cache.get(lk).is_none());
     }
@@ -1523,7 +1515,7 @@ mod tests {
         };
 
         // First: check miss
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key("/blog/hello", None, "", &mut buf);
         assert!(cache.get(lk).is_none());
 
@@ -1531,7 +1523,7 @@ mod tests {
         cache.insert(key.clone(), resp.clone());
 
         // Second: cache hit
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key("/blog/hello", None, "", &mut buf);
         let hit = cache.get(lk);
         assert!(hit.is_some());
@@ -1649,7 +1641,7 @@ mod tests {
     #[test]
     fn test_make_lookup_key_matches_cache_key() {
         let key = CacheKey::new("/foo/bar", None, "gzip");
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let lk = make_lookup_key("/foo/bar", None, "gzip", &mut buf);
         // The borrow of CacheKey must equal the lookup key string.
         let borrowed: &str = std::borrow::Borrow::borrow(&key);
@@ -1662,14 +1654,14 @@ mod tests {
         let borrowed: &str = std::borrow::Borrow::borrow(&key);
 
         // Same query — must match.
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert_eq!(
             borrowed,
             make_lookup_key("/foo", Some("x=1"), "br", &mut buf)
         );
 
         // Different query — must not match.
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert_ne!(
             borrowed,
             make_lookup_key("/foo", Some("y=2"), "br", &mut buf)
@@ -1680,8 +1672,8 @@ mod tests {
     /// to impersonate a different one by moving the boundary.
     #[test]
     fn test_lookup_key_boundaries_are_unambiguous() {
-        let mut a = [0u8; 512];
-        let mut b = [0u8; 512];
+        let mut a = String::with_capacity(512);
+        let mut b = String::with_capacity(512);
         assert_ne!(
             make_lookup_key("/a", Some("b"), "gz", &mut a),
             make_lookup_key("/a\u{1}b", None, "gz", &mut b),
@@ -1702,15 +1694,15 @@ mod tests {
 
         cache.evict_path("/page");
 
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert!(cache
             .get(make_lookup_key("/page", Some("a=1"), "", &mut buf))
             .is_none());
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert!(cache
             .get(make_lookup_key("/page", Some("a=2"), "gzip", &mut buf))
             .is_none());
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         assert!(cache
             .get(make_lookup_key("/other", Some("a=1"), "", &mut buf))
             .is_some());
@@ -1829,7 +1821,7 @@ mod method_gate_tests {
             "if this ever becomes true, the entry below overwrites the GET body"
         );
 
-        let mut b2 = [0u8; 512];
+        let mut b2 = String::with_capacity(512);
         let got = cache
             .get(make_lookup_key("/page", None, "br", &mut b2))
             .expect("entry present");
@@ -2680,7 +2672,7 @@ mod capacity_tests {
         for i in 0..500 {
             // Read the hot entry between each insert, exactly as real traffic
             // would while an attacker floods alongside it.
-            let mut buf = [0u8; 512];
+            let mut buf = String::with_capacity(512);
             let k = make_lookup_key("/", None, "gzip", &mut buf);
             assert!(
                 !matches!(cache.lookup(k), Lookup::Miss),
@@ -2692,7 +2684,7 @@ mod capacity_tests {
             );
         }
 
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let k = make_lookup_key("/", None, "gzip", &mut buf);
         assert!(
             !matches!(cache.lookup(k), Lookup::Miss),
@@ -2804,7 +2796,7 @@ mod capacity_accounting_tests {
 
         // And the cache still works afterwards.
         cache.insert(CacheKey::new("/after", None, "gzip"), resp(5_000));
-        let mut buf = [0u8; 512];
+        let mut buf = String::with_capacity(512);
         let k = make_lookup_key("/after", None, "gzip", &mut buf);
         assert!(
             !matches!(cache.lookup(k), Lookup::Miss),
