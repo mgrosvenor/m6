@@ -171,6 +171,11 @@ pub struct Upstream {
     /// can arrive before the write finishes; reuse then truncates the request
     /// and desynchronises the backend, so reuse requires this.
     request_finished: bool,
+    /// Test seam: when set, the next `write_tls` on this connection reports a
+    /// WouldBlock once. Per-connection, so the parallel test runner cannot
+    /// cross the flag between tests.
+    #[cfg(test)]
+    block_next_write: std::cell::Cell<bool>,
     /// The address of the open connection, for keep-alive reuse.
     connected: Option<Addr>,
     /// The TLS identity of the open connection: the verified server name and the
@@ -206,6 +211,8 @@ impl Upstream {
             method_is_head: false,
             reusable: false,
             request_finished: false,
+            #[cfg(test)]
+            block_next_write: std::cell::Cell::new(false),
             connected: None,
             connected_name: None,
             connected_config: None,
@@ -475,6 +482,11 @@ impl Upstream {
                 // Flush any TLS ciphertext that is still buffered. If it would
                 // block, report it so a later drive retries the flush.
                 if let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) {
+                    #[cfg(test)]
+                    if !flush_tls(tls, stream, &self.block_next_write)? {
+                        return Ok(false);
+                    }
+                    #[cfg(not(test))]
                     if !flush_tls(tls, stream)? {
                         return Ok(false);
                     }
@@ -487,6 +499,11 @@ impl Upstream {
                 let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) else {
                     return Ok(true);
                 };
+                #[cfg(test)]
+                if !flush_tls(tls, stream, &self.block_next_write)? {
+                    return Ok(false);
+                }
+                #[cfg(not(test))]
                 if !flush_tls(tls, stream)? {
                     return Ok(false);
                 }
@@ -819,21 +836,20 @@ fn connect_in_progress(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EINPROGRESS)
 }
 
-// Test seam: when set on this thread, the next `write_tls` reports a
-// WouldBlock once, so the flush's retry is exercised without filling the
-// socket send buffer. Thread-local so the parallel test runner cannot cross
-// the flag between tests.
-#[cfg(test)]
-thread_local! {
-    static BLOCK_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+// Test seam (per-connection): when the caller's `block_next_write` flag is set,
+// the next `write_tls` reports a WouldBlock once, so the flush's retry is
+// exercised without filling the socket send buffer.
 
 /// Flush TLS ciphertext to the socket. Returns `Ok(true)` when all pending
 /// bytes are written, `Ok(false)` when the socket would block.
-fn flush_tls(tls: &mut ClientConnection, stream: &mut Stream) -> io::Result<bool> {
+fn flush_tls(
+    tls: &mut ClientConnection,
+    stream: &mut Stream,
+    #[cfg(test)] block_next_write: &std::cell::Cell<bool>,
+) -> io::Result<bool> {
     while tls.wants_write() {
         #[cfg(test)]
-        if !tls.is_handshaking() && BLOCK_NEXT_WRITE.with(|b| b.replace(false)) {
+        if !tls.is_handshaking() && block_next_write.replace(false) {
             return Ok(false);
         }
         match tls.write_tls(stream) {
@@ -1970,7 +1986,7 @@ mod socket_tests {
             .expect("start");
 
         // Force the next final flush to report a WouldBlock, then drive.
-        BLOCK_NEXT_WRITE.with(|b| b.set(true));
+        up.block_next_write.set(true);
 
         let mut poll = Poll::new().expect("poll");
         let mut events = Events::with_capacity(8);
