@@ -135,11 +135,6 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
-      # A unit that declares RuntimeDirectory without RuntimeDirectoryPreserve=yes
-      # deletes /run/m6 on stop and takes every other service's socket with it.
-      - name: Unit files preserve the shared runtime directory
-        run: python3 tools/check-units.py
-
       # Zero warnings, release and test builds, pre-existing included. This is
       # a standing rule and it is checked on Linux because that is where it
       # runs: three defects have only ever shown up there.

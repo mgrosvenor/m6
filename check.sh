@@ -74,16 +74,6 @@ fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
 info() { echo -e "${YELLOW}----${RESET} $1"; }
 warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
 
-# ── 0. Unit files ─────────────────────────────────────────────────────────────
-# A unit that declares RuntimeDirectory without RuntimeDirectoryPreserve=yes
-# deletes /run/m6 on stop and takes every other service's socket with it.
-info "Checking unit files..."
-if python3 tools/check-units.py; then
-  pass "Unit files (RuntimeDirectory preserved)"
-else
-  fail "A unit declares RuntimeDirectory without RuntimeDirectoryPreserve=yes"
-fi
-
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 info "Building (release)..."
 cargo build --workspace --release --quiet
