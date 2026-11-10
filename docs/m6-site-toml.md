@@ -307,13 +307,13 @@ A file that does not exist, cannot be read or is not valid TOML stops the app at
 
 ## 4. Key reference
 
-The key reference states a key's type, its default and the check that refuses a bad value.
+The key reference states a key's type, its default and what the loader does with a bad value.
 The tables group the keys by the section that declares them, and the sections after this one state the behaviour those keys turn on.
-Take from the tables that each key has one owner file and one type, and that a bad value stops the start with exit 2.
+Take from the tables that each key has one owner file and one type, and that an unknown key or section stops the start with exit 2.
 
 ### 4.1. `[site]`
 
-Table 2 gives the two `[site]` keys.
+Table 2 gives the two required `[site]` keys.
 Take from it that both are required, and that both describe the site every node serves.
 
 | Key | Type | Required | Notes |
@@ -394,6 +394,7 @@ Take from it that both have a default, so an absent section leaves the process o
 The level names are case-insensitive.
 
 All processes log to stdout, and `format` applies to every process that reads this config.
+A `format` outside `"json"` writes text.
 
 ### 4.4. `[errors]`
 
@@ -418,14 +419,8 @@ The default mode already sends a page, so `mode` is only needed to choose a diff
 **Table 6: the three error modes.**
 `"custom"` needs its route to exist, because m6-http reaches the page through the route table like any other request.
 
-When `mode = "custom"` and a response is an error, m6-http follows four steps:
-
-1. m6-http makes an internal GET to `<[errors] path>?status=404&from=/original-path`.
-2. The backend renders the page from the `status` and `from` query parameters.
-3. m6-http returns the page to the client with the original status code.
-4. A fetch that fails falls back to `"internal"` mode.
-
-The error path must be declared as a route in `site.toml`, and the route points to the backend that handles it.
+A `mode` outside the three is read as `"internal"`.
+[`m6-http.md`](m6-http.md) owns the custom flow, from the internal fetch and its query parameters to the fallback.
 A page fetched in custom mode is held for reuse for 60 seconds per status, so a sustained run of one error costs one fetch a minute and a redeployed page appears within a minute.
 
 The example below runs custom mode and declares the route the error page comes from.
@@ -496,7 +491,7 @@ An IPv4-mapped IPv6 peer matches the IPv4 entry.
 `metrics_peers` composes with either gate.
 `/health` ignores both keys.
 On a host where a public interface could receive packets with a listed source address, filter them with reverse-path filtering, because a peer address that arrives on the wrong interface is still a completed handshake.
-With none of the three keys set, the legacy gate alone applies, and without a token file it answers 404.
+With none of the three keys set, the legacy gate alone applies.
 
 The example below gates `/perf` and `/traffic` on a role and one peer address.
 
@@ -597,8 +592,8 @@ Section 5 states which route answers a request.
 
 ## 5. Route matching
 
-m6-http matches the request path against the routes from `site.toml` before it reaches the cache or a backend.
-Two rules decide the match.
+m6-http answers a request from the cache first, and a cache hit is answered without selecting a route or contacting a backend.
+A miss matches the request path against the routes from `site.toml`, and two rules decide which route answers.
 A fixed route, whose every segment is a literal, beats a pattern route, which has a `{param}` or `{*rest}` segment.
 A table with two routes that the rules cannot separate stops the start with exit 2, and `--dump-config` fails the same way.
 
@@ -614,71 +609,22 @@ Section 6 follows that request to the backend.
 
 ## 6. Request forwarding
 
-m6-http forwards the request to the backend a route names.
-Table 13 gives the headers it adds and the headers it removes.
-Take from it that the proxy writes the client address itself and drops every field that describes one hop.
-
-| Header | Direction | Value |
-|---|---|---|
-| `X-Forwarded-For` | Added | The client address m6-http attributes the request to |
-| `X-Forwarded-Proto` | Added | `https` |
-| `X-Forwarded-Host` | Added | The original `Host` |
-| `Connection` | Removed | Hop-by-hop |
-| `Upgrade` | Removed | Hop-by-hop |
-| `Keep-Alive` | Removed | Hop-by-hop |
-| `Transfer-Encoding` | Removed | Hop-by-hop |
-| `TE` | Removed | Hop-by-hop |
-| `Trailer` | Removed | Hop-by-hop |
-| `Proxy-Authorization` | Removed | Hop-by-hop |
-| `Proxy-Connection` | Removed | Hop-by-hop |
-
-**Table 13: the headers m6-http adds and removes on a forwarded request.**
-A field that describes the connection ends at m6-http.
-
-m6-http also drops a client's copy of `Content-Length`, `X-Real-IP` and the three `X-Forwarded-*` fields, because those state something only the proxy can truthfully set.
-The method, the path, the query string and the body reach the backend.
-
-The backend therefore sees the request the client sent, with the proxy's account of the connection attached.
+m6-http forwards the request to the backend a route names, with the proxy's own headers attached and the hop-by-hop fields removed.
+[`m6-backend-protocol.md`](m6-backend-protocol.md) §2.2 and §2.5 own the fields the proxy sends and the fields it drops.
 Section 7 states how the process stops when a signal arrives.
 
 ## 7. Signal handling
 
-A process stops on a shutdown signal.
-Table 14 gives the two receipts.
-Take from it that the first signal is the graceful stop and the second is the forced exit.
-
-| Signal | First receipt | Second receipt |
-|---|---|---|
-| `SIGTERM` or `SIGINT` | A graceful stop, exit 0 | Immediate exit |
-
-**Table 14: SIGTERM and SIGINT, first and second.**
-The second signal guarantees that the process exits even when the loop is stuck.
-
-m6-http and the renderers shut down the same way.
-The first signal stops accepting new connections, removes the Unix socket if the process has one, and exits 0.
-Requests in progress are not waited for.
-The second signal exits at once, so a process that is slow to stop still stops.
-
-Both receipts exit 0, so a supervisor reads a stop as a clean stop.
+A process stops on `SIGTERM` or `SIGINT`, with a second signal forcing the exit, and reopens its log file on `SIGUSR1`.
+[`m6-http.md`](m6-http.md) owns the signal table and the shutdown sequence.
 Section 8 gives the codes a failure returns.
 
 ## 8. Exit codes
 
-A process exits with one of three codes.
-Table 15 gives them.
-Take from it that a non-zero code names the stage that failed, and that a config mistake is always exit 2.
-
-| Code | Meaning |
-|---|---|
-| `0` | Clean shutdown after a signal, or a completed `--dump-config` |
-| `1` | Runtime failure, such as the TLS listener failing to bind |
-| `2` | Configuration or usage error at start |
-
-**Table 15: the exit codes.**
-Exit 2 covers the checks in section 9, and exit 1 covers a runtime failure after the configuration was read.
-
-Exit 2 repeats on every start until the operator fixes the file.
-Section 9 lists the checks that produce it.
+m6-http exits 0 on a clean stop, 2 on a configuration or usage error, and 1 on a runtime failure.
+A port conflict on `[server].bind` is the exception: the TLS and h2c listeners exit 1, and the HTTP/3 UDP socket exits 2.
+[`m6-http.md`](m6-http.md) owns the exit-code table.
+Exit 2 repeats on every start until the operator fixes the file, and section 9 lists the checks that produce it.
 
 ## 9. Startup validation
 
@@ -777,9 +723,9 @@ Section 11 closes with where the rest is documented.
 The page gives the two files m6-http reads.
 `site.toml` holds the state every node shares: the site identity, the routes, the backends, the log and the error settings.
 The system config holds one node's state: the node name, the bind address, the certificate and the credential paths.
-A key in the other file stops the start with exit 2 and names the file it belongs in, so a key has one owner.
+A key in the other file stops the start with exit 2, so a key has one owner.
 
-Table 16 gives the pages that own the behaviour behind these keys.
+Table 13 gives the pages that own the behaviour behind these keys.
 Take from it that the server's internals, the renderer's own keys and the site layout each have a page of their own.
 
 | document | covers |
@@ -790,6 +736,6 @@ Take from it that the server's internals, the renderer's own keys and the site l
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) | The renderer config, which is the process config of a service |
 | [`m6-site-layout.md`](m6-site-layout.md) | One root per app, which a `[[route_group]]` glob has to account for |
 
-**Table 16: further reading, and what each document covers.**
+**Table 13: further reading, and what each document covers.**
 
 A site that runs with these two files and the keys in the tables is a site whose configuration m6-http has read and accepted.
