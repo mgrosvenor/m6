@@ -97,7 +97,7 @@ Table 2 gives the nine features.
 | `csrf` | off | *CSRF* (cross-site request forgery) token generation in the request dictionary, and `Request::verify_csrf`. No new dependencies. |
 | `email` | off | `lettre` in the prelude. |
 | `http-client` | off | `ureq` in the prelude. |
-| `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite 0.31 with bundled SQLite. |
+| `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite with bundled SQLite. |
 
 **Table 2: the nine features, their defaults and what each one compiles.**
 Take from it that `templates` and `minify` are on by default, seven features pull a dependency and two add code only.

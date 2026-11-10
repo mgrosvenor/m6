@@ -114,7 +114,7 @@ use std::time::{Duration, Instant};
 pub use rusqlite;
 pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use rusqlite::{DatabaseName, TransactionBehavior};
+use rusqlite::{TransactionBehavior, MAIN_DB};
 
 /// The busy timeout [`open`] sets: 5 seconds.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -189,7 +189,7 @@ impl OpenOptions {
             path: path.to_path_buf(),
             source,
         })?;
-        if conn.is_readonly(DatabaseName::Main)? {
+        if conn.is_readonly(MAIN_DB)? {
             return Err(SqliteError::ReadOnly(path.to_path_buf()));
         }
         // First, so that changing the journal mode waits for a lock instead of
