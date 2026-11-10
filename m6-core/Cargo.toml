@@ -167,6 +167,23 @@ name    = "upstream_no_alloc"
 harness = false
 required-features = ["testkit"]
 
+# `h1::ServerConn`'s proof: keep-alive requests allocate nothing, a pipelined
+# pair is served from the buffer, a large request's buffer is cut back, and a
+# streamed body is pumped a chunk per writable turn. Its own `main`, so the
+# counting allocator is installed before any thread starts.
+[[test]]
+name    = "server_conn"
+harness = false
+required-features = ["testkit"]
+
+# The page path's allocation baseline, for ALLOC-3: a hundred requests through
+# a `Site` and a `ServerConn`, each after the first allocating the same number
+# of times. Its own `main`, as `server_conn`'s.
+[[test]]
+name    = "site_allocs"
+harness = false
+required-features = ["testkit"]
+
 [[bench]]
 name    = "critical_path"
 harness = false

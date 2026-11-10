@@ -16,9 +16,9 @@ use std::io::{Read, Write};
 use crate::http::RawRequest;
 
 /// Maximum size for request line + headers combined (8 KB).
-const MAX_HEADER_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// Maximum body size (16 MB).
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {

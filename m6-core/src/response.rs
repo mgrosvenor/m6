@@ -467,14 +467,7 @@ impl Response {
         let has = |name: &str| crate::headers::contains(&headers[..], name);
 
         let etag;
-        let mut hdrs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        if !has("content-type") && !body.is_empty() {
-            hdrs.push(("Content-Type", "text/html; charset=utf-8"));
-        }
+        let mut hdrs = wire_headers(&headers, !has("content-type") && !body.is_empty());
 
         match body {
             // Written straight through, and deliberately given no default
@@ -502,6 +495,25 @@ impl Response {
         }
         Ok(())
     }
+}
+
+/// The response head's fields as borrowed pairs, with the `Content-Type` a
+/// handler left out supplied when `add_content_type` is set.
+///
+/// One rule for every sender: `Response::send` and a connection slot's stream
+/// head both build their head here, so the two cannot default differently.
+pub(crate) fn wire_headers(
+    headers: &[(String, String)],
+    add_content_type: bool,
+) -> Vec<(&str, &str)> {
+    let mut hdrs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if add_content_type {
+        hdrs.push(("Content-Type", "text/html; charset=utf-8"));
+    }
+    hdrs
 }
 
 fn content_hash(body: &[u8]) -> u64 {

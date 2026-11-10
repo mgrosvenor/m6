@@ -56,7 +56,7 @@ fn main() -> Result<()> {
 ```
 
 The prelude is deliberately small.
-It exports `App` and `AppContext`, `Dict`, `Error` and `Result`, `Request` and `Response`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
+It exports `App` and `AppContext`, `Site`, `Handled` and `CodeRoute`, `Dict`, `Error` and `Result`, `Request` and `Response`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
 Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, lettre's `Message`, `SmtpTransport` and `Transport`, `ureq`, and `rusqlite`.
 
 A service that renders no templates says so, and takes core with `default-features = false` to stop linking Tera.
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
 There is a second shape.
 `m6-http` is a proxy with its own event loop and datagram sockets, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all.
 Every module is public, and most of the crate can be used without the `App` loop, so m6-core is a library first and a framework second.
-One part is not reachable that way: `FrameworkState::build_dict` is private, which section 4 records as an open item.
+The second shape uses `site::Site` for the request path and writes the loop itself: the four EL-6 jobs moved those parts out of `App`.
 
 Both shapes link one crate, and the difference is where the service loop comes from.
 Section 2 gives the features that decide which parts compile.
@@ -116,13 +116,14 @@ Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-Thirty-seven component modules, five of them behind features, grouped by the task that sends a reader to one.
-The prelude in section 1 is the thirty-eighth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
+Thirty-eight component modules, five of them behind features, grouped by the task that sends a reader to one.
+The prelude in section 1 is the thirty-ninth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
 | group | module | what it is |
 |---|---|---|
 | **Building a service** | `app` | The `App` builder, routing, the thread pool, the request dictionary and the service lifecycle. The largest module. |
+| | `site` | `Site`, `CodeRoute` and `Handled`. The site's request path, as plain functions on a value the service owns. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
 | | `signal` | `block()`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
@@ -136,7 +137,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `cookie` | `Cookie` and `SameSite`. One place that says what a cookie can be. |
 | | `multipart` | `Upload` and `parse_upload`. Feature `multipart`. |
 | | `time_range` | `TimeRange`, the `from` and `to` of a query read as a half-open UTC range, and `rfc3339_utc_ms`. |
-| **HTTP semantics** | `h1` | The HTTP/1.1 parser, plus `Responder`, `keep_alive`, `status_reason` and `Expectation`. |
+| **HTTP semantics** | `h1` | The HTTP/1.1 parser, plus `ServerConn`, `Responder`, `keep_alive`, `status_reason` and `Expectation`. |
 | | `parse` | The stream adapter over `h1`. Reads bytes until `h1` says the message is complete. |
 | | `conditional` | RFC 9110 13.2 preconditions. `evaluate_preconditions` and `is_not_modified`. |
 | | `negotiate` | Content-coding negotiation, RFC 9110 12.5.3, with real q-values. |
@@ -156,7 +157,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
 | | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
 | **Storage** | `sqlite` | One SQLite file with the house settings, versioned migrations and append-only tables. Feature `sqlite`. |
-| **Everything else** | `net` | `is_private_ip` and `bind_ip`. The one definition of a private address. |
+| **Everything else** | `net` | `is_private_ip`, `bind_ip`, `listen_unix` and `listen_tcp`. The one definition of a private address, and the two listeners. |
 | | `error` | `Error` and `Result`. |
 | | `testkit` | The shared integration harness. Feature `testkit`. |
 
@@ -208,7 +209,7 @@ The thread pool: `ThreadPool::new(size, queue_size)`, or `new_with_exit(size, qu
 `submit` returns `false` when the queue is full, which is how the loop sheds load with a 503 instead of growing a backlog.
 `try_submit(resource, f)` hands a resource to the work and returns it back when the queue is full.
 
-The request dictionary: `FrameworkState::build_dict` is where the real knowledge lives, and it is **private**, which is the outstanding item on this module, because a service not using `App` cannot reuse any of it.
+The request dictionary: `FrameworkState::build_dict` is where the real knowledge lives. It is private to the crate, and `site::Site` is how a service reaches it without `App`.
 Three layers no longer run per request: config keys, global params files and a route's static params files are merged once at start into `route.base_dict`.
 The per-request order is:
 
@@ -325,7 +326,57 @@ A route that names a template produces a `Response` carrying `template_name` and
 **Table 5: the site template filters and functions.**
 Take from it that `asset` and `img_dims` are computed from tables built at start, and that `not_found()` turns a missing lookup into a 404.
 
-Those five modules are a service's own parts: the builder, its configuration, its socket, its signals and its renderer.
+### 4.6. `site`
+
+`Site` is the site's request handling as plain functions on a value the service owns.
+A service's loop calls `Site::load` once at start, then per request `handle`, its own handler for the index, and `finish`.
+`Site` never calls back into the service: a route the service answers itself comes back as `Handled::Code` or `Handled::Named` with the index of its route.
+
+**Start.** `Site::load` reads the command line (`--version`, `--dump-config`), the config, `site.toml`, the logging settings, the route table, templates and params.
+It exits 2 on a configuration error and 1 when logging cannot start, and it refuses a route that names a handler nothing provides.
+`name` is the service's name for the lifecycle lines.
+`read_timeout`, `socket_mode` and `socket_path` are what the loop binds and applies, and `user_config`, `site_dir`, `config_path` and `site_toml` are the roots a service resolves its own files against.
+
+```rust
+pub fn load(name: &str, code: &[CodeRoute], named: &[&str], renderer: &dyn RendererFactory) -> Site;
+pub fn socket_path(&self) -> &Path;
+pub fn read_timeout(&self) -> Option<Duration>;
+pub fn socket_mode(&self) -> u32;
+pub fn user_config(&self) -> &Map<String, Value>;
+pub fn site_dir(&self) -> &Path;
+pub fn config_path(&self) -> &Path;
+pub fn site_toml(&self) -> &Path;
+pub fn handle(&self, head: &RequestHead<'_>) -> Handled;
+pub fn finish(&self, req: &Request, resp: Response) -> Response;
+```
+
+**Per request.** `handle` routes, builds the dictionary and the owned `Request`, and either answers a template route itself or returns the service's index.
+`Done` is already finished.
+`Code` and `Named` carry the request, and the service calls `finish` on the response its handler returned.
+The service's dispatch is a plain `match` on that index.
+
+```rust
+let resp = match site.handle(&head) {
+    Handled::Done(resp) => resp,
+    Handled::Code(FILES, req) => {
+        let r = handler::serve(&req).unwrap_or_else(|e| error_response(&e));
+        site.finish(&req, r)
+    }
+    Handled::Named(FILES, req) => {
+        let r = handler::serve(&req).unwrap_or_else(|e| error_response(&e));
+        site.finish(&req, r)
+    }
+    Handled::Named(..) | Handled::Code(..) => unreachable!("load checked every route and name"),
+};
+```
+
+`finish` renders a template the response names, then applies the route's `Cache-Control`, `Last-Modified` and headers, the CSRF and flash cookies, minification and compression, in the order the old request path did.
+
+**Allocation.** `Site` allocates on the start and stop paths freely.
+The page path allocates once per request today: the owned `Request`, its dictionary, Tera and compression.
+EL-6a measures that count in `site_allocs` and ALLOC-3 reduces it.
+
+Those six modules are a service's own parts: the builder, its configuration, its socket, its signals, its renderer and the site's request path.
 Section 5 turns to the objects a handler receives and returns.
 
 ---
@@ -446,6 +497,58 @@ onto it is what caught that. All four targets now score 32/32 and
 `send_with_length`, `error`, with `keeps_alive()` and `body_bytes()`. It omits
 the body on a HEAD, which the three hand-written writers it replaced did not
 reliably do, so every 404, 405, 400 and 412 answering a HEAD went out with one.
+`write_head_to` is the same head written straight into a caller's buffer, for a
+caller whose writer is already a buffer.
+
+**`ServerConn`** is one HTTP/1.1 connection slot for a service's own loop.
+`new(read_cap, write_cap)` makes it at start, `attach` takes an accepted
+`mio::net::UnixStream` and `detach` gives it back, and `stream()` is what the
+reactor registers.
+`read` reads until the socket would block, parses with `parse_head_uninit` into
+the caller's fixed header slots, and returns `Read::Request(head)`, `Read::More`
+or `Read::Closed`. It keeps the request's method, the keep-alive decision and
+the served count on the slot, so `respond` needs no request argument.
+`respond(status, headers, body)` queues a short answer and
+`respond_response(Response)` queues a handler's. `flush` writes until the socket
+would block and reports `Done` (empty and keeping alive), `More` (empty the
+socket, write again when writable) or `Close` (empty and done).
+A `Body::Stream` body is pumped 64 KiB per writable turn, one `read(2)` of the
+file per turn.
+A request or a response larger than the slot's buffers grows that buffer and it
+is cut back to the configured size afterwards.
+The parser is edge-triggered, so one turn reads and writes until the socket
+would block.
+
+The header slots are `MaybeUninit` and made with `head_slots()`.
+The head borrows them for one call, which is why the array is made where it is
+used and costs no writes.
+
+The turn loop:
+
+```rust
+loop {
+    let mut heads = h1::head_slots();
+    let read = conn.read(&mut heads)?;
+    let (answered, response) = match read {
+        Read::Request(head) => (true, Some(site.handle(&head))),
+        Read::More => (false, None),
+        Read::Closed => break,
+    };
+    if let Some(response) = response {
+        conn.respond_response(response);
+    }
+    if conn.flush()? != Flush::Done {
+        break;
+    }
+    if !answered {
+        break;
+    }
+}
+```
+
+**Allocation.** `ServerConn` allocates nothing per request: its buffers are made
+at start and a request or response larger than them is the one case that grows
+one.
 
 ### 6.2. `parse`
 
@@ -510,6 +613,13 @@ address, and gives `None` for a host name. Names are never resolved.
 An IPv4-mapped IPv6 address is classified by its IPv4 form. `0.0.0.0` and `::`
 are not private. A check on a peer address only means something on a socket
 that faces the client directly; behind a proxy the peer is the proxy.
+
+`listen_unix(path, mode)` removes a stale socket file, creates the parent
+directory, binds non-blocking and sets the mode. `listen_tcp(addr)` binds
+non-blocking with `SO_REUSEADDR`, so a restart can rebind a port whose
+connections are in `TIME_WAIT` and a live listener on it is still refused.
+Both are start only and return `Err` rather than recovering, because a socket
+with a mode nobody chose or a port someone else holds is a start failure.
 
 ---
 
@@ -870,9 +980,6 @@ links it.
 Recorded here because a reference that only describes the good parts is a
 brochure.
 
-- **`FrameworkState::build_dict` is private.** Twelve ordered steps of real
-  knowledge that a service not using `App` cannot reach. This is the open
-  "header to dict" item.
 - **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on
   the production path of every socket backend. What was deleted is the parser
   that used to be in it; it is now the stream adapter described in §6.
