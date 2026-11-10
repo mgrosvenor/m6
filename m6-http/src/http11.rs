@@ -1188,13 +1188,25 @@ impl H1Io<'_> {
         }
     }
 
-    /// Pump the transport. For TLS that is the record layer; for plaintext
-    /// there is nothing between the buffer and the socket, so it is a no-op.
-    /// Returns whether ciphertext was read.
-    fn advance(&mut self) -> io::Result<bool> {
+    /// Flush pending TLS ciphertext to the socket, without pulling ciphertext.
+    ///
+    /// The write path only owes bytes outward; `read_tls` would be a wasted
+    /// `recvfrom` (a WouldBlock on a socket that has nothing for us) once per
+    /// response. `write_tls` alone drains rustls's outgoing buffer.
+    fn flush_write(&mut self) -> io::Result<()> {
         match self {
-            H1Io::Tls { tls, stream } => advance_tls(tls, stream, None),
-            H1Io::Plain { .. } => Ok(false),
+            H1Io::Tls { tls, stream } => {
+                while tls.wants_write() {
+                    match tls.write_tls(&mut &**stream) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            H1Io::Plain { .. } => Ok(()),
         }
     }
 
@@ -1317,7 +1329,7 @@ fn drive_h1<S, F, G>(
                                 Some(m6_core::h1::Expectation::Continue) => {
                                     h1.expect_handled = true;
                                     let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
-                                    let _ = io.advance();
+                                    let _ = io.flush_write();
                                 }
                                 Some(m6_core::h1::Expectation::Unsupported) => {
                                     h1.expect_handled = true;
@@ -1409,7 +1421,7 @@ fn drive_h1<S, F, G>(
                 ));
                 h1.state = H1State::Writing { buf, pos: 0 };
                 // pump TLS to start sending immediately
-                if io.advance().is_err() {
+                if io.flush_write().is_err() {
                     h1.state = H1State::Done;
                     return;
                 }
@@ -1419,7 +1431,7 @@ fn drive_h1<S, F, G>(
                 // Flush any ciphertext still pending from a previous turn: a
                 // full socket stopped the flush but the response is not done.
                 if io.wants_write() {
-                    if io.advance().is_err() {
+                    if io.flush_write().is_err() {
                         h1.state = H1State::Done;
                         return;
                     }
@@ -1451,7 +1463,7 @@ fn drive_h1<S, F, G>(
                         return;
                     }
                 }
-                if io.advance().is_err() {
+                if io.flush_write().is_err() {
                     h1.state = H1State::Done;
                     return;
                 }
