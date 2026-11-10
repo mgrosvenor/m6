@@ -217,6 +217,9 @@ struct ChunkProgress {
     decoded: usize,
     next: usize,
     trailers: bool,
+    /// Bytes of the trailer section scanned so far, capped like the request
+    /// head: trailer fields are header-field syntax.
+    trailer_bytes: usize,
 }
 
 impl ChunkProgress {
@@ -225,6 +228,7 @@ impl ChunkProgress {
         decoded: 0,
         next: 0,
         trailers: false,
+        trailer_bytes: 0,
     };
 }
 
@@ -254,6 +258,12 @@ thread_local! {
     static CHUNK_SIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Bytes of chunk-size and trailer lines scanned, for the bounded-scan test.
+#[cfg(test)]
+thread_local! {
+    static CHUNK_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Parse one chunk-size line at `i`, returning the size and the index after
 /// its CRLF.
 ///
@@ -264,9 +274,23 @@ thread_local! {
 fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), ChunkSizeError> {
     #[cfg(test)]
     CHUNK_SIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let Some(eol) = find_crlf(&buf[i..]) else {
-        return Err(ChunkSizeError::Incomplete);
+    // A chunk-size line is header-field syntax, bounded like the request head.
+    // The scan is bounded too: a partial line is never looked at past the cap,
+    // so one long extension cannot be re-read on every read.
+    let available = &buf[i..];
+    let window = &available[..available.len().min(MAX_HEADER_BYTES + 2)];
+    #[cfg(test)]
+    CHUNK_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + window.len()));
+    let Some(eol) = find_crlf(window) else {
+        return if available.len() > MAX_HEADER_BYTES {
+            Err(ChunkSizeError::Bad)
+        } else {
+            Err(ChunkSizeError::Incomplete)
+        };
     };
+    if eol > MAX_HEADER_BYTES {
+        return Err(ChunkSizeError::Bad);
+    }
     let Some(line_end) = i.checked_add(eol) else {
         return Err(ChunkSizeError::Bad);
     };
@@ -298,14 +322,30 @@ fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), ChunkSizeError>
 }
 
 /// Walk the trailer fields that follow the last chunk.
-fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize) -> Chunked {
+fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize, mut trailer_bytes: usize) -> Chunked {
     loop {
-        let Some(eol) = find_crlf(&buf[i..]) else {
-            return Chunked::More(ChunkProgress {
-                decoded,
-                next: i,
-                trailers: true,
-            });
+        let available = &buf[i..];
+        let window = &available[..available.len().min(MAX_HEADER_BYTES + 2)];
+        #[cfg(test)]
+        CHUNK_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + window.len()));
+        let Some(eol) = find_crlf(window) else {
+            return if available.len() > MAX_HEADER_BYTES || trailer_bytes > MAX_HEADER_BYTES {
+                Chunked::Bad
+            } else {
+                Chunked::More(ChunkProgress {
+                    decoded,
+                    next: i,
+                    trailers: true,
+                    trailer_bytes,
+                })
+            };
+        };
+        if eol > MAX_HEADER_BYTES {
+            return Chunked::Bad;
+        }
+        trailer_bytes = match trailer_bytes.checked_add(eol + 2) {
+            Some(v) if v <= MAX_HEADER_BYTES => v,
+            _ => return Chunked::Bad,
         };
         i = match i.checked_add(eol).and_then(|v| v.checked_add(2)) {
             Some(v) => v,
@@ -328,7 +368,7 @@ fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
     let mut decoded = from.decoded;
     let mut i = from.next;
     if from.trailers {
-        return chunked_trailers(buf, decoded, i);
+        return chunked_trailers(buf, decoded, i, from.trailer_bytes);
     }
     loop {
         // Where this chunk's size line starts, so an incomplete chunk resumes
@@ -341,6 +381,7 @@ fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
                     decoded,
                     next: chunk_start,
                     trailers: false,
+                    trailer_bytes: 0,
                 })
             }
             Err(ChunkSizeError::Bad) => return Chunked::Bad,
@@ -348,7 +389,7 @@ fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
         i = next;
 
         if size == 0 {
-            return chunked_trailers(buf, decoded, i);
+            return chunked_trailers(buf, decoded, i, 0);
         }
 
         let Some(decoded_end) = decoded.checked_add(size) else {
@@ -368,6 +409,7 @@ fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
                 decoded,
                 next: chunk_start,
                 trailers: false,
+                trailer_bytes: 0,
             });
         }
         // Every chunk's data is followed by CRLF, exactly.
@@ -1218,8 +1260,10 @@ pub struct ServerConn {
     in_buf: Vec<u8>,
     in_len: usize,
     in_read_cap: usize,
-    /// Bytes of the buffer the request being answered occupies, dropped when
-    /// the next `read` starts.
+    /// Bytes of the buffer the request being answered occupies. They are
+    /// dropped when its answer is flushed (`release_request`), or at the next
+    /// read when no answer was flushed; the buffer grown for a large request is
+    /// cut back at that point too.
     consumed: usize,
     /// How far a chunked body has been framed, so the next read continues
     /// from there rather than walking the chunks already seen again.
@@ -1607,8 +1651,9 @@ impl ServerConn {
         self.chunk = None;
     }
 
-    /// Drop the previous request from the input buffer when the next read
-    /// starts, and cut a grown buffer back to its start size.
+    /// The fallback release, for a request whose answer was never flushed:
+    /// drop it now and cut a grown buffer back to its start size. The normal
+    /// release is in `flush`, when the answer is written.
     fn drop_consumed(&mut self) {
         if self.consumed == 0 {
             // A request is still arriving: keep the chunked body's position.
@@ -1830,6 +1875,106 @@ mod framing_overflow_tests {
         let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
                     1\r\na\r\nffffffffffffffff\r\n";
         assert!(matches!(parse_request(raw), ParseResult::Error));
+    }
+
+    /// A long partial chunk-size line is refused at the head cap instead of
+    /// being rescanned from its start on every read: the scan per read is
+    /// bounded by the cap, however much extension a client sends.
+    #[test]
+    fn a_long_chunk_extension_is_refused_with_bounded_scanning() {
+        let (mut client, mut conn) = chunked_conn();
+        let mut line = b"1;".to_vec();
+        line.extend(std::iter::repeat_n(b'a', 16 * 1024));
+
+        CHUNK_SCAN_BYTES.with(|bytes| bytes.set(0));
+        let refused = feed_until_refused(&mut client, &mut conn, &line);
+        let scanned = CHUNK_SCAN_BYTES.with(|bytes| bytes.get());
+        assert!(refused, "a long chunk extension must be refused");
+        assert!(
+            scanned <= 4 * MAX_HEADER_BYTES,
+            "scanned {scanned} bytes of the extension"
+        );
+        assert_refusal(&mut client);
+    }
+
+    /// The same bound for a trailer field: the trailer section is header-field
+    /// syntax, so it is capped like the head and not rescanned past the cap.
+    #[test]
+    fn a_long_trailer_field_is_refused_with_bounded_scanning() {
+        let (mut client, mut conn) = chunked_conn();
+        client.write_all(b"0\r\n").expect("the last chunk's line");
+        let field = vec![b'a'; 16 * 1024];
+
+        CHUNK_SCAN_BYTES.with(|bytes| bytes.set(0));
+        let refused = feed_until_refused(&mut client, &mut conn, &field);
+        let scanned = CHUNK_SCAN_BYTES.with(|bytes| bytes.get());
+        assert!(refused, "a long trailer field must be refused");
+        assert!(
+            scanned <= 4 * MAX_HEADER_BYTES,
+            "scanned {scanned} bytes of the trailer"
+        );
+        assert_refusal(&mut client);
+    }
+
+    /// A connection with a chunked request's head already sent. Both ends are
+    /// non-blocking, so the feeder never waits for a reader that is not there.
+    fn chunked_conn() -> (std::os::unix::net::UnixStream, ServerConn) {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream as StdUnixStream;
+
+        let (mut client, server) = StdUnixStream::pair().expect("a pair");
+        server
+            .set_nonblocking(true)
+            .expect("a non-blocking server end");
+        client
+            .set_nonblocking(true)
+            .expect("a non-blocking client end");
+        let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
+        conn.attach(mio::net::UnixStream::from_std(server));
+        client
+            .write_all(b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .expect("the head");
+        (client, conn)
+    }
+
+    /// Feed `bytes` while the connection reads, until it refuses. Returns
+    /// false if the bytes ran out and no refusal came.
+    fn feed_until_refused(
+        client: &mut std::os::unix::net::UnixStream,
+        conn: &mut ServerConn,
+        bytes: &[u8],
+    ) -> bool {
+        let mut pending = bytes;
+        loop {
+            while !pending.is_empty() {
+                match client.write(pending) {
+                    Ok(0) => return false,
+                    Ok(n) => pending = &pending[n..],
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return false,
+                }
+            }
+            let mut heads = head_slots();
+            let _ = conn.read(&mut heads).expect("read");
+            if conn.flush().expect("flush") == Flush::Close {
+                return true;
+            }
+            if pending.is_empty() {
+                return false;
+            }
+        }
+    }
+
+    /// Read the queued refusal and check the status line.
+    fn assert_refusal(client: &mut std::os::unix::net::UnixStream) {
+        let mut response = [0u8; 512];
+        let n = client.read(&mut response).expect("read the refusal");
+        assert!(
+            response[..n].starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "got {:?}",
+            String::from_utf8_lossy(&response[..n])
+        );
     }
 
     /// A body of many small chunks fed one byte at a time must walk each chunk

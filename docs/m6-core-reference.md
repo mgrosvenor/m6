@@ -561,13 +561,15 @@ loop {
         Flush::Done if !idle => {}
         // Everything is written and this turn has nothing more to read.
         Flush::Done => {
-            reregister(&mut conn, conn.interest(), token);
+            let interest = conn.interest();
+            reregister(&mut conn, interest, token);
             break;
         }
         // The socket would block with output still queued: register with
         // `conn.interest()` (WRITABLE here) and flush again when it is.
         Flush::More => {
-            reregister(&mut conn, conn.interest(), token);
+            let interest = conn.interest();
+            reregister(&mut conn, interest, token);
             break;
         }
         // Everything is written and this connection closes.
