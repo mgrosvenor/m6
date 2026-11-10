@@ -83,6 +83,10 @@ impl Transport for H2cTransport {
         }
         None
     }
+
+    fn wants_write(&self) -> bool {
+        false
+    }
 }
 
 /// Persistent non-blocking H2C connection.

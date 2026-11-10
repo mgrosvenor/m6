@@ -119,7 +119,7 @@ pub struct Conn {
     /// The `mio` token this connection's descriptor is registered under.
     token: Token,
     /// What the poll currently waits for, so `reregister` runs only on change.
-    interest: Interest,
+    registered_interest: Interest,
 }
 
 /// What one connection's turn reports to the loop that owns the timeouts and
@@ -148,7 +148,7 @@ impl Conn {
     }
 
     pub fn set_interest(&mut self, interest: Interest) {
-        self.interest = interest;
+        self.registered_interest = interest;
     }
 
     fn empty() -> Conn {
@@ -163,7 +163,7 @@ impl Conn {
                 created: Instant::now(),
             },
             token: Token(usize::MAX),
-            interest: Interest::READABLE,
+            registered_interest: Interest::READABLE,
         }
     }
 
@@ -371,7 +371,7 @@ impl Http11Listener {
 
     /// Accept one connection, building its `Conn` (stream, TLS, kind). `None`
     /// when no connection is pending. The caller allocates the token and the
-    /// slot, sets `conn.token` and `conn.interest`, registers the descriptor,
+    /// slot, sets `conn.token` and `conn.registered_interest`, registers the descriptor,
     /// and stores the `Conn` back into the slot.
     pub fn accept_one(&mut self) -> Option<Conn> {
         loop {
@@ -431,7 +431,7 @@ impl Http11Listener {
                         tls,
                         kind,
                         token: Token(usize::MAX),
-                        interest: Interest::READABLE,
+                        registered_interest: Interest::READABLE,
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
@@ -488,13 +488,13 @@ impl Http11Listener {
         drive.parked = conn.is_parked();
         if !drive.done {
             let interest = conn.interest();
-            if interest != conn.interest {
+            if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
                         .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
                         .ok();
                 }
-                conn.interest = interest;
+                conn.registered_interest = interest;
             }
         }
         drive
@@ -521,7 +521,7 @@ pub struct H2cPlainConn {
     h2: Option<Box<Http2Conn>>,
     client_ip: String,
     token: Token,
-    interest: Interest,
+    registered_interest: Interest,
 }
 
 impl H2cPlainConn {
@@ -535,7 +535,7 @@ impl H2cPlainConn {
     }
 
     pub fn set_interest(&mut self, interest: Interest) {
-        self.interest = interest;
+        self.registered_interest = interest;
     }
 
     fn empty() -> H2cPlainConn {
@@ -544,7 +544,7 @@ impl H2cPlainConn {
             h2: None,
             client_ip: String::new(),
             token: Token(usize::MAX),
-            interest: Interest::READABLE,
+            registered_interest: Interest::READABLE,
         }
     }
 
@@ -850,7 +850,7 @@ impl H2cListener {
                     h2: Some(Box::new(h2)),
                     client_ip: peer.ip().to_string(),
                     token: Token(usize::MAX),
-                    interest: Interest::READABLE,
+                    registered_interest: Interest::READABLE,
                 })
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => H2cAccept::WouldBlock,
@@ -924,13 +924,13 @@ impl H2cListener {
         drive.parked = conn.h2.as_ref().expect("h2c slot").has_pending_url();
         if !drive.done {
             let interest = conn.interest();
-            if interest != conn.interest {
+            if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
                         .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
                         .ok();
                 }
-                conn.interest = interest;
+                conn.registered_interest = interest;
             }
         }
         drive
@@ -1190,11 +1190,10 @@ impl H1Io<'_> {
 
     /// Pump the transport. For TLS that is the record layer; for plaintext
     /// there is nothing between the buffer and the socket, so it is a no-op.
-    /// `overflow` is the request buffer the TLS layer drains into when its
-    /// plaintext buffer is full. Returns whether ciphertext was read.
-    fn advance(&mut self, overflow: Option<&mut Vec<u8>>) -> io::Result<bool> {
+    /// Returns whether ciphertext was read.
+    fn advance(&mut self) -> io::Result<bool> {
         match self {
-            H1Io::Tls { tls, stream } => advance_tls(tls, stream, overflow),
+            H1Io::Tls { tls, stream } => advance_tls(tls, stream, None),
             H1Io::Plain { .. } => Ok(false),
         }
     }
@@ -1318,7 +1317,7 @@ fn drive_h1<S, F, G>(
                                 Some(m6_core::h1::Expectation::Continue) => {
                                     h1.expect_handled = true;
                                     let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
-                                    let _ = io.advance(None);
+                                    let _ = io.advance();
                                 }
                                 Some(m6_core::h1::Expectation::Unsupported) => {
                                     h1.expect_handled = true;
@@ -1410,7 +1409,7 @@ fn drive_h1<S, F, G>(
                 ));
                 h1.state = H1State::Writing { buf, pos: 0 };
                 // pump TLS to start sending immediately
-                if io.advance(None).is_err() {
+                if io.advance().is_err() {
                     h1.state = H1State::Done;
                     return;
                 }
@@ -1420,7 +1419,7 @@ fn drive_h1<S, F, G>(
                 // Flush any ciphertext still pending from a previous turn: a
                 // full socket stopped the flush but the response is not done.
                 if io.wants_write() {
-                    if io.advance(None).is_err() {
+                    if io.advance().is_err() {
                         h1.state = H1State::Done;
                         return;
                     }
@@ -1452,7 +1451,7 @@ fn drive_h1<S, F, G>(
                         return;
                     }
                 }
-                if io.advance(None).is_err() {
+                if io.advance().is_err() {
                     h1.state = H1State::Done;
                     return;
                 }
@@ -1558,7 +1557,7 @@ fn advance_tls(
             {
                 match &mut overflow {
                     Some(buf) => {
-                        if drain_plaintext(tls, buf) == 0 {
+                        if drain_tls_plaintext(tls, buf)? == 0 {
                             break;
                         }
                     }
@@ -1579,23 +1578,25 @@ fn advance_tls(
     Ok(progress)
 }
 
-/// Drain rustls's decoded plaintext into `overflow`. Returns how many bytes
-/// moved.
-fn drain_plaintext(tls: &mut ServerConnection, overflow: &mut Vec<u8>) -> usize {
+/// Drain rustls's decoded plaintext into `into`. Returns how many bytes moved.
+/// Shared with the h2 engine so both paths read the reader the same way.
+pub(crate) fn drain_tls_plaintext(
+    tls: &mut ServerConnection,
+    into: &mut Vec<u8>,
+) -> io::Result<usize> {
     let mut tmp = [0u8; 4096];
     let mut drained = 0;
     loop {
         match tls.reader().read(&mut tmp) {
-            Ok(0) => break,
+            Ok(0) => return Ok(drained),
             Ok(n) => {
-                overflow.extend_from_slice(&tmp[..n]);
+                into.extend_from_slice(&tmp[..n]);
                 drained += n;
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(drained),
+            Err(e) => return Err(e),
         }
     }
-    drained
 }
 
 // ── HTTP/1.1 request parser ───────────────────────────────────────────────────

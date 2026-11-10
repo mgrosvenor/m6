@@ -66,6 +66,11 @@ pub trait Transport: Sized {
     /// Read whatever decrypted bytes are available into `recv_buf`. Returns
     /// `Some(reason)` on EOF or read error, deferred until after the frame loop.
     fn fill_recv(&mut self, recv_buf: &mut Vec<u8>) -> Option<String>;
+
+    /// Whether the transport still holds bytes to flush (rustls ciphertext for
+    /// TLS, always false for cleartext), so the connection asks for write
+    /// readiness rather than dropping `WRITABLE`.
+    fn wants_write(&self) -> bool;
 }
 
 // ── H2Stream (private) ────────────────────────────────────────────────────────
@@ -107,7 +112,7 @@ pub struct H2Client<T: Transport> {
     /// The `mio` token this connection's descriptor is registered under.
     token: Token,
     /// What the poll currently waits for, so `reregister` runs only on change.
-    interest: Interest,
+    registered_interest: Interest,
 }
 
 impl<T: Transport> H2Client<T> {
@@ -128,7 +133,7 @@ impl<T: Transport> H2Client<T> {
             peer_max_frame: DEFAULT_MAX_FRAME,
             is_dead: false,
             token: Token(usize::MAX),
-            interest: Interest::READABLE,
+            registered_interest: Interest::READABLE,
         }
     }
 
@@ -158,13 +163,14 @@ impl<T: Transport> H2Client<T> {
 
     /// Set the interest the caller registered this connection with.
     pub fn set_interest(&mut self, interest: Interest) {
-        self.interest = interest;
+        self.registered_interest = interest;
     }
 
     /// The interest to register next: write readiness while request bytes are
-    /// still owed, read readiness once they are flushed.
+    /// still owed or the transport holds unflushed output, read readiness once
+    /// both are empty.
     pub fn interest(&self) -> Interest {
-        if self.send_buf.is_empty() {
+        if self.send_buf.is_empty() && !self.transport.wants_write() {
             Interest::READABLE
         } else {
             Interest::READABLE | Interest::WRITABLE
@@ -800,7 +806,7 @@ impl<T: Transport> Pool<T> {
         let conn = self.connections.get_mut(base_url).unwrap();
         let rx = conn.dispatch(req, &host, client_ip, original_host)?;
         let interest = conn.interest();
-        if interest != conn.interest {
+        if interest != conn.registered_interest {
             registry
                 .reregister(
                     &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
@@ -808,7 +814,7 @@ impl<T: Transport> Pool<T> {
                     interest,
                 )
                 .ok();
-            conn.interest = interest;
+            conn.registered_interest = interest;
         }
         Ok(rx)
     }
@@ -821,7 +827,7 @@ impl<T: Transport> Pool<T> {
         };
         conn.drive();
         let interest = conn.interest();
-        if interest != conn.interest {
+        if interest != conn.registered_interest {
             registry
                 .reregister(
                     &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
@@ -829,7 +835,7 @@ impl<T: Transport> Pool<T> {
                     interest,
                 )
                 .ok();
-            conn.interest = interest;
+            conn.registered_interest = interest;
         }
         conn.is_dead && conn.streams.is_empty()
     }

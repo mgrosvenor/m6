@@ -64,8 +64,8 @@ use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    make_tls_server_config, H2cAccept, H2cListener, Http11Listener, RequestOutcome,
-    H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
+    make_tls_server_config, H2cListener, Http11Listener, RequestOutcome, H2_IDLE_TIMEOUT_SECS,
+    INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::RouteTable;
@@ -171,7 +171,7 @@ struct SocketUpstreamEntry {
     member_idx: usize,
     backend_name: String,
     tx: Option<std::sync::mpsc::Sender<std::io::Result<forward::HttpResponse>>>,
-    interest: Interest,
+    registered_interest: Interest,
 }
 
 impl SocketUpstreamEntry {
@@ -181,7 +181,7 @@ impl SocketUpstreamEntry {
             member_idx: 0,
             backend_name: String::new(),
             tx: None,
-            interest: Interest::READABLE,
+            registered_interest: Interest::READABLE,
         }
     }
 }
@@ -845,43 +845,35 @@ fn accept_h2c(
     registry: &m6_core::mio::Registry,
     now: Instant,
 ) -> (bool, bool) {
-    let mut handled = 0;
     let mut full = false;
-    while handled < MAX_ACCEPTS_PER_WAKE {
+    let handled = h.accept_up_to(MAX_ACCEPTS_PER_WAKE, |h, mut conn| {
         if state.sources.is_full() {
             full = true;
-            break;
+            return false;
         }
-        match h.accept_one() {
-            H2cAccept::Admitted(mut conn) => {
-                handled += 1;
-                let Some(token) = take_token(state) else {
-                    full = true;
-                    break;
-                };
-                let Some(owner) = h.take_slot() else {
-                    state.sources.free(token.0);
-                    full = true;
-                    break;
-                };
-                conn.set_token(token);
-                conn.set_interest(Interest::READABLE);
-                if let Err(e) =
-                    registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
-                {
-                    warn!(error = %e, "h2c register");
-                    h.free_slot(owner.key);
-                    state.sources.free(token.0);
-                    continue;
-                }
-                state.h2_idle_timeouts.touch(token, now);
-                *state.sources.get_mut(token.0) = Source::H2cConn(owner.key);
-                *h.slot_mut(owner.key) = conn;
-            }
-            H2cAccept::Refused => handled += 1,
-            H2cAccept::WouldBlock => break,
+        let Some(token) = take_token(state) else {
+            full = true;
+            return false;
+        };
+        let Some(owner) = h.take_slot() else {
+            state.sources.free(token.0);
+            full = true;
+            return false;
+        };
+        conn.set_token(token);
+        conn.set_interest(Interest::READABLE);
+        if let Err(e) = registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
+        {
+            warn!(error = %e, "h2c register");
+            h.free_slot(owner.key);
+            state.sources.free(token.0);
+            return true;
         }
-    }
+        state.h2_idle_timeouts.touch(token, now);
+        *state.sources.get_mut(token.0) = Source::H2cConn(owner.key);
+        *h.slot_mut(owner.key) = conn;
+        true
+    });
     (full, !full && handled == MAX_ACCEPTS_PER_WAKE)
 }
 
@@ -938,6 +930,11 @@ fn drive_conn_token(
         state
             .stats
             .record_handshake(hs.elapsed_ns, Channel::new(v, state.tls_iface), hs.resumed);
+        // An h2 connection is idle-governed by `h2_idle_timeouts`, not the
+        // 30 s read deadline set at accept, so drop that deadline here.
+        if hs.is_h2 {
+            state.read_timeouts.clear(token);
+        }
     }
     if drive.restarted {
         state.read_timeouts.touch(token, now);
@@ -994,11 +991,11 @@ fn drive_socket_upstream_one(
             return;
         };
         let interest = upstream.interest();
-        if interest != entry.interest {
+        if interest != entry.registered_interest {
             registry
                 .reregister(&mut SourceFd(&upstream.raw_fd()), token, interest)
                 .ok();
-            entry.interest = interest;
+            entry.registered_interest = interest;
         }
         match upstream.drive() {
             Some(result) => {
@@ -1063,50 +1060,89 @@ fn expire_socket_upstream(
 }
 
 /// Ensure an h2c pool connection exists for `url`, registering a new one under
-/// its own token.
+/// its own token. A token is taken first, so a full table fails before any
+/// connection is created, and every failure frees what it took.
 fn ensure_h2c_conn(
     state: &mut ServerState,
     url: &str,
     registry: &m6_core::mio::Registry,
 ) -> std::io::Result<()> {
-    if !state.h2c_pool.ensure_connection(url)? {
-        return Ok(());
-    }
     let token =
         take_token(state).ok_or_else(|| std::io::Error::other("no token for h2c upstream"))?;
-    let conn = state.h2c_pool.connection_mut(url).expect("just created");
-    conn.set_token(token);
-    conn.set_interest(Interest::READABLE | Interest::WRITABLE);
-    registry.register(
-        &mut SourceFd(&conn.raw_fd()),
-        token,
-        Interest::READABLE | Interest::WRITABLE,
-    )?;
+    let created = match state.h2c_pool.ensure_connection(url) {
+        Ok(c) => c,
+        Err(e) => {
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            return Err(e);
+        }
+    };
+    if !created {
+        // The connection already existed and is registered under its own token.
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Ok(());
+    }
+    let registered = {
+        let conn = state.h2c_pool.connection_mut(url).expect("just created");
+        conn.set_token(token);
+        conn.set_interest(Interest::READABLE | Interest::WRITABLE);
+        registry.register(
+            &mut SourceFd(&conn.raw_fd()),
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        )
+    };
+    if let Err(e) = registered {
+        state.h2c_pool.remove_by_token(token, registry);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(e);
+    }
     *state.sources.get_mut(token.0) = Source::H2cUpstream;
     Ok(())
 }
 
 /// Ensure an h2s pool connection exists for `url`, registering a new one under
-/// its own token.
+/// its own token. A token is taken first, so a full table fails before any
+/// connection is created, and every failure frees what it took.
 fn ensure_h2s_conn(
     state: &mut ServerState,
     url: &str,
     tls: std::sync::Arc<rustls::ClientConfig>,
     registry: &m6_core::mio::Registry,
 ) -> std::io::Result<()> {
-    if !state.h2s_pool.ensure_connection(url, tls)? {
-        return Ok(());
-    }
     let token =
         take_token(state).ok_or_else(|| std::io::Error::other("no token for h2s upstream"))?;
-    let conn = state.h2s_pool.connection_mut(url).expect("just created");
-    conn.set_token(token);
-    conn.set_interest(Interest::READABLE | Interest::WRITABLE);
-    registry.register(
-        &mut SourceFd(&conn.raw_fd()),
-        token,
-        Interest::READABLE | Interest::WRITABLE,
-    )?;
+    let created = match state.h2s_pool.ensure_connection(url, tls) {
+        Ok(c) => c,
+        Err(e) => {
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            return Err(e);
+        }
+    };
+    if !created {
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Ok(());
+    }
+    let registered = {
+        let conn = state.h2s_pool.connection_mut(url).expect("just created");
+        conn.set_token(token);
+        conn.set_interest(Interest::READABLE | Interest::WRITABLE);
+        registry.register(
+            &mut SourceFd(&conn.raw_fd()),
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        )
+    };
+    if let Err(e) = registered {
+        state.h2s_pool.remove_by_token(token, registry);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(e);
+    }
     *state.sources.get_mut(token.0) = Source::H2sUpstream;
     Ok(())
 }
@@ -1228,12 +1264,23 @@ fn event_loop(
             .min(tick);
         poll_timeout = poll_timeout.min(quic_timeout);
         // Edge-triggered: a capped accept leaves connections in the kernel
-        // queue that the h2c listener will not be reported for again, so drain
-        // before waiting, without blocking.
-        if let Some(h) = h2c.as_ref() {
+        // queue that the h2c listener will not be reported for again. Drain
+        // before waiting, and do not block while more remain.
+        let mut h2c_full = false;
+        if let Some(h) = h2c.as_mut() {
             if h.accept_again() {
-                poll_timeout = std::time::Duration::ZERO;
+                let (full, again) =
+                    accept_h2c(h, state, poll.registry(), std::time::Instant::now());
+                h.set_accept_again(again);
+                if again {
+                    poll_timeout = std::time::Duration::ZERO;
+                }
+                h2c_full = full;
             }
+        }
+        if h2c_full && accepting {
+            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+            accepting = false;
         }
 
         match poll.poll(&mut events, Some(poll_timeout)) {
@@ -2527,7 +2574,7 @@ fn launch_socket_upstream(
         member_idx,
         backend_name: backend_name.to_string(),
         tx: Some(tx),
-        interest,
+        registered_interest: interest,
     };
     Ok(rx)
 }

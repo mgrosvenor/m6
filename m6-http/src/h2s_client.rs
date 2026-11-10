@@ -166,6 +166,10 @@ impl Transport for H2sTransport {
         }
         None
     }
+
+    fn wants_write(&self) -> bool {
+        self.tls_conn.wants_write()
+    }
 }
 
 /// Persistent non-blocking H2S (TLS) connection.
@@ -210,9 +214,6 @@ impl H2sTlsClientPool {
         Self(Pool::new())
     }
 
-    /// Dispatch a request to the named backend URL.
-    ///
-    /// `tls_config` must have ALPN `h2` — use `pool::build_h2_tls_client_config()`.
     /// Ensure a connection exists for `base_url`. Returns whether one was made.
     pub fn ensure_connection(
         &mut self,

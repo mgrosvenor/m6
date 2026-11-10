@@ -557,9 +557,7 @@ impl Http2Conn {
                             if e.kind() == io::ErrorKind::Other
                                 && e.to_string().contains("received plaintext buffer full") =>
                         {
-                            let before = self.recv_buf.len();
-                            Self::drain_tls_reader(tls, &mut self.recv_buf)?;
-                            if self.recv_buf.len() == before {
+                            if crate::http11::drain_tls_plaintext(tls, &mut self.recv_buf)? == 0 {
                                 break;
                             }
                             moved = true;
@@ -598,22 +596,6 @@ impl Http2Conn {
             }
         }
         Ok(moved)
-    }
-
-    /// Drain rustls's decoded plaintext into `recv_buf`.
-    fn drain_tls_reader(
-        tls: &mut rustls::ServerConnection,
-        recv_buf: &mut Vec<u8>,
-    ) -> io::Result<()> {
-        let mut tmp = [0u8; 8192];
-        loop {
-            match tls.reader().read(&mut tmp) {
-                Ok(0) => return Ok(()),
-                Ok(n) => recv_buf.extend_from_slice(&tmp[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
     }
 
     fn flush_io(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
