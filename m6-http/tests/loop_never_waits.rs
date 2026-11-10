@@ -599,6 +599,21 @@ fn await_slow_seen(rx: &mpsc::Receiver<()>, deadline: Instant) -> bool {
     }
 }
 
+/// Wait until `needle` appears in the service's captured log, so a test can
+/// synchronise on a server-observable event rather than sleep for a fixed time.
+fn wait_for_log(service: &Service, needle: &str, deadline: Instant) {
+    while Instant::now() < deadline {
+        if service.output().contains(needle) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!(
+        "no \"{needle}\" in the log within the deadline\n--- m6-http ---\n{}",
+        service.output()
+    );
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// Run the "a held backend does not delay a cache hit" scenario with one GET
@@ -1309,17 +1324,22 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     listener.set_nonblocking(true).expect("nonblocking");
     let (slow_seen_tx, slow_seen_rx) = mpsc::channel();
     let (slow2_seen_tx, slow2_seen_rx) = mpsc::channel();
-    let release = Arc::new(AtomicBool::new(false));
+    // Two releases, so the stale /slow reply can be forced to arrive while
+    // /slow2 is still held, making the misdelivery (and its guard) observable.
+    let release_slow = Arc::new(AtomicBool::new(false));
+    let release_slow2 = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let backend = std::thread::spawn({
         let stop = Arc::clone(&stop);
-        let release = Arc::clone(&release);
+        let release_slow = Arc::clone(&release_slow);
+        let release_slow2 = Arc::clone(&release_slow2);
         move || {
             while !stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let stop = Arc::clone(&stop);
-                        let release = Arc::clone(&release);
+                        let release_slow = Arc::clone(&release_slow);
+                        let release_slow2 = Arc::clone(&release_slow2);
                         let slow_seen_tx = slow_seen_tx.clone();
                         let slow2_seen_tx = slow2_seen_tx.clone();
                         std::thread::spawn(move || {
@@ -1335,10 +1355,10 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
                                 }
                             }
                             let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
-                            let (seen_tx, body) = if head.starts_with("get /slow2") {
-                                (&slow2_seen_tx, SECOND_BODY)
+                            let (seen_tx, body, release) = if head.starts_with("get /slow2") {
+                                (&slow2_seen_tx, SECOND_BODY, &release_slow2)
                             } else {
-                                (&slow_seen_tx, SLOW_BODY)
+                                (&slow_seen_tx, SLOW_BODY, &release_slow)
                             };
                             let _ = seen_tx.send(());
                             while !release.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
@@ -1369,7 +1389,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
              [server]\nbackend_timeout_secs = 30\nmax_requests_per_connection = 10000\n\n\
-             [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+             [log]\nlevel = \"trace\"\nformat = \"text\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
              [[backend]]\nname = \"app\"\nsockets = \"{}\"\n\n\
@@ -1423,6 +1443,15 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         // `a` drops: the client closes with its /slow still in flight.
     }
 
+    // Wait until the loop has reaped A (its h2 EOF is observed at trace level),
+    // so the freed token is handed back out and client B deterministically
+    // reuses it.
+    wait_for_log(
+        &service,
+        "h2 fill_recv",
+        Instant::now() + Duration::from_secs(5),
+    );
+
     // Client B, on the reused token, dispatches /slow2 (also held).
     let cfg = probe::tls_config(b"h2");
     let mut b = H2sTlsClientConn::connect("127.0.0.1", port, cfg).expect("client B");
@@ -1437,9 +1466,33 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         service.output()
     );
 
-    // Release both; client A's stale reply must be dropped and client B must
-    // get its own /slow2 body, never A's /slow body.
-    release.store(true, Ordering::SeqCst);
+    // Release A's stale /slow first. Its reply must be dropped, so B receives
+    // nothing yet; a SLOW_BODY here means the stale waiter was delivered.
+    release_slow.store(true, Ordering::SeqCst);
+    let stale_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        b.drive();
+        if let Some(c) = b
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == sid)
+        {
+            let r = c.result.expect("client B's response");
+            assert_eq!(
+                String::from_utf8_lossy(&r.body),
+                SECOND_BODY,
+                "client B received a stale reply before /slow2 was released\n--- m6-http ---\n{}",
+                service.output()
+            );
+        }
+        if Instant::now() >= stale_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Now release B's own /slow2 and collect its reply.
+    release_slow2.store(true, Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         b.drive();
