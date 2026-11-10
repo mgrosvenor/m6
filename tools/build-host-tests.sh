@@ -439,37 +439,9 @@ grep -E '^test result:' $T/eg-tests.log || true
 sed -n '/^failures:/,$p' $T/eg-tests.log | head -40
 
 echo "### development certificates"
-# A fresh checkout has no keys/: they are gitignored, and each example's dev.sh
-# generates them. The config parse below validates that tls_cert exists, so
-# without this every example is rejected for a missing file. This passed here only
-# because rsync carried the developer's own untracked keys.
-for d in examples/*/; do
-    [ -f "$d/dev.sh" ] || continue
-    mkdir -p "$d/keys"
-    if [ ! -f "$d/keys/dev.pem" ]; then
-        openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-            -keyout "$d/keys/dev-key.pem" -out "$d/keys/dev.pem" \
-            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-    fi
-    # Five examples need an auth signing keypair too; their setup.sh makes it.
-    if [ ! -f "$d/keys/auth.pub" ]; then
-        # PKCS#8 (`genpkey`), not SEC1 (`ecparam -genkey`). m6-auth-server
-        # refuses SEC1 with "invalid private key (tried EC and RSA):
-        # InvalidKeyFormat" and exits, and pre-creating one here made dev.sh
-        # skip generating a good one — 33 of 98 checks failed with 502s
-        # because the auth server was never up.
-        # `ec_param_enc:named_curve` too. It is the default for OpenSSL, so it
-        # changes nothing here, but LibreSSL -- which is what macOS ships as
-        # /usr/bin/openssl -- writes explicit curve parameters instead of the
-        # prime256v1 OID, and the token signer refuses those with "JWT encode
-        # error: InvalidEcdsaKey" at every login. Stated here so the two sides
-        # of the check generate the same key.
-        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$d/keys/auth.pem" 2>/dev/null
-        openssl pkey -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
-        chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
-    fi
-done
-mkdir -p examples/09-global-deployment/certs
+# A fresh checkout has no keys: examples/dev-keys.sh writes them to /tmp/m6/dev,
+# which the config parse below needs.
+examples/dev-keys.sh
 echo "certificates present"
 
 echo "### every example's config parses"
@@ -491,12 +463,12 @@ for d in examples/*/; do
             printf '  %-24s not parsed: systemd units only, it has no site config\n' "$name"
             continue ;;
         09-global-deployment)
-            # Its configs name /etc/letsencrypt paths for five real cache nodes,
-            # so m6-http rejects them here for a missing certificate rather than
-            # for anything wrong with the config. Its own integration test in
+            # It holds one system config per node and one site config per role,
+            # so it has no single configs/system-dev.toml for this loop to parse.
+            # Its own integration test in
             # examples/09-global-deployment/integration-test covers it instead,
             # and that test ran above.
-            printf '  %-24s not parsed: production configs name letsencrypt paths; its integration test covers it\n' "$name"
+            printf '  %-24s not parsed: per-node configs, no single system-dev.toml; its integration test covers it\n' "$name"
             continue ;;
     esac
     sys="$d/configs/system-dev.toml"

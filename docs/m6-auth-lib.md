@@ -442,7 +442,7 @@ auth_db = "/srv/example.com/data/auth.db"
 ```
 
 The key is absolute because a per-thread initialiser receives no site directory to resolve a relative path against.
-`m6-auth-server` and `m6-auth-cli` resolve a relative `[storage] path` against the configuration file's directory, so the renderer has to name the same file the server opened.
+`m6-auth-server` and `m6-auth-cli` take only an absolute `[storage] path`, so the renderer names the same file, and `m6_core::config::secret_path("auth_db", ...)` gives it the same check.
 `m6-app-anatomy.md` section 5.3 gives the two state tiers and what each initialiser receives.
 
 `m6-auth-server` uses the per-worker shape too: `App::with_state` gives each worker thread its own `Db`, opened on the thread's first request.

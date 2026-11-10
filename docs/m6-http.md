@@ -158,10 +158,10 @@ A refusal never reaches routing or the cache, so a catch-all route can never ans
 
 | Key | Where | Meaning |
 |---|---|---|
-| `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. A relative path in the system config resolves against the site directory |
+| `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. An absolute path |
 | `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. A token with the claim is required, from the Authorization header or the session cookie, as route `require` reads it |
 | `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
-| `[health] metrics_token_file` | either file, system config wins | Legacy bearer string. A relative path in the system config resolves against the site directory. Ignored when `metrics_require` is set |
+| `[health] metrics_token_file` | either file, system config wins | Legacy bearer string. An absolute path. Ignored when `metrics_require` is set |
 
 *Table 1: the keys that decide who reads `/perf` and `/traffic`. With none of them set, only the legacy file gate applies.*
 
@@ -217,12 +217,14 @@ m6-http supports HTTP/2 without TLS on a separate port, intended for use over a 
 ```toml
 [server]
 bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
+tls_cert = "/run/credentials/m6-http.service/tls-cert.pem"
+tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 h2c_bind = "127.0.0.1:8080"   # plain-TCP HTTP/2 on this address
 internal_binds = ["127.0.0.1:8080"]
 internal_peers = ["127.0.0.1"]   # the only peers it accepts
 ```
+
+The unit's `LoadCredential` lines deliver the two files, as `m6-user-guide.md` section 7.2 sets out.
 
 The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directly (no TLS record layer). The request is then routed and handled identically to a TLS request.
 

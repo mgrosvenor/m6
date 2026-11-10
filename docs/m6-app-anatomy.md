@@ -170,7 +170,7 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `[log]` | core | `level`, default `info`. `format`, default `json` |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |
-| `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash |
+| `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash. An absolute path, and a relative one is exit 2 |
 | `flash_secret` | core, feature `flash` | the HMAC key for flash cookies. Absent with the feature on is exit 2 |
 | `site_toml` | core | the path of `site.toml`. Absolute as given, relative to `site_dir`, default `<site_dir>/site.toml`. A named file that does not exist, cannot be read or is not valid TOML is exit 2 |
 | `[errors]` | `m6-http`, in `site.toml` | reserved, so it does not reach the request dictionary. The section itself belongs to `site.toml` |
@@ -366,7 +366,7 @@ The signal line is written before the shutdown flag is published, because the fl
 A connection is served until the peer closes it or 100 requests have gone by, and the read deadline from `[server] read_timeout_s` is applied at accept time, so a silent peer holds a worker for exactly that long.
 A full queue answers 503 immediately, which is how backpressure reaches the edge.
 
-The systemd unit has to supply four things: the two positional arguments, the user and group the socket directory is owned by, `RuntimeDirectory=m6` with `RuntimeDirectoryMode=0750`, and `ReadWritePaths` naming what this service actually writes.
+The systemd unit has to supply four things: the two positional arguments, the user and group the socket directory is owned by, `RuntimeDirectory=m6` with `RuntimeDirectoryMode=0750`, and `ReadWritePaths` naming what this service actually writes. It also supplies `LoadCredential` for each secret and `StateDirectory` for a database, as `m6-user-guide.md` section 7.2 sets out.
 `m6-user-guide.md`, "Example 06, production with systemd", carries a complete unit per service and this document does not repeat them.
 
 **`ReadWritePaths` must name only paths that exist.**

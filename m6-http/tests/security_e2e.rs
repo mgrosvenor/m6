@@ -513,10 +513,11 @@ name = "test-node"
 
 [auth]
 backend    = "m6-file"
-public_key = "auth-public.pem"
+public_key = "{pubkey}"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
+            pubkey = site.join("auth-public.pem").display(),
         ),
     )
     .unwrap();

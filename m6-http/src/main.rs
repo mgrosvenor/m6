@@ -4682,7 +4682,7 @@ fn run(args: Vec<String>) -> i32 {
 
     // Load public key if auth declared
     let public_key = if let Some(ref auth_cfg) = config.auth {
-        let key_path = config::resolve_path(&config.site_dir, &auth_cfg.public_key);
+        let key_path = PathBuf::from(&auth_cfg.public_key);
         match PublicKey::from_pem_file(&key_path) {
             Ok(k) => Some(k),
             Err(e) => {

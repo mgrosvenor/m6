@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{self, Service};
 
@@ -141,9 +141,11 @@ fn a_key_outside_the_allowed_tables_exits_2_and_names_it() {
         &system,
         format!(
             "[node]\nname = \"startup-errors\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n\n\
              [frobnicate]\nsetting = \"value\"\n",
-            claim.addr()
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -170,8 +172,10 @@ fn a_misplaced_key_exits_2_and_names_it() {
         site.join("site.toml"),
         format!(
             "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("site.toml");
@@ -180,8 +184,10 @@ fn a_misplaced_key_exits_2_and_names_it() {
         &system,
         format!(
             "[node]\nname = \"startup-errors\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -210,8 +216,10 @@ fn a_missing_node_exits_2() {
     std::fs::write(
         &system,
         format!(
-            "[server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+            "[server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -243,8 +251,10 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
         &system,
         format!(
             "[node]\nname = \"startup-errors\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -284,8 +294,10 @@ fn dump_config_refuses_routes_that_can_match_one_path() {
         &system,
         format!(
             "[node]\nname = \"startup-errors\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -325,8 +337,10 @@ fn dump_config_prints_the_merged_server_from_the_system_file_and_exits_0() {
         &system,
         format!(
             "[node]\nname = \"startup-errors\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -372,8 +386,10 @@ fn a_pool_whose_glob_matches_no_socket_exits_2() {
         &system,
         format!(
             "[node]\nname = \"startup-errors\"\n\n\
-             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
-            claim.addr()
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
         ),
     )
     .expect("system config");
@@ -388,5 +404,50 @@ fn a_pool_whose_glob_matches_no_socket_exits_2() {
     assert!(
         err.contains("[[backend]] b:"),
         "the error must name the backend, got: {err}"
+    );
+}
+
+/// A relative `[server] tls_key` is refused at start and names the setting,
+/// even though the key file is present in the site directory.
+#[test]
+fn a_relative_tls_key_exits_2_and_names_the_setting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(site.join("site.toml"), site_toml()).expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"key.pem\"\n",
+            site.display()
+        ),
+    )
+    .expect("system config");
+
+    let mut cmd = Command::new(testkit::binary("m6-http"));
+    cmd.arg(&site).arg(&system);
+    let mut svc = Service::spawn("m6-http", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-http did not exit for a relative [server] tls_key\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        svc.output().contains("[server] tls_key"),
+        "the error did not name [server] tls_key\n--- output ---\n{}",
+        svc.output()
     );
 }

@@ -74,8 +74,10 @@ Each config already names paths relative to its own app's root:
 ```toml
 # m6-file.conf        root = "assets/"
 # m6-html.conf        template = "templates/page.html"
-# render-contact.conf secrets_file = "keys/relay-secrets.toml"
+# render-contact.conf secrets_file = "/etc/m6/relay-secrets.toml"
 ```
+
+`secrets_file` is the exception, an absolute path, because m6 reads no secret from a site tree.
 
 That is the test for whether the boundary is in the right place.
 If splitting the roots forces you to rewrite paths, those paths were encoding the shared root rather than the app's own.
