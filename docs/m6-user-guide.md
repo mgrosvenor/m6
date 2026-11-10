@@ -1632,19 +1632,7 @@ openssl pkey -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
 chmod 600   /etc/m6/auth.pem
 chmod 600   /etc/m6/auth.pub
 
-cat > /etc/m6/m6-auth.conf << 'CONF'
-[storage]
-path = "/var/lib/m6-auth/auth.db"
-
-[tokens]
-issuer = "example.com"
-
-[keys]
-private_key = "/run/credentials/m6-auth.service/auth.pem"
-public_key  = "/run/credentials/m6-auth.service/auth.pub"
-CONF
-chown root:m6 /etc/m6/m6-auth.conf
-chmod 640 /etc/m6/m6-auth.conf
+Write `/etc/m6/m6-auth.conf` as section 7.1 shows it.
 
 cat > /etc/m6/my-blog.toml << 'TOML'
 [server]
