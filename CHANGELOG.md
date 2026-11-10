@@ -99,6 +99,8 @@ A client that makes more requests than this on one connection reconnects, with a
 
 ### Security
 
+**SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected; no configuration changes.
+
 **HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
 Only the compressed header block was bounded, at 256 KiB, and HPACK lets one byte stand for a table entry of up to 4096 bytes, so a block under that cap could decode to a far larger header list.
 The list is now counted as RFC 9113 6.5.2 defines it while it is decoded, and a field is kept only while the list is within the limit, so a request keeps at most 64 KiB of header fields, as RFC 9113 6.5.2 counts them, however far its block would decode. It is answered 431 and RST_STREAM on its own stream after it is decoded in full, so the HPACK table stays in step and other streams are unaffected.
@@ -196,6 +198,8 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**The minimum supported Rust version is 1.89** (was 1.88), the version the updated SQLite binding requires.
 
 **m6-http drives only the connections that have events, accepts only when a client is waiting, and resumes a blocked write when the socket can take more.** Every HTTP/1.1 connection shared the listener's token, so any event drove every connection and tried a failing accept, and a response that filled the socket buffer waited for the next unrelated wake-up. Each descriptor now has its own token, each turn reads and writes until the socket would block, a connection with unsent bytes asks for write readiness, and idle and read timeouts are deadlines rather than checks on every pass. On the build host this removed one failing accept4 per loop pass and one or two recvfrom calls per request.
 
