@@ -314,10 +314,6 @@ impl Drop for Stack {
 
 impl Stack {
     fn start(lang: &str) -> Option<Stack> {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-
         if !available(lang) {
             let msg = format!("{lang}: {} is not installed", toolchain_for(lang));
             assert!(
@@ -341,6 +337,22 @@ impl Stack {
             .prefix("m6px-")
             .tempdir_in(m6_core::testkit::exec_scratch_root())
             .unwrap();
+        Self::start_in(lang, tmp, false, &mut None)
+    }
+
+    /// The spawn+guard path, given the scratch dir. `broken_tls_key` writes a
+    /// system.toml naming a missing TLS key so the edge exits before binding.
+    /// `backend_pid` receives the spawned backend's pid before the edge is
+    /// spawned, so a caller can assert the guard reaped it on a failed start.
+    fn start_in(
+        lang: &str,
+        tmp: tempfile::TempDir,
+        broken_tls_key: bool,
+        backend_pid: &mut Option<u32>,
+    ) -> Option<Stack> {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let base = tmp.path();
 
         // The socket goes under /tmp with a short name, NOT in the temp dir:
@@ -414,12 +426,17 @@ backend = "example"
         .unwrap();
 
         let sys = base.join("system.toml");
+        let tls_key_arg = if broken_tls_key {
+            "missing-key.pem".to_string()
+        } else {
+            key_f.display().to_string()
+        };
         std::fs::write(
             &sys,
             format!(
                 "[node]\nname = \"edge\"\n\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
                 cert_f.display(),
-                key_f.display()
+                tls_key_arg
             ),
         )
         .unwrap();
@@ -436,6 +453,7 @@ backend = "example"
                     .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
             ),
         };
+        *backend_pid = backend.child.as_ref().map(|c| c.id());
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -677,22 +695,17 @@ fn a_non_compressing_backend_gets_no_vary_accept_encoding() {
 
 #[test]
 fn a_failed_start_leaves_no_backend_process_behind() {
-    // The backend is owned by `BackendGuard` from the moment it is spawned, so
-    // a panic anywhere after the spawn reaps it. Simulate the edge-fails path
-    // and assert the child is gone.
-    let child = Command::new("sleep")
-        .arg("30")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    let backend = BackendGuard { child: Some(child) };
+    // The sandbox denies the exec scratch root /var/tmp, so build the stack in
+    // a writable temp dir and go through start_in's real spawn+guard path: the
+    // real backend is spawned, then the edge is made to exit before binding by
+    // naming a missing TLS key, and the guard must reap the backend.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut backend_pid = None;
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _backend = backend;
-        panic!("the edge failed to start");
+        let _ = Stack::start_in("rust-plain", tmp, true, &mut backend_pid);
     }));
-    assert!(failed.is_err(), "the panic should have unwound");
+    assert!(failed.is_err(), "the edge should fail to start");
+    let pid = backend_pid.expect("the backend was spawned before the edge failed");
     let alive = Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -701,7 +714,7 @@ fn a_failed_start_leaves_no_backend_process_behind() {
         .unwrap_or(false);
     assert!(
         !alive,
-        "the backend process should have been reaped after the failed start"
+        "the backend process should have been reaped after the failed edge start"
     );
 }
 
