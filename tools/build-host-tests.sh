@@ -463,12 +463,12 @@ for d in examples/*/; do
             printf '  %-24s not parsed: systemd units only, it has no site config\n' "$name"
             continue ;;
         09-global-deployment)
-            # Its configs name /etc/letsencrypt paths for five real cache nodes,
-            # so m6-http rejects them here for a missing certificate rather than
-            # for anything wrong with the config. Its own integration test in
+            # It holds one system config per node and one site config per role,
+            # so it has no single configs/system-dev.toml for this loop to parse.
+            # Its own integration test in
             # examples/09-global-deployment/integration-test covers it instead,
             # and that test ran above.
-            printf '  %-24s not parsed: production configs name letsencrypt paths; its integration test covers it\n' "$name"
+            printf '  %-24s not parsed: per-node configs, no single system-dev.toml; its integration test covers it\n' "$name"
             continue ;;
     esac
     sys="$d/configs/system-dev.toml"

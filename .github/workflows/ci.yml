@@ -135,6 +135,11 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # A unit that declares RuntimeDirectory without RuntimeDirectoryPreserve=yes
+      # deletes /run/m6 on stop and takes every other service's socket with it.
+      - name: Unit files preserve the shared runtime directory
+        run: python3 tools/check-units.py
+
       # Zero warnings, release and test builds, pre-existing included. This is
       # a standing rule and it is checked on Linux because that is where it
       # runs: three defects have only ever shown up there.
@@ -405,11 +410,10 @@ jobs:
       # config with the real binary is a second of work and catches that outright.
       #
       # Every example is accounted for. 06-systemd is systemd units with no site
-      # config, and 09-global-deployment's configs name /etc/letsencrypt paths for
-      # five real cache nodes, so m6-http would reject them here for a missing
-      # certificate rather than for anything wrong with them; its own integration
-      # test covers it and ran above. An example with neither a config nor a
-      # reason recorded here fails the job.
+      # config, and 09-global-deployment holds one system config per node and one
+      # site config per role, so it has no single configs/system-dev.toml for this
+      # loop to parse; its own integration test covers it and ran above. An
+      # example with neither a config nor a reason recorded here fails the job.
       # A FRESH CHECKOUT HAS NO CERTIFICATES, and the config parse needs them:
       # m6-http validates that tls_cert exists. The development keys live in
       # /tmp/m6/dev, written by examples/dev-keys.sh, which the config parse
@@ -431,7 +435,7 @@ jobs:
             case "$name" in
               data) continue ;;
               06-systemd) echo "  $name  not parsed: systemd units only, no site config"; continue ;;
-              09-global-deployment) echo "  $name  not parsed: configs name letsencrypt paths; its integration test covers it"; continue ;;
+              09-global-deployment) echo "  $name  not parsed: per-node configs, no single system-dev.toml; its integration test covers it"; continue ;;
             esac
             sys="$d/configs/system-dev.toml"
             [ -f "$sys" ] || sys="$d/site.toml"
