@@ -443,14 +443,15 @@ impl Ptr {
     }
 }
 
-/// Letters, digits, `-`, `_` and `.`, at most 253 characters: the shape of a
-/// host name as a resolver returns it, with or without the trailing dot.
+/// Letters, digits, `-`, `_` and `.`, at most 253 characters once the trailing
+/// dot a resolver may return is removed: the shape of a host name.
 ///
 /// `pub(crate)` because `resolve.rs`'s worker thread applies the same check
 /// until EL-9 removes that path.
 pub(crate) fn is_host_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
     !name.is_empty()
-        && name.len() <= 254
+        && name.len() <= 253
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -974,5 +975,16 @@ mod tests {
     fn an_empty_domain_never_verifies() {
         assert!(!Ptr::Name("anything.example.com".into()).verifies(""));
         assert!(!Ptr::Name("anything.example.com".into()).verifies("."));
+    }
+
+    /// The length limit is a host name without the trailing dot: 253 bytes
+    /// pass and 254 do not, with or without the dot a resolver may append.
+    #[test]
+    fn a_host_name_is_at_most_253_characters_without_the_trailing_dot() {
+        let longest = "a".repeat(253);
+        assert!(is_host_name(&longest));
+        assert!(is_host_name(&format!("{longest}.")));
+        assert!(!is_host_name(&format!("{longest}b")));
+        assert!(!is_host_name(&format!("{longest}b.")));
     }
 }
