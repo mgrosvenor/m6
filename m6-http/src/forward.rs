@@ -3,7 +3,10 @@
 /// `client::Upstream`.
 use std::io::{self, Read};
 
-use m6_core::client::{MAX_BODY, MAX_INFORMATIONAL};
+pub use m6_core::client::too_many_informational;
+use m6_core::client::{
+    is_skipped_informational, parse_framing, Framing, MAX_BODY, MAX_INFORMATIONAL,
+};
 use m6_core::mio::Token;
 
 /// Hop-by-hop headers to remove before forwarding.
@@ -281,6 +284,28 @@ impl HttpResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
         m6_core::headers::get(&self.headers[..], name)
     }
+
+    /// Copy a borrowed [`m6_core::client::Reply`] into the owned form the cache
+    /// insert and error mode need. This is the miss path's only per-request
+    /// allocation.
+    pub fn from_reply(reply: &m6_core::client::Reply<'_>) -> HttpResponse {
+        let headers = reply
+            .headers
+            .iter()
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    String::from_utf8_lossy(h.value).into_owned(),
+                )
+            })
+            .collect();
+        HttpResponse {
+            status: reply.status,
+            reason: String::new(),
+            headers,
+            body: reply.body.to_vec(),
+        }
+    }
 }
 
 /// Can this field value be written into HTTP/1.1 syntax without changing the
@@ -515,12 +540,6 @@ pub fn encode_request(
     Ok(())
 }
 
-/// Whether a response status is informational and to be skipped: a 1xx other
-/// than 101, which is final for the exchange.
-fn is_skipped_informational(status: u16) -> bool {
-    (100..200).contains(&status) && status != 101
-}
-
 /// What a decoded HTTP/2 response header block turned out to be.
 pub enum ResponseBlock {
     /// The final response, or trailers. Its fields are now in the response.
@@ -568,30 +587,6 @@ pub fn apply_response_block(
     ResponseBlock::Final
 }
 
-/// The error for a backend that sent too many informational responses.
-pub fn too_many_informational() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "backend sent more than {MAX_INFORMATIONAL} informational responses \
-             without a final one"
-        ),
-    )
-}
-
-/// A response body's framing, decided once from its header section.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Framing {
-    /// No body: a HEAD request, or status 101, 204 or 304.
-    Bodyless,
-    /// `Content-Length: N`.
-    ContentLength(usize),
-    /// `Transfer-Encoding: chunked`.
-    Chunked,
-    /// No framing: read to end of stream.
-    CloseDelimited,
-}
-
 /// A parsed header section and its body framing.
 struct ParsedHead {
     headers: Vec<(String, String)>,
@@ -599,18 +594,14 @@ struct ParsedHead {
 }
 
 /// Parse a complete header section (status line already consumed) and decide
-/// the body framing. Enforces the same rules `read_response_for` has always
-/// enforced, in one place, so the incremental `client::Upstream` reader and the
-/// blocking reader cannot disagree about where a response ends.
-fn parse_head(head: &str, status: u16, method: &str) -> io::Result<ParsedHead> {
+/// the body framing. The framing rules live in [`m6_core::client::parse_framing`],
+/// so this reader and the incremental `client::Upstream` reader cannot disagree
+/// about where a response ends.
+fn parse_head(head: &str, status: u16, method: &str, http10: bool) -> io::Result<ParsedHead> {
     let after_status_line = head.split_once("\r\n").map_or("", |(_, rest)| rest);
     let lines = after_status_line.split("\r\n");
 
     let mut headers: Vec<(String, String)> = Vec::with_capacity(16);
-    let mut content_length: Option<usize> = None;
-    let mut te_present = false;
-    let mut chunked = false;
-
     for line in lines {
         if line.is_empty() {
             break;
@@ -618,89 +609,18 @@ fn parse_head(head: &str, status: u16, method: &str) -> io::Result<ParsedHead> {
         if let Some(colon) = line.find(':') {
             let name = line[..colon].trim();
             let value = line[colon + 1..].trim();
-            if name.eq_ignore_ascii_case("content-length") {
-                // A single field may itself carry a comma-separated list, and
-                // the field may repeat. Every value present must agree; if any
-                // differ the framing is ambiguous and the message is refused
-                // rather than resolved by position (F028).
-                for part in value.split(',') {
-                    let part = part.trim();
-                    // `1*DIGIT` (RFC 9110 8.6), checked explicitly rather than
-                    // left to `str::parse`, which accepts a leading `+` -- so
-                    // `Content-Length: +5` was quietly read as 5.
-                    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("backend sent an invalid Content-Length: {part:?}"),
-                        ));
-                    }
-                    let parsed: usize = part.parse().map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("backend sent an out-of-range Content-Length: {part:?}"),
-                        )
-                    })?;
-                    match content_length {
-                        Some(prev) if prev != parsed => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "backend sent conflicting Content-Length values \
-                                     ({prev} and {parsed}); refusing to guess the framing"
-                                ),
-                            ));
-                        }
-                        _ => content_length = Some(parsed),
-                    }
-                }
-            }
-            if name.eq_ignore_ascii_case("transfer-encoding") {
-                te_present = true;
-                // A list; only the FINAL coding decides the framing
-                // (RFC 9112 6.1). `gzip, chunked` is chunked.
-                if let Some(last) = value.split(',').next_back() {
-                    if last.trim().eq_ignore_ascii_case("chunked") {
-                        chunked = true;
-                    }
-                }
-            }
             headers.push((name.to_owned(), value.to_owned()));
         }
     }
 
-    // Both present: RFC 9112 6.1 forbids sending them together, and a
-    // recipient that picks one is the classic smuggling primitive (F029).
-    if te_present && content_length.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backend sent both Transfer-Encoding and Content-Length; refusing to guess the framing",
-        ));
-    }
-
-    // Transfer-Encoding present but not ending in `chunked`: the message has no
-    // self-delimiting framing at all (RFC 9112 6.1).
-    if te_present && !chunked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "backend sent a Transfer-Encoding not ending in chunked; response is unframed",
-        ));
-    }
-
-    // RFC 9112 6.3 rule 1: these responses never have a body, whatever their
-    // headers claim. Checked before any body read, so a HEAD does not block
-    // waiting for bytes a correct backend will never send (F035).
-    let bodyless =
-        method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || status == 101;
-
-    let framing = if bodyless {
-        Framing::Bodyless
-    } else if chunked {
-        Framing::Chunked
-    } else if let Some(len) = content_length {
-        Framing::ContentLength(len)
-    } else {
-        Framing::CloseDelimited
-    };
+    let mut reusable = false;
+    let framing = parse_framing(
+        after_status_line.as_bytes(),
+        status,
+        method.eq_ignore_ascii_case("HEAD"),
+        http10,
+        &mut reusable,
+    )?;
 
     Ok(ParsedHead { headers, framing })
 }
@@ -747,7 +667,7 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
     //
     // Bytes read past an informational head belong to the next head, so they
     // are moved to the front of the buffer rather than discarded.
-    let (header_end, status, reason) = loop {
+    let (header_end, status, reason, http10) = loop {
         let header_end = loop {
             if let Some(pos) = find_header_end(&header_buf[..n_total]) {
                 break pos;
@@ -778,7 +698,7 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
         let status_line = std::str::from_utf8(&head[..line_end]).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
         })?;
-        let (status, reason) = parse_status_line(status_line)?;
+        let (status, reason, http10) = parse_status_line(status_line)?;
 
         if is_skipped_informational(status) {
             informational += 1;
@@ -790,12 +710,12 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
             n_total -= consumed;
             continue;
         }
-        break (header_end, status, reason);
+        break (header_end, status, reason, http10);
     };
 
     let header_section = std::str::from_utf8(&header_buf[..header_end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8"))?;
-    let parsed = parse_head(header_section, status, request_method)?;
+    let parsed = parse_head(header_section, status, request_method, http10)?;
 
     if parsed.framing == Framing::Bodyless {
         return Ok(HttpResponse {
@@ -862,16 +782,16 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Parse the status line `HTTP/x.y NNN Reason` into (status_code, reason).
-fn parse_status_line(line: &str) -> io::Result<(u16, String)> {
+fn parse_status_line(line: &str) -> io::Result<(u16, String, bool)> {
     let mut parts = line.splitn(3, ' ');
-    // Skip the version token
-    parts.next();
+    let version = parts.next().unwrap_or("");
+    let http10 = version.eq_ignore_ascii_case("HTTP/1.0");
     let status: u16 = parts
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad or missing status code"))?;
     let reason = parts.next().unwrap_or("").to_owned();
-    Ok((status, reason))
+    Ok((status, reason, http10))
 }
 
 /// Decode a chunked body (RFC 9112 7.1).
@@ -1947,5 +1867,58 @@ mod forwarded_trust_tests {
         ];
         strip_untrusted_inbound(&mut headers);
         assert_eq!(headers, vec![("Accept".to_string(), "*/*".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod read_response_tests {
+    use super::*;
+
+    fn chunked(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}").into_bytes()
+    }
+
+    /// The blocking reader's chunked decoder must agree with the incremental
+    /// one, so the URL-backend path (until EL-5b) stays exercised.
+    #[test]
+    fn well_formed_chunked_bodies_decode() {
+        for (body, want) in [
+            ("5\r\nhello\r\n0\r\n\r\n", "hello"),
+            ("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world"),
+            ("0\r\n\r\n", ""),
+            ("5;foo=bar\r\nhello\r\n0\r\n\r\n", "hello"),
+            ("5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n", "hello"),
+        ] {
+            let r = read_response_for(&chunked(body)[..], "GET")
+                .unwrap_or_else(|e| panic!("{body:?} should decode: {e}"));
+            assert_eq!(String::from_utf8_lossy(&r.body), want, "for {body:?}");
+        }
+    }
+
+    #[test]
+    fn missing_crlf_after_chunk_data_is_refused() {
+        let err = read_response_for(&chunked("5\r\nhelloXX0\r\n\r\n")[..], "GET").unwrap_err();
+        assert!(
+            err.to_string().contains("not terminated by CRLF"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn short_chunk_data_is_refused() {
+        let err = read_response_for(&chunked("10\r\nhello\r\n0\r\n\r\n")[..], "GET").unwrap_err();
+        assert!(
+            err.to_string().contains("shorter than declared"),
+            "got: {err}"
+        );
+    }
+
+    /// A declared Content-Length above the cap is refused, the same rule the
+    /// incremental reader enforces.
+    #[test]
+    fn a_content_length_above_the_cap_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4000000000\r\n\r\n";
+        let err = read_response_for(&raw[..], "GET").unwrap_err();
+        assert!(err.to_string().contains("above the"), "got: {err}");
     }
 }

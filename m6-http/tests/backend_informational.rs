@@ -40,26 +40,6 @@ fn backend(sock: &Path, informational: usize) -> std::thread::JoinHandle<()> {
     })
 }
 
-/// Copy a borrowed reply into the owned form `forward::HttpResponse` carries.
-fn response_from_reply(reply: &m6_core::client::Reply<'_>) -> forward::HttpResponse {
-    let headers = reply
-        .headers
-        .iter()
-        .map(|h| {
-            (
-                h.name.to_string(),
-                String::from_utf8_lossy(h.value).into_owned(),
-            )
-        })
-        .collect();
-    forward::HttpResponse {
-        status: reply.status,
-        reason: String::new(),
-        headers,
-        body: reply.body.to_vec(),
-    }
-}
-
 /// Drive one request over a Unix socket until it completes, blocking with a
 /// `mio::Poll` (tests may block).
 fn drive_upstream(
@@ -97,9 +77,11 @@ fn drive_upstream(
                 registered = interest;
             }
             if up.drive()? {
-                let mut slots = [httparse::EMPTY_HEADER; 64];
+                let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
+                    m6_core::client::MAX_HEADERS] =
+                    [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
                 let reply = up.reply(&mut slots).expect("reply after complete drive");
-                return Ok(response_from_reply(&reply));
+                return Ok(forward::HttpResponse::from_reply(&reply));
             }
         }
         if std::time::Instant::now() >= up.deadline() {

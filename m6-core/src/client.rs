@@ -29,6 +29,11 @@ pub const MAX_BODY: usize = 128 * 1024 * 1024;
 /// sending them without end.
 pub const MAX_INFORMATIONAL: usize = 8;
 
+/// The number of header slots a caller hands to [`Upstream::reply`]. The slots
+/// are an uninitialised array on the caller's stack, so building them costs
+/// nothing.
+pub const MAX_HEADERS: usize = 64;
+
 /// Ceiling on a response head (status line and headers). Matches the blocking
 /// reader's stack buffer, so the two never disagree about what fits.
 const MAX_HEAD: usize = 8192;
@@ -57,7 +62,7 @@ pub struct Reply<'a> {
 
 /// A response body's framing, decided once from its header section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Framing {
+pub enum Framing {
     /// No body: a HEAD request, or status 101, 204 or 304.
     Bodyless,
     /// `Content-Length: N`.
@@ -164,7 +169,12 @@ pub struct Upstream {
     reusable: bool,
     /// The address of the open connection, for keep-alive reuse.
     connected: Option<Addr>,
-    connected_tls: bool,
+    /// The TLS identity of the open connection: the verified server name and the
+    /// config that verified it. Reuse requires the same identity, so one slot
+    /// cannot carry a second request over a connection authenticated for a
+    /// different name or trust root.
+    connected_name: Option<rustls::pki_types::ServerName<'static>>,
+    connected_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Upstream {
@@ -192,7 +202,8 @@ impl Upstream {
             method_is_head: false,
             reusable: false,
             connected: None,
-            connected_tls: false,
+            connected_name: None,
+            connected_config: None,
         }
     }
 
@@ -203,7 +214,7 @@ impl Upstream {
     }
 
     /// A non-blocking connect, or reuse of this slot's open keep-alive
-    /// connection to the same address. Never waits.
+    /// connection to the same address and TLS identity. Never waits.
     pub fn start(
         &mut self,
         addr: &Addr,
@@ -216,7 +227,7 @@ impl Upstream {
         let can_reuse = self.stream.is_some()
             && self.reusable
             && self.connected.as_ref() == Some(addr)
-            && self.connected_tls == tls.is_some();
+            && self.tls_identity_matches(tls);
 
         // Reset the per-request state, keeping the buffers and their capacity.
         self.write_offset = 0;
@@ -244,6 +255,18 @@ impl Upstream {
         self.stream = None;
         self.tls = None;
         self.connect(addr, tls)
+    }
+
+    /// Whether the TLS identity of the open connection matches the one being
+    /// started: the same verified server name and the same config (by pointer).
+    fn tls_identity_matches(&self, tls: Option<&TlsClient>) -> bool {
+        match (tls, &self.connected_name, &self.connected_config) {
+            (None, None, None) => true,
+            (Some(t), Some(name), Some(config)) => {
+                *name == t.name && Arc::ptr_eq(config, &t.config)
+            }
+            _ => false,
+        }
     }
 
     /// Open a non-blocking socket and begin the connect.
@@ -303,8 +326,14 @@ impl Upstream {
                 self.tls = tls_conn;
             }
         }
-        self.connected = Some(addr.clone());
-        self.connected_tls = tls.is_some();
+        // Reuse the previous address's buffer when the slot reconnects, so a
+        // fresh connection does not allocate a path each time.
+        match &mut self.connected {
+            Some(existing) => existing.clone_from(addr),
+            None => self.connected = Some(addr.clone()),
+        }
+        self.connected_name = tls.map(|t| t.name.clone());
+        self.connected_config = tls.map(|t| t.config.clone());
         Ok(())
     }
 
@@ -319,7 +348,7 @@ impl Upstream {
             Phase::Connecting => mio::Interest::WRITABLE,
             Phase::Handshaking => mio::Interest::READABLE | mio::Interest::WRITABLE,
             Phase::Transfer => {
-                if self.write_offset < self.request.len() {
+                if self.wants_write() {
                     mio::Interest::READABLE | mio::Interest::WRITABLE
                 } else {
                     mio::Interest::READABLE
@@ -327,6 +356,11 @@ impl Upstream {
             }
             Phase::Idle => mio::Interest::READABLE,
         }
+    }
+
+    /// Whether request bytes or TLS ciphertext are still owed to the socket.
+    fn wants_write(&self) -> bool {
+        self.write_offset < self.request.len() || self.tls.as_ref().is_some_and(|t| t.wants_write())
     }
 
     /// Do what can be done without blocking. Returns `Ok(true)` when the reply
@@ -392,8 +426,8 @@ impl Upstream {
     /// Write the rest of the request, then read and parse. Returns `Ok(true)`
     /// when the reply is complete.
     fn transfer(&mut self) -> io::Result<bool> {
-        if self.write_offset < self.request.len() && !self.write_request()? {
-            return Ok(false);
+        if self.wants_write() {
+            let _ = self.write_request()?;
         }
         self.read_available()?;
         self.parse_progress()
@@ -429,9 +463,12 @@ impl Upstream {
             };
             self.write_offset += written;
             if self.write_offset >= self.request.len() {
-                // Flush any TLS ciphertext that is still buffered.
+                // Flush any TLS ciphertext that is still buffered. If it would
+                // block, report it so a later drive retries the flush.
                 if let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) {
-                    flush_tls(tls, stream)?;
+                    if !flush_tls(tls, stream)? {
+                        return Ok(false);
+                    }
                 }
                 return Ok(true);
             }
@@ -605,7 +642,7 @@ impl Upstream {
             let status_line = std::str::from_utf8(&head[..line_end]).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
             })?;
-            let (status, _reason) = parse_status_line(status_line)?;
+            let (status, _reason, http10) = parse_status_line(status_line)?;
             if is_skipped_informational(status) {
                 self.informational += 1;
                 if self.informational > MAX_INFORMATIONAL {
@@ -622,6 +659,7 @@ impl Upstream {
                 &head[after..],
                 status,
                 self.method_is_head,
+                http10,
                 &mut self.reusable,
             )?);
             self.chunk_pos = header_end + 4;
@@ -717,11 +755,19 @@ impl Upstream {
 
     /// Parse the completed head into the caller's header slots and return the
     /// reply. Only valid once [`Upstream::drive`] has reported the reply ready.
-    pub fn reply<'a>(&'a self, slots: &'a mut [httparse::Header<'a>]) -> Option<Reply<'a>> {
+    ///
+    /// `slots` is an uninitialised array of [`MAX_HEADERS`] entries, so building
+    /// it costs nothing: httparse writes only the entries it fills.
+    pub fn reply<'a>(
+        &'a self,
+        slots: &'a mut [std::mem::MaybeUninit<httparse::Header<'a>>],
+    ) -> Option<Reply<'a>> {
         self.framing?;
         let head = &self.read_buf[self.head_start..self.head_end + 4];
-        let mut resp = httparse::Response::new(slots);
-        let Ok(httparse::Status::Complete(_)) = resp.parse(head) else {
+        let mut resp = httparse::Response::new(&mut []);
+        let Ok(httparse::Status::Complete(_)) = httparse::ParserConfig::default()
+            .parse_response_with_uninit_headers(&mut resp, head, slots)
+        else {
             return None;
         };
         let status = resp.code.unwrap_or(self.status);
@@ -746,13 +792,12 @@ impl Upstream {
         self.reusable
     }
 
-    /// Drop the connection (closes the socket). The buffers stay.
+    /// Drop the connection (closes the socket). The buffers stay, including the
+    /// last address, so the next connect reuses its allocation.
     pub fn close(&mut self) {
         self.stream = None;
         self.tls = None;
         self.phase = Phase::Idle;
-        self.connected = None;
-        self.connected_tls = false;
         self.reusable = false;
     }
 }
@@ -788,24 +833,26 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
-fn parse_status_line(line: &str) -> io::Result<(u16, &str)> {
+fn parse_status_line(line: &str) -> io::Result<(u16, &str, bool)> {
     let mut parts = line.splitn(3, ' ');
-    parts.next();
+    let version = parts.next().unwrap_or("");
+    let http10 = version.eq_ignore_ascii_case("HTTP/1.0");
     let status: u16 = parts
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad or missing status code"))?;
     let reason = parts.next().unwrap_or("");
-    Ok((status, reason))
+    Ok((status, reason, http10))
 }
 
 /// Whether a response status is informational and to be skipped: a 1xx other
 /// than 101, which is final for the exchange.
-fn is_skipped_informational(status: u16) -> bool {
+pub fn is_skipped_informational(status: u16) -> bool {
     (100..200).contains(&status) && status != 101
 }
 
-fn too_many_informational() -> io::Error {
+/// The error for a backend that sent too many informational responses.
+pub fn too_many_informational() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("backend sent more than {MAX_INFORMATIONAL} informational responses without a final one"),
@@ -839,18 +886,23 @@ fn is_field_name(name: &str) -> bool {
 }
 
 /// Parse the header section (status line already consumed) and decide the body
-/// framing. Enforces the same rules the blocking reader enforces, in one place,
-/// so the two cannot disagree about where a response ends.
-fn parse_framing(
+/// framing. This is the one place the framing rules live, so the incremental
+/// `Upstream` reader and the blocking URL-backend reader cannot disagree about
+/// where a response ends.
+pub fn parse_framing(
     head: &[u8],
     status: u16,
     method_is_head: bool,
+    http10: bool,
     reusable: &mut bool,
 ) -> io::Result<Framing> {
     let mut content_length: Option<usize> = None;
     let mut te_present = false;
-    let mut chunked = false;
+    // The final transfer-coding across all Transfer-Encoding fields, in order
+    // (RFC 9110 5.3 folds repeated fields into one comma-joined list).
+    let mut last_coding: Option<&[u8]> = None;
     let mut connection_close = false;
+    let mut connection_keep_alive = false;
 
     for line in head.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -860,8 +912,8 @@ fn parse_framing(
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
         };
-        let name = &line[..colon];
-        let value = &line[colon + 1..];
+        let name = trim_ascii(&line[..colon]);
+        let value = trim_ascii(&line[colon + 1..]);
         if name.eq_ignore_ascii_case(b"content-length") {
             for part in value.split(|&b| b == b',') {
                 let part = trim_ascii(part);
@@ -898,20 +950,24 @@ fn parse_framing(
         }
         if name.eq_ignore_ascii_case(b"transfer-encoding") {
             te_present = true;
-            if let Some(last) = value.split(|&b| b == b',').next_back() {
-                if trim_ascii(last).eq_ignore_ascii_case(b"chunked") {
-                    chunked = true;
-                }
+            for coding in value.split(|&b| b == b',') {
+                last_coding = Some(trim_ascii(coding));
             }
         }
         if name.eq_ignore_ascii_case(b"connection") {
             for token in value.split(|&b| b == b',') {
-                if trim_ascii(token).eq_ignore_ascii_case(b"close") {
+                let token = trim_ascii(token);
+                if token.eq_ignore_ascii_case(b"close") {
                     connection_close = true;
+                }
+                if token.eq_ignore_ascii_case(b"keep-alive") {
+                    connection_keep_alive = true;
                 }
             }
         }
     }
+
+    let chunked = te_present && last_coding.is_some_and(|c| c.eq_ignore_ascii_case(b"chunked"));
 
     if te_present && content_length.is_some() {
         return Err(io::Error::new(
@@ -932,15 +988,28 @@ fn parse_framing(
     } else if chunked {
         Framing::Chunked
     } else if let Some(len) = content_length {
+        // Refuse before reading, so a hostile declared length cannot grow the
+        // buffer, and the size never reaches the addition below unchecked.
+        if len > MAX_BODY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("backend declared Content-Length {len}, above the {MAX_BODY} limit"),
+            ));
+        }
         Framing::ContentLength(len)
     } else {
         Framing::CloseDelimited
     };
 
-    // A connection is reusable only when the response is self-delimited and did
-    // not ask to close.
-    *reusable =
-        matches!(framing, Framing::ContentLength(_) | Framing::Chunked) && !connection_close;
+    // Reusable only when self-delimited and persistent: HTTP/1.1 unless the
+    // backend asked to close, HTTP/1.0 only when it asked to keep alive.
+    let self_delimited = matches!(framing, Framing::ContentLength(_) | Framing::Chunked);
+    *reusable = self_delimited
+        && if http10 {
+            connection_keep_alive
+        } else {
+            !connection_close
+        };
 
     Ok(framing)
 }
@@ -963,6 +1032,21 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
     b
 }
 
+/// Copy a borrowed reply's headers into owned strings, for test assertions.
+#[cfg(test)]
+fn reply_headers(reply: &Reply<'_>) -> Vec<(String, String)> {
+    reply
+        .headers
+        .iter()
+        .map(|h| {
+            (
+                h.name.to_string(),
+                String::from_utf8_lossy(h.value).into_owned(),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,18 +1063,10 @@ mod tests {
         up.read_len = raw.len();
         up.eof = true;
         assert!(up.parse_progress()?, "response must be complete at EOF");
-        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+            [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS];
         let reply = up.reply(&mut slots).expect("reply");
-        let headers = reply
-            .headers
-            .iter()
-            .map(|h| {
-                (
-                    h.name.to_string(),
-                    String::from_utf8_lossy(h.value).into_owned(),
-                )
-            })
-            .collect();
+        let headers = reply_headers(&reply);
         Ok((reply.status, headers, reply.body.to_vec()))
     }
 
@@ -1010,16 +1086,24 @@ mod tests {
 
     #[test]
     fn parse_status_line_reads_status_and_reason() {
-        let (status, reason) = parse_status_line("HTTP/1.1 200 OK").unwrap();
+        let (status, reason, http10) = parse_status_line("HTTP/1.1 200 OK").unwrap();
         assert_eq!(status, 200);
         assert_eq!(reason, "OK");
+        assert!(!http10);
     }
 
     #[test]
     fn parse_status_line_accepts_a_missing_reason() {
-        let (status, reason) = parse_status_line("HTTP/1.1 404").unwrap();
+        let (status, reason, http10) = parse_status_line("HTTP/1.1 404").unwrap();
         assert_eq!(status, 404);
         assert_eq!(reason, "");
+        assert!(!http10);
+    }
+
+    #[test]
+    fn parse_status_line_flags_http_10() {
+        let (_, _, http10) = parse_status_line("HTTP/1.0 200 OK").unwrap();
+        assert!(http10);
     }
 
     #[test]
@@ -1027,7 +1111,7 @@ mod tests {
         const { assert!(crate::ndjson::MAX_PAGE_BYTES < MAX_BODY) };
     }
 
-    // ── Framing rules, moved from forward.rs ──────────────────────────────────
+    // ── Framing rules ────────────────────────────────────────────────────────
 
     #[test]
     fn conflicting_content_length_is_refused() {
@@ -1160,7 +1244,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
-    // ── Chunked rules, moved from forward.rs ─────────────────────────────────
+    // ── Chunked rules ────────────────────────────────────────────────────────
 
     fn chunked(body: &str) -> Vec<u8> {
         format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}").into_bytes()
@@ -1247,24 +1331,77 @@ mod tests {
             up.read_buf[i] = byte;
             up.read_len = i + 1;
             if up.parse_progress().unwrap() {
-                let mut slots = [httparse::EMPTY_HEADER; 64];
+                let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+                    [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS];
                 let reply = up.reply(&mut slots).unwrap();
-                let headers: Vec<(String, String)> = reply
-                    .headers
-                    .iter()
-                    .map(|h| {
-                        (
-                            h.name.to_string(),
-                            String::from_utf8_lossy(h.value).into_owned(),
-                        )
-                    })
-                    .collect();
+                let headers = reply_headers(&reply);
                 let body = reply.body.to_vec();
                 assert_eq!((reply.status, headers, body), whole);
                 return;
             }
         }
         panic!("the one-byte response never completed");
+    }
+
+    /// A declared Content-Length above the cap is refused at the head, before
+    /// any body is read.
+    #[test]
+    fn a_content_length_above_the_cap_is_refused_at_the_head() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4000000000\r\n\r\n";
+        let err = parse(raw, false).unwrap_err();
+        assert!(
+            err.to_string().contains("above the") && err.to_string().contains("limit"),
+            "got: {err}"
+        );
+    }
+
+    /// `usize::MAX` is refused rather than overflowing the body-end addition.
+    #[test]
+    fn a_content_length_of_usize_max_is_refused_not_panicking() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n";
+        let err = parse(raw, false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "got: {err}");
+    }
+
+    /// Repeated Transfer-Encoding fields fold into one list (RFC 9110 5.3), so
+    /// the final coding decides the framing.
+    #[test]
+    fn a_transfer_encoding_split_across_header_lines_is_combined() {
+        let chunked_then_gzip = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\nhello";
+        let err = parse(chunked_then_gzip, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not ending in chunked"),
+            "got: {err}"
+        );
+
+        let gzip_then_chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (_, _, body) = parse(gzip_then_chunked, false).unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    /// An HTTP/1.0 reply is close-by-default, so it must not be reusable unless
+    /// the backend asked to keep the connection alive.
+    #[test]
+    fn an_http_10_content_length_reply_is_not_reusable() {
+        let raw = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut up = Upstream::new(8192, 1024);
+        up.method_is_head = false;
+        up.read_buf[..raw.len()].copy_from_slice(raw);
+        up.read_len = raw.len();
+        up.eof = true;
+        assert!(up.parse_progress().unwrap());
+        assert!(!up.reusable(), "HTTP/1.0 is close-by-default");
+
+        let keep_alive =
+            b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello";
+        let mut up2 = Upstream::new(8192, 1024);
+        up2.method_is_head = false;
+        up2.read_buf[..keep_alive.len()].copy_from_slice(keep_alive);
+        up2.read_len = keep_alive.len();
+        up2.eof = true;
+        assert!(up2.parse_progress().unwrap());
+        assert!(up2.reusable(), "HTTP/1.0 keep-alive is reusable");
     }
 }
 
@@ -1302,18 +1439,10 @@ mod socket_tests {
                     registered = interest;
                 }
                 if up.drive()? {
-                    let mut slots = [httparse::EMPTY_HEADER; 64];
+                    let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+                        [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS];
                     let reply = up.reply(&mut slots).expect("reply after complete drive");
-                    let headers = reply
-                        .headers
-                        .iter()
-                        .map(|h| {
-                            (
-                                h.name.to_string(),
-                                String::from_utf8_lossy(h.value).into_owned(),
-                            )
-                        })
-                        .collect();
+                    let headers = reply_headers(&reply);
                     return Ok((reply.status, headers, reply.body.to_vec()));
                 }
             }
@@ -1496,5 +1625,80 @@ mod socket_tests {
             .expect_err("a full backlog is WouldBlock");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
         drop(listener);
+    }
+
+    /// A backend that answers at once without reading the request is still read
+    /// while the request write would block (RFC 9110 6.1).
+    #[test]
+    fn a_backend_that_answers_without_reading_is_read_while_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("early.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            // Never read the request; write a 413 at once and hold the socket.
+            let _ = s.write_all(
+                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        up.request_buf()
+            .extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
+        up.request_buf()
+            .extend(std::iter::repeat_n(b'x', 1_048_576));
+        up.start(
+            &Addr::Unix(path),
+            None,
+            false,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("start");
+        let (status, _, body) = drive_to_completion(&mut up).expect("drive");
+        assert_eq!((status, body.as_slice()), (413, &b""[..]));
+        peer.join().expect("peer");
+    }
+
+    /// A different TLS identity (name or config) for the same address must not
+    /// reuse the connection authenticated for the first identity.
+    #[test]
+    fn a_different_tls_identity_does_not_reuse_the_connection() {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = || {
+            Arc::new(
+                rustls::ClientConfig::builder_with_provider(provider.clone())
+                    .with_safe_default_protocol_versions()
+                    .expect("versions")
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            )
+        };
+        let name_a =
+            rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
+        let name_b =
+            rustls::pki_types::ServerName::try_from("example.com".to_string()).expect("name");
+
+        let mut up = Upstream::new(8192, 1024);
+        let config_a = config();
+        up.connected_name = Some(name_a.clone());
+        up.connected_config = Some(config_a.clone());
+        let tls_a = TlsClient {
+            config: config_a.clone(),
+            name: name_a.clone(),
+        };
+        assert!(up.tls_identity_matches(Some(&tls_a)));
+
+        let tls_b = TlsClient {
+            config: config_a,
+            name: name_b,
+        };
+        assert!(!up.tls_identity_matches(Some(&tls_b)));
+
+        let tls_c = TlsClient {
+            config: config(),
+            name: name_a,
+        };
+        assert!(!up.tls_identity_matches(Some(&tls_c)));
     }
 }

@@ -77,7 +77,8 @@ fn answer_one(up: &mut Upstream, server: &mut UnixStream, response: &[u8]) {
     }
     server.write_all(response).expect("write reply");
     assert!(up.drive().expect("drive"), "the reply must complete");
-    let mut slots = [httparse::EMPTY_HEADER; 64];
+    let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>; m6_core::client::MAX_HEADERS] =
+        [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
     let reply = up.reply(&mut slots).expect("reply");
     assert_eq!((reply.status, reply.body.len()), (200, 4096));
 }
@@ -209,7 +210,9 @@ fn tls_request(
                 *registered = Some(next);
             }
             if up.drive().expect("drive") {
-                let mut slots = [httparse::EMPTY_HEADER; 64];
+                let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
+                    m6_core::client::MAX_HEADERS] =
+                    [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
                 let reply = up.reply(&mut slots).expect("reply");
                 assert_eq!(reply.status, 200);
                 return;
