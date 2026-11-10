@@ -1224,7 +1224,7 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
         site.join("site.toml"),
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-             [server]\nbackend_timeout_secs = 30\nmax_requests_per_connection = 10000\n\n\
+             [server]\nbackend_timeout_secs = 30\n\n\
              [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
@@ -1388,7 +1388,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         site.join("site.toml"),
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-             [server]\nbackend_timeout_secs = 30\nmax_requests_per_connection = 10000\n\n\
+             [server]\nbackend_timeout_secs = 30\n\n\
              [log]\nlevel = \"trace\"\nformat = \"text\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
