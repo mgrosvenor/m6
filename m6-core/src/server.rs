@@ -117,14 +117,12 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 /// them, typically `0o755`. That worked for the same reason `0o666` worked:
 /// the directory was doing the enforcing. Neither is a decision anybody made.
 ///
-/// Failure is logged and tolerated. The socket is already bound and the service
-/// is already serving; refusing to continue would trade a socket that is more
-/// permissive than intended for one that does not exist.
-pub fn apply_socket_mode(path: &Path, mode: u32) {
+/// A socket whose mode cannot be set is a start failure: a mode nobody chose is
+/// a socket nobody can reason about, so the caller stops rather than serve on
+/// a socket that is more permissive than intended.
+pub fn apply_socket_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        warn!(error = %e, mode = format!("{mode:04o}"), "failed to set socket permissions");
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// Apply the per-connection read timeout, in one place.
@@ -367,6 +365,13 @@ mod tests {
     fn test_socket_path_from_config_no_extension() {
         let p = socket_path_from_config(Path::new("configs/myconfig"));
         assert_eq!(p, PathBuf::from("/run/m6/myconfig.sock"));
+    }
+
+    #[test]
+    fn a_chmod_that_fails_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-socket");
+        assert!(apply_socket_mode(&missing, 0o660).is_err());
     }
 
     #[test]

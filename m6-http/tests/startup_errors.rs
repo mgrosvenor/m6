@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use m6_core::testkit::{self, wait, Service};
+use m6_core::testkit::{self, Service};
 
 /// Run the built `m6-http` to completion and return its captured output.
 fn run(args: &[&std::ffi::OsStr]) -> Output {
@@ -45,12 +45,10 @@ fn write_cert_key(site: &Path) {
 
 /// A `site.toml` that names the site, binds `bind`, and uses the certificate
 /// `write_cert_key` wrote. Plain `info` logging so warnings are visible.
-fn site_toml_with_server(bind: &str) -> String {
-    format!(
-        "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-         [server]\nbind = \"{bind}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"plain\"\n"
-    )
+fn site_toml() -> String {
+    "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+     [log]\nlevel = \"info\"\nformat = \"plain\"\n"
+        .to_string()
 }
 
 /// Scenario: m6-http runs with no arguments. Wrong outcome: it starts with some
@@ -131,44 +129,97 @@ fn an_unparseable_system_config_exits_2_and_names_the_file_rather_than_starting(
 /// `[node]`, `[auth]` and `[health]`. Wrong outcome: the key is dropped without
 /// a word, so a typo in a config section passes silently.
 #[test]
-fn a_key_outside_the_allowed_tables_warns_naming_the_key_and_the_service_starts() {
+fn a_key_outside_the_allowed_tables_exits_2_and_names_it() {
     let claim = testkit::claim_port();
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
-    std::fs::write(site.join("site.toml"), site_toml_with_server(&claim.addr()))
-        .expect("site.toml");
+    std::fs::write(site.join("site.toml"), site_toml()).expect("site.toml");
     let system = dir.path().join("system.toml");
     std::fs::write(
         &system,
-        "[node]\nname = \"startup-errors\"\n\n[frobnicate]\nsetting = \"value\"\n",
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n\
+             [frobnicate]\nsetting = \"value\"\n",
+            claim.addr()
+        ),
     )
     .expect("system config");
 
-    let mut cmd = Command::new(testkit::binary("m6-http"));
-    cmd.arg(&site).arg(&system);
-    let mut svc = Service::spawn("m6-http-extra-key", &mut cmd);
-    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    let out = run(&[site.as_os_str(), system.as_os_str()]);
+    let err = stderr_of(&out);
+    assert_eq!(exit_code(&out), 2, "stderr: {err}");
+    assert!(
+        err.contains("frobnicate"),
+        "the error must name the unknown key, got: {err}"
+    );
+}
 
-    assert!(
-        wait::until(Duration::from_secs(5), || svc
-            .output()
-            .contains("frobnicate")),
-        "m6-http never logged \"frobnicate\"\n--- output ---\n{}",
-        svc.output()
-    );
-    let out = svc.output();
-    assert!(
-        out.contains("ignoring key"),
-        "the warning must say the key is ignored, got: {out}"
-    );
+/// Scenario: `[server] bind` in `site.toml`, which is this node's own state.
+/// Wrong outcome: the key is read from the wrong file and the service starts.
+#[test]
+fn a_misplaced_key_exits_2_and_names_it() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            claim.addr()
+        ),
+    )
+    .expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            claim.addr()
+        ),
+    )
+    .expect("system config");
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let out = run(&[site.as_os_str(), system.as_os_str()]);
+    let err = stderr_of(&out);
+    assert_eq!(exit_code(&out), 2, "stderr: {err}");
     assert!(
-        status.success(),
-        "m6-http should exit 0 on SIGTERM, got {status}"
+        err.contains("site.toml sets [server].bind"),
+        "the error must name the key and the file it belongs in, got: {err}"
     );
+    assert!(err.contains("belongs in the system config"), "{err}");
+}
+
+/// Scenario: a system config with no `[node]`. Wrong outcome: the node identity
+/// falls back to `[site].name` and the service starts.
+#[test]
+fn a_missing_node_exits_2() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(site.join("site.toml"), site_toml()).expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[server]\nbind = \"{}\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            claim.addr()
+        ),
+    )
+    .expect("system config");
+
+    let out = run(&[site.as_os_str(), system.as_os_str()]);
+    let err = stderr_of(&out);
+    assert_eq!(exit_code(&out), 2, "stderr: {err}");
+    assert!(err.contains("has no [node]"), "{err}");
 }
 
 /// Scenario: `[server]` is absent from `site.toml` but present in the system

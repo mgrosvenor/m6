@@ -26,9 +26,9 @@ Logs to stdout as structured JSON.
 ## Startup Sequence
 
 1. Load `site.toml` from site directory
-2. Load `<system-config>` and merge. It may carry `[server]`, `[node]`, `[auth]` and the `[health]` keys `metrics_require` and `metrics_peers`. Its `[server]` and `[health]` keys win
+2. Load `<system-config>`. It carries `[node]`, the `[server]` node keys, `[auth]` and the `[health]` access keys, and nothing else. A key in the wrong file is exit 2
 3. Validate merged config — exit 2 on error, before binding
-4. If `[auth]` is declared (in either file, never both), load the public key for local JWT verification. `backend` is optional
+4. If `[auth]` is declared in the system config, load the public key for local JWT verification. `backend` is optional
 5. Expand `[[route_group]]` globs against site directory — builds route table entries and invalidation map
 6. Read renderer configs to build params-file → URL invalidation map entries
 7. Bind the TLS listener. If `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`

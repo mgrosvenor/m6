@@ -283,6 +283,22 @@ fn https_get(
 
 // ── One example behind one edge ──────────────────────────────────────────────
 
+/// Owns a spawned backend from the moment it is spawned, so a panic anywhere
+/// in `Stack::start` after the spawn still kills it. Once `Stack` owns the
+/// child the child is taken out and `Stack::drop` takes over.
+struct BackendGuard {
+    child: Option<Child>,
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 struct Stack {
     _backend: Child,
     _edge: Service,
@@ -303,10 +319,6 @@ impl Drop for Stack {
 
 impl Stack {
     fn start(lang: &str) -> Option<Stack> {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-
         if !available(lang) {
             let msg = format!("{lang}: {} is not installed", toolchain_for(lang));
             assert!(
@@ -330,6 +342,22 @@ impl Stack {
             .prefix("m6px-")
             .tempdir_in(m6_core::testkit::exec_scratch_root())
             .unwrap();
+        Self::start_in(lang, tmp, false, &mut None)
+    }
+
+    /// The spawn+guard path, given the scratch dir. `broken_tls_key` writes a
+    /// system.toml naming a missing TLS key so the edge exits before binding.
+    /// `backend_pid` receives the spawned backend's pid before the edge is
+    /// spawned, so a caller can assert the guard reaped it on a failed start.
+    fn start_in(
+        lang: &str,
+        tmp: tempfile::TempDir,
+        broken_tls_key: bool,
+        backend_pid: &mut Option<u32>,
+    ) -> Option<Stack> {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let base = tmp.path();
 
         // The socket goes under /tmp with a short name, NOT in the temp dir:
@@ -403,30 +431,45 @@ backend = "example"
         .unwrap();
 
         let sys = base.join("system.toml");
+        let tls_key_arg = if broken_tls_key {
+            "missing-key.pem".to_string()
+        } else {
+            key_f.display().to_string()
+        };
         std::fs::write(
             &sys,
             format!(
-                "[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+                "[node]\nname = \"edge\"\n\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
                 cert_f.display(),
-                key_f.display()
+                tls_key_arg
             ),
         )
         .unwrap();
 
         // Backend first: the pool reads its glob once at start, so the socket
-        // must exist before m6-http is spawned.
-        let mut backend = backend_command(lang, base, &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("{lang}: spawn: {e}"));
+        // must exist before m6-http is spawned. The guard owns the child from
+        // this moment, so a failure in the edge path below still reaps it.
+        let mut backend = BackendGuard {
+            child: Some(
+                backend_command(lang, base, &sock)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
+            ),
+        };
+        *backend_pid = backend.child.as_ref().map(|c| c.id());
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
                 break;
             }
-            if let Some(code) = backend.try_wait().ok().flatten() {
+            if let Some(code) = backend
+                .child
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+            {
                 panic!("{lang}: backend exited with {code} before binding");
             }
             assert!(
@@ -437,7 +480,7 @@ backend = "example"
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        let edge = Service::spawn(
+        let mut edge = Service::spawn(
             "m6-http",
             Command::new(binary("m6-http")).args([
                 site.to_str().unwrap(),
@@ -449,26 +492,12 @@ backend = "example"
 
         let tls = trusting_client(&cert_der);
         // Wait for the edge to answer, rather than sleeping a fixed amount.
-        //
-        // The panic matters. This loop used to run to its deadline and then carry
-        // on regardless, so an edge that never bound produced a connection error
-        // in whichever assertion happened to run first, naming the symptom instead
-        // of the cause. A wait that cannot fail is not a wait, it is a sleep with
-        // extra steps.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{lang}: the edge never bound 127.0.0.1:{port} within 20s"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        // `wait_for_tcp` fails at once with the edge's exit status and stderr
+        // if the edge exits, instead of waiting out the whole deadline.
+        edge.wait_for_tcp(port, Duration::from_secs(20));
 
         Some(Stack {
-            _backend: backend,
+            _backend: backend.child.take().unwrap(),
             _edge: edge,
             port,
             tls,
@@ -667,6 +696,31 @@ fn a_non_compressing_backend_gets_no_vary_accept_encoding() {
             "{lang}: and nothing should be compressed"
         );
     });
+}
+
+#[test]
+fn a_failed_start_leaves_no_backend_process_behind() {
+    // The sandbox denies the exec scratch root /var/tmp, so build the stack in
+    // a writable temp dir and go through start_in's real spawn+guard path: the
+    // real backend is spawned, then the edge is made to exit before binding by
+    // naming a missing TLS key, and the guard must reap the backend.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut backend_pid = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = Stack::start_in("rust-plain", tmp, true, &mut backend_pid);
+    }));
+    assert!(failed.is_err(), "the edge should fail to start");
+    let pid = backend_pid.expect("the backend was spawned before the edge failed");
+    let alive = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        !alive,
+        "the backend process should have been reaped after the failed edge start"
+    );
 }
 
 #[test]

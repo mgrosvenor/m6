@@ -345,7 +345,46 @@ fn default_compression() -> std::collections::HashMap<String, CompressionLevel> 
     m
 }
 
+/// Refuse an unknown key inside one of the core config tables `parse_config`
+/// reads, so a typo in a key core acts on cannot pass silently as a default.
+///
+/// Out of scope: top-level keys (a service's own config, `user_config`), the
+/// keys of a `[[route]]` beyond core's (kept as the route's `settings` by
+/// design, `parse_routes`), `[errors]` (m6-http's, reserved here so it does not
+/// reach the dictionary) and `[multipart]` (an ordinary service key).
+fn check_keys(tv: &toml::Value, table: &str, known: &[&str]) -> anyhow::Result<()> {
+    let Some(val) = tv.get(table) else {
+        return Ok(());
+    };
+    let tbl = val
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[{table}] must be a table"))?;
+    if let Some(key) = tbl.keys().find(|k| !known.contains(&k.as_str())) {
+        anyhow::bail!(
+            "unknown key [{table}] {key}: known keys are {}",
+            known.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererConfig> {
+    check_keys(&tv, "thread_pool", &["size", "queue_size"])?;
+    check_keys(&tv, "params_cache", &["size"])?;
+    check_keys(&tv, "server", &["read_timeout_s", "socket_mode"])?;
+    check_keys(&tv, "log", &["level", "format"])?;
+    if let Some(toml::Value::Table(tbl)) = tv.get("compression") {
+        for (mime, val) in tbl {
+            let table = format!("compression.\"{mime}\"");
+            let inner = val
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("[{table}] must be a table"))?;
+            if let Some(key) = inner.keys().find(|k| *k != "brotli" && *k != "gzip") {
+                anyhow::bail!("unknown key [{table}] {key}: known keys are brotli, gzip");
+            }
+        }
+    }
+
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -458,16 +497,22 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
 
     // --- log ---
     let log = LogConfig {
-        level: tv
-            .get("log")
-            .and_then(|l| l.get("level"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        format: tv
-            .get("log")
-            .and_then(|l| l.get("format"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        level: match tv.get("log").and_then(|l| l.get("level")) {
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
+                    .to_string(),
+            ),
+            None => None,
+        },
+        format: match tv.get("log").and_then(|l| l.get("format")) {
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("[log] format must be a string, got {v}"))?
+                    .to_string(),
+            ),
+            None => None,
+        },
     };
 
     // --- site_toml ---
@@ -514,12 +559,13 @@ fn parse_minification(
     };
     if let Some(toml::Value::Table(tbl)) = table {
         for (key, val) in tbl {
+            let on = val.as_bool().ok_or_else(|| {
+                anyhow::anyhow!("[minification] {key} must be true or false, got {val}")
+            })?;
             if key == "inline_js" {
-                minification.inline_js = val.as_bool().unwrap_or(false);
+                minification.inline_js = on;
             } else {
-                minification
-                    .enabled
-                    .insert(key.clone(), val.as_bool().unwrap_or(false));
+                minification.enabled.insert(key.clone(), on);
             }
         }
     }
@@ -957,6 +1003,38 @@ queue_size = 32
         writeln!(cfg_file, "secrets_file = {:?}", secrets.path()).unwrap();
 
         assert!(load(cfg_file.path(), Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_core_table_is_refused_and_named() {
+        for (body, table, key) in [
+            ("[server]\nread_timeout = 5\n", "server", "read_timeout"),
+            ("[thread_pool]\nsise = 2\n", "thread_pool", "sise"),
+            ("[log]\nlevle = \"info\"\n", "log", "levle"),
+            (
+                "[compression.\"text/html\"]\nbrottli = 5\n",
+                "compression.\"text/html\"",
+                "brottli",
+            ),
+        ] {
+            let err = load_text(body).unwrap_err().to_string();
+            assert!(err.contains(table), "error should name {table:?}: {err}");
+            assert!(err.contains(key), "error should name {key:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_minification_value_is_refused() {
+        let err = load_text("[minification]\ninline_js = \"yes\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be true or false"), "{err}");
+    }
+
+    #[test]
+    fn a_service_key_outside_the_core_tables_still_loads() {
+        let cfg = load_text("[contact]\nname = \"Contact\"\n").unwrap();
+        assert!(cfg.user_config.contains_key("contact"));
     }
 }
 

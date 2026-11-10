@@ -188,8 +188,11 @@ path    = "/url/h2s/"
 backend = "url-h2s"
 EOF
 
-# system.toml — bind address, TLS, and H2C plain-TCP listener.
+# system.toml — node name, bind address, TLS, and H2C plain-TCP listener.
 cat > "$BENCH_DIR/system.toml" <<EOF
+[node]
+name = "bench"
+
 [server]
 bind     = "$BENCH_ADDR"
 h2c_bind = "$H2C_BENCH_ADDR"
