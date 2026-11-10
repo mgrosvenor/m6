@@ -3848,7 +3848,7 @@ fn run(args: Vec<String>) -> i32 {
     let config = match config::load(&cli.site_dir, &cli.system_config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config error: {}", e);
+            eprintln!("{e}");
             return 2;
         }
     };

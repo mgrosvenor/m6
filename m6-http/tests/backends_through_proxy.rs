@@ -278,6 +278,22 @@ fn https_get(
 
 // ── One example behind one edge ──────────────────────────────────────────────
 
+/// Owns a spawned backend from the moment it is spawned, so a panic anywhere
+/// in `Stack::start` after the spawn still kills it. Once `Stack` owns the
+/// child the child is taken out and `Stack::drop` takes over.
+struct BackendGuard {
+    child: Option<Child>,
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 struct Stack {
     _backend: Child,
     _edge: Service,
@@ -401,7 +417,7 @@ backend = "example"
         std::fs::write(
             &sys,
             format!(
-                "[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+                "[node]\nname = \"edge\"\n\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
                 cert_f.display(),
                 key_f.display()
             ),
@@ -409,19 +425,28 @@ backend = "example"
         .unwrap();
 
         // Backend first: the pool reads its glob once at start, so the socket
-        // must exist before m6-http is spawned.
-        let mut backend = backend_command(lang, base, &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("{lang}: spawn: {e}"));
+        // must exist before m6-http is spawned. The guard owns the child from
+        // this moment, so a failure in the edge path below still reaps it.
+        let mut backend = BackendGuard {
+            child: Some(
+                backend_command(lang, base, &sock)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
+            ),
+        };
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
                 break;
             }
-            if let Some(code) = backend.try_wait().ok().flatten() {
+            if let Some(code) = backend
+                .child
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+            {
                 panic!("{lang}: backend exited with {code} before binding");
             }
             assert!(
@@ -432,7 +457,7 @@ backend = "example"
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        let edge = Service::spawn(
+        let mut edge = Service::spawn(
             "m6-http",
             Command::new(binary("m6-http")).args([
                 site.to_str().unwrap(),
@@ -444,26 +469,12 @@ backend = "example"
 
         let tls = trusting_client(&cert_der);
         // Wait for the edge to answer, rather than sleeping a fixed amount.
-        //
-        // The panic matters. This loop used to run to its deadline and then carry
-        // on regardless, so an edge that never bound produced a connection error
-        // in whichever assertion happened to run first, naming the symptom instead
-        // of the cause. A wait that cannot fail is not a wait, it is a sleep with
-        // extra steps.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{lang}: the edge never bound 127.0.0.1:{port} within 20s"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        // `wait_for_tcp` fails at once with the edge's exit status and stderr
+        // if the edge exits, instead of waiting out the whole deadline.
+        edge.wait_for_tcp(port, Duration::from_secs(20));
 
         Some(Stack {
-            _backend: backend,
+            _backend: backend.child.take().unwrap(),
             _edge: edge,
             port,
             tls,
@@ -662,6 +673,36 @@ fn a_non_compressing_backend_gets_no_vary_accept_encoding() {
             "{lang}: and nothing should be compressed"
         );
     });
+}
+
+#[test]
+fn a_failed_start_leaves_no_backend_process_behind() {
+    // The backend is owned by `BackendGuard` from the moment it is spawned, so
+    // a panic anywhere after the spawn reaps it. Simulate the edge-fails path
+    // and assert the child is gone.
+    let child = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    let backend = BackendGuard { child: Some(child) };
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _backend = backend;
+        panic!("the edge failed to start");
+    }));
+    assert!(failed.is_err(), "the panic should have unwound");
+    let alive = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        !alive,
+        "the backend process should have been reaped after the failed start"
+    );
 }
 
 #[test]
