@@ -3,9 +3,9 @@
 //!
 //! [`Confirm`] is the reverse-then-forward check that [`crate::resolve`]'s
 //! worker thread makes: resolve the address to a name, then resolve the name
-//! forward and require the address among the results. It is here because a
-//! monitor already waits on descriptors with a deadline, and a lookup driven by
-//! that loop needs no thread. [`Query`] owns one UDP socket connected to one
+//! forward and require the address among the results. The monitor's own loop
+//! (EL-9) will wait on descriptors with a deadline, so a lookup driven by that
+//! loop needs no thread. [`Query`] owns one UDP socket connected to one
 //! nameserver. Nothing in this module waits.
 //!
 //! # Three outcomes, and they are not two
