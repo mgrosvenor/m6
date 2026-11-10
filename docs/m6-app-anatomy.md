@@ -366,7 +366,7 @@ The signal line is written before the shutdown flag is published, because the fl
 A connection is served until the peer closes it or 100 requests have gone by, and the read deadline from `[server] read_timeout_s` is applied at accept time, so a silent peer holds a worker for exactly that long.
 A full queue answers 503 immediately, which is how backpressure reaches the edge.
 
-The systemd unit has to supply four things: the two positional arguments, the user and group the socket directory is owned by, `RuntimeDirectory=m6` with `RuntimeDirectoryMode=0750`, and `ReadWritePaths` naming what this service actually writes.
+The systemd unit has to supply four things: the two positional arguments, the user and group the socket directory is owned by, `RuntimeDirectory=m6` with `RuntimeDirectoryMode=0750`, and `ReadWritePaths` naming what this service actually writes. It also supplies `LoadCredential` for each secret and `StateDirectory` for a database, as `m6-user-guide.md` section 7.2 sets out.
 `m6-user-guide.md`, "Example 06, production with systemd", carries a complete unit per service and this document does not repeat them.
 
 **`ReadWritePaths` must name only paths that exist.**
