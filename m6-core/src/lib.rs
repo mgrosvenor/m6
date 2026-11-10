@@ -5,6 +5,7 @@ pub mod config;
 pub mod cookie;
 pub mod dict;
 pub mod error;
+pub mod event;
 pub mod firewall;
 pub mod h1;
 pub mod headers;
@@ -53,6 +54,11 @@ pub mod template;
 
 #[cfg(feature = "templates")]
 pub use template::{TeraFactory, TeraRenderer};
+
+/// The reactor: `Poll`, `Events`, `Token`, `Interest` and the non-blocking
+/// sockets. Re-exported so a service names `m6_core::mio::...` and links only
+/// m6-core.
+pub use mio;
 
 pub use app::App;
 pub use app::AppContext;

@@ -1968,4 +1968,23 @@ pub struct StatsSnapshot {
     /// zeros around the four that matter, and the useful signal here is
     /// exactly which codes appeared.
     pub status_counts: std::collections::BTreeMap<u16, u64>,
+    /// The event loop's own figures: how long it waited against how long it
+    /// worked, per kind of event that woke it, since the last accounting tick.
+    ///
+    /// `#[serde(default)]` so a node older than this field still parses.
+    #[serde(default)]
+    pub event_loop: Vec<LoopTriggerSnapshot>,
+}
+
+/// One trigger's event-loop figures in a [`StatsSnapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoopTriggerSnapshot {
+    pub name: String,
+    pub count: u64,
+    pub wait_min_ns: u64,
+    pub wait_max_ns: u64,
+    pub wait_mean_ns: u64,
+    pub work_min_ns: u64,
+    pub work_max_ns: u64,
+    pub work_mean_ns: u64,
 }

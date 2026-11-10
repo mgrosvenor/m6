@@ -42,6 +42,7 @@
 //! m6-core = { path = "../m6-core", features = ["testkit"] }
 //! ```
 
+pub mod alloc_count;
 pub mod paths;
 pub mod port;
 pub mod process;

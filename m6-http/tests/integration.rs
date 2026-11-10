@@ -19,11 +19,11 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use m6_core::mio::{Poll, Token};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::http11::{
     make_tls_server_config, Http11Listener, RequestOutcome, DEFAULT_MAX_REQUESTS_PER_CONN,
 };
-use m6_http_lib::poller::{Poller, Token};
 use quiche::h3::NameValue as _;
 
 const TOKEN_TCP: Token = Token(1);
@@ -105,16 +105,16 @@ where
     let stop2 = Arc::clone(&stop);
 
     thread::spawn(move || {
-        let poller = Poller::new().expect("poller");
+        let poll = Poll::new().expect("poll");
         while !stop2.load(Ordering::Relaxed) {
-            listener.accept_pending(&poller, TOKEN_TCP);
+            listener.accept_pending(poll.registry(), TOKEN_TCP);
             listener.drive_all(
                 |req, client_ip| {
                     let (s, h, b, be) = handler(req, client_ip);
                     RequestOutcome::Ready(s, h, b, be)
                 },
                 |_resp, _ctx| (503, vec![], vec![], "none".to_string()),
-                &poller,
+                poll.registry(),
             );
             thread::sleep(Duration::from_millis(2));
         }

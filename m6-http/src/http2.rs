@@ -547,7 +547,8 @@ impl Http2Conn {
                         //
                         // Stop pumping ciphertext for this round exactly like
                         // WouldBlock: the drain loop below empties the reader,
-                        // and the next (level-triggered) poller wakeup resumes,
+                        // and the next iteration drives the connection again
+                        // (the loop drives every connection every iteration),
                         // because the rest of the record is still in the kernel
                         // socket buffer.
                         Err(e)
