@@ -297,7 +297,16 @@ fn an_idle_client_is_closed_after_its_deadline() {
 fn a_reset_client_does_not_take_the_server_down() {
     let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
     let mut reset = TcpStream::connect(srv.addr).expect("connect");
-    reset.write_all(&vec![b'y'; 100_000]).expect("send");
+    // Drive the order explicitly: round-trip a message first, so the reset
+    // below lands on a connection the server has fully read and echoed, not on
+    // a read still in flight. The old test wrote 100 KB and reset immediately,
+    // which raced the reset against the server's read and surfaced as
+    // ECONNRESET under load.
+    reset.write_all(b"probe\n").expect("send");
+    assert_eq!(
+        recv_exact(&mut reset, 6, Duration::from_secs(10)),
+        b"probe\n"
+    );
     socket2::SockRef::from(&reset)
         .set_linger(Some(Duration::ZERO))
         .ok();
