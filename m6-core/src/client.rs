@@ -171,10 +171,6 @@ pub struct Upstream {
     /// can arrive before the write finishes; reuse then truncates the request
     /// and desynchronises the backend, so reuse requires this.
     request_finished: bool,
-    /// Test seam: when set, the next final flush reports a WouldBlock so the
-    /// retry is exercised without filling the socket send buffer.
-    #[cfg(test)]
-    block_final_flush: bool,
     /// The address of the open connection, for keep-alive reuse.
     connected: Option<Addr>,
     /// The TLS identity of the open connection: the verified server name and the
@@ -210,8 +206,6 @@ impl Upstream {
             method_is_head: false,
             reusable: false,
             request_finished: false,
-            #[cfg(test)]
-            block_final_flush: false,
             connected: None,
             connected_name: None,
             connected_config: None,
@@ -480,11 +474,6 @@ impl Upstream {
             if self.write_offset >= self.request.len() {
                 // Flush any TLS ciphertext that is still buffered. If it would
                 // block, report it so a later drive retries the flush.
-                #[cfg(test)]
-                if self.block_final_flush {
-                    self.block_final_flush = false;
-                    return Ok(false);
-                }
                 if let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) {
                     if !flush_tls(tls, stream)? {
                         return Ok(false);
@@ -830,10 +819,21 @@ fn connect_in_progress(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EINPROGRESS)
 }
 
+/// Test seam: when set, the next `write_tls` reports a WouldBlock once, so the
+/// flush's retry is exercised without filling the socket send buffer.
+#[cfg(test)]
+static BLOCK_NEXT_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Flush TLS ciphertext to the socket. Returns `Ok(true)` when all pending
 /// bytes are written, `Ok(false)` when the socket would block.
 fn flush_tls(tls: &mut ClientConnection, stream: &mut Stream) -> io::Result<bool> {
     while tls.wants_write() {
+        #[cfg(test)]
+        if !tls.is_handshaking()
+            && BLOCK_NEXT_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
         match tls.write_tls(stream) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
@@ -1681,10 +1681,9 @@ mod socket_tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
-        up.request_buf()
-            .extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
-        up.request_buf()
-            .extend(std::iter::repeat_n(b'x', 1_048_576));
+        let req = up.request_buf();
+        req.extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
+        req.extend(std::iter::repeat_n(b'x', 1_048_576));
         up.start(&Addr::Unix(path.clone()), None, false, deadline)
             .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
@@ -1923,7 +1922,7 @@ mod socket_tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let body_len = 128 * 1024usize;
+        let body_len = 65 * 1024usize;
         let peer = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().expect("accept");
             let conn = rustls::ServerConnection::new(server).expect("server conn");
@@ -1958,7 +1957,7 @@ mod socket_tests {
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         let mut req = Vec::new();
         req.extend_from_slice(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 131072\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 66560\r\n\r\n",
         );
         req.extend(std::iter::repeat_n(b'x', body_len));
         up.request_buf().extend_from_slice(&req);
@@ -1966,7 +1965,7 @@ mod socket_tests {
             .expect("start");
 
         // Force the next final flush to report a WouldBlock, then drive.
-        up.block_final_flush = true;
+        BLOCK_NEXT_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let mut poll = Poll::new().expect("poll");
         let mut events = Events::with_capacity(8);
