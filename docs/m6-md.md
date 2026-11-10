@@ -7,19 +7,18 @@ Where this page and the code disagree, the code is right and this page is a defe
 ## 1. How to read this page
 
 The page is one binary's reference, and the list below links every section.
-The nine sections after this one are:
+The eight sections after this one are:
 
 2. [The command line](#2-the-command-line)
 3. [Input files](#3-input-files)
 4. [Frontmatter](#4-frontmatter)
 5. [The output file](#5-the-output-file)
-6. [Watch mode](#6-watch-mode)
-7. [Serving the output](#7-serving-the-output)
-8. [Errors and exit codes](#8-errors-and-exit-codes)
-9. [Limits](#9-limits)
-10. [Summary](#10-summary)
+6. [Serving the output](#6-serving-the-output)
+7. [Errors and exit codes](#7-errors-and-exit-codes)
+8. [Limits](#8-limits)
+9. [Summary](#9-summary)
 
-The command line, the input, the output and the watch loop are in `m6-md/src/main.rs`.
+The command line, the input and the output are in `m6-md/src/main.rs`.
 Table 5 names the sources for the workspace membership and the renderer's params.
 
 ## 2. The command line
@@ -28,22 +27,19 @@ m6-md takes one input directory and one output path, and Table 1 gives every arg
 Take from it that an ordinary run needs those two arguments and nothing else.
 
 ```sh
-m6-md <input-dir> --output <file> [--log-level <level>] [--watch] [--touch <path>]
+m6-md <input-dir> --output <file> [--log-level <level>]
 ```
 
 | argument or flag | required | what it does |
 |---|---|---|
 | `<input-dir>` | yes | Directory of `*.md` files. m6-md reads one level. |
 | `--output <file>` | yes | Path of the JSON file to write. |
-| `--log-level <level>` | no | Log filter directive, default `info`. An invalid value falls back to `info`. |
-| `--watch` | no | Stay running and regenerate the output on every `.md` change. |
-| `--touch <path>` | no | With `--watch`, touch this file after a change triggers a regeneration. |
+| `--log-level <level>` | no | Log filter directive, default `info`. A value the filter refuses is a usage error, exit 2. |
 | `--version`, `-V` | no | Print the m6-md version and exit 0. |
 
 **Table 1: every command-line argument and flag, whether it is required, and what it does.** The version flag writes no file.
 
 The input directory is positional and the output path is required, so a run that names both completes one pass.
-The two flags that change what a run does are `--watch` and `--touch`, and section 6 covers them together.
 A successful run logs to stdout as one JSON object per line, and usage and runtime errors go to stderr as plain text, so a caller can read the output file and ignore the log.
 Section 3 starts with the input directory that feeds that file.
 
@@ -130,22 +126,9 @@ The four frontmatter keys and the body become this element:
 }
 ```
 
-The order of the array is the order a site lists its posts in, and section 6 covers the mode that keeps the file current while a site runs.
+The order of the array is the order a site lists its posts in, and section 6 shows how a site serves the file.
 
-## 6. Watch mode
-
-`--watch` keeps m6-md resident and regenerates the output whenever a `.md` file in the input directory changes.
-The first pass runs once before the watcher starts and writes the output file.
-It does not touch the `--touch` path, so a site that is already up keeps its old params until the next `.md` change or a restart.
-
-The watcher covers the input directory itself and reacts to create, modify and remove events on paths that end in `.md`.
-After a relevant event it waits 50 milliseconds and drains the queue, so an editor that deletes and renames a file counts as one change.
-A regeneration that fails is logged and retried on the next change, and the process stays up.
-
-The process shuts down on the first `SIGTERM` or `SIGINT` after a clean stop and exits immediately on a second, with exit code 0 either way.
-Section 7 shows how a running site uses `--touch` to learn that a post changed.
-
-## 7. Serving the output
+## 6. Serving the output
 
 A site serves the output through an m6-html route that lists the file in its `params` array, and the route pattern supplies the value the template looks up.
 The contract is one key from the file and one variable from the path, and this section shows both.
@@ -175,20 +158,20 @@ A template finds its post in the array and answers 404 when the lookup returns n
 The index links each post with `/blog/{{ doc.stem }}`, because `path` carries no `/blog` prefix.
 
 A static params file is read once at start when m6-html builds its routes, so a running renderer keeps serving the old document array until a restart.
-The example runs m6-md with `--watch --touch site.toml`.
+Run m6-md again after a post changes.
 [`m6-http.md`](m6-http.md) owns the cache and its clearing rules, and Example 02 in [`m6-user-guide.md`](m6-user-guide.md) is the full site with both templates.
-Section 8 gives the exit codes a run can return.
+Section 7 gives the exit codes a run can return.
 
-## 8. Errors and exit codes
+## 7. Errors and exit codes
 
 m6-md exits with one of three codes, and Table 4 gives the condition behind each.
 Take from it that a usage mistake exits 2 and every failure during a run exits 1.
 
 | code | when |
 |---|---|
-| 0 | The run wrote the output, `--version` printed the version, or watch mode shut down cleanly |
-| 1 | A runtime failure: the input directory is missing or is a file, the output path's parent directory is missing, a source file cannot be read, a frontmatter block is malformed, the output cannot be written, or the watcher cannot start |
-| 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, or a second positional argument is given |
+| 0 | The run wrote the output, or `--version` printed the version |
+| 1 | A runtime failure: the input directory is missing or is a file, the output path's parent directory is missing, a source file cannot be read, a frontmatter block is malformed, or the output cannot be written |
+| 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, a second positional argument is given, or `--log-level` is a filter directive m6-md cannot parse |
 
 **Table 4: the three exit codes and the conditions behind each.**
 
@@ -196,9 +179,9 @@ A malformed frontmatter block stops the run with the file named in the message, 
 A source file that cannot be read stops the run at that file, and the run writes no output file.
 
 The codes separate a wrong invocation from a failed run, and the message names the file that failed.
-Section 9 lists what m6-md leaves out.
+Section 8 lists what m6-md leaves out.
 
-## 9. Limits
+## 8. Limits
 
 Four limits follow from reading one directory and writing one file.
 
@@ -211,20 +194,20 @@ Four limits follow from reading one directory and writing one file.
 - **No link rewriting.**
   A Markdown link such as `[other post](other-post.md)` stays as written, so a site writes the served route path in its source.
 
-The run has no option for any of them, and section 10 says where the surrounding subjects are written down.
+The run has no option for any of them, and section 9 says where the surrounding subjects are written down.
 
-## 10. Summary
+## 9. Summary
 
 m6-md is one command, one directory of Markdown and one JSON file, and a site serves that file through a route.
-The command line has two required arguments and four optional flags, the frontmatter has two keys, and the output has five fixed fields.
-Watch mode keeps the file current, and a running site reads the output once at start.
+The command line has two required arguments and two optional flags, the frontmatter has two keys, and the output has five fixed fields.
+A running site reads the output once at start.
 
 Table 5 gives the sources for what this page leaves out.
 Take from it that every subject here has one owner.
 
 | source | what it owns |
 |---|---|
-| `m6-md/src/main.rs` | m6-md's command line, input, output and watch behaviour |
+| `m6-md/src/main.rs` | m6-md's command line, input and output |
 | `Cargo.toml`, `m6-md/Cargo.toml` | the workspace members list, and the crate's dependencies |
 | `m6-core/src/app.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.1 | the renderer's static params, read at start |
 | [`m6-user-guide.md`](m6-user-guide.md) | Example 02, the blog that serves this output, with both templates |
