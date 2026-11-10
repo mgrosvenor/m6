@@ -33,6 +33,10 @@ impl Transport for H2cTransport {
         self.stream.take_error()
     }
 
+    fn is_connected(&self) -> bool {
+        self.stream.peer_addr().is_ok()
+    }
+
     fn is_handshaking(&self) -> bool {
         false
     }

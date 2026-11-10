@@ -40,6 +40,10 @@ impl Transport for H2sTransport {
         self.tcp.take_error()
     }
 
+    fn is_connected(&self) -> bool {
+        self.tcp.peer_addr().is_ok()
+    }
+
     fn is_handshaking(&self) -> bool {
         self.tls_conn.is_handshaking()
     }

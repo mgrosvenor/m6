@@ -57,6 +57,11 @@ pub trait Transport: Sized {
     /// The pending socket error of an in-progress connect, if any.
     fn take_error(&self) -> io::Result<Option<io::Error>>;
 
+    /// Whether a non-blocking connect has completed. A socket whose connect is
+    /// still in progress has no peer address yet, and a write to it fails with
+    /// `ENOTCONN`, so this is the check that decides the connect is really up.
+    fn is_connected(&self) -> bool;
+
     /// Whether the TLS handshake is still in progress. False for cleartext.
     fn is_handshaking(&self) -> bool;
 
@@ -267,6 +272,11 @@ impl<T: Transport> H2Client<T> {
                         self.mark_dead(&format!("{}: connect: {e}", T::prefix()));
                         return false;
                     }
+                }
+                if !self.transport.is_connected() {
+                    // The connect is still in progress. A write now would fail
+                    // with ENOTCONN; wait for the next readiness instead.
+                    return false;
                 }
                 self.phase = if self.transport.is_handshaking() {
                     Phase::Handshaking
