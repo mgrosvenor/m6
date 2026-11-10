@@ -128,8 +128,8 @@ use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
     make_tls_server_config, ConnDrive, H2cListener, HitHeaders, Http11Listener, ParseResult,
-    RequestHead, RequestOutcome, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE,
-    READ_TIMEOUT_SECS,
+    RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
+    MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::PoolManager;
 use m6_http_lib::router::RouteTable;
@@ -656,7 +656,6 @@ enum Routed {
         status: u16,
         entry: CachedResponse,
         age: std::time::Duration,
-        cache_state: &'static str,
         set_cookie: Option<String>,
     },
     Ready(u16, Vec<(String, String)>, Vec<u8>, String),
@@ -822,7 +821,6 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             status: cached.status,
             entry: cached,
             age,
-            cache_state,
             set_cookie,
         };
     }
@@ -878,7 +876,7 @@ fn on_request_impl(
             iface,
         } => {
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-            let mut outcome = handle_request(
+            let outcome = handle_request(
                 req,
                 client_ip,
                 enc,
@@ -887,13 +885,7 @@ fn on_request_impl(
                 h2c && state.h2c_iface == Iface::Internal,
                 registry,
             );
-            if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
-                set_alt_svc(headers, quic_port);
-                let elapsed_ns = start.elapsed().as_nanos() as u64;
-                let chan = Channel::new(version, iface);
-                state.stats.record(elapsed_ns, false, status, chan, backend);
-            }
-            outcome
+            finish_miss(state, outcome, start, version, iface, quic_port)
         }
     }
 }
@@ -919,16 +911,13 @@ fn on_request_head(
         false,
     ) {
         Routed::Cached {
-            status,
             entry,
             age,
-            cache_state,
             set_cookie,
+            ..
         } => RequestOutcome::Cached {
-            status,
             entry,
             age,
-            cache_state,
             set_cookie,
         },
         Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
@@ -946,19 +935,32 @@ fn on_request_head(
             // h1 and h2 paths do.
             forward::strip_untrusted_inbound(&mut req.headers);
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-            let mut outcome = handle_request(&req, client_ip, enc, state, false, false, registry);
-            if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
-                set_alt_svc(headers, quic_port);
-                let elapsed_ns = start.elapsed().as_nanos() as u64;
-                let chan = Channel::new(version, iface);
-                state.stats.record(elapsed_ns, false, status, chan, backend);
-            }
-            outcome
+            let outcome = handle_request(&req, client_ip, enc, state, false, false, registry);
+            finish_miss(state, outcome, start, version, iface, quic_port)
         }
     }
 }
 
 // ── Token and slot helpers ────────────────────────────────────────────────────
+
+/// The tail every cache miss shares: advertise `alt-svc` and record the miss in
+/// the stats, then return the outcome unchanged.
+fn finish_miss(
+    state: &mut ServerState,
+    mut outcome: RequestOutcome,
+    start: std::time::Instant,
+    version: HttpVersion,
+    iface: Iface,
+    quic_port: u16,
+) -> RequestOutcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
+        set_alt_svc(headers, quic_port);
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let chan = Channel::new(version, iface);
+        state.stats.record(elapsed_ns, false, status, chan, backend);
+    }
+    outcome
+}
 
 /// Take one token from the shared table, growing the three deadline tables and
 /// the generation table to match when the token table doubles. Each hand-out
@@ -3823,29 +3825,13 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compres
     if !backend_compresses && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("vary")) {
         return;
     }
-    let mut fields: Vec<String> = Vec::new();
-    for (k, v) in headers.iter() {
-        if !k.eq_ignore_ascii_case("vary") {
-            continue;
-        }
-        // `Vary: *` means "unpredictable"; it cannot be narrowed by adding a
-        // field name to it, so leave such a response exactly as the backend
-        // wrote it.
-        if v.trim() == "*" {
-            return;
-        }
-        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
-            if !fields.iter().any(|e| e.eq_ignore_ascii_case(f)) {
-                fields.push(f.to_string());
-            }
-        }
+    // The merge (including the `Vary: *` passthrough) is shared with the cached
+    // hit writer, so the two paths cannot disagree.
+    let merge = VaryMerge::new(headers);
+    if merge.is_star() {
+        return;
     }
-    if !fields
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case("accept-encoding"))
-    {
-        fields.push("Accept-Encoding".to_string());
-    }
+    let fields: Vec<String> = merge.map(str::to_string).collect();
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("vary"));
     headers.push(("vary".to_string(), fields.join(", ")));
 }

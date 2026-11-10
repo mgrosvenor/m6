@@ -45,10 +45,8 @@ pub enum RequestOutcome {
     /// writer can emit it without copying the headers or the body. The other
     /// protocols convert it back to `Ready` with their owned header form.
     Cached {
-        status: u16,
         entry: CachedResponse,
         age: std::time::Duration,
-        cache_state: &'static str,
         /// A freshly-minted analytics session cookie, when the response is HTML
         /// and this visit has no session yet. None for a returning visitor.
         set_cookie: Option<String>,
@@ -1392,6 +1390,45 @@ impl H1Io<'_> {
     }
 }
 
+/// Answer a request's `Expect` field from the buffered bytes, once per request.
+///
+/// RFC 9110 10.1.1: a client that sent `Expect: 100-continue` holds its body
+/// back until the server answers. This must run on every incomplete read, not
+/// only when the head is still arriving, or a request whose head is complete but
+/// whose body has not arrived stalls until the client times out. Returns `true`
+/// when a final 417 was queued, so the caller stops reading and switches to
+/// writing.
+fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
+    if h1.expect_handled {
+        return false;
+    }
+    let Some(exp) = (match &h1.state {
+        H1State::Reading { buf } => m6_core::h1::expectation(buf),
+        _ => None,
+    }) else {
+        // Head still arriving; nothing to conclude yet.
+        return false;
+    };
+    match exp {
+        m6_core::h1::Expectation::None => h1.expect_handled = true,
+        m6_core::h1::Expectation::Continue => {
+            h1.expect_handled = true;
+            let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
+            let _ = io.advance();
+        }
+        m6_core::h1::Expectation::Unsupported => {
+            h1.expect_handled = true;
+            let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            h1.state = H1State::Writing {
+                buf: resp.to_vec(),
+                pos: 0,
+            };
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)] // transport, connection, state and the two dispatch closures
 fn drive_h1<S, FH, FO>(
     io: &mut H1Io<'_>,
@@ -1474,34 +1511,12 @@ fn drive_h1<S, FH, FO>(
                 match parsed {
                     HeadResult::Incomplete => {
                         // The head may be complete even though the message is
-                        // not, and a client that sent `Expect: 100-continue`
-                        // is holding its body back until we answer. Saying
-                        // nothing is a deadlock the client breaks by timing
-                        // out: curl waits a full second, then sends anyway.
-                        if !h1.expect_handled {
-                            let exp = match &h1.state {
-                                H1State::Reading { buf } => m6_core::h1::expectation(buf),
-                                _ => None,
-                            };
-                            match exp {
-                                // Head still arriving; nothing to conclude yet.
-                                None => {}
-                                Some(m6_core::h1::Expectation::None) => h1.expect_handled = true,
-                                Some(m6_core::h1::Expectation::Continue) => {
-                                    h1.expect_handled = true;
-                                    let _ = io.write(m6_core::h1::CONTINUE_RESPONSE);
-                                    let _ = io.advance();
-                                }
-                                Some(m6_core::h1::Expectation::Unsupported) => {
-                                    h1.expect_handled = true;
-                                    let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                    h1.state = H1State::Writing {
-                                        buf: resp.to_vec(),
-                                        pos: 0,
-                                    };
-                                    continue;
-                                }
-                            }
+                        // not, and a client that sent `Expect: 100-continue` is
+                        // holding its body back until we answer. `handle_expect`
+                        // answers it once and returns true when a final 417 was
+                        // queued, so the loop switches to writing.
+                        if handle_expect(h1, io) {
+                            continue;
                         }
                         // More request bytes may already be buffered: read on.
                         if dry {
@@ -1527,6 +1542,12 @@ fn drive_h1<S, FH, FO>(
                             };
                             match owned {
                                 ParseResult::Incomplete => {
+                                    // The head is complete and the body is not:
+                                    // answer `Expect: 100-continue` here too, so
+                                    // a client holding its body does not stall.
+                                    if handle_expect(h1, io) {
+                                        continue;
+                                    }
                                     if dry {
                                         break;
                                     }
@@ -1984,6 +2005,112 @@ pub struct HitHeaders {
     pub describedby: Option<Arc<[u8]>>,
 }
 
+/// The merged `Vary` field list for a response, deduplicated case-insensitively
+/// and with `Accept-Encoding` appended when absent. Allocation-free: the dedup
+/// rescans the header list, so a response naming any number of vary dimensions
+/// is handled. [`VaryMerge::is_star`] is true when a `Vary: *` is present, which
+/// the caller must replay as-is instead of merging.
+pub struct VaryMerge<'a> {
+    headers: &'a [(String, String)],
+    star: bool,
+    next: usize,
+    phase: u8,
+    has_accept_encoding: bool,
+}
+
+impl<'a> VaryMerge<'a> {
+    pub fn new(headers: &'a [(String, String)]) -> Self {
+        let star = headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.split(',').any(|f| f.trim() == "*"));
+        VaryMerge {
+            headers,
+            star,
+            next: 0,
+            phase: 0,
+            has_accept_encoding: false,
+        }
+    }
+
+    /// Whether the response carries `Vary: *`, which is replayed unchanged.
+    pub fn is_star(&self) -> bool {
+        self.star
+    }
+}
+
+impl<'a> Iterator for VaryMerge<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.star {
+            return None;
+        }
+        loop {
+            match self.phase {
+                0 => match vary_field_at(self.headers, self.next) {
+                    None => self.phase = 1,
+                    Some(field) => {
+                        self.next += 1;
+                        if vary_earlier(self.headers, self.next - 1, field) {
+                            continue;
+                        }
+                        if field.eq_ignore_ascii_case("accept-encoding") {
+                            self.has_accept_encoding = true;
+                        }
+                        return Some(field);
+                    }
+                },
+                1 => {
+                    self.phase = 2;
+                    return if self.has_accept_encoding {
+                        None
+                    } else {
+                        Some("Accept-Encoding")
+                    };
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// The vary field at flattened index `idx`, or `None` past the last one.
+fn vary_field_at(headers: &[(String, String)], idx: usize) -> Option<&str> {
+    let mut i = 0usize;
+    for (k, v) in headers {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if i == idx {
+                return Some(f);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Whether an equal field appears before the vary field at flattened index `upto`.
+fn vary_earlier(headers: &[(String, String)], upto: usize, field: &str) -> bool {
+    let mut i = 0usize;
+    for (k, v) in headers {
+        if !k.eq_ignore_ascii_case("vary") {
+            continue;
+        }
+        for g in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if i == upto {
+                return false;
+            }
+            if g.eq_ignore_ascii_case(field) {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Write a cached HTTP/1.1 response straight into `out`, allocating nothing.
 ///
 /// This is the cached-hit half of [`build_response`]: the same bytes, but the
@@ -2005,35 +2132,9 @@ pub fn write_cached_h1(
     let write_describedby = extra.describedby.is_some() && is_html;
 
     // Vary is merged (or left alone on `Vary: *`) exactly as
-    // `set_vary_accept_encoding(.., true)` does, so the two writers agree. The
-    // field list is bounded at 8: a response naming more vary dimensions is not
-    // one a real backend produces, and beyond the bound the writer still emits
-    // the fields, only without deduplicating them.
-    let mut vary_fields: [&str; 8] = [""; 8];
-    let mut nfields = 0usize;
-    let mut vary_star = false;
-    for (k, v) in entry.headers.iter() {
-        if !k.eq_ignore_ascii_case("vary") {
-            continue;
-        }
-        if v.trim() == "*" {
-            vary_star = true;
-            break;
-        }
-        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
-            if nfields < vary_fields.len()
-                && !vary_fields[..nfields]
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case(f))
-            {
-                vary_fields[nfields] = f;
-                nfields += 1;
-            }
-        }
-    }
-    let has_accept_encoding = vary_fields[..nfields]
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case("accept-encoding"));
+    // `set_vary_accept_encoding(.., true)` does, so the two writers agree.
+    let vary = VaryMerge::new(&entry.headers[..]);
+    let vary_star = vary.is_star();
 
     out.extend_from_slice(b"HTTP/1.1 ");
     out.extend_from_slice(itoa::Buffer::new().format(entry.status).as_bytes());
@@ -2072,17 +2173,11 @@ pub fn write_cached_h1(
 
     if !vary_star {
         out.extend_from_slice(b"vary: ");
-        for (i, f) in vary_fields[..nfields].iter().enumerate() {
+        for (i, f) in vary.enumerate() {
             if i > 0 {
                 out.extend_from_slice(b", ");
             }
             out.extend_from_slice(f.as_bytes());
-        }
-        if !has_accept_encoding {
-            if nfields > 0 {
-                out.extend_from_slice(b", ");
-            }
-            out.extend_from_slice(b"Accept-Encoding");
         }
         out.extend_from_slice(b"\r\n");
     }
@@ -2658,6 +2753,122 @@ mod keep_alive_tests {
         // Case-insensitive, per RFC 9110 7.6.1.
         assert!(!wants_keep_alive(&req("HTTP/1.1", &["CLOSE"])));
         assert!(wants_keep_alive(&req("HTTP/1.0", &["Keep-Alive"])));
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: a blocking TcpStream::connect drives the connection from outside"
+)]
+mod expect_tests {
+    use super::*;
+
+    fn h1_with_head(buf: Vec<u8>) -> H1Conn {
+        H1Conn {
+            state: H1State::Reading { buf },
+            created: Instant::now(),
+            keep_alive: false,
+            served: 0,
+            max_requests: 100,
+            expect_handled: false,
+        }
+    }
+
+    /// RFC 9110 10.1.1: a client that sends `Expect: 100-continue` holds its body
+    /// back until the server answers. The answer must fire on the body-incomplete
+    /// read too, not only while the head is still arriving.
+    #[test]
+    fn expect_100_continue_is_answered_before_the_body_arrives() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        let mut h1 = h1_with_head(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+                .to_vec(),
+        );
+        let mut io = H1Io::Plain { stream: &server };
+        assert!(!handle_expect(&mut h1, &mut io));
+        let mut got = [0u8; 64];
+        let n = client.read(&mut got).unwrap();
+        assert_eq!(&got[..n], m6_core::h1::CONTINUE_RESPONSE);
+    }
+
+    /// An unsupported expectation answers a final 417 and marks it handled, so a
+    /// later read does not answer twice.
+    #[test]
+    fn an_unsupported_expectation_queues_a_417() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        let mut h1 = h1_with_head(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: bogus\r\n\r\n".to_vec(),
+        );
+        let mut io = H1Io::Plain { stream: &server };
+        assert!(handle_expect(&mut h1, &mut io));
+        assert!(h1.expect_handled);
+        assert!(matches!(h1.state, H1State::Writing { .. }));
+    }
+}
+
+#[cfg(test)]
+mod vary_merge_tests {
+    use super::VaryMerge;
+
+    fn hdrs(vary: &[&str]) -> Vec<(String, String)> {
+        vary.iter()
+            .map(|v| ("Vary".to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn merged(vary: &[&str]) -> Vec<String> {
+        VaryMerge::new(&hdrs(vary)).map(str::to_string).collect()
+    }
+
+    /// The merge deduplicates case-insensitively, keeps field order, and appends
+    /// `Accept-Encoding` when absent.
+    #[test]
+    fn deduplicates_and_appends_accept_encoding() {
+        assert_eq!(
+            merged(&["Accept-Encoding, Cookie", "cookie, User-Agent"]),
+            vec!["Accept-Encoding", "Cookie", "User-Agent"]
+        );
+        assert_eq!(merged(&[]), vec!["Accept-Encoding"]);
+    }
+
+    /// More than eight vary dimensions must all survive: the writer used to cap
+    /// the list at 8 and silently drop the rest, which would let a downstream
+    /// shared cache share a response it should not.
+    #[test]
+    fn more_than_eight_fields_survive() {
+        let fields = [
+            "A",
+            "B",
+            "C",
+            "D",
+            "E",
+            "F",
+            "G",
+            "H",
+            "Cookie",
+            "User-Agent",
+        ];
+        let mut want: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        want.push("Accept-Encoding".to_string());
+        assert_eq!(merged(&[&fields.join(", ")]), want);
+    }
+
+    /// `Vary: *` means unpredictable and must be replayed as-is, never narrowed.
+    #[test]
+    fn star_is_replayed_as_is() {
+        let h = hdrs(&["*", "Accept-Encoding"]);
+        let merge = VaryMerge::new(&h);
+        assert!(merge.is_star());
+        assert_eq!(merge.collect::<Vec<_>>(), Vec::<&str>::new());
     }
 }
 
