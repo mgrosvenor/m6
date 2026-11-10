@@ -68,6 +68,9 @@ pub struct Request {
     /// rule this codebase settled on: config is a read-only reference
     /// throughout, never a copy.
     pub(crate) config: Option<std::sync::Arc<crate::config::RendererConfig>>,
+    /// When the request path picked the request up, for the completion log's
+    /// `latency_us`. Set by `site::Site::handle_raw`; `now` otherwise.
+    pub(crate) started: std::time::Instant,
 }
 
 impl Request {
@@ -85,7 +88,19 @@ impl Request {
             route_pattern: None,
             route_settings: None,
             config: None,
+            started: std::time::Instant::now(),
         }
+    }
+
+    /// Record the instant the request path started on, for `latency_us`.
+    pub(crate) fn with_started(mut self, started: std::time::Instant) -> Self {
+        self.started = started;
+        self
+    }
+
+    /// The instant the request path started on.
+    pub(crate) fn started(&self) -> std::time::Instant {
+        self.started
     }
 
     /// Attach route settings directly, without a `CompiledRoute`.

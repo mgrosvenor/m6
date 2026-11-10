@@ -205,16 +205,113 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
 /// Largest decoded chunked body accepted, matching the Content-Length cap.
 const MAX_CHUNKED_BODY: usize = 16 * 1024 * 1024;
 
-/// Outcome of decoding a chunked body in place.
+/// Outcome of decoding a chunked body.
 enum Chunked {
-    /// Fully decoded: `decoded` bytes at the front of the buffer, from `raw`
-    /// bytes of chunk framing at its start.
+    /// Fully decoded or decodable: `decoded` bytes at the front of the buffer,
+    /// from `raw` bytes of chunk framing at its start.
     Done { decoded: usize, raw: usize },
     /// A complete body has not arrived yet; read more and retry.
     Incomplete,
     /// Malformed framing. Not recoverable: the connection cannot be trusted to
     /// resynchronise, because the next bytes might be a smuggled request.
     Bad,
+}
+
+/// Parse one chunk-size line at `i`, returning the size and the index after
+/// its CRLF.
+///
+/// Extensions are permitted and ignored; the size ends at ';'. No sign, no
+/// whitespace, no underscores: a lenient size parser is exactly how two hops
+/// end up disagreeing. The arithmetic is checked, because a 16-digit size is a
+/// client's number and must not overflow.
+fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), Chunked> {
+    let Some(eol) = find_crlf(&buf[i..]) else {
+        return Err(Chunked::Incomplete);
+    };
+    let Some(line_end) = i.checked_add(eol) else {
+        return Err(Chunked::Bad);
+    };
+    let line = &buf[i..line_end];
+    let size_str = match line.iter().position(|&c| c == b';') {
+        Some(semi) => &line[..semi],
+        None => line,
+    };
+    if size_str.is_empty() || size_str.len() > 16 {
+        return Err(Chunked::Bad);
+    }
+    let mut size: usize = 0;
+    for &c in size_str {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => return Err(Chunked::Bad),
+        };
+        size = match size.checked_mul(16).and_then(|v| v.checked_add(d as usize)) {
+            Some(v) => v,
+            None => return Err(Chunked::Bad),
+        };
+    }
+    match line_end.checked_add(2) {
+        Some(next) => Ok((size, next)),
+        None => Err(Chunked::Bad),
+    }
+}
+
+/// Walk the chunk framing without touching a byte, and say whether the whole
+/// body is here.
+///
+/// The decoder below may copy only once this returns `Done`, so a body split
+/// across reads is retried against the bytes as they arrived rather than
+/// against a half-decoded buffer.
+fn chunked_extent(buf: &[u8]) -> Chunked {
+    let mut decoded = 0usize;
+    let mut i = 0usize;
+    loop {
+        let (size, next) = match chunk_size_at(buf, i) {
+            Ok(parsed) => parsed,
+            Err(outcome) => return outcome,
+        };
+        i = next;
+
+        if size == 0 {
+            // Last chunk. Trailer fields may follow, ending with a blank line.
+            loop {
+                let Some(eol) = find_crlf(&buf[i..]) else {
+                    return Chunked::Incomplete;
+                };
+                i = match i.checked_add(eol).and_then(|v| v.checked_add(2)) {
+                    Some(v) => v,
+                    None => return Chunked::Bad,
+                };
+                if eol == 0 {
+                    return Chunked::Done { decoded, raw: i };
+                }
+            }
+        }
+
+        let Some(decoded_end) = decoded.checked_add(size) else {
+            return Chunked::Bad;
+        };
+        if decoded_end > MAX_CHUNKED_BODY {
+            return Chunked::Bad;
+        }
+        let Some(data_end) = i.checked_add(size) else {
+            return Chunked::Bad;
+        };
+        let Some(crlf_end) = data_end.checked_add(2) else {
+            return Chunked::Bad;
+        };
+        if buf.len() < crlf_end {
+            return Chunked::Incomplete;
+        }
+        // Every chunk's data is followed by CRLF, exactly.
+        if &buf[data_end..crlf_end] != b"\r\n" {
+            return Chunked::Bad;
+        }
+        decoded = decoded_end;
+        i = crlf_end;
+    }
 }
 
 /// Decode a chunked transfer-coded body in place (RFC 9112 7.1).
@@ -230,78 +327,41 @@ enum Chunked {
 /// and the backend cannot disagree about where the request ends. That
 /// disagreement is request smuggling.
 ///
-/// In place because the bytes only shrink: each chunk's data is copied behind
-/// its framing, so a connection's buffer holds the decoded body with no second
-/// allocation, and a pipelined request behind the raw body stays where it is.
+/// The framing is walked first and nothing is written unless the whole body is
+/// present, so an incomplete body can be retried and a refused one leaves the
+/// buffer as it arrived. In place because the bytes only shrink: each chunk's
+/// data is copied behind its framing, so a connection's buffer holds the
+/// decoded body with no second allocation, and a pipelined request behind the
+/// raw body stays where it is.
 fn decode_chunked(buf: &mut [u8]) -> Chunked {
+    let (decoded, raw) = match chunked_extent(buf) {
+        Chunked::Done { decoded, raw } => (decoded, raw),
+        other => return other,
+    };
+
     let mut out = 0usize;
     let mut i = 0usize;
-
     loop {
-        // chunk-size [ ";" chunk-ext ] CRLF
-        let Some(eol) = find_crlf(&buf[i..]) else {
-            return Chunked::Incomplete;
+        let (size, next) = match chunk_size_at(buf, i) {
+            Ok(parsed) => parsed,
+            Err(_) => return Chunked::Bad,
         };
-        // Extensions are permitted and ignored; the size ends at ';'. No sign,
-        // no whitespace, no underscores: a lenient size parser is exactly how
-        // two hops end up disagreeing.
-        let size = {
-            let line = &buf[i..i + eol];
-            let size_str = match line.iter().position(|&c| c == b';') {
-                Some(semi) => &line[..semi],
-                None => line,
-            };
-            if size_str.is_empty() || size_str.len() > 16 {
-                return Chunked::Bad;
-            }
-            let mut size: usize = 0;
-            for &c in size_str {
-                let d = match c {
-                    b'0'..=b'9' => c - b'0',
-                    b'a'..=b'f' => c - b'a' + 10,
-                    b'A'..=b'F' => c - b'A' + 10,
-                    _ => return Chunked::Bad,
-                };
-                size = match size.checked_mul(16).and_then(|v| v.checked_add(d as usize)) {
-                    Some(v) => v,
-                    None => return Chunked::Bad,
-                };
-            }
-            size
-        };
-        i += eol + 2;
-
+        i = next;
         if size == 0 {
-            // Last chunk. Trailer fields may follow, ending with a blank line.
-            loop {
-                let Some(eol) = find_crlf(&buf[i..]) else {
-                    return Chunked::Incomplete;
-                };
-                i += eol + 2;
-                if eol == 0 {
-                    return Chunked::Done {
-                        decoded: out,
-                        raw: i,
-                    };
-                }
-            }
+            break;
         }
-
-        if out + size > MAX_CHUNKED_BODY {
+        let Some(data_end) = i.checked_add(size) else {
             return Chunked::Bad;
-        }
-        if buf.len() < i + size + 2 {
-            return Chunked::Incomplete;
-        }
-        buf.copy_within(i..i + size, out);
+        };
+        buf.copy_within(i..data_end, out);
         out += size;
-        i += size;
-        // Every chunk's data is followed by CRLF, exactly.
-        if &buf[i..i + 2] != b"\r\n" {
-            return Chunked::Bad;
-        }
-        i += 2;
+        i = match data_end.checked_add(2) {
+            Some(v) => v,
+            None => return Chunked::Bad,
+        };
     }
+    debug_assert_eq!(out, decoded, "the two chunk walks must agree");
+    Chunked::Done { decoded, raw }
 }
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
@@ -535,15 +595,15 @@ fn finish_head<'a>(
 
     // The body bytes are here only when the whole body has arrived. A caller
     // that frames a message itself waits for `head_len + body_len` bytes
-    // before it hands the head on.
+    // before it hands the head on. `Content-Length` is client input, so the
+    // sum is checked: a 20-digit length is larger than `usize` can add to an
+    // offset, and the refusal is `inspect`'s 413, not a panic here.
     let body: &'a [u8] = if saw_te {
         &[]
     } else {
-        let end = body_offset + body_len;
-        if buf.len() >= end {
-            &buf[body_offset..end]
-        } else {
-            &[]
+        match body_offset.checked_add(body_len) {
+            Some(end) if buf.len() >= end => &buf[body_offset..end],
+            _ => &[],
         }
     };
 
@@ -576,25 +636,6 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
 /// [`parse_head`] (the HTTP/1.1 fast path) calls this on the miss, so the
 /// head is not parsed twice.
 pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
-    let method = head.method.to_string();
-    let path = head.path.to_string();
-    let query = head.query.map(str::to_string);
-    let version = head.version.to_string();
-
-    // Copy the surviving headers: transfer-coding is hop-by-hop and not
-    // forwarded, and a value that is not UTF-8 is dropped rather than rejected
-    // (matching prior behaviour).
-    let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(head.headers.len());
-    for h in head.headers {
-        if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            continue;
-        }
-        let Ok(v) = std::str::from_utf8(h.value) else {
-            continue;
-        };
-        fwd_headers.push((h.name.to_string(), v.to_string()));
-    }
-
     let chunked = head
         .headers
         .iter()
@@ -610,7 +651,6 @@ pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
             Chunked::Bad => return ParseResult::Error,
             Chunked::Done { decoded, .. } => {
                 body.truncate(decoded);
-                fwd_headers.push(("Content-Length".to_string(), decoded.to_string()));
                 body
             }
         }
@@ -621,15 +661,42 @@ pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
         }
         buf[head.head_len..head.head_len + head.body_len].to_vec()
     };
+    ParseResult::Complete(owned_request(head, body))
+}
 
-    ParseResult::Complete(RawRequest {
-        method,
-        path,
-        query,
-        version,
-        headers: fwd_headers,
+/// Copy a parsed head and its body into the owned request a handler receives.
+///
+/// One copy of the method, path, query, headers and body, shared by
+/// [`materialize`] and by `site::Site`'s update of a slot's borrowed head.
+/// Transfer-coding is hop-by-hop and dropped, and a decoded chunked body is
+/// given a `Content-Length`, so no downstream hop has to agree about chunk
+/// framing.
+pub(crate) fn owned_request(head: &RequestHead<'_>, body: Vec<u8>) -> RawRequest {
+    let chunked = head
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+    let mut headers = Vec::with_capacity(head.headers.len());
+    for h in head.headers {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        let Ok(value) = std::str::from_utf8(h.value) else {
+            continue;
+        };
+        headers.push((h.name.to_string(), value.to_string()));
+    }
+    if chunked {
+        headers.push(("Content-Length".to_string(), body.len().to_string()));
+    }
+    RawRequest {
+        method: head.method.to_string(),
+        path: head.path.to_string(),
+        query: head.query.map(str::to_string),
+        version: head.version.to_string(),
+        headers,
         body,
-    })
+    }
 }
 
 // ── Responses ────────────────────────────────────────────────────────────────
@@ -897,10 +964,11 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
         let bodyless = write_head_to(
             &mut w,
             status,
-            headers,
+            headers.iter().copied(),
             length,
             self.is_head,
             self.keep_alive,
+            None,
         )?;
         w.flush()?;
         drop(w);
@@ -914,13 +982,14 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
 /// persistence decision are written. `Responder` wraps `w` in a `BufWriter` so
 /// a socket gets one write per head; a connection slot's writer is already the
 /// slot's buffer, so it calls this directly. Returns whether a body follows.
-fn write_head_to<W: std::io::Write>(
+fn write_head_to<'a, W: std::io::Write>(
     w: &mut W,
     status: u16,
-    headers: &[(&str, &str)],
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
     length: u64,
     is_head: bool,
     keep_alive: bool,
+    etag: Option<u64>,
 ) -> std::io::Result<bool> {
     write!(w, "HTTP/1.1 {} {}\r\n", status, status_reason(status))?;
     for (k, v) in headers {
@@ -935,6 +1004,12 @@ fn write_head_to<W: std::io::Write>(
         w.write_all(b": ")?;
         w.write_all(v.as_bytes())?;
         w.write_all(b"\r\n")?;
+    }
+    // The default tag is formatted here rather than built as a `String`, so a
+    // connection slot writes a whole answer with no allocation. A caller that
+    // already put an `ETag` in `headers` passes `None`.
+    if let Some(hash) = etag {
+        write!(w, "ETag: \"{hash:x}\"\r\n")?;
     }
     write!(
         w,
@@ -953,9 +1028,11 @@ fn write_head_to<W: std::io::Write>(
 
 /// Header slots a service's loop hands to [`ServerConn::read`].
 ///
-/// Made once at start with [`head_slots`], one array per connection or one per
-/// loop, never one per request. The slots are `MaybeUninit` so making the
-/// array writes nothing: the parser fills exactly the entries it uses.
+/// Made where the head is read, not once at start: a `&mut` to a long-lived
+/// array cannot be reborrowed for each turn's shorter borrow of the head, and
+/// the borrow checker refuses it. `head_slots`, not a zeroed array: the slots
+/// are `MaybeUninit`, so making them writes nothing and the parser fills
+/// exactly the entries it uses.
 pub type HeadSlots<'a> = [std::mem::MaybeUninit<httparse::Header<'a>>; 64];
 
 /// A new set of empty header slots.
@@ -999,14 +1076,20 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 ///
 /// A slot is made at start with its buffers ([`ServerConn::new`]), a stream is
 /// attached on accept and detached on close. Reading, parsing and writing go
-/// through those buffers, so serving a request allocates only when a request
-/// or a response is larger than them.
+/// through those buffers, so serving a request allocates nothing: a request or
+/// a response larger than them is the one case that grows a buffer, and it is
+/// cut back afterwards.
 ///
 /// The turn loop a service writes per connection:
 ///
 /// ```no_run
-/// # fn serve(conn: &mut m6_core::h1::ServerConn) -> std::io::Result<()> {
+/// # fn serve(conn: &mut m6_core::h1::ServerConn, site: &m6_core::Site) -> std::io::Result<()> {
+/// # fn service_route(_: usize, _: &m6_core::Request) -> m6_core::Response {
+/// #     m6_core::Response::text("handler")
+/// # }
 /// use m6_core::h1::{Flush, Read};
+/// use m6_core::mio::{Interest, Token};
+/// # fn reregister(_: &mut m6_core::h1::ServerConn, _: Interest, _: Token) {}
 ///
 /// loop {
 ///     // Made here, not before the loop: the head borrows the slots, and a
@@ -1014,22 +1097,47 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 ///     // shorter head on each turn. `head_slots` writes nothing.
 ///     let mut heads = m6_core::h1::head_slots();
 ///     let read = conn.read(&mut heads)?;
-///     let answered = match read {
-///         // The head borrows the slot. It is dropped here, before the answer,
-///         // so the slot can be written to below.
-///         Read::Request(_head) => true,
-///         // Nothing more to read. Flush an answer queued for a refusal.
-///         Read::More => false,
+///     // The head borrows the slot, so its answer is built in this match and
+///     // written after it, when the borrow has ended.
+///     let (response, idle) = match read {
+///         Read::Request(head) => {
+///             let response = match site.handle(&head) {
+///                 m6_core::Handled::Done(response) => response,
+///                 // A route the service answers itself: its handler for the
+///                 // index, then `site.finish`.
+///                 m6_core::Handled::Code(index, req) => {
+///                     let response = service_route(index, &req);
+///                     site.finish(&req, response)
+///                 }
+///                 m6_core::Handled::Named(index, req) => {
+///                     let response = service_route(index, &req);
+///                     site.finish(&req, response)
+///                 }
+///             };
+///             (Some(response), false)
+///         }
+///         // Nothing more to read. A refusal may have been queued for a
+///         // malformed request; write it below.
+///         Read::More => (None, true),
 ///         Read::Closed => return Ok(()),
 ///     };
-///     if answered {
-///         // `site.handle(&head)` goes here, then `respond_response`.
-///         conn.respond(200, &[("Content-Type", "text/plain")], b"ok");
+///     if let Some(response) = response {
+///         conn.respond_response(response);
 ///     }
 ///     match conn.flush()? {
-///         Flush::Done if answered => {}
+///         // The answer is out and the connection keeps alive. A pipelined
+///         // request may already be buffered, so read again before waiting.
+///         Flush::Done if !idle => {}
+///         // The answer is out and there is nothing more to read this turn.
 ///         Flush::Done => return Ok(()),
-///         Flush::More | Flush::Close => return Ok(()),
+///         // The socket would block with output still queued. Register
+///         // WRITABLE and flush again when it is.
+///         Flush::More => {
+///             reregister(conn, Interest::WRITABLE, Token(0));
+///             return Ok(());
+///         }
+///         // Everything is written and this connection closes.
+///         Flush::Close => return Ok(()),
 ///     }
 /// }
 /// # }
@@ -1043,16 +1151,19 @@ pub struct ServerConn {
     in_read_cap: usize,
     /// Bytes of the buffer the request being answered occupies, dropped when
     /// the next `read` starts.
-    consumed: std::cell::Cell<usize>,
+    consumed: usize,
+    /// A chunked body already decoded in place, waiting for the next parse to
+    /// lend its head: (head length, decoded length, raw length).
+    decoded: Option<(usize, usize, usize)>,
     /// Output: `out_buf[..out_len]` is queued, `out_pos` bytes of it written.
     out_buf: Vec<u8>,
     out_len: usize,
     out_pos: usize,
     out_write_cap: usize,
     body: Option<StreamBody>,
-    is_head: std::cell::Cell<bool>,
-    keep_alive: std::cell::Cell<bool>,
-    served: std::cell::Cell<u32>,
+    is_head: bool,
+    keep_alive: bool,
+    served: u32,
     close_after: bool,
     expect_answered: bool,
 }
@@ -1069,15 +1180,16 @@ impl ServerConn {
             in_buf: vec![0; read_cap],
             in_len: 0,
             in_read_cap: read_cap,
-            consumed: std::cell::Cell::new(0),
+            consumed: 0,
+            decoded: None,
             out_buf: vec![0; write_cap],
             out_len: 0,
             out_pos: 0,
             out_write_cap: write_cap,
             body: None,
-            is_head: std::cell::Cell::new(false),
-            keep_alive: std::cell::Cell::new(true),
-            served: std::cell::Cell::new(0),
+            is_head: false,
+            keep_alive: true,
+            served: 0,
             close_after: false,
             expect_answered: false,
         }
@@ -1113,10 +1225,17 @@ impl ServerConn {
     /// Read and parse one request. Never waits: `More` when the socket has
     /// nothing complete, `Closed` when the peer is gone.
     ///
-    /// A request already complete in the buffer is returned without a read, so
-    /// a pipelined second request is served on the same readiness event. A
-    /// refusal a malformed request earns is queued as a response and returned
-    /// as `More`, with the connection marked to close after the flush.
+    /// The socket is read until it would block (edge-triggered) and the
+    /// buffered bytes are framed. A whole request is then parsed once more to
+    /// lend its head: the framing parse's head borrows a scratch array that
+    /// dies with it, and EL-3c's `RequestHead` needs the caller's slots to be
+    /// the ones the parse filled, so the lending parse is the one that can
+    /// return. A request already complete in the buffer is served on the same
+    /// readiness event as the read that brought it.
+    ///
+    /// A refusal a malformed request earns is queued as a response and
+    /// returned as `More`, with the connection marked to close after the
+    /// flush.
     pub fn read<'a>(&'a mut self, heads: &'a mut HeadSlots<'a>) -> io::Result<Read<'a>> {
         if self.stream.is_none() {
             return Ok(Read::Closed);
@@ -1124,80 +1243,62 @@ impl ServerConn {
         self.drop_consumed();
 
         loop {
-            // The decision step borrows the slot only for its own call, so its
-            // result is owned and the slot can be used again below.
             match inspect(&self.in_buf[..self.in_len]) {
                 Next::Complete {
                     len,
                     is_head,
                     keep_alive,
                 } => {
-                    let parsed = parse_head_uninit(&self.in_buf[..self.in_len], heads);
-                    let HeadResult::Complete(head) = parsed else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "a request head changed between two parses",
-                        ));
-                    };
                     self.begin(is_head, keep_alive, len);
-                    return Ok(Read::Request(head));
+                    return self.lend(heads, None);
+                }
+                Next::Chunked {
+                    head_len,
+                    is_head,
+                    keep_alive,
+                } => match decode_chunked(&mut self.in_buf[head_len..self.in_len]) {
+                    Chunked::Bad => {
+                        self.queue_error(400);
+                        return Ok(Read::More);
+                    }
+                    Chunked::Incomplete => {
+                        // Answer any expectation before the next read could
+                        // wait for a body the client holds back.
+                        self.answer_expectation();
+                        if self.close_after {
+                            return Ok(Read::More);
+                        }
+                    }
+                    Chunked::Done { decoded, raw } => {
+                        self.begin(is_head, keep_alive, head_len + raw);
+                        return self.lend(heads, Some((head_len, decoded)));
+                    }
+                },
+                Next::Need => {
+                    self.answer_expectation();
+                    if self.close_after {
+                        return Ok(Read::More);
+                    }
                 }
                 Next::Error(status) => {
                     self.queue_error(status);
                     return Ok(Read::More);
                 }
-                Next::Need(total) => {
-                    self.answer_expectation();
-                    if self.close_after {
-                        return Ok(Read::More);
-                    }
-                    if self.in_buf.len() < total {
-                        self.in_buf.resize(total, 0);
-                    }
-                }
-                Next::Chunked(head_len) => {
-                    match decode_chunked(&mut self.in_buf[head_len..self.in_len]) {
-                        Chunked::Bad => {
-                            self.queue_error(400);
-                            return Ok(Read::More);
-                        }
-                        Chunked::Incomplete => {
-                            self.answer_expectation();
-                            if self.close_after {
-                                return Ok(Read::More);
-                            }
-                        }
-                        Chunked::Done { decoded, raw } => {
-                            let parsed = parse_head_uninit(&self.in_buf[..self.in_len], heads);
-                            let HeadResult::Complete(head) = parsed else {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "a request head changed between two parses",
-                                ));
-                            };
-                            let head = with_body(head, &self.in_buf[head_len..head_len + decoded]);
-                            self.begin(
-                                head.method.eq_ignore_ascii_case("HEAD"),
-                                keep_alive_head(&head),
-                                head_len + raw,
-                            );
-                            return Ok(Read::Request(head));
-                        }
-                    }
-                }
                 Next::Read => {}
             }
 
-            // Room for more bytes: the request's own size when it is known,
-            // otherwise double, up to the two caps.
+            // Room for more bytes: double when the buffer is full, and only
+            // for bytes that actually arrived, so a declared body does not
+            // allocate before its contents do. A declared length over the cap
+            // was refused by `inspect`.
             if self.in_len == self.in_buf.len() {
                 let cap = MAX_HEADER_BYTES + MAX_BODY_BYTES;
                 if self.in_buf.len() >= cap {
                     self.queue_error(413);
                     return Ok(Read::More);
                 }
-                let grown = (self.in_buf.len() * 2).min(cap);
-                self.in_buf.resize(grown, 0);
+                let doubled = (self.in_buf.len() * 2).min(cap);
+                self.in_buf.resize(doubled, 0);
             }
 
             match self.fill()? {
@@ -1213,6 +1314,37 @@ impl ServerConn {
                 }
             }
         }
+    }
+
+    /// Parse the buffered bytes once more and lend the head, with the chunked
+    /// body filled in when there is one.
+    fn lend<'a>(
+        &'a mut self,
+        heads: &'a mut HeadSlots<'a>,
+        body: Option<(usize, usize)>,
+    ) -> io::Result<Read<'a>> {
+        let parsed = parse_head_uninit(&self.in_buf[..self.in_len], heads);
+        let HeadResult::Complete(head) = parsed else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a request head changed between two parses",
+            ));
+        };
+        Ok(Read::Request(match body {
+            Some((head_len, decoded)) => {
+                with_body(head, &self.in_buf[head_len..head_len + decoded])
+            }
+            None => head,
+        }))
+    }
+
+    /// Record the request being answered: its method, its persistence and how
+    /// much of the input buffer it occupies.
+    fn begin(&mut self, is_head: bool, keep_alive: bool, len: usize) {
+        self.served += 1;
+        self.is_head = is_head;
+        self.keep_alive = keep_alive && self.served < MAX_REQUESTS_PER_CONN;
+        self.consumed = len;
     }
 
     /// Answer `Expect: 100-continue` once, before a read could wait for a body
@@ -1236,7 +1368,8 @@ impl ServerConn {
     /// The slot's input and output buffer sizes.
     ///
     /// Testkit only: it proves a buffer grown for a request larger than the
-    /// slot was cut back afterwards, which nothing on the wire can show.
+    /// slot was cut back afterwards, and that a declared body does not grow it
+    /// before the body arrives. Nothing on the wire can show either.
     #[cfg(feature = "testkit")]
     pub fn buffer_caps(&self) -> (usize, usize) {
         (self.in_buf.len(), self.out_buf.len())
@@ -1248,10 +1381,11 @@ impl ServerConn {
         let bodyless = write_head_to(
             &mut out,
             status,
-            headers,
+            headers.iter().copied(),
             body.len() as u64,
-            self.is_head.get(),
-            self.keep_alive.get(),
+            self.is_head,
+            self.keep_alive,
+            None,
         )
         .expect("the slot's output buffer cannot fail");
         if !bodyless {
@@ -1260,50 +1394,58 @@ impl ServerConn {
         }
     }
 
-    /// Queue a [`Response`]. A `Body::Stream` writes its head here and its body
-    /// is pumped by [`flush`](Self::flush), one chunk per writable turn.
+    /// Queue a [`Response`]. Its head is written straight into the slot, with
+    /// the one default `Content-Type`/`ETag` rule, so no request allocates a
+    /// header vector or a formatting buffer. A `Body::Stream` writes its head
+    /// here and its body is pumped by [`flush`](Self::flush), one chunk per
+    /// writable turn.
     pub fn respond_response(&mut self, response: Response) {
-        let add_content_type = !crate::headers::contains(&response.headers[..], "content-type")
-            && !response.body.is_empty();
-        if matches!(response.body, Body::Stream { .. }) {
-            let Response {
-                status,
-                headers,
-                body,
-                ..
-            } = response;
-            let Body::Stream { len, reader } = body else {
-                unreachable!("matched above");
-            };
-            let hdrs = crate::response::wire_headers(&headers, add_content_type);
-            let bodyless = {
+        let etag = crate::response::default_etag(&response.headers, &response.body);
+        let Response {
+            status,
+            headers,
+            body,
+            ..
+        } = response;
+        match body {
+            Body::Bytes(bytes) => {
                 let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
-                write_head_to(
+                let bodyless = write_head_to(
                     &mut out,
                     status,
-                    &hdrs,
-                    len,
-                    self.is_head.get(),
-                    self.keep_alive.get(),
+                    crate::response::head_fields(&headers, bytes.is_empty()),
+                    bytes.len() as u64,
+                    self.is_head,
+                    self.keep_alive,
+                    etag,
                 )
-                .expect("the slot's output buffer cannot fail")
-            };
-            if !bodyless {
-                self.body = Some(StreamBody {
-                    remaining: len,
-                    reader,
-                });
-            }
-        } else {
-            let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
-            let mut responder = Responder::new(
-                &mut out,
-                if self.is_head.get() { "HEAD" } else { "" },
-                self.keep_alive.get(),
-            );
-            response
-                .send(&mut responder)
                 .expect("the slot's output buffer cannot fail");
+                if !bodyless {
+                    out.write_all(&bytes)
+                        .expect("the slot's output buffer cannot fail");
+                }
+            }
+            Body::Stream { len, reader } => {
+                let bodyless = {
+                    let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
+                    write_head_to(
+                        &mut out,
+                        status,
+                        crate::response::head_fields(&headers, false),
+                        len,
+                        self.is_head,
+                        self.keep_alive,
+                        None,
+                    )
+                    .expect("the slot's output buffer cannot fail")
+                };
+                if !bodyless {
+                    self.body = Some(StreamBody {
+                        remaining: len,
+                        reader,
+                    });
+                }
+            }
         }
     }
 
@@ -1360,33 +1502,23 @@ impl ServerConn {
             self.out_buf.shrink_to(self.out_write_cap);
         }
 
-        Ok(if self.close_after || !self.keep_alive.get() {
+        Ok(if self.close_after || !self.keep_alive {
             Flush::Close
         } else {
             Flush::Done
         })
     }
 
-    /// Record the request being answered: its method, its persistence and how
-    /// much of the input buffer it occupies.
-    fn begin(&self, is_head: bool, keep_alive: bool, len: usize) {
-        self.served.set(self.served.get() + 1);
-        self.is_head.set(is_head);
-        self.keep_alive
-            .set(keep_alive && self.served.get() < MAX_REQUESTS_PER_CONN);
-        self.consumed.set(len);
-    }
-
     /// Drop the previous request from the input buffer when the next read
     /// starts, and cut a grown buffer back to its start size.
     fn drop_consumed(&mut self) {
-        let consumed = self.consumed.get();
-        if consumed == 0 {
+        self.decoded = None;
+        if self.consumed == 0 {
             return;
         }
-        self.in_buf.copy_within(consumed..self.in_len, 0);
-        self.in_len -= consumed;
-        self.consumed.set(0);
+        self.in_buf.copy_within(self.consumed..self.in_len, 0);
+        self.in_len -= self.consumed;
+        self.consumed = 0;
         self.expect_answered = false;
         if self.in_buf.len() > self.in_read_cap && self.in_len <= self.in_read_cap {
             self.in_buf.truncate(self.in_read_cap);
@@ -1402,7 +1534,7 @@ impl ServerConn {
             .error(status)
             .expect("the slot's output buffer cannot fail");
         self.close_after = true;
-        self.keep_alive.set(false);
+        self.keep_alive = false;
     }
 
     fn queue_bytes(&mut self, bytes: &[u8]) {
@@ -1432,13 +1564,14 @@ impl ServerConn {
     /// Reset every per-connection field and cut grown buffers back.
     fn reset(&mut self) {
         self.in_len = 0;
-        self.consumed.set(0);
+        self.consumed = 0;
+        self.decoded = None;
         self.out_len = 0;
         self.out_pos = 0;
         self.body = None;
-        self.is_head.set(false);
-        self.keep_alive.set(true);
-        self.served.set(0);
+        self.is_head = false;
+        self.keep_alive = true;
+        self.served = 0;
         self.close_after = false;
         self.expect_answered = false;
         if self.in_buf.len() > self.in_read_cap {
@@ -1452,29 +1585,34 @@ impl ServerConn {
     }
 }
 
-/// What one parse of the buffered bytes says to do next.
+/// What one framing parse of the buffered bytes says to do next.
+///
+/// Owned, so the parse's borrow of the buffer ends before the slot is used
+/// again. `Complete` and `Chunked` carry the request's method and persistence
+/// so the slot can record them before the lending parse.
 enum Next {
-    /// A complete request is buffered, with the framing `read` records before
-    /// it parses once more to lend the head.
+    /// A whole request is buffered.
     Complete {
         len: usize,
         is_head: bool,
         keep_alive: bool,
     },
-    /// More bytes are needed.
+    /// A chunked request whose body is not decoded yet.
+    Chunked {
+        head_len: usize,
+        is_head: bool,
+        keep_alive: bool,
+    },
+    /// A `Content-Length` body is still incomplete.
+    Need,
+    /// More bytes are needed for the head.
     Read,
     /// Refuse with this status and close.
     Error(u16),
-    /// A `Content-Length` body this many bytes long is still incomplete.
-    Need(usize),
-    /// A chunked body starting after this head length is still incomplete.
-    Chunked(usize),
 }
 
-/// Parse the buffered bytes for a framing decision.
-///
-/// Its own slots on the stack, so the caller's slots stay free for the parse
-/// that lends the request head. `MaybeUninit`, so this writes nothing.
+/// Frame the buffered bytes. Its own stack slots, so the caller's slots stay
+/// free for the lending parse that follows.
 fn inspect(in_buf: &[u8]) -> Next {
     let mut slots = head_slots();
     match parse_head_uninit(in_buf, &mut slots) {
@@ -1489,34 +1627,33 @@ fn inspect(in_buf: &[u8]) -> Next {
             }
         }
         HeadResult::Complete(head) => {
-            if !head.has_body() {
-                complete(&head, head.head_len)
-            } else if head.body_len > MAX_BODY_BYTES {
-                Next::Error(413)
-            } else if head
+            let is_head = head.method.eq_ignore_ascii_case("HEAD");
+            let keep_alive = keep_alive_head(&head);
+            if head
                 .headers
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
             {
-                Next::Chunked(head.head_len)
+                Next::Chunked {
+                    head_len: head.head_len,
+                    is_head,
+                    keep_alive,
+                }
+            } else if head.body_len > MAX_BODY_BYTES {
+                Next::Error(413)
             } else {
                 let total = head.head_len + head.body_len;
                 if in_buf.len() >= total {
-                    complete(&head, total)
+                    Next::Complete {
+                        len: total,
+                        is_head,
+                        keep_alive,
+                    }
                 } else {
-                    Next::Need(total)
+                    Next::Need
                 }
             }
         }
-    }
-}
-
-/// The framing decision for a complete request, as owned values.
-fn complete(head: &RequestHead<'_>, len: usize) -> Next {
-    Next::Complete {
-        len,
-        is_head: head.method.eq_ignore_ascii_case("HEAD"),
-        keep_alive: keep_alive_head(head),
     }
 }
 
@@ -1559,6 +1696,41 @@ impl std::io::Write for OutBuf<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod framing_overflow_tests {
+    use super::*;
+
+    /// `Content-Length` is client input. A 20-digit value is larger than a
+    /// `usize` can add to the head offset, and it must be refused by the body
+    /// cap rather than panicking in the head slice or the owned copy.
+    #[test]
+    fn a_twenty_digit_content_length_does_not_overflow() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: a\r\n\
+                    Content-Length: 18446744073709551615\r\n\r\n";
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        match parse_head(raw, &mut slots) {
+            HeadResult::Complete(head) => {
+                assert_eq!(head.body_len, usize::MAX);
+                assert_eq!(head.body(), b"");
+            }
+            _ => panic!("the head is valid"),
+        }
+        assert!(
+            matches!(parse_request(raw), ParseResult::Incomplete),
+            "the body has not arrived, so the message is incomplete"
+        );
+    }
+
+    /// A chunk size of 16 hex digits is `usize::MAX`. Adding it to the decoded
+    /// position overflows, and the body is malformed framing, not a panic.
+    #[test]
+    fn a_sixteen_digit_chunk_size_is_malformed() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    1\r\na\r\nffffffffffffffff\r\n";
+        assert!(matches!(parse_request(raw), ParseResult::Error));
     }
 }
 

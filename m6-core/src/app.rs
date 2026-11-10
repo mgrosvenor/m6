@@ -120,7 +120,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2479,7 +2479,7 @@ fn run_app_with_shutdown(
     // logging, the route table and the checks that name it. The `Arc` is
     // shared read-only by the worker threads until EL-6d removes `App`.
     let site = Arc::new(crate::site::Site::start(
-        &program_name(),
+        &crate::site::program_name(),
         Invocation {
             site_dir,
             config_path,
@@ -2496,29 +2496,15 @@ fn run_app_with_shutdown(
     let socket_mode = site.socket_mode();
     let socket_path = site.socket_path().to_path_buf();
 
-    // Bind socket.
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path).ok();
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
+    // Bind socket: one start helper, so the stale-file, parent-directory and
+    // mode rules are the ones every service has. The listener is non-blocking
+    // for the poll loop; an accepted stream goes back to blocking for the
+    // worker thread that serves it.
+    let listener = crate::net::listen_unix(&socket_path, socket_mode).unwrap_or_else(|e| {
         eprintln!("Failed to bind socket {}: {e}", socket_path.display());
+        std::fs::remove_file(&socket_path).ok();
         std::process::exit(2);
     });
-
-    // Before the shutdown handle below, which self-connects to this socket:
-    // the mode has to be right by the time anything can reach it. A socket
-    // with a mode nobody chose is a start failure, so the process stops.
-    if let Err(e) = crate::server::apply_socket_mode(&socket_path, socket_mode) {
-        eprintln!(
-            "Failed to set mode {socket_mode:04o} on socket {}: {e}",
-            socket_path.display()
-        );
-        std::fs::remove_file(&socket_path).ok();
-        std::process::exit(2);
-    }
 
     // After the bind, not before: the wake connects to this socket, so it has
     // to exist by the time a signal can arrive.
@@ -2541,8 +2527,10 @@ fn run_app_with_shutdown(
             .map(|(_, _, handler)| handler)
             .collect(),
     );
-    let named_handlers: Arc<HashMap<String, Arc<BoxHandler>>> =
-        Arc::new(named.into_iter().collect());
+    // A vector, in the order `Site` was given the names: `Handled::Named(i)`
+    // is an index, so no lookup and no second absent-name branch here.
+    let named_handlers: Arc<Vec<Arc<BoxHandler>>> =
+        Arc::new(named.into_iter().map(|(_, handler)| handler).collect());
 
     use std::os::unix::io::AsRawFd;
     let listener_fd = listener.as_raw_fd();
@@ -2564,6 +2552,13 @@ fn run_app_with_shutdown(
 
         match listener.accept() {
             Ok((stream, _)) => {
+                // The listener is non-blocking; the pool's workers read and
+                // write with blocking calls, so the stream is put back first.
+                let stream: UnixStream = stream.into();
+                if let Err(e) = stream.set_nonblocking(false) {
+                    error!("accept error: {e}");
+                    continue;
+                }
                 // Before the handoff, not inside the worker: a worker that has
                 // already taken the connection is the resource being protected.
                 crate::server::apply_read_timeout(&stream, read_timeout);
@@ -2601,21 +2596,6 @@ fn run_app_with_shutdown(
     Ok(())
 }
 
-/// The binary's own name, for the lifecycle lines: `argv[0]`'s file name.
-fn program_name() -> String {
-    std::env::args()
-        .next()
-        .and_then(|a| {
-            std::path::Path::new(&a)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(str::to_owned)
-        })
-        // Used only when `argv[0]` has no file name, so no binary name is
-        // available to report.
-        .unwrap_or_else(|| "m6-app".to_string())
-}
-
 /// One accepted connection, served until it ends.
 ///
 /// The loop, the malformed-request answer, the HEAD rule and the keep-alive
@@ -2625,7 +2605,7 @@ fn handle_connection(
     stream: &mut UnixStream,
     site: &crate::site::Site,
     code_handlers: &[Arc<BoxHandler>],
-    named_handlers: &HashMap<String, Arc<BoxHandler>>,
+    named_handlers: &[Arc<BoxHandler>],
 ) {
     let served: std::result::Result<(), std::io::Error> =
         crate::server::serve_connection(stream, |raw, resp| {
@@ -2635,17 +2615,10 @@ fn handle_connection(
                     Ok(response) => site.finish(&req, response),
                     Err(e) => site.finish(&req, crate::response::error_to_response(&e)),
                 },
-                crate::site::Handled::Named(index, req) => {
-                    match named_handlers.get(&site.named_handlers()[index]) {
-                        Some(handler) => match handler.call(&req) {
-                            Ok(response) => site.finish(&req, response),
-                            Err(e) => site.finish(&req, crate::response::error_to_response(&e)),
-                        },
-                        // `Site::prepare` refused an absent name, so this is
-                        // unreachable in a started service. 500, not 404.
-                        None => site.finish(&req, Response::status(500)),
-                    }
-                }
+                crate::site::Handled::Named(index, req) => match named_handlers[index].call(&req) {
+                    Ok(response) => site.finish(&req, response),
+                    Err(e) => site.finish(&req, crate::response::error_to_response(&e)),
+                },
             };
             crate::server::write_response(resp, response).ok();
             Ok(())

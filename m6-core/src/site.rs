@@ -61,12 +61,12 @@ pub struct Site {
     name: String,
     /// Index into `code` by `pattern:method`, the key the dispatch uses.
     code_index: HashMap<String, usize>,
-    /// Config routes' handler names, in the order `load` was given them.
-    named: Vec<String>,
-    /// The logging worker, held for the life of the site. The `Mutex` only
-    /// makes `Site` `Sync` when `App` shares it across worker threads; nothing
-    /// locks it after start.
-    _log: std::sync::Mutex<Option<crate::log::LogHandle>>,
+    /// Index into the named handlers by name. `Handled::Named` is this index,
+    /// and the caller's handler vector is in the order `load` was given.
+    named_index: HashMap<String, usize>,
+    /// The logging worker, held for the life of the site and never touched
+    /// again. A plain `Option` because `LogHandle` is `Sync`.
+    _log: Option<crate::log::LogHandle>,
 }
 
 impl Site {
@@ -221,6 +221,11 @@ impl Site {
             .map(|(i, (pattern, method))| (format!("{pattern}:{}", route_method_key(method)), i))
             .collect();
 
+        let named_index = named
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
         Ok(Site {
             state,
             config_path,
@@ -228,8 +233,8 @@ impl Site {
             socket_path,
             name: name.to_string(),
             code_index,
-            named: named.to_vec(),
-            _log: std::sync::Mutex::new(log),
+            named_index,
+            _log: log,
         })
     }
 
@@ -266,7 +271,7 @@ impl Site {
     }
 
     /// The service's name, for the lifecycle lines and the startup log.
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
@@ -283,12 +288,6 @@ impl Site {
         )
     }
 
-    /// The config routes' handler names, in the order `load` was given them.
-    /// A service's `Handled::Named(i, ..)` indexes into this.
-    pub(crate) fn named_handlers(&self) -> &[String] {
-        &self.named
-    }
-
     /// Handle a borrowed request head. Builds the owned request the service's
     /// handler needs from the head, then dispatches.
     pub fn handle(&self, head: &RequestHead<'_>) -> Handled {
@@ -298,39 +297,38 @@ impl Site {
     /// `handle` for a caller that already owns a [`RawRequest`]: the one
     /// dispatch, shared by the borrowed path and by `App`'s blocking workers.
     pub(crate) fn handle_raw(&self, raw: RawRequest) -> Handled {
+        let started = std::time::Instant::now();
         let matched = find_route(raw.path(), raw.method(), &self.state.routes)
             .map(|(route, params)| (route, self.state.build_dict(&raw, route, &params)));
 
         let (route, dict) = match matched {
             None => {
                 warn!(path = raw.path(), "unmatched path");
-                let resp = self.finish_raw(&raw, None, None, Response::not_found());
+                let resp = self.finish_raw(&raw, None, None, started, Response::not_found());
                 return Handled::Done(resp);
             }
             Some((route, dict)) => match dict {
                 Ok(dict) => (route, dict),
                 Err(e) => {
+                    // An internal failure is finished like the unmatched 404:
+                    // no route defaults and no cookies an error has no use for.
                     let resp = crate::response::error_to_response(&e);
-                    let resp = self.finish_raw(&raw, None, Some(route), resp);
+                    let resp = self.finish_raw(&raw, None, None, started, resp);
                     return Handled::Done(resp);
                 }
             },
         };
 
-        // A template route is answered here and comes back finished.
-        if let Some(template) = &route.template {
-            let resp = Response::render_request_dict(template, route.status);
-            let resp = self.finish_raw(&raw, Some(&dict), Some(route), resp);
-            return Handled::Done(resp);
-        }
-
         let req = Request::new(raw, dict, Arc::clone(&self.state.site_dir))
+            .with_started(started)
             .with_route(route)
             .with_config(Arc::clone(&self.state.config));
 
-        // A config route naming a registered handler.
+        // The order the request path has always dispatched in: a config route
+        // naming a handler, then a code route, then a template. A route
+        // carrying both a handler and a template goes to the handler.
         if let Some(name) = &route.handler {
-            if let Some(index) = self.named.iter().position(|n| n == name) {
+            if let Some(&index) = self.named_index.get(name) {
                 return Handled::Named(index, req);
             }
             // `prepare` refused an absent name, so an absent one here means
@@ -345,16 +343,27 @@ impl Site {
             return Handled::Done(resp);
         }
 
-        // A code route, found by pattern and method exactly as the dispatch
-        // used to find it.
-        let key = format!("{}:{}", route.pattern, route.methods.handler_key());
-        match self.code_index.get(&key) {
-            Some(&index) => Handled::Code(index, req),
-            None => {
-                let resp = Response::not_found();
-                Handled::Done(self.finish(&req, resp))
+        if route.template.is_none() {
+            // A code route, found by pattern and method exactly as the
+            // dispatch used to find it.
+            let key = format!("{}:{}", route.pattern, route.methods.handler_key());
+            match self.code_index.get(&key) {
+                Some(&index) => return Handled::Code(index, req),
+                None => {
+                    let resp = self.finish(&req, Response::not_found());
+                    return Handled::Done(resp);
+                }
             }
         }
+
+        if let Some(template) = &route.template {
+            let resp = Response::render_request_dict(template, route.status);
+            let resp = self.finish_raw(req.raw(), Some(req.dict()), Some(route), started, resp);
+            return Handled::Done(resp);
+        }
+
+        let resp = self.finish(&req, Response::not_found());
+        Handled::Done(resp)
     }
 
     /// Renders a template the response names, then Cache-Control, CSRF, flash,
@@ -363,7 +372,7 @@ impl Site {
     pub fn finish(&self, req: &Request, resp: Response) -> Response {
         let route =
             find_route(req.path(), req.method(), &self.state.routes).map(|(route, _)| route);
-        self.finish_raw(req.raw(), Some(req.dict()), route, resp)
+        self.finish_raw(req.raw(), Some(req.dict()), route, req.started(), resp)
     }
 
     /// The one finish path, for a request that has a [`Request`] and for one
@@ -373,6 +382,7 @@ impl Site {
         raw: &RawRequest,
         dict: Option<&Dict>,
         route: Option<&CompiledRoute>,
+        started: std::time::Instant,
         mut resp: Response,
     ) -> Response {
         // Render a template the response names.
@@ -518,6 +528,7 @@ impl Site {
             path = raw.path(),
             method = raw.method(),
             status = resp.status,
+            latency_us = started.elapsed().as_micros(),
             "request complete"
         );
         resp
@@ -541,6 +552,11 @@ impl Site {
             .enumerate()
             .map(|(i, (pattern, method))| (format!("{pattern}:{}", route_method_key(method)), i))
             .collect();
+        let named_index = named
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
         Site {
             state,
             config_path: PathBuf::new(),
@@ -548,42 +564,16 @@ impl Site {
             socket_path: PathBuf::new(),
             name: "m6-test".to_string(),
             code_index,
-            named,
-            _log: std::sync::Mutex::new(None),
+            named_index,
+            _log: None,
         }
     }
 }
 
-/// The owned request a handler is given, built from the borrowed head: one
-/// copy of the method, path, query, headers and body. Transfer-coding is
-/// dropped and the decoded body is given a `Content-Length`, as the owned
-/// parser does, so no downstream hop has to agree about chunk framing.
+/// The owned request a handler is given, built from the borrowed head: the one
+/// copy `h1::owned_request` makes for both the borrowed path and the owned one.
 fn raw_from_head(head: &RequestHead<'_>) -> RawRequest {
-    let chunked = head
-        .headers
-        .iter()
-        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
-    let mut headers = Vec::with_capacity(head.headers.len());
-    for h in head.headers {
-        if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            continue;
-        }
-        let Ok(value) = std::str::from_utf8(h.value) else {
-            continue;
-        };
-        headers.push((h.name.to_string(), value.to_string()));
-    }
-    if chunked {
-        headers.push(("Content-Length".to_string(), head.body().len().to_string()));
-    }
-    RawRequest {
-        method: head.method.to_string(),
-        path: head.path.to_string(),
-        query: head.query.map(str::to_string),
-        version: head.version.to_string(),
-        headers,
-        body: head.body().to_vec(),
-    }
+    crate::h1::owned_request(head, head.body().to_vec())
 }
 
 /// The checking half of the `App` start path's `site_toml_or_exit`.
@@ -626,6 +616,24 @@ pub(crate) struct Invocation {
     pub(crate) cli_log_level: Option<String>,
 }
 
+/// The binary's own name, from `argv[0]`, for the lifecycle lines and
+/// `--version`.
+///
+/// Not `CARGO_PKG_NAME`: that macro expands where it is written, which is
+/// m6-core, so every service would announce itself as "m6-core" and a deploy
+/// log would not say which binary it had just checked.
+pub(crate) fn program_name() -> String {
+    std::env::args()
+        .next()
+        .and_then(|arg| {
+            std::path::Path::new(&arg)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "m6".to_string())
+}
+
 /// Parse the command line, and handle the flags that do not start a server.
 ///
 /// `--dump-config` loads the configuration exactly as the service would, prints
@@ -653,11 +661,7 @@ pub(crate) fn parse_invocation(
         // expands where it is written, which is m6-core, so every service would
         // announce itself as "m6-core" and a deploy log would not say which binary
         // it had just checked.
-        let name = std::path::Path::new(&args[0])
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("m6");
-        println!("{} {}", name, env!("CARGO_PKG_VERSION"));
+        println!("{} {}", program_name(), env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
 
@@ -1027,6 +1031,63 @@ mod tests {
         match site.handle(&head) {
             Handled::Done(resp) => assert_eq!(resp.status, 200),
             _ => panic!("a template route must come back Done"),
+        }
+    }
+
+    /// A route carrying both a handler and a template goes to the handler,
+    /// which is the order the request path has always dispatched in. A change
+    /// there would silently send such a route's requests to the template.
+    #[test]
+    fn a_route_with_a_handler_and_a_template_goes_to_the_handler() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/both\"\nhandler = \"files\"\n\
+             template = \"templates/index.html\"\n",
+            &["other", "files"],
+        );
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(b"GET /both HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut slots) {
+            crate::h1::HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        match site.handle(&head) {
+            Handled::Named(1, _) => {}
+            Handled::Named(0, _) => panic!("index 0 is `other`"),
+            Handled::Named(index, _) => panic!("unexpected named index {index}"),
+            Handled::Done(_) => panic!("the handler wins over the template"),
+            Handled::Code(..) => panic!("a config route names no code route"),
+        }
+    }
+
+    /// An internal dictionary failure is finished like the unmatched 404: no
+    /// route's default `Cache-Control`, no `Last-Modified`, no route headers.
+    /// An error must not go out looking like cacheable content.
+    #[test]
+    fn a_dictionary_error_is_finished_without_route_defaults() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/assets/{*relpath}\"\ntemplate = \"templates/index.html\"\n\
+             cache = \"public\"\n",
+            &[],
+        );
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        // A percent sign in the wildcard capture fails path validation, which
+        // is a dictionary build error. (A space would fail the HTTP parse.)
+        let head = match parse_head(
+            b"GET /assets/a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut slots,
+        ) {
+            crate::h1::HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        match site.handle(&head) {
+            Handled::Done(response) => {
+                assert_eq!(response.status, 400);
+                assert!(
+                    !crate::headers::contains(&response.headers[..], "cache-control"),
+                    "an error must not carry the route's Cache-Control: {:?}",
+                    response.headers
+                );
+            }
+            _ => panic!("a matched route with a template comes back Done"),
         }
     }
 

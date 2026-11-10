@@ -61,6 +61,14 @@ fn main() {
         keep_alive_and_the_request_cap,
     );
     failed |= check("parse_errors_answer_as_today", parse_errors_answer_as_today);
+    failed |= check(
+        "a_chunked_body_split_across_reads_is_one_request",
+        a_chunked_body_split_across_reads_is_one_request,
+    );
+    failed |= check(
+        "a_declared_body_does_not_allocate_before_it_arrives",
+        a_declared_body_does_not_allocate_before_it_arrives,
+    );
     std::process::exit(if failed { 1 } else { 0 });
 }
 
@@ -671,5 +679,154 @@ fn parse_errors_answer_as_today() -> bool {
         }
     }
 
+    // A 20-digit Content-Length is refused by the body cap. It must not
+    // overflow the head's body slice on the way.
+    {
+        let mut h = harness();
+        h.client
+            .write_all(
+                b"POST /x HTTP/1.1\r\nHost: localhost\r\n\
+                  Content-Length: 18446744073709551615\r\n\r\n",
+            )
+            .expect("write");
+        h.wait_readable();
+        let flush = h.turn();
+        let mut response = [0u8; 4096];
+        let n = h.client.read(&mut response).expect("read");
+        let text = String::from_utf8_lossy(&response[..n]).to_string();
+        if flush != Flush::Close || !text.starts_with("HTTP/1.1 413 Payload Too Large\r\n") {
+            println!("  20-digit length: {flush:?} {text:?}");
+            return false;
+        }
+    }
+
+    // A 16-hex-digit chunk size is `usize::MAX`: malformed framing, 400.
+    {
+        let mut h = harness();
+        h.client
+            .write_all(
+                b"POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  1\r\na\r\nffffffffffffffff\r\n",
+            )
+            .expect("write");
+        h.wait_readable();
+        let flush = h.turn();
+        let mut response = [0u8; 4096];
+        let n = h.client.read(&mut response).expect("read");
+        let text = String::from_utf8_lossy(&response[..n]).to_string();
+        if flush != Flush::Close || !text.starts_with("HTTP/1.1 400 Bad Request\r\n") {
+            println!("  huge chunk size: {flush:?} {text:?}");
+            return false;
+        }
+    }
+
     true
+}
+
+/// A chunked body split across reads is one request with the whole body, never
+/// a 400 and never a second request parsed out of the chunk framing. The
+/// in-place decoder may copy only once the whole body is buffered.
+fn a_chunked_body_split_across_reads_is_one_request() -> bool {
+    const HEAD: &[u8] =
+        b"POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const BODY: &[u8] = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+
+    // One byte at a time.
+    {
+        let mut h = harness();
+        h.client.write_all(HEAD).expect("write the head");
+        h.wait_readable();
+        {
+            let mut heads = h1::head_slots();
+            if !matches!(h.conn.read(&mut heads).expect("read"), Read::More) {
+                println!("  the head alone must be More");
+                return false;
+            }
+        }
+        let mut body = None;
+        for &byte in BODY {
+            h.client.write_all(&[byte]).expect("write a body byte");
+            h.wait_readable();
+            let mut heads = h1::head_slots();
+            match h.conn.read(&mut heads).expect("read") {
+                Read::Request(head) => {
+                    body = Some(head.body().to_vec());
+                    break;
+                }
+                Read::More => {}
+                Read::Closed => return false,
+            }
+        }
+        if body.as_deref() != Some(&b"hello world"[..]) {
+            println!("  one-byte body gave {body:?}");
+            return false;
+        }
+        // The chunk framing must not be parsed again as requests.
+        {
+            let mut heads = h1::head_slots();
+            if !matches!(h.conn.read(&mut heads).expect("read"), Read::More) {
+                println!("  the body was parsed a second time");
+                return false;
+            }
+        }
+        h.conn
+            .respond(200, &[("Content-Type", "text/plain")], b"ok");
+        if h.conn.flush().expect("flush") != Flush::Done {
+            return false;
+        }
+        let mut response = [0u8; RESPONSE_LEN];
+        if h.client.read_exact(&mut response).is_err() {
+            return false;
+        }
+        if !response.starts_with(b"HTTP/1.1 200 OK\r\n") {
+            return false;
+        }
+    }
+
+    // In two writes.
+    {
+        let mut h = harness();
+        h.client.write_all(HEAD).expect("write the head");
+        h.wait_readable();
+        let half = BODY.len() / 2;
+        h.client.write_all(&BODY[..half]).expect("write half");
+        h.wait_readable();
+        {
+            let mut heads = h1::head_slots();
+            if !matches!(h.conn.read(&mut heads).expect("read"), Read::More) {
+                println!("  half a body must be More");
+                return false;
+            }
+        }
+        h.client.write_all(&BODY[half..]).expect("write the rest");
+        h.wait_readable();
+        let mut heads = h1::head_slots();
+        match h.conn.read(&mut heads).expect("read") {
+            Read::Request(head) => {
+                if head.body() != b"hello world" {
+                    println!("  two-write body gave {:?}", head.body());
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+/// A declared body allocates only as its bytes arrive: a short request naming
+/// a 16 MiB `Content-Length` must not grow the slot to 16 MiB before the body
+/// is sent.
+fn a_declared_body_does_not_allocate_before_it_arrives() -> bool {
+    let mut h = harness();
+    h.client
+        .write_all(b"POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16777216\r\n\r\n")
+        .expect("write");
+    h.wait_readable();
+    let mut heads = h1::head_slots();
+    let more = matches!(h.conn.read(&mut heads).expect("read"), Read::More);
+    let (read_cap, _) = h.conn.buffer_caps();
+    println!("  declared 16 MiB body, head only: read buffer {read_cap}");
+    more && read_cap <= 2 * READ_CAP
 }

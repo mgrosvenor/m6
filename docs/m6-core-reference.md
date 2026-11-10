@@ -116,8 +116,8 @@ Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-Thirty-eight component modules, five of them behind features, grouped by the task that sends a reader to one.
-The prelude in section 1 is the thirty-ninth `pub mod` in `lib.rs`, and it re-exports the items the other modules implement.
+The component modules, five of them behind features, are grouped by the task that sends a reader to one.
+The prelude in section 1 is a `pub mod` in `lib.rs` that re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
 | group | module | what it is |
@@ -346,6 +346,7 @@ pub fn user_config(&self) -> &Map<String, Value>;
 pub fn site_dir(&self) -> &Path;
 pub fn config_path(&self) -> &Path;
 pub fn site_toml(&self) -> &Path;
+pub fn name(&self) -> &str;
 pub fn handle(&self, head: &RequestHead<'_>) -> Handled;
 pub fn finish(&self, req: &Request, resp: Response) -> Response;
 ```
@@ -373,7 +374,7 @@ let resp = match site.handle(&head) {
 `finish` renders a template the response names, then applies the route's `Cache-Control`, `Last-Modified` and headers, the CSRF and flash cookies, minification and compression, in the order the old request path did.
 
 **Allocation.** `Site` allocates on the start and stop paths freely.
-The page path allocates once per request today: the owned `Request`, its dictionary, Tera and compression.
+The page path allocates on every request today: the owned `Request` and its dictionary, Tera and compression.
 EL-6a measures that count in `site_allocs` and ALLOC-3 reduces it.
 
 Those six modules are a service's own parts: the builder, its configuration, its socket, its signals, its renderer and the site's request path.
@@ -504,14 +505,16 @@ caller whose writer is already a buffer.
 `new(read_cap, write_cap)` makes it at start, `attach` takes an accepted
 `mio::net::UnixStream` and `detach` gives it back, and `stream()` is what the
 reactor registers.
-`read` reads until the socket would block, parses with `parse_head_uninit` into
-the caller's fixed header slots, and returns `Read::Request(head)`, `Read::More`
-or `Read::Closed`. It keeps the request's method, the keep-alive decision and
-the served count on the slot, so `respond` needs no request argument.
+`read` reads until the socket would block and frames what is buffered. A whole
+request is then parsed with `parse_head_uninit` into the caller's fixed header
+slots and returned as `Read::Request(head)`, or `read` reports `Read::More` or
+`Read::Closed`. It keeps the request's method, the keep-alive decision and the
+served count on the slot, so `respond` needs no request argument.
 `respond(status, headers, body)` queues a short answer and
 `respond_response(Response)` queues a handler's. `flush` writes until the socket
-would block and reports `Done` (empty and keeping alive), `More` (empty the
-socket, write again when writable) or `Close` (empty and done).
+would block and reports `Done` (everything written, connection keeping alive),
+`More` (the socket would block with output still queued, so write again when it
+is writable) or `Close` (everything written and the connection closes).
 A `Body::Stream` body is pumped 64 KiB per writable turn, one `read(2)` of the
 file per turn.
 A request or a response larger than the slot's buffers grows that buffer and it
@@ -529,19 +532,43 @@ The turn loop:
 loop {
     let mut heads = h1::head_slots();
     let read = conn.read(&mut heads)?;
-    let (answered, response) = match read {
-        Read::Request(head) => (true, Some(site.handle(&head))),
-        Read::More => (false, None),
+    // The head borrows the slot, so its answer is built here and written
+    // after the match, when the borrow has ended.
+    let (response, idle) = match read {
+        Read::Request(head) => {
+            let response = match site.handle(&head) {
+                Handled::Done(response) => response,
+                Handled::Code(index, req) => {
+                    let response = service_route(index, &req);
+                    site.finish(&req, response)
+                }
+                Handled::Named(index, req) => {
+                    let response = service_route(index, &req);
+                    site.finish(&req, response)
+                }
+            };
+            (Some(response), false)
+        }
+        Read::More => (None, true),
         Read::Closed => break,
     };
     if let Some(response) = response {
         conn.respond_response(response);
     }
-    if conn.flush()? != Flush::Done {
-        break;
-    }
-    if !answered {
-        break;
+    match conn.flush()? {
+        // Everything is written and the connection keeps alive. A pipelined
+        // request may already be buffered, so read again before waiting.
+        Flush::Done if !idle => {}
+        // Everything is written and this turn has nothing more to read.
+        Flush::Done => break,
+        // The socket would block with output still queued: register
+        // WRITABLE and flush again when it is.
+        Flush::More => {
+            reregister(&mut conn, Interest::WRITABLE, token);
+            break;
+        }
+        // Everything is written and this connection closes.
+        Flush::Close => break,
     }
 }
 ```
