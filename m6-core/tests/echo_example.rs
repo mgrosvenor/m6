@@ -1,9 +1,10 @@
-//! The echo examples, proved over the wire: the nine checks of the echo
+//! The echo programs, proved over the wire: the nine checks of the echo
 //! prototype's `check.py` in Rust, plus one TLS round-trip check.
 //!
-//! Each test starts the example as a child process, reads its `listening on`
+//! Each test starts a program as a child process, reads its `listening on`
 //! line for the address, and waits on a signal with a deadline, never a fixed
-//! sleep. Run with `--features testkit` so the examples are built:
+//! sleep. The programs are `[[bin]]` targets behind `testkit`, so this one
+//! command builds and runs them (`CARGO_BIN_EXE_echo` / `CARGO_BIN_EXE_echo_tls`):
 //!
 //! ```text
 //! cargo test -p m6-core --features testkit --test echo_example -- --test-threads=1
@@ -297,16 +298,14 @@ fn an_idle_client_is_closed_after_its_deadline() {
 fn a_reset_client_does_not_take_the_server_down() {
     let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
     let mut reset = TcpStream::connect(srv.addr).expect("connect");
-    // Drive the order explicitly: round-trip a message first, so the reset
-    // below lands on a connection the server has fully read and echoed, not on
-    // a read still in flight. The old test wrote 100 KB and reset immediately,
-    // which raced the reset against the server's read and surfaced as
-    // ECONNRESET under load.
-    reset.write_all(b"probe\n").expect("send");
-    assert_eq!(
-        recv_exact(&mut reset, 6, Duration::from_secs(10)),
-        b"probe\n"
-    );
+    // A payload far larger than one buffer, so a reset can land while bytes the
+    // server has not read yet are still in flight.
+    reset.write_all(&vec![b'y'; 100_000]).expect("send");
+    // The echo is the signal the server has STARTED reading: read one buffer's
+    // worth, then reset while the rest of the 100 KB is still in flight. This
+    // is driven by the echo, not by timing.
+    let echoed = recv_exact(&mut reset, 16 * 1024, Duration::from_secs(10));
+    assert!(echoed.iter().all(|&b| b == b'y'));
     socket2::SockRef::from(&reset)
         .set_linger(Some(Duration::ZERO))
         .ok();
