@@ -180,8 +180,13 @@ pub fn record(
 /// load generates (every static asset it references) instead of writing a
 /// fresh `Set-Cookie` on each one.
 pub fn is_html_response(resp_headers: &[(String, String)]) -> bool {
-    m6_core::headers::get(resp_headers, "content-type")
-        .is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"))
+    // Case-insensitive prefix check with no allocation: `to_ascii_lowercase`
+    // built a `String` on the cached-hit hot path.
+    m6_core::headers::get(resp_headers, "content-type").is_some_and(|v| {
+        v.as_bytes()
+            .get(..9)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"text/html"))
+    })
 }
 
 /// Convenience veneer over [`record`] for call sites that already own a

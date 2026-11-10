@@ -24,8 +24,8 @@ use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::http11::{
-    make_tls_server_config, Http11Listener, RequestOutcome, DEFAULT_MAX_REQUESTS_PER_CONN,
-    INITIAL_CONNECTIONS,
+    make_tls_server_config, HitHeaders, Http11Listener, RequestHead, RequestOutcome,
+    DEFAULT_MAX_REQUESTS_PER_CONN, INITIAL_CONNECTIONS,
 };
 use quiche::h3::NameValue as _;
 
@@ -125,9 +125,21 @@ where
             )
             .expect("register listener");
         let mut events = Events::with_capacity(64);
-        let mut on_request = |_: &mut (), req: &HttpRequest, ip: &str| {
+        let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
+            let req = match m6_core::h1::materialize(head, buf) {
+                m6_core::h1::ParseResult::Complete(r) => r,
+                _ => return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string()),
+            };
+            let (s, h, b, be) = handler(&req, ip);
+            RequestOutcome::Ready(s, h, b, be)
+        };
+        let mut on_owned = |_: &mut (), req: &HttpRequest, ip: &str| {
             let (s, h, b, be) = handler(req, ip);
             RequestOutcome::Ready(s, h, b, be)
+        };
+        let hit = HitHeaders {
+            alt_svc: std::sync::Arc::from(&[] as &[u8]),
+            describedby: None,
         };
         while !stop2.load(Ordering::Relaxed) {
             match poll.poll(&mut events, Some(Duration::from_millis(2))) {
@@ -162,8 +174,14 @@ where
                         }
                     }
                     Token(k) => {
-                        let drive =
-                            listener.drive_one(k, &mut (), &mut on_request, poll.registry());
+                        let drive = listener.drive_one(
+                            k,
+                            &mut (),
+                            &mut on_head,
+                            &mut on_owned,
+                            &hit,
+                            poll.registry(),
+                        );
                         if drive.done {
                             listener.close_one(k, poll.registry());
                         }

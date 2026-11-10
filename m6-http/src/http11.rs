@@ -1384,6 +1384,7 @@ impl H1Io<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // transport, connection, state and the two dispatch closures
 fn drive_h1<S, FH, FO>(
     io: &mut H1Io<'_>,
     h1: &mut H1Conn,
@@ -2041,7 +2042,9 @@ pub fn write_cached_h1(
         }
         if write_describedby
             && k.eq_ignore_ascii_case("link")
-            && v.to_ascii_lowercase().contains("rel=\"describedby\"")
+            && v.as_bytes()
+                .windows(b"rel=\"describedby\"".len())
+                .any(|w| w.eq_ignore_ascii_case(b"rel=\"describedby\""))
         {
             continue;
         }

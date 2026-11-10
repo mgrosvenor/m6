@@ -152,3 +152,9 @@ harness = false
 [[bench]]
 name    = "bench_coldstart"
 harness = false
+
+# The cached-hit allocation check, on the main thread so the counting allocator
+# reads only the hit path's own allocations.
+[[test]]
+name = "alloc_cached_hit"
+harness = false

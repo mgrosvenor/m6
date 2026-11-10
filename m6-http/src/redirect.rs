@@ -295,6 +295,7 @@ mod tests {
         match outcome {
             RequestOutcome::Ready(s, ..) => *s,
             RequestOutcome::Pending { .. } => panic!("a redirect is never pending"),
+            RequestOutcome::Cached { .. } => panic!("a redirect is never cached"),
         }
     }
 
@@ -305,6 +306,7 @@ mod tests {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.clone()),
             RequestOutcome::Pending { .. } => None,
+            RequestOutcome::Cached { .. } => None,
         }
     }
 

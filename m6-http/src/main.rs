@@ -671,6 +671,7 @@ enum Routed {
 /// borrowed (h1) paths. The request fields are borrowed, so a cached hit never
 /// materialises an owned request. Stats and analytics run here; the caller
 /// writes the outcome in the shape its protocol wants.
+#[allow(clippy::too_many_arguments)] // one request's five borrowed fields plus state, peer and role
 fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     state: &mut ServerState,
     method: &str,

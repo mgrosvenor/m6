@@ -1216,7 +1216,7 @@ mod parse_head_tests {
         assert!(!h.has_body());
         assert_eq!(h.headers.len(), 2);
         assert_eq!(
-            crate::http::header(&h.headers[..], "host"),
+            crate::http::header(h.headers, "host"),
             Some("example.com")
         );
     }
