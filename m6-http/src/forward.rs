@@ -1223,8 +1223,14 @@ mod tests {
         .expect("encode");
         let s = std::str::from_utf8(&bytes).unwrap();
 
-        assert!(s.contains("Host: api.example.com\r\n"), "{s}");
-        assert!(!s.contains("Host: original.host\r\n"), "{s}");
+        assert!(
+            s.lines().any(|l| l == "Host: api.example.com"),
+            "the backend's authority is the Host: {s}"
+        );
+        assert!(
+            !s.lines().any(|l| l == "Host: original.host"),
+            "the client's Host is replaced, not repeated: {s}"
+        );
         assert!(s.contains("Connection: keep-alive\r\n"), "{s}");
         assert!(!s.contains("Connection: close\r\n"), "{s}");
     }
