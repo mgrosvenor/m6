@@ -71,9 +71,10 @@ fn setup_test_env(id: &str) -> TestEnv {
     std::fs::write(&private_key_path, &private_pem).unwrap();
     std::fs::write(&public_key_path, &public_pem).unwrap();
 
+    let db_path = site_dir.join("data/auth.db").display().to_string();
     let config = format!(
         r#"[storage]
-path = "data/auth.db"
+path = "{}"
 
 [tokens]
 access_ttl  = 900
@@ -88,6 +89,7 @@ queue_size = 32
 private_key = "{}"
 public_key  = "{}"
 "#,
+        db_path,
         private_key_path.display(),
         public_key_path.display(),
     );

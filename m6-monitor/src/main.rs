@@ -121,6 +121,9 @@ fn build_state(ctx: &AppContext) -> Result<MonitorState> {
     let history_config = history::config_from(ctx.config.get("monitor"), ctx.site_dir)?;
     let (recorder, handle) = history::start(history_config.clone())?;
     let poller_handle = handle.clone();
+    // A fleet the poller cannot read stops the start here (exit 2), as a bad
+    // history key does.
+    fleet::Fleet::from_config(ctx.config_path)?;
     #[expect(
         clippy::disallowed_methods,
         reason = "monitor threads; removed by EL-9"

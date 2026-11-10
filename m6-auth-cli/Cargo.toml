@@ -11,6 +11,7 @@ name = "m6-auth-cli"
 
 [dependencies]
 m6-auth     = { path = "../m6-auth" }
+m6-core     = { path = "../m6-core", default-features = false }
 toml        = "0.8"
 anyhow      = "1"
 rpassword   = "7"

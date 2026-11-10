@@ -198,8 +198,8 @@ bind     = "$BENCH_ADDR"
 h2c_bind = "$H2C_BENCH_ADDR"
 internal_binds = ["$H2C_BENCH_ADDR"]
 internal_peers = ["$H2C_BENCH_PEER"]
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
+tls_cert = "$SITE_DIR/cert.pem"
+tls_key  = "$SITE_DIR/key.pem"
 EOF
 
 # m6-html config:

@@ -65,7 +65,7 @@ Take from it that every flag is optional and the two positional arguments are re
 
 | argument or flag | meaning |
 |---|---|
-| `<site-dir>` | the site root, used to resolve the key paths and the default `site.toml` |
+| `<site-dir>` | the site root, used to find the default `site.toml` |
 | `<config-path>` | the service config, normally `configs/m6-auth.conf` |
 | `--log-level <level>` | overrides the configured log level for this run |
 | `--dump-config` | prints the core configuration and any routes declared in the config, then exits |
@@ -87,9 +87,7 @@ The default format is *JSON* (JavaScript Object Notation), and `[log] format` in
 Logging is core's, so every m6 service writes the same lifecycle lines.
 Section 11.3 lists the lines this service adds.
 
-The config path decides the socket name and the storage base.
-The site directory decides the key paths and the default `site.toml`.
-Section 4 gives both rules, because the two roots differ.
+The config path decides the socket name.
 
 ## 4. Configuration
 
@@ -99,20 +97,20 @@ Take from it that `[storage]` and `[keys]` are the required sections, and that t
 
 | section | key | type | default | notes |
 |---|---|---|---|---|
-| `[storage]` | `path` | string | required | SQLite database path, resolved against the directory holding this config file |
+| `[storage]` | `path` | string | required | SQLite database path, absolute |
 | `[tokens]` | `access_ttl` | integer | `900` | access token lifetime in seconds |
 | `[tokens]` | `refresh_ttl` | integer | `2592000` | refresh token lifetime in seconds |
 | `[tokens]` | `issuer` | string | `[site] domain`, then `localhost` | the `iss` claim |
-| `[keys]` | `private_key` | string | required | path to the PEM private key, resolved against the site directory |
-| `[keys]` | `public_key` | string | required | path to the PEM public key, resolved against the site directory |
+| `[keys]` | `private_key` | string | required | path to the PEM private key, absolute |
+| `[keys]` | `public_key` | string | required | path to the PEM public key, absolute |
 | `[rate_limit]` | `max_attempts` | integer | `5` | failed logins allowed per address per window |
 | `[rate_limit]` | `window_secs` | integer | `900` | length of the failure window in seconds |
 
-**Table 3: the config keys, their defaults, and the two different path rules.**
+**Table 3: the config keys and their defaults.**
 
-A config at `configs/m6-auth.conf` with `path = "data/auth.db"` opens `<site>/configs/data/auth.db`.
-To put the database at `<site>/data/auth.db`, use `path = "../data/auth.db"`.
-The two path rules are in the notes column of Table 3, and the code is `m6-auth-server/src/config.rs`.
+Every path in this file is absolute.
+A relative path stops the service at startup with exit 2, and the error names the setting.
+The check is `secret_path` in `m6-core/src/config.rs`.
 
 The `issuer` falls back to `[site] domain` in the `site.toml` that the optional `site_toml` key names.
 When that file has no domain, the fallback is `localhost`.
@@ -127,7 +125,7 @@ A complete config:
 # configs/m6-auth.conf
 
 [storage]
-path = "../data/auth.db"          # resolved against configs/, so this is <site>/data/auth.db
+path = "/var/lib/m6-auth/auth.db"
 
 [tokens]
 access_ttl  = 900                 # 15 minutes
@@ -135,20 +133,21 @@ refresh_ttl = 2592000             # 30 days
 issuer      = "example.com"
 
 [keys]
-private_key = "/etc/m6/auth.pem"  # resolved against <site-dir>, and an absolute path is used as is
-public_key  = "/etc/m6/auth.pub"
+private_key = "/run/credentials/m6-auth.service/auth.pem"
+public_key  = "/run/credentials/m6-auth.service/auth.pub"
 
 [rate_limit]
 max_attempts = 5                  # failed logins per address
 window_secs  = 900                # 15 minutes
 ```
 
+The keys come from the unit's `LoadCredential` lines and the database from `StateDirectory=m6-auth`, as `m6-user-guide.md` section 7.2 sets out.
+
 ### 4.1. Keys and paths
 
 The private key signs every token and the public key verifies them.
 The service reads both files at startup and keeps them in memory.
-Both paths resolve against the site directory, so `keys/auth.pem` in a config at any path means `<site>/keys/auth.pem`.
-An absolute path is used unchanged.
+Both paths are absolute.
 
 The pair is checked at load.
 The service signs a probe token with the private key and verifies it with the public key.
@@ -157,11 +156,12 @@ Section 4.2 covers what a rotation does to tokens already issued.
 
 ### 4.2. Key rotation
 
-A rotation writes both key files, then restarts the service.
-The service reads both files at start and checks the pair, and a key that fails to load exits 2.
+A rotation writes the new key pair in /etc/m6.
+Restart m6-auth-server.
+Restart m6-http.
+systemd copies a credential when the unit starts, so each restart delivers the new files.
 
 A successful rotation changes the signing key immediately after the restart.
-Restart m6-http after m6-auth-server so it reads the new public key.
 From then on, m6-http refuses an access token signed with the old key at the next request with 401, and a browser sees the error response.
 
 A rotation also invalidates outstanding refresh tokens.
@@ -396,7 +396,7 @@ WAL lets readers and one writer proceed together.
 A second writer waits up to 5 seconds and then fails.
 Each worker has its own connection, so a login that is checking a password holds no lock another request needs.
 
-The database path is the `[storage] path` key, resolved against the config file's directory as section 4 states.
+The database path is the `[storage] path` key, an absolute path.
 The service creates the parent directory when it is missing.
 `m6-auth-cli` and a custom renderer use the same library and the same file, so a user created by the CLI is visible at the next login.
 
@@ -457,7 +457,7 @@ Take from it that a configuration fault fails the start, and a request fault bec
 |---|---|
 | `0` | clean shutdown, `--version`, or a successful `--dump-config` |
 | `1` | runtime error, including a failure to start logging |
-| `2` | configuration or invocation error: a missing argument, a config that does not parse, a key that does not load, a key pair that does not match, a database that cannot be opened, or a socket that cannot be bound |
+| `2` | configuration or invocation error: a missing argument, a config that does not parse, a relative path, a key that does not load, a key pair that does not match, a database that cannot be opened, or a socket that cannot be bound |
 
 **Table 9: the process exit codes.**
 

@@ -2,6 +2,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use m6_core::config::secret_path;
 use serde::{Deserialize, Serialize};
 
 /// Full merged configuration for m6-http.
@@ -1013,9 +1014,14 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     };
     let internal_binds = internal_binds.unwrap_or_default();
 
-    // Resolve TLS cert/key paths relative to site_dir if not absolute.
-    let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
-    let tls_key_path = tls_key.as_deref().map(|k| resolve_path(site_dir, k));
+    let tls_cert_path = tls_cert
+        .as_deref()
+        .map(|c| secret_path("[server] tls_cert", c))
+        .transpose()?;
+    let tls_key_path = tls_key
+        .as_deref()
+        .map(|k| secret_path("[server] tls_key", k))
+        .transpose()?;
 
     // Validate [site] required keys
     let raw_site = site_parsed.site.unwrap_or(RawSiteSection {
@@ -1077,9 +1083,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     if let Some(sys) = node_health {
         health.metrics_require = sys.metrics_require;
         health.metrics_peers = sys.metrics_peers;
-        health.metrics_token_file = sys
-            .metrics_token_file
-            .map(|p| resolve_path(site_dir, &p).to_string_lossy().into_owned());
+        health.metrics_token_file = sys.metrics_token_file;
     }
     // A token file and a token claim are two gates for the same endpoint. Both
     // set is a mistake, and a token file that cannot be read is a start failure.
@@ -1087,6 +1091,9 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         anyhow::bail!(
             "config error: [health] metrics_require replaces metrics_token_file. Remove metrics_token_file"
         );
+    }
+    if let Some(path) = &health.metrics_token_file {
+        secret_path("[health] metrics_token_file", path)?;
     }
     if let Some(ref path) = health.metrics_token_file {
         let token = std::fs::read_to_string(path).map_err(|e| {
@@ -1175,7 +1182,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // Validate auth. The misplaced check above has already refused an [auth] in
     // site.toml in two-file mode, so `auth` is the one owner's value.
     if let Some(ref a) = auth {
-        let key_path = resolve_path(site_dir, &a.public_key);
+        let key_path = secret_path("[auth] public_key", &a.public_key)?;
         if !key_path.exists() {
             anyhow::bail!(
                 "config error: [auth].public_key file not found: {}",
@@ -1248,16 +1255,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         route_groups,
         site_dir: site_dir.to_path_buf(),
     })
-}
-
-/// Resolve a path: if absolute, return as-is; otherwise relative to base.
-pub fn resolve_path(base: &Path, p: &str) -> PathBuf {
-    let pb = Path::new(p);
-    if pb.is_absolute() {
-        pb.to_path_buf()
-    } else {
-        base.join(pb)
-    }
 }
 
 /// Keys that are this node's own state. They belong in the system config.
@@ -1347,7 +1344,8 @@ mod tests {
     }
 
     fn write_file(dir: &Path, name: &str, content: &str) {
-        std::fs::write(dir.join(name), content).unwrap();
+        let replaced = content.replace("{DIR}", &dir.display().to_string());
+        std::fs::write(dir.join(name), replaced).unwrap();
     }
 
     /// `[[backend]] compresses` and what the edge does with it.
@@ -1396,7 +1394,7 @@ backend = "says-yes"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
 
         let cfg = load(dir.path(), &dir.path().join("system.toml")).expect("load");
@@ -1438,8 +1436,8 @@ name = "test"
 
 [server]
 bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
+tls_cert = "{DIR}/cert.pem"
+tls_key  = "{DIR}/key.pem"
 "#
         .to_string()
     }
@@ -1531,7 +1529,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1551,8 +1549,8 @@ name   = "Test"
 domain = "test.example.com"
 [server]
 bind     = "0.0.0.0:443"
-tls_cert = "missing-cert.pem"
-tls_key  = "key.pem"
+tls_cert = "{DIR}/missing-cert.pem"
+tls_key  = "{DIR}/key.pem"
 "#,
         );
         write_file(dir.path(), "system.toml", "");
@@ -1581,7 +1579,7 @@ path    = "/"
 backend = "unknown"
 "#,
         );
-        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown backend"));
@@ -1610,7 +1608,7 @@ path    = "/"
 backend = "b"
 "#,
         );
-        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("duplicate"));
@@ -1637,7 +1635,7 @@ backend = "b"
 require = "group:editors"
 "#,
         );
-        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("require"));
@@ -1662,7 +1660,7 @@ name = "b"
 sockets = "/run/m6/*.sock"
 "#,
         );
-        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("custom"));
@@ -1676,12 +1674,12 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "site.toml",
-            "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+            "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
         );
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
@@ -1773,7 +1771,7 @@ sockets = "/run/m6/*.sock"
             dir.path(),
             "system.toml",
             &format!(
-                "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n{line}\n"
+                "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{{DIR}}/cert.pem\"\ntls_key = \"{{DIR}}/key.pem\"\n{line}\n"
             ),
         );
         load(dir.path(), &dir.path().join("system.toml"))
@@ -1818,7 +1816,7 @@ backend = "b"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 60);
@@ -1837,7 +1835,7 @@ backend = "b"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\nbackend_timeout_secs = 120\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\nbackend_timeout_secs = 120\n",
         );
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
@@ -1981,8 +1979,8 @@ backend = "b"
         setup_minimal(dir.path());
         let mut site = minimal_site_toml();
         site = site.replace(
-            "tls_key  = \"key.pem\"\n",
-            "tls_key  = \"key.pem\"\ninternal_binds = []\n",
+            "tls_key  = \"{DIR}/key.pem\"\n",
+            "tls_key  = \"{DIR}/key.pem\"\ninternal_binds = []\n",
         );
         write_file(dir.path(), "site.toml", &site);
         let mut sys = minimal_system_toml();
@@ -2121,8 +2119,8 @@ domain = "test.example.com"
         setup_minimal(dir.path());
         let mut site = minimal_site_toml();
         site = site.replace(
-            "tls_key  = \"key.pem\"\n",
-            "tls_key  = \"key.pem\"\ninternal_peers = [\"10.0.0.9\"]\n",
+            "tls_key  = \"{DIR}/key.pem\"\n",
+            "tls_key  = \"{DIR}/key.pem\"\ninternal_peers = [\"10.0.0.9\"]\n",
         );
         write_file(dir.path(), "site.toml", &site);
         let mut sys = minimal_system_toml();
@@ -2169,11 +2167,11 @@ domain = "test.example.com"
 
     #[test]
     fn auth_without_backend_loads() {
-        let (_d, cfg) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
+        let (_d, cfg) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
         let cfg = cfg.unwrap();
         let auth = cfg.auth.expect("auth present");
         assert_eq!(auth.backend, None);
-        assert_eq!(auth.public_key, "auth.pem");
+        assert!(auth.public_key.ends_with("/auth.pem"));
     }
 
     #[test]
@@ -2204,7 +2202,7 @@ domain = "test.example.com"
     #[test]
     fn auth_in_both_files_is_refused() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
             "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
         );
         let e = r.unwrap_err().to_string();
@@ -2213,21 +2211,56 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn a_relative_public_key_in_the_system_config_resolves_against_the_site_dir() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
-        // load_with writes auth.pem into the site directory.
-        let auth = r.unwrap().auth.expect("auth present");
-        assert_eq!(auth.public_key, "auth.pem");
-    }
-
-    #[test]
-    fn a_relative_public_key_in_the_system_config_must_exist_in_the_site_dir() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"missing.pem\"\n");
+    fn a_missing_public_key_file_is_refused() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/missing.pem\"\n");
         let e = r.unwrap_err().to_string();
         assert!(
             e.contains("[auth].public_key file not found") && e.ends_with("/missing.pem"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_relative_tls_cert_or_key_is_refused_and_named() {
+        for (relative, absolute, expected) in [
+            (
+                "tls_cert = \"cert.pem\"",
+                "tls_key = \"{DIR}/key.pem\"",
+                "[server] tls_cert",
+            ),
+            (
+                "tls_key = \"key.pem\"",
+                "tls_cert = \"{DIR}/cert.pem\"",
+                "[server] tls_key",
+            ),
+        ] {
+            let dir = make_test_dir();
+            write_file(dir.path(), "cert.pem", "dummy");
+            write_file(dir.path(), "key.pem", "dummy");
+            write_file(dir.path(), "site.toml", &minimal_site_toml());
+            let sys = format!(
+                "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\n{relative}\n{absolute}\n"
+            );
+            write_file(dir.path(), "system.toml", &sys);
+            let e = load(dir.path(), &dir.path().join("system.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(expected), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_relative_public_key_is_refused_and_named() {
+        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("[auth] public_key"), "{e}");
+    }
+
+    #[test]
+    fn a_relative_metrics_token_file_is_refused_and_named() {
+        let (_d, r) = load_with("", "\n[health]\nmetrics_token_file = \"token\"\n");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("[health] metrics_token_file"), "{e}");
     }
 
     fn peers_error(entries: &str) -> String {
@@ -2317,7 +2350,7 @@ domain = "test.example.com"
     #[test]
     fn health_keys_in_site_toml_are_refused() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
             "\n[health]\nmetrics_require = \"role:system\"\nmetrics_peers = [\"10.0.0.2\"]\n",
         );
         let e = r.unwrap_err().to_string();
@@ -2329,7 +2362,7 @@ domain = "test.example.com"
     #[test]
     fn a_system_health_key_alone_keeps_the_other_from_the_site() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\n",
             "\n[health]\nmetrics_peers = [\"10.0.0.2\"]\n",
         );
         let e = r.unwrap_err().to_string();
@@ -2359,11 +2392,11 @@ domain = "test.example.com"
         setup_minimal(dir.path());
         write_file(dir.path(), "auth.pem", "dummy");
         let mut site = minimal_site_toml();
-        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
         write_file(dir.path(), "site.toml", &site);
         let same = dir.path().join("site.toml");
         let cfg = load(dir.path(), &same).expect("one file for both loads");
-        assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
+        assert!(cfg.auth.expect("auth").public_key.ends_with("/auth.pem"));
         assert_eq!(cfg.health.perf_path, "/p");
         assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
     }
@@ -2392,25 +2425,6 @@ domain = "test.example.com"
         assert!(e.contains("belongs in the system config"), "{e}");
     }
 
-    #[test]
-    fn a_relative_metrics_token_file_in_the_system_config_resolves_against_the_site_dir() {
-        let dir = make_test_dir();
-        setup_minimal(dir.path());
-        std::fs::write(dir.path().join("token"), "from-site-dir\n").unwrap();
-        write_file(dir.path(), "site.toml", &minimal_site_toml());
-        let mut sys = minimal_system_toml();
-        sys.push_str("\n[health]\nmetrics_token_file = \"token\"\n");
-        write_file(dir.path(), "system.toml", &sys);
-        let h = load(dir.path(), &dir.path().join("system.toml"))
-            .unwrap()
-            .health;
-        assert_eq!(
-            h.metrics_token_file.as_deref(),
-            dir.path().join("token").to_str()
-        );
-        assert_eq!(h.metrics_token.as_deref(), Some("from-site-dir"));
-    }
-
     /// Write `site` and `system` into a fresh directory and name the misplaced keys.
     fn misplaced(site: &str, system: &str) -> Vec<String> {
         let site_table: toml::Table = toml::from_str(site).unwrap_or_default();
@@ -2421,7 +2435,7 @@ domain = "test.example.com"
     #[test]
     fn misplaced_keys_names_a_bind_in_site_toml() {
         let m = misplaced(
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"{DIR}/k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
             "[server]\nbind = \"0.0.0.0:443\"\n",
         );
         assert_eq!(m.len(), 3, "{m:?}");
@@ -2451,7 +2465,7 @@ domain = "test.example.com"
     fn one_file_mode_reads_node_keys_from_the_one_file() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\nallowed_methods = [\"GET\"]\n\n[node]\nname = \"test\"\n\n[auth]\npublic_key = \"k\"\n";
+        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\nallowed_methods = [\"GET\"]\n\n[node]\nname = \"test\"\n\n[auth]\npublic_key = \"{DIR}/k\"\n";
         write_file(dir.path(), "site.toml", one);
         std::fs::write(dir.path().join("cert.pem"), "").unwrap();
         std::fs::write(dir.path().join("key.pem"), "").unwrap();
@@ -2485,7 +2499,7 @@ domain = "test.example.com"
         write_file(
             dir.path(),
             "system.toml",
-            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let err = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
@@ -2496,7 +2510,7 @@ domain = "test.example.com"
     #[test]
     fn one_file_mode_without_node_is_refused() {
         let dir = make_test_dir();
-        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n";
+        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n";
         write_file(dir.path(), "site.toml", one);
         write_file(dir.path(), "cert.pem", "");
         write_file(dir.path(), "key.pem", "");
@@ -2581,7 +2595,7 @@ domain = "test.example.com"
 
     #[test]
     fn an_unknown_key_is_refused_and_named() {
-        let sys = "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n";
+        let sys = "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n";
         for (site, system, key) in [
             ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n", format!("{sys}bnid = \"x\"\n"), "bnid"),
             ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\ntitel = \"x\"\n", sys.to_string(), "titel"),
@@ -2619,7 +2633,7 @@ domain = "test.example.com"
         let dir = make_test_dir();
         setup_minimal(dir.path());
         let mut sys = minimal_system_toml();
-        sys.push_str("\n[health]\nmetrics_token_file = \"missing\"\n");
+        sys.push_str("\n[health]\nmetrics_token_file = \"{DIR}/missing\"\n");
         write_file(dir.path(), "system.toml", &sys);
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
@@ -2634,7 +2648,7 @@ domain = "test.example.com"
         setup_minimal(dir.path());
         write_file(dir.path(), "empty-token", "");
         let mut sys = minimal_system_toml();
-        sys.push_str("\n[health]\nmetrics_token_file = \"empty-token\"\n");
+        sys.push_str("\n[health]\nmetrics_token_file = \"{DIR}/empty-token\"\n");
         write_file(dir.path(), "system.toml", &sys);
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
@@ -2649,7 +2663,7 @@ domain = "test.example.com"
         write_file(dir.path(), "auth.pem", "dummy");
         write_file(dir.path(), "token", "secret\n");
         let mut sys = minimal_system_toml();
-        sys.push_str("\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_token_file = \"token\"\nmetrics_require = \"role:monitor\"\n");
+        sys.push_str("\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_token_file = \"{DIR}/token\"\nmetrics_require = \"role:monitor\"\n");
         write_file(dir.path(), "system.toml", &sys);
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()

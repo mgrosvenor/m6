@@ -411,54 +411,15 @@ jobs:
       # test covers it and ran above. An example with neither a config nor a
       # reason recorded here fails the job.
       # A FRESH CHECKOUT HAS NO CERTIFICATES, and the config parse needs them:
-      # m6-http validates that tls_cert exists, so every example was rejected here
-      # with "tls_cert file not found: .../keys/dev.pem" on CI's first ever run.
-      # keys/ is gitignored — correctly, they are generated secrets — and each
-      # example's dev.sh creates them on first run. This step does the same thing
-      # dev.sh does, ahead of the parse.
-      #
-      # It passed on the build host only because rsync carried a developer's own
-      # untracked keys/ directories. A check that depends on an untracked file is
-      # not a check, which is the same lesson the mkcert fallback taught earlier.
+      # m6-http validates that tls_cert exists. The development keys live in
+      # /tmp/m6/dev, written by examples/dev-keys.sh, which the config parse
+      # below needs, so this step runs it ahead of the parse.
       - name: Generate development certificates
         id: certs
         if: ${{ !cancelled() }}
         working-directory: m6-examples
         run: |
-          for d in examples/*/; do
-            [ -f "$d/dev.sh" ] || continue
-            mkdir -p "$d/keys"
-            if [ ! -f "$d/keys/dev.pem" ]; then
-              openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-                -keyout "$d/keys/dev-key.pem" -out "$d/keys/dev.pem" \
-                -subj "/CN=localhost" \
-                -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-            fi
-            # Five examples also need an auth signing keypair, which their
-            # setup.sh generates. Without it the parse fails with
-            # "[auth].public_key file not found" — found by running this against a
-            # genuinely fresh clone rather than a working tree that already had
-            # them.
-            if [ ! -f "$d/keys/auth.pub" ]; then
-              # PKCS#8 (`genpkey`), not SEC1 (`ecparam -genkey`). m6-auth-server
-              # refuses SEC1 with "invalid private key (tried EC and RSA):
-              # InvalidKeyFormat" and exits, and pre-creating one here made dev.sh
-              # skip generating a good one — 33 of 98 checks failed with 502s
-              # because the auth server was never up.
-              # `ec_param_enc:named_curve` too. It is the default for OpenSSL, so it
-              # changes nothing here, but LibreSSL -- which is what macOS ships as
-              # /usr/bin/openssl -- writes explicit curve parameters instead of the
-              # prime256v1 OID, and the token signer refuses those with "JWT encode
-              # error: InvalidEcdsaKey" at every login. Stated here so the two sides
-              # of the check generate the same key.
-              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$d/keys/auth.pem" 2>/dev/null
-              openssl pkey -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
-              chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
-            fi
-            echo "  $(basename "$d")"
-          done
-          # 09 keeps its certificates somewhere else.
-          mkdir -p examples/09-global-deployment/certs
+          examples/dev-keys.sh
 
       - name: Every example's config parses
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}

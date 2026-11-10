@@ -6,7 +6,8 @@ use std::path::Path;
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn write_file(dir: &Path, name: &str, content: &str) {
-    std::fs::write(dir.join(name), content).unwrap();
+    let replaced = content.replace("{DIR}", &dir.display().to_string());
+    std::fs::write(dir.join(name), replaced).unwrap();
 }
 
 // ── Phase 10: Routing + Forwarding ───────────────────────────────────────────
@@ -29,7 +30,7 @@ mod phase10 {
         write_file(
             dir,
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
     }
 
@@ -84,7 +85,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("bind"), "error should mention 'bind': {}", err);
@@ -102,7 +103,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"missing.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/missing.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -228,7 +229,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n[auth]\nbackend = \"b\"\npublic_key = \"missing-key.pub\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"b\"\npublic_key = \"{DIR}/missing-key.pub\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -252,7 +253,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n[auth]\nbackend = \"missing-auth-backend\"\npublic_key = \"auth.pub\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"missing-auth-backend\"\npublic_key = \"{DIR}/auth.pub\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -275,7 +276,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let cfg = m6_http_lib::config::load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.bind, "0.0.0.0:443");
@@ -531,7 +532,15 @@ mod config_load {
         // Write initial config
         std::fs::write(dir_path.join("cert.pem"), "dummy").unwrap();
         std::fs::write(dir_path.join("key.pem"), "dummy").unwrap();
-        std::fs::write(dir_path.join("system.toml"), "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n").unwrap();
+        std::fs::write(
+            dir_path.join("system.toml"),
+            format!(
+                "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n",
+                dir_path.display(),
+                dir_path.display()
+            ),
+        )
+        .unwrap();
         std::fs::write(
             dir_path.join("site.toml"),
             r#"

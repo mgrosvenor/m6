@@ -47,7 +47,7 @@ cargo build --release
 ```
 
 m6-http serves the public site over *TLS* (Transport Layer Security), so every site needs a certificate.
-Install `mkcert` once, and the local `dev.sh` scripts write a development certificate on first run into the path their system config names.
+Install `mkcert` once, and the local `dev.sh` scripts run `examples/dev-keys.sh`, which writes the development certificate to `/tmp/m6/dev` on first run.
 When `mkcert` is absent, `dev.sh` uses `openssl` and the browser warns about the self-signed certificate.
 
 Check the install with Example 05, which runs the whole stack.
@@ -498,6 +498,7 @@ The `[smtp]` values are development defaults.
 In production they move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
 
 A key set in both files is refused at startup, and a missing secrets file is ignored, so the example runs with no setup.
+In production, deliver the secrets file with `LoadCredential=secrets.toml:/etc/m6/render-contact.toml` and set `secrets_file = "/run/credentials/render-contact.service/secrets.toml"`.
 
 ### 4.4. `templates/contact.html`
 
@@ -597,16 +598,13 @@ The keys are *PKCS#8* (Public-Key Cryptography Standards #8), the format `m6-aut
 set -e
 SITE="$(cd "$(dirname "$0")" && pwd)"
 
-mkdir -p "$SITE/keys"
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$SITE/keys/auth.pem"
-openssl pkey -in "$SITE/keys/auth.pem" -pubout -out "$SITE/keys/auth.pub"
-chmod 600 "$SITE/keys/auth.pem"
+# Development keys, written by examples/dev-keys.sh into /tmp/m6/dev.
+"$SITE/../dev-keys.sh"
 
 m6-auth-cli "$SITE/configs/m6-auth.conf" user add admin --role admin --password admin
 ```
 
-`openssl genpkey` writes the PKCS#8 private key, and `ec_param_enc:named_curve` keeps the named curve form the token signer accepts.
-`chmod 600` makes the private key readable by its owner only.
+`examples/dev-keys.sh` writes the signing key pair to `/tmp/m6/dev`.
 `user add admin --role admin --password admin` creates the admin user with the role `admin` and the password `admin`, and it creates the auth database on first run.
 
 ### 5.2. `configs/m6-auth.conf`
@@ -615,7 +613,7 @@ m6-auth-cli "$SITE/configs/m6-auth.conf" user add admin --role admin --password 
 
 ```toml
 [storage]
-path = "data/auth.db"
+path = "/tmp/m6/04-auth/auth.db"
 
 [tokens]
 access_ttl  = 900
@@ -623,12 +621,12 @@ refresh_ttl = 2592000
 issuer      = "localhost"
 
 [keys]
-private_key = "keys/auth.pem"
-public_key  = "keys/auth.pub"
+private_key = "/tmp/m6/dev/auth.pem"
+public_key  = "/tmp/m6/dev/auth.pub"
 ```
 
 `access_ttl` sets the access token lifetime to 900 seconds, and `refresh_ttl` sets the refresh token lifetime to 2592000 seconds.
-`issuer` sets the `iss` claim the service writes into tokens, and the two key paths name the files `setup.sh` generated.
+`issuer` sets the `iss` claim the service writes into tokens, and the two key paths name the files `examples/dev-keys.sh` wrote.
 
 ### 5.3. New config
 
@@ -641,7 +639,7 @@ The `[auth]` block lives in `configs/system-dev.toml`, the system config `m6-htt
 ```toml
 [auth]
 backend    = "m6-auth"
-public_key = "keys/auth.pub"
+public_key = "/tmp/m6/dev/auth.pub"
 ```
 
 The backend and routes live in `site.toml`:
@@ -820,12 +818,12 @@ allowed_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE"]
 ```toml
 [server]
 bind     = "127.0.0.1:8443"
-tls_cert = "keys/dev.pem"
-tls_key  = "keys/dev-key.pem"
+tls_cert = "/tmp/m6/dev/dev.pem"
+tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [auth]
 backend    = "m6-auth"
-public_key = "keys/auth.pub"
+public_key = "/tmp/m6/dev/auth.pub"
 ```
 
 ### 6.3. `render-cms/Cargo.toml`
@@ -919,7 +917,7 @@ Example 06 runs the Example 05 CMS blog under systemd.
 The example holds only the unit files in `examples/06-systemd/systemd/`.
 It reuses the Example 05 site directory, with a production `site.toml` and a production system config written on the server.
 This section prepares the server, deploys the site directory and writes the units.
-Sections 7.4 to 7.11 install them, verify the stack and cover logs, scaling and recovery.
+Sections 7.5 to 7.12 install them, verify the stack and cover logs, scaling and recovery.
 
 ### 7.1. Server preparation
 
@@ -943,43 +941,92 @@ It writes the *PKCS#8* (Public-Key Cryptography Standards #8) form that m6-auth-
 ```bash
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out /etc/m6/auth.pem
 openssl pkey -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
-chown m6:m6 /etc/m6/auth.pem /etc/m6/auth.pub
 chmod 600   /etc/m6/auth.pem
+chmod 600   /etc/m6/auth.pub
 ```
 
+systemd reads a credential as root, so both key files stay root's.
+
+Write `/etc/m6/m6-auth.conf`, owned by root and readable by the m6 group:
+
+```bash
+cat > /etc/m6/m6-auth.conf << 'CONF'
+[storage]
+path = "/var/lib/m6-auth/auth.db"
+
+[tokens]
+issuer = "example.com"
+
+[keys]
+private_key = "/run/credentials/m6-auth.service/auth.pem"
+public_key  = "/run/credentials/m6-auth.service/auth.pub"
+CONF
+chown root:m6 /etc/m6/m6-auth.conf
+chmod 640 /etc/m6/m6-auth.conf
+```
+
+The socket name comes from the file's stem, so it stays `/run/m6/m6-auth.sock`.
+
 Obtain the certificate with certbot.
-It writes `fullchain.pem` and `privkey.pem` under `/etc/letsencrypt/live/example.com/`, the paths the system config names as `tls_cert` and `tls_key`.
-The unprivileged `m6` user needs read access to the private key, so add it to the `ssl-cert` group or adjust the permissions.
+It writes `fullchain.pem` and `privkey.pem` under `/etc/letsencrypt/live/example.com/`, the paths the m6-http unit's `LoadCredential` lines deliver.
 
 ```bash
 certbot certonly --standalone -d example.com
 ```
 
-m6-http reads the certificate files once at start, so a renewal has to restart it after it writes them.
-This deploy hook does that, and certbot runs it after each renewal:
+The deploy hook is `/etc/letsencrypt/renewal-hooks/deploy/m6-http-restart.sh`:
 
 ```sh
 #!/bin/sh
-# /etc/letsencrypt/renewal-hooks/deploy/m6-restart.sh, mode 0755
+# /etc/letsencrypt/renewal-hooks/deploy/m6-http-restart.sh, mode 0755
 systemctl restart m6-http
 ```
 
-The restart makes m6-http read the new files.
-Until it runs, m6-http keeps serving the previous certificate.
+systemd copies the certificate and key into m6-http's credential directory when the unit starts, so the hook restarts m6-http after each renewal, and until then m6-http serves the previous certificate.
 
-### 7.2. Deploy site directory
+### 7.2. Secrets and state
+
+Every m6 setting that names a secret, key or certificate takes an absolute path, and a relative one stops the service at startup with exit 2, naming the setting.
+Table 1 lists the settings, the file each sits in and the program that reads it.
+
+| Setting | File | Reader |
+|---|---|---|
+| `secrets_file` | any renderer config | m6-core |
+| `[server] tls_cert`, `tls_key` | system config | m6-http |
+| `[auth] public_key` | system config | m6-http |
+| `[health] metrics_token_file` | system config | m6-http, delivered by `LoadCredential` like every other secret |
+| `[storage] path` | m6-auth config | m6-auth-server and m6-auth-cli |
+| `[keys] private_key`, `public_key` | m6-auth config | m6-auth-server and m6-auth-cli |
+| `perf_token_file` | `[monitor]` | m6-monitor |
+
+**Table 1: the settings that name a secret, key or certificate, the file each sits in and the program that reads it. Each takes an absolute path.**
+
+The documented layout:
+
+- Configuration in `/etc/m6/`.
+- A secret in `/etc/m6/<file>`, owned by root, mode 0600, delivered by the unit's `LoadCredential=<name>:/etc/m6/<file>` and named in the config as `/run/credentials/<unit>/<name>`.
+- A service's database in `/var/lib/<service>/`, which `StateDirectory=<service>` creates, owned by the unit's user and writable under `ProtectSystem=strict`.
+
+systemd copies a credential when the unit starts, so a changed secret reaches a service at its next restart.
+A certificate renewal is one of those: certbot's deploy hook restarts m6-http (section 7.1).
+
+m6-monitor's `history_file` may be relative, and `/var/lib/m6-monitor/` with `StateDirectory=m6-monitor` is the place for it.
+
+The examples keep their development keys in `/tmp/m6/dev`, which `examples/dev-keys.sh` writes, outside every site directory.
+
+Section 7.4 gives the unit files that carry the `LoadCredential` and `StateDirectory` lines.
+
+### 7.3. Deploy site directory
 
 Deploy the Example 05 site directory with rsync, then fix ownership.
 Three paths stay on the server and are excluded from the sync:
 
 - `content/drafts/`, managed by the CMS renderer
-- `configs/data/auth.db`, the persistent server-side login state
-- `keys/`, already present under `/etc/m6/` on the server
+- `keys/`, so a key file never leaves the development machine
 
 ```bash
 rsync -av --delete \
   --exclude 'content/drafts/' \
-  --exclude 'configs/data/auth.db' \
   --exclude 'keys/' \
   examples/05-cms/ \
   user@example.com:/var/www/my-blog/
@@ -990,7 +1037,7 @@ chown -R m6:m6 /var/www/my-blog
 The production `site.toml` differs from Example 05 in two places.
 `domain` names the public site, and the backend `sockets` globs move from `/tmp/m6/` to `/run/m6/`, where a renderer writes its socket when no `M6_SOCKET_OVERRIDE` is set.
 The method list stays in `site.toml`.
-The `[server]` bind and certificate paths, and `[auth]`, live in the system config `/etc/m6/my-blog.toml`, which the m6-http unit in section 7.3 names.
+The `[server]` bind and certificate paths, and `[auth]`, live in the system config `/etc/m6/my-blog.toml`, which the m6-http unit in section 7.4 names.
 
 ```toml
 [site]
@@ -1012,10 +1059,10 @@ sockets = "/run/m6/m6-html*.sock"
 
 [`m6-site-toml.md`](m6-site-toml.md) section 3 owns the split between `site.toml` and the system config.
 
-### 7.3. Unit files
+### 7.4. Unit files
 
 One unit per process, five in total.
-The four backend units (m6-html, m6-file, m6-auth, render-cms) follow one pattern and differ in `Description`, `ExecStart`, `ReadWritePaths` and `ReadOnlyPaths`.
+The four backend units (m6-html, m6-file, m6-auth, render-cms) follow one pattern and differ in `Description`, `ExecStart`, `ReadWritePaths`, `ReadOnlyPaths`, for m6-http `LoadCredential`, and for m6-auth `LoadCredential` and `StateDirectory`.
 m6-http's unit names the system config as its second argument and adds `AmbientCapabilities` to bind port 443.
 
 `/etc/systemd/system/m6-html.service`:
@@ -1103,7 +1150,12 @@ RuntimeDirectoryMode=0750
 
 ExecStart=/usr/local/bin/m6-auth-server \
     /var/www/my-blog \
-    /var/www/my-blog/configs/m6-auth.conf
+    /etc/m6/m6-auth.conf
+
+LoadCredential=auth.pem:/etc/m6/auth.pem
+LoadCredential=auth.pub:/etc/m6/auth.pub
+StateDirectory=m6-auth
+StateDirectoryMode=0700
 
 Restart=on-failure
 RestartSec=2
@@ -1113,15 +1165,15 @@ SyslogIdentifier=m6-auth
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/m6 /var/www/my-blog/configs/data
+ReadWritePaths=/run/m6
 ReadOnlyPaths=/var/www/my-blog /etc/m6
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-m6-auth writes its *SQLite* database under `configs/data/`, which is why its `ReadWritePaths` adds `/var/www/my-blog/configs/data`.
-The database path resolves relative to the config file, in `configs/`.
+m6-auth's keys come from the two `LoadCredential` lines, and its database lives in `/var/lib/m6-auth`, which `StateDirectory=m6-auth` creates.
+Section 7.2 gives the layout.
 
 `/etc/systemd/system/render-cms.service`:
 
@@ -1163,6 +1215,7 @@ The render-cms binary lives in `/var/www/my-blog/bin/`, deployed beside the site
 ```ini
 [Unit]
 Description=m6-http reverse proxy and cache
+Documentation=https://github.com/mgrosvenor/m6
 After=network.target m6-html.service m6-file.service m6-auth.service render-cms.service
 
 [Service]
@@ -1173,6 +1226,10 @@ RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
 
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
+
+LoadCredential=tls-cert.pem:/etc/letsencrypt/live/example.com/fullchain.pem
+LoadCredential=tls-key.pem:/etc/letsencrypt/live/example.com/privkey.pem
+LoadCredential=auth.pub:/etc/m6/auth.pub
 
 Restart=on-failure
 RestartSec=2
@@ -1185,7 +1242,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/m6
-ReadOnlyPaths=/var/www/my-blog /etc/letsencrypt /etc/m6
+ReadOnlyPaths=/var/www/my-blog /etc/m6
 
 [Install]
 WantedBy=multi-user.target
@@ -1195,9 +1252,9 @@ WantedBy=multi-user.target
 `After=` is an ordering hint only.
 m6-http reads each pool's sockets once at start, so the backends' sockets must exist before it starts, and a pool whose glob matches no socket exits 2.
 
-Section 7.4 installs these units and starts the stack.
+Section 7.5 installs these units and starts the stack.
 
-### 7.4. Install and start
+### 7.5. Install and start
 
 Copy the five units into place, reload systemd, then enable and start them together:
 
@@ -1218,7 +1275,7 @@ Each unit reports `active (running)`:
    Main PID: 12345 (m6-html)
 ```
 
-### 7.5. Verify
+### 7.6. Verify
 
 Check that m6-http is listening and that every backend wrote its socket into `/run/m6/`:
 
@@ -1258,7 +1315,7 @@ The `/cms` route is protected, so a plain `curl` gets a 401.
 A browser, which sends `Accept: text/html`, gets a 302 to `/login` instead.
 That split is m6-http's own rule for a missing token.
 
-### 7.6. Logs
+### 7.7. Logs
 
 Every unit logs to journald, so `journalctl` reads them all:
 
@@ -1275,7 +1332,7 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 The `-o cat | jq .` form only parses when `site.toml` sets `format = "json"`.
 Example 05 sets `format = "text"`, so change it to `json` for structured log processing.
 
-### 7.7. Rotating the analytics log
+### 7.8. Rotating the analytics log
 
 m6-http writes the analytics log to one file and reopens it when it receives SIGUSR1.
 Rotation renames the file and sends that signal, so no line is lost and `copytruncate` is not needed.
@@ -1330,18 +1387,19 @@ The limit is only as true as the schedule, so set it after logrotate runs hourly
 `/traffic` reads the newest rotated file next to the log when the live file does not cover its window, so its sixty minute window does not shrink just after a rotation.
 It skips a rotated file last written before the window, and a `.gz` file larger than the 24 MB read budget on disk or once decoded.
 
-### 7.8. Monitor history
+### 7.9. Monitor history
 
 m6-monitor keeps a history of every poll when `[monitor] history_file` is set, and serves it as *JSON Lines* (one JSON object per line).
-Table 1 gives the two keys, which are read once at start.
+Table 2 gives the two keys, which are read once at start.
 
 | key (`[monitor]`) | default | rule |
 |---|---|---|
 | `history_file` | absent, so no history | a non-empty path, relative to the site directory |
 | `history_max_mb` | 256 | 1 to 1048576, one MB is 2^20 bytes |
 
-**Table 1: the two `[monitor]` keys that switch the history on and cap it, with their defaults and rules.**
+**Table 2: the two `[monitor]` keys that switch the history on and cap it, with their defaults and rules.**
 A change to either needs a restart.
+Put `history_file` in `/var/lib/m6-monitor/` and give the unit `StateDirectory=m6-monitor`.
 
 The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per `/traffic` window the response status counts and crawler sightings of each node.
 When the file passes `history_max_mb`, the oldest polls are deleted, 256 at a time, until it is 5% under the cap.
@@ -1389,14 +1447,13 @@ It has no channels, reachability, host figures or tunnel, and it disappears whil
 Only the history keeps those, and it keeps them through an outage.
 Channel counters include the monitor's own polls and header checks (issue #107), and `monitor_requests` on each node row says how many.
 
-### 7.9. Deploy updates
+### 7.10. Deploy updates
 
 Deploy code and template changes with rsync, then restart m6-http so it reads the new `site.toml`:
 
 ```bash
 rsync -av --delete \
   --exclude 'content/drafts/' \
-  --exclude 'data/auth.db' \
   --exclude 'keys/' \
   examples/05-cms/ \
   user@example.com:/var/www/my-blog/
@@ -1417,7 +1474,7 @@ For certificate renewal, certbot renews and its deploy hook restarts m6-http, an
 certbot renew
 ```
 
-### 7.10. Horizontal scaling
+### 7.11. Horizontal scaling
 
 Add a second m6-html instance to handle more traffic, then restart m6-http so it reads the pool again:
 
@@ -1450,7 +1507,7 @@ systemctl stop m6-html-2
 
 The socket disappears and m6-http backs the member off, and it serves again once a listener is bound there.
 
-### 7.11. Crash recovery
+### 7.12. Crash recovery
 
 systemd restarts a failed unit with `Restart=on-failure` and `RestartSec=2`.
 During the brief restart window, m6-http's pool backoff handles the missing socket and answers the affected routes with a 502 until the socket reappears.
@@ -1520,15 +1577,15 @@ The development system config `configs/system-dev.toml` holds the node's bind ad
 ```toml
 [server]
 bind     = "127.0.0.1:8443"
-tls_cert = "keys/dev.pem"
-tls_key  = "keys/dev-key.pem"
+tls_cert = "/tmp/m6/dev/dev.pem"
+tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [auth]
 backend    = "m6-auth"
-public_key = "keys/auth.pub"
+public_key = "/tmp/m6/dev/auth.pub"
 ```
 
-The production system config `/etc/m6/my-blog.toml` holds the same two sections, with the public bind `0.0.0.0:443`, the two Let's Encrypt paths under `/etc/letsencrypt/live/example.com/`, and the auth public key `/etc/m6/auth.pub`.
+The production system config `/etc/m6/my-blog.toml` holds the same two sections, with the public bind `0.0.0.0:443`, the two credential paths under `/run/credentials/m6-http.service/`, and the auth public key `/run/credentials/m6-http.service/auth.pub`.
 Section 8.3 writes it as a heredoc.
 
 The split is one rule: `site.toml` holds the state every node shares, and the system config holds the state of one node.
@@ -1572,18 +1629,20 @@ chown m6:m6 /var/www/my-blog
 mkdir -p /etc/m6
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out /etc/m6/auth.pem
 openssl pkey -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
-chown m6:m6 /etc/m6/auth.pem /etc/m6/auth.pub
 chmod 600   /etc/m6/auth.pem
+chmod 600   /etc/m6/auth.pub
+
+Write `/etc/m6/m6-auth.conf` as section 7.1 shows it.
 
 cat > /etc/m6/my-blog.toml << 'TOML'
 [server]
 bind     = "0.0.0.0:443"
-tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+tls_cert = "/run/credentials/m6-http.service/tls-cert.pem"
+tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 
 [auth]
 backend    = "m6-auth"
-public_key = "/etc/m6/auth.pub"
+public_key = "/run/credentials/m6-http.service/auth.pub"
 TOML
 chown root:m6 /etc/m6/my-blog.toml
 chmod 640 /etc/m6/my-blog.toml
@@ -1603,7 +1662,7 @@ systemctl start  m6-html m6-file m6-auth render-cms m6-http
 
 ### 8.4. Systemd unit, m6-http
 
-The m6-http unit is the same as Example 06's in section 7.3, and the renderer units are identical to Example 06.
+The m6-http unit is the same as Example 06's in section 7.4, and the renderer units are identical to Example 06.
 Each takes two positional arguments, the site directory and its config.
 
 ### 8.5. Deploy
@@ -1624,7 +1683,6 @@ rsync -av --delete \
   --exclude 'content/drafts/' \
   --exclude 'content/posts/' \
   --exclude 'data/posts.json' \
-  --exclude 'configs/data/auth.db' \
   --exclude 'keys/' \
   --exclude '*.pem' \
   --exclude '*.pub' \
@@ -1645,20 +1703,20 @@ echo "Deployed."
 
 ### 8.6. Dev vs production at a glance
 
-Table 2 maps each setting to its two values.
+Table 3 maps each setting to its two values.
 Take from it that the two environments differ only in the system config and the process manager.
 
 | Setting | Development | Production |
 |---|---|---|
 | m6-http invocation | `m6-http $SITE configs/system-dev.toml` | `m6-http /var/www/my-blog /etc/m6/my-blog.toml` |
 | `[server] bind` | `127.0.0.1:8443` | `0.0.0.0:443` |
-| `[server] tls_cert` | `keys/dev.pem` | `/etc/letsencrypt/live/example.com/fullchain.pem` |
-| `[auth] public_key` | `keys/auth.pub` | `/etc/m6/auth.pub` |
+| `[server] tls_cert` | `/tmp/m6/dev/dev.pem` | `/run/credentials/m6-http.service/tls-cert.pem` |
+| `[auth] public_key` | `/tmp/m6/dev/auth.pub` | `/run/credentials/m6-http.service/auth.pub` |
 | System config | `configs/system-dev.toml`, in the repo | `/etc/m6/my-blog.toml`, on the server |
 | Process manager | `dev.sh` | systemd |
 | Logs | terminal stdout | journald |
 
-**Table 2: development and production, key by key.**
+**Table 3: development and production, key by key.**
 The site directory, the routes and the backends are identical in both environments.
 
 ### 8.7. Checking what is in effect
@@ -1708,7 +1766,7 @@ The stack is three processes: m6-http, m6-html and m6-file.
 `site.toml` sets `format = "json"` and `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
 The route is direct, so m6-http forwards the request without requiring the log files to exist at startup.
 The example leaves the tail route unauthenticated, and `level = "debug"` logs can carry request detail.
-A production deployment protects the route with `require = "role:..."`, the way section 7.8 protects the monitor history.
+A production deployment protects the route with `require = "role:..."`, the way section 7.9 protects the monitor history.
 
 `configs/m6-file.conf` turns on tail mode for the log files:
 
@@ -1760,7 +1818,7 @@ cd examples/10-api-tokens
 
 ### 11.1. When to use API tokens
 
-Table 3 compares a session cookie with an API token.
+Table 4 compares a session cookie with an API token.
 Take from it that the token is the machine-friendly form of the same credential.
 
 | | Session cookie | API token |
@@ -1771,7 +1829,7 @@ Take from it that the token is the machine-friendly form of the same credential.
 | Issuance | `POST /auth/login` | `m6-auth-cli token create` |
 | Revocation | `POST /auth/logout` | `m6-auth-cli token revoke` |
 
-**Table 3: session cookie versus API token.**
+**Table 4: session cookie versus API token.**
 Both are signed with the same *EC* (Elliptic Curve) key, and `require` accepts either.
 
 ### 11.2. Setup
@@ -1860,7 +1918,7 @@ It has six tabs: Perf, System, Bench, Logs, Routes and Config.
 
 ### 12.1. API endpoints
 
-Table 4 lists the endpoints the renderer registers.
+Table 5 lists the endpoints the renderer registers.
 Take from it that the first twelve manage the dashboard tabs, and the last five report backend and m6-http statistics.
 
 | Method | Path | Returns |
@@ -1883,7 +1941,7 @@ Take from it that the first twelve manage the dashboard tabs, and the last five 
 | `GET` | `/api/admin/m6http/sample` | m6-http's own stats over the sample window |
 | `GET` | `/api/admin/m6http/alltime` | m6-http's own stats over all time |
 
-**Table 4: the seventeen `/api/admin` endpoints.**
+**Table 5: the seventeen `/api/admin` endpoints.**
 `site.toml` must declare `allowed_methods` with `PUT`, or the edge answers `PUT /api/admin/config` with a 405.
 
 ### 12.2. JSON blob shapes
