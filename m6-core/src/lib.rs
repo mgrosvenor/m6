@@ -1,4 +1,5 @@
 pub mod app;
+pub mod client;
 pub mod compress;
 pub mod conditional;
 pub mod config;

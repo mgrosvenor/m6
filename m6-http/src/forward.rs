@@ -1,11 +1,9 @@
-/// HTTP/1.1 request forwarding over Unix sockets (synchronous blocking I/O),
-/// plus the non-blocking `SocketUpstream` the event loop drives.
-use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::time::Instant;
+/// HTTP/1.1 request forwarding: the request bytes a backend receives, and the
+/// blocking response reader the URL-backend path uses until EL-5b moves it onto
+/// `client::Upstream`.
+use std::io::{self, Read};
 
+use m6_core::client::{MAX_BODY, MAX_INFORMATIONAL};
 use m6_core::mio::Token;
 
 /// Hop-by-hop headers to remove before forwarding.
@@ -34,19 +32,6 @@ pub const HOP_BY_HOP: &[&str] = &[
 ///
 /// Stripped on ingress, before routing, on every protocol — so no downstream
 /// code has to remember to distrust them.
-/// Ceiling on a backend response body.
-///
-/// `vec![0u8; len]` below allocates the backend's declared `Content-Length`
-/// up front, before a single byte is read -- so a backend (or anything able to
-/// impersonate one) declaring `Content-Length: 4000000000` allocated 4 GB
-/// immediately. The bodyless `read_to_end` path was unbounded in the same way,
-/// just more slowly.
-///
-/// 128 MiB is far above anything this serves -- the largest real asset is a
-/// few MB of PDF -- so it never trips in normal operation, while bounding what
-/// a misbehaving or hostile backend can cost.
-const MAX_BACKEND_BODY: usize = 128 * 1024 * 1024;
-
 pub const UNTRUSTED_INBOUND: &[&str] = &[
     "x-auth-claims",
     "x-forwarded-for",
@@ -450,27 +435,15 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[end..]
 }
 
-/// Forward an HTTP request over a Unix socket (blocking).
-/// Adds proxy headers, removes hop-by-hop headers.
-/// `timeout` sets both the read and write timeout; `None` means no timeout.
-pub fn forward_request(
-    socket_path: &Path,
-    req: &HttpRequest,
-    client_ip: &str,
-    original_host: &str,
-) -> io::Result<HttpResponse> {
-    forward_request_timeout(socket_path, req, client_ip, original_host, None)
-}
-
 /// Build the exact HTTP/1.1 request bytes a socket backend receives, refusing
-/// (before any connection) a request that cannot be serialised safely. Shared
-/// by the blocking `forward_request_timeout` and the non-blocking
-/// `SocketUpstream`, so the two write identical bytes.
+/// (before any connection) a request that cannot be serialised safely. Writes
+/// into `buf` (already cleared), so the caller can point it at a reused buffer.
 pub fn encode_request(
+    buf: &mut Vec<u8>,
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<()> {
     // Before the connection, not after: a request that cannot be safely
     // serialised must never reach a backend socket at all.
     if let Err(what) = check_forwardable(req, client_ip, original_host) {
@@ -481,8 +454,6 @@ pub fn encode_request(
             )),
         ));
     }
-
-    let mut buf = Vec::with_capacity(8192);
 
     // Write request line
     buf.extend_from_slice(req.method.as_bytes());
@@ -516,7 +487,7 @@ pub fn encode_request(
     buf.extend_from_slice(b"Via: ");
     buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
     buf.extend_from_slice(b"\r\n");
-    write_host_if_absent(&mut buf, req, original_host);
+    write_host_if_absent(buf, req, original_host);
 
     // Add proxy headers
     buf.extend_from_slice(b"X-Forwarded-For: ");
@@ -541,63 +512,8 @@ pub fn encode_request(
         buf.extend_from_slice(&req.body);
     }
 
-    Ok(buf)
+    Ok(())
 }
-
-/// Like `forward_request` but with a configurable timeout for the total
-/// backend call (connect + write + read). A `TimedOut` error is returned if
-/// the backend does not respond within the deadline.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test callers and the custom-error-page fetch in apply_error_mode (a blocking forward still runs in the loop on that path); EL-3b makes the error page fetch non-blocking"
-)]
-pub fn forward_request_timeout(
-    socket_path: &Path,
-    req: &HttpRequest,
-    client_ip: &str,
-    original_host: &str,
-    timeout: Option<std::time::Duration>,
-) -> io::Result<HttpResponse> {
-    let buf = encode_request(req, client_ip, original_host)?;
-
-    let mut stream = UnixStream::connect(socket_path)?;
-
-    if let Some(dur) = timeout {
-        stream.set_read_timeout(Some(dur))?;
-        stream.set_write_timeout(Some(dur))?;
-    }
-
-    // A backend is allowed to answer before it has read the whole request
-    // (RFC 9110 6.1), and a good one does: m6-file refuses a header block over
-    // its cap, writes 400, and closes without draining the rest. The proxy is
-    // still writing at that point, so the write fails with EPIPE.
-    //
-    // Treating that as a connection failure turns the backend's correct 400
-    // into a 502, and marks a healthy pool member down. The response is
-    // already waiting on the socket; read it.
-    let write_result = stream.write_all(&buf).and_then(|()| stream.flush());
-    if let Err(e) = write_result {
-        let broken = matches!(
-            e.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-        );
-        if !broken {
-            return Err(e);
-        }
-        // Read the response the backend closed on us to deliver. If there is
-        // none, the original write error is the honest answer.
-        return read_response_for(stream, &req.method).map_err(|_| e);
-    }
-
-    // Read response. The method matters: a HEAD response is bodyless whatever
-    // its Content-Length says, and without this the read blocks until timeout.
-    read_response_for(stream, &req.method)
-}
-
-/// The most informational (1xx) responses one fetch will skip before the
-/// backend must send a final one. A bound, so a backend cannot hold a worker by
-/// sending them without end.
-const MAX_INFORMATIONAL: usize = 8;
 
 /// Whether a response status is informational and to be skipped: a 1xx other
 /// than 101, which is final for the exchange.
@@ -663,16 +579,6 @@ pub fn too_many_informational() -> io::Error {
     )
 }
 
-/// Read an HTTP/1.1 response from a synchronous stream.
-///
-/// Kept for callers that genuinely cannot know the request method. Prefer
-/// [`read_response_for`]: without the method this cannot apply RFC 9112 6.3's
-/// first rule, and will wait for a body on a HEAD response that will never
-/// have one.
-pub fn read_response<R: Read>(reader: R) -> io::Result<HttpResponse> {
-    read_response_for(reader, "GET")
-}
-
 /// A response body's framing, decided once from its header section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
@@ -694,7 +600,7 @@ struct ParsedHead {
 
 /// Parse a complete header section (status line already consumed) and decide
 /// the body framing. Enforces the same rules `read_response_for` has always
-/// enforced, in one place, so the incremental `SocketUpstream` reader and the
+/// enforced, in one place, so the incremental `client::Upstream` reader and the
 /// blocking reader cannot disagree about where a response ends.
 fn parse_head(head: &str, status: u16, method: &str) -> io::Result<ParsedHead> {
     let after_status_line = head.split_once("\r\n").map_or("", |(_, rest)| rest);
@@ -908,12 +814,10 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
         Framing::ContentLength(len) => {
             // Refuse before allocating, not after: the whole point is that the
             // allocation is the damage.
-            if len > MAX_BACKEND_BODY {
+            if len > MAX_BODY {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"
-                    ),
+                    format!("backend declared Content-Length {len}, above the {MAX_BODY} limit"),
                 ));
             }
             let mut body = vec![0u8; len];
@@ -928,14 +832,14 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
             // No declared length: read to EOF, but bounded. `take` caps it without
             // needing to know the size in advance.
             let mut body = body_prefix.to_vec();
-            let remaining = MAX_BACKEND_BODY.saturating_sub(body.len());
+            let remaining = MAX_BODY.saturating_sub(body.len());
             let read =
                 std::io::Read::take(&mut reader, remaining as u64 + 1).read_to_end(&mut body)?;
             let _ = read;
-            if body.len() > MAX_BACKEND_BODY {
+            if body.len() > MAX_BODY {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("backend response body exceeded the {MAX_BACKEND_BODY} limit"),
+                    format!("backend response body exceeded the {MAX_BODY} limit"),
                 ));
             }
             body
@@ -988,7 +892,7 @@ fn parse_status_line(line: &str) -> io::Result<(u16, String)> {
 ///   leading `+`, so `+A` parsed as 10 -- the same trap that let
 ///   `Content-Length: +5` through.
 /// - **The read is bounded.** `read_to_end` had no limit here, so while the
-///   `Content-Length` path refused to allocate above `MAX_BACKEND_BODY`, a
+///   `Content-Length` path refused to allocate above `MAX_BODY`, a
 ///   chunked response could allocate without bound. That is the same memory
 ///   exhaustion the length cap exists to prevent, reachable by simply choosing
 ///   chunked framing.
@@ -999,14 +903,14 @@ fn read_chunked_body<R: Read>(reader: &mut R, prefix: Vec<u8>) -> io::Result<Vec
     // +1 lets an over-limit body be detected rather than silently truncated to
     // exactly the cap.
     let mut pending: Vec<u8> = prefix;
-    let budget = MAX_BACKEND_BODY.saturating_sub(pending.len());
+    let budget = MAX_BODY.saturating_sub(pending.len());
     let mut rest = Vec::new();
     Read::take(reader, budget as u64 + 1).read_to_end(&mut rest)?;
     pending.extend_from_slice(&rest);
-    if pending.len() > MAX_BACKEND_BODY {
+    if pending.len() > MAX_BODY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("chunked backend response exceeds the {MAX_BACKEND_BODY} byte limit"),
+            format!("chunked backend response exceeds the {MAX_BODY} byte limit"),
         ));
     }
 
@@ -1096,240 +1000,6 @@ fn read_chunked_body<R: Read>(reader: &mut R, prefix: Vec<u8>) -> io::Result<Vec
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
-}
-
-/// Find the final response header end and framing in a growing buffer, skipping
-/// up to [`MAX_INFORMATIONAL`] 1xx responses. Returns `None` when the buffer
-/// does not yet hold the complete final header section, so the caller must
-/// read more.
-fn locate_final_head(buf: &[u8], method: &str) -> io::Result<Option<(usize, Framing)>> {
-    let mut offset = 0usize;
-    let mut informational = 0usize;
-    loop {
-        let Some(rel_end) = find_header_end(&buf[offset..]) else {
-            return Ok(None);
-        };
-        let header_end = offset + rel_end;
-        let head = &buf[offset..header_end];
-        let line_end = head
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .unwrap_or(head.len());
-        let status_line = std::str::from_utf8(&head[..line_end]).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
-        })?;
-        let (status, _reason) = parse_status_line(status_line)?;
-
-        if is_skipped_informational(status) {
-            informational += 1;
-            if informational > MAX_INFORMATIONAL {
-                return Err(too_many_informational());
-            }
-            offset = header_end + 4;
-            continue;
-        }
-
-        let header_section = std::str::from_utf8(head).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "response headers not UTF-8")
-        })?;
-        let parsed = parse_head(header_section, status, method)?;
-        return Ok(Some((header_end, parsed.framing)));
-    }
-}
-
-/// One non-blocking HTTP/1.1 request to a Unix-socket backend, driven step by
-/// step by the event loop. This is the interim form approved for EL-1: EL-4
-/// replaces it with the shared `client::Upstream` incremental parser.
-pub struct SocketUpstream {
-    stream: UnixStream,
-    request: Vec<u8>,
-    write_offset: usize,
-    read_buf: Vec<u8>,
-    method: String,
-    deadline: Instant,
-    /// Once the final header section has been read and parsed, its terminating
-    /// `\r\n\r\n` offset and the body framing. `None` until then.
-    completion: Option<(usize, Framing)>,
-}
-
-impl SocketUpstream {
-    /// Make a non-blocking Unix socket, connect it, and write the request. A
-    /// Unix-socket connect completes at once or fails; `WouldBlock` means the
-    /// backend's listen backlog is full, which the caller answers as 503.
-    pub fn start(
-        path: &Path,
-        request: Vec<u8>,
-        method: &str,
-        deadline: Instant,
-    ) -> io::Result<SocketUpstream> {
-        let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-        sock.set_nonblocking(true)?;
-        sock.connect(&socket2::SockAddr::unix(path)?)?;
-        // socket2's `From<Socket> for UnixStream` needs its `all` feature, so
-        // go through `OwnedFd`, which is always implemented.
-        let stream: UnixStream = std::os::fd::OwnedFd::from(sock).into();
-        let mut upstream = SocketUpstream {
-            stream,
-            request,
-            write_offset: 0,
-            read_buf: Vec::new(),
-            method: method.to_string(),
-            deadline,
-            completion: None,
-        };
-        // Write the request now, while the connect is fresh, so the backend has
-        // the bytes before the loop's next drive. A short request fits in one
-        // write; the rest is written by `drive`.
-        upstream.write_request()?;
-        Ok(upstream)
-    }
-
-    /// The descriptor to register with the poll.
-    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.stream.as_raw_fd()
-    }
-
-    /// Whether the backend deadline has passed.
-    pub fn expired(&self, now: Instant) -> bool {
-        now >= self.deadline
-    }
-
-    /// The interest to register next: write readiness while request bytes are
-    /// still owed, read readiness once they are written.
-    pub fn interest(&self) -> m6_core::mio::Interest {
-        if self.write_offset < self.request.len() {
-            m6_core::mio::Interest::READABLE | m6_core::mio::Interest::WRITABLE
-        } else {
-            m6_core::mio::Interest::READABLE
-        }
-    }
-
-    /// Write what is left of the request. A backend may answer before it has
-    /// read the whole request (RFC 9110 6.1), so an EPIPE or ECONNRESET keeps
-    /// reading: the response is already waiting on the socket.
-    fn write_request(&mut self) -> io::Result<()> {
-        while self.write_offset < self.request.len() {
-            match self.stream.write(&self.request[self.write_offset..]) {
-                Ok(0) => break,
-                Ok(n) => self.write_offset += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e)
-                    if e.kind() == io::ErrorKind::BrokenPipe
-                        || e.kind() == io::ErrorKind::ConnectionReset =>
-                {
-                    self.write_offset = self.request.len();
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// Make progress: write what is left of the request, then read until
-    /// `WouldBlock` or end of stream. Returns `Some` when the response is
-    /// complete or failed, `None` when the caller must drive it again.
-    pub fn drive(&mut self) -> Option<io::Result<HttpResponse>> {
-        if let Err(e) = self.write_request() {
-            return Some(Err(e));
-        }
-
-        // Read until WouldBlock or end of stream.
-        let mut eof = false;
-        loop {
-            let mut tmp = [0u8; 8192];
-            match self.stream.read(&mut tmp) {
-                Ok(0) => {
-                    eof = true;
-                    break;
-                }
-                Ok(n) => {
-                    self.read_buf.extend_from_slice(&tmp[..n]);
-                    // Bound the incremental buffer the same way the blocking
-                    // reader bounds a body: a hostile backend must not grow the
-                    // process without limit before the deadline fires.
-                    if self.read_buf.len() > MAX_BACKEND_BODY + 8192 {
-                        return Some(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("backend response exceeded the {MAX_BACKEND_BODY} byte limit"),
-                        )));
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                // The backend reset or closed while we read. Treat it as end of
-                // stream so the completion check below uses whatever reply is
-                // already buffered: a backend that rejects a request (a 413 for
-                // an oversized header) writes its answer and then resets without
-                // draining the rest, and that answer must reach the client.
-                Err(e)
-                    if e.kind() == io::ErrorKind::ConnectionReset
-                        || e.kind() == io::ErrorKind::BrokenPipe =>
-                {
-                    eof = true;
-                    break;
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-
-        // Locate and parse the final header section, once.
-        if self.completion.is_none() {
-            match locate_final_head(&self.read_buf, &self.method) {
-                Ok(Some(completion)) => self.completion = Some(completion),
-                Ok(None) => {
-                    if eof {
-                        return Some(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "connection closed before headers complete",
-                        )));
-                    }
-                    return None;
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-
-        let (header_end, framing) = self.completion.unwrap();
-        let complete = match framing {
-            Framing::Bodyless => true,
-            Framing::ContentLength(len) => {
-                // Refuse before growing the buffer: read_response_for applies
-                // the same limit, but only after the whole body has arrived.
-                if len > MAX_BACKEND_BODY {
-                    return Some(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "backend declared Content-Length {len}, above the {MAX_BACKEND_BODY} limit"
-                        ),
-                    )));
-                }
-                if self.read_buf.len() >= header_end + 4 + len {
-                    true
-                } else if eof {
-                    // The backend closed before sending the declared body: fail
-                    // now, as the old blocking read_exact did, rather than
-                    // re-driving a closed fd until the deadline.
-                    return Some(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "connection closed before the body was complete",
-                    )));
-                } else {
-                    false
-                }
-            }
-            Framing::Chunked => eof || self.read_buf.ends_with(b"0\r\n\r\n"),
-            Framing::CloseDelimited => eof,
-        };
-
-        if complete {
-            Some(read_response_for(
-                std::io::Cursor::new(&self.read_buf[..]),
-                &self.method,
-            ))
-        } else {
-            None
-        }
-    }
 }
 
 /// Parse an incoming HTTP/1.1 request from a byte buffer.
@@ -1770,100 +1440,6 @@ pub fn build_response(
 mod tests {
     use super::*;
 
-    /// A full JSON Lines page from `m6_core::ndjson` must fit in a backend body
-    /// this edge will accept, or a service honouring its own page limit would
-    /// still be refused here.
-    #[test]
-    fn a_full_ndjson_page_fits_under_the_backend_body_cap() {
-        const { assert!(m6_core::ndjson::MAX_PAGE_BYTES < MAX_BACKEND_BODY) };
-    }
-
-    /// A backend that declares a body then closes early must fail at once with
-    /// `UnexpectedEof`, not be re-driven until the 30 s deadline. The blocking
-    /// reader used `read_exact`, which failed immediately; the incremental
-    /// reader must match.
-    #[test]
-    fn a_short_content_length_body_fails_at_once_not_at_the_deadline() {
-        use std::os::unix::net::UnixListener;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("b.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        let path2 = path.clone();
-        let backend = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().expect("accept");
-            let mut buf = [0u8; 4096];
-            let mut got = Vec::new();
-            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
-                match s.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => got.extend_from_slice(&buf[..n]),
-                }
-            }
-            // Declare 100 bytes, send only 5, then close.
-            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort";
-            let _ = s.write_all(resp.as_bytes());
-            let _ = s.flush();
-        });
-
-        let req = b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec();
-        let mut up = SocketUpstream::start(
-            &path2,
-            req,
-            "GET",
-            Instant::now() + std::time::Duration::from_secs(30),
-        )
-        .expect("start");
-
-        let started = std::time::Instant::now();
-        let result = loop {
-            if let Some(r) = up.drive() {
-                break r;
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
-                "a short body must not hang the upstream"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-        backend.join().expect("backend");
-        let err = result.expect_err("a short body must be an error");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::UnexpectedEof,
-            "a short body must fail with UnexpectedEof: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_status_line() {
-        let (status, reason) = parse_status_line("HTTP/1.1 200 OK").unwrap();
-        assert_eq!(status, 200);
-        assert_eq!(reason, "OK");
-    }
-
-    #[test]
-    fn test_parse_status_line_no_reason() {
-        let (status, reason) = parse_status_line("HTTP/1.1 404").unwrap();
-        assert_eq!(status, 404);
-        assert_eq!(reason, "");
-    }
-
-    #[test]
-    fn test_read_response_basic() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let resp = read_response(&raw[..]).unwrap();
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, b"hello");
-    }
-
-    #[test]
-    fn test_read_response_chunked() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let resp = read_response(&raw[..]).unwrap();
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.body, b"hello");
-    }
-
     #[test]
     fn test_parse_request_basic() {
         let raw = b"GET /hello?foo=bar HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -1975,24 +1551,6 @@ mod tests {
         assert!(s.contains("X-Forwarded-Host: original.host\r\n"));
         // Connection: close must be present
         assert!(s.contains("Connection: close\r\n"));
-    }
-
-    #[test]
-    fn test_forward_request_timeout_conn_refused() {
-        // Connecting to a port that has no listener should fail, not hang.
-        let req = HttpRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            query: None,
-            version: "HTTP/1.1".to_string(),
-            headers: vec![],
-            body: vec![],
-        };
-        // /tmp/nonexistent-m6-test.sock will not exist
-        let path = std::path::Path::new("/tmp/nonexistent-m6-test-timeout.sock");
-        let timeout = std::time::Duration::from_millis(100);
-        let result = forward_request_timeout(path, &req, "127.0.0.1", "localhost", Some(timeout));
-        assert!(result.is_err());
     }
 }
 
@@ -2145,268 +1703,6 @@ mod smuggling_tests {
             body: b"a=1".to_vec(),
         };
         assert_eq!(check_forwardable(&r, "203.0.113.7", "example.com"), Ok(()));
-    }
-}
-
-#[cfg(test)]
-mod response_framing_tests {
-    use super::*;
-
-    /// F028. The parser kept the last `Content-Length` it saw, so a backend
-    /// emitting two different lengths framed the response by whichever came
-    /// last. If this hop and the next hop disagree about the length, the
-    /// remainder becomes the head of the following response on a reused
-    /// connection -- response splitting.
-    #[test]
-    fn conflicting_content_length_is_refused() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
-        let err = read_response(&raw[..]).unwrap_err();
-        assert!(
-            err.to_string().contains("conflicting Content-Length"),
-            "got: {err}"
-        );
-    }
-
-    /// Repeated but identical values are unambiguous, so they must still work.
-    /// Without this the fix above would reject legitimate traffic.
-    #[test]
-    fn duplicate_but_equal_content_length_is_accepted() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
-        let r = read_response(&raw[..]).expect("equal duplicates are unambiguous");
-        assert_eq!(r.body, b"hello");
-    }
-
-    /// A single field carrying a list must be checked element-wise too.
-    #[test]
-    fn content_length_list_must_agree() {
-        assert!(
-            read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello"[..]).is_err()
-        );
-        let r =
-            read_response(&b"HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello"[..]).unwrap();
-        assert_eq!(r.body, b"hello");
-    }
-
-    /// F029. RFC 9112 6.1 forbids sending both. A recipient that picks one is
-    /// the classic smuggling primitive because the next hop may pick the other.
-    #[test]
-    fn transfer_encoding_with_content_length_is_refused() {
-        let raw =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
-        let err = read_response(&raw[..]).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("both Transfer-Encoding and Content-Length"),
-            "got: {err}"
-        );
-    }
-
-    /// F030. Transfer-Encoding is a list and only the FINAL coding frames the
-    /// message. `gzip, chunked` is chunked; the old check compared the whole
-    /// value to "chunked" and so treated this as unframed, handing the chunk
-    /// envelope back as though it were the body.
-    #[test]
-    fn transfer_encoding_list_ending_in_chunked_is_chunked() {
-        let raw =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let r = read_response(&raw[..]).expect("gzip, chunked is chunked");
-        assert_eq!(r.body, b"hello", "chunk envelope was not decoded");
-    }
-
-    /// The converse: a Transfer-Encoding NOT ending in chunked leaves the
-    /// message with no self-delimiting framing at all.
-    #[test]
-    fn transfer_encoding_not_ending_in_chunked_is_refused() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhello";
-        let err = read_response(&raw[..]).unwrap_err();
-        assert!(
-            err.to_string().contains("not ending in chunked"),
-            "got: {err}"
-        );
-    }
-
-    /// F031. An unparseable length used to become `None` via `.ok()` and fall
-    /// through to read-to-EOF, quietly switching framing mode on malformed
-    /// input instead of rejecting it.
-    #[test]
-    fn invalid_content_length_is_refused_not_read_to_eof() {
-        for bad in ["abc", "5x", "-1", "0x10", "+5", ""] {
-            let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {bad}\r\n\r\nhello");
-            let err = read_response(raw.as_bytes()).unwrap_err();
-            assert!(
-                err.to_string().contains("invalid Content-Length"),
-                "Content-Length {bad:?} should be refused, got: {err}"
-            );
-        }
-    }
-
-    /// F035. A response to HEAD carries the headers a GET would, Content-Length
-    /// included, but no body. Without the method the reader blocked waiting for
-    /// bytes a correct backend never sends, so every HEAD to a backend stalled
-    /// until the read timeout.
-    ///
-    /// The reader here yields EOF immediately after the headers: if the code
-    /// tries to read a body at all this fails, which is exactly the stall.
-    #[test]
-    fn head_response_is_bodyless_despite_content_length() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 16422\r\n\r\n";
-        let r = read_response_for(&raw[..], "HEAD").expect("HEAD must not wait for a body");
-        assert!(r.body.is_empty());
-        assert_eq!(
-            r.header("content-length"),
-            Some("16422"),
-            "the header must survive; only the body is absent"
-        );
-    }
-
-    /// Same rule, driven by status rather than method (RFC 9112 6.3).
-    #[test]
-    fn status_codes_that_never_have_a_body() {
-        for status in [204u16, 304, 101] {
-            let raw = format!("HTTP/1.1 {status} X\r\nContent-Length: 99\r\n\r\n");
-            let r = read_response(raw.as_bytes())
-                .unwrap_or_else(|e| panic!("{status} must not wait for a body: {e}"));
-            assert!(r.body.is_empty(), "{status} must have no body");
-        }
-    }
-
-    /// A 1xx other than 101 is not the answer: the reader goes on to the next
-    /// head, whichever of those statuses it was.
-    #[test]
-    fn informational_responses_other_than_101_are_skipped() {
-        for status in [100u16, 102, 103, 199] {
-            let raw = format!(
-                "HTTP/1.1 {status} X\r\nContent-Length: 99\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
-            );
-            let r = read_response(raw.as_bytes())
-                .unwrap_or_else(|e| panic!("{status} must be skipped: {e}"));
-            assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]), "{status}");
-        }
-    }
-
-    /// The heads can arrive in separate reads, however the socket splits them.
-    /// One byte per read is the worst split, and is deterministic.
-    #[test]
-    fn an_informational_head_split_across_reads_is_skipped() {
-        struct OneByte<'a>(&'a [u8]);
-        impl Read for OneByte<'_> {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                let Some((&b, rest)) = self.0.split_first() else {
-                    return Ok(0);
-                };
-                buf[0] = b;
-                self.0 = rest;
-                Ok(1)
-            }
-        }
-        let raw = b"HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        let r = read_response(OneByte(raw)).unwrap();
-        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
-    }
-
-    /// A backend that sends only informational responses and then closes has
-    /// given no answer, and that is an error rather than a 1xx result.
-    #[test]
-    fn informational_responses_with_no_final_one_are_an_error() {
-        let raw = b"HTTP/1.1 103 Early Hints\r\n\r\n";
-        assert!(read_response(&raw[..]).is_err());
-    }
-
-    /// A GET with the same headers still reads its body, so the bodyless rule
-    /// cannot have been implemented by ignoring bodies generally.
-    #[test]
-    fn get_still_reads_its_body() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        assert_eq!(read_response_for(&raw[..], "GET").unwrap().body, b"hello");
-    }
-}
-
-#[cfg(test)]
-mod chunked_tests {
-    use super::read_response;
-
-    fn resp(body: &str) -> Vec<u8> {
-        format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}").into_bytes()
-    }
-
-    /// The happy path, including a trailer section, so the stricter parsing
-    /// cannot have been achieved by rejecting valid messages.
-    #[test]
-    fn well_formed_chunked_bodies_decode() {
-        for (body, want) in [
-            ("5\r\nhello\r\n0\r\n\r\n", "hello"),
-            ("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", "hello world"),
-            ("0\r\n\r\n", ""),
-            // chunk-ext is permitted and ignored
-            ("5;foo=bar\r\nhello\r\n0\r\n\r\n", "hello"),
-            // uppercase hex
-            ("A\r\n0123456789\r\n0\r\n\r\n", "0123456789"),
-            // trailers
-            ("5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n", "hello"),
-        ] {
-            let r = read_response(&resp(body)[..])
-                .unwrap_or_else(|e| panic!("{body:?} should decode: {e}"));
-            assert_eq!(String::from_utf8_lossy(&r.body), want, "for {body:?}");
-        }
-    }
-
-    /// F032. The CRLF after chunk data used to be skipped only if present, so a
-    /// chunk whose data was followed by anything else resynchronised onto the
-    /// wrong offset and the remainder was parsed as chunk headers.
-    #[test]
-    fn missing_crlf_after_chunk_data_is_refused() {
-        let err = read_response(&resp("5\r\nhelloXX0\r\n\r\n")[..]).unwrap_err();
-        assert!(
-            err.to_string().contains("not terminated by CRLF"),
-            "got: {err}"
-        );
-    }
-
-    /// F033/F034. The decoder returned at the zero chunk without confirming the
-    /// message actually ended, so a truncated trailer section was
-    /// indistinguishable from a complete body.
-    #[test]
-    fn truncated_trailer_section_is_refused() {
-        for body in ["5\r\nhello\r\n0\r\n", "5\r\nhello\r\n0\r\nX-Trailer: v\r\n"] {
-            let err = read_response(&resp(body)[..]).unwrap_err();
-            assert!(
-                err.to_string().contains("trailer section was terminated"),
-                "{body:?} should be refused, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_trailer_is_refused() {
-        let err =
-            read_response(&resp("5\r\nhello\r\n0\r\nnot a header line\r\n\r\n")[..]).unwrap_err();
-        assert!(err.to_string().contains("malformed trailer"), "got: {err}");
-    }
-
-    /// `usize::from_str_radix` accepts a leading `+`, so `+A` parsed as 10 --
-    /// the same trap that let `Content-Length: +5` through.
-    #[test]
-    fn chunk_size_must_be_plain_hex() {
-        for bad in ["+A", "-5", "", " ", "0x5", "5g"] {
-            let body = format!("{bad}\r\nhello\r\n0\r\n\r\n");
-            let err = read_response(&resp(&body)[..]).unwrap_err();
-            assert!(
-                err.to_string().contains("invalid chunk size")
-                    || err.to_string().contains("missing CRLF"),
-                "chunk size {bad:?} should be refused, got: {err}"
-            );
-        }
-    }
-
-    /// A chunk claiming more data than was sent must not return a short body as
-    /// though it were complete.
-    #[test]
-    fn short_chunk_data_is_refused() {
-        let err = read_response(&resp("10\r\nhello\r\n0\r\n\r\n")[..]).unwrap_err();
-        assert!(
-            err.to_string().contains("shorter than declared"),
-            "got: {err}"
-        );
     }
 }
 

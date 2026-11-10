@@ -17,6 +17,7 @@ use quiche::h3::NameValue;
 use rand::RngCore;
 use tracing::{debug, error, info, warn};
 
+use m6_core::client::Upstream;
 use m6_http_lib::analytics;
 use m6_http_lib::analytics::H3Headers;
 use m6_http_lib::auth;
@@ -221,9 +222,11 @@ enum PendingH3Response {
 
 /// One in-flight socket-backend request the loop drives. When it completes or
 /// expires the loop writes the result straight into the waiting stream named by
-/// `waiter`, with the request context it carries.
+/// `waiter`, with the request context it carries. The `Upstream` slot and its
+/// buffers are made at start and reused for every request, so a socket miss
+/// allocates nothing on the connect, write or parse path.
 struct SocketUpstreamEntry {
-    upstream: Option<forward::SocketUpstream>,
+    upstream: Upstream,
     member_idx: usize,
     backend_name: String,
     waiter: Option<Waiter>,
@@ -234,7 +237,7 @@ struct SocketUpstreamEntry {
 impl SocketUpstreamEntry {
     fn empty() -> SocketUpstreamEntry {
         SocketUpstreamEntry {
-            upstream: None,
+            upstream: Upstream::new(64 * 1024, 16 * 1024),
             member_idx: 0,
             backend_name: String::new(),
             waiter: None,
@@ -1299,6 +1302,28 @@ fn complete_waiter(
     }
 }
 
+/// Copy a borrowed [`m6_core::client::Reply`] into the owned form the cache
+/// insert and error mode need. The copy is the miss path's only per-request
+/// allocation; Planner B's ALLOC-2 removes the cache's own copy.
+fn http_response_from_reply(reply: &m6_core::client::Reply<'_>) -> forward::HttpResponse {
+    let headers = reply
+        .headers
+        .iter()
+        .map(|h| {
+            (
+                h.name.to_string(),
+                String::from_utf8_lossy(h.value).into_owned(),
+            )
+        })
+        .collect();
+    forward::HttpResponse {
+        status: reply.status,
+        reason: String::new(),
+        headers,
+        body: reply.body.to_vec(),
+    }
+}
+
 /// Drive the one socket upstream whose descriptor fired.
 fn drive_socket_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
     let Source::SocketUpstream(slot) = *cx.state.sources.get(token.0) else {
@@ -1306,24 +1331,35 @@ fn drive_socket_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
     };
     let result = {
         let entry = cx.state.socket_upstreams.get_mut(slot);
-        let Some(upstream) = entry.upstream.as_mut() else {
-            return;
-        };
+        let upstream = &mut entry.upstream;
         let interest = upstream.interest();
         if interest != entry.registered_interest {
             cx.registry
-                .reregister(&mut SourceFd(&upstream.raw_fd()), token, interest)
+                .reregister(&mut SourceFd(&upstream.fd()), token, interest)
                 .ok();
             entry.registered_interest = interest;
         }
         match upstream.drive() {
-            Some(result) => {
-                cx.registry
-                    .deregister(&mut SourceFd(&upstream.raw_fd()))
-                    .ok();
-                Some(result)
+            Ok(true) => {
+                let mut slots = [httparse::EMPTY_HEADER; 64];
+                match upstream.reply(&mut slots) {
+                    Some(reply) => {
+                        cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                        Some(Ok(http_response_from_reply(&reply)))
+                    }
+                    None => {
+                        cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                        Some(Err(std::io::Error::other(
+                            "upstream reported a reply but none parsed",
+                        )))
+                    }
+                }
             }
-            None => None,
+            Ok(false) => None,
+            Err(e) => {
+                cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                Some(Err(e))
+            }
         }
     };
     let Some(result) = result else {
@@ -1334,7 +1370,7 @@ fn drive_socket_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
     let backend_name = std::mem::take(&mut entry.backend_name);
     let waiter = entry.waiter.take();
     let ctx = entry.ctx.take();
-    entry.upstream.take();
+    entry.upstream.close();
     cx.state.socket_upstreams.free(slot);
     *cx.state.sources.get_mut(token.0) = Source::Vacant;
     cx.state.sources.free(token.0);
@@ -1357,11 +1393,10 @@ fn expire_socket_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
         return;
     };
     let entry = cx.state.socket_upstreams.get_mut(slot);
-    if let Some(upstream) = entry.upstream.take() {
-        cx.registry
-            .deregister(&mut SourceFd(&upstream.raw_fd()))
-            .ok();
-    }
+    cx.registry
+        .deregister(&mut SourceFd(&entry.upstream.fd()))
+        .ok();
+    entry.upstream.close();
     let member_idx = entry.member_idx;
     let backend_name = std::mem::take(&mut entry.backend_name);
     let waiter = entry.waiter.take();
@@ -2843,37 +2878,26 @@ enum SocketLaunchError {
     Register(std::io::Error),
 }
 
-/// Encode already done by the caller; this takes the member, starts the
-/// non-blocking upstream, registers it, and parks it in `socket_upstreams`.
+/// Encode the request into the slot's buffer, take the member, start the
+/// non-blocking upstream, register it, and park it in `socket_upstreams`.
 /// Returns the upstream's slot key, so the caller can store its waiter there.
 fn launch_socket_upstream(
     state: &mut ServerState,
     registry: &m6_core::mio::Registry,
-    request: Vec<u8>,
-    method: &str,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    original_host: &str,
     backend_name: &str,
     timeout: std::time::Duration,
 ) -> Result<usize, SocketLaunchError> {
     let (socket_path, member_idx) = match state.pool_manager.get_pool_mut(backend_name) {
-        Some(pool) => pool.take_member().map_err(|_| SocketLaunchError::Empty)?,
+        Some(pool) => {
+            let (path, idx) = pool.take_member().map_err(|_| SocketLaunchError::Empty)?;
+            (path.to_path_buf(), idx)
+        }
         None => return Err(SocketLaunchError::UnknownBackend),
     };
     let deadline = std::time::Instant::now() + timeout;
-    let upstream = match forward::SocketUpstream::start(socket_path, request, method, deadline) {
-        Ok(u) => u,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-                pool.cancel(member_idx);
-            }
-            return Err(SocketLaunchError::BacklogFull);
-        }
-        Err(e) => {
-            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-                pool.mark_failed(member_idx);
-            }
-            return Err(SocketLaunchError::Connect(e));
-        }
-    };
     let Some(token) = take_token(state) else {
         if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
             pool.cancel(member_idx);
@@ -2887,8 +2911,46 @@ fn launch_socket_upstream(
         }
         return Err(SocketLaunchError::BacklogFull);
     };
+    let upstream = &mut state.socket_upstreams.get_mut(owner.key).upstream;
+    let buf = upstream.request_buf();
+    if let Err(e) = forward::encode_request(buf, req, client_ip, original_host) {
+        state.socket_upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+            pool.cancel(member_idx);
+        }
+        return Err(SocketLaunchError::Connect(e));
+    }
+    let method_is_head = req.method.eq_ignore_ascii_case("HEAD");
+    match upstream.start(
+        &m6_core::client::Addr::Unix(socket_path),
+        None,
+        method_is_head,
+        deadline,
+    ) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            state.socket_upstreams.free(owner.key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+                pool.cancel(member_idx);
+            }
+            return Err(SocketLaunchError::BacklogFull);
+        }
+        Err(e) => {
+            state.socket_upstreams.free(owner.key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+                pool.mark_failed(member_idx);
+            }
+            return Err(SocketLaunchError::Connect(e));
+        }
+    }
     let interest = upstream.interest();
-    if let Err(e) = registry.register(&mut SourceFd(&upstream.raw_fd()), token, interest) {
+    if let Err(e) = registry.register(&mut SourceFd(&upstream.fd()), token, interest) {
         state.socket_upstreams.free(owner.key);
         *state.sources.get_mut(token.0) = Source::Vacant;
         state.sources.free(token.0);
@@ -2901,14 +2963,12 @@ fn launch_socket_upstream(
         .upstream_timeouts
         .touch(token, std::time::Instant::now());
     *state.sources.get_mut(token.0) = Source::SocketUpstream(owner.key);
-    *state.socket_upstreams.get_mut(owner.key) = SocketUpstreamEntry {
-        upstream: Some(upstream),
-        member_idx,
-        backend_name: backend_name.to_string(),
-        waiter: None,
-        ctx: None,
-        registered_interest: interest,
-    };
+    let entry = state.socket_upstreams.get_mut(owner.key);
+    entry.member_idx = member_idx;
+    entry.backend_name = backend_name.to_string();
+    entry.waiter = None;
+    entry.ctx = None;
+    entry.registered_interest = interest;
     Ok(owner.key)
 }
 
@@ -3371,28 +3431,16 @@ fn handle_request_inner(
     // arrives on the entry's channel and is finished by complete_socket_response
     // (reached from finalize_url_response), which keeps the socket branch's own
     // completion semantics.
-    let original_host = origin_host(req, &state.config);
+    let original_host = origin_host(req, &state.config).to_string();
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
     let backend_start = std::time::Instant::now();
-
-    let request = match forward::encode_request(req, client_ip, original_host) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(backend = %backend_name, error = %e, "backend error");
-            let err_ctx = error::ErrorContext {
-                route: Some(route.path.clone()),
-                backend: Some(backend_name.clone()),
-                detail: Some(e.to_string()),
-            };
-            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
-        }
-    };
 
     let slot = match launch_socket_upstream(
         state,
         registry,
-        request,
-        &req.method,
+        req,
+        client_ip,
+        &original_host,
         &backend_name,
         timeout,
     ) {
@@ -3512,7 +3560,7 @@ fn check_rate_limit(
 
 /// Try to fetch the configured `[errors] mode = "custom"` error page without
 /// blocking the loop: a URL/H2C/H2S backend is dispatched to its own thread or
-/// pool, and a socket backend to a non-blocking `SocketUpstream`, both carrying
+/// pool, and a socket backend to a non-blocking `client::Upstream`, both carrying
 /// `error_status_override` so the completion returns the fetched body under the
 /// original failing status.
 ///
@@ -3654,9 +3702,16 @@ fn dispatch_custom_error_async(
 
     // Socket backend: a non-blocking upstream, the same way the socket branch
     // reaches a normal route.
-    let request = forward::encode_request(&error_req, client_ip, &original_host).ok()?;
-    let slot =
-        launch_socket_upstream(state, registry, request, "GET", &backend_name, timeout).ok()?;
+    let slot = launch_socket_upstream(
+        state,
+        registry,
+        &error_req,
+        client_ip,
+        &original_host,
+        &backend_name,
+        timeout,
+    )
+    .ok()?;
 
     let ctx = forward::PendingUrlContext {
         req: req.clone(),

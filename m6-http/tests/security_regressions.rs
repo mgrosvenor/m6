@@ -77,8 +77,54 @@ fn forward_and_capture(req: &HttpRequest, client_ip: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("backend.sock");
     let handle = capture_backend(&sock);
-    forward::forward_request(&sock, req, client_ip, "example.com").expect("forward");
+    drive_and_capture(&sock, req, client_ip);
     String::from_utf8(handle.join().unwrap()).expect("utf8 request")
+}
+
+/// Drive one request over a Unix socket until it completes, blocking with a
+/// `mio::Poll` (tests may block). The reply is discarded: the caller wants the
+/// request bytes the backend captured.
+fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
+    use m6_core::mio::unix::SourceFd;
+    use m6_core::mio::{Events, Poll, Token};
+
+    let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
+    forward::encode_request(up.request_buf(), req, client_ip, "example.com").expect("encode");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    up.start(
+        &m6_core::client::Addr::Unix(sock.to_path_buf()),
+        None,
+        false,
+        deadline,
+    )
+    .expect("start");
+
+    let mut poll = Poll::new().expect("poll");
+    let mut events = Events::with_capacity(8);
+    let token = Token(0);
+    let mut registered = up.interest();
+    poll.registry()
+        .register(&mut SourceFd(&up.fd()), token, registered)
+        .expect("register");
+    loop {
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))
+            .expect("poll");
+        if events.iter().any(|ev| ev.token() == token) {
+            let interest = up.interest();
+            if interest != registered {
+                poll.registry()
+                    .reregister(&mut SourceFd(&up.fd()), token, interest)
+                    .expect("reregister");
+                registered = interest;
+            }
+            if up.drive().expect("drive") {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= up.deadline() {
+            panic!("backend timed out");
+        }
+    }
 }
 
 fn get_request(path: &str, headers: Vec<(String, String)>) -> HttpRequest {

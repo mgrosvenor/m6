@@ -2,7 +2,7 @@
 //! (RFC 9110 15.2). The proxy must skip them and return the final response.
 //!
 //! Each test runs a loopback backend on a Unix socket and fetches from it
-//! through `forward_request`, the call the edge makes for a cache miss.
+//! through `client::Upstream`, the call the edge makes for a cache miss.
 
 #![allow(
     clippy::disallowed_methods,
@@ -40,6 +40,77 @@ fn backend(sock: &Path, informational: usize) -> std::thread::JoinHandle<()> {
     })
 }
 
+/// Copy a borrowed reply into the owned form `forward::HttpResponse` carries.
+fn response_from_reply(reply: &m6_core::client::Reply<'_>) -> forward::HttpResponse {
+    let headers = reply
+        .headers
+        .iter()
+        .map(|h| {
+            (
+                h.name.to_string(),
+                String::from_utf8_lossy(h.value).into_owned(),
+            )
+        })
+        .collect();
+    forward::HttpResponse {
+        status: reply.status,
+        reason: String::new(),
+        headers,
+        body: reply.body.to_vec(),
+    }
+}
+
+/// Drive one request over a Unix socket until it completes, blocking with a
+/// `mio::Poll` (tests may block).
+fn drive_upstream(
+    sock: &Path,
+    req: &HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+) -> std::io::Result<forward::HttpResponse> {
+    use m6_core::mio::unix::SourceFd;
+    use m6_core::mio::{Events, Poll, Token};
+
+    let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
+    forward::encode_request(up.request_buf(), req, client_ip, original_host)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    up.start(
+        &m6_core::client::Addr::Unix(sock.to_path_buf()),
+        None,
+        false,
+        deadline,
+    )?;
+
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(8);
+    let token = Token(0);
+    let mut registered = up.interest();
+    poll.registry()
+        .register(&mut SourceFd(&up.fd()), token, registered)?;
+    loop {
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))?;
+        if events.iter().any(|ev| ev.token() == token) {
+            let interest = up.interest();
+            if interest != registered {
+                poll.registry()
+                    .reregister(&mut SourceFd(&up.fd()), token, interest)?;
+                registered = interest;
+            }
+            if up.drive()? {
+                let mut slots = [httparse::EMPTY_HEADER; 64];
+                let reply = up.reply(&mut slots).expect("reply after complete drive");
+                return Ok(response_from_reply(&reply));
+            }
+        }
+        if std::time::Instant::now() >= up.deadline() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend timed out",
+            ));
+        }
+    }
+}
+
 fn fetch(informational: usize) -> std::io::Result<forward::HttpResponse> {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("backend.sock");
@@ -52,13 +123,7 @@ fn fetch(informational: usize) -> std::io::Result<forward::HttpResponse> {
         headers: vec![("Host".to_string(), "example.com".to_string())],
         body: vec![],
     };
-    let r = forward::forward_request_timeout(
-        &sock,
-        &req,
-        "127.0.0.1",
-        "example.com",
-        Some(std::time::Duration::from_secs(5)),
-    );
+    let r = drive_upstream(&sock, &req, "127.0.0.1", "example.com");
     let _ = handle.join();
     r
 }
