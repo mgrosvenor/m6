@@ -931,9 +931,12 @@ fn drive_conn_token(
             .stats
             .record_handshake(hs.elapsed_ns, Channel::new(v, state.tls_iface), hs.resumed);
         // An h2 connection is idle-governed by `h2_idle_timeouts`, not the
-        // 30 s read deadline set at accept, so drop that deadline here.
+        // 30 s read deadline set at accept, so drop that deadline and start
+        // the idle clock now: a peer that finishes the handshake but never
+        // sends its client preface must still be reaped.
         if hs.is_h2 {
             state.read_timeouts.clear(token);
+            state.h2_idle_timeouts.touch(token, now);
         }
     }
     if drive.restarted {
