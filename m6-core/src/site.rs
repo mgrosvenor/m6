@@ -310,8 +310,11 @@ impl Site {
             Some((route, dict)) => match dict {
                 Ok(dict) => (route, dict),
                 Err(e) => {
-                    // An internal failure is finished like the unmatched 404:
-                    // no route defaults and no cookies an error has no use for.
+                    // An internal failure is finished like the unmatched 404,
+                    // with no route at all: no default `Cache-Control`, no
+                    // `Last-Modified`, no route headers. The CSRF and flash
+                    // housekeeping is the same as the 404's, because it is the
+                    // same finish path.
                     let resp = crate::response::error_to_response(&e);
                     let resp = self.finish_raw(&raw, None, None, started, resp);
                     return Handled::Done(resp);
@@ -343,27 +346,21 @@ impl Site {
             return Handled::Done(resp);
         }
 
-        if route.template.is_none() {
-            // A code route, found by pattern and method exactly as the
-            // dispatch used to find it.
-            let key = format!("{}:{}", route.pattern, route.methods.handler_key());
-            match self.code_index.get(&key) {
-                Some(&index) => return Handled::Code(index, req),
-                None => {
-                    let resp = self.finish(&req, Response::not_found());
-                    return Handled::Done(resp);
-                }
-            }
-        }
-
         if let Some(template) = &route.template {
             let resp = Response::render_request_dict(template, route.status);
             let resp = self.finish_raw(req.raw(), Some(req.dict()), Some(route), started, resp);
             return Handled::Done(resp);
         }
 
-        let resp = self.finish(&req, Response::not_found());
-        Handled::Done(resp)
+        // No template: a code route, or a 404 when nothing in code answers it.
+        let key = format!("{}:{}", route.pattern, route.methods.handler_key());
+        match self.code_index.get(&key) {
+            Some(&index) => Handled::Code(index, req),
+            None => {
+                let resp = self.finish(&req, Response::not_found());
+                Handled::Done(resp)
+            }
+        }
     }
 
     /// Renders a template the response names, then Cache-Control, CSRF, flash,
@@ -1084,6 +1081,19 @@ mod tests {
                 assert!(
                     !crate::headers::contains(&response.headers[..], "cache-control"),
                     "an error must not carry the route's Cache-Control: {:?}",
+                    response.headers
+                );
+                // The finish path is the unmatched 404's, so the CSRF
+                // housekeeping still runs. That is the intended model: an
+                // error is finished like any other answer that has no route.
+                #[cfg(feature = "csrf")]
+                assert!(
+                    response
+                        .headers
+                        .iter()
+                        .any(|(name, value)| name.eq_ignore_ascii_case("set-cookie")
+                            && value.contains("_csrf=")),
+                    "the unmatched-404 model sets the CSRF cookie: {:?}",
                     response.headers
                 );
             }

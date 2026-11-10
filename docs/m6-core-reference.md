@@ -161,7 +161,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `error` | `Error` and `Result`. |
 | | `testkit` | The shared integration harness. Feature `testkit`. |
 
-**Table 3: the 37 component modules, their group and one line on what each holds.**
+**Table 3: the component modules, their group and one line on what each holds.**
 Take from it that the group names the task, and the module name is the string to search for in the section that follows.
 
 The index is the map for the rest of the document.
@@ -560,11 +560,14 @@ loop {
         // request may already be buffered, so read again before waiting.
         Flush::Done if !idle => {}
         // Everything is written and this turn has nothing more to read.
-        Flush::Done => break,
-        // The socket would block with output still queued: register
-        // WRITABLE and flush again when it is.
+        Flush::Done => {
+            reregister(&mut conn, conn.interest(), token);
+            break;
+        }
+        // The socket would block with output still queued: register with
+        // `conn.interest()` (WRITABLE here) and flush again when it is.
         Flush::More => {
-            reregister(&mut conn, Interest::WRITABLE, token);
+            reregister(&mut conn, conn.interest(), token);
             break;
         }
         // Everything is written and this connection closes.
@@ -572,6 +575,9 @@ loop {
     }
 }
 ```
+
+The service's own loop registers the token with `conn.interest()` after every turn, so a turn that ends waiting for the socket to be readable leaves a READABLE registration and a turn that owes output leaves a WRITABLE one.
+When a WRITABLE event arrives, the loop calls `conn.flush()` and re-registers with `conn.interest()` again, which is what continues a `Flush::More`.
 
 **Allocation.** `ServerConn` allocates nothing per request: its buffers are made
 at start and a request or response larger than them is the one case that grows

@@ -69,6 +69,7 @@ fn main() {
         "a_declared_body_does_not_allocate_before_it_arrives",
         a_declared_body_does_not_allocate_before_it_arrives,
     );
+    failed |= check("a_response_allocates_nothing", a_response_allocates_nothing);
     std::process::exit(if failed { 1 } else { 0 });
 }
 
@@ -376,8 +377,16 @@ fn a_large_upload_grows_and_returns_the_buffer() -> bool {
     // Serve the upload and the small request, then stop: the client thread has
     // read both answers even though the test still holds a client copy.
     let mut requests = 0u32;
+    let mut small_allocations = None;
     loop {
         h.wait_readable();
+        // The small request is the second one; its whole server turn is
+        // counted, including the answer and the flush.
+        let counted = if requests == 1 {
+            Some(alloc_count::now())
+        } else {
+            None
+        };
         let mut heads = h1::head_slots();
         let read = h.conn.read(&mut heads).expect("read");
         let answered = match read {
@@ -390,7 +399,11 @@ fn a_large_upload_grows_and_returns_the_buffer() -> bool {
                 .respond(200, &[("Content-Type", "text/plain")], b"ok");
             requests += 1;
         }
-        match h.conn.flush().expect("flush") {
+        let flush = h.conn.flush().expect("flush");
+        if let (Some(start), true) = (counted, answered) {
+            small_allocations = Some(alloc_count::now() - start);
+        }
+        match flush {
             Flush::Done if requests >= 2 => break,
             Flush::Close => break,
             _ => {}
@@ -399,11 +412,49 @@ fn a_large_upload_grows_and_returns_the_buffer() -> bool {
     assert_eq!(requests, 2, "both requests must be served");
     uploader.join().expect("the uploading client");
 
-    // The grown input buffer was cut back after the large request; the small
-    // one that followed allocated nothing.
+    // The grown input buffer was cut back after the large request, and the
+    // small request that followed allocated nothing, as the plan's row says.
     let (read_cap, write_cap) = h.conn.buffer_caps();
-    println!("  slot buffers after the upload: read {read_cap}, write {write_cap}");
-    read_cap == READ_CAP && write_cap == WRITE_CAP
+    println!(
+        "  slot buffers after the upload: read {read_cap}, write {write_cap}; \
+         small request: {small_allocations:?} allocation(s)"
+    );
+    read_cap == READ_CAP && write_cap == WRITE_CAP && small_allocations == Some(0)
+}
+
+/// A `Response` answered through `respond_response` allocates nothing: the
+/// head is written into the slot and the default `ETag` is formatted there.
+/// This is the claim `site_allocs` cannot make on its own, because it only
+/// checks that its count does not vary.
+fn a_response_allocates_nothing() -> bool {
+    use m6_core::response::{Body, Response};
+
+    let mut h = harness();
+    h.client.write_all(REQUEST).expect("write a request");
+    h.wait_readable();
+    {
+        let mut heads = h1::head_slots();
+        let read = h.conn.read(&mut heads).expect("read");
+        if !matches!(read, Read::Request(_head)) {
+            println!("  expected one request");
+            return false;
+        }
+    }
+    // Built before the count: the response and its bytes are the caller's.
+    let response = Response {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
+        body: Body::Bytes(b"ok".to_vec()),
+        verbatim: false,
+        template_name: None,
+        template_dict: None,
+    };
+    let start = alloc_count::now();
+    h.conn.respond_response(response);
+    let flush = h.conn.flush().expect("flush");
+    let allocations = alloc_count::now() - start;
+    println!("  respond_response + flush: {allocations} allocation(s)");
+    flush == Flush::Done && allocations == 0
 }
 
 fn a_stream_body_is_pumped_per_writable_turn() -> bool {

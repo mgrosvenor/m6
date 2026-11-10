@@ -205,16 +205,53 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
 /// Largest decoded chunked body accepted, matching the Content-Length cap.
 const MAX_CHUNKED_BODY: usize = 16 * 1024 * 1024;
 
+/// A chunked body's decode position: bytes decoded so far, the index of the
+/// next chunk header, and whether the body is past its last chunk and reading
+/// trailer fields.
+///
+/// Kept on the connection slot between reads, so a body that arrives one byte
+/// at a time walks each chunk header once instead of restarting from the
+/// first chunk on every read.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ChunkProgress {
+    decoded: usize,
+    next: usize,
+    trailers: bool,
+}
+
+impl ChunkProgress {
+    /// The start of a chunked body.
+    const START: ChunkProgress = ChunkProgress {
+        decoded: 0,
+        next: 0,
+        trailers: false,
+    };
+}
+
+/// Why one chunk-size line could not be read.
+enum ChunkSizeError {
+    /// The line has not fully arrived.
+    Incomplete,
+    /// A malformed size or line.
+    Bad,
+}
+
 /// Outcome of decoding a chunked body.
 enum Chunked {
     /// Fully decoded or decodable: `decoded` bytes at the front of the buffer,
     /// from `raw` bytes of chunk framing at its start.
     Done { decoded: usize, raw: usize },
-    /// A complete body has not arrived yet; read more and retry.
-    Incomplete,
+    /// Not all here yet. Resume from this position when more bytes arrive.
+    More(ChunkProgress),
     /// Malformed framing. Not recoverable: the connection cannot be trusted to
     /// resynchronise, because the next bytes might be a smuggled request.
     Bad,
+}
+
+// Count of chunk-size lines read, for the linearity test only.
+#[cfg(test)]
+thread_local! {
+    static CHUNK_SIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Parse one chunk-size line at `i`, returning the size and the index after
@@ -224,12 +261,14 @@ enum Chunked {
 /// whitespace, no underscores: a lenient size parser is exactly how two hops
 /// end up disagreeing. The arithmetic is checked, because a 16-digit size is a
 /// client's number and must not overflow.
-fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), Chunked> {
+fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), ChunkSizeError> {
+    #[cfg(test)]
+    CHUNK_SIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let Some(eol) = find_crlf(&buf[i..]) else {
-        return Err(Chunked::Incomplete);
+        return Err(ChunkSizeError::Incomplete);
     };
     let Some(line_end) = i.checked_add(eol) else {
-        return Err(Chunked::Bad);
+        return Err(ChunkSizeError::Bad);
     };
     let line = &buf[i..line_end];
     let size_str = match line.iter().position(|&c| c == b';') {
@@ -237,7 +276,7 @@ fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), Chunked> {
         None => line,
     };
     if size_str.is_empty() || size_str.len() > 16 {
-        return Err(Chunked::Bad);
+        return Err(ChunkSizeError::Bad);
     }
     let mut size: usize = 0;
     for &c in size_str {
@@ -245,49 +284,71 @@ fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), Chunked> {
             b'0'..=b'9' => c - b'0',
             b'a'..=b'f' => c - b'a' + 10,
             b'A'..=b'F' => c - b'A' + 10,
-            _ => return Err(Chunked::Bad),
+            _ => return Err(ChunkSizeError::Bad),
         };
         size = match size.checked_mul(16).and_then(|v| v.checked_add(d as usize)) {
             Some(v) => v,
-            None => return Err(Chunked::Bad),
+            None => return Err(ChunkSizeError::Bad),
         };
     }
     match line_end.checked_add(2) {
         Some(next) => Ok((size, next)),
-        None => Err(Chunked::Bad),
+        None => Err(ChunkSizeError::Bad),
     }
 }
 
-/// Walk the chunk framing without touching a byte, and say whether the whole
-/// body is here.
+/// Walk the trailer fields that follow the last chunk.
+fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize) -> Chunked {
+    loop {
+        let Some(eol) = find_crlf(&buf[i..]) else {
+            return Chunked::More(ChunkProgress {
+                decoded,
+                next: i,
+                trailers: true,
+            });
+        };
+        i = match i.checked_add(eol).and_then(|v| v.checked_add(2)) {
+            Some(v) => v,
+            None => return Chunked::Bad,
+        };
+        if eol == 0 {
+            return Chunked::Done { decoded, raw: i };
+        }
+    }
+}
+
+/// Walk the chunk framing without touching a byte, from `from`, and say
+/// whether the whole body is here.
 ///
 /// The decoder below may copy only once this returns `Done`, so a body split
 /// across reads is retried against the bytes as they arrived rather than
-/// against a half-decoded buffer.
-fn chunked_extent(buf: &[u8]) -> Chunked {
-    let mut decoded = 0usize;
-    let mut i = 0usize;
+/// against a half-decoded buffer, and each read continues from the position the
+/// last one reached.
+fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
+    let mut decoded = from.decoded;
+    let mut i = from.next;
+    if from.trailers {
+        return chunked_trailers(buf, decoded, i);
+    }
     loop {
+        // Where this chunk's size line starts, so an incomplete chunk resumes
+        // from its own header rather than from its data.
+        let chunk_start = i;
         let (size, next) = match chunk_size_at(buf, i) {
             Ok(parsed) => parsed,
-            Err(outcome) => return outcome,
+            Err(ChunkSizeError::Incomplete) => {
+                return Chunked::More(ChunkProgress {
+                    decoded,
+                    next: chunk_start,
+                    trailers: false,
+                })
+            }
+            Err(ChunkSizeError::Bad) => return Chunked::Bad,
         };
         i = next;
 
         if size == 0 {
-            // Last chunk. Trailer fields may follow, ending with a blank line.
-            loop {
-                let Some(eol) = find_crlf(&buf[i..]) else {
-                    return Chunked::Incomplete;
-                };
-                i = match i.checked_add(eol).and_then(|v| v.checked_add(2)) {
-                    Some(v) => v,
-                    None => return Chunked::Bad,
-                };
-                if eol == 0 {
-                    return Chunked::Done { decoded, raw: i };
-                }
-            }
+            return chunked_trailers(buf, decoded, i);
         }
 
         let Some(decoded_end) = decoded.checked_add(size) else {
@@ -303,7 +364,11 @@ fn chunked_extent(buf: &[u8]) -> Chunked {
             return Chunked::Bad;
         };
         if buf.len() < crlf_end {
-            return Chunked::Incomplete;
+            return Chunked::More(ChunkProgress {
+                decoded,
+                next: chunk_start,
+                trailers: false,
+            });
         }
         // Every chunk's data is followed by CRLF, exactly.
         if &buf[data_end..crlf_end] != b"\r\n" {
@@ -333,12 +398,13 @@ fn chunked_extent(buf: &[u8]) -> Chunked {
 /// data is copied behind its framing, so a connection's buffer holds the
 /// decoded body with no second allocation, and a pipelined request behind the
 /// raw body stays where it is.
-fn decode_chunked(buf: &mut [u8]) -> Chunked {
-    let (decoded, raw) = match chunked_extent(buf) {
+fn decode_chunked(buf: &mut [u8], from: ChunkProgress) -> Chunked {
+    let (decoded, raw) = match chunked_extent(buf, from) {
         Chunked::Done { decoded, raw } => (decoded, raw),
         other => return other,
     };
 
+    // One linear copy walk, now that the framing is known to be whole.
     let mut out = 0usize;
     let mut i = 0usize;
     loop {
@@ -646,8 +712,8 @@ pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
         // copy is the owned body this function exists to produce, and the
         // decoder shrinks it in place.
         let mut body = buf[head.head_len..].to_vec();
-        match decode_chunked(&mut body) {
-            Chunked::Incomplete => return ParseResult::Incomplete,
+        match decode_chunked(&mut body, ChunkProgress::START) {
+            Chunked::More(_) => return ParseResult::Incomplete,
             Chunked::Bad => return ParseResult::Error,
             Chunked::Done { decoded, .. } => {
                 body.truncate(decoded);
@@ -1129,11 +1195,14 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 ///         // request may already be buffered, so read again before waiting.
 ///         Flush::Done if !idle => {}
 ///         // The answer is out and there is nothing more to read this turn.
-///         Flush::Done => return Ok(()),
-///         // The socket would block with output still queued. Register
-///         // WRITABLE and flush again when it is.
+///         Flush::Done => {
+///             reregister(conn, conn.interest(), Token(0));
+///             return Ok(());
+///         }
+///         // The socket would block with output still queued. Register with
+///         // `conn.interest()` (WRITABLE here) and flush again when it is.
 ///         Flush::More => {
-///             reregister(conn, Interest::WRITABLE, Token(0));
+///             reregister(conn, conn.interest(), Token(0));
 ///             return Ok(());
 ///         }
 ///         // Everything is written and this connection closes.
@@ -1152,9 +1221,9 @@ pub struct ServerConn {
     /// Bytes of the buffer the request being answered occupies, dropped when
     /// the next `read` starts.
     consumed: usize,
-    /// A chunked body already decoded in place, waiting for the next parse to
-    /// lend its head: (head length, decoded length, raw length).
-    decoded: Option<(usize, usize, usize)>,
+    /// How far a chunked body has been framed, so the next read continues
+    /// from there rather than walking the chunks already seen again.
+    chunk: Option<ChunkProgress>,
     /// Output: `out_buf[..out_len]` is queued, `out_pos` bytes of it written.
     out_buf: Vec<u8>,
     out_len: usize,
@@ -1181,7 +1250,7 @@ impl ServerConn {
             in_len: 0,
             in_read_cap: read_cap,
             consumed: 0,
-            decoded: None,
+            chunk: None,
             out_buf: vec![0; write_cap],
             out_len: 0,
             out_pos: 0,
@@ -1256,24 +1325,30 @@ impl ServerConn {
                     head_len,
                     is_head,
                     keep_alive,
-                } => match decode_chunked(&mut self.in_buf[head_len..self.in_len]) {
-                    Chunked::Bad => {
-                        self.queue_error(400);
-                        return Ok(Read::More);
-                    }
-                    Chunked::Incomplete => {
-                        // Answer any expectation before the next read could
-                        // wait for a body the client holds back.
-                        self.answer_expectation();
-                        if self.close_after {
+                } => {
+                    let from = self.chunk.unwrap_or(ChunkProgress::START);
+                    match decode_chunked(&mut self.in_buf[head_len..self.in_len], from) {
+                        Chunked::Bad => {
+                            self.queue_error(400);
                             return Ok(Read::More);
                         }
+                        Chunked::More(progress) => {
+                            // The next read resumes from here: the chunks
+                            // already framed are not walked again.
+                            self.chunk = Some(progress);
+                            // Answer any expectation before the next read
+                            // could wait for a body the client holds back.
+                            self.answer_expectation();
+                            if self.close_after {
+                                return Ok(Read::More);
+                            }
+                        }
+                        Chunked::Done { decoded, raw } => {
+                            self.begin(is_head, keep_alive, head_len + raw);
+                            return self.lend(heads, Some((head_len, decoded)));
+                        }
                     }
-                    Chunked::Done { decoded, raw } => {
-                        self.begin(is_head, keep_alive, head_len + raw);
-                        return self.lend(heads, Some((head_len, decoded)));
-                    }
-                },
+                }
                 Next::Need => {
                     self.answer_expectation();
                     if self.close_after {
@@ -1495,11 +1570,21 @@ impl ServerConn {
             self.out_len = n;
         }
 
+        // The request being answered is finished with the response, so it is
+        // dropped here rather than at the next read. That lets the input buffer
+        // a large request grew be cut back now, before the next request starts,
+        // so the cut-back is not charged to that request.
+        self.release_request();
+
         // A response larger than the slot's buffer grew it; cut it back now the
         // response is out, so memory does not creep.
         if self.out_buf.len() > self.out_write_cap {
             self.out_buf.truncate(self.out_write_cap);
             self.out_buf.shrink_to(self.out_write_cap);
+        }
+        if self.in_buf.len() > self.in_read_cap && self.in_len <= self.in_read_cap {
+            self.in_buf.truncate(self.in_read_cap);
+            self.in_buf.shrink_to(self.in_read_cap);
         }
 
         Ok(if self.close_after || !self.keep_alive {
@@ -1509,13 +1594,27 @@ impl ServerConn {
         })
     }
 
-    /// Drop the previous request from the input buffer when the next read
-    /// starts, and cut a grown buffer back to its start size.
-    fn drop_consumed(&mut self) {
-        self.decoded = None;
+    /// Drop the request just answered from the input buffer, keeping any
+    /// pipelined bytes behind it.
+    fn release_request(&mut self) {
         if self.consumed == 0 {
             return;
         }
+        self.in_buf.copy_within(self.consumed..self.in_len, 0);
+        self.in_len -= self.consumed;
+        self.consumed = 0;
+        self.expect_answered = false;
+        self.chunk = None;
+    }
+
+    /// Drop the previous request from the input buffer when the next read
+    /// starts, and cut a grown buffer back to its start size.
+    fn drop_consumed(&mut self) {
+        if self.consumed == 0 {
+            // A request is still arriving: keep the chunked body's position.
+            return;
+        }
+        self.chunk = None;
         self.in_buf.copy_within(self.consumed..self.in_len, 0);
         self.in_len -= self.consumed;
         self.consumed = 0;
@@ -1565,7 +1664,7 @@ impl ServerConn {
     fn reset(&mut self) {
         self.in_len = 0;
         self.consumed = 0;
-        self.decoded = None;
+        self.chunk = None;
         self.out_len = 0;
         self.out_pos = 0;
         self.body = None;
@@ -1731,6 +1830,60 @@ mod framing_overflow_tests {
         let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
                     1\r\na\r\nffffffffffffffff\r\n";
         assert!(matches!(parse_request(raw), ParseResult::Error));
+    }
+
+    /// A body of many small chunks fed one byte at a time must walk each chunk
+    /// header a bounded number of times. Restarting the frame walk on every
+    /// read makes this quadratic, which is seconds of loop CPU for one
+    /// unauthenticated request. The call count is compared between two body
+    /// sizes, so the test is about growth rather than a machine's speed.
+    #[test]
+    fn a_many_read_chunked_body_walks_the_framing_once() {
+        fn calls_for(chunks: usize) -> usize {
+            use std::io::Write as _;
+            use std::os::unix::net::UnixStream as StdUnixStream;
+
+            let (mut client, server) = StdUnixStream::pair().expect("a pair");
+            server
+                .set_nonblocking(true)
+                .expect("a non-blocking server end");
+            let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
+            conn.attach(mio::net::UnixStream::from_std(server));
+            client
+                .write_all(b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .expect("the head");
+            let mut body = Vec::new();
+            for _ in 0..chunks {
+                body.extend_from_slice(b"1\r\na\r\n");
+            }
+            body.extend_from_slice(b"0\r\n\r\n");
+
+            CHUNK_SIZE_CALLS.with(|calls| calls.set(0));
+            let mut returned = None;
+            for &byte in &body {
+                client.write_all(&[byte]).expect("a body byte");
+                let mut heads = head_slots();
+                match conn.read(&mut heads) {
+                    Ok(Read::Request(head)) => {
+                        returned = Some(head.body().to_vec());
+                        break;
+                    }
+                    Ok(Read::More) => {}
+                    Ok(Read::Closed) => panic!("the client stays open"),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            assert_eq!(returned.expect("one request"), vec![b'a'; chunks]);
+            CHUNK_SIZE_CALLS.with(|calls| calls.get())
+        }
+
+        let small = calls_for(200);
+        let large = calls_for(400);
+        assert!(
+            large <= 3 * small,
+            "chunk_size_at calls went {small} for 200 chunks and {large} for 400: \
+             the walk restarts instead of resuming"
+        );
     }
 }
 
