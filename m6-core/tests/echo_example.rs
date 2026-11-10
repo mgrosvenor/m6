@@ -24,20 +24,13 @@ use std::time::{Duration, Instant};
 // ── Binaries ──────────────────────────────────────────────────────────────────
 
 fn bin(name: &str) -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let path = exe
-        .parent()
-        .expect("deps")
-        .parent()
-        .expect("target profile")
-        .join("examples")
-        .join(name);
-    assert!(
-        path.exists(),
-        "{} is not built: run `cargo test -p m6-core --features testkit --test echo_example`",
-        path.display()
-    );
-    path
+    // The two echo programs are `[[bin]]` targets, so cargo builds them with the
+    // test and exposes their paths as `CARGO_BIN_EXE_*`.
+    std::path::PathBuf::from(match name {
+        "echo" => env!("CARGO_BIN_EXE_echo"),
+        "echo_tls" => env!("CARGO_BIN_EXE_echo_tls"),
+        other => panic!("unknown echo binary: {other}"),
+    })
 }
 
 // ── The server under test ─────────────────────────────────────────────────────

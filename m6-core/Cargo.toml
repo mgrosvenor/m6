@@ -5,6 +5,9 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
+# `examples/echo.rs` and `examples/echo_tls.rs` are declared as `[[bin]]`
+# targets below, not examples, so `cargo test --test echo_example` builds them.
+autoexamples = false
 
 [lib]
 name = "m6_core"
@@ -18,8 +21,9 @@ name = "m6_core"
 # unifies features, and m6-html turns both on there.
 default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
-# links it; enable it from a crate's [dev-dependencies] entry.
-testkit = []
+# links it; enable it from a crate's [dev-dependencies] entry. It also pulls in
+# rustls, which the TLS echo program needs and no production binary links.
+testkit = ["dep:rustls", "dep:rustls-pki-types"]
 
 # Request/response extras, off by default so a binary links only what it uses.
 # `multipart` gates the multipart body parser and the streaming types it needs.
@@ -100,6 +104,11 @@ ureq          = { version = "2",    optional = true, features = ["json"] }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
 rusqlite      = { version = "0.31", optional = true, features = ["bundled"] }
+# The TLS echo program, `examples/echo_tls.rs`, uses rustls with exactly the
+# features m6-http names, so the workspace builds one rustls, not two. Optional
+# and gated behind `testkit` so no production binary links it.
+rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile  = "3"
@@ -111,19 +120,20 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # a `time::OffsetDateTime` and rcgen does not re-export the type.
 rcgen     = "0.13"
 time      = "0.3"
-# The TLS echo example, `examples/echo_tls.rs`, uses rustls with exactly the
-# features m6-http names, so the workspace builds one rustls, not two.
-rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pki-types = "1"
 
-# The echo examples prove the loop serves with no heap allocation outside table
-# growth. They use the counting allocator behind `testkit`.
-[[example]]
+# The echo programs prove the loop serves with no heap allocation outside table
+# growth. They use the counting allocator behind `testkit`. They are `[[bin]]`
+# targets (not `[[example]]`) so `cargo test --test echo_example` builds them and
+# exposes them as `CARGO_BIN_EXE_echo` / `CARGO_BIN_EXE_echo_tls`; the test
+# starts them as child processes over the wire.
+[[bin]]
 name    = "echo"
+path    = "examples/echo.rs"
 required-features = ["testkit"]
 
-[[example]]
+[[bin]]
 name    = "echo_tls"
+path    = "examples/echo_tls.rs"
 required-features = ["testkit"]
 
 # Its own `main`: the signal mask is inherited only by threads created after
