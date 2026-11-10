@@ -1803,7 +1803,7 @@ dependencies = [
  "md-5",
  "minify-html",
  "minify-js",
- "mio 1.2.3",
+ "mio",
  "multer",
  "nix 0.31.3",
  "rand",

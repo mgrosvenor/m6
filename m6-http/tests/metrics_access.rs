@@ -666,7 +666,7 @@ fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
 
 #[test]
 fn perf_reports_the_event_loop() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     let auth = bearer(&run.token(&["monitor"]));
     // A few requests so the loop has work to report on the accounting tick.
     for _ in 0..3 {
