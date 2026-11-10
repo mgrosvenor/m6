@@ -660,6 +660,30 @@ impl<T: Transport> H2Client<T> {
         if let Some(reason) = eof {
             self.mark_dead(&reason);
         }
+
+        // The frame loop may have resumed a body (WINDOW_UPDATE granted credit,
+        // or SETTINGS raised the window) and appended fresh DATA frames after
+        // the flush at the top of `drive`. Flush them now, in the same turn: an
+        // edge-triggered poll will not re-report a socket that is already
+        // writable, so leaving them would stall the request until some
+        // unrelated event fires.
+        if !self.send_buf.is_empty() {
+            if let Err(reason) = self.transport.flush_send(&mut self.send_buf) {
+                self.mark_dead(&reason);
+            }
+        }
+    }
+
+    /// Test-only: how many bytes are still queued to flush.
+    #[cfg(test)]
+    pub(crate) fn send_buf_len_for_test(&self) -> usize {
+        self.send_buf.len()
+    }
+
+    /// Test-only: inject received bytes directly, bypassing the socket.
+    #[cfg(test)]
+    pub(crate) fn inject_recv_for_test(&mut self, bytes: &[u8]) {
+        self.recv_buf.extend_from_slice(bytes);
     }
 
     /// Decode the accumulated header block and apply it to its stream.

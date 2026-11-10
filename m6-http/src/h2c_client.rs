@@ -160,3 +160,74 @@ impl H2cClientPool {
         self.0.remove_by_token(token, registry);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A WINDOW_UPDATE frame: 4-byte increment on `stream_id`.
+    fn window_update_frame(stream_id: u32, inc: u32) -> Vec<u8> {
+        let mut f = Vec::with_capacity(13);
+        f.extend_from_slice(&4u32.to_be_bytes()[1..]); // 3-byte length
+        f.push(0x8); // WINDOW_UPDATE
+        f.push(0); // no flags
+        f.extend_from_slice(&stream_id.to_be_bytes());
+        f.extend_from_slice(&inc.to_be_bytes());
+        f
+    }
+
+    /// A request body larger than the connection send window is sent in two
+    /// parts: the first window eagerly, the rest once WINDOW_UPDATE grants
+    /// credit. The resumed DATA must be flushed in the same `drive` that reads
+    /// the credit, or the connection waits for a writable edge that an
+    /// edge-triggered poll never re-reports. The WINDOW_UPDATEs are injected
+    /// straight into the receive buffer so the order is explicit and no sleep
+    /// or socket timing can mask the flush.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture opens a loopback socketpair, not an upstream"
+    )]
+    fn flow_control_resume_flushes_in_the_same_drive() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        let mut conn = H2Client::new(H2cTransport { stream: client });
+        let req = HttpRequest {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            query: None,
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("content-length".to_string(), "65536".to_string())],
+            body: vec![b'x'; 65_536],
+        };
+        let _rx = conn
+            .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1")
+            .unwrap();
+
+        // First drive flushes HEADERS + the first connection window of DATA,
+        // leaving one byte pending on flow control.
+        conn.drive();
+        assert_eq!(
+            conn.send_buf_len_for_test(),
+            0,
+            "first window must flush in the first drive"
+        );
+
+        // Grant connection-level and stream-level credit back, exactly as the
+        // origin does after consuming the first window.
+        conn.inject_recv_for_test(&window_update_frame(0, 65_535));
+        conn.inject_recv_for_test(&window_update_frame(1, 65_535));
+
+        // Second drive reads the WINDOW_UPDATEs and pumps the final DATA byte.
+        conn.drive();
+        assert_eq!(
+            conn.send_buf_len_for_test(),
+            0,
+            "resumed DATA must be flushed in the same drive, not left in send_buf"
+        );
+    }
+}
