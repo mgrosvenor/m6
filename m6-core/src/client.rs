@@ -819,19 +819,21 @@ fn connect_in_progress(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EINPROGRESS)
 }
 
-/// Test seam: when set, the next `write_tls` reports a WouldBlock once, so the
-/// flush's retry is exercised without filling the socket send buffer.
+// Test seam: when set on this thread, the next `write_tls` reports a
+// WouldBlock once, so the flush's retry is exercised without filling the
+// socket send buffer. Thread-local so the parallel test runner cannot cross
+// the flag between tests.
 #[cfg(test)]
-static BLOCK_NEXT_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static BLOCK_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Flush TLS ciphertext to the socket. Returns `Ok(true)` when all pending
 /// bytes are written, `Ok(false)` when the socket would block.
 fn flush_tls(tls: &mut ClientConnection, stream: &mut Stream) -> io::Result<bool> {
     while tls.wants_write() {
         #[cfg(test)]
-        if !tls.is_handshaking()
-            && BLOCK_NEXT_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+        if !tls.is_handshaking() && BLOCK_NEXT_WRITE.with(|b| b.replace(false)) {
             return Ok(false);
         }
         match tls.write_tls(stream) {
@@ -1922,6 +1924,9 @@ mod socket_tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
+        // Just over rustls's 64 KiB send-buffer limit, so the write fills the
+        // buffer before the handshake and the seam fires on the post-handshake
+        // final flush, not the buffered pre-handshake write.
         let body_len = 65 * 1024usize;
         let peer = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().expect("accept");
@@ -1965,7 +1970,7 @@ mod socket_tests {
             .expect("start");
 
         // Force the next final flush to report a WouldBlock, then drive.
-        BLOCK_NEXT_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        BLOCK_NEXT_WRITE.with(|b| b.set(true));
 
         let mut poll = Poll::new().expect("poll");
         let mut events = Events::with_capacity(8);
