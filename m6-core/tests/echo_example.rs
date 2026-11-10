@@ -1,9 +1,10 @@
-//! The echo examples, proved over the wire: the nine checks of the echo
+//! The echo programs, proved over the wire: the nine checks of the echo
 //! prototype's `check.py` in Rust, plus one TLS round-trip check.
 //!
-//! Each test starts the example as a child process, reads its `listening on`
+//! Each test starts a program as a child process, reads its `listening on`
 //! line for the address, and waits on a signal with a deadline, never a fixed
-//! sleep. Run with `--features testkit` so the examples are built:
+//! sleep. The programs are `[[bin]]` targets behind `testkit`, so this one
+//! command builds and runs them (`CARGO_BIN_EXE_echo` / `CARGO_BIN_EXE_echo_tls`):
 //!
 //! ```text
 //! cargo test -p m6-core --features testkit --test echo_example -- --test-threads=1
@@ -24,20 +25,13 @@ use std::time::{Duration, Instant};
 // ── Binaries ──────────────────────────────────────────────────────────────────
 
 fn bin(name: &str) -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let path = exe
-        .parent()
-        .expect("deps")
-        .parent()
-        .expect("target profile")
-        .join("examples")
-        .join(name);
-    assert!(
-        path.exists(),
-        "{} is not built: run `cargo test -p m6-core --features testkit --test echo_example`",
-        path.display()
-    );
-    path
+    // The two echo programs are `[[bin]]` targets, so cargo builds them with the
+    // test and exposes their paths as `CARGO_BIN_EXE_*`.
+    std::path::PathBuf::from(match name {
+        "echo" => env!("CARGO_BIN_EXE_echo"),
+        "echo_tls" => env!("CARGO_BIN_EXE_echo_tls"),
+        other => panic!("unknown echo binary: {other}"),
+    })
 }
 
 // ── The server under test ─────────────────────────────────────────────────────
@@ -304,7 +298,14 @@ fn an_idle_client_is_closed_after_its_deadline() {
 fn a_reset_client_does_not_take_the_server_down() {
     let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
     let mut reset = TcpStream::connect(srv.addr).expect("connect");
+    // A payload far larger than one buffer, so a reset can land while bytes the
+    // server has not read yet are still in flight.
     reset.write_all(&vec![b'y'; 100_000]).expect("send");
+    // The echo is the signal the server has STARTED reading: read one buffer's
+    // worth, then reset while the rest of the 100 KB is still in flight. This
+    // is driven by the echo, not by timing.
+    let echoed = recv_exact(&mut reset, 16 * 1024, Duration::from_secs(10));
+    assert!(echoed.iter().all(|&b| b == b'y'));
     socket2::SockRef::from(&reset)
         .set_linger(Some(Duration::ZERO))
         .ok();

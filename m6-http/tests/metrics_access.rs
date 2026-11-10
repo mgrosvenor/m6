@@ -14,7 +14,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quiche::h3::NameValue as _;
@@ -279,17 +279,15 @@ fn get_req(path: &str, extra: &[(&str, &str)], version: &str) -> HttpRequest {
     }
 }
 
-/// Drive a client connection until `rx` answers, or ten seconds pass.
+/// Drive a client connection until `poll` answers, or ten seconds pass.
 fn await_resp(
     label: &str,
-    rx: &mpsc::Receiver<std::io::Result<HttpResponse>>,
-    mut drive: impl FnMut(),
+    mut poll: impl FnMut() -> Option<std::io::Result<HttpResponse>>,
 ) -> Resp {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        drive();
-        match rx.try_recv() {
-            Ok(Ok(r)) => {
+        match poll() {
+            Some(Ok(r)) => {
                 return Resp {
                     status: r.status,
                     headers: r
@@ -300,11 +298,11 @@ fn await_resp(
                     body: r.body,
                 }
             }
-            Ok(Err(e)) => return no_response(format!("{label} response: {e}")),
-            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+            Some(Err(e)) => return no_response(format!("{label} response: {e}")),
+            None if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            Err(e) => return no_response(format!("{label} wait: {e:?}")),
+            None => return no_response(format!("{label} wait: timed out")),
         }
     }
 }
@@ -344,16 +342,22 @@ impl Running {
             conn.drive();
             std::thread::sleep(Duration::from_millis(1));
         }
-        let rx = match conn.dispatch(
+        let stream_id = match conn.dispatch(
             &get_req(path, extra, "HTTP/1.1"),
             "127.0.0.1",
             client_ip,
             "localhost",
         ) {
-            Ok(rx) => rx,
+            Ok(stream_id) => stream_id,
             Err(e) => return no_response(format!("h2c dispatch: {e}")),
         };
-        await_resp("h2c", &rx, || conn.drive())
+        await_resp("h2c", || {
+            conn.drive();
+            conn.drain_completions()
+                .into_iter()
+                .find(|c| c.stream_id == stream_id)
+                .map(|c| c.result)
+        })
     }
 
     /// One HTTP/1.1 GET over TLS on a fresh connection.
@@ -420,16 +424,22 @@ impl Running {
             Ok(c) => c,
             Err(e) => return no_response(format!("h2 connect: {e}")),
         };
-        let rx = match conn.dispatch(
+        let stream_id = match conn.dispatch(
             &get_req(path, extra, "HTTP/2"),
             "localhost",
             client_ip,
             "localhost",
         ) {
-            Ok(rx) => rx,
+            Ok(stream_id) => stream_id,
             Err(e) => return no_response(format!("h2 dispatch: {e}")),
         };
-        await_resp("h2", &rx, || conn.drive())
+        await_resp("h2", || {
+            conn.drive();
+            conn.drain_completions()
+                .into_iter()
+                .find(|c| c.stream_id == stream_id)
+                .map(|c| c.result)
+        })
     }
 
     /// One HTTP/3 GET over QUIC.
@@ -688,11 +698,11 @@ fn perf_reports_the_event_loop() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let event_loop = event_loop.expect("event_loop never populated within the deadline");
-    // The test drives HTTP/1.1 over TLS, so the `tls` trigger has events.
+    // The test drives HTTP/1.1 over TLS, so the `conn` trigger has events.
     let trigger = event_loop
         .iter()
-        .find(|t| t.name == "tls" && t.count > 0)
-        .expect("a tls trigger with events");
+        .find(|t| t.name == "conn" && t.count > 0)
+        .expect("a conn trigger with events");
     assert!(trigger.work_max_ns >= trigger.work_min_ns, "{trigger:?}");
 }
 

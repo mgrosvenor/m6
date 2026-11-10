@@ -288,6 +288,23 @@ impl HeaderSource for Vec<(String, String)> {
     }
 }
 
+// A borrowed request head's headers: `httparse::Header` slices, whose names and
+// values point into the request buffer rather than into the slice itself. The
+// value lifetime outlives the slice borrow by construction (`RequestHead`
+// unifies both), which is what lets `find` return a `&str` tied to `&self`.
+impl HeaderSource for [httparse::Header<'_>] {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name))
+            .filter_map(|h| std::str::from_utf8(h.value).ok())
+    }
+}
+
 /// Look up a header by case-insensitive name.
 pub fn header<'a>(headers: &'a (impl HeaderSource + ?Sized), name: &str) -> Option<&'a str> {
     headers.find(name)

@@ -9,12 +9,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::RawFd;
-use std::sync::mpsc;
 use std::sync::Arc;
 
 use crate::forward::{
-    apply_response_block, too_many_informational, HttpRequest, HttpResponse, ResponseBlock,
-    HOP_BY_HOP,
+    apply_response_block, too_many_informational, HttpRequest, HttpResponse, PendingUrlContext,
+    ResponseBlock, Waiter, HOP_BY_HOP,
 };
 use m6_core::mio::{Interest, Registry, Token};
 
@@ -66,6 +65,11 @@ pub trait Transport: Sized {
     /// Read whatever decrypted bytes are available into `recv_buf`. Returns
     /// `Some(reason)` on EOF or read error, deferred until after the frame loop.
     fn fill_recv(&mut self, recv_buf: &mut Vec<u8>) -> Option<String>;
+
+    /// Whether the transport still holds bytes to flush (rustls ciphertext for
+    /// TLS, always false for cleartext), so the connection asks for write
+    /// readiness rather than dropping `WRITABLE`.
+    fn wants_write(&self) -> bool;
 }
 
 // ── H2Stream (private) ────────────────────────────────────────────────────────
@@ -77,7 +81,11 @@ struct H2Stream {
     headers_done: bool,
     /// Informational (1xx) header blocks seen so far on this stream.
     informational: usize,
-    tx: mpsc::Sender<io::Result<HttpResponse>>,
+    /// Who waits for this stream's reply, stored here by the loop's owner once
+    /// the request is parked, and moved into the completion when it arrives.
+    waiter: Option<Waiter>,
+    /// The request context the completion path finalizes with.
+    ctx: Option<Box<PendingUrlContext>>,
     // The request body still owed to the peer, and how much of it has gone out.
     // The body is resumable state rather than a loop because credit arrives
     // asynchronously: see `pump_stream`.
@@ -86,6 +94,15 @@ struct H2Stream {
     // RFC 9113 6.9.2: the per-stream send window starts at the peer's
     // SETTINGS_INITIAL_WINDOW_SIZE, not at the 65 535 connection default.
     send_window: i32,
+}
+
+/// One stream's finished reply, pushed onto the pool's completion list for the
+/// loop's owner to write straight into the waiting stream.
+pub struct H2Completion {
+    pub stream_id: u32,
+    pub result: io::Result<HttpResponse>,
+    pub waiter: Option<Waiter>,
+    pub ctx: Option<Box<PendingUrlContext>>,
 }
 
 // ── H2Client (public) ─────────────────────────────────────────────────────────
@@ -104,7 +121,13 @@ pub struct H2Client<T: Transport> {
     peer_initial_window: i32,
     peer_max_frame: u32,
     pub is_dead: bool,
-    registered: bool,
+    /// The `mio` token this connection's descriptor is registered under.
+    token: Token,
+    /// What the poll currently waits for, so `reregister` runs only on change.
+    registered_interest: Interest,
+    /// Streams that finished this drive, for the loop's owner to complete.
+    /// Allocated at start and drained each drive, never grown on the hot path.
+    completions: Vec<H2Completion>,
 }
 
 impl<T: Transport> H2Client<T> {
@@ -124,7 +147,9 @@ impl<T: Transport> H2Client<T> {
             peer_initial_window: DEFAULT_WINDOW,
             peer_max_frame: DEFAULT_MAX_FRAME,
             is_dead: false,
-            registered: false,
+            token: Token(usize::MAX),
+            registered_interest: Interest::READABLE,
+            completions: Vec::with_capacity(64),
         }
     }
 
@@ -142,17 +167,43 @@ impl<T: Transport> H2Client<T> {
         self.transport.raw_fd()
     }
 
+    /// The `mio` token this connection is registered under.
+    pub fn token(&self) -> Token {
+        self.token
+    }
+
+    /// Set the token the caller registered this connection under.
+    pub fn set_token(&mut self, token: Token) {
+        self.token = token;
+    }
+
+    /// Set the interest the caller registered this connection with.
+    pub fn set_interest(&mut self, interest: Interest) {
+        self.registered_interest = interest;
+    }
+
+    /// The interest to register next: write readiness while request bytes are
+    /// still owed or the transport holds unflushed output, read readiness once
+    /// both are empty.
+    pub fn interest(&self) -> Interest {
+        if self.send_buf.is_empty() && !self.transport.wants_write() {
+            Interest::READABLE
+        } else {
+            Interest::READABLE | Interest::WRITABLE
+        }
+    }
+
     /// Dispatch an HTTP request as a new H2 stream.
     ///
-    /// Returns a receiver that will yield the response when the stream
-    /// completes. The connection must not be dead.
+    /// Returns the stream id. The reply arrives on `drain_completions` when the
+    /// stream finishes. The connection must not be dead.
     pub fn dispatch(
         &mut self,
         req: &HttpRequest,
         host: &str,
         client_ip: &str,
         original_host: &str,
-    ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
+    ) -> io::Result<u32> {
         if self.is_dead {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -216,7 +267,6 @@ impl<T: Transport> H2Client<T> {
         let headers_flags = FLAG_END_HEADERS | if has_body { 0 } else { FLAG_END_STREAM };
         self.push_frame(TYPE_HEADERS, headers_flags, stream_id, &header_block);
 
-        let (tx, rx) = mpsc::channel();
         self.streams.insert(
             stream_id,
             H2Stream {
@@ -225,7 +275,8 @@ impl<T: Transport> H2Client<T> {
                 resp_body: vec![],
                 headers_done: false,
                 informational: 0,
-                tx,
+                waiter: None,
+                ctx: None,
                 pending_body: if has_body {
                     req.body.clone()
                 } else {
@@ -243,7 +294,21 @@ impl<T: Transport> H2Client<T> {
         // is a connection error (RFC 9113 6.9).
         self.pump_stream(stream_id);
 
-        Ok(rx)
+        Ok(stream_id)
+    }
+
+    /// Store who waits for `stream_id`'s reply, after the loop's owner parked
+    /// the request. The reply arrives on `drain_completions` carrying both.
+    pub fn set_waiter(&mut self, stream_id: u32, waiter: Waiter, ctx: Box<PendingUrlContext>) {
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.waiter = Some(waiter);
+            s.ctx = Some(ctx);
+        }
+    }
+
+    /// Take the completions this connection produced since the last drain.
+    pub fn drain_completions(&mut self) -> Vec<H2Completion> {
+        std::mem::take(&mut self.completions)
     }
 
     /// Send as much of a stream's pending body as connection and stream credit
@@ -526,10 +591,15 @@ impl<T: Transport> H2Client<T> {
 
                 TYPE_RST_STREAM if stream_id > 0 => {
                     if let Some(s) = self.streams.remove(&stream_id) {
-                        let _ = s.tx.send(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            format!("{}: stream reset by server", T::prefix()),
-                        )));
+                        self.completions.push(H2Completion {
+                            stream_id,
+                            result: Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                format!("{}: stream reset by server", T::prefix()),
+                            )),
+                            waiter: s.waiter,
+                            ctx: s.ctx,
+                        });
                     }
                 }
 
@@ -625,6 +695,30 @@ impl<T: Transport> H2Client<T> {
         if let Some(reason) = eof {
             self.mark_dead(&reason);
         }
+
+        // The frame loop may have resumed a body (WINDOW_UPDATE granted credit,
+        // or SETTINGS raised the window) and appended fresh DATA frames after
+        // the flush at the top of `drive`. Flush them now, in the same turn: an
+        // edge-triggered poll will not re-report a socket that is already
+        // writable, so leaving them would stall the request until some
+        // unrelated event fires.
+        if !self.send_buf.is_empty() {
+            if let Err(reason) = self.transport.flush_send(&mut self.send_buf) {
+                self.mark_dead(&reason);
+            }
+        }
+    }
+
+    /// Test-only: how many bytes are still queued to flush.
+    #[cfg(test)]
+    pub(crate) fn send_buf_len_for_test(&self) -> usize {
+        self.send_buf.len()
+    }
+
+    /// Test-only: inject received bytes directly, bypassing the socket.
+    #[cfg(test)]
+    pub(crate) fn inject_recv_for_test(&mut self, bytes: &[u8]) {
+        self.recv_buf.extend_from_slice(bytes);
     }
 
     /// Decode the accumulated header block and apply it to its stream.
@@ -654,7 +748,12 @@ impl<T: Transport> H2Client<T> {
             ResponseBlock::TooManyInformational => {
                 // Fail this stream only. The connection is healthy.
                 if let Some(s) = self.streams.remove(&stream_id) {
-                    let _ = s.tx.send(Err(too_many_informational()));
+                    self.completions.push(H2Completion {
+                        stream_id,
+                        result: Err(too_many_informational()),
+                        waiter: s.waiter,
+                        ctx: s.ctx,
+                    });
                 }
                 self.push_frame(TYPE_RST_STREAM, 0, stream_id, &8u32.to_be_bytes());
             }
@@ -662,7 +761,8 @@ impl<T: Transport> H2Client<T> {
         true
     }
 
-    /// Complete a stream: remove it and send the response (or an error) on tx.
+    /// Complete a stream: remove it and push the response (or an error) onto
+    /// the completion list.
     fn complete_stream(&mut self, stream_id: u32) {
         if let Some(s) = self.streams.remove(&stream_id) {
             // A peer may answer before we have finished sending (an early error
@@ -677,19 +777,25 @@ impl<T: Transport> H2Client<T> {
                     &8u32.to_be_bytes(), // CANCEL
                 );
             }
-            if s.headers_done {
-                let _ = s.tx.send(Ok(HttpResponse {
+            let result = if s.headers_done {
+                Ok(HttpResponse {
                     status: s.resp_status,
                     reason: String::new(),
                     headers: s.resp_headers,
                     body: s.resp_body,
-                }));
+                })
             } else {
-                let _ = s.tx.send(Err(io::Error::new(
+                Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!("{}: stream ended without headers", T::prefix()),
-                )));
-            }
+                ))
+            };
+            self.completions.push(H2Completion {
+                stream_id,
+                result,
+                waiter: s.waiter,
+                ctx: s.ctx,
+            });
         }
     }
 
@@ -697,11 +803,16 @@ impl<T: Transport> H2Client<T> {
     fn mark_dead(&mut self, reason: &str) {
         self.is_dead = true;
         let streams = std::mem::take(&mut self.streams);
-        for (_, s) in streams {
-            let _ = s.tx.send(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                reason.to_string(),
-            )));
+        for (stream_id, s) in streams {
+            self.completions.push(H2Completion {
+                stream_id,
+                result: Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    reason.to_string(),
+                )),
+                waiter: s.waiter,
+                ctx: s.ctx,
+            });
         }
     }
 
@@ -716,6 +827,8 @@ impl<T: Transport> H2Client<T> {
 pub struct Pool<T: Transport> {
     /// backend base_url → connection
     connections: HashMap<String, H2Client<T>>,
+    /// Streams finished since the last drain, for the loop's owner to complete.
+    completions: Vec<H2Completion>,
 }
 
 impl<T: Transport> Default for Pool<T> {
@@ -728,56 +841,122 @@ impl<T: Transport> Pool<T> {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
+            completions: Vec::with_capacity(64),
         }
     }
 
-    /// Dispatch a request to the named backend URL.
+    /// Ensure a connection exists for `base_url`, creating one if none exists
+    /// or the existing one is dead. Returns whether one was created.
+    pub fn ensure_connection(
+        &mut self,
+        base_url: &str,
+        tls: Option<Arc<rustls::ClientConfig>>,
+    ) -> io::Result<bool> {
+        let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
+        let needs_new = match self.connections.get(base_url) {
+            None => true,
+            Some(conn) => conn.is_dead && conn.streams.is_empty(),
+        };
+        if needs_new {
+            let new_conn = H2Client::connect(&host, port, tls)?;
+            self.connections.insert(base_url.to_string(), new_conn);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The connection for `base_url`, to register and set its token.
+    pub fn connection_mut(&mut self, base_url: &str) -> Option<&mut H2Client<T>> {
+        self.connections.get_mut(base_url)
+    }
+
+    /// Dispatch a request on the existing connection. `registry` lets the call
+    /// ask for write readiness when the request goes into the send buffer.
     ///
-    /// Creates a new connection if none exists or the existing one is dead.
+    /// Returns the connection token and the outbound stream id, so the caller
+    /// can store its waiter on the stream with [`Pool::set_waiter`].
     pub fn dispatch(
         &mut self,
         base_url: &str,
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
-        tls: Option<Arc<rustls::ClientConfig>>,
-    ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
-        let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
-
-        // Check if we need a new connection
-        let needs_new = match self.connections.get(base_url) {
-            None => true,
-            Some(conn) => conn.is_dead && conn.streams.is_empty(),
-        };
-
-        if needs_new {
-            let new_conn = H2Client::connect(&host, port, tls)?;
-            self.connections.insert(base_url.to_string(), new_conn);
-        }
-
+        registry: &Registry,
+    ) -> io::Result<(Token, u32)> {
+        let (host, _) = parse_host_port(base_url, T::prefix(), T::default_port())?;
         let conn = self.connections.get_mut(base_url).unwrap();
-        conn.dispatch(req, &host, client_ip, original_host)
+        let stream_id = conn.dispatch(req, &host, client_ip, original_host)?;
+        let interest = conn.interest();
+        if interest != conn.registered_interest {
+            registry
+                .reregister(
+                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
+                    conn.token(),
+                    interest,
+                )
+                .ok();
+            conn.registered_interest = interest;
+        }
+        Ok((conn.token(), stream_id))
     }
 
-    /// Register new connections with the poll and drive all connections.
-    ///
-    /// Must be called on every event-loop iteration.
-    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
-        for conn in self.connections.values_mut() {
-            if !conn.registered {
-                let _ = registry.register(
-                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                    token,
-                    Interest::READABLE,
-                );
-                conn.registered = true;
-            }
-            conn.drive();
+    /// Store who waits for an outbound stream's reply.
+    pub fn set_waiter(
+        &mut self,
+        token: Token,
+        stream_id: u32,
+        waiter: Waiter,
+        ctx: Box<PendingUrlContext>,
+    ) {
+        if let Some(conn) = self.connections.values_mut().find(|c| c.token() == token) {
+            conn.set_waiter(stream_id, waiter, ctx);
         }
+    }
 
-        // Remove connections that are dead and have no pending streams
-        self.connections
-            .retain(|_, conn| !(conn.is_dead && conn.streams.is_empty()));
+    /// Drive the one connection whose token fired. Returns whether it is dead
+    /// with no pending streams, so the caller can free its token and remove it.
+    /// Finished streams land in [`Pool::drain_completions`].
+    pub fn drive_one(&mut self, token: Token, registry: &Registry) -> bool {
+        let Some(conn) = self.connections.values_mut().find(|c| c.token() == token) else {
+            return false;
+        };
+        conn.drive();
+        let interest = conn.interest();
+        if interest != conn.registered_interest {
+            registry
+                .reregister(
+                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
+                    conn.token(),
+                    interest,
+                )
+                .ok();
+            conn.registered_interest = interest;
+        }
+        self.completions.append(&mut conn.completions);
+        conn.is_dead && conn.streams.is_empty()
+    }
+
+    /// Take the completions every driven connection produced since the last
+    /// drain.
+    pub fn drain_completions(&mut self) -> Vec<H2Completion> {
+        std::mem::take(&mut self.completions)
+    }
+
+    /// Deregister and drop the connection registered under `token`, if any.
+    pub fn remove_by_token(&mut self, token: Token, registry: &Registry) {
+        let url = self
+            .connections
+            .iter()
+            .find(|(_, c)| c.token() == token)
+            .map(|(k, _)| k.clone());
+        if let Some(url) = url {
+            if let Some(conn) = self.connections.remove(&url) {
+                registry
+                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.raw_fd()))
+                    .ok();
+            }
+        }
     }
 }
 

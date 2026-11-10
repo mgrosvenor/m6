@@ -32,16 +32,16 @@
 //! So this is now the same `Http11Listener` as `:443`, bound without TLS, and
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
-use crate::http11::{Http11Listener, RequestOutcome};
-use m6_core::event::Signals;
+use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
+use m6_core::event::{raise_open_file_limit, Signals, Timeouts};
+use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const TOKEN_LISTENER: Token = Token(0);
-const TOKEN_CONN: Token = Token(1);
-const TOKEN_SIGNAL: Token = Token(2);
+const TOKEN_LISTENER: Token = Token(usize::MAX);
+const TOKEN_SIGNAL: Token = Token(usize::MAX - 1);
 const POLL_TIMEOUT_MS: u64 = 1_000;
 
 /// Percent-safe: the request target is echoed back into `Location` verbatim,
@@ -71,11 +71,25 @@ fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
 /// Both used to be answered with 400, which says the request was malformed
 /// when it was not.
 fn redirect_for(req: &HttpRequest) -> RequestOutcome {
+    redirect_head(
+        &req.method,
+        &req.path,
+        req.query.as_deref(),
+        &req.headers[..],
+    )
+}
+
+fn redirect_head(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &(impl m6_core::http::HeaderSource + ?Sized),
+) -> RequestOutcome {
     // RFC 9110 9.3.6: CONNECT establishes a tunnel through a proxy. This is an
     // origin server and will not be one, so the method is refused -- 405, the
     // answer for a method this resource does not support, with `Allow` naming
     // the ones it does (RFC 9110 15.5.6 requires that field).
-    if req.method.eq_ignore_ascii_case("CONNECT") {
+    if method.eq_ignore_ascii_case("CONNECT") {
         return ready(
             405,
             vec![
@@ -88,7 +102,7 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     // RFC 9110 9.3.7: `OPTIONS *` asks about the server rather than any
     // resource, so there is no target to send anywhere. Answering for the
     // server is the whole point of the form.
-    if req.method.eq_ignore_ascii_case("OPTIONS") && req.path == "*" {
+    if method.eq_ignore_ascii_case("OPTIONS") && path == "*" {
         return ready(
             200,
             vec![
@@ -98,7 +112,7 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         );
     }
 
-    let host = m6_core::headers::get(&req.headers[..], "host")
+    let host = m6_core::headers::get(headers, "host")
         .map(str::trim)
         .unwrap_or("");
 
@@ -107,9 +121,9 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     // `https://example.com/x` and every query parameter on an http:// link was
     // silently dropped -- a versioned asset URL, a tracking parameter, a form
     // GET. Found by a test written for the OPTIONS/CONNECT work above.
-    let target = match req.query.as_deref() {
-        Some(q) => format!("{}?{}", req.path, q),
-        None => req.path.clone(),
+    let target = match query {
+        Some(q) => format!("{}?{}", path, q),
+        None => path.to_string(),
     };
     let target = target.as_str();
 
@@ -136,29 +150,51 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
     lifecycle.started();
 
-    let mut listener =
-        Http11Listener::bind_plain(bind, crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN)?;
+    let ceiling = raise_open_file_limit()?;
+    let mut listener = Http11Listener::bind_plain(
+        bind,
+        crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN,
+        crate::http11::INITIAL_CONNECTIONS,
+        ceiling,
+    )?;
     let mut signals = Signals::new()?;
     let mut poll = Poll::new()?;
     poll.registry().register(
-        &mut m6_core::mio::unix::SourceFd(&listener.raw_fd()),
+        &mut SourceFd(&listener.raw_fd()),
         TOKEN_LISTENER,
         Interest::READABLE,
     )?;
     poll.registry().register(
-        &mut m6_core::mio::unix::SourceFd(&signals.raw_fd()),
+        &mut SourceFd(&signals.raw_fd()),
         TOKEN_SIGNAL,
         Interest::READABLE,
     )?;
 
+    // The read timeout, as a deadline rather than a per-pass sweep. The
+    // one-second poll cap only bounds the wait until the earliest deadline.
+    let mut read_timeouts = Timeouts::new(
+        crate::http11::INITIAL_CONNECTIONS,
+        Duration::from_secs(crate::http11::READ_TIMEOUT_SECS),
+    );
+    let mut on_head = |_: &mut (), head: &RequestHead<'_>, _: &[u8], _: &str| {
+        redirect_head(head.method, head.path, head.query, head.headers)
+    };
+    let mut on_owned = |_: &mut (), req: &HttpRequest, _: &str| redirect_for(req);
+    let hit = HitHeaders {
+        alt_svc: std::sync::Arc::from(&[] as &[u8]),
+        describedby: None,
+    };
+
     info!(bind = %bind, "HTTP->HTTPS redirect listener started");
 
     let mut events = Events::with_capacity(64);
+    let mut accepting = true;
     loop {
-        // The timeout also drives the connection sweep inside `drive_all` when
-        // nothing else is happening, so a stalled client is still reaped on an
-        // otherwise silent listener.
-        match poll.poll(&mut events, Some(Duration::from_millis(POLL_TIMEOUT_MS))) {
+        let now = Instant::now();
+        match poll.poll(
+            &mut events,
+            Some(read_timeouts.timeout(now, Duration::from_millis(POLL_TIMEOUT_MS))),
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -166,10 +202,40 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                 continue;
             }
         }
+        let now = Instant::now();
 
         for ev in &events {
             match ev.token() {
-                TOKEN_LISTENER => listener.accept_pending(poll.registry(), TOKEN_CONN),
+                TOKEN_LISTENER => loop {
+                    let Some(taken) = listener.take_slot() else {
+                        poll.registry()
+                            .deregister(&mut SourceFd(&listener.raw_fd()))
+                            .ok();
+                        accepting = false;
+                        break;
+                    };
+                    let key = taken.key;
+                    let mut conn = match listener.accept_one() {
+                        Some(c) => c,
+                        None => {
+                            listener.free_slot(key);
+                            break;
+                        }
+                    };
+                    conn.set_token(Token(key));
+                    conn.set_interest(Interest::READABLE);
+                    if let Err(e) = poll.registry().register(
+                        &mut SourceFd(&conn.raw_fd()),
+                        Token(key),
+                        Interest::READABLE,
+                    ) {
+                        warn!(error = %e, "redirect: register connection");
+                        listener.free_slot(key);
+                        continue;
+                    }
+                    read_timeouts.touch(Token(key), now);
+                    *listener.slot_mut(key) = conn;
+                },
                 TOKEN_SIGNAL => {
                     let mut stop = false;
                     while let Some(sig) = signals.read() {
@@ -182,16 +248,39 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                         return Ok(());
                     }
                 }
-                _ => {}
+                Token(k) => {
+                    let drive = listener.drive_one(
+                        k,
+                        &mut (),
+                        &mut on_head,
+                        &mut on_owned,
+                        &hit,
+                        poll.registry(),
+                    );
+                    if drive.restarted {
+                        read_timeouts.touch(Token(k), now);
+                    }
+                    if drive.done {
+                        listener.close_one(k, poll.registry());
+                        read_timeouts.clear(Token(k));
+                    }
+                }
             }
         }
 
-        listener.drive_all(
-            |req, _client_ip| redirect_for(req),
-            // No URL backends here, so no pending response can ever arrive.
-            |_resp, _ctx| (500, Vec::new(), Vec::new(), String::new()),
-            poll.registry(),
-        );
+        // Close connections idle past the read deadline.
+        while let Some(Token(k)) = read_timeouts.expired(Instant::now()) {
+            listener.close_one(k, poll.registry());
+        }
+        // A slot came free while the table was full: accept again.
+        if !accepting && !listener.is_full() {
+            poll.registry().register(
+                &mut SourceFd(&listener.raw_fd()),
+                TOKEN_LISTENER,
+                Interest::READABLE,
+            )?;
+            accepting = true;
+        }
     }
 }
 
@@ -211,6 +300,7 @@ mod tests {
         match outcome {
             RequestOutcome::Ready(s, ..) => *s,
             RequestOutcome::Pending { .. } => panic!("a redirect is never pending"),
+            RequestOutcome::Cached { .. } => panic!("a redirect is never cached"),
         }
     }
 
@@ -221,6 +311,7 @@ mod tests {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.clone()),
             RequestOutcome::Pending { .. } => None,
+            RequestOutcome::Cached { .. } => None,
         }
     }
 

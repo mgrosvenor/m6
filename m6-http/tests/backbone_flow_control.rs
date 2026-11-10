@@ -276,7 +276,7 @@ fn a_backbone_body_respects_the_peers_send_window() {
         headers: vec![("content-length".to_string(), BODY_LEN.to_string())],
         body: sent.clone(),
     };
-    let rx_resp = conn
+    let stream_id = conn
         .dispatch(&req, "127.0.0.1", "203.0.113.9", "example.test")
         .expect("dispatch");
 
@@ -286,14 +286,15 @@ fn a_backbone_body_respects_the_peers_send_window() {
     let mut response = None;
     while Instant::now() < deadline {
         conn.drive();
-        match rx_resp.try_recv() {
-            Ok(r) => {
-                response = Some(r);
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
-            Err(mpsc::TryRecvError::Disconnected) => break,
+        if let Some(c) = conn
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+        {
+            response = Some(c.result);
+            break;
         }
+        thread::sleep(Duration::from_millis(1));
         if conn.is_dead {
             break;
         }

@@ -19,14 +19,17 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use m6_core::mio::{Poll, Token};
+use m6_core::event::raise_open_file_limit;
+use m6_core::mio::unix::SourceFd;
+use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::http11::{
-    make_tls_server_config, Http11Listener, RequestOutcome, DEFAULT_MAX_REQUESTS_PER_CONN,
+    make_tls_server_config, HitHeaders, Http11Listener, RequestHead, RequestOutcome,
+    DEFAULT_MAX_REQUESTS_PER_CONN, INITIAL_CONNECTIONS,
 };
 use quiche::h3::NameValue as _;
 
-const TOKEN_TCP: Token = Token(1);
+const TOKEN_TCP: Token = Token(usize::MAX);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -99,24 +102,92 @@ where
         .install_default()
         .ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
-    let mut listener = Http11Listener::bind("127.0.0.1:0", tls_cfg, max_requests).expect("bind");
+    let ceiling = raise_open_file_limit().unwrap_or(4096);
+    let mut listener = Http11Listener::bind(
+        "127.0.0.1:0",
+        tls_cfg,
+        max_requests,
+        INITIAL_CONNECTIONS,
+        ceiling,
+    )
+    .expect("bind");
     let port = listener.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
     thread::spawn(move || {
-        let poll = Poll::new().expect("poll");
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register(
+                &mut SourceFd(&listener.raw_fd()),
+                TOKEN_TCP,
+                Interest::READABLE,
+            )
+            .expect("register listener");
+        let mut events = Events::with_capacity(64);
+        let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
+            let req = match m6_core::h1::materialize(head, buf) {
+                m6_core::h1::ParseResult::Complete(r) => r,
+                _ => return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string()),
+            };
+            let (s, h, b, be) = handler(&req, ip);
+            RequestOutcome::Ready(s, h, b, be)
+        };
+        let mut on_owned = |_: &mut (), req: &HttpRequest, ip: &str| {
+            let (s, h, b, be) = handler(req, ip);
+            RequestOutcome::Ready(s, h, b, be)
+        };
+        let hit = HitHeaders {
+            alt_svc: std::sync::Arc::from(&[] as &[u8]),
+            describedby: None,
+        };
         while !stop2.load(Ordering::Relaxed) {
-            listener.accept_pending(poll.registry(), TOKEN_TCP);
-            listener.drive_all(
-                |req, client_ip| {
-                    let (s, h, b, be) = handler(req, client_ip);
-                    RequestOutcome::Ready(s, h, b, be)
-                },
-                |_resp, _ctx| (503, vec![], vec![], "none".to_string()),
-                poll.registry(),
-            );
-            thread::sleep(Duration::from_millis(2));
+            match poll.poll(&mut events, Some(Duration::from_millis(2))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+            for ev in &events {
+                match ev.token() {
+                    TOKEN_TCP => {
+                        while let Some(taken) = listener.take_slot() {
+                            let key = taken.key;
+                            let Some(mut conn) = listener.accept_one() else {
+                                listener.free_slot(key);
+                                break;
+                            };
+                            conn.set_token(Token(key));
+                            conn.set_interest(Interest::READABLE);
+                            if poll
+                                .registry()
+                                .register(
+                                    &mut SourceFd(&conn.raw_fd()),
+                                    Token(key),
+                                    Interest::READABLE,
+                                )
+                                .is_err()
+                            {
+                                listener.free_slot(key);
+                                continue;
+                            }
+                            *listener.slot_mut(key) = conn;
+                        }
+                    }
+                    Token(k) => {
+                        let drive = listener.drive_one(
+                            k,
+                            &mut (),
+                            &mut on_head,
+                            &mut on_owned,
+                            &hit,
+                            poll.registry(),
+                        );
+                        if drive.done {
+                            listener.close_one(k, poll.registry());
+                        }
+                    }
+                }
+            }
         }
     });
 

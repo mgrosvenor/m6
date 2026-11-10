@@ -224,7 +224,7 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
     );
 
     // Victim asks for a different query.
-    let mut buf = [0u8; 512];
+    let mut buf = String::with_capacity(512);
     let victim_key = make_lookup_key("/search", Some("q=victim"), "", &mut buf);
 
     assert!(

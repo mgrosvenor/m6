@@ -6,13 +6,12 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::mpsc;
 use std::sync::Arc;
 
 use rustls::ClientConnection;
 
-use crate::forward::{HttpRequest, HttpResponse};
-use crate::h2_client::{client_init_frame, H2Client, Pool, Transport};
+use crate::forward::{HttpRequest, PendingUrlContext, Waiter};
+use crate::h2_client::{client_init_frame, H2Client, H2Completion, Pool, Transport};
 use m6_core::mio::{Registry, Token};
 
 /// The TLS transport for `h2s://` backends.
@@ -166,6 +165,10 @@ impl Transport for H2sTransport {
         }
         None
     }
+
+    fn wants_write(&self) -> bool {
+        self.tls_conn.wants_write()
+    }
 }
 
 /// Persistent non-blocking H2S (TLS) connection.
@@ -210,23 +213,56 @@ impl H2sTlsClientPool {
         Self(Pool::new())
     }
 
+    /// Ensure a connection exists for `base_url`. Returns whether one was made.
+    pub fn ensure_connection(
+        &mut self,
+        base_url: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> io::Result<bool> {
+        self.0.ensure_connection(base_url, Some(tls_config))
+    }
+
+    /// The connection for `base_url`, to register and set its token.
+    pub fn connection_mut(&mut self, base_url: &str) -> Option<&mut H2Client<H2sTransport>> {
+        self.0.connection_mut(base_url)
+    }
+
     /// Dispatch a request to the named backend URL.
-    ///
-    /// `tls_config` must have ALPN `h2` — use `pool::build_h2_tls_client_config()`.
     pub fn dispatch(
         &mut self,
         base_url: &str,
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
-        tls_config: Arc<rustls::ClientConfig>,
-    ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
+        registry: &Registry,
+    ) -> io::Result<(Token, u32)> {
         self.0
-            .dispatch(base_url, req, client_ip, original_host, Some(tls_config))
+            .dispatch(base_url, req, client_ip, original_host, registry)
     }
 
-    /// Register new connections with the poll and drive all connections.
-    pub fn drive_all(&mut self, registry: &Registry, token: Token) {
-        self.0.drive_all(registry, token);
+    /// Store who waits for an outbound stream's reply.
+    pub fn set_waiter(
+        &mut self,
+        token: Token,
+        stream_id: u32,
+        waiter: Waiter,
+        ctx: Box<PendingUrlContext>,
+    ) {
+        self.0.set_waiter(token, stream_id, waiter, ctx);
+    }
+
+    /// Drive the one connection whose token fired.
+    pub fn drive_one(&mut self, token: Token, registry: &Registry) -> bool {
+        self.0.drive_one(token, registry)
+    }
+
+    /// Take the completions the last drives produced.
+    pub fn drain_completions(&mut self) -> Vec<H2Completion> {
+        self.0.drain_completions()
+    }
+
+    /// Deregister and drop the connection under `token`, if any.
+    pub fn remove_by_token(&mut self, token: Token, registry: &Registry) {
+        self.0.remove_by_token(token, registry);
     }
 }
