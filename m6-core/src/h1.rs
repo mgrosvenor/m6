@@ -322,249 +322,226 @@ pub enum ParseResult {
     Complete(RawRequest),
 }
 
-pub fn parse_request(buf: &[u8]) -> ParseResult {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
+/// A request head parsed into slices of the input buffer, with no allocation.
+///
+/// Every string borrows from `buf` (the method, the path, the query and every
+/// header name and value) except `version`, which is one of the two static
+/// HTTP/1.x strings. This is the borrowed half of [`parse_request`]: the same
+/// checks run once, and the owned parser copies the result.
+pub struct RequestHead<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    pub version: &'a str,
+    pub headers: &'a [httparse::Header<'a>],
+    /// Byte offset in `buf` where the body begins (the end of the head).
+    pub head_len: usize,
+    /// Body length for a `Content-Length` request, 0 otherwise. A chunked
+    /// request carries no `Content-Length`, so it reads 0 here and
+    /// [`RequestHead::has_body`] finds the `Transfer-Encoding` header instead.
+    pub body_len: usize,
+}
+
+impl RequestHead<'_> {
+    /// Whether a body follows the head: `Content-Length` above zero, or chunked.
+    pub fn has_body(&self) -> bool {
+        self.body_len > 0
+            || self
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+    }
+}
+
+/// Outcome of parsing a request head. Mirrors [`ParseResult`] for the borrowed
+/// head: `Complete` carries no body, only its length.
+pub enum HeadResult<'a> {
+    Incomplete,
+    Error,
+    Complete(RequestHead<'a>),
+}
+
+/// Parse a request head into borrowed slices of `buf`.
+///
+/// This is the shared half of [`parse_request`]: every framing check the owned
+/// parser makes lives here, so the two cannot disagree about what is accepted.
+/// The owned parser calls this and copies the head into `RawRequest`.
+pub fn parse_head<'a>(
+    buf: &'a [u8],
+    headers: &'a mut [httparse::Header<'a>; 64],
+) -> HeadResult<'a> {
+    let mut req = httparse::Request::new(headers);
     let body_offset = match req.parse(buf) {
-        Ok(httparse::Status::Partial) => return ParseResult::Incomplete,
+        Ok(httparse::Status::Partial) => return HeadResult::Incomplete,
         Ok(httparse::Status::Complete(n)) => n,
-        Err(_) => return ParseResult::Error,
+        Err(_) => return HeadResult::Error,
     };
 
-    // Reject a bare LF anywhere in the header block.
-    //
-    // httparse accepts LF alone as a line terminator, which is lenient in the
-    // way most servers historically were. The consequence is that a header
-    // VALUE containing a raw \n is silently split into two headers:
-    //
-    //     X-Test: a\nX-Injected: yes   ->   X-Test: a  +  X-Injected: yes
-    //
-    // and the second one is then forwarded to the backend. Found by a raw
-    // socket test; no client library will send this, which is why it survived.
-    //
-    // Honest scope: this is not a demonstrated exploit against the current
-    // topology. Ingress stripping runs after the split, so proxy-owned headers
-    // are still removed, and m6-http re-serialises with CRLF, so its own
-    // cache-node-to-origin hop cannot desync with itself. The hazard is the
-    // classic one from RFC 9112 11.2 -- two hops disagreeing about where a
-    // header ends -- and it goes live the moment anything is placed in front
-    // of m6. Rejecting is what current hardened servers do, and it costs one
-    // scan of a small buffer on a path that has already parsed it once.
-    //
-    // Scanning `buf[..body_offset]` rather than the whole buffer keeps a body
-    // containing legitimate LF bytes out of it.
+    // Reject a bare LF anywhere in the header block. (See `parse_request`'s
+    // original note: the split it permits is the smuggling primitive.)
     {
         let head = &buf[..body_offset];
         let mut i = 0;
         while let Some(off) = head[i..].iter().position(|&c| c == b'\n') {
             let at = i + off;
             if at == 0 || head[at - 1] != b'\r' {
-                return ParseResult::Error;
+                return HeadResult::Error;
             }
             i = at + 1;
         }
     }
 
-    let method = req.method.unwrap_or("GET").to_string();
+    let method = req.method.unwrap_or("GET");
     let raw_path = req.path.unwrap_or("/");
 
-    // RFC 9112 3.2.2: a server MUST accept absolute-form
-    // (`GET http://example.com/path HTTP/1.1`), which is what a request through a
-    // proxy looks like and what an attacker sends to see whether the origin
-    // and the proxy agree about the target.
-    //
-    // The scheme and authority are dropped and the path kept, so routing sees
-    // the same target it would for origin-form. Previously the whole URI was
-    // handed to the router, which matched nothing and answered 404 -- accepted
-    // in name, unusable in fact.
-    //
-    // The authority is deliberately NOT used to override `Host`: doing so
-    // lets a client name one origin in the URI and another in `Host`, which is
-    // the routing-confusion primitive. `Host` stays authoritative; a
-    // disagreement is the client's problem, not a licence to pick one.
+    // Absolute-form is reduced to its path, exactly as the owned parser does.
     let target = strip_absolute_form(raw_path);
-
     let (path, query) = match target.find('?') {
-        Some(q) => (target[..q].to_string(), Some(target[q + 1..].to_string())),
-        None => (target.to_string(), None),
+        Some(q) => (&target[..q], Some(&target[q + 1..])),
+        None => (target, None),
     };
 
-    // Extract what we need from req.headers before dropping req.
-    //
-    // One pass does three jobs — framing validation, ingress stripping, and
-    // materialisation — because this loop is the single hottest piece of
-    // per-request work in the proxy. It used to be two passes plus a
-    // `filter_map().collect()` whose size hint forced the Vec to grow.
     let nheaders = req.headers.len();
 
-    // Request framing must be unambiguous. Two disagreeing `Content-Length`
-    // values, or a `Content-Length` alongside a `Transfer-Encoding`, let two
-    // hops disagree about where this request ends and the next begins — the
-    // basis of request smuggling. We refuse such a request rather than pick a
-    // winner and hope the backend picks the same one.
+    // Framing validation: one pass, no allocation. The owned parser copies the
+    // surviving headers afterwards; the checks themselves are shared.
     let mut first_cl: Option<&str> = None;
     let mut saw_cl = false;
     let mut host_count = 0usize;
     let mut host_empty = false;
     let mut saw_te = false;
-    let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(nheaders);
 
     for h in &req.headers[..nheaders] {
         if h.name.eq_ignore_ascii_case("transfer-encoding") {
             let Ok(v) = std::str::from_utf8(h.value) else {
-                return ParseResult::Error;
+                return HeadResult::Error;
             };
-            // RFC 9112 6.1: `chunked` must be the FINAL coding, and any other
-            // coding is one this server does not implement. `chunked, gzip`
-            // is malformed; `gzip, chunked` names a coding we cannot decode.
             let last = v.rsplit(',').next().unwrap_or("").trim();
             if !last.eq_ignore_ascii_case("chunked") {
-                return ParseResult::Error;
+                return HeadResult::Error;
             }
             if v.split(',').count() > 1 {
-                return ParseResult::Error;
+                return HeadResult::Error;
             }
             saw_te = true;
-            // Not forwarded: transfer-coding is hop-by-hop, and the body is
-            // decoded here so the next hop gets a plain Content-Length.
             continue;
         }
         if h.name.eq_ignore_ascii_case("content-length") {
             let Ok(value) = std::str::from_utf8(h.value) else {
-                return ParseResult::Error;
+                return HeadResult::Error;
             };
             let value = value.trim();
             match first_cl {
-                // Duplicates are tolerable only when they agree.
-                Some(prev) if prev != value => return ParseResult::Error,
+                Some(prev) if prev != value => return HeadResult::Error,
                 Some(_) => {}
                 None => first_cl = Some(value),
             }
             saw_cl = true;
         }
-
         if h.name.eq_ignore_ascii_case("host") {
             host_count += 1;
             match std::str::from_utf8(h.value).map(str::trim) {
                 Ok(v) if !v.is_empty() => {
                     if !host_is_valid(v) {
-                        return ParseResult::Error;
+                        return HeadResult::Error;
                     }
                 }
                 _ => host_empty = true,
             }
         }
+    }
 
-        // A header value that is not UTF-8 is dropped rather than rejected
-        // (matching prior behaviour); `content-length` is the exception
-        // handled above, where it is a framing error.
+    if host_count > 1 {
+        return HeadResult::Error;
+    }
+    let is_http11 = req.version == Some(1);
+    if is_http11 && (host_count == 0 || host_empty) {
+        return HeadResult::Error;
+    }
+    if saw_te && !is_http11 {
+        return HeadResult::Error;
+    }
+    if saw_te && saw_cl {
+        return HeadResult::Error;
+    }
+
+    let body_len: usize = match first_cl {
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => return HeadResult::Error,
+        },
+        None if saw_cl => return HeadResult::Error,
+        None => 0,
+    };
+
+    let version = if is_http11 { "HTTP/1.1" } else { "HTTP/1.0" };
+
+    HeadResult::Complete(RequestHead {
+        method,
+        path,
+        query,
+        version,
+        headers: &req.headers[..nheaders],
+        head_len: body_offset,
+        body_len,
+    })
+}
+
+pub fn parse_request(buf: &[u8]) -> ParseResult {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let head = match parse_head(buf, &mut headers) {
+        HeadResult::Incomplete => return ParseResult::Incomplete,
+        HeadResult::Error => return ParseResult::Error,
+        HeadResult::Complete(h) => h,
+    };
+
+    let method = head.method.to_string();
+    let path = head.path.to_string();
+    let query = head.query.map(str::to_string);
+    let version = head.version.to_string();
+
+    // Copy the surviving headers: transfer-coding is hop-by-hop and not
+    // forwarded, and a value that is not UTF-8 is dropped rather than rejected
+    // (matching prior behaviour).
+    let mut fwd_headers: Vec<(String, String)> = Vec::with_capacity(head.headers.len());
+    for h in head.headers {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
         let Ok(v) = std::str::from_utf8(h.value) else {
             continue;
         };
         fwd_headers.push((h.name.to_string(), v.to_string()));
     }
 
-    // Host validation, RFC 9112 3.2: a server MUST answer 400 to an HTTP/1.1
-    // request that lacks a Host, carries more than one, or carries an invalid
-    // value. All three returned 200 before this.
-    //
-    // More than one is the one with teeth: two hops can pick different Host
-    // values and disagree about which site — or which origin — a request is
-    // for. Rejected regardless of version for that reason.
-    //
-    // The version gate matters. HTTP/1.0 predates Host and is allowed to omit
-    // it, so rejecting a 1.0 request for that would break clients that are
-    // behaving correctly. httparse reports `version` as the minor number, so
-    // 1 means HTTP/1.1.
-    //
-    // Note the H2C and HTTP/2 paths do not come through here (they build their
-    // request in http2.rs, where `:authority` is already translated to Host),
-    // and the synthetic refresh request is constructed directly rather than
-    // parsed — so neither is affected by this.
-    if host_count > 1 {
-        return ParseResult::Error;
-    }
-    let is_http11 = req.version == Some(1);
-    if is_http11 && (host_count == 0 || host_empty) {
-        return ParseResult::Error;
-    }
-
-    // RFC 9112 6.1: chunked is an HTTP/1.1 transfer coding. An HTTP/1.0
-    // message claiming it is malformed, and treating it as chunked anyway is
-    // exactly the version-straddling disagreement smuggling exploits: a hop
-    // that honours the header and one that falls back to read-to-close frame
-    // the same bytes differently.
-    if saw_te && !is_http11 {
-        return ParseResult::Error;
-    }
-
-    // Transfer-Encoding and Content-Length together is the smuggling
-    // primitive: two hops can pick different framings and disagree about
-    // where the request ends. RFC 9112 6.1 says reject.
-    if saw_te && saw_cl {
-        return ParseResult::Error;
-    }
-
-    let content_length: usize = match first_cl {
-        Some(v) => match v.parse() {
-            Ok(n) => n,
-            Err(_) => return ParseResult::Error,
-        },
-        // `saw_cl` without a value is unreachable (the loop sets both
-        // together), but keep the framing decision explicit rather than
-        // silently defaulting a malformed header to zero.
-        None if saw_cl => return ParseResult::Error,
-        None => 0,
-    };
-
-    if saw_te {
+    let chunked = head
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+    let body = if chunked {
         // Decoded here, so the body handed on is a plain one of known length
         // and no downstream hop has to agree with us about chunk framing.
-        return match decode_chunked(&buf[body_offset..]) {
-            Chunked::Incomplete => ParseResult::Incomplete,
-            Chunked::Bad => ParseResult::Error,
+        match decode_chunked(&buf[head.head_len..]) {
+            Chunked::Incomplete => return ParseResult::Incomplete,
+            Chunked::Bad => return ParseResult::Error,
             Chunked::Done(body) => {
                 fwd_headers.push(("Content-Length".to_string(), body.len().to_string()));
-                ParseResult::Complete(RawRequest {
-                    method,
-                    path,
-                    query,
-                    version: if is_http11 {
-                        "HTTP/1.1".to_string()
-                    } else {
-                        "HTTP/1.0".to_string()
-                    },
-                    headers: fwd_headers,
-                    body,
-                })
+                body
             }
-        };
-    }
-
-    let available = buf.len() - body_offset;
-    if available < content_length {
-        return ParseResult::Incomplete;
-    }
-
-    let body = buf[body_offset..body_offset + content_length].to_vec();
+        }
+    } else {
+        let available = buf.len() - head.head_len;
+        if available < head.body_len {
+            return ParseResult::Incomplete;
+        }
+        buf[head.head_len..head.head_len + head.body_len].to_vec()
+    };
 
     ParseResult::Complete(RawRequest {
         method,
         path,
         query,
-        // The version the client actually sent, not a constant.
-        //
-        // This was hardcoded to "HTTP/1.1" for every request, so the field was
-        // a lie for anything that read it. It went unnoticed while nothing
-        // did: the code above uses httparse's own `req.version` and never this
-        // string. Persistent connections need it, because HTTP/1.1 defaults to
-        // keeping the connection and HTTP/1.0 defaults to closing it -- and
-        // with the constant in place an HTTP/1.0 client was told keep-alive.
-        version: if is_http11 {
-            "HTTP/1.1".to_string()
-        } else {
-            "HTTP/1.0".to_string()
-        },
+        version,
         headers: fwd_headers,
         body,
     })
@@ -1176,5 +1153,64 @@ mod stream_tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("Content-Length: 4096"), "{s}");
         assert!(s.ends_with("\r\n\r\n"), "a HEAD must carry no body");
+    }
+}
+
+#[cfg(test)]
+mod parse_head_tests {
+    use super::*;
+
+    fn is_error(raw: &[u8]) -> bool {
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        matches!(parse_head(raw, &mut headers), HeadResult::Error)
+    }
+
+    /// The borrowed parser rejects exactly what the owned parser rejects, so the
+    /// two cannot drift apart on what reaches the ingress boundary.
+    #[test]
+    fn parse_head_refuses_what_parse_request_refuses() {
+        assert!(is_error(b"GET / HTTP/1.1\nHost: x\n\n"), "bare LF");
+        assert!(
+            is_error(
+                b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"
+            ),
+            "two disagreeing Content-Length"
+        );
+        assert!(
+            is_error(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            ),
+            "Transfer-Encoding with Content-Length"
+        );
+        let mut raw = String::from("GET / HTTP/1.1\r\nHost: x\r\n");
+        for i in 0..70 {
+            raw.push_str(&format!("X-H{i}: v\r\n"));
+        }
+        raw.push_str("\r\n");
+        assert!(is_error(raw.as_bytes()), "more than 64 headers");
+    }
+
+    /// The borrowed head points into the request buffer and reads nothing owned.
+    #[test]
+    fn parse_head_borrows_without_copying() {
+        let raw = b"GET /a/b?c=1 HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\n\r\n";
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let h = match parse_head(raw, &mut headers) {
+            HeadResult::Complete(h) => h,
+            HeadResult::Incomplete => panic!("expected Complete, got Incomplete"),
+            HeadResult::Error => panic!("expected Complete, got Error"),
+        };
+        assert_eq!(h.method, "GET");
+        assert_eq!(h.path, "/a/b");
+        assert_eq!(h.query, Some("c=1"));
+        assert_eq!(h.version, "HTTP/1.1");
+        assert_eq!(h.body_len, 0);
+        assert!(!h.has_body());
+        assert_eq!(h.headers.len(), 2);
+        assert_eq!(
+            crate::http::header(&h.headers[..], "host"),
+            Some("example.com")
+        );
     }
 }
