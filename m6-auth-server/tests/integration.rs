@@ -67,7 +67,7 @@ fn setup_test_env(id: &str) -> TestEnv {
     std::fs::write(&public_key_path, &public_pem).unwrap();
 
     // Write config
-    let db_path = "data/auth.db";
+    let db_path = site_dir.join("data/auth.db").display().to_string();
     let config = format!(
         r#"[storage]
 path = "{}"

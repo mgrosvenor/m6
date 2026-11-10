@@ -80,14 +80,10 @@ Take from it that the user and group commands need only `[storage]`.
 
 **Table 2: the config keys m6-auth-cli reads.** Only `token create` needs the two key entries.
 
-Paths resolve differently for the two groups of keys.
-A relative `[storage] path` resolves against the directory that holds the config file, and an absolute path is used as written.
+Every path in the file is absolute, and a relative one exits 2 naming the setting.
 m6-auth-cli creates the directory that holds the database when it is missing.
-
-The `[keys]` paths resolve against the site root.
-That root is the parent of the `configs` directory when the config file sits inside one, and the config file's own directory otherwise.
-An absolute key path is used as written.
-`--site-dir` on `token create` overrides the directory for the private key only, so the public key still comes from the inferred site root unless the config gives it as an absolute path.
+Run it as the service's user, for example `sudo -u m6`, so every file it creates beside the database stays the service's.
+`token create` reads the private key the config names, so with a key delivered by `LoadCredential` it runs while m6-auth-server runs.
 
 Every other key is ignored by m6-auth-cli.
 The token lifetimes belong to m6-auth-server, and [`m6-auth.md`](m6-auth.md) owns the full config.
@@ -170,7 +166,7 @@ Take from it that `token create` is the only command that prints a token.
 
 | command | what it does |
 |---|---|
-| `token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]` | mints a token and prints it to stdout |
+| `token create <username> [--name <name>] [--ttl-days <days>]` | mints a token and prints it to stdout |
 | `token ls <username> [--json]` | lists every token record for the user |
 | `token revoke <token-id>` | deletes one token record |
 

@@ -11,8 +11,9 @@
 //! file is three lines of setup and one call because that claim is true.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use m6_core::testkit::{assert_app_lifecycle, binary};
+use m6_core::testkit::{assert_app_lifecycle, binary, Service};
 
 /// A config m6-monitor will actually start on.
 ///
@@ -105,5 +106,59 @@ fn check_without_config_fails_loudly() {
     assert!(
         err.contains("usage") || err.contains("config"),
         "the failure should say what was missing\n--- stderr ---\n{err}"
+    );
+}
+
+/// A relative `perf_token_file` is refused at start, before the poller runs.
+#[test]
+fn a_relative_perf_token_file_stops_the_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("monitor.conf");
+    let config_text = r#"
+[monitor]
+timeout_ms = 200
+perf_token_file = "token"
+
+[[monitor.nodes]]
+name = "unreachable"
+url  = "https://127.0.0.1:1"
+role = "origin"
+
+[thread_pool]
+size       = 1
+queue_size = 4
+
+[log]
+level  = "info"
+format = "text"
+"#;
+    std::fs::write(&config, config_text).expect("write config");
+    std::fs::write(dir.path().join("site.toml"), "").unwrap();
+    let sock = dir.path().join("mon.sock");
+
+    let mut cmd = Command::new(binary("m6-monitor"));
+    cmd.arg(dir.path())
+        .arg(&config)
+        .env("M6_SOCKET_OVERRIDE", &sock);
+    let mut svc = Service::spawn("m6-monitor", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-monitor did not exit for a relative perf_token_file\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        svc.output().contains("perf_token_file"),
+        "the error did not name perf_token_file\n--- output ---\n{}",
+        svc.output()
     );
 }

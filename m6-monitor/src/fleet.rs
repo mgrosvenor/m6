@@ -254,6 +254,9 @@ impl Fleet {
         if fleet.nodes.is_empty() {
             anyhow::bail!("[monitor] lists no nodes");
         }
+        if let Some(p) = &fleet.perf_token_file {
+            m6_core::config::secret_path("[monitor] perf_token_file", p)?;
+        }
         // The top-level key, through the function the poller uses.
         let poll_interval_s = poll_interval_s(|k| {
             value
@@ -279,6 +282,9 @@ impl Fleet {
             );
         }
         for n in &fleet.nodes {
+            if let Some(p) = &n.perf_token_file {
+                m6_core::config::secret_path(&format!("node {:?}: perf_token_file", n.name), p)?;
+            }
             if n.metrics_over_tunnel && n.tunnel.is_none() {
                 anyhow::bail!(
                     "node {:?}: metrics_over_tunnel needs tunnel.address, the node's HTTPS port on its tunnel address",
@@ -582,5 +588,20 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
             e.contains("metrics_over_tunnel needs tunnel.address"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn a_relative_perf_token_file_is_refused_and_named() {
+        let fleet = load(
+            "[monitor]\nperf_token_file = \"token\"\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\n",
+        );
+        let err = fleet.unwrap_err().to_string();
+        assert!(err.contains("[monitor] perf_token_file"), "{err}");
+
+        let node = load(
+            "[monitor]\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\nperf_token_file = \"token\"\n",
+        );
+        let err = node.unwrap_err().to_string();
+        assert!(err.contains("node \"a\": perf_token_file"), "{err}");
     }
 }

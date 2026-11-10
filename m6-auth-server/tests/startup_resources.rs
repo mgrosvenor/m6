@@ -75,8 +75,7 @@ impl TestSite {
         }
     }
 
-    /// Write the config naming `private_key`, `public_key` and the database at
-    /// `db_path`, which the service resolves against the config file's directory.
+    /// Write the config naming the two keys and the database path db_path.
     fn write_config(&self, private_key: &Path, public_key: &Path, db_path: &str) {
         let config = format!(
             r#"[storage]
@@ -126,7 +125,8 @@ fn missing_private_key_exits_nonzero_names_the_file_and_binds_no_socket() {
     std::fs::write(&public, "unused").unwrap();
     // Named in the config but never written.
     let missing = site.key_dir.path().join("missing-auth.pem");
-    site.write_config(&missing, &public, "data/auth.db");
+    let db_path = site.site_dir.join("data/auth.db").display().to_string();
+    site.write_config(&missing, &public, &db_path);
 
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
@@ -173,8 +173,8 @@ fn missing_storage_directory_is_created_and_the_socket_accepts_a_connection() {
     std::fs::write(&public, &public_pem).unwrap();
 
     // Two directory levels that do not exist yet.
-    let db_rel = "missing/deep/auth.db";
-    site.write_config(&private, &public, db_rel);
+    let db_rel = site.site_dir.join("missing/deep/auth.db");
+    site.write_config(&private, &public, &db_rel.display().to_string());
 
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
@@ -187,7 +187,7 @@ fn missing_storage_directory_is_created_and_the_socket_accepts_a_connection() {
         svc.output()
     );
 
-    let db_path = site.site_dir.join(db_rel);
+    let db_path = db_rel.clone();
     assert!(
         db_path.parent().unwrap().is_dir(),
         "the storage directory {} was not created\n--- output ---\n{}",
@@ -199,5 +199,105 @@ fn missing_storage_directory_is_created_and_the_socket_accepts_a_connection() {
         "the database file {} was not created\n--- output ---\n{}",
         db_path.display(),
         svc.output()
+    );
+}
+
+/// A relative `[storage] path` is refused at start, names the setting, binds no
+/// socket and creates no database or directory.
+#[test]
+fn a_relative_storage_path_exits_2_and_names_the_setting() {
+    let site = TestSite::new("relative-storage");
+    let (private_pem, public_pem) = generate_test_rsa_keys();
+    let private = site.key_dir.path().join("auth.pem");
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&private, &private_pem).unwrap();
+    std::fs::write(&public, &public_pem).unwrap();
+    site.write_config(&private, &public, "data/auth.db");
+
+    let mut cmd = site.command();
+    let mut svc = Service::spawn("m6-auth-server", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-auth-server did not exit for a relative [storage] path\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        svc.output().contains("[storage] path"),
+        "the error did not name [storage] path\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !site.socket_path.exists(),
+        "the socket appeared despite a relative [storage] path"
+    );
+    assert!(
+        !site.site_dir.join("data/auth.db").exists() && !site.site_dir.join("data").exists(),
+        "the relative database or its directory was created"
+    );
+}
+
+/// A relative `[keys] private_key` is refused at start and names the setting.
+#[test]
+fn a_relative_private_key_exits_2_and_names_the_setting() {
+    let site = TestSite::new("relative-private-key");
+    let (private_pem, public_pem) = generate_test_rsa_keys();
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&public, &public_pem).unwrap();
+    std::fs::write(site.site_dir.join("auth.pem"), &private_pem).unwrap();
+
+    let db_path = site.site_dir.join("data/auth.db").display().to_string();
+    let config = format!(
+        r#"[storage]
+path = "{}"
+
+[tokens]
+access_ttl  = 900
+refresh_ttl = 2592000
+issuer      = "test.example.com"
+
+[keys]
+private_key = "auth.pem"
+public_key  = "{}"
+"#,
+        db_path,
+        public.display(),
+    );
+    std::fs::write(&site.config_path, config).unwrap();
+
+    let mut cmd = site.command();
+    let mut svc = Service::spawn("m6-auth-server", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-auth-server did not exit for a relative [keys] private_key\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        svc.output().contains("[keys] private_key"),
+        "the error did not name [keys] private_key\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !site.socket_path.exists(),
+        "the socket appeared despite a relative [keys] private_key"
     );
 }

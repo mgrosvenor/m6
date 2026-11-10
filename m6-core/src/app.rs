@@ -1839,9 +1839,8 @@ fn check_site_toml(
 /// only the config's non-framework keys, which was enough for a service whose
 /// state is derived from values; it is not enough for one whose config *names
 /// files*, because those resolve against a root the map does not carry.
-/// m6-auth-server's `db_path` resolves against its config file's directory and
-/// its key paths against the site, so the initialiser is given both roots
-/// rather than a third argument each time a service needs another.
+/// A service may need either root, so the initialiser is given both rather
+/// than a third argument each time a service needs another.
 pub struct AppContext<'a> {
     /// The config's non-framework keys, already parsed by core.
     pub config: &'a Map<String, Value>,

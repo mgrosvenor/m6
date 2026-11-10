@@ -49,26 +49,12 @@ struct RateLimitConfig {
 /// service config's `[log]`, then `--log-level`. Two parsers for one section
 /// is how they drift.
 pub struct AuthConfig {
-    /// Resolved against the CONFIG FILE's directory, not the site root.
-    ///
-    /// This comment used to say "relative to site_dir", which is what the two
-    /// key paths below do and what every other service in m6 does with a
-    /// relative path. It was simply wrong, and being wrong cost something:
-    /// three of the examples grew three different workarounds for it. 05-cms
-    /// looked for `<site>/data/auth.db` and never found the database, so it
-    /// re-created the admin user on every run and died; 11-admin-dashboard
-    /// wrote `path = "../data/auth.db"` to climb back out of `configs/`; two
-    /// others check both locations.
-    ///
-    /// m6-auth-cli resolves it the same way, so the server and the tool do
-    /// agree and no deployment is broken by this. Whether the behaviour should
-    /// change to match `[keys]` is a separate decision, because it moves a
-    /// running deployment's database.
+    /// Absolute: see m6_core::config::secret_path.
     pub db_path: PathBuf,
     pub access_ttl: u64,  // seconds
     pub refresh_ttl: u64, // seconds
     pub issuer: String,
-    /// Both key paths are resolved against `site_dir`. See `db_path`.
+    /// Absolute, as db_path is.
     pub private_key_path: PathBuf,
     pub public_key_path: PathBuf,
     /// Failed logins allowed per IP per `rate_limit_window_secs`.
@@ -77,15 +63,14 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn load(site_dir: &Path, config_path: &Path, site_toml: &Path) -> Result<Self> {
+    /// Every path in the file is absolute.
+    pub fn load(config_path: &Path, site_toml: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading config: {}", config_path.display()))?;
 
         let raw: RawConfig = toml::from_str(&text)
             .with_context(|| format!("parsing TOML: {}", config_path.display()))?;
 
-        // Validate db path — resolve relative to the config file's directory
-        // (matching m6-auth-cli behaviour).
         let db_path_str = raw
             .storage
             .path
@@ -93,15 +78,7 @@ impl AuthConfig {
         if db_path_str.is_empty() {
             return Err(anyhow!("[storage] path must not be empty"));
         }
-        let db_path = {
-            let p = PathBuf::from(&db_path_str);
-            if p.is_absolute() {
-                p
-            } else {
-                let config_dir = config_path.parent().unwrap_or(Path::new("."));
-                config_dir.join(&p)
-            }
-        };
+        let db_path = m6_core::config::secret_path("[storage] path", &db_path_str)?;
 
         let tokens = raw.tokens.unwrap_or(TokensConfig {
             access_ttl: None,
@@ -118,8 +95,10 @@ impl AuthConfig {
             try_issuer_from_site_toml(site_toml).unwrap_or_else(|| "localhost".to_string())
         });
 
-        let private_key_path = site_dir.join(&raw.keys.private_key);
-        let public_key_path = site_dir.join(&raw.keys.public_key);
+        let private_key_path =
+            m6_core::config::secret_path("[keys] private_key", &raw.keys.private_key)?;
+        let public_key_path =
+            m6_core::config::secret_path("[keys] public_key", &raw.keys.public_key)?;
 
         let rl = raw.rate_limit.unwrap_or(RateLimitConfig {
             max_attempts: None,

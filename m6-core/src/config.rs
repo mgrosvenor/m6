@@ -211,7 +211,7 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
 
     // Optionally merge secrets file.
     if let Some(secrets_path) = toml_val.get("secrets_file").and_then(|v| v.as_str()) {
-        let sp = PathBuf::from(secrets_path);
+        let sp = secret_path("secrets_file", secrets_path)?;
         if sp.exists() {
             let srw = std::fs::read_to_string(&sp)
                 .with_context(|| format!("reading secrets file {}", sp.display()))?;
@@ -269,6 +269,27 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
     }
 
     parse_config(toml_val, site_dir)
+}
+
+/// The path a setting that names a secret, key or certificate holds, which
+/// must be absolute.
+///
+/// A relative path resolves against a base the reader of a config has to
+/// know, and for a secret that base decides which file is read. systemd's
+/// credential directory and /etc/m6 are both absolute, so no deployment
+/// needs a relative one. Every crate calls this, so the rule and its message
+/// are the same everywhere.
+pub fn secret_path(setting: &str, value: &str) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        anyhow::bail!(
+            "{setting} = {value:?} is a relative path. A secret, key or certificate \
+             is named by an absolute path, for example /etc/m6/<file> or \
+             /run/credentials/<unit>/<name>"
+        )
+    }
 }
 
 /// Every leaf key present in BOTH trees, as dotted paths.
@@ -1218,5 +1239,36 @@ password = "hunter2"
         writeln!(cfg, "site_name = \"A\"").unwrap();
         cfg.flush().unwrap();
         load(cfg.path(), dir.path()).expect("an absent secrets file is tolerated");
+    }
+
+    /// A relative path for a secret, key or certificate is refused, and the
+    /// error names the setting and the value.
+    #[test]
+    fn secret_path_refuses_a_relative_path_and_names_the_setting() {
+        for value in ["keys/x.pem", "./x.pem", ""] {
+            let err = secret_path("secrets_file", value).unwrap_err().to_string();
+            assert!(err.contains("secrets_file"), "{err}");
+            assert!(err.contains(&format!("{value:?}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn secret_path_returns_an_absolute_path_unchanged() {
+        assert_eq!(
+            secret_path("secrets_file", "/etc/m6/x.pem").unwrap(),
+            PathBuf::from("/etc/m6/x.pem")
+        );
+    }
+
+    /// A relative secrets_file is refused at load, where the old code ignored
+    /// an absent file rather than checking its path.
+    #[test]
+    fn a_relative_secrets_file_is_refused_at_load() {
+        let mut cfg = NamedTempFile::new().unwrap();
+        writeln!(cfg, "secrets_file = \"secrets.toml\"").unwrap();
+        writeln!(cfg, "site_name = \"A\"").unwrap();
+        cfg.flush().unwrap();
+        let err = load(cfg.path(), Path::new("/tmp")).unwrap_err().to_string();
+        assert!(err.contains("secrets_file"), "{err}");
     }
 }

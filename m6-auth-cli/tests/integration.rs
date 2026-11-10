@@ -15,7 +15,12 @@ impl TestEnv {
         // Create data subdirectory
         std::fs::create_dir_all(dir.path().join("data")).expect("mkdir data");
         // Write config
-        let cfg = "[storage]\npath = \"data/auth.db\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\nissuer = \"test\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"keys/auth.pub\"\n";
+        let cfg = format!(
+            "[storage]\npath = \"{}\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\nissuer = \"test\"\n\n[keys]\nprivate_key = \"{}\"\npublic_key = \"{}\"\n",
+            dir.path().join("data/auth.db").display(),
+            dir.path().join("keys/auth.pem").display(),
+            dir.path().join("keys/auth.pub").display(),
+        );
         std::fs::write(dir.path().join("m6-auth.conf"), cfg).expect("write config");
         TestEnv { dir }
     }
@@ -591,4 +596,41 @@ fn test_group_member_del() {
     // Verify removed
     let out2 = env.run(&["group", "member", "ls", "team"]);
     assert!(!stdout(&out2).contains("alice"), "alice still a member");
+}
+
+#[test]
+fn a_relative_storage_path_exits_2() {
+    let env = TestEnv::new();
+    std::fs::write(
+        env.dir.path().join("m6-auth.conf"),
+        "[storage]\npath = \"data/auth.db\"\n",
+    )
+    .expect("write config");
+    let out = env.run(&["user", "ls"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[storage] path"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_relative_private_key_exits_2() {
+    let env = TestEnv::new();
+    let db = env.dir.path().join("data/auth.db").display().to_string();
+    std::fs::write(
+        env.dir.path().join("m6-auth.conf"),
+        format!(
+            "[storage]\npath = \"{db}\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"keys/auth.pub\"\n"
+        ),
+    )
+    .expect("write config");
+    let out = env.run(&["user", "ls"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[keys] private_key"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }

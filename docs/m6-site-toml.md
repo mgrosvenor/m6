@@ -215,7 +215,7 @@ The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-f
 
 ### 3.2. Renderer secrets
 
-A renderer config may declare `secrets_file`, a path to a TOML file that sits outside the site directory.
+A renderer config may declare `secrets_file`, the absolute path of a TOML file outside the site directory.
 The secrets file holds the values the repo must not carry, such as mail credentials.
 
 The merge rule is one owner per key.
@@ -223,6 +223,7 @@ A key set in both the config and the secrets file is refused at start, and the e
 A key set only in the secrets file is added to the merged config.
 A key set only in the config stays as written.
 `secrets_file` is optional, and an absent secrets file is ignored.
+A relative `secrets_file` stops the renderer at startup with exit 2.
 
 The config, in version control:
 

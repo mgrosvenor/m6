@@ -39,22 +39,6 @@ struct ParsedConfig {
     public_key_path: Option<PathBuf>,
 }
 
-/// Infer the site root from the config file path.
-/// If the config is inside a directory named "configs", the site root is
-/// its parent; otherwise the site root is the config file's directory.
-fn infer_site_dir(config_path: &Path) -> PathBuf {
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    if config_dir
-        .file_name()
-        .map(|n| n == "configs")
-        .unwrap_or(false)
-    {
-        config_dir.parent().unwrap_or(config_dir).to_path_buf()
-    } else {
-        config_dir.to_path_buf()
-    }
-}
-
 fn load_config(config_path: &str) -> Result<ParsedConfig> {
     let p = Path::new(config_path);
     if !p.exists() {
@@ -65,28 +49,26 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
     let cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parsing config file: {}", config_path))?;
 
-    let db_path = if cfg.storage.path.is_empty() {
+    if cfg.storage.path.is_empty() {
         bail!("config missing [storage] path");
-    } else {
-        let sp = Path::new(&cfg.storage.path);
-        if sp.is_absolute() {
-            sp.to_path_buf()
-        } else {
-            let dir = p.parent().unwrap_or(Path::new("."));
-            dir.join(sp)
-        }
-    };
+    }
+    let db_path = m6_core::config::secret_path("[storage] path", &cfg.storage.path)?;
 
     let issuer = cfg
         .tokens
         .and_then(|t| t.issuer)
         .unwrap_or_else(|| "localhost".to_string());
 
-    let site_dir = infer_site_dir(p);
     let (private_key_path, public_key_path) = match cfg.keys {
         Some(k) if !k.private_key.is_empty() => (
-            Some(site_dir.join(&k.private_key)),
-            Some(site_dir.join(&k.public_key)),
+            Some(m6_core::config::secret_path(
+                "[keys] private_key",
+                &k.private_key,
+            )?),
+            Some(m6_core::config::secret_path(
+                "[keys] public_key",
+                &k.public_key,
+            )?),
         ),
         _ => (None, None),
     };
@@ -173,13 +155,12 @@ fn print_usage() {
     eprintln!("  m6-auth-cli <config> group member del <group> <username>");
     eprintln!();
     eprintln!("API token commands:");
-    eprintln!("  m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]");
+    eprintln!("  m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>]");
     eprintln!("  m6-auth-cli <config> token ls <username> [--json]");
     eprintln!("  m6-auth-cli <config> token revoke <token-id>");
     eprintln!();
     eprintln!("  Tokens require [keys] private_key and public_key in the config.");
-    eprintln!("  Key paths are resolved relative to the site root (inferred as the parent");
-    eprintln!("  of the 'configs/' directory, or overridden with --site-dir).");
+    eprintln!("  Every path in the config is absolute.");
 }
 
 // ── Argument parsing helpers ──────────────────────────────────────────────────
@@ -464,9 +445,7 @@ fn cmd_group_member_del(db: &Db, args: &[String]) -> Result<()> {
 
 fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!(
-            "usage: token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]"
-        );
+        bail!("usage: token create <username> [--name <name>] [--ttl-days <days>]");
     }
     let username = &args[0];
     let name = flag_value(args, "--name").unwrap_or("api-token");
@@ -475,20 +454,7 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
         .transpose()?
         .unwrap_or(365);
 
-    // Resolve site_dir: --site-dir flag overrides the inferred default.
-    let private_key_path = if let Some(sd) = flag_value(args, "--site-dir") {
-        let site_dir = Path::new(sd);
-        // Re-read the raw key path from config — we already stored the inferred path,
-        // so if site-dir is overridden we need the original relative path. Store both.
-        cfg.private_key_path.as_ref().map(|p| {
-            // Extract the original relative component by stripping the old site_dir prefix.
-            // Simpler: just use the last two components as the relative path heuristic.
-            // Best: require --site-dir to be used only with relative key paths in config.
-            site_dir.join(p.file_name().unwrap_or(p.as_os_str()))
-        })
-    } else {
-        cfg.private_key_path.clone()
-    };
+    let private_key_path = cfg.private_key_path.clone();
 
     let private_key_path = private_key_path
         .ok_or_else(|| anyhow::anyhow!("config missing [keys] section — cannot mint tokens"))?;
