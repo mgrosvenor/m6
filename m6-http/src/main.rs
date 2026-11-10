@@ -4339,12 +4339,18 @@ fn run(args: Vec<String>) -> i32 {
     let config = match config::load(&cli.site_dir, &cli.system_config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config error: {}", e);
+            eprintln!("{e}");
             return 2;
         }
     };
 
     // CLI --log-level overrides site.toml [log].level; format always comes from config.
+    if let Some(level) = cli.log_level.as_deref() {
+        if let Err(e) = m6_core::log::parse_level(level) {
+            eprintln!("usage error: --log-level: {e}");
+            return 2;
+        }
+    }
     let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
     let analytics_path = config
         .analytics
@@ -4364,14 +4370,6 @@ fn run(args: Vec<String>) -> i32 {
     // Held for the life of the process: dropping the handle flushes and stops
     // the log writer.
     let _log_handle = log_handle;
-
-    config::warn_system_config_extra_keys(&cli.system_config);
-    config::warn_node_fallback(&cli.system_config);
-    for m in config::misplaced_keys(&cli.site_dir, &cli.system_config) {
-        warn!("{m}");
-    }
-    config::warn_health_token(&config.health);
-    config::warn_ignored_route_cache_keys(&config);
 
     // --dump-config
     //

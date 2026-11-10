@@ -64,6 +64,7 @@ impl TestSite {
         let config_path = site_dir.join("m6-auth-test.conf");
         // The socket lives in this test's own temp directory, never a shared one.
         let socket_path = temp.path().join(format!("{id}.sock"));
+        std::fs::write(site_dir.join("site.toml"), "").unwrap();
 
         TestSite {
             _temp: temp,

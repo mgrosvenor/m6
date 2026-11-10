@@ -176,13 +176,14 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `[errors]` | `m6-http`, in `site.toml` | reserved, so it does not reach the request dictionary. The section itself belongs to `site.toml` |
 
 **Table 4: the twelve reserved keys, who reads each, and its default.**
-Take from it that every value core reads has a working default, and that `[server]` refuses a value it cannot parse, because a service that started with a deadline nobody chose looks healthy.
+Take from it that every value core reads has a working default, and that `[server]` refuses a value it cannot parse, because a service that started with a deadline nobody chose looks healthy. An unknown key inside one of these tables stops the service at start with exit 2.
 
 Every other top-level key lands in `RendererConfig::user_config` and is readable from the request dictionary.
 That is how a service gets its own settings without inventing a second configuration file, and `m6-monitor` puts its whole fleet under `[monitor]` this way.
 
 The logging level has three sources and the last one wins: `site.toml`'s `[log]`, then this file's `[log]`, then `--log-level`.
 The format has the first two.
+An unknown level in any of the three stops the service at start with exit 2.
 
 ### 4.1 One name in three places
 

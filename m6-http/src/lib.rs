@@ -12,6 +12,7 @@ pub mod h2s_client;
 pub mod health;
 pub mod http11;
 pub mod http2;
+pub mod perf_ab;
 pub mod pool;
 pub mod probe;
 pub mod rate_limit;

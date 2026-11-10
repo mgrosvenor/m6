@@ -72,15 +72,15 @@ mod token_file_tests {
     }
 
     /// The file indirection has to be enforced, not advisory: a token written
-    /// inline in site.toml must not be honoured, because site.toml is
-    /// committed and shipped to every node.
+    /// inline in site.toml must be refused, because site.toml is committed and
+    /// shipped to every node.
     #[test]
-    fn inline_token_in_toml_is_ignored() {
-        let parsed: HealthConfig =
-            toml::from_str("metrics_token = \"inline-secret\"").expect("parses");
-        assert_eq!(
-            parsed.metrics_token, None,
-            "an inline token must not be accepted from config"
+    fn inline_token_in_toml_is_refused() {
+        let err = toml::from_str::<HealthConfig>("metrics_token = \"inline-secret\"")
+            .expect_err("an inline token must be refused, not ignored");
+        assert!(
+            err.to_string().contains("metrics_token"),
+            "the error should name the key: {err}"
         );
     }
 }

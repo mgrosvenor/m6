@@ -46,6 +46,12 @@ The new JSON fields are additive.
 `CrawlerReport` gains `first_seen` and `last_seen` (RFC 3339 UTC), both `serde(default)`, so a node older than these fields still parses and an aggregator newer than a node reads an empty string as "not reported".
 No existing field changes, so no migration is needed.
 
+### Migration
+
+**m6-http refuses at start, with exit 2, a config it used to warn about.** That covers a key or section it does not know, a key in the file it does not belong to (docs/m6-site-toml.md §3.3, Table 1), a system config with no `[node]`, a `[health] metrics_token_file` that is missing, empty or set together with `metrics_require`, and a cache key on a `[[route]]` or `[[route_group]]` (set `Cache-Control` on the backend's response instead).
+Before upgrading, run `m6-http <site> <system config> --dump-config` on every node and fix what it names: add `[node] name = "<node>"` to each system config, and move every node key out of `site.toml`.
+Every m6 service refuses an unknown log level (in `site.toml`, its own config or `--log-level`), a `site.toml` that is missing or is not valid TOML (the default path included), an unknown key in one of m6-core's own tables (`[thread_pool]`, `[params_cache]`, `[server]`, `[log]`, `[compression]`), and a socket whose mode it cannot set.
+
 ### Added
 
 **Crawler sightings carry a time and a verdict (#205).**
@@ -186,6 +192,10 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**m6-core: an unknown log level, a missing or invalid `site.toml` and a failed socket chmod stop a service at start with exit 2.**
+
+**m6-http: each setting is read from one file, and an unknown or misplaced key, a missing `[node]` or an unusable metrics token file stops the start with exit 2.**
 
 **`check.sh` and `tools/build-host-tests.sh` share a build host safely: builds and lints run side by side, the steps that bind fixed ports take turns, and a measurement runs only when the host is otherwise idle (#344).**
 The protocol is written once, in `tools/host-lock.sh`, which `check.sh`, `tools/perfcheck.sh` and both build-host halves of `tools/build-host-tests.sh` source. A run holds `/var/tmp/m6-host.lock` shared, takes `/var/tmp/m6-test.lock` around the test suite, conformance and the examples' tests and stack, and builds its tests before taking it. A measurement drops its shared hold, queues through an entry lock that stops new runs from starting while it waits, and takes the host lock exclusive. If the host is not idle within `M6_HOST_IDLE_WAIT` seconds (default 7200), the measurement reports NOT MEASURED and the run fails, and `check.sh` says the run is incomplete. Lock files are created readable by every account and opened read only, and processes a run leaves behind do not keep its locks. The remote half of `build-host-tests.sh` keeps its logs in a directory of its own. Where `flock` is missing, as on macOS, nothing is locked.

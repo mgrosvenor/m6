@@ -266,10 +266,6 @@ mode = "internal"
 [analytics]
 enabled = false
 
-[auth]
-backend    = "m6-file"
-public_key = "auth-public.pem"
-
 [[backend]]
 name    = "m6-file"
 sockets = "{sock_glob}"
@@ -317,6 +313,10 @@ tls_key  = "{key}"
 
 [node]
 name = "test-node"
+
+[auth]
+backend    = "m6-file"
+public_key = "auth-public.pem"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),

@@ -17,10 +17,14 @@ const ROUTE: &str =
     "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
 
 /// A site tree: `site.toml` at the top, the app root at `apps/file`.
+///
+/// The app root also holds an empty `site.toml`, because every App needs a
+/// readable `<site_dir>/site.toml` even when no key names the one at the top.
 fn tree(site_toml_body: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("apps/file/assets")).unwrap();
     std::fs::write(tmp.path().join("site.toml"), site_toml_body).unwrap();
+    std::fs::write(tmp.path().join("apps/file/site.toml"), "").unwrap();
     tmp
 }
 
@@ -85,15 +89,16 @@ fn dump_config_names_the_site_toml() {
         .unwrap_or_else(|| panic!("no site.toml line in:\n{stdout}"));
     assert!(line.ends_with("apps/file/../../site.toml"), "{line}");
 
-    // With no key and no file at the default place, the line says so.
+    // With no key, the default <app_root>/site.toml is read.
     let conf = config(&root, "");
     let out = run(&root, &conf, Some("--dump-config"));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
     let line = stdout
         .lines()
         .find(|l| l.starts_with("site.toml"))
         .unwrap_or_else(|| panic!("no site.toml line in:\n{stdout}"));
-    assert!(line.ends_with("(absent)"), "{line}");
+    assert!(line.ends_with("apps/file/site.toml"), "{line}");
 }
 
 #[test]

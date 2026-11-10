@@ -100,6 +100,7 @@ public_key  = "{}"
     std::fs::write(&config_path, &config).unwrap();
 
     std::fs::create_dir_all(site_dir.join("data")).unwrap();
+    std::fs::write(site_dir.join("site.toml"), "").unwrap();
 
     // The socket lives in this test's own temp directory, not a shared one.
     let socket_path = temp.path().join(format!("{id}.sock"));
