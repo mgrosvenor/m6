@@ -167,6 +167,10 @@ pub struct Upstream {
     deadline: Instant,
     method_is_head: bool,
     reusable: bool,
+    /// Whether the whole request has been written to the socket. An early reply
+    /// can arrive before the write finishes; reuse then truncates the request
+    /// and desynchronises the backend, so reuse requires this.
+    request_finished: bool,
     /// The address of the open connection, for keep-alive reuse.
     connected: Option<Addr>,
     /// The TLS identity of the open connection: the verified server name and the
@@ -201,6 +205,7 @@ impl Upstream {
             deadline: Instant::now(),
             method_is_head: false,
             reusable: false,
+            request_finished: false,
             connected: None,
             connected_name: None,
             connected_config: None,
@@ -226,6 +231,7 @@ impl Upstream {
         // reply and is cleared with the rest of the per-request state below.
         let can_reuse = self.stream.is_some()
             && self.reusable
+            && self.request_finished
             && self.connected.as_ref() == Some(addr)
             && self.tls_identity_matches(tls);
 
@@ -245,6 +251,7 @@ impl Upstream {
         self.deadline = deadline;
         self.method_is_head = method_is_head;
         self.reusable = false;
+        self.request_finished = false;
 
         if can_reuse {
             self.phase = Phase::Transfer;
@@ -327,10 +334,12 @@ impl Upstream {
             }
         }
         // Reuse the previous address's buffer when the slot reconnects, so a
-        // fresh connection does not allocate a path each time.
-        match &mut self.connected {
-            Some(existing) => existing.clone_from(addr),
-            None => self.connected = Some(addr.clone()),
+        // fresh connection does not allocate a path each time. `Addr` derives
+        // `Clone`, so clone into the inner variant by hand.
+        match (&mut self.connected, addr) {
+            (Some(Addr::Unix(existing)), Addr::Unix(path)) => existing.clone_from(path),
+            (Some(Addr::Tcp(existing)), Addr::Tcp(ip)) => *existing = *ip,
+            (_, addr) => self.connected = Some(addr.clone()),
         }
         self.connected_name = tls.map(|t| t.name.clone());
         self.connected_config = tls.map(|t| t.config.clone());
@@ -470,6 +479,7 @@ impl Upstream {
                         return Ok(false);
                     }
                 }
+                self.request_finished = true;
                 return Ok(true);
             }
             if self.tls.is_some() {
@@ -786,10 +796,10 @@ impl Upstream {
         self.deadline
     }
 
-    /// The last reply had keep-alive framing and the connection can carry
-    /// another request.
+    /// The last reply had keep-alive framing and the whole request was written,
+    /// so the connection can carry another request.
     pub fn reusable(&self) -> bool {
-        self.reusable
+        self.reusable && self.request_finished
     }
 
     /// Drop the connection (closes the socket). The buffers stay, including the
@@ -988,8 +998,7 @@ pub fn parse_framing(
     } else if chunked {
         Framing::Chunked
     } else if let Some(len) = content_length {
-        // Refuse before reading, so a hostile declared length cannot grow the
-        // buffer, and the size never reaches the addition below unchecked.
+        // The cap is the bound the buffer is sized for, so refuse above it.
         if len > MAX_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1003,13 +1012,9 @@ pub fn parse_framing(
 
     // Reusable only when self-delimited and persistent: HTTP/1.1 unless the
     // backend asked to close, HTTP/1.0 only when it asked to keep alive.
+    // `Connection: close` always wins.
     let self_delimited = matches!(framing, Framing::ContentLength(_) | Framing::Chunked);
-    *reusable = self_delimited
-        && if http10 {
-            connection_keep_alive
-        } else {
-            !connection_close
-        };
+    *reusable = self_delimited && !connection_close && (!http10 || connection_keep_alive);
 
     Ok(framing)
 }
@@ -1355,9 +1360,9 @@ mod tests {
         );
     }
 
-    /// `usize::MAX` is refused rather than overflowing the body-end addition.
+    /// A declared Content-Length that cannot fit is refused, not delivered.
     #[test]
-    fn a_content_length_of_usize_max_is_refused_not_panicking() {
+    fn a_declared_content_length_above_the_limit_is_refused() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n";
         let err = parse(raw, false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "got: {err}");
@@ -1387,6 +1392,7 @@ mod tests {
         let raw = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let mut up = Upstream::new(8192, 1024);
         up.method_is_head = false;
+        up.request_finished = true;
         up.read_buf[..raw.len()].copy_from_slice(raw);
         up.read_len = raw.len();
         up.eof = true;
@@ -1397,6 +1403,7 @@ mod tests {
             b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello";
         let mut up2 = Upstream::new(8192, 1024);
         up2.method_is_head = false;
+        up2.request_finished = true;
         up2.read_buf[..keep_alive.len()].copy_from_slice(keep_alive);
         up2.read_len = keep_alive.len();
         up2.eof = true;
@@ -1636,11 +1643,12 @@ mod socket_tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let peer = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().expect("accept");
-            // Never read the request; write a 413 at once and hold the socket.
-            let _ = s.write_all(
-                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-            std::thread::sleep(Duration::from_millis(100));
+            // Never read the request; write a keep-alive 413 at once. The client
+            // must read it, and must not reuse: the request was never fully
+            // written.
+            let _ = s.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
+            // Hold the socket open until the client is done, then close.
+            std::thread::park();
         });
 
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
@@ -1657,48 +1665,192 @@ mod socket_tests {
         .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (413, &b""[..]));
+        assert!(
+            !up.reusable(),
+            "an early reply before the request is written must not reuse"
+        );
+        peer.thread().unpark();
         peer.join().expect("peer");
     }
 
-    /// A different TLS identity (name or config) for the same address must not
-    /// reuse the connection authenticated for the first identity.
+    /// A different TLS identity (name) for the same address reconnects instead
+    /// of reusing the connection authenticated for the first identity.
     #[test]
-    fn a_different_tls_identity_does_not_reuse_the_connection() {
+    fn a_different_tls_identity_reconnects_instead_of_reusing() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = || {
-            Arc::new(
-                rustls::ClientConfig::builder_with_provider(provider.clone())
-                    .with_safe_default_protocol_versions()
-                    .expect("versions")
-                    .with_root_certificates(rustls::RootCertStore::empty())
-                    .with_no_client_auth(),
-            )
-        };
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let config_a = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server2 = server.clone();
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((tcp, _)) = listener.accept() else {
+                    break;
+                };
+                accept_tx.send(()).expect("report the accept");
+                let conn = rustls::ServerConnection::new(server2.clone()).expect("server conn");
+                let mut stream = rustls::StreamOwned::new(conn, tcp);
+                loop {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let mut complete = false;
+                    while !complete {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                got.extend_from_slice(&buf[..n]);
+                                complete = got.windows(4).any(|w| w == b"\r\n\r\n");
+                            }
+                        }
+                    }
+                    if !complete {
+                        break;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    let _ = stream.flush();
+                }
+            }
+        });
+
         let name_a =
             rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
         let name_b =
             rustls::pki_types::ServerName::try_from("example.com".to_string()).expect("name");
-
-        let mut up = Upstream::new(8192, 1024);
-        let config_a = config();
-        up.connected_name = Some(name_a.clone());
-        up.connected_config = Some(config_a.clone());
         let tls_a = TlsClient {
             config: config_a.clone(),
-            name: name_a.clone(),
+            name: name_a,
         };
-        assert!(up.tls_identity_matches(Some(&tls_a)));
-
         let tls_b = TlsClient {
             config: config_a,
             name: name_b,
         };
-        assert!(!up.tls_identity_matches(Some(&tls_b)));
 
-        let tls_c = TlsClient {
-            config: config(),
-            name: name_a,
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut up = Upstream::new(64 * 1024, 16 * 1024);
+        // Request 1 with identity A: the server accepts once.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls_a), false, deadline)
+            .expect("start");
+        assert_eq!(drive_to_completion(&mut up).expect("drive").0, 200);
+        assert!(up.reusable());
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "request 1 must connect"
+        );
+
+        // Request 2 with identity A reuses the open connection, so the server
+        // accepts nothing new.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls_a), false, deadline)
+            .expect("start");
+        assert_eq!(drive_to_completion(&mut up).expect("drive").0, 200);
+        assert!(
+            accept_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the same identity must reuse the connection"
+        );
+
+        // Request 3 with identity B reconnects: the server accepts a second
+        // time, and the handshake fails because the certificate is for a
+        // different name.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls_b), false, deadline)
+            .expect("start");
+        assert!(drive_to_completion(&mut up).is_err());
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a different identity must reconnect"
+        );
+        // Close the failed handshake so the server's read returns instead of
+        // blocking on a close the client never sends.
+        up.close();
+
+        peer.join().expect("peer");
+    }
+
+    /// A TLS request with a body completes: the client encrypts and flushes the
+    /// request and the server answers.
+    #[test]
+    fn a_tls_request_with_a_body_completes() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(server).expect("server conn");
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = stream.flush();
+        });
+
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
+        let tls = TlsClient {
+            config: client,
+            name,
         };
-        assert!(!up.tls_identity_matches(Some(&tls_c)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        up.request_buf().extend_from_slice(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
+        );
+        up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
+            .expect("start");
+        let (status, _, body) = drive_to_completion(&mut up).expect("drive");
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        peer.join().expect("peer");
     }
 }

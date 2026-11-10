@@ -111,7 +111,8 @@ fn tls_requests_report_their_allocations() {
         let (tcp, _) = listener.accept().expect("accept");
         let conn = rustls::ServerConnection::new(server).expect("server conn");
         let mut stream = rustls::StreamOwned::new(conn, tcp);
-        for _ in 0..N {
+        // One warm-up request plus the N counted ones.
+        for _ in 0..=N {
             let mut got = Vec::new();
             let mut buf = [0u8; 4096];
             while !got.windows(4).any(|w| w == b"\r\n\r\n") {

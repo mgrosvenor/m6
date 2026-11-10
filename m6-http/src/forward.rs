@@ -732,14 +732,6 @@ pub fn read_response_for<R: Read>(mut reader: R, request_method: &str) -> io::Re
     let body = match parsed.framing {
         Framing::Chunked => read_chunked_body(&mut reader, body_prefix.to_vec())?,
         Framing::ContentLength(len) => {
-            // Refuse before allocating, not after: the whole point is that the
-            // allocation is the damage.
-            if len > MAX_BODY {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("backend declared Content-Length {len}, above the {MAX_BODY} limit"),
-                ));
-            }
             let mut body = vec![0u8; len];
             let already = body_prefix.len().min(len);
             body[..already].copy_from_slice(&body_prefix[..already]);

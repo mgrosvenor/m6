@@ -2957,7 +2957,8 @@ fn launch_socket_upstream(
     *state.sources.get_mut(token.0) = Source::SocketUpstream(owner.key);
     let entry = state.socket_upstreams.get_mut(owner.key);
     entry.member_idx = member_idx;
-    entry.backend_name = backend_name.to_string();
+    entry.backend_name.clear();
+    entry.backend_name.push_str(backend_name);
     entry.waiter = None;
     entry.ctx = None;
     entry.registered_interest = interest;
