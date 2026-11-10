@@ -676,17 +676,28 @@ mod tests {
     #[test]
     fn a_reply_with_the_wrong_id_is_ignored() {
         let (addr, server) = nameserver(1, |query| {
-            let mut wrong = reply(
+            let mut wrong_id = reply(
                 query,
                 ResponseCode::NoError,
                 vec![RData::PTR(PTR(
                     Name::from_ascii("wrong.example.com.").expect("name")
                 ))],
             );
-            wrong.metadata.id = query.metadata.id.wrapping_add(1);
-            let mut right = ptr_reply(query, "crawler.example.com.");
-            let mut replies = vec![wrong];
-            replies.append(&mut right);
+            wrong_id.metadata.id = query.metadata.id.wrapping_add(1);
+            // The same id, with a question this query did not ask, must be
+            // ignored by the question half of the check.
+            let mut other = query.clone();
+            other.queries[0] = Question::query(name("other.example.com."), RecordType::PTR);
+            let wrong_question = reply(
+                &other,
+                ResponseCode::NoError,
+                vec![RData::PTR(PTR(Name::from_ascii(
+                    "wrong-question.example.com.",
+                )
+                .expect("name")))],
+            );
+            let mut replies = vec![wrong_id, wrong_question];
+            replies.append(&mut ptr_reply(query, "crawler.example.com."));
             replies
         });
         let ip = "198.51.100.7".parse().expect("address");
