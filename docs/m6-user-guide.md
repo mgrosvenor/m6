@@ -824,6 +824,9 @@ tls_key  = "/tmp/m6/dev/dev-key.pem"
 [auth]
 backend    = "m6-auth"
 public_key = "/tmp/m6/dev/auth.pub"
+
+[node]
+name = "dev"
 ```
 
 ### 6.3. `render-cms/Cargo.toml`
@@ -1079,6 +1082,7 @@ Group=m6
 
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 ExecStart=/usr/local/bin/m6-html \
     /var/www/my-blog \
@@ -1114,6 +1118,7 @@ User=m6
 Group=m6
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 ExecStart=/usr/local/bin/m6-file \
     /var/www/my-blog \
@@ -1147,6 +1152,7 @@ User=m6
 Group=m6
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 ExecStart=/usr/local/bin/m6-auth-server \
     /var/www/my-blog \
@@ -1188,6 +1194,7 @@ User=m6
 Group=m6
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 ExecStart=/var/www/my-blog/bin/render-cms \
     /var/www/my-blog \
@@ -1224,6 +1231,9 @@ User=m6
 Group=m6
 RuntimeDirectory=m6
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+WorkingDirectory=/var/www/my-blog
 
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 
@@ -1241,7 +1251,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/m6
+ReadWritePaths=/run/m6 /var/www/my-blog/logs
 ReadOnlyPaths=/var/www/my-blog /etc/m6
 
 [Install]
@@ -1339,7 +1349,7 @@ Rotation renames the file and sends that signal, so no line is lost and `copytru
 This logrotate stanza rotates the file every hour and keeps the last 48 files, two days:
 
 ```
-/var/www/example/logs/analytics.ndjson {
+/var/www/my-blog/logs/analytics.ndjson {
     hourly
     dateext
     dateformat -%Y%m%d%H
@@ -1572,7 +1582,7 @@ sockets = "/tmp/m6/render-cms-prod*.sock"
 # ... the public, auth and CMS routes as in Example 05
 ```
 
-The development system config `configs/system-dev.toml` holds the node's bind address, certificate paths and auth key:
+The development system config `configs/system-dev.toml` holds the node name, bind address, certificate paths and auth key:
 
 ```toml
 [server]
@@ -1583,9 +1593,12 @@ tls_key  = "/tmp/m6/dev/dev-key.pem"
 [auth]
 backend    = "m6-auth"
 public_key = "/tmp/m6/dev/auth.pub"
+
+[node]
+name = "dev"
 ```
 
-The production system config `/etc/m6/my-blog.toml` holds the same two sections, with the public bind `0.0.0.0:443`, the two credential paths under `/run/credentials/m6-http.service/`, and the auth public key `/run/credentials/m6-http.service/auth.pub`.
+The production system config `/etc/m6/my-blog.toml` holds the same three sections, with the node name `origin`, the public bind `0.0.0.0:443`, the two credential paths under `/run/credentials/m6-http.service/`, and the auth public key `/run/credentials/m6-http.service/auth.pub`.
 Section 8.3 writes it as a heredoc.
 
 The split is one rule: `site.toml` holds the state every node shares, and the system config holds the state of one node.
@@ -1643,6 +1656,9 @@ tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 [auth]
 backend    = "m6-auth"
 public_key = "/run/credentials/m6-http.service/auth.pub"
+
+[node]
+name = "origin"
 TOML
 chown root:m6 /etc/m6/my-blog.toml
 chmod 640 /etc/m6/my-blog.toml
