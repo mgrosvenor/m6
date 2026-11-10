@@ -26,7 +26,11 @@ mod phase10 {
         write_file(dir, "cert.pem", "dummy");
         write_file(dir, "key.pem", "dummy");
         write_file(dir, "site.toml", site_toml);
-        write_file(dir, "system.toml", "");
+        write_file(
+            dir,
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+        );
     }
 
     #[test]
@@ -37,10 +41,6 @@ mod phase10 {
             r#"
 [site]
 domain = "example.com"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -58,10 +58,6 @@ sockets = "/run/m6/*.sock"
             r#"
 [site]
 name = "Test"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -78,19 +74,17 @@ sockets = "/run/m6/*.sock"
     #[test]
     fn validation_missing_bind_exits_2() {
         let dir = tempfile::tempdir().unwrap();
-        setup(
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        write_file(
             dir.path(),
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "site.toml",
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("bind"), "error should mention 'bind': {}", err);
@@ -103,20 +97,13 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "missing.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"missing.pem\"\ntls_key = \"key.pem\"\n",
+        );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
             err.contains("tls_cert"),
@@ -134,10 +121,6 @@ sockets = "/run/m6/*.sock"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -163,10 +146,6 @@ backend = "unknown"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -195,10 +174,6 @@ backend = "b"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -225,10 +200,6 @@ require = "group:editors"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [errors]
 mode = "custom"
 [[backend]]
@@ -249,25 +220,15 @@ sockets = "/run/m6/*.sock"
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "system.toml", "");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[auth]
-backend    = "b"
-public_key = "missing-key.pub"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n[auth]\nbackend = \"b\"\npublic_key = \"missing-key.pub\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -283,25 +244,15 @@ sockets = "/run/m6/*.sock"
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
         write_file(dir.path(), "auth.pub", "dummy-key");
-        write_file(dir.path(), "system.toml", "");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[auth]
-backend    = "missing-auth-backend"
-public_key = "auth.pub"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n\n[auth]\nbackend = \"missing-auth-backend\"\npublic_key = \"auth.pub\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -312,35 +263,19 @@ sockets = "/run/m6/*.sock"
     }
 
     #[test]
-    fn system_config_server_wins() {
+    fn bind_comes_from_the_system_config() {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
         );
         write_file(
             dir.path(),
             "system.toml",
-            r#"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-"#,
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
         );
         let cfg = m6_http_lib::config::load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.bind, "0.0.0.0:443");
@@ -596,17 +531,13 @@ mod config_load {
         // Write initial config
         std::fs::write(dir_path.join("cert.pem"), "dummy").unwrap();
         std::fs::write(dir_path.join("key.pem"), "dummy").unwrap();
-        std::fs::write(dir_path.join("system.toml"), "").unwrap();
+        std::fs::write(dir_path.join("system.toml"), "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n").unwrap();
         std::fs::write(
             dir_path.join("site.toml"),
             r#"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -629,10 +560,6 @@ backend = "b"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"

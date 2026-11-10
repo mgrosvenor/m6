@@ -657,6 +657,7 @@ fn a_head_on_an_unreadable_file_still_answers() {
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path();
     std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
 
     // Not a text type: no minification, no compression, so this is the shape
     // the fast path is for.
@@ -785,6 +786,7 @@ fn site_with_two_trees() -> tempfile::TempDir {
     std::fs::create_dir_all(site.path().join("files/deep")).unwrap();
     std::fs::write(site.path().join("assets/a.txt"), b"asset").unwrap();
     std::fs::write(site.path().join("files/deep/report.txt"), b"report").unwrap();
+    std::fs::write(site.path().join("site.toml"), "").unwrap();
     site
 }
 

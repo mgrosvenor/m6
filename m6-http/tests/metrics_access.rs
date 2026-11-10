@@ -104,9 +104,12 @@ fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
 /// The legacy bearer string every fixture writes to `metrics.token`.
 const LEGACY_TOKEN: &str = "legacy-secret-token-0123456789abcdef";
 
-/// `[auth]` with a verify key only, and a route that needs a role.
-const AUTH: &str = "[auth]\npublic_key = \"{KEY}\"\n\n\
-    [[route]]\npath = \"/private/{relpath}\"\nbackend = \"b\"\nrequire = \"role:monitor\"\n";
+/// `[auth]` with a verify key only.
+const AUTH: &str = "[auth]\npublic_key = \"{KEY}\"\n";
+
+/// A route that needs a role, which belongs in site.toml.
+const PRIVATE_ROUTE: &str =
+    "[[route]]\npath = \"/private/{relpath}\"\nbackend = \"b\"\nrequire = \"role:monitor\"\n";
 
 /// The metrics gate, for the listed peer 127.0.0.1.
 const GATE: &str =
@@ -597,7 +600,7 @@ fn h3_get(port: u16, path: &str, extra: &[(&str, &str)]) -> Result<Resp, String>
 /// 11.6.1), on every protocol.
 #[test]
 fn a_require_route_401_carries_www_authenticate() {
-    let run = Fixture::new(AUTH, "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", AUTH).start();
     for (proto, r) in run.all("/private/x", &[]) {
         assert_eq!(r.status, 401, "{proto}: {}", r.text());
         assert_eq!(r.header("www-authenticate"), Some("Bearer"), "{proto}");
@@ -612,7 +615,7 @@ fn a_require_route_401_carries_www_authenticate() {
 /// backend, which is a 502 or 503.
 #[test]
 fn a_require_route_is_enforced_with_a_verify_only_auth() {
-    let run = Fixture::new(AUTH, "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", AUTH).start();
     assert_eq!(run.h1("/private/x", &[]).status, 401);
     let token = run.token(&["monitor"]);
     let r = run.h1("/private/x", &[("Authorization", &bearer(&token))]);
@@ -627,11 +630,14 @@ fn a_require_route_is_enforced_with_a_verify_only_auth() {
 }
 
 #[test]
-fn auth_in_both_files_refuses_to_start() {
-    let fx = Fixture::new(AUTH, "", "[auth]\npublic_key = \"{KEY}\"\n");
+fn auth_in_site_toml_is_refused() {
+    let fx = Fixture::new("[auth]\npublic_key = \"{KEY}\"\n", "", "");
     let (code, output) = fx.run_until_exit();
     assert_eq!(code, Some(2), "output:\n{output}");
-    assert!(output.contains("declare it in one"), "output:\n{output}");
+    assert!(
+        output.contains("site.toml sets [auth]"),
+        "output:\n{output}"
+    );
 }
 
 // ── /perf and /traffic ────────────────────────────────────────────────────────
@@ -651,7 +657,7 @@ fn assert_report(proto: &str, r: &Resp) {
 
 #[test]
 fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     let auth = bearer(&run.token(&["monitor"]));
     for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
         assert_report(proto, &r);
@@ -660,8 +666,8 @@ fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
 
 #[test]
 fn an_unlisted_peer_gets_404_with_a_valid_token_over_h1_h2_h3() {
-    let site = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
-    let run = Fixture::new(&site, "", "").start();
+    let system = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
+    let run = Fixture::new(PRIVATE_ROUTE, "", &system).start();
     let auth = bearer(&run.token(&["monitor"]));
     for path in ["/perf", "/traffic"] {
         for (proto, r) in run.all(path, &[("Authorization", &auth)]) {
@@ -673,8 +679,8 @@ fn an_unlisted_peer_gets_404_with_a_valid_token_over_h1_h2_h3() {
 
 #[test]
 fn a_forwarded_address_naming_a_listed_peer_does_not_open_perf() {
-    let site = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
-    let run = Fixture::new(&site, "", "").start();
+    let system = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
+    let run = Fixture::new(PRIVATE_ROUTE, "", &system).start();
     let auth = bearer(&run.token(&["monitor"]));
     let r = run.h1(
         "/perf",
@@ -689,9 +695,9 @@ fn a_forwarded_address_naming_a_listed_peer_does_not_open_perf() {
 #[test]
 fn perf_is_refused_on_an_internal_h2c_listener() {
     let run = Fixture::new(
-        &gated(),
+        PRIVATE_ROUTE,
         "h2c_bind = \"{H2C}\"\ninternal_binds = [\"{H2C}\"]\ninternal_peers = [\"127.0.0.1\"]\n",
-        "",
+        &gated(),
     )
     .start();
     let auth = bearer(&run.token(&["monitor"]));
@@ -703,7 +709,7 @@ fn perf_is_refused_on_an_internal_h2c_listener() {
 
 #[test]
 fn perf_without_a_token_is_401_with_www_authenticate() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     for (proto, r) in run.all("/perf", &[]) {
         assert_eq!(r.status, 401, "{proto}: {}", r.text());
         assert_eq!(r.header("www-authenticate"), Some("Bearer"), "{proto}");
@@ -712,7 +718,7 @@ fn perf_without_a_token_is_401_with_www_authenticate() {
 
 #[test]
 fn perf_with_a_token_lacking_the_role_is_403() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     let auth = bearer(&run.token(&["reader"]));
     for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
         assert_eq!(r.status, 403, "{proto}: {}", r.text());
@@ -723,7 +729,7 @@ fn perf_with_a_token_lacking_the_role_is_403() {
 
 #[test]
 fn perf_with_another_keys_token_is_401() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     let auth = bearer(&run.foreign_token(&["monitor"]));
     for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
         assert_eq!(r.status, 401, "{proto}: {}", r.text());
@@ -732,24 +738,27 @@ fn perf_with_another_keys_token_is_401() {
 
 #[test]
 fn an_expired_token_is_401() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     let auth = bearer(&mint(&run.fx.private_pem, &["monitor"], -3600));
     let r = run.h1("/perf", &[("Authorization", &auth)]);
     assert_eq!(r.status, 401, "{}", r.text());
 }
 
 #[test]
-fn the_legacy_bearer_string_is_refused_once_metrics_require_is_set() {
-    let site = format!("{AUTH}\n{GATE}metrics_token_file = \"{{TOKEN}}\"\n");
-    let run = Fixture::new(&site, "", "").start();
-    let auth = bearer(LEGACY_TOKEN);
-    let r = run.h1("/perf", &[("Authorization", &auth)]);
-    assert_eq!(r.status, 401, "{}", r.text());
+fn metrics_token_file_with_metrics_require_is_refused() {
+    let system = format!("{AUTH}\n{GATE}metrics_token_file = \"{{TOKEN}}\"\n");
+    let fx = Fixture::new(PRIVATE_ROUTE, "", &system);
+    let (code, output) = fx.run_until_exit();
+    assert_eq!(code, Some(2), "output:\n{output}");
+    assert!(
+        output.contains("metrics_require replaces metrics_token_file"),
+        "output:\n{output}"
+    );
 }
 
 #[test]
 fn traffic_follows_the_same_rule() {
-    let run = Fixture::new(&gated(), "", "").start();
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
     let good = bearer(&run.token(&["monitor"]));
     let reader = bearer(&run.token(&["reader"]));
     for (want, extra) in [
@@ -765,8 +774,8 @@ fn traffic_follows_the_same_rule() {
 
 #[test]
 fn health_stays_open_to_an_unlisted_peer() {
-    let site = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
-    let run = Fixture::new(&site, "", "").start();
+    let system = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "10.0.0.9"));
+    let run = Fixture::new(PRIVATE_ROUTE, "", &system).start();
     for (proto, r) in run.all("/health", &[]) {
         // 200, or 503 when degraded: either way not 404 and not 401.
         assert!(r.status == 200 || r.status == 503, "{proto}: {}", r.status);
@@ -786,7 +795,7 @@ fn auth_and_health_keys_are_read_from_the_system_config() {
 
 #[test]
 fn without_new_keys_perf_behaves_as_before() {
-    let run = Fixture::new("[health]\nmetrics_token_file = \"{TOKEN}\"\n", "", "").start();
+    let run = Fixture::new("", "", "[health]\nmetrics_token_file = \"{TOKEN}\"\n").start();
     let right = bearer(LEGACY_TOKEN);
     assert_report("h1", &run.h1("/perf", &[("Authorization", &right)]));
     assert_eq!(
@@ -798,8 +807,8 @@ fn without_new_keys_perf_behaves_as_before() {
 
 #[test]
 fn a_public_metrics_peer_refuses_to_start() {
-    let site = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "203.0.113.7"));
-    let (code, output) = Fixture::new(&site, "", "").run_until_exit();
+    let system = format!("{AUTH}\n{}", GATE.replace("127.0.0.1", "203.0.113.7"));
+    let (code, output) = Fixture::new(PRIVATE_ROUTE, "", &system).run_until_exit();
     assert_eq!(code, Some(2), "output:\n{output}");
     assert!(output.contains("not in a local range"), "output:\n{output}");
 }

@@ -204,14 +204,12 @@ In that example, development and production differ in the bind address and the c
 
 The merge rules, in order:
 
-1. The system config loads after `site.toml`.
-2. Its `[server]` keys win on conflict, and so do its three `[health]` keys.
+1. Each key has one file, Table 1 in §3.3.
+2. A key in the other file, an unknown key or section in either file, or a system config with no `[node]` stops m6-http at start with exit 2, and the error names the key and the file it belongs in.
 3. A relative `[auth] public_key` in the system config resolves against the site directory, as `tls_cert` does.
 4. An absolute path is used as given.
-5. Any other top-level key in the system config is ignored with a warning, and any other `[health]` key there fails to parse.
-6. Validation runs after the merge.
-7. When both arguments name one file, its `[auth]` and `[health]` belong to the site config alone.
-8. A key read only at start keeps its running value, and the log names it and says to restart.
+5. Validation runs after both files are read.
+6. When both arguments name one file, every key is read from it, `[node]` included.
 
 The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file and `metrics_token_file` rules.
 
@@ -280,11 +278,9 @@ Take from it that App `[log]` is the one key with two homes, and every other key
 
 **Table 1: which file owns each key.**
 
-m6-http accepts most of these keys in either file, and the system config wins.
-A misplaced key works, so m6-http logs a warning at start naming the key and the file it belongs in.
-The warning is silent when both arguments name one file.
-A `[node]` in `site.toml` is never read, so it is warned about too.
-A system config with no `[node]` logs a warning that the node name falls back to `[site].name`.
+m6-http reads each key from its file only.
+A key in the other file stops the start with exit 2, and the error names the key and the file it belongs in.
+The check does not run when both arguments name one file.
 A secrets file is part of its process config.
 
 ### 3.4. Where an app finds `site.toml`
@@ -299,8 +295,7 @@ An app with its own root under `apps/` sets `site_toml` to reach the file at the
 site_toml = "../../site.toml"
 ```
 
-A named file that does not exist, cannot be read or is not valid TOML stops the app at start with exit 2.
-A file at the default path may be absent or invalid, as before.
+A file that does not exist, cannot be read or is not valid TOML stops the app at start with exit 2, whether the key names it or it is the default `<site_dir>/site.toml`.
 `--dump-config` prints the resolved path on a `site.toml` line.
 
 ### 3.5. `site.toml` is clean
@@ -341,7 +336,7 @@ Only the h2c listener can be internal, so an entry that equals `bind` is refused
 Every entry must be in a local range, which means loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local.
 Host names are never resolved and a wildcard address such as `0.0.0.0` is refused.
 The list is read at startup, so a change needs a restart.
-The system config wins, and its list replaces the one in `site.toml` as a whole.
+The list is read from the system config only.
 A redirect-mode config ignores the key.
 
 An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
@@ -357,7 +352,7 @@ A new address past that takes the place of the remembered address whose last lin
 When no remembered address qualifies, refusals from the new address are counted.
 Across all addresses it writes at most 32 of those lines in 60 seconds, and refusals past that limit are counted.
 The first refusal after the 60 seconds ends writes one summary line with the counts, the number of distinct counted addresses (up to 1024) and the most recent counted address.
-The list is read at startup, and the system config's list replaces the one in `site.toml` as a whole.
+The list is read at startup, from the system config only.
 
 ```toml
 [server]
@@ -421,7 +416,7 @@ Error responses are never cached regardless of mode.
 | `backend` | string | no | Name of a declared `[[backend]]`. Checked when given. Verification does not use it |
 | `public_key` | string | yes | Path to m6-auth's public key for local JWT verification |
 
-`[auth]` may sit in `site.toml` or in the system config, never both.
+`[auth]` sits in the system config only.
 A config that only verifies tokens needs `public_key` alone.
 
 ### 4.6. `[health]`
@@ -435,11 +430,11 @@ The monitoring endpoints, answered inside m6-http ahead of routing, the cache an
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | Summary of the last hour of the analytics log |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_token_file` | string | none | The legacy gate. Path to a file holding a bearer string. May also sit in the system config, where it wins and a relative path resolves against the site directory. In `site.toml` a relative path resolves against the working directory, so use an absolute path. Ignored when `metrics_require` is set |
-| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
-| `metrics_peers` | list of strings | none | IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
+| `metrics_token_file` | string | none | System config only. The legacy gate. A file holding a bearer string. A file that is missing or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
+| `metrics_require` | string | none | System config only. `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`. It comes from the Authorization header or the session cookie, as route `require` reads it |
+| `metrics_peers` | list of strings | none | System config only. IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
-The system config accepts `metrics_require` and `metrics_peers` only.
+The system config accepts `metrics_require`, `metrics_peers` and `metrics_token_file` only.
 
 **Who may read `/perf` and `/traffic`.**
 A request is served only when both rules pass, checked in this order.
@@ -577,7 +572,12 @@ Exit 2 on:
 - `[log] level` unrecognised
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared with a `backend` that is not declared in `[[backend]]`
-- `[auth]` declared in both `site.toml` and the system config
+- `[auth]` in `site.toml` (it belongs in the system config)
+- A key in the file it does not belong to, or a key or section m6-http does not know
+- A system config with no `[node]`
+- `metrics_token_file` missing, empty, or set together with `metrics_require`
+- `--log-level` unrecognised
+- `cache` on a `[[route]]` or `[[route_group]]`
 - `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
 - `[health] metrics_peers` entry that is not in a local range
 - `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`
