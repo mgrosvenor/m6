@@ -1,6 +1,5 @@
 /// HTTP/1.1 request forwarding: the request bytes a backend receives, and the
-/// blocking response reader the URL-backend path uses until EL-5b moves it onto
-/// `client::Upstream`.
+/// blocking response reader its tests pin against `client::Upstream`'s framing.
 use std::io::{self, Read};
 
 pub use m6_core::client::too_many_informational;
@@ -463,11 +462,43 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
 /// Build the exact HTTP/1.1 request bytes a socket backend receives, refusing
 /// (before any connection) a request that cannot be serialised safely. Writes
 /// into `buf` (already cleared), so the caller can point it at a reused buffer.
+///
+/// The connection closes after one request, so the bytes ask the backend to
+/// close it.
 pub fn encode_request(
     buf: &mut Vec<u8>,
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
+) -> io::Result<()> {
+    encode_forwarded(buf, req, client_ip, original_host, None, false)
+}
+
+/// Build the request bytes a URL backend receives, on a connection kept open
+/// for the next request.
+///
+/// `host` is the backend's own authority and replaces any `Host` the client
+/// sent: the backend is the origin of this hop, so its own name is what it must
+/// see.
+pub fn encode_url_request(
+    buf: &mut Vec<u8>,
+    req: &HttpRequest,
+    host: &str,
+    client_ip: &str,
+    original_host: &str,
+) -> io::Result<()> {
+    encode_forwarded(buf, req, client_ip, original_host, Some(host), true)
+}
+
+/// The one serializer for both. `host_override` replaces the client's `Host`,
+/// and `keep_alive` decides the connection header.
+fn encode_forwarded(
+    buf: &mut Vec<u8>,
+    req: &HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+    host_override: Option<&str>,
+    keep_alive: bool,
 ) -> io::Result<()> {
     // Before the connection, not after: a request that cannot be safely
     // serialised must never reach a backend socket at all.
@@ -492,6 +523,15 @@ pub fn encode_request(
     }
     buf.extend_from_slice(b" HTTP/1.1\r\n");
 
+    // A URL backend is addressed by its own authority, and its virtual host is
+    // chosen by that name. A socket backend sits behind the site's name, so it
+    // receives the client's.
+    if let Some(host) = host_override {
+        buf.extend_from_slice(b"Host: ");
+        buf.extend_from_slice(host.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+
     // Forward headers, excluding hop-by-hop, anything the proxy owns, and
     // anything the client nominated in `Connection` (RFC 9110 7.6.1).
     let nominated = connection_nominated(&req.headers);
@@ -504,6 +544,9 @@ pub fn encode_request(
         if skip_when_forwarding(name) || nominated.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
         }
+        if host_override.is_some() && name.eq_ignore_ascii_case("host") {
+            continue; // replaced above
+        }
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(b": ");
         buf.extend_from_slice(value.as_bytes());
@@ -512,7 +555,9 @@ pub fn encode_request(
     buf.extend_from_slice(b"Via: ");
     buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
     buf.extend_from_slice(b"\r\n");
-    write_host_if_absent(buf, req, original_host);
+    if host_override.is_none() {
+        write_host_if_absent(buf, req, original_host);
+    }
 
     // Add proxy headers
     buf.extend_from_slice(b"X-Forwarded-For: ");
@@ -521,7 +566,7 @@ pub fn encode_request(
     buf.extend_from_slice(original_host.as_bytes());
     buf.extend_from_slice(b"\r\n");
 
-    // Content-Length for body — write decimal without allocating.
+    // Content-Length for body: write decimal without allocating.
     if !req.body.is_empty() {
         buf.extend_from_slice(b"Content-Length: ");
         let mut cl_buf = [0u8; 20];
@@ -529,8 +574,14 @@ pub fn encode_request(
         buf.extend_from_slice(b"\r\n");
     }
 
-    // Connection: close for HTTP/1.1 since we're doing per-request connections
-    buf.extend_from_slice(b"Connection: close\r\n\r\n");
+    // A socket backend serves one request per connection. A URL backend may
+    // keep the connection for the next one, and the reply's own framing decides
+    // whether it really does.
+    buf.extend_from_slice(if keep_alive {
+        b"Connection: keep-alive\r\n\r\n"
+    } else {
+        b"Connection: close\r\n\r\n"
+    });
 
     // Write body
     if !req.body.is_empty() {
@@ -972,88 +1023,6 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
     })
 }
 
-/// Forward a request to a URL backend over HTTP/1.1.
-///
-/// `base_url` must be `https://example.com[:port]` (HTTP/1.1 over TLS) or
-/// `http://example.com[:port]` (HTTP/1.1 plain).
-///
-/// `h2c://` and `h2s://` backends are dispatched via their respective
-/// persistent client pools (`H2cClientPool` / `H2sTlsClientPool`) and must
-/// NOT be passed to this function.
-///
-/// `tls_config` is a pre-built rustls ClientConfig (built once at startup by
-/// PoolManager — avoids expensive per-request native cert loading).
-///
-/// URL backends are not pooled — a new TCP connection is opened for every
-/// request. The `timeout` (if given) is applied as both read and write
-/// timeout on the underlying TCP stream.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "URL backend thread per request; removed by EL-5b"
-)]
-pub fn forward_url_request(
-    base_url: &str,
-    req: &HttpRequest,
-    client_ip: &str,
-    original_host: &str,
-    timeout: Option<std::time::Duration>,
-    tls_config: std::sync::Arc<rustls::ClientConfig>,
-) -> io::Result<HttpResponse> {
-    // Same gate as the unix-socket path. Checked here rather than only inside
-    // `build_forwarded_request_bytes` so the refusal happens before a TCP
-    // connection is opened to the upstream.
-    if let Err(what) = check_forwardable(req, client_ip, original_host) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            Refused(format!(
-                "refusing to forward: unsafe {what} would inject HTTP/1.1 framing"
-            )),
-        ));
-    }
-
-    // ── Parse URL ────────────────────────────────────────────────────────────
-    let (scheme, authority) = parse_url_scheme_authority(base_url)?;
-    let (host, port) = split_host_port(
-        &authority,
-        match scheme.as_str() {
-            "https" => 443,
-            _ => 80, // http and h2c both default to 80
-        },
-    )?;
-
-    // ── TCP connect ──────────────────────────────────────────────────────────
-    use std::net::TcpStream;
-    let addr = format!("{}:{}", host, port);
-    let tcp = TcpStream::connect(&addr)?;
-    if let Some(dur) = timeout {
-        tcp.set_read_timeout(Some(dur))?;
-        tcp.set_write_timeout(Some(dur))?;
-    }
-
-    // ── Send + receive ───────────────────────────────────────────────────────
-    if scheme == "https" {
-        let req_bytes = build_forwarded_request_bytes(req, &host, client_ip, original_host);
-        forward_over_tls(tcp, &host, req_bytes, tls_config, &req.method)
-    } else if scheme == "h2c" {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "h2c:// backends must be dispatched via H2cClientPool, not forward_url_request",
-        ))
-    } else if scheme == "h2s" {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "h2s:// backends must be dispatched via H2sTlsClientPool, not forward_url_request",
-        ))
-    } else {
-        use std::io::Write;
-        let req_bytes = build_forwarded_request_bytes(req, &host, client_ip, original_host);
-        let mut stream = tcp;
-        stream.write_all(&req_bytes)?;
-        stream.flush()?;
-        read_response_for(stream, &req.method)
-    }
-}
-
 /// Which backend kind a pending request is waiting on. The event loop finishes
 /// a socket reply with the socket branch's own semantics and a URL reply with
 /// the URL branch's, so the two never share a completion path.
@@ -1068,14 +1037,13 @@ pub enum PendingKind {
 /// the upstream finishes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UpstreamId {
-    /// A socket upstream, by its `socket_upstreams` slot key.
-    Socket(usize),
+    /// An upstream in the shared table, by its slot key. A socket-backend
+    /// request and a URL-backend request both live there.
+    Slot(usize),
     /// An h2c pool stream, by the connection token and the outbound stream id.
     H2c { conn: Token, stream: u32 },
     /// An h2s pool stream, by the connection token and the outbound stream id.
     H2s { conn: Token, stream: u32 },
-    /// A URL backend running on its own thread, by its pending-list index.
-    Url(usize),
 }
 
 /// Who is waiting for an upstream reply, so a completion can be written
@@ -1112,10 +1080,10 @@ pub struct PendingDispatch {
     pub ctx: Box<PendingUrlContext>,
 }
 
-/// Context carried alongside a pending backend receiver so the event loop can
+/// Context carried alongside a pending backend request so the event loop can
 /// finish processing (cache insertion, hints, error-mode) when the reply
-/// arrives, whether that reply came from a URL-backend thread or a socket
-/// upstream the loop drove. All fields are cheaply cloneable.
+/// arrives, whether the upstream is a socket member or a URL backend. All
+/// fields are cheaply cloneable.
 #[derive(Clone)]
 pub struct PendingUrlContext {
     pub req: HttpRequest,
@@ -1150,185 +1118,6 @@ pub struct PendingUrlContext {
     /// `WWW-Authenticate` for a 401 or `Retry-After` for a 503. Empty for every
     /// ordinary dispatch.
     pub extra_headers: Vec<(String, String)>,
-}
-
-/// Dispatch a URL-backend request to a dedicated I/O thread.
-///
-/// Returns a one-shot channel.  The caller MUST poll with `try_recv()` inside
-/// the event loop — never block waiting on the receiver.
-pub fn dispatch_url_request(
-    base_url: String,
-    req: HttpRequest,
-    client_ip: String,
-    original_host: String,
-    timeout: Option<std::time::Duration>,
-    tls_config: std::sync::Arc<rustls::ClientConfig>,
-) -> std::sync::mpsc::Receiver<std::io::Result<HttpResponse>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "URL backend thread per request; removed by EL-5b"
-    )]
-    std::thread::spawn(move || {
-        let _ = tx.send(forward_url_request(
-            &base_url,
-            &req,
-            &client_ip,
-            &original_host,
-            timeout,
-            tls_config,
-        ));
-    });
-    rx
-}
-
-/// Build a forwarded HTTP/1.1 request byte buffer (no TLS framing).
-/// Serialise an HTTP/1.1 request for an upstream.
-///
-/// **Invariant: every caller must have run `check_forwardable` first.** This
-/// writes header names and values into CRLF-delimited syntax verbatim, so an
-/// unchecked CR or LF here is request smuggling (F036/F094). It cannot do the
-/// check itself because it returns bytes rather than a Result, and making it
-/// fallible would push the failure past the point where a connection has
-/// already been opened. Both current callers gate at the top of
-/// `forward_url_request`.
-fn build_forwarded_request_bytes(
-    req: &HttpRequest,
-    host: &str,
-    client_ip: &str,
-    original_host: &str,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4096);
-
-    buf.extend_from_slice(req.method.as_bytes());
-    buf.push(b' ');
-    buf.extend_from_slice(req.path.as_bytes());
-    if let Some(ref q) = req.query {
-        if !q.is_empty() {
-            buf.push(b'?');
-            buf.extend_from_slice(q.as_bytes());
-        }
-    }
-    buf.extend_from_slice(b" HTTP/1.1\r\n");
-
-    // Host header
-    buf.extend_from_slice(b"Host: ");
-    buf.extend_from_slice(host.as_bytes());
-    buf.extend_from_slice(b"\r\n");
-
-    // Forward original headers (minus hop-by-hop, proxy-owned, Host, and
-    // anything the client nominated in `Connection` -- RFC 9110 7.6.1).
-    let nominated = connection_nominated(&req.headers);
-    let mut existing_via: Option<&str> = None;
-    for (name, value) in &req.headers {
-        if name.eq_ignore_ascii_case("via") {
-            existing_via = Some(value.as_str());
-            continue;
-        }
-        if skip_when_forwarding(name) || nominated.iter().any(|n| name.eq_ignore_ascii_case(n)) {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("host") {
-            continue; // already written above
-        }
-        buf.extend_from_slice(name.as_bytes());
-        buf.extend_from_slice(b": ");
-        buf.extend_from_slice(value.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-    }
-    buf.extend_from_slice(b"Via: ");
-    buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
-    buf.extend_from_slice(b"\r\n");
-    write_host_if_absent(&mut buf, req, original_host);
-
-    // Proxy headers
-    buf.extend_from_slice(b"X-Forwarded-For: ");
-    buf.extend_from_slice(client_ip.as_bytes());
-    buf.extend_from_slice(b"\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: ");
-    buf.extend_from_slice(original_host.as_bytes());
-    buf.extend_from_slice(b"\r\n");
-
-    // Content-Length
-    if !req.body.is_empty() {
-        buf.extend_from_slice(b"Content-Length: ");
-        let mut cl_buf = [0u8; 20];
-        buf.extend_from_slice(write_decimal(req.body.len(), &mut cl_buf));
-        buf.extend_from_slice(b"\r\n");
-    }
-
-    buf.extend_from_slice(b"Connection: close\r\n\r\n");
-
-    if !req.body.is_empty() {
-        buf.extend_from_slice(&req.body);
-    }
-
-    buf
-}
-
-/// Parse `scheme://authority` from a URL string.
-fn parse_url_scheme_authority(url: &str) -> io::Result<(String, String)> {
-    let sep = "://";
-    let idx = url.find(sep).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL: {}", url))
-    })?;
-    let scheme = url[..idx].to_lowercase();
-    let rest = &url[idx + sep.len()..];
-    // Authority ends at the first `/`, `?`, or `#`
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = rest[..auth_end].to_string();
-    Ok((scheme, authority))
-}
-
-/// Split `host:port` or `[ipv6]:port` into (host, port).
-fn split_host_port(authority: &str, default_port: u16) -> io::Result<(String, u16)> {
-    // IPv6: `[::1]:8443`
-    if let Some(bracket_end) = authority.find(']') {
-        let host = authority[1..bracket_end].to_string();
-        let port =
-            if bracket_end + 1 < authority.len() && authority.as_bytes()[bracket_end + 1] == b':' {
-                authority[bracket_end + 2..].parse::<u16>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid port in URL")
-                })?
-            } else {
-                default_port
-            };
-        return Ok((host, port));
-    }
-    if let Some(colon) = authority.rfind(':') {
-        if let Ok(p) = authority[colon + 1..].parse::<u16>() {
-            return Ok((authority[..colon].to_string(), p));
-        }
-    }
-    Ok((authority.to_string(), default_port))
-}
-
-/// Send `req_bytes` over a TLS-wrapped TCP stream to `host` and read back the response.
-/// `tls_config` is the pre-built ClientConfig from PoolManager (avoids per-request cert loading).
-fn forward_over_tls(
-    tcp: std::net::TcpStream,
-    host: &str,
-    req_bytes: Vec<u8>,
-    tls_config: std::sync::Arc<rustls::ClientConfig>,
-    request_method: &str,
-) -> io::Result<HttpResponse> {
-    use rustls::ClientConnection;
-    use rustls::StreamOwned;
-    use std::io::Write;
-
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid server name: {}", host),
-        )
-    })?;
-
-    let conn = ClientConnection::new(tls_config, server_name)
-        .map_err(|e| io::Error::other(format!("TLS init error: {}", e)))?;
-
-    let mut tls_stream = StreamOwned::new(conn, tcp);
-    tls_stream.write_all(&req_bytes)?;
-    tls_stream.flush()?;
-    read_response_for(tls_stream, request_method)
 }
 
 /// Build a simple HTTP response buffer (kept for tests).
@@ -1387,90 +1176,57 @@ mod tests {
         assert!(s.ends_with("hello"));
     }
 
-    // ── URL forwarding helpers ────────────────────────────────────────────────
+    // ── The forwarded request bytes ───────────────────────────────────────────
 
-    #[test]
-    fn test_parse_url_scheme_authority_https() {
-        let (scheme, authority) = parse_url_scheme_authority("https://api.example.com").unwrap();
-        assert_eq!(scheme, "https");
-        assert_eq!(authority, "api.example.com");
-    }
-
-    #[test]
-    fn test_parse_url_scheme_authority_with_path() {
-        let (scheme, authority) =
-            parse_url_scheme_authority("https://api.example.com/v1/foo").unwrap();
-        assert_eq!(scheme, "https");
-        assert_eq!(authority, "api.example.com");
-    }
-
-    #[test]
-    fn test_parse_url_scheme_authority_with_port() {
-        let (scheme, authority) =
-            parse_url_scheme_authority("https://api.example.com:8443/v1").unwrap();
-        assert_eq!(scheme, "https");
-        assert_eq!(authority, "api.example.com:8443");
-    }
-
-    #[test]
-    fn test_parse_url_invalid_no_scheme() {
-        assert!(parse_url_scheme_authority("api.example.com").is_err());
-    }
-
-    #[test]
-    fn test_split_host_port_default() {
-        let (host, port) = split_host_port("api.example.com", 443).unwrap();
-        assert_eq!(host, "api.example.com");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn test_split_host_port_explicit() {
-        let (host, port) = split_host_port("api.example.com:8443", 443).unwrap();
-        assert_eq!(host, "api.example.com");
-        assert_eq!(port, 8443);
-    }
-
-    #[test]
-    fn test_split_host_port_ipv6() {
-        let (host, port) = split_host_port("[::1]:9000", 443).unwrap();
-        assert_eq!(host, "::1");
-        assert_eq!(port, 9000);
-    }
-
-    #[test]
-    fn test_split_host_port_ipv6_default() {
-        let (host, port) = split_host_port("[::1]", 443).unwrap();
-        assert_eq!(host, "::1");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn test_build_forwarded_request_bytes_basic() {
-        let req = HttpRequest {
+    fn upstream_req() -> HttpRequest {
+        HttpRequest {
             method: "GET".to_string(),
             path: "/api/test".to_string(),
             query: Some("key=value".to_string()),
             version: "HTTP/3".to_string(),
             headers: vec![
                 ("accept".to_string(), "application/json".to_string()),
-                ("connection".to_string(), "keep-alive".to_string()), // hop-by-hop, should be stripped
+                ("connection".to_string(), "keep-alive".to_string()),
             ],
             body: vec![],
-        };
-        let bytes =
-            build_forwarded_request_bytes(&req, "api.example.com", "1.2.3.4", "original.host");
+        }
+    }
+
+    #[test]
+    fn a_forwarded_request_carries_the_proxy_headers_and_no_hop_by_hop_field() {
+        let req = upstream_req();
+        let mut bytes = Vec::new();
+        encode_request(&mut bytes, &req, "1.2.3.4", "original.host").expect("encode");
         let s = std::str::from_utf8(&bytes).unwrap();
 
         assert!(s.starts_with("GET /api/test?key=value HTTP/1.1\r\n"));
-        assert!(s.contains("Host: api.example.com\r\n"));
+        assert!(s.contains("Host: original.host\r\n"));
         assert!(s.contains("accept: application/json\r\n"));
         // hop-by-hop 'connection' must not appear
         assert!(!s.contains("connection: keep-alive"));
         assert!(s.contains("X-Forwarded-For: 1.2.3.4\r\n"));
         assert!(s.contains("X-Forwarded-Host: original.host\r\n"));
-        // Connection: close must be present
         assert!(s.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn a_url_backend_request_names_the_backend_and_asks_to_keep_the_connection() {
+        let req = upstream_req();
+        let mut bytes = Vec::new();
+        encode_url_request(
+            &mut bytes,
+            &req,
+            "api.example.com",
+            "1.2.3.4",
+            "original.host",
+        )
+        .expect("encode");
+        let s = std::str::from_utf8(&bytes).unwrap();
+
+        assert!(s.contains("Host: api.example.com\r\n"), "{s}");
+        assert!(!s.contains("Host: original.host\r\n"), "{s}");
+        assert!(s.contains("Connection: keep-alive\r\n"), "{s}");
+        assert!(!s.contains("Connection: close\r\n"), "{s}");
     }
 }
 
@@ -1645,13 +1401,10 @@ mod via_and_connection_tests {
     }
 
     fn serialised(r: &HttpRequest) -> String {
-        String::from_utf8_lossy(&build_forwarded_request_bytes(
-            r,
-            "backend.internal",
-            "1.2.3.4",
-            "example.com",
-        ))
-        .into_owned()
+        let mut bytes = Vec::new();
+        encode_url_request(&mut bytes, r, "backend.internal", "1.2.3.4", "example.com")
+            .expect("encode");
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn header_values(raw: &str, name: &str) -> Vec<String> {
@@ -1878,8 +1631,8 @@ mod read_response_tests {
         format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}").into_bytes()
     }
 
-    /// The blocking reader's chunked decoder must agree with the incremental
-    /// one, so the URL-backend path (until EL-5b) stays exercised.
+    /// The blocking reader's chunked decoder and `client::Upstream`'s
+    /// incremental one must agree; this pins the blocking side.
     #[test]
     fn well_formed_chunked_bodies_decode() {
         for (body, want) in [

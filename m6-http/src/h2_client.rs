@@ -8,13 +8,16 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::forward::{
     apply_response_block, too_many_informational, HttpRequest, HttpResponse, PendingUrlContext,
     ResponseBlock, Waiter, HOP_BY_HOP,
 };
+use m6_core::client::TlsClient;
+use m6_core::event::Timeouts;
 use m6_core::mio::{Interest, Registry, Token};
 
 // ── Frame constants ───────────────────────────────────────────────────────────
@@ -39,15 +42,26 @@ const DEFAULT_MAX_FRAME: u32 = 16_384;
 
 /// The bits that differ between the cleartext and TLS transports.
 ///
-/// `connect()` performs the transport setup and the synchronous HTTP/2
-/// handshake (client preface + SETTINGS). The rest are the I/O operations the
-/// shared frame loop needs, plus the per-transport constants.
+/// `connect()` begins a non-blocking connect to a resolved address and returns
+/// at once. The client drives the connect, and the TLS handshake for `h2s`,
+/// from [`H2Client::drive`]: the first writable event finishes the connect, and
+/// for TLS the handshake follows on the same descriptor. The rest are the I/O
+/// operations the shared frame loop needs, plus the per-transport constants.
 pub trait Transport: Sized {
-    /// Establish the transport and send the client preface + SETTINGS.
-    fn connect(host: &str, port: u16, tls: Option<Arc<rustls::ClientConfig>>) -> io::Result<Self>;
+    /// Begin a non-blocking connect to `addr`. Never waits.
+    fn connect(addr: SocketAddr, tls: Option<&TlsClient>) -> io::Result<Self>;
 
     /// The raw file descriptor, for the poll.
     fn raw_fd(&self) -> RawFd;
+
+    /// The pending socket error of an in-progress connect, if any.
+    fn take_error(&self) -> io::Result<Option<io::Error>>;
+
+    /// Whether the TLS handshake is still in progress. False for cleartext.
+    fn is_handshaking(&self) -> bool;
+
+    /// The negotiated ALPN protocol, when the transport is TLS.
+    fn alpn_protocol(&self) -> Option<&[u8]>;
 
     /// The `:scheme` value for dispatched requests.
     fn scheme() -> &'static [u8];
@@ -94,6 +108,9 @@ struct H2Stream {
     // RFC 9113 6.9.2: the per-stream send window starts at the peer's
     // SETTINGS_INITIAL_WINDOW_SIZE, not at the 65 535 connection default.
     send_window: i32,
+    /// This stream's slot in the pool's stream deadlines, or `usize::MAX` when
+    /// no pool owns it. The pool clears it when the stream completes.
+    deadline_slot: usize,
 }
 
 /// One stream's finished reply, pushed onto the pool's completion list for the
@@ -103,6 +120,9 @@ pub struct H2Completion {
     pub result: io::Result<HttpResponse>,
     pub waiter: Option<Waiter>,
     pub ctx: Option<Box<PendingUrlContext>>,
+    /// The pool's deadline slot for this stream, cleared when the completion is
+    /// taken.
+    pub(crate) deadline_slot: usize,
 }
 
 // ── H2Client (public) ─────────────────────────────────────────────────────────
@@ -120,6 +140,9 @@ pub struct H2Client<T: Transport> {
     conn_send_window: i32,
     peer_initial_window: i32,
     peer_max_frame: u32,
+    /// Where this connection is in its own start-up. Request frames go into
+    /// `send_buf` while it is not open, and flush when it is.
+    phase: Phase,
     pub is_dead: bool,
     /// The `mio` token this connection's descriptor is registered under.
     token: Token,
@@ -130,8 +153,19 @@ pub struct H2Client<T: Transport> {
     completions: Vec<H2Completion>,
 }
 
+/// Where a connection is in its own start-up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// The non-blocking TCP connect is in progress.
+    Connecting,
+    /// The TLS handshake is in progress.
+    Handshaking,
+    /// Requests may be written and replies read.
+    Open,
+}
+
 impl<T: Transport> H2Client<T> {
-    /// Build a client around an already-connected transport.
+    /// Build a client around an already-open transport.
     pub(crate) fn new(transport: T) -> Self {
         Self {
             transport,
@@ -146,6 +180,7 @@ impl<T: Transport> H2Client<T> {
             conn_send_window: DEFAULT_WINDOW,
             peer_initial_window: DEFAULT_WINDOW,
             peer_max_frame: DEFAULT_MAX_FRAME,
+            phase: Phase::Open,
             is_dead: false,
             token: Token(usize::MAX),
             registered_interest: Interest::READABLE,
@@ -153,13 +188,122 @@ impl<T: Transport> H2Client<T> {
         }
     }
 
-    /// Connect via the transport and build the client around it.
-    pub(crate) fn connect(
-        host: &str,
-        port: u16,
-        tls: Option<Arc<rustls::ClientConfig>>,
-    ) -> io::Result<Self> {
-        Ok(Self::new(T::connect(host, port, tls)?))
+    /// Begin a non-blocking connect and queue the client preface and SETTINGS
+    /// behind it. The connection is not usable until `drive` reports it open,
+    /// so a caller that must not wait sends its request now and lets the loop
+    /// flush it when the connect finishes.
+    pub(crate) fn connect(addr: SocketAddr, tls: Option<&TlsClient>) -> io::Result<Self> {
+        let mut client = Self::new(T::connect(addr, tls)?);
+        client.phase = Phase::Connecting;
+        client.send_buf.extend_from_slice(&client_init_frame());
+        Ok(client)
+    }
+
+    /// The interest to register while the connection is still starting: a
+    /// connect finishes on writability, and the TLS handshake needs both.
+    pub fn phase_interest(&self) -> Interest {
+        match self.phase {
+            Phase::Connecting => Interest::WRITABLE,
+            Phase::Handshaking => Interest::READABLE | Interest::WRITABLE,
+            Phase::Open => self.interest(),
+        }
+    }
+
+    /// Whether the connection is open for requests.
+    pub fn is_open(&self) -> bool {
+        self.phase == Phase::Open && !self.is_dead
+    }
+
+    /// Wait for this connection to open.
+    ///
+    /// Tests and benchmarks only. A service never waits: it registers the
+    /// descriptor and calls `drive` when its loop reports it ready. The client
+    /// convenience constructors use this so their callers keep the blocking
+    /// contract they were written against.
+    pub(crate) fn wait_until_open(&mut self) -> io::Result<()> {
+        let mut poll = m6_core::mio::Poll::new()?;
+        poll.registry().register(
+            &mut m6_core::mio::unix::SourceFd(&self.raw_fd()),
+            Token(0),
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
+        let mut events = m6_core::mio::Events::with_capacity(8);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.drive();
+            if self.is_open() {
+                return Ok(());
+            }
+            if self.is_dead {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("{}: connection failed", T::prefix()),
+                ));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{}: connect did not open", T::prefix()),
+                ));
+            }
+            poll.poll(&mut events, Some(left))?;
+            events.clear();
+        }
+    }
+
+    /// Finish the connect, and then the TLS handshake, as far as the descriptor
+    /// allows. False when the connection died.
+    fn start_progress(&mut self) -> bool {
+        match self.phase {
+            Phase::Connecting => {
+                match self.transport.take_error() {
+                    Ok(None) => {}
+                    Ok(Some(e)) => {
+                        self.mark_dead(&format!("{}: connect: {e}", T::prefix()));
+                        return false;
+                    }
+                    Err(e) => {
+                        self.mark_dead(&format!("{}: connect: {e}", T::prefix()));
+                        return false;
+                    }
+                }
+                self.phase = if self.transport.is_handshaking() {
+                    Phase::Handshaking
+                } else {
+                    Phase::Open
+                };
+                true
+            }
+            Phase::Handshaking => {
+                if let Err(reason) = self.transport.flush_send(&mut self.send_buf) {
+                    self.mark_dead(&reason);
+                    return false;
+                }
+                if let Some(reason) = self.transport.fill_recv(&mut self.recv_buf) {
+                    self.mark_dead(&reason);
+                    return false;
+                }
+                if self.transport.is_handshaking() {
+                    return false;
+                }
+                if self.transport.alpn_protocol() != Some(b"h2".as_slice()) {
+                    let got = self
+                        .transport
+                        .alpn_protocol()
+                        .map(|p| String::from_utf8_lossy(p).into_owned())
+                        .unwrap_or_else(|| "none".to_string());
+                    self.mark_dead(&format!(
+                        "{}: server did not negotiate h2 (got: {got})",
+                        T::prefix()
+                    ));
+                    return false;
+                }
+                self.phase = Phase::Open;
+                true
+            }
+            Phase::Open => true,
+        }
     }
 
     /// Return the raw file descriptor for this connection.
@@ -284,6 +428,7 @@ impl<T: Transport> H2Client<T> {
                 },
                 body_off: 0,
                 send_window: self.peer_initial_window,
+                deadline_slot: usize::MAX,
             },
         );
 
@@ -390,6 +535,9 @@ impl<T: Transport> H2Client<T> {
     /// Must be called on every event-loop iteration.
     pub fn drive(&mut self) {
         if self.is_dead {
+            return;
+        }
+        if self.phase != Phase::Open && !self.start_progress() {
             return;
         }
 
@@ -599,6 +747,7 @@ impl<T: Transport> H2Client<T> {
                             )),
                             waiter: s.waiter,
                             ctx: s.ctx,
+                            deadline_slot: s.deadline_slot,
                         });
                     }
                 }
@@ -753,6 +902,7 @@ impl<T: Transport> H2Client<T> {
                         result: Err(too_many_informational()),
                         waiter: s.waiter,
                         ctx: s.ctx,
+                        deadline_slot: s.deadline_slot,
                     });
                 }
                 self.push_frame(TYPE_RST_STREAM, 0, stream_id, &8u32.to_be_bytes());
@@ -795,8 +945,31 @@ impl<T: Transport> H2Client<T> {
                 result,
                 waiter: s.waiter,
                 ctx: s.ctx,
+                deadline_slot: s.deadline_slot,
             });
         }
+    }
+
+    /// Fail one stream because its deadline passed: tell the peer to cancel it,
+    /// remove it, and hand its completion to the caller.
+    fn time_out_stream(&mut self, stream_id: u32) -> Option<H2Completion> {
+        let s = self.streams.remove(&stream_id)?;
+        self.push_frame(
+            TYPE_RST_STREAM,
+            0,
+            stream_id,
+            &8u32.to_be_bytes(), // CANCEL
+        );
+        Some(H2Completion {
+            stream_id,
+            result: Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{}: upstream stream timed out", T::prefix()),
+            )),
+            waiter: s.waiter,
+            ctx: s.ctx,
+            deadline_slot: s.deadline_slot,
+        })
     }
 
     /// Mark the connection as dead and drain all pending streams with an error.
@@ -812,6 +985,7 @@ impl<T: Transport> H2Client<T> {
                 )),
                 waiter: s.waiter,
                 ctx: s.ctx,
+                deadline_slot: s.deadline_slot,
             });
         }
     }
@@ -829,36 +1003,42 @@ pub struct Pool<T: Transport> {
     connections: HashMap<String, H2Client<T>>,
     /// Streams finished since the last drain, for the loop's owner to complete.
     completions: Vec<H2Completion>,
-}
-
-impl<T: Transport> Default for Pool<T> {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// One deadline per in-flight stream. A stream id cannot index this: it
+    /// grows past 2^31, so each stream takes a slot from a fixed table when it
+    /// is dispatched and gives it back when it completes.
+    stream_deadlines: Timeouts,
+    /// The connection token and stream id that own each deadline slot.
+    deadline_owner: Vec<Option<(Token, u32)>>,
+    free_deadline_slots: Vec<usize>,
 }
 
 impl<T: Transport> Pool<T> {
-    pub fn new() -> Self {
+    /// `stream_timeout` is the backend deadline every stream is given.
+    pub fn new(stream_timeout: Duration) -> Self {
         Self {
             connections: HashMap::new(),
             completions: Vec::with_capacity(64),
+            stream_deadlines: Timeouts::new(64, stream_timeout),
+            deadline_owner: Vec::with_capacity(64),
+            free_deadline_slots: Vec::new(),
         }
     }
 
     /// Ensure a connection exists for `base_url`, creating one if none exists
-    /// or the existing one is dead. Returns whether one was created.
+    /// or the existing one is dead. `addr` is the backend's address resolved
+    /// once at start. Returns whether one was created.
     pub fn ensure_connection(
         &mut self,
         base_url: &str,
-        tls: Option<Arc<rustls::ClientConfig>>,
+        addr: SocketAddr,
+        tls: Option<&TlsClient>,
     ) -> io::Result<bool> {
-        let (host, port) = parse_host_port(base_url, T::prefix(), T::default_port())?;
         let needs_new = match self.connections.get(base_url) {
             None => true,
             Some(conn) => conn.is_dead && conn.streams.is_empty(),
         };
         if needs_new {
-            let new_conn = H2Client::connect(&host, port, tls)?;
+            let new_conn = H2Client::connect(addr, tls)?;
             self.connections.insert(base_url.to_string(), new_conn);
             Ok(true)
         } else {
@@ -885,20 +1065,86 @@ impl<T: Transport> Pool<T> {
         registry: &Registry,
     ) -> io::Result<(Token, u32)> {
         let (host, _) = parse_host_port(base_url, T::prefix(), T::default_port())?;
-        let conn = self.connections.get_mut(base_url).unwrap();
-        let stream_id = conn.dispatch(req, &host, client_ip, original_host)?;
-        let interest = conn.interest();
-        if interest != conn.registered_interest {
-            registry
-                .reregister(
-                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                    conn.token(),
-                    interest,
-                )
-                .ok();
-            conn.registered_interest = interest;
+        let (token, stream_id) = {
+            let conn = self.connections.get_mut(base_url).unwrap();
+            let stream_id = conn.dispatch(req, &host, client_ip, original_host)?;
+            let interest = conn.phase_interest();
+            if interest != conn.registered_interest {
+                registry
+                    .reregister(
+                        &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
+                        conn.token(),
+                        interest,
+                    )
+                    .ok();
+                conn.registered_interest = interest;
+            }
+            (conn.token(), stream_id)
+        };
+        let slot = self.take_deadline_slot(token, stream_id, Instant::now());
+        if let Some(stream) = self
+            .connections
+            .get_mut(base_url)
+            .and_then(|c| c.streams.get_mut(&stream_id))
+        {
+            stream.deadline_slot = slot;
         }
-        Ok((conn.token(), stream_id))
+        Ok((token, stream_id))
+    }
+
+    /// A deadline slot for a new stream, grown on demand.
+    fn take_deadline_slot(&mut self, token: Token, stream_id: u32, now: Instant) -> usize {
+        let slot = match self.free_deadline_slots.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = self.deadline_owner.len();
+                self.deadline_owner.push(None);
+                self.stream_deadlines.grow(slot + 1);
+                slot
+            }
+        };
+        self.stream_deadlines.touch(Token(slot), now);
+        self.deadline_owner[slot] = Some((token, stream_id));
+        slot
+    }
+
+    /// Give a completed stream's deadline slot back.
+    fn release_deadline_slot(&mut self, slot: usize) {
+        if slot >= self.deadline_owner.len() || self.deadline_owner[slot].is_none() {
+            return;
+        }
+        self.stream_deadlines.clear(Token(slot));
+        self.deadline_owner[slot] = None;
+        self.free_deadline_slots.push(slot);
+    }
+
+    /// Time until the earliest stream deadline, capped at `tick`.
+    pub fn timeout(&self, now: Instant, tick: Duration) -> Duration {
+        self.stream_deadlines.timeout(now, tick)
+    }
+
+    /// Fail every stream past its deadline, cancelling it at the peer, and
+    /// return the completions so the loop can answer each waiter.
+    pub fn expire(&mut self, now: Instant) -> Vec<H2Completion> {
+        let mut out = Vec::new();
+        while let Some(slot) = self.stream_deadlines.expired(now) {
+            let Some((token, stream_id)) = self.deadline_owner[slot.0].take() else {
+                continue;
+            };
+            self.free_deadline_slots.push(slot.0);
+            let Some(conn) = self.connections.values_mut().find(|c| c.token() == token) else {
+                continue;
+            };
+            if let Some(completion) = conn.time_out_stream(stream_id) {
+                out.push(completion);
+                conn.drive();
+                out.append(&mut conn.completions);
+            }
+        }
+        for completion in &out {
+            self.release_deadline_slot(completion.deadline_slot);
+        }
+        out
     }
 
     /// Store who waits for an outbound stream's reply.
@@ -922,7 +1168,7 @@ impl<T: Transport> Pool<T> {
             return false;
         };
         conn.drive();
-        let interest = conn.interest();
+        let interest = conn.phase_interest();
         if interest != conn.registered_interest {
             registry
                 .reregister(
@@ -938,8 +1184,12 @@ impl<T: Transport> Pool<T> {
     }
 
     /// Take the completions every driven connection produced since the last
-    /// drain.
+    /// drain, clearing their deadlines.
     pub fn drain_completions(&mut self) -> Vec<H2Completion> {
+        for i in 0..self.completions.len() {
+            let slot = self.completions[i].deadline_slot;
+            self.release_deadline_slot(slot);
+        }
         std::mem::take(&mut self.completions)
     }
 
@@ -958,6 +1208,27 @@ impl<T: Transport> Pool<T> {
             }
         }
     }
+}
+
+/// Start a non-blocking TCP connect. `EINPROGRESS` is success: the caller waits
+/// for writability and then checks the socket's error.
+pub(crate) fn nonblocking_tcp_connect(addr: SocketAddr) -> io::Result<TcpStream> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    sock.set_nonblocking(true)?;
+    sock.set_tcp_nodelay(true)?;
+    match sock.connect(&socket2::SockAddr::from(addr)) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == io::ErrorKind::WouldBlock
+                || e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(TcpStream::from(std::os::fd::OwnedFd::from(sock)))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -984,7 +1255,11 @@ pub(crate) fn client_init_frame() -> Vec<u8> {
 }
 
 /// Parse `scheme://host:port[/path]` into `(host, port)`.
-fn parse_host_port(base_url: &str, scheme: &str, default_port: u16) -> io::Result<(String, u16)> {
+pub(crate) fn parse_host_port(
+    base_url: &str,
+    scheme: &str,
+    default_port: u16,
+) -> io::Result<(String, u16)> {
     let rest = base_url
         .strip_prefix(scheme)
         .and_then(|r| r.strip_prefix("://"))

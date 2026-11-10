@@ -4,11 +4,13 @@
 //! transport. One `H2cClientConn` is maintained per backend URL.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::time::{Duration, Instant};
 
 use crate::forward::{HttpRequest, PendingUrlContext, Waiter};
-use crate::h2_client::{client_init_frame, H2Client, H2Completion, Pool, Transport};
+use crate::h2_client::{H2Client, H2Completion, Pool, Transport};
+use m6_core::client::TlsClient;
 use m6_core::mio::{Registry, Token};
 
 /// The cleartext transport for `h2c://` backends.
@@ -17,29 +19,26 @@ pub struct H2cTransport {
 }
 
 impl Transport for H2cTransport {
-    fn connect(
-        host: &str,
-        port: u16,
-        _tls: Option<std::sync::Arc<rustls::ClientConfig>>,
-    ) -> io::Result<Self> {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "blocking upstream connect; removed by EL-5b"
-        )]
-        let mut stream = TcpStream::connect(format!("{}:{}", host, port))?;
-        stream.set_nodelay(true)?;
-
-        // Send client preface + SETTINGS while still in blocking mode so the
-        // write never returns WouldBlock.
-        stream.write_all(&client_init_frame())?;
-        stream.flush()?;
-
-        stream.set_nonblocking(true)?;
-        Ok(Self { stream })
+    fn connect(addr: SocketAddr, _tls: Option<&TlsClient>) -> io::Result<Self> {
+        Ok(Self {
+            stream: crate::h2_client::nonblocking_tcp_connect(addr)?,
+        })
     }
 
     fn raw_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
+    }
+
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.stream.take_error()
+    }
+
+    fn is_handshaking(&self) -> bool {
+        false
+    }
+
+    fn alpn_protocol(&self) -> Option<&[u8]> {
+        None
     }
 
     fn scheme() -> &'static [u8] {
@@ -106,29 +105,40 @@ impl std::ops::DerefMut for H2cClientConn {
 }
 
 impl H2cClientConn {
-    /// Connect to an H2C backend at `host:port`.
+    /// Connect to an H2C backend at `host:port` and wait for it to open.
+    ///
+    /// A test and benchmark helper: a service resolves the address at start and
+    /// drives its pooled connection in the loop.
     pub fn connect(host: &str, port: u16) -> io::Result<Self> {
-        Ok(Self(H2Client::connect(host, port, None)?))
+        let addr = m6_core::net::resolve(host, port)?;
+        let mut client = H2Client::connect(addr, None)?;
+        client.wait_until_open()?;
+        Ok(Self(client))
     }
 }
 
 /// Persistent H2C connection pool, keyed by backend URL.
 pub struct H2cClientPool(Pool<H2cTransport>);
 
-impl Default for H2cClientPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl H2cClientPool {
-    pub fn new() -> Self {
-        Self(Pool::new())
+    /// `stream_timeout` is `backend_timeout_secs`: an h2 stream's deadline.
+    pub fn new(stream_timeout: Duration) -> Self {
+        Self(Pool::new(stream_timeout))
     }
 
     /// Ensure a connection exists for `base_url`. Returns whether one was made.
-    pub fn ensure_connection(&mut self, base_url: &str) -> io::Result<bool> {
-        self.0.ensure_connection(base_url, None)
+    pub fn ensure_connection(&mut self, base_url: &str, addr: SocketAddr) -> io::Result<bool> {
+        self.0.ensure_connection(base_url, addr, None)
+    }
+
+    /// Time until the earliest stream deadline, capped at `tick`.
+    pub fn timeout(&self, now: Instant, tick: Duration) -> Duration {
+        self.0.timeout(now, tick)
+    }
+
+    /// Fail every stream past its deadline, cancelling it at the peer.
+    pub fn expire(&mut self, now: Instant) -> Vec<H2Completion> {
+        self.0.expire(now)
     }
 
     /// The connection for `base_url`, to register and set its token.
