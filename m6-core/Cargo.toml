@@ -88,9 +88,9 @@ md-5        = "0.10"
 # Re-exported as `m6_core::mio`, so a service links only m6-core.
 mio         = { version = "1", features = ["os-poll", "os-ext", "net"] }
 # DNS messages for the monitor's crawler check. Only the message codec is
-# wanted: the socket and the loop are m6's, and the default `tokio` feature
-# would bring an async runtime into the crate.
-hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
+# wanted: the socket and the loop are m6's, and `std` is the whole feature set
+# this crate needs.
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 resolv-conf   = { version = "0.7", default-features = false }
 
 minify-html   = { version = "0.15", optional = true }

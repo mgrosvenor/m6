@@ -211,13 +211,9 @@ impl Query {
 
     /// One question datagram: recursion desired, one question, a fresh id.
     fn send(&self, id: u16, name: &Name, record_type: RecordType) -> io::Result<()> {
-        let mut message = Message::new();
-        message
-            .set_id(id)
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true)
-            .add_query(Question::query(name.clone(), record_type));
+        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Question::query(name.clone(), record_type));
         let bytes = message
             .to_bytes()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -234,20 +230,20 @@ impl Query {
         };
         match &mut self.kind {
             Kind::Ptr { id, name } => {
-                if message.id() != *id || !asks_about(&message, name, RecordType::PTR) {
+                if message.metadata.id != *id || !asks_about(&message, name, RecordType::PTR) {
                     return None;
                 }
                 // A truncated reply would need TCP to complete, which is not a
                 // second mechanism this lookup takes on. It is a failed lookup
                 // instead.
-                if message.truncated() {
+                if message.metadata.truncation {
                     return Some(Answer::Failed);
                 }
-                Some(match message.response_code() {
+                Some(match message.metadata.response_code {
                     ResponseCode::NoError => message
-                        .answers()
+                        .answers
                         .iter()
-                        .find_map(|record| match record.data() {
+                        .find_map(|record| match &record.data {
                             RData::PTR(name) => Some(Answer::Name(name.to_utf8())),
                             _ => None,
                         })
@@ -264,9 +260,9 @@ impl Query {
                 aaaa_answered,
                 addrs,
             } => {
-                let record_type = if message.id() == *a {
+                let record_type = if message.metadata.id == *a {
                     RecordType::A
-                } else if message.id() == *aaaa {
+                } else if message.metadata.id == *aaaa {
                     RecordType::AAAA
                 } else {
                     return None;
@@ -274,10 +270,10 @@ impl Query {
                 if !asks_about(&message, name, record_type) {
                     return None;
                 }
-                if message.truncated() {
+                if message.metadata.truncation {
                     return Some(Answer::Failed);
                 }
-                match message.response_code() {
+                match message.metadata.response_code {
                     ResponseCode::NoError => {
                         // A duplicate reply must not add the same address twice.
                         let answered = if record_type == RecordType::A {
@@ -289,8 +285,8 @@ impl Query {
                             return None;
                         }
                         *answered = true;
-                        for record in message.answers() {
-                            match record.data() {
+                        for record in &message.answers {
+                            match &record.data {
                                 RData::A(address) => addrs.push(IpAddr::V4(address.0)),
                                 RData::AAAA(address) => addrs.push(IpAddr::V6(address.0)),
                                 _ => {}
@@ -316,7 +312,7 @@ impl Query {
 
 /// Whether `message` echoes the one question asked: its name and record type.
 fn asks_about(message: &Message, name: &Name, record_type: RecordType) -> bool {
-    let questions = message.queries();
+    let questions = &message.queries;
     questions.len() == 1 && questions[0].name() == name && questions[0].query_type() == record_type
 }
 
@@ -492,15 +488,11 @@ mod tests {
     /// A response to `query` with `rcode` and `answers`, echoing its id and
     /// question.
     fn reply(query: &Message, rcode: ResponseCode, answers: Vec<RData>) -> Message {
-        let asked = &query.queries()[0];
-        let mut message = Message::new();
-        message
-            .set_id(query.id())
-            .set_message_type(MessageType::Response)
-            .set_op_code(OpCode::Query)
-            .set_recursion_desired(true)
-            .set_response_code(rcode);
-        for question in query.queries() {
+        let asked = &query.queries[0];
+        let mut message = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.metadata.response_code = rcode;
+        for question in &query.queries {
             message.add_query(question.clone());
         }
         for rdata in answers {
@@ -624,7 +616,7 @@ mod tests {
         let (seen_tx, seen_rx) = mpsc::channel();
         let (addr, server) = nameserver(1, move |query| {
             seen_tx
-                .send(query.queries()[0].name().to_utf8())
+                .send(query.queries[0].name().to_utf8())
                 .expect("report the question");
             ptr_reply(query, "crawler.example.com.")
         });
@@ -645,7 +637,7 @@ mod tests {
     fn an_a_and_aaaa_answer_is_returned() {
         let (seen_tx, seen_rx) = mpsc::channel();
         let (addr, server) = nameserver(2, move |query| {
-            let question = &query.queries()[0];
+            let question = &query.queries[0];
             seen_tx
                 .send((question.name().to_utf8(), question.query_type()))
                 .expect("report the question");
@@ -691,7 +683,7 @@ mod tests {
                     Name::from_ascii("wrong.example.com.").expect("name")
                 ))],
             );
-            wrong.set_id(query.id().wrapping_add(1));
+            wrong.metadata.id = query.metadata.id.wrapping_add(1);
             let mut right = ptr_reply(query, "crawler.example.com.");
             let mut replies = vec![wrong];
             replies.append(&mut right);
@@ -735,7 +727,7 @@ mod tests {
         tcp.set_nonblocking(true).expect("non-blocking listener");
         let (_, server) = nameserver_on(udp, 1, |query| {
             let mut message = reply(query, ResponseCode::NoError, Vec::new());
-            message.set_truncated(true);
+            message.metadata.truncation = true;
             vec![message]
         });
         let ip = "198.51.100.7".parse().expect("address");
@@ -839,7 +831,7 @@ mod tests {
         let reverse = ptr_name;
         let (seen_tx, seen_rx) = mpsc::channel();
         let (addr, server) = nameserver(questions, move |query| {
-            let kind = query.queries()[0].query_type();
+            let kind = query.queries[0].query_type();
             seen_tx.send(kind).expect("report the question");
             if kind == RecordType::PTR {
                 let (rcode, answers) = match &reverse {
