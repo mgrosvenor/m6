@@ -555,6 +555,45 @@ mod tests {
         nameserver_on(socket, questions, answer)
     }
 
+    /// A fake nameserver for an A and AAAA pair: it reads both questions, in
+    /// either order, then sends the replies `script` builds from both.
+    ///
+    /// The ordinary helper cannot answer a stray reply that has to know both
+    /// ids, which is what the id-mismatch test sends.
+    fn addrs_nameserver(
+        script: impl FnOnce(&Message, &Message) -> Vec<Message> + Send + 'static,
+    ) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").expect("bind fake nameserver");
+        let addr = socket.local_addr().expect("fake nameserver address");
+        socket
+            .set_read_timeout(Some(T))
+            .expect("fake nameserver read timeout");
+        let handle = std::thread::spawn(move || {
+            let mut a = None;
+            let mut aaaa = None;
+            let mut peer = None;
+            let mut buf = [0u8; MAX_REPLY];
+            while a.is_none() || aaaa.is_none() {
+                let (n, from) = socket.recv_from(&mut buf).expect("receive a question");
+                let message = Message::from_bytes(&buf[..n]).expect("parse the question");
+                match message.queries[0].query_type() {
+                    RecordType::A => a = Some(message),
+                    RecordType::AAAA => aaaa = Some(message),
+                    other => panic!("unexpected question type {other:?}"),
+                }
+                peer = Some(from);
+            }
+            let peer = peer.expect("a peer address");
+            let a = a.expect("the A question");
+            let aaaa = aaaa.expect("the AAAA question");
+            for message in script(&a, &aaaa) {
+                let bytes = message.to_bytes().expect("encode the reply");
+                socket.send_to(&bytes, peer).expect("send the reply");
+            }
+        });
+        (addr, handle)
+    }
+
     /// One reply carrying the one PTR record `name`.
     fn ptr_reply(query: &Message, name: &str) -> Vec<Message> {
         let name = Name::from_ascii(name).expect("PTR name");
@@ -724,6 +763,88 @@ mod tests {
             driven(&mut query),
             Answer::Name("crawler.example.com.".to_string())
         );
+        server.join().expect("fake nameserver");
+    }
+
+    #[test]
+    fn an_addrs_reply_with_an_unmatched_id_is_ignored() {
+        let (addr, server) = addrs_nameserver(|a, aaaa| {
+            let mut stray = reply(
+                aaaa,
+                ResponseCode::NoError,
+                vec![RData::AAAA(AAAA("2001:db8::bad".parse().expect("address")))],
+            );
+            // An id that belongs to neither outstanding question.
+            let mut id = a.metadata.id.wrapping_add(1);
+            if id == aaaa.metadata.id {
+                id = id.wrapping_add(1);
+            }
+            stray.metadata.id = id;
+            vec![
+                stray,
+                reply(
+                    a,
+                    ResponseCode::NoError,
+                    vec![RData::A(A("192.0.2.1".parse().expect("address")))],
+                ),
+                reply(
+                    aaaa,
+                    ResponseCode::NoError,
+                    vec![RData::AAAA(AAAA("2001:db8::1".parse().expect("address")))],
+                ),
+            ]
+        });
+        let mut query = Query::addrs("crawler.example.com", addr).expect("start the query");
+        let mut addrs = match driven(&mut query) {
+            Answer::Addrs(addrs) => addrs,
+            other => panic!("expected addresses, got {other:?}"),
+        };
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "192.0.2.1".parse::<IpAddr>().expect("address"),
+                "2001:db8::1".parse().expect("address"),
+            ]
+        );
+        server.join().expect("fake nameserver");
+    }
+
+    #[test]
+    fn a_truncated_addrs_reply_is_failed() {
+        let (addr, server) = nameserver(2, |query| match query.queries[0].query_type() {
+            RecordType::A => {
+                let mut message = reply(
+                    query,
+                    ResponseCode::NoError,
+                    vec![RData::A(A("192.0.2.1".parse().expect("address")))],
+                );
+                message.metadata.truncation = true;
+                vec![message]
+            }
+            _ => vec![reply(
+                query,
+                ResponseCode::NoError,
+                vec![RData::AAAA(AAAA("2001:db8::1".parse().expect("address")))],
+            )],
+        });
+        let mut query = Query::addrs("crawler.example.com", addr).expect("start the query");
+        assert_eq!(driven(&mut query), Answer::Failed);
+        server.join().expect("fake nameserver");
+    }
+
+    #[test]
+    fn an_addrs_reply_of_nxdomain_is_not_found() {
+        let (addr, server) = nameserver(2, |query| match query.queries[0].query_type() {
+            RecordType::A => vec![reply(query, ResponseCode::NXDomain, Vec::new())],
+            _ => vec![reply(
+                query,
+                ResponseCode::NoError,
+                vec![RData::AAAA(AAAA("2001:db8::1".parse().expect("address")))],
+            )],
+        });
+        let mut query = Query::addrs("crawler.example.com", addr).expect("start the query");
+        assert_eq!(driven(&mut query), Answer::NotFound);
         server.join().expect("fake nameserver");
     }
 
