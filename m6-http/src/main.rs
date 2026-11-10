@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -29,6 +29,8 @@ use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
 use m6_http_lib::forward::{self, UpstreamId, Waiter};
 use m6_http_lib::health;
+#[cfg(target_os = "linux")]
+use m6_http_lib::http2::SEND_QUEUE_BYTES;
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
 
@@ -979,6 +981,39 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
     Some(Token(taken.key))
 }
 
+/// Ask the kernel to report the socket writable only once its unsent data
+/// falls below the send queue's bound. The bounded queue decides which frames
+/// enter the kernel; without this option the kernel takes a whole response
+/// body at once and decides what leaves first, so the order would be lost.
+///
+/// Linux only: TCP_NOTSENT_LOWAT has no equivalent elsewhere, and there the
+/// kernel's own order stays in force.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // one setsockopt on the connection's own descriptor
+fn limit_kernel_send_queue(fd: RawFd) {
+    let lowat = SEND_QUEUE_BYTES as libc::c_int;
+    // SAFETY: `fd` is the accepted connection's live descriptor, and the
+    // option reads exactly the one `c_int` it is given.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            std::ptr::from_ref(&lowat).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            error = %std::io::Error::last_os_error(),
+            "TCP_NOTSENT_LOWAT: the send queue is bounded, but this kernel will not wait for it"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn limit_kernel_send_queue(_fd: RawFd) {}
+
 /// Accept TLS connections until the socket would block or the token table is
 /// full. Returns whether the table is at its ceiling.
 fn accept_tls(
@@ -1039,6 +1074,7 @@ fn accept_h2c(
         };
         conn.set_token(token);
         conn.set_interest(Interest::READABLE);
+        limit_kernel_send_queue(conn.raw_fd());
         if let Err(e) = registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
         {
             warn!(error = %e, "h2c register");
@@ -1130,6 +1166,9 @@ fn drive_conn_token(
         if hs.is_h2 {
             state.read_timeouts.clear(token);
             state.h2_idle_timeouts.touch(token, now);
+            if let Some(t) = tcp.as_mut() {
+                limit_kernel_send_queue(t.slot_mut(slot).raw_fd());
+            }
         }
     }
     after_conn_drive(token, &drive, state, tcp, h2c, registry, now);
