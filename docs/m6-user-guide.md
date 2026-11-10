@@ -27,7 +27,7 @@ The examples need two checkouts, one certificate tool and a release build of m6.
 This section installs them and points at the full-stack check, so a later failure is a real answer about an example.
 The release build puts every m6 binary on the path, including `m6-md`, which Example 02 uses.
 
-Rust 1.88 or newer provides the compiler and Cargo.
+Rust 1.89 or newer provides the compiler and Cargo.
 `mkcert` issues a development certificate that a browser trusts.
 `openssl` is the fallback when `mkcert` is absent.
 The two checkouts must sit side by side, because the renderer crates reach m6 through the relative path `../../../../m6/m6-core`.
