@@ -203,9 +203,11 @@ fn write_site_toml(site: &Path) {
 }
 
 /// Write `system.toml` binding `port`, with the certificate and key named by
-/// their paths relative to `site`.
+/// absolute paths to the files `cert` and `key` in `site`.
 fn write_system_toml(site: &Path, port: u16, cert: &str, key: &str) -> std::path::PathBuf {
     let system = site.join("system.toml");
+    let cert = site.join(cert).display().to_string();
+    let key = site.join(key).display().to_string();
     std::fs::write(
         &system,
         format!(

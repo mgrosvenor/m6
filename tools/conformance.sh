@@ -392,7 +392,7 @@ start_auth() {  # start_auth <bridge-port>
   fi
   cat > "$site/m6-auth.conf" <<TOML
 [storage]
-path = "data/auth.db"
+path = "$site/data/auth.db"
 
 [tokens]
 access_ttl  = 900
