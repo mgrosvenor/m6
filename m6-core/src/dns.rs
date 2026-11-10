@@ -38,9 +38,11 @@
 //! path of every server.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
+
+use nix::net::if_::if_nametoindex;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query as Question, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -66,7 +68,29 @@ pub fn nameserver_from(path: &Path) -> io::Result<SocketAddr> {
             "the resolver configuration has no nameserver",
         )
     })?;
-    Ok(SocketAddr::new(nameserver.into(), 53))
+    Ok(match nameserver {
+        resolv_conf::ScopedIp::V4(ip) => SocketAddr::V4(SocketAddrV4::new(*ip, 53)),
+        // The scope id is part of the address: a link-local nameserver without
+        // it cannot be reached, and connect would succeed before send failed.
+        resolv_conf::ScopedIp::V6(ip, scope) => {
+            SocketAddr::V6(SocketAddrV6::new(*ip, 53, 0, scope_id(scope.as_deref())?))
+        }
+    })
+}
+
+/// The scope id of a scoped IPv6 nameserver: a number, or an interface name
+/// resolved once at start.
+///
+/// An interface name that does not resolve is an error, because a link-local
+/// nameserver without its scope is unreachable.
+fn scope_id(scope: Option<&str>) -> io::Result<u32> {
+    let Some(scope) = scope else {
+        return Ok(0);
+    };
+    if let Ok(id) = scope.parse::<u32>() {
+        return Ok(id);
+    }
+    if_nametoindex(scope).map_err(io::Error::from)
 }
 
 /// The answer to one [`Query`].
@@ -924,6 +948,33 @@ mod tests {
             nameserver_from(&path).expect("the nameserver"),
             "192.0.2.53:53".parse::<SocketAddr>().expect("address")
         );
+    }
+
+    /// A link-local nameserver keeps its scope id: without it the socket
+    /// connects and the first send fails, so every lookup reads Failed.
+    #[test]
+    fn nameserver_from_keeps_an_ipv6_scope_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver fe80::1%7\n").expect("write");
+        assert_eq!(
+            nameserver_from(&path).expect("the nameserver"),
+            SocketAddr::V6(SocketAddrV6::new(
+                "fe80::1".parse().expect("address"),
+                53,
+                0,
+                7
+            ))
+        );
+    }
+
+    /// An interface name that does not resolve is an error at start.
+    #[test]
+    fn nameserver_from_rejects_an_unknown_interface_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("resolv.conf");
+        std::fs::write(&path, "nameserver fe80::1%m6nosuchif0\n").expect("write");
+        assert!(nameserver_from(&path).is_err());
     }
 
     /// The dot boundary is the whole of the check, so it gets the most tests.

@@ -63,7 +63,7 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
-nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource"] }
+nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net"] }
 socket2    = "0.6"
 httparse   = "1"
 httpdate   = "1"
