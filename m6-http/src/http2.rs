@@ -278,6 +278,11 @@ struct H2Stream {
     resp_sent: usize,
     /// Pending backend request: set by maybe_dispatch when backend is async.
     pending: bool,
+    /// Whether our END_STREAM has gone out. The stream state cannot say: the
+    /// peer's END_STREAM turns half-closed (local) into half-closed (remote),
+    /// and without this flag the flusher would owe the stream a second
+    /// END_STREAM and send DATA after it.
+    end_stream_sent: bool,
     /// The RFC 9218 priority this request asked for. The flush sends this
     /// stream's response in the order it names.
     priority: Priority,
@@ -295,27 +300,22 @@ impl H2Stream {
             resp_body: None,
             resp_sent: 0,
             pending: false,
+            end_stream_sent: false,
             priority: Priority::default(),
         }
     }
 
     /// Whether the flusher owes this stream a frame: the END_STREAM of an
-    /// empty body, or body bytes both send windows allow. False once the
-    /// stream's own END_STREAM has gone out, and while either window is spent.
+    /// empty body, which needs no window, or body bytes both send windows
+    /// allow. False once the stream's own END_STREAM has gone out.
     fn can_send(&self, conn_send_window: i32) -> bool {
-        if self.end_stream_sent() {
+        if self.end_stream_sent {
             return false;
         }
         let Some(body) = self.resp_body.as_ref() else {
             return false;
         };
         body.len() == self.resp_sent || (conn_send_window > 0 && self.send_window > 0)
-    }
-
-    /// Whether our END_STREAM has already gone out, which leaves the stream
-    /// half-closed (local) until the peer ends its request.
-    fn end_stream_sent(&self) -> bool {
-        self.state == StreamState::HalfClosedLocal
     }
 
     /// Record the RFC 9218 priority this request asked for.
@@ -491,7 +491,7 @@ impl Http2Conn {
             || self
                 .streams
                 .values()
-                .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent())
+                .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent)
     }
 
     /// Drive one step: pump I/O, parse frames, dispatch requests. Returns
@@ -1935,13 +1935,13 @@ impl Http2Conn {
     /// Free a stream whose own END_STREAM has gone out. It has nothing left to
     /// send, and its entry counts against the peer's concurrency limit, so the
     /// slot is not held until the peer ends its request. The peer's end of the
-    /// request may still be open, in which case the stream is half-closed
-    /// (local) and a later DATA from it is answered STREAM_CLOSED.
+    /// request may still be open, in which case the stream state is the peer's
+    /// half of the machine and a later DATA from it is answered STREAM_CLOSED.
     fn reap_ended_streams(&mut self) {
         while let Some(stream_id) = self
             .streams
             .iter()
-            .find(|(_, stream)| stream.end_stream_sent())
+            .find(|(_, stream)| stream.end_stream_sent)
             .map(|(&stream_id, _)| stream_id)
         {
             self.close_stream_remembering_window(stream_id);
@@ -2077,6 +2077,7 @@ impl Http2Conn {
                 }
             } else if let Some(s) = self.streams.get_mut(&stream_id) {
                 s.state = StreamState::HalfClosedLocal;
+                s.end_stream_sent = true;
             }
         }
     }
@@ -4408,6 +4409,24 @@ mod tests {
         order
     }
 
+    /// The DATA frames in `send_buf`, as (stream id, flags, payload length).
+    fn data_frame_header(buf: &[u8]) -> Vec<(u32, u8, usize)> {
+        let mut frames = Vec::new();
+        let mut at = 0usize;
+        while at + FRAME_HDR <= buf.len() {
+            let len = u24_be(&buf[at..at + 3]) as usize;
+            let ftype = buf[at + 3];
+            let flags = buf[at + 4];
+            let stream_id =
+                u32::from_be_bytes(buf[at + 5..at + 9].try_into().unwrap()) & 0x7fff_ffff;
+            if ftype == TYPE_DATA {
+                frames.push((stream_id, flags, len));
+            }
+            at += FRAME_HDR + len;
+        }
+        frames
+    }
+
     /// One request whose handler answers `len` bytes on `stream_id`.
     fn request_with_body(stream_id: u32, len: usize) -> Http2Conn {
         let mut c = Http2Conn::new();
@@ -4501,5 +4520,43 @@ mod tests {
             vec![1, 3, 1, 3, 1, 3, 1, 3],
             "incremental responses must take one frame each in turn"
         );
+    }
+
+    /// A response dispatched before the peer ends its request has already put
+    /// END_STREAM on its last DATA frame. The peer's own END_STREAM, an empty
+    /// DATA or a trailer section, must not make the flusher send a second one:
+    /// RFC 9113 5.1 makes a frame the peer receives after END_STREAM a
+    /// connection error.
+    #[test]
+    fn one_end_stream_when_the_peer_ends_after_ours() {
+        for terminator in [
+            frame(TYPE_DATA, FLAG_END_STREAM, 1, &[]),
+            frame(TYPE_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &[]),
+        ] {
+            let mut c = request_with_body(1, 16);
+            assert_eq!(
+                data_frame_header(&c.send_buf),
+                vec![(1, FLAG_END_STREAM, 16)],
+                "the response goes out as one DATA frame with END_STREAM"
+            );
+
+            c.recv_buf.extend_from_slice(&terminator);
+            let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| {
+                RequestOutcome::Ready(200, vec![], vec![], String::new())
+            };
+            c.process_frame(&mut (), &mut on_request, "127.0.0.1")
+                .expect("the peer's end is a legal frame");
+            c.flush_pending_streams();
+
+            assert_eq!(
+                data_frame_header(&c.send_buf),
+                vec![(1, FLAG_END_STREAM, 16)],
+                "the peer's END_STREAM must not produce a second one"
+            );
+            assert!(
+                c.streams.is_empty(),
+                "a stream both ends have finished is reaped"
+            );
+        }
     }
 }
