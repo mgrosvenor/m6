@@ -247,7 +247,7 @@ m6-html renders the blog pages from that JSON.
 The Markdown conversion happens before the server starts.
 
 A new or changed post needs a rebuild and a cache invalidation.
-`dev.sh` builds the m6 binaries, then runs `m6-md` in watch mode to rebuild the params file after each change.
+`dev.sh` builds the m6 binaries and runs m6-md once to write `data/posts.json`.
 
 ### 3.2. Source file format
 
@@ -353,7 +353,7 @@ It repeats the date descending sort that m6-md already applied, so the page keep
 {% set post = post_list | first %}
 ```
 
-[`m6-md.md`](m6-md.md) owns the frontmatter rules, the watch flags, the output format and `not_found()`.
+[`m6-md.md`](m6-md.md) owns the frontmatter rules, the command line, the output format and `not_found()`.
 [`m6-core-reference.md`](m6-core-reference.md) owns the template engine and its m6 filters at §4.5, and the built-in keys at §4.1.
 The `sort`, `reverse`, `filter`, `length` and `first` filters are Tera's standard filters.
 
@@ -899,7 +899,6 @@ The contact, `/login` and `/_errors` routes are marked `cache = "no-store"`.
 
 `dev.sh` builds m6 and render-cms, writes the TLS and auth keys, creates the admin user, generates `data/posts.json` and starts the stack.
 The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http.
-When m6-md is installed, it also runs in watch mode over `content/posts/`.
 
 `test.sh` checks the running stack over the wire.
 It has 15 sections, numbered 0 to 14, and every check has one expected answer.
