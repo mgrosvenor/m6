@@ -48,11 +48,15 @@ No existing field changes, so no migration is needed.
 
 ### Migration
 
+**Every setting that names a secret, key or certificate takes an absolute path, and a relative one stops the service at startup with exit 2, naming the setting: `secrets_file` (every service built on m6-core), `[server] tls_cert`, `tls_key`, `[auth] public_key` and `[health] metrics_token_file` (m6-http), `[storage] path`, `[keys] private_key` and `[keys] public_key` (m6-auth-server and m6-auth-cli), and `perf_token_file` (m6-monitor).** Before upgrading, replace each relative value with the absolute path it resolved to. m6-http resolved them against the site directory. m6-auth-server and m6-auth-cli resolved `[keys]` against the site directory and `[storage] path` against the config file's directory, so `configs/m6-auth.conf` with `path = "data/auth.db"` used `<site>/configs/data/auth.db`. m6-core and m6-monitor resolved them against the working directory. `m6-auth-cli token create` no longer takes `--site-dir`. The documented production layout delivers m6-http's certificate, key and auth public key through systemd `LoadCredential` as well, and a certificate renewal restarts m6-http: a deployment that follows it changes its certbot deploy hook from a touch of the system config to `systemctl restart` of the m6-http unit.
+
 **m6-http refuses at start, with exit 2, a config it used to warn about.** That covers a key or section it does not know, a key in the file it does not belong to (docs/m6-site-toml.md §3.3, Table 1), a system config with no `[node]`, a `[health] metrics_token_file` that is missing, empty or set together with `metrics_require`, and a cache key on a `[[route]]` or `[[route_group]]` (set `Cache-Control` on the backend's response instead).
 Before upgrading, run `m6-http <site> <system config> --dump-config` on every node and fix what it names: add `[node] name = "<node>"` to each system config, and move every node key out of `site.toml`.
 Every m6 service refuses an unknown log level (in `site.toml`, its own config or `--log-level`), a `site.toml` that is missing or is not valid TOML (the default path included), an unknown key in one of m6-core's own tables (`[thread_pool]`, `[params_cache]`, `[server]`, `[log]`, `[compression]`), and a socket whose mode it cannot set.
 
 ### Added
+
+**User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
 
 **Crawler sightings carry a time and a verdict (#205).**
 The monitor report's crawler section prints `seen: <first> .. <last>` for each sighting, and one line per address (at most three) with one of these outcomes:
@@ -192,6 +196,10 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**m6-core: `config::secret_path` is the one absolute-path check every crate uses, and m6-auth-server's two path bases are gone (m6 #16). m6-monitor reads its fleet once at start, so a fleet it cannot read stops the start with exit 2.**
+
+**m6-http: `tls_cert`, `tls_key`, `[auth] public_key` and `metrics_token_file` take absolute paths, from either file.**
 
 **m6-core: an unknown log level, a missing or invalid `site.toml` and a failed socket chmod stop a service at start with exit 2.**
 
