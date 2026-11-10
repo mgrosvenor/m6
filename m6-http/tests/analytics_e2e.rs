@@ -526,9 +526,6 @@ mode = "internal"
 [analytics]
 log_path = "{log_path}"
 
-[health]
-metrics_token_file = "{token_file}"
-
 [rate_limit]
 enabled = false
 
@@ -542,7 +539,6 @@ backend = "m6-file"
 "#,
             sock_glob = sock_glob.display(),
             log_path = analytics_log.display(),
-            token_file = token_file.display(),
         ),
     )
     .unwrap();
@@ -571,9 +567,13 @@ tls_key  = "{key}"
 
 [node]
 name = "test-node"
+
+[health]
+metrics_token_file = "{token_file}"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
+            token_file = token_file.display(),
         ),
     )
     .unwrap();

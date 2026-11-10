@@ -155,6 +155,39 @@ fn l1_valid_config_starts_and_socket_appears() {
     );
 }
 
+/// An unknown `--log-level` is a startup error: the service names the level,
+/// exits 2, and never binds its socket.
+#[test]
+fn an_unknown_log_level_exits_2_before_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("verbose.sock");
+
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .arg("--log-level")
+            .arg("verbose")
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .expect("m6-html should exit on an unknown log level");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("unknown log level"),
+        "--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket should never have been bound: {}",
+        socket_path.display()
+    );
+}
+
 /// secrets_file pointing at a non-existent path is silently ignored.
 #[test]
 fn l1_secrets_file_absent_still_starts() {

@@ -267,6 +267,7 @@ It is read once at startup, like the pool dimensions: it is set on a socket at a
 
 `[server] socket_mode` is the mode applied to the unix socket after bind, defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`).
 It is an **octal string**, as systemd writes it, because TOML has no octal literal and `660` as a decimal integer is `0o1224`.
+A chmod that fails stops the service at start with exit 2.
 
 Neither key silently falls back.
 A value that cannot be understood, a negative timeout or a mode above `0777` fails `config::load` and the service does not start.

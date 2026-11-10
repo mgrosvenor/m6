@@ -93,6 +93,7 @@ public_key  = "{}"
 
     // Create data directory
     std::fs::create_dir_all(site_dir.join("data")).unwrap();
+    std::fs::write(site_dir.join("site.toml"), "").unwrap();
 
     // The socket lives in this test's own temp directory, not a shared one.
     // It used to be `$TMPDIR/m6-test-sockets/<id>.sock`, a fixed path per test
