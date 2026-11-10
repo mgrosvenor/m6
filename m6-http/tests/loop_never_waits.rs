@@ -549,7 +549,7 @@ impl Fixture {
 fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
     format!(
         "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-         [server]\nbackend_timeout_secs = {backend_timeout_secs}\nmax_requests_per_connection = 10000\n\n\
+         [server]\nbackend_timeout_secs = {backend_timeout_secs}\n\n\
          [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
@@ -568,7 +568,7 @@ fn system_toml(
     token: &std::path::Path,
 ) -> String {
     format!(
-        "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n\n\
+        "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
          [health]\nmetrics_token_file = \"{}\"\n\n\
          [node]\nname = \"loop-never-waits\"\n",
         cert.display(),
