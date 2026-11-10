@@ -1257,16 +1257,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     })
 }
 
-/// Resolve a path: if absolute, return as-is; otherwise relative to base.
-pub fn resolve_path(base: &Path, p: &str) -> PathBuf {
-    let pb = Path::new(p);
-    if pb.is_absolute() {
-        pb.to_path_buf()
-    } else {
-        base.join(pb)
-    }
-}
-
 /// Keys that are this node's own state. They belong in the system config.
 const NODE_SERVER_KEYS: &[&str] = &[
     "bind",
