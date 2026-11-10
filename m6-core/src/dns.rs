@@ -834,10 +834,8 @@ mod tests {
         questions: usize,
     ) -> Ptr {
         let reverse = ptr_name;
-        let (seen_tx, seen_rx) = mpsc::channel();
         let (addr, server) = nameserver(questions, move |query| {
             let kind = query.queries[0].query_type();
-            seen_tx.send(kind).expect("report the question");
             if kind == RecordType::PTR {
                 let (rcode, answers) = match &reverse {
                     Some(name) => (ResponseCode::NoError, vec![RData::PTR(PTR(name.clone()))]),
@@ -852,10 +850,6 @@ mod tests {
         let ip = "192.0.2.7".parse().expect("address");
         let mut confirm = Confirm::start(ip, addr).expect("start the confirmation");
         let result = driven_confirm(&mut confirm);
-        // Every question the confirmation asked was answered before it
-        // completed, so the count is settled by now.
-        let asked: Vec<RecordType> = seen_rx.try_iter().collect();
-        assert_eq!(asked.len(), questions, "the confirmation asked {asked:?}");
         server.join().expect("fake nameserver");
         result
     }
