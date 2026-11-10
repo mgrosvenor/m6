@@ -2940,6 +2940,7 @@ fn launch_socket_upstream(
         let entry = state.socket_upstreams.get_mut(owner.key);
         let interest = entry.upstream.interest();
         if let Err(e) = registry.register(&mut SourceFd(&entry.upstream.fd()), token, interest) {
+            entry.upstream.close();
             state.socket_upstreams.free(owner.key);
             *state.sources.get_mut(token.0) = Source::Vacant;
             state.sources.free(token.0);
