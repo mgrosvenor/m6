@@ -28,9 +28,9 @@ use std::time::Instant;
 use rustls::ServerConnection;
 use tracing::warn;
 
+use crate::cache::CachedResponse;
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
 use crate::http2::{H2Io, Http2Conn};
-use crate::cache::CachedResponse;
 use m6_core::event::{Slots, Taken};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Interest, Registry, Token};
@@ -470,7 +470,15 @@ impl Http11Listener {
             handshake: None,
         };
         let conn = self.conns.get_mut(key);
-        drive_conn(conn, self.max_requests, state, on_head, on_owned, hit, &mut drive);
+        drive_conn(
+            conn,
+            self.max_requests,
+            state,
+            on_head,
+            on_owned,
+            hit,
+            &mut drive,
+        );
         if let Some(ns) = conn.handshake_ns.take() {
             drive.handshake = Some(HandshakeSample {
                 elapsed_ns: ns,
@@ -1560,9 +1568,9 @@ fn drive_h1<S, FH, FO>(
                                             h1.state = H1State::WaitingBackend;
                                             break; // the upstream's completion resumes this connection
                                         }
-                                        RequestOutcome::Cached { .. } => unreachable!(
-                                            "the owned path returns Ready, not Cached"
-                                        ),
+                                        RequestOutcome::Cached { .. } => {
+                                            unreachable!("the owned path returns Ready, not Cached")
+                                        }
                                     }
                                 }
                             }
@@ -1717,7 +1725,10 @@ fn wants_keep_alive(req: &HttpRequest) -> bool {
 }
 
 /// The borrowed form of [`wants_keep_alive`], for a parsed request head.
-fn wants_keep_alive_head(version: &str, headers: &(impl m6_core::http::HeaderSource + ?Sized)) -> bool {
+fn wants_keep_alive_head(
+    version: &str,
+    headers: &(impl m6_core::http::HeaderSource + ?Sized),
+) -> bool {
     // EVERY `Connection` field line, not just the first. RFC 9110 5.3: repeated
     // field lines are equivalent to one comma-joined value, so a request
     // carrying `Connection: keep-alive` and `Connection: close` means
@@ -2011,7 +2022,9 @@ pub fn write_cached_h1(
         }
         for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
             if nfields < vary_fields.len()
-                && !vary_fields[..nfields].iter().any(|e| e.eq_ignore_ascii_case(f))
+                && !vary_fields[..nfields]
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(f))
             {
                 vary_fields[nfields] = f;
                 nfields += 1;

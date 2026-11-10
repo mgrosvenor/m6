@@ -71,7 +71,12 @@ fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
 /// Both used to be answered with 400, which says the request was malformed
 /// when it was not.
 fn redirect_for(req: &HttpRequest) -> RequestOutcome {
-    redirect_head(&req.method, &req.path, req.query.as_deref(), &req.headers[..])
+    redirect_head(
+        &req.method,
+        &req.path,
+        req.query.as_deref(),
+        &req.headers[..],
+    )
 }
 
 fn redirect_head(

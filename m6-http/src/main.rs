@@ -701,8 +701,8 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     let enc_str = m6_core::headers::get(headers, "accept-encoding").unwrap_or("");
     let start = std::time::Instant::now();
 
-    let cacheable = !state.route_table.requires_auth(path)
-        && m6_http_lib::cache::method_may_read_cache(method);
+    let cacheable =
+        !state.route_table.requires_auth(path) && m6_http_lib::cache::method_may_read_cache(method);
     let lookup_key = make_lookup_key(path, query, enc_str, &mut state.lookup_key_buf);
     let req_cc = m6_http_lib::cache::RequestDirectives::parse(headers);
     let looked_up = if cacheable {
@@ -937,11 +937,14 @@ fn on_request_head(
             version,
             iface,
         } => {
-            let req = match m6_core::h1::materialize(head, buf) {
+            let mut req = match m6_core::h1::materialize(head, buf) {
                 ParseResult::Complete(r) => r,
                 // The head was parsed complete and carries no body.
                 _ => unreachable!("bodyless head materializes"),
             };
+            // Strip proxy-owned headers before forwarding, exactly as the owned
+            // h1 and h2 paths do.
+            forward::strip_untrusted_inbound(&mut req.headers);
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
             let mut outcome = handle_request(&req, client_ip, enc, state, false, false, registry);
             if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
@@ -1077,10 +1080,9 @@ fn drive_conn_token(
         alt_svc: state.alt_svc_line.clone(),
         describedby: state.describedby_line.clone(),
     };
-    let mut on_head = |state: &mut ServerState,
-                       head: &RequestHead<'_>,
-                       buf: &[u8],
-                       ip: &str| on_request_head(state, head, buf, ip, quic_port, registry);
+    let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
+        on_request_head(state, head, buf, ip, quic_port, registry)
+    };
     let mut on_h2 = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
         on_request_impl(state, req, ip, quic_port, registry, is_h2c)
     };
@@ -1819,7 +1821,12 @@ fn event_loop(
 
         // Drain one background fetch per loop iteration.
         if let Some(r) = state.prefetch_queue.pop_front() {
-            let lk = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut state.lookup_key_buf);
+            let lk = make_lookup_key(
+                &r.path,
+                r.query.as_deref(),
+                &r.enc,
+                &mut state.lookup_key_buf,
+            );
             if state.cache.get(lk).is_none() {
                 let synth = synth_refresh_request(&r);
                 match handle_request(

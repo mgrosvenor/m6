@@ -10,9 +10,11 @@ use std::sync::Arc;
 
 use m6_core::h1::{parse_head, HeadResult};
 use m6_core::testkit::alloc_count;
-use m6_http_lib::cache::{make_lookup_key, Cache, CacheKey, CachedResponse, Lookup, RequestDirectives};
-use m6_http_lib::http11::{write_cached_h1, HitHeaders};
+use m6_http_lib::cache::{
+    make_lookup_key, Cache, CacheKey, CachedResponse, Lookup, RequestDirectives,
+};
 use m6_http_lib::http11::status_may_have_content_length;
+use m6_http_lib::http11::{write_cached_h1, HitHeaders};
 
 #[global_allocator]
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
@@ -26,11 +28,23 @@ fn main() {
     // loop, so the count is the hit path's own.
     let cache = Cache::new();
     let headers: Arc<Vec<(String, String)>> = Arc::new(vec![
-        ("content-type".to_string(), "text/html; charset=utf-8".to_string()),
-        ("cache-control".to_string(), "public, max-age=3600".to_string()),
+        (
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        ),
+        (
+            "cache-control".to_string(),
+            "public, max-age=3600".to_string(),
+        ),
         ("etag".to_string(), "\"abc123\"".to_string()),
-        ("last-modified".to_string(), "Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-        ("date".to_string(), "Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+        (
+            "last-modified".to_string(),
+            "Mon, 01 Jan 2024 00:00:00 GMT".to_string(),
+        ),
+        (
+            "date".to_string(),
+            "Mon, 01 Jan 2024 00:00:00 GMT".to_string(),
+        ),
         ("server".to_string(), "m6".to_string()),
         ("x-powered-by".to_string(), "m6".to_string()),
         ("content-language".to_string(), "en".to_string()),
@@ -114,8 +128,7 @@ fn the_hit_bytes_match_build_response(
     let enc = m6_core::http::header(head.headers, "accept-encoding").unwrap_or("");
     let key = make_lookup_key(head.path, head.query, enc, &mut key_buf);
     let req_cc = RequestDirectives::default();
-    let (Lookup::Fresh(got, age) | Lookup::Stale(got, age)) =
-        cache.lookup_with(key, &req_cc)
+    let (Lookup::Fresh(got, age) | Lookup::Stale(got, age)) = cache.lookup_with(key, &req_cc)
     else {
         println!("the_hit_bytes_match_build_response: cache missed");
         return true;
@@ -135,7 +148,10 @@ fn the_hit_bytes_match_build_response(
         }
     };
     if resp.code != Some(200) {
-        println!("the_hit_bytes_match_build_response: wrong status {:?}", resp.code);
+        println!(
+            "the_hit_bytes_match_build_response: wrong status {:?}",
+            resp.code
+        );
         return true;
     }
     if out[body_start..] != entry.body[..] {
