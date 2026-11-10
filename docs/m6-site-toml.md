@@ -491,7 +491,7 @@ An IPv4-mapped IPv6 peer matches the IPv4 entry.
 `metrics_peers` composes with either gate.
 `/health` ignores both keys.
 On a host where a public interface could receive packets with a listed source address, filter them with reverse-path filtering, because a peer address that arrives on the wrong interface is still a completed handshake.
-With none of the three keys set, the legacy gate alone applies.
+When `metrics_require` and `metrics_peers` are unset, the legacy `metrics_token_file` gate alone applies.
 
 The example below gates `/perf` and `/traffic` on a role and one peer address.
 
@@ -616,13 +616,14 @@ Section 7 states how the process stops when a signal arrives.
 ## 7. Signal handling
 
 A process stops on `SIGTERM` or `SIGINT`, with a second signal forcing the exit, and reopens its log file on `SIGUSR1`.
+Both receipts exit 0, so a supervisor reads a stop as a clean stop.
 [`m6-http.md`](m6-http.md) owns the signal table and the shutdown sequence.
 Section 8 gives the codes a failure returns.
 
 ## 8. Exit codes
 
 m6-http exits 0 on a clean stop, 2 on a configuration or usage error, and 1 on a runtime failure.
-A port conflict on `[server].bind` is the exception: the TLS and h2c listeners exit 1, and the HTTP/3 UDP socket exits 2.
+A bind failure splits by listener: the TLS listener on `[server].bind` and the h2c listener on `h2c_bind` exit 1, and the HTTP/3 UDP socket on `[server].bind` exits 2.
 [`m6-http.md`](m6-http.md) owns the exit-code table.
 Exit 2 repeats on every start until the operator fixes the file, and section 9 lists the checks that produce it.
 
