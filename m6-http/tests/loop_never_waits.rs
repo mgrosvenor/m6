@@ -484,16 +484,6 @@ impl Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let site = dir.path().to_path_buf();
 
-        let ck = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-        ])
-        .expect("certificate");
-        let cert = site.join("cert.pem");
-        let key = site.join("key.pem");
-        std::fs::write(&cert, ck.cert.pem()).expect("cert");
-        std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
-
         let pid = std::process::id();
         let mut backends = Vec::new();
         let mut slow_seens = Vec::new();
@@ -511,23 +501,11 @@ impl Fixture {
 
         let claim = claim_port();
         let port = claim.port();
-        std::fs::write(
-            site.join("site.toml"),
-            site_toml(&glob, backend_timeout_secs),
-        )
-        .expect("site.toml");
-        std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
-        std::fs::write(
-            site.join("system.toml"),
-            system_toml(port, &cert, &key, &site.join("metrics.token")),
-        )
-        .expect("system.toml");
+        let system = write_site(&site, &site_toml(&glob, backend_timeout_secs), port);
 
         let service = Service::spawn(
             "m6-http",
-            Command::new(binary("m6-http"))
-                .arg(&site)
-                .arg(site.join("system.toml")),
+            Command::new(binary("m6-http")).arg(&site).arg(&system),
         );
         let mut service = service;
         service.wait_for_tcp(port, Duration::from_secs(20));
@@ -549,19 +527,29 @@ impl Fixture {
     }
 }
 
-fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
+/// The site config every test starts from: quiet logging, no analytics, no
+/// rate limiting, then the given `[server]` keys, backends and routes.
+fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> String {
     format!(
         "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-         [server]\nbackend_timeout_secs = {backend_timeout_secs}\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+         [server]\n{server}\n\n\
+         [log]\nlevel = \"{log_level}\"\nformat = \"text\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
-         [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\
-         [[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
+         {backends}\n\n{routes}\n"
+    )
+}
+
+fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
+    site_with(
+        "info",
+        &format!("backend_timeout_secs = {backend_timeout_secs}"),
+        &format!("[[backend]]\nname = \"app\"\nsockets = \"{glob}\""),
+        "[[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/large\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/echo\"\nbackend = \"app\"\n\n\
-         [[route]]\npath = \"/miss/{{id}}\"\nbackend = \"app\"\n"
+         [[route]]\npath = \"/miss/{id}\"\nbackend = \"app\"",
     )
 }
 
@@ -1527,17 +1515,10 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
 
 // ── URL backends and h2 upstreams in the loop ────────────────────────────────
 
-/// `site.toml` for a URL-backend test: quiet logging, no analytics, no rate
-/// limiting, the given `[server]` keys, then the backends and routes.
+/// `site.toml` for a URL-backend test: the common preamble with the given
+/// `[server]` keys, backends and routes.
 fn url_site(server: &str, backends: &str, routes: &str) -> String {
-    format!(
-        "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-         [server]\n{server}\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
-         [analytics]\nenabled = false\n\n\
-         [rate_limit]\nenabled = false\n\n\
-         {backends}\n\n{routes}\n"
-    )
+    site_with("info", server, backends, routes)
 }
 
 /// Write a site directory with a certificate, a metrics token, `site.toml` and
@@ -1551,20 +1532,10 @@ fn write_site(dir: &std::path::Path, site_toml: &str, port: u16) -> PathBuf {
     std::fs::write(&cert, ck.cert.pem()).expect("cert");
     std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
     std::fs::write(dir.join("site.toml"), site_toml).expect("site.toml");
-    std::fs::write(dir.join("metrics.token"), "loop-never-waits-token").expect("token");
+    let token = dir.join("metrics.token");
+    std::fs::write(&token, "loop-never-waits-token").expect("token");
     let system = dir.join("system.toml");
-    std::fs::write(
-        &system,
-        format!(
-            "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
-             [health]\nmetrics_token_file = \"{}\"\n\n\
-             [node]\nname = \"loop-never-waits\"\n",
-            cert.display(),
-            key.display(),
-            dir.join("metrics.token").display(),
-        ),
-    )
-    .expect("system.toml");
+    std::fs::write(&system, system_toml(port, &cert, &key, &token)).expect("system.toml");
     system
 }
 
@@ -1668,6 +1639,87 @@ fn url_backend_connections_are_reused() {
         1,
         "the URL backend saw {connections} connections; expected 1\n--- m6-http ---\n{}",
         fx.service.output()
+    );
+}
+
+/// A plain-HTTP test backend that answers one request per connection and then
+/// closes it, counting accepted connections.
+fn spawn_closing_backend(accepts: Arc<AtomicUsize>) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            accepts.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || serve_one_and_close(stream));
+        }
+    });
+    port
+}
+
+fn serve_one_and_close(mut stream: TcpStream) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        FAST_BODY.len(),
+        FAST_BODY
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+/// An idle URL connection the backend closes is dropped before the next request
+/// can be handed it.
+///
+/// The bug this catches: the slot stayed on the idle list with its descriptor
+/// deregistered, so the peer's close was invisible and the next request reused
+/// a half-closed socket and answered 502.
+#[test]
+fn an_idle_url_connection_the_backend_closes_is_dropped_before_reuse() {
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let backend_port = spawn_closing_backend(Arc::clone(&accepts));
+    let fx = UrlFixture::start(
+        // Debug logging so the test can wait until the loop has seen the close.
+        &site_with(
+            "debug",
+            "backend_timeout_secs = 5",
+            &format!("[[backend]]\nname = \"url\"\nurl = \"http://127.0.0.1:{backend_port}\""),
+            "[[route]]\npath = \"/conn/{id}\"\nbackend = \"url\"",
+        ),
+        "m6-http-url-idle-close",
+    );
+    let (first_status, first_body) = h1_get(fx.port(), "/conn/0", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("GET /conn/0: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(first_status, 200, "GET /conn/0: {first_body}");
+    assert_eq!(first_body, FAST_BODY);
+
+    // The backend answered and closed. The loop must see the close on the idle
+    // descriptor and drop the slot before the next request takes it.
+    wait_for_log(
+        &fx.service,
+        "idle url connection dropped",
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    let (second_status, second_body) = h1_get(fx.port(), "/conn/1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("GET /conn/1: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(
+        second_status,
+        200,
+        "GET /conn/1: {second_body}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+    assert_eq!(second_body, FAST_BODY);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "the dropped idle connection must be replaced by a new one"
     );
 }
 
@@ -1860,7 +1912,10 @@ fn an_unreachable_h2c_upstream_does_not_stall_cache_hits() {
     let _backend = Backend::start(sock, slow_seen, large_seen, Arc::clone(&release));
     let glob = format!("/tmp/m6lnw-{pid}-h2cdead-*.sock");
     let fx = UrlFixture::start(
-        &url_site(
+        // Debug logging so the test can wait until m6-http has dispatched the
+        // dead request before it asks for the cache hit.
+        &site_with(
+            "debug",
             "backend_timeout_secs = 1",
             &format!(
                 "[[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n[[backend]]\nname = \"dead\"\nurl = \"h2c://192.0.2.1:9\""
@@ -1876,6 +1931,13 @@ fn an_unreachable_h2c_upstream_does_not_stall_cache_hits() {
 
     let port = fx.port();
     let dead = std::thread::spawn(move || h1_get(port, "/dead", Duration::from_secs(10)));
+    // Wait until m6-http has the dead request and is starting its connect, so
+    // the hit below is issued while that connect is outstanding.
+    wait_for_log(
+        &fx.service,
+        "url backend dispatch",
+        Instant::now() + Duration::from_secs(5),
+    );
     let hit = h1_get(fx.port(), "/fast", Duration::from_secs(2));
     let (hit_status, hit_body) = match hit {
         Ok(r) => r,

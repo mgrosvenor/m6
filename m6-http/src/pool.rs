@@ -187,8 +187,9 @@ pub struct UrlBackend {
     addr: Option<std::net::SocketAddr>,
     /// The TLS client config and server name for a TLS scheme, built at start.
     pub tls: Option<m6_core::client::TlsClient>,
-    /// Keys of this backend's slots whose connection is open and idle, for
-    /// reuse. A fixed array made at start.
+    /// Keys of this backend's slots whose connection is open and registered
+    /// for read, so a peer close is seen and the key removed before a request
+    /// reuses it. A fixed array made at start.
     pub idle: IdleSlots,
     /// Skip TLS certificate verification. Test and development only.
     pub skip_verify: bool,
@@ -241,6 +242,9 @@ impl UrlScheme {
 const MAX_IDLE_URL_CONNECTIONS: usize = 8;
 
 /// Keys of open idle connections to one URL backend, last in first out.
+///
+/// A key stays only while its connection is open and its descriptor is watched
+/// for a close. `remove` is how a close is taken out of the list.
 pub struct IdleSlots {
     keys: [usize; MAX_IDLE_URL_CONNECTIONS],
     len: usize,
@@ -272,6 +276,14 @@ impl IdleSlots {
         self.keys[self.len] = key;
         self.len += 1;
         true
+    }
+
+    /// Take `key` out, because its connection is gone.
+    pub fn remove(&mut self, key: usize) {
+        if let Some(pos) = self.keys[..self.len].iter().position(|k| *k == key) {
+            self.keys.copy_within(pos + 1..self.len, pos);
+            self.len -= 1;
+        }
     }
 }
 

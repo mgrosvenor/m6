@@ -140,9 +140,10 @@ impl H2cClientPool {
         self.0.timeout(now, tick)
     }
 
-    /// Fail every stream past its deadline, cancelling it at the peer.
-    pub fn expire(&mut self, now: Instant) -> Vec<H2Completion> {
-        self.0.expire(now)
+    /// Fail every stream past its deadline, cancelling it at the peer. Returns
+    /// the completions and the tokens of connections left dead.
+    pub fn expire(&mut self, now: Instant, registry: &Registry) -> (Vec<Token>, Vec<H2Completion>) {
+        self.0.expire(now, registry)
     }
 
     /// The connection for `base_url`, to register and set its token.

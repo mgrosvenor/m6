@@ -1078,17 +1078,7 @@ impl<T: Transport> Pool<T> {
         let (token, stream_id) = {
             let conn = self.connections.get_mut(base_url).unwrap();
             let stream_id = conn.dispatch(req, &host, client_ip, original_host)?;
-            let interest = conn.phase_interest();
-            if interest != conn.registered_interest {
-                registry
-                    .reregister(
-                        &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                        conn.token(),
-                        interest,
-                    )
-                    .ok();
-                conn.registered_interest = interest;
-            }
+            Self::register_interest(conn, registry);
             (conn.token(), stream_id)
         };
         let slot = self.take_deadline_slot(token, stream_id, Instant::now());
@@ -1100,6 +1090,26 @@ impl<T: Transport> Pool<T> {
             stream.deadline_slot = slot;
         }
         Ok((token, stream_id))
+    }
+
+    /// Register the interest the connection's phase now needs.
+    ///
+    /// Every path that drives a connection calls this afterwards, so a drive
+    /// that queued frames asks for the write readiness they need. `dispatch`
+    /// calls it without driving: driving there could complete a reply before
+    /// the caller has stored its waiter.
+    fn register_interest(conn: &mut H2Client<T>, registry: &Registry) {
+        let interest = conn.phase_interest();
+        if interest != conn.registered_interest {
+            registry
+                .reregister(
+                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
+                    conn.token(),
+                    interest,
+                )
+                .ok();
+            conn.registered_interest = interest;
+        }
     }
 
     /// A deadline slot for a new stream, grown on demand.
@@ -1134,8 +1144,11 @@ impl<T: Transport> Pool<T> {
     }
 
     /// Fail every stream past its deadline, cancelling it at the peer, and
-    /// return the completions so the loop can answer each waiter.
-    pub fn expire(&mut self, now: Instant) -> Vec<H2Completion> {
+    /// return the completions so the loop can answer each waiter, plus the
+    /// tokens of connections the drives left dead. The caller reaps those like
+    /// the ones [`Pool::drive_one`] reports, or their tokens leak.
+    pub fn expire(&mut self, now: Instant, registry: &Registry) -> (Vec<Token>, Vec<H2Completion>) {
+        let mut dead = Vec::new();
         let mut out = Vec::new();
         while let Some(slot) = self.stream_deadlines.expired(now) {
             let Some((token, stream_id)) = self.deadline_owner[slot.0].take() else {
@@ -1148,13 +1161,17 @@ impl<T: Transport> Pool<T> {
             if let Some(completion) = conn.time_out_stream(stream_id) {
                 out.push(completion);
                 conn.drive();
+                Self::register_interest(conn, registry);
                 out.append(&mut conn.completions);
+                if conn.is_dead && conn.streams.is_empty() {
+                    dead.push(conn.token());
+                }
             }
         }
         for completion in &out {
             self.release_deadline_slot(completion.deadline_slot);
         }
-        out
+        (dead, out)
     }
 
     /// Store who waits for an outbound stream's reply.
@@ -1178,17 +1195,7 @@ impl<T: Transport> Pool<T> {
             return false;
         };
         conn.drive();
-        let interest = conn.phase_interest();
-        if interest != conn.registered_interest {
-            registry
-                .reregister(
-                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                    conn.token(),
-                    interest,
-                )
-                .ok();
-            conn.registered_interest = interest;
-        }
+        Self::register_interest(conn, registry);
         self.completions.append(&mut conn.completions);
         conn.is_dead && conn.streams.is_empty()
     }

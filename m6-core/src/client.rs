@@ -107,6 +107,15 @@ impl Stream {
             Stream::Unix(_) => Ok(None),
         }
     }
+
+    /// Whether the socket has a peer, which a TCP connect gets only when it
+    /// completes. A Unix connect completes at once.
+    fn is_connected(&self) -> bool {
+        match self {
+            Stream::Tcp(s) => s.peer_addr().is_ok(),
+            Stream::Unix(_) => true,
+        }
+    }
 }
 
 impl Read for Stream {
@@ -370,7 +379,9 @@ impl Upstream {
         match self.phase {
             Phase::Idle => Ok(false),
             Phase::Connecting => {
-                self.finish_connect()?;
+                if !self.finish_connect()? {
+                    return Ok(false);
+                }
                 self.transfer()
             }
             Phase::Handshaking => {
@@ -384,20 +395,24 @@ impl Upstream {
         }
     }
 
-    /// Check a completed TCP connect, and move on to the handshake or transfer.
-    fn finish_connect(&mut self) -> io::Result<()> {
+    /// Check a completed TCP connect. `Ok(false)` when it is still in progress.
+    fn finish_connect(&mut self) -> io::Result<bool> {
         let stream = self.stream.as_ref().expect("connecting stream");
-        match stream.take_error()? {
-            Some(e) => Err(e),
-            None => {
-                self.phase = if self.tls.is_some() {
-                    Phase::Handshaking
-                } else {
-                    Phase::Transfer
-                };
-                Ok(())
-            }
+        if let Some(e) = stream.take_error()? {
+            return Err(e);
         }
+        // `take_error` reports no error while a non-blocking connect is still
+        // in progress, and a write to such a socket fails with ENOTCONN. The
+        // peer address exists only once the handshake has completed.
+        if !stream.is_connected() {
+            return Ok(false);
+        }
+        self.phase = if self.tls.is_some() {
+            Phase::Handshaking
+        } else {
+            Phase::Transfer
+        };
+        Ok(true)
     }
 
     /// Drive the TLS handshake until it completes or the socket would block.
@@ -1487,6 +1502,31 @@ mod socket_tests {
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         peer.join().expect("peer");
+    }
+
+    /// A connect that has not completed is not driven as if it had.
+    ///
+    /// `take_error` reports no error while a non-blocking connect is in
+    /// progress, and a write to such a socket fails with ENOTCONN on macOS, so
+    /// before the peer-address check the first drive failed the request. RFC
+    /// 5737's TEST-NET-1 gives no answer, so the connect stays in progress.
+    #[test]
+    fn a_connect_still_in_progress_is_not_treated_as_open() {
+        let mut up = Upstream::new(64 * 1024, 16 * 1024);
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let addr: std::net::SocketAddr = "192.0.2.1:9".parse().expect("an RFC 5737 address");
+        up.start(
+            &Addr::Tcp(addr),
+            None,
+            false,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("a non-blocking connect is not an error");
+        assert!(
+            matches!(up.drive(), Ok(false)),
+            "a connect in progress must report not-ready, not the ENOTCONN a write gives"
+        );
     }
 
     /// A `Content-Length` response without `Connection: close` is reusable, and
