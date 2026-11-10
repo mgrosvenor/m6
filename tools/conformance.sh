@@ -386,6 +386,11 @@ TOML
 start_auth() {  # start_auth <bridge-port>
   local port="$1" site="$WORK/auth-site"
   mkdir -p "$site/data"
+  cat > "$site/site.toml" <<TOML
+[site]
+name   = "conformance"
+domain = "localhost"
+TOML
   if [[ ! -f "$site/auth.pem" ]]; then
     openssl genrsa -out "$site/auth.pem" 2048 2>/dev/null
     openssl rsa -in "$site/auth.pem" -pubout -out "$site/auth.pub" 2>/dev/null
