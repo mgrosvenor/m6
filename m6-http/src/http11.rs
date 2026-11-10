@@ -1195,17 +1195,7 @@ impl H1Io<'_> {
     /// response. `write_tls` alone drains rustls's outgoing buffer.
     fn flush_write(&mut self) -> io::Result<()> {
         match self {
-            H1Io::Tls { tls, stream } => {
-                while tls.wants_write() {
-                    match tls.write_tls(&mut &**stream) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(())
-            }
+            H1Io::Tls { tls, stream } => drain_writes(tls, stream),
             H1Io::Plain { .. } => Ok(()),
         }
     }
@@ -1548,6 +1538,21 @@ fn wants_keep_alive(req: &HttpRequest) -> bool {
 ///
 /// Returns whether any ciphertext was read, so a caller can loop until the
 /// socket would block.
+/// Flush rustls's outgoing ciphertext to the socket until it is empty or the
+/// socket would block. Shared by the read path (`advance_tls`) and the
+/// write-only path (`H1Io::flush_write`).
+fn drain_writes(tls: &mut ServerConnection, stream: &TcpStream) -> io::Result<()> {
+    while tls.wants_write() {
+        match tls.write_tls(&mut &*stream) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn advance_tls(
     tls: &mut ServerConnection,
     stream: &TcpStream,
@@ -1579,14 +1584,7 @@ fn advance_tls(
             Err(e) => return Err(e),
         }
     }
-    loop {
-        match tls.write_tls(&mut &*stream) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
+    drain_writes(tls, stream)?;
     Ok(progress)
 }
 
