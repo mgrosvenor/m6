@@ -12,7 +12,6 @@
 )]
 
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use m6_http_lib::forward::HttpRequest;
@@ -193,18 +192,23 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
             body: Vec::new(),
         };
         let client = format!("203.0.113.{}", i + 1);
-        let rx = conn
+        let stream_id = conn
             .dispatch(&req, "127.0.0.1", &client, "localhost")
             .expect("dispatch");
         let deadline = Instant::now() + Duration::from_secs(10);
         let resp = loop {
             conn.drive();
-            match rx.try_recv() {
-                Ok(r) => break r.expect("response"),
-                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => panic!("no response: {e:?}\n{}", svc.output()),
+            if let Some(c) = conn
+                .drain_completions()
+                .into_iter()
+                .find(|c| c.stream_id == stream_id)
+            {
+                break c.result.expect("response");
+            }
+            if Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                panic!("no response\n{}", svc.output());
             }
         };
         statuses.push(resp.status);
@@ -305,17 +309,24 @@ fn an_unlisted_peer_is_refused_at_connect() {
             };
             match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost") {
                 Err(e) => Err(format!("dispatch: {e}")),
-                Ok(rx) => {
+                Ok(stream_id) => {
                     let deadline = Instant::now() + Duration::from_secs(10);
                     loop {
                         conn.drive();
-                        match rx.try_recv() {
-                            Ok(Ok(r)) => break Ok(r.status),
-                            Ok(Err(e)) => break Err(format!("response: {e}")),
-                            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(e) => break Err(format!("receiver: {e:?}")),
+                        if let Some(c) = conn
+                            .drain_completions()
+                            .into_iter()
+                            .find(|c| c.stream_id == stream_id)
+                        {
+                            break match c.result {
+                                Ok(r) => Ok(r.status),
+                                Err(e) => Err(format!("response: {e}")),
+                            };
+                        }
+                        if Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                        } else {
+                            break Err("no response".to_string());
                         }
                     }
                 }

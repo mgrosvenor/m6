@@ -27,7 +27,7 @@ use m6_http_lib::cache::{
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
-use m6_http_lib::forward::{self, HttpResponse};
+use m6_http_lib::forward::{self, UpstreamId, Waiter};
 use m6_http_lib::health;
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
@@ -53,6 +53,41 @@ type CachedErrorPage = (std::time::Instant, Vec<(String, String)>, Vec<u8>);
 /// advertise; see issue #93 for why those are gone.
 type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 
+/// What finishing a backend reply can mean: the response is ready to write, or
+/// the reply itself needs an error page fetched, so the same waiter is stored
+/// on a fresh upstream instead. The error page fetch carries
+/// `error_status_override`, so it never re-derives another error page.
+enum Completion {
+    Ready(FinalizedResponse),
+    Pending {
+        id: UpstreamId,
+        ctx: Box<forward::PendingUrlContext>,
+    },
+}
+
+/// What applying an error mode can mean, on the request path: the response is
+/// ready, or a custom error page must be fetched first and the request parks.
+enum ErrorOutcome {
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String),
+    Pending {
+        id: UpstreamId,
+        ctx: Box<forward::PendingUrlContext>,
+    },
+}
+
+/// The loop state a completion touches, bundled so the completion helpers stay
+/// under clippy's argument ceiling.
+struct CompletionCtx<'a> {
+    state: &'a mut ServerState,
+    tcp: &'a mut Option<Http11Listener>,
+    h2c: &'a mut Option<H2cListener>,
+    registry: &'a m6_core::mio::Registry,
+    quic_port: u16,
+    udp: &'a UdpSocket,
+    connections: &'a mut HashMap<Vec<u8>, QuicConn>,
+    now: Instant,
+}
+
 /// How long a fetched error document is reused before being re-fetched.
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
@@ -64,10 +99,10 @@ use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    make_tls_server_config, H2cListener, Http11Listener, RequestOutcome, H2_IDLE_TIMEOUT_SECS,
-    INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
+    make_tls_server_config, ConnDrive, H2cListener, Http11Listener, RequestOutcome,
+    H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS, MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
-use m6_http_lib::pool::{self, PoolManager};
+use m6_http_lib::pool::PoolManager;
 use m6_http_lib::router::RouteTable;
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 
@@ -120,14 +155,6 @@ struct QuicConn {
     /// Responses awaiting flow-control credit, retried by drain_writable() the
     /// next time each stream reports writable.
     partial_responses: HashMap<u64, PendingH3Response>,
-    /// Pending backend requests for H3 streams. Keyed by H3 stream_id.
-    pending_url: HashMap<
-        u64,
-        (
-            std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-            Box<forward::PendingUrlContext>,
-        ),
-    >,
     client_addr: SocketAddr,
     /// When we last heard from this connection (for timeout tracking)
     last_active: Instant,
@@ -163,14 +190,15 @@ enum PendingH3Response {
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
-/// One in-flight socket-backend request the loop drives. The sender's receiver
-/// is parked on the waiting connection (h1, h2 or h3), and the loop sends the
-/// result into it when the upstream completes or expires.
+/// One in-flight socket-backend request the loop drives. When it completes or
+/// expires the loop writes the result straight into the waiting stream named by
+/// `waiter`, with the request context it carries.
 struct SocketUpstreamEntry {
     upstream: Option<forward::SocketUpstream>,
     member_idx: usize,
     backend_name: String,
-    tx: Option<std::sync::mpsc::Sender<std::io::Result<forward::HttpResponse>>>,
+    waiter: Option<Waiter>,
+    ctx: Option<Box<forward::PendingUrlContext>>,
     registered_interest: Interest,
 }
 
@@ -180,10 +208,19 @@ impl SocketUpstreamEntry {
             upstream: None,
             member_idx: 0,
             backend_name: String::new(),
-            tx: None,
+            waiter: None,
+            ctx: None,
             registered_interest: Interest::READABLE,
         }
     }
+}
+
+/// One URL-backend request on its own thread, polled once per iteration because
+/// the thread has no descriptor. The one channel kind that remains until EL-5b.
+struct UrlPending {
+    rx: std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
+    waiter: Option<Waiter>,
+    ctx: Option<Box<forward::PendingUrlContext>>,
 }
 
 struct ServerState {
@@ -200,29 +237,14 @@ struct ServerState {
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
     prefetch_queue: std::collections::VecDeque<Refresh>,
-    /// Background fetches dispatched to a backend and awaiting a reply.
-    ///
-    /// A real request parks its pending reply on its own connection, which
-    /// the event loop then polls. A background fetch has no connection, so
-    /// before this existed the returned receiver was simply dropped: on a
-    /// cache node -- whose only backend is origin over h2c, i.e. always the
-    /// async path -- every prefetch and every stale-while-revalidate refresh
-    /// was dispatched and then silently discarded, so nothing was ever
-    /// refilled. A socket-backend refresh now returns Pending too and parks
-    /// here until its upstream completes in the loop.
-    background_pending: Vec<(
-        std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-        Box<forward::PendingUrlContext>,
-    )>,
     /// In-flight socket-backend requests, one per slot, driven when their
     /// descriptor fires. Each entry carries the non-blocking upstream, the pool
-    /// member it was taken from, the backend name, and the one-shot sender
-    /// whose receiver the h1, h2 or h3 connection parks on.
+    /// member it was taken from, the backend name, and who waits for the reply.
     socket_upstreams: Slots<SocketUpstreamEntry>,
-    /// Tokens of connections waiting on a backend channel, driven once per
-    /// iteration because a channel has no descriptor that fires. Interim code
-    /// removed by EL-3b (socket and h2 upstreams) and EL-5b (URL upstreams).
-    parked: Vec<Token>,
+    /// URL-backend requests on their own thread, polled once per iteration
+    /// because the thread has no descriptor. The one channel kind that remains
+    /// until EL-5b.
+    url_pending: Vec<UrlPending>,
     /// The read timeout (handshakes and HTTP/1.1), as deadlines.
     read_timeouts: Timeouts,
     /// The HTTP/2 idle timeout, as deadlines.
@@ -756,38 +778,6 @@ fn on_request_impl(
     outcome
 }
 
-/// Finalize a URL-backend reply and record it, shared by the two listeners.
-fn on_response_impl(
-    state: &mut ServerState,
-    http_result: std::io::Result<forward::HttpResponse>,
-    ctx: &forward::PendingUrlContext,
-    quic_port: u16,
-    h2c: bool,
-) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
-    let (status, headers, body, backend_name) =
-        finalize_url_response(http_result, ctx, quic_port, state);
-    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-    let (version, iface) = if h2c {
-        (HttpVersion::Http2, state.h2c_iface)
-    } else {
-        (HttpVersion::from_wire(&ctx.req.version), state.tls_iface)
-    };
-    let chan = Channel::new(version, iface);
-    state
-        .stats
-        .record(elapsed_ns, false, status, chan, &ctx.backend_name);
-    debug!(
-        path = %ctx.req.path,
-        status,
-        version = %ctx.req.version,
-        backend = %backend_name,
-        latency_ns = elapsed_ns,
-        cache_hit = false,
-        "request complete (async url backend)"
-    );
-    (status, headers, body, backend_name)
-}
-
 // ── Token and slot helpers ────────────────────────────────────────────────────
 
 /// Take one token from the shared table, growing the three deadline tables to
@@ -877,16 +867,15 @@ fn accept_h2c(
     (full, !full && handled == MAX_ACCEPTS_PER_WAKE)
 }
 
-/// What one connection turn did, for the parked list and the timeouts.
+/// What one connection turn did, for the timeouts.
 enum ConnOutcome {
-    Parked,
     Active,
     Closed,
     /// The token was freed earlier in this batch: skip it.
     Gone,
 }
 
-/// Drive the connection whose token fired or whose parked slot is being polled.
+/// Drive the connection whose token fired.
 fn drive_conn_token(
     token: Token,
     state: &mut ServerState,
@@ -905,22 +894,30 @@ fn drive_conn_token(
     let mut on_request = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
         on_request_impl(state, req, ip, quic_port, registry, is_h2c)
     };
-    let mut on_response = |state: &mut ServerState,
-                           r: std::io::Result<forward::HttpResponse>,
-                           ctx: &forward::PendingUrlContext| {
-        on_response_impl(state, r, ctx, quic_port, is_h2c)
-    };
-    let drive = if is_h2c {
+    let mut drive = if is_h2c {
         match h2c.as_mut() {
-            Some(h) => h.drive_one(slot, state, &mut on_request, &mut on_response, registry),
+            Some(h) => h.drive_one(slot, state, &mut on_request, registry),
             None => return ConnOutcome::Closed,
         }
     } else {
         match tcp.as_mut() {
-            Some(t) => t.drive_one(slot, state, &mut on_request, &mut on_response, registry),
+            Some(t) => t.drive_one(slot, state, &mut on_request, registry),
             None => return ConnOutcome::Closed,
         }
     };
+    // Park each request this turn dispatched to a backend, storing the waiter
+    // in the upstream slot it named.
+    let mut pending = std::mem::take(&mut drive.pending);
+    for d in pending.drain(..) {
+        let waiter = match d.stream {
+            None => Waiter::H1 { conn: token },
+            Some(stream) => Waiter::H2 {
+                conn: token,
+                stream,
+            },
+        };
+        park(state, d.id, d.ctx, waiter);
+    }
     if let Some(hs) = drive.handshake {
         let v = if hs.is_h2 {
             HttpVersion::Http2
@@ -939,17 +936,17 @@ fn drive_conn_token(
             state.h2_idle_timeouts.touch(token, now);
         }
     }
-    if drive.restarted {
-        state.read_timeouts.touch(token, now);
-    }
-    if drive.moved {
-        state.h2_idle_timeouts.touch(token, now);
+    after_conn_drive(token, &drive, state, tcp, h2c, registry, now);
+    // Give the pending buffer back to the listener so the next drive reuses it.
+    if is_h2c {
+        if let Some(h) = h2c.as_mut() {
+            h.return_pending(pending);
+        }
+    } else if let Some(t) = tcp.as_mut() {
+        t.return_pending(pending);
     }
     if drive.done {
-        close_conn_token(token, state, tcp, h2c, registry);
         ConnOutcome::Closed
-    } else if drive.parked {
-        ConnOutcome::Parked
     } else {
         ConnOutcome::Active
     }
@@ -979,30 +976,147 @@ fn close_conn_token(
     state.upstream_timeouts.clear(token);
 }
 
-/// Drive the one socket upstream whose descriptor fired.
-fn drive_socket_upstream_one(
-    token: Token,
+/// Store a parked request's waiter and context in the upstream slot it named.
+fn park(
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    id: UpstreamId,
+    ctx: Box<forward::PendingUrlContext>,
+    waiter: Waiter,
 ) {
-    let Source::SocketUpstream(slot) = *state.sources.get(token.0) else {
+    match id {
+        UpstreamId::Socket(slot) => {
+            let e = state.socket_upstreams.get_mut(slot);
+            e.waiter = Some(waiter);
+            e.ctx = Some(ctx);
+        }
+        UpstreamId::H2c { conn, stream } => {
+            state.h2c_pool.set_waiter(conn, stream, waiter, ctx);
+        }
+        UpstreamId::H2s { conn, stream } => {
+            state.h2s_pool.set_waiter(conn, stream, waiter, ctx);
+        }
+        UpstreamId::Url(idx) => {
+            let e = &mut state.url_pending[idx];
+            e.waiter = Some(waiter);
+            e.ctx = Some(ctx);
+        }
+    }
+}
+
+/// Finish a connection drive: touch timeouts and close the connection when the
+/// drive says it is done.
+fn after_conn_drive(
+    token: Token,
+    drive: &ConnDrive,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::mio::Registry,
+    now: Instant,
+) {
+    if drive.restarted {
+        state.read_timeouts.touch(token, now);
+    }
+    if drive.moved {
+        state.h2_idle_timeouts.touch(token, now);
+    }
+    if drive.done {
+        close_conn_token(token, state, tcp, h2c, registry);
+    }
+}
+
+/// Write a finished response straight into the waiting stream, in this turn.
+fn write_waiter(
+    waiter: Waiter,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    method: &str,
+    cx: &mut CompletionCtx<'_>,
+) {
+    match waiter {
+        Waiter::H1 { conn } => {
+            if let Source::TlsConn(slot) = *cx.state.sources.get(conn.0) {
+                if let Some(t) = cx.tcp {
+                    let drive = t.complete_h1(slot, status, &headers, body, method, cx.registry);
+                    after_conn_drive(conn, &drive, cx.state, cx.tcp, cx.h2c, cx.registry, cx.now);
+                }
+            }
+        }
+        Waiter::H2 { conn, stream } => {
+            let done = match *cx.state.sources.get(conn.0) {
+                Source::TlsConn(slot) => cx.tcp.as_mut().is_some_and(|t| {
+                    t.complete_h2(slot, stream, (status, headers, body), method, cx.registry)
+                }),
+                Source::H2cConn(slot) => cx.h2c.as_mut().is_some_and(|h| {
+                    h.complete_h2(slot, stream, (status, headers, body), method, cx.registry)
+                }),
+                _ => false,
+            };
+            if done {
+                close_conn_token(conn, cx.state, cx.tcp, cx.h2c, cx.registry);
+            }
+        }
+        Waiter::H3 { conn_id, stream } => {
+            if let Some(qconn) = cx.connections.get_mut(&conn_id) {
+                send_h3_response(
+                    stream,
+                    qconn,
+                    status,
+                    &headers,
+                    Bytes::from(body),
+                    method.eq_ignore_ascii_case("HEAD"),
+                );
+                flush_conn(cx.udp, qconn);
+            }
+        }
+        Waiter::Background => {
+            // The finalize step already filled the cache; there is no client.
+        }
+    }
+}
+
+/// Finish a backend reply: finalize it, then write it to the waiter, or re-park
+/// the same waiter on the upstream that fetches the custom error page.
+fn complete_waiter(
+    result: std::io::Result<forward::HttpResponse>,
+    ctx: Box<forward::PendingUrlContext>,
+    waiter: Waiter,
+    cx: &mut CompletionCtx<'_>,
+) {
+    let method = ctx.req.method.clone();
+    match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
+        Completion::Ready((status, headers, body, _)) => {
+            write_waiter(waiter, status, headers, body, &method, cx);
+        }
+        Completion::Pending { id, ctx } => {
+            park(cx.state, id, ctx, waiter);
+        }
+    }
+}
+
+/// Drive the one socket upstream whose descriptor fired.
+fn drive_socket_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
+    let Source::SocketUpstream(slot) = *cx.state.sources.get(token.0) else {
         return;
     };
     let result = {
-        let entry = state.socket_upstreams.get_mut(slot);
+        let entry = cx.state.socket_upstreams.get_mut(slot);
         let Some(upstream) = entry.upstream.as_mut() else {
             return;
         };
         let interest = upstream.interest();
         if interest != entry.registered_interest {
-            registry
+            cx.registry
                 .reregister(&mut SourceFd(&upstream.raw_fd()), token, interest)
                 .ok();
             entry.registered_interest = interest;
         }
         match upstream.drive() {
             Some(result) => {
-                registry.deregister(&mut SourceFd(&upstream.raw_fd())).ok();
+                cx.registry
+                    .deregister(&mut SourceFd(&upstream.raw_fd()))
+                    .ok();
                 Some(result)
             }
             None => None,
@@ -1011,54 +1125,59 @@ fn drive_socket_upstream_one(
     let Some(result) = result else {
         return;
     };
-    let entry = state.socket_upstreams.get_mut(slot);
+    let entry = cx.state.socket_upstreams.get_mut(slot);
     let member_idx = entry.member_idx;
     let backend_name = std::mem::take(&mut entry.backend_name);
-    let tx = entry.tx.take();
+    let waiter = entry.waiter.take();
+    let ctx = entry.ctx.take();
     entry.upstream.take();
-    state.socket_upstreams.free(slot);
-    *state.sources.get_mut(token.0) = Source::Vacant;
-    state.sources.free(token.0);
-    state.upstream_timeouts.clear(token);
-    if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+    cx.state.socket_upstreams.free(slot);
+    *cx.state.sources.get_mut(token.0) = Source::Vacant;
+    cx.state.sources.free(token.0);
+    cx.state.upstream_timeouts.clear(token);
+    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
         if result.is_err() {
             pool.mark_failed(member_idx);
         } else {
             pool.release(member_idx);
         }
     }
-    if let Some(tx) = tx {
-        let _ = tx.send(result);
+    if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
+        complete_waiter(result, ctx, waiter, cx);
     }
 }
 
 /// Close the socket upstream whose deadline passed.
-fn expire_socket_upstream(
-    token: Token,
-    state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
-) {
-    let Source::SocketUpstream(slot) = *state.sources.get(token.0) else {
+fn expire_socket_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
+    let Source::SocketUpstream(slot) = *cx.state.sources.get(token.0) else {
         return;
     };
-    let entry = state.socket_upstreams.get_mut(slot);
+    let entry = cx.state.socket_upstreams.get_mut(slot);
     if let Some(upstream) = entry.upstream.take() {
-        registry.deregister(&mut SourceFd(&upstream.raw_fd())).ok();
+        cx.registry
+            .deregister(&mut SourceFd(&upstream.raw_fd()))
+            .ok();
     }
     let member_idx = entry.member_idx;
     let backend_name = std::mem::take(&mut entry.backend_name);
-    let tx = entry.tx.take();
-    state.socket_upstreams.free(slot);
-    *state.sources.get_mut(token.0) = Source::Vacant;
-    state.sources.free(token.0);
-    if let Some(pool) = state.pool_manager.get_pool_mut(&backend_name) {
+    let waiter = entry.waiter.take();
+    let ctx = entry.ctx.take();
+    cx.state.socket_upstreams.free(slot);
+    *cx.state.sources.get_mut(token.0) = Source::Vacant;
+    cx.state.sources.free(token.0);
+    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
         pool.mark_failed(member_idx);
     }
-    if let Some(tx) = tx {
-        let _ = tx.send(Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "backend timed out",
-        )));
+    if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
+        complete_waiter(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend timed out",
+            )),
+            ctx,
+            waiter,
+            cx,
+        );
     }
 }
 
@@ -1347,7 +1466,7 @@ fn event_loop(
                 }
                 Token(k) => match *state.sources.get(k) {
                     Source::TlsConn(_) | Source::H2cConn(_) => {
-                        let outcome = drive_conn_token(
+                        drive_conn_token(
                             Token(k),
                             state,
                             &mut tcp,
@@ -1356,17 +1475,28 @@ fn event_loop(
                             quic_port,
                             now,
                         );
-                        if matches!(outcome, ConnOutcome::Parked)
-                            && !state.parked.contains(&Token(k))
-                        {
-                            state.parked.push(Token(k));
-                        }
                     }
                     Source::H2cUpstream => {
                         if state.h2c_pool.drive_one(Token(k), poll.registry()) {
                             state.h2c_pool.remove_by_token(Token(k), poll.registry());
                             *state.sources.get_mut(k) = Source::Vacant;
                             state.sources.free(k);
+                        }
+                        let completions = state.h2c_pool.drain_completions();
+                        for c in completions {
+                            if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
+                                let mut cx = CompletionCtx {
+                                    state: &mut *state,
+                                    tcp: &mut tcp,
+                                    h2c: &mut h2c,
+                                    registry: poll.registry(),
+                                    quic_port,
+                                    udp: &udp,
+                                    connections: &mut connections,
+                                    now,
+                                };
+                                complete_waiter(c.result, ctx, waiter, &mut cx);
+                            }
                         }
                     }
                     Source::H2sUpstream => {
@@ -1375,33 +1505,38 @@ fn event_loop(
                             *state.sources.get_mut(k) = Source::Vacant;
                             state.sources.free(k);
                         }
+                        let completions = state.h2s_pool.drain_completions();
+                        for c in completions {
+                            if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
+                                let mut cx = CompletionCtx {
+                                    state: &mut *state,
+                                    tcp: &mut tcp,
+                                    h2c: &mut h2c,
+                                    registry: poll.registry(),
+                                    quic_port,
+                                    udp: &udp,
+                                    connections: &mut connections,
+                                    now,
+                                };
+                                complete_waiter(c.result, ctx, waiter, &mut cx);
+                            }
+                        }
                     }
                     Source::SocketUpstream(_) => {
-                        drive_socket_upstream_one(Token(k), state, poll.registry());
+                        let mut cx = CompletionCtx {
+                            state: &mut *state,
+                            tcp: &mut tcp,
+                            h2c: &mut h2c,
+                            registry: poll.registry(),
+                            quic_port,
+                            udp: &udp,
+                            connections: &mut connections,
+                            now,
+                        };
+                        drive_socket_upstream_one(Token(k), &mut cx);
                     }
                     Source::Vacant => {}
                 },
-            }
-        }
-
-        // Drive the parked connections once each: their reply arrives on a
-        // channel, which has no descriptor that wakes the loop.
-        let mut i = 0;
-        while i < state.parked.len() {
-            let token = state.parked[i];
-            match drive_conn_token(
-                token,
-                state,
-                &mut tcp,
-                &mut h2c,
-                poll.registry(),
-                quic_port,
-                now,
-            ) {
-                ConnOutcome::Parked => i += 1,
-                ConnOutcome::Active | ConnOutcome::Closed | ConnOutcome::Gone => {
-                    state.parked.swap_remove(i);
-                }
             }
         }
 
@@ -1414,7 +1549,17 @@ fn event_loop(
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
         while let Some(token) = state.upstream_timeouts.expired(Instant::now()) {
-            expire_socket_upstream(token, state, poll.registry());
+            let mut cx = CompletionCtx {
+                state: &mut *state,
+                tcp: &mut tcp,
+                h2c: &mut h2c,
+                registry: poll.registry(),
+                quic_port,
+                udp: &udp,
+                connections: &mut connections,
+                now,
+            };
+            expire_socket_upstream(token, &mut cx);
         }
 
         // A slot came free while the token table was full: accept again.
@@ -1426,36 +1571,37 @@ fn event_loop(
         // Drive connection timeouts and flush pending sends.
         flush_all(&udp, &mut connections);
 
-        // Poll pending URL-backend responses for H3 streams.
-        for qconn in connections.values_mut() {
-            let sids: Vec<u64> = qconn.pending_url.keys().copied().collect();
-            for sid in sids {
-                use std::sync::mpsc::TryRecvError;
-                let result: Option<std::io::Result<forward::HttpResponse>> =
-                    match qconn.pending_url.get(&sid) {
-                        Some((rx, _)) => match rx.try_recv() {
-                            Ok(r) => Some(r),
-                            Err(TryRecvError::Empty) => None,
-                            Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "url backend thread died",
-                            ))),
-                        },
-                        None => None,
-                    };
-                if let Some(http_result) = result {
-                    let (_, ctx) = qconn.pending_url.remove(&sid).unwrap();
-                    let (status, resp_headers, body, _) =
-                        finalize_url_response(http_result, &ctx, quic_port, state);
-                    send_h3_response(
-                        sid,
-                        qconn,
-                        status,
-                        &resp_headers,
-                        Bytes::from(body),
-                        ctx.req.method.eq_ignore_ascii_case("HEAD"),
-                    );
+        // Poll pending URL-backend replies, the one channel kind that remains:
+        // their thread has no descriptor that wakes the loop.
+        let mut idx = 0;
+        while idx < state.url_pending.len() {
+            use std::sync::mpsc::TryRecvError;
+            let got = match state.url_pending[idx].rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "url backend thread died",
+                ))),
+            };
+            match got {
+                Some(result) => {
+                    let entry = state.url_pending.swap_remove(idx);
+                    if let (Some(waiter), Some(ctx)) = (entry.waiter, entry.ctx) {
+                        let mut cx = CompletionCtx {
+                            state: &mut *state,
+                            tcp: &mut tcp,
+                            h2c: &mut h2c,
+                            registry: poll.registry(),
+                            quic_port,
+                            udp: &udp,
+                            connections: &mut connections,
+                            now,
+                        };
+                        complete_waiter(result, ctx, waiter, &mut cx);
+                    }
                 }
+                None => idx += 1,
             }
         }
 
@@ -1469,38 +1615,6 @@ fn event_loop(
             .maybe_emit(state.pool_manager.total_active_members())
         {
             state.stats.set_event_loop(trace.report());
-        }
-
-        // Complete any background fetch whose reply has arrived.
-        if !state.background_pending.is_empty() {
-            use std::sync::mpsc::TryRecvError;
-            let mut done: Vec<(
-                std::io::Result<forward::HttpResponse>,
-                Box<forward::PendingUrlContext>,
-            )> = Vec::new();
-            let mut idx = 0;
-            while idx < state.background_pending.len() {
-                let got = match state.background_pending[idx].0.try_recv() {
-                    Ok(r) => Some(r),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "url backend thread died",
-                    ))),
-                };
-                match got {
-                    Some(result) => {
-                        let (_, ctx) = state.background_pending.remove(idx);
-                        done.push((result, ctx));
-                    }
-                    None => idx += 1,
-                }
-            }
-            for (result, ctx) in done {
-                let path = ctx.req.path.clone();
-                let _ = finalize_url_response(result, &ctx, quic_port, state);
-                debug!(path = %path, "background fetch: cache filled (async)");
-            }
         }
 
         // Drain one background fetch per loop iteration.
@@ -1521,9 +1635,9 @@ fn event_loop(
                     RequestOutcome::Ready(..) => {
                         debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
                     }
-                    RequestOutcome::Pending { rx, ctx } => {
-                        if state.background_pending.len() < MAX_REFRESH_QUEUE {
-                            state.background_pending.push((rx, ctx));
+                    RequestOutcome::Pending { id, ctx } => {
+                        if state.url_pending.len() < MAX_REFRESH_QUEUE {
+                            park(state, id, ctx, Waiter::Background);
                         }
                     }
                 }
@@ -1614,7 +1728,6 @@ fn drain_udp(
                     h3_conn: None,
                     pending: HashMap::new(),
                     partial_responses: HashMap::new(),
-                    pending_url: HashMap::new(),
                     client_addr: from,
                     last_active: Instant::now(),
                     created: Instant::now(),
@@ -1713,7 +1826,7 @@ fn drain_udp(
 
         // Process H3 events
         if qconn.h3_conn.is_some() {
-            process_h3(qconn, udp, state, h3);
+            process_h3(qconn, &key, state, h3);
         }
 
         // Send any pending QUIC packets
@@ -1723,7 +1836,7 @@ fn drain_udp(
 
 // ── H3 event processing ───────────────────────────────────────────────────────
 
-fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, h3_loop: &H3Loop) {
+fn process_h3(qconn: &mut QuicConn, conn_id: &[u8], state: &mut ServerState, h3_loop: &H3Loop) {
     // client_ip is NOT computed here — deferred to cache-miss path in handle_h3_request.
 
     while let Some(h3) = qconn.h3_conn.as_mut() {
@@ -1746,7 +1859,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, h
                 entry.headers_done = true;
                 if !more_frames {
                     // No body — process immediately
-                    handle_h3_request(stream_id, qconn, state, h3_loop);
+                    handle_h3_request(stream_id, qconn, state, h3_loop, conn_id);
                     // After handle_h3_request qconn may be mutated; restart loop
                     continue;
                 }
@@ -1791,7 +1904,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, h
             Ok((stream_id, quiche::h3::Event::Finished)) => {
                 // Body fully received (or no body) — process
                 if qconn.pending.contains_key(&stream_id) {
-                    handle_h3_request(stream_id, qconn, state, h3_loop);
+                    handle_h3_request(stream_id, qconn, state, h3_loop, conn_id);
                     continue;
                 }
             }
@@ -1814,7 +1927,13 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, h
 
 // ── Request handling ──────────────────────────────────────────────────────────
 
-fn handle_h3_request(stream_id: u64, qconn: &mut QuicConn, state: &mut ServerState, h3: &H3Loop) {
+fn handle_h3_request(
+    stream_id: u64,
+    qconn: &mut QuicConn,
+    state: &mut ServerState,
+    h3: &H3Loop,
+    conn_id: &[u8],
+) {
     let req = match qconn.pending.remove(&stream_id) {
         Some(r) => r,
         None => return,
@@ -2216,9 +2335,18 @@ fn handle_h3_request(stream_id: u64, qconn: &mut QuicConn, state: &mut ServerSta
                 http_req.method.eq_ignore_ascii_case("HEAD"),
             );
         }
-        RequestOutcome::Pending { rx, ctx } => {
-            // URL backend dispatched async — store and poll later.
-            qconn.pending_url.insert(stream_id, (rx, ctx));
+        RequestOutcome::Pending { id, ctx } => {
+            // Store who waits in the upstream's slot; the completion writes the
+            // response straight into this stream.
+            park(
+                state,
+                id,
+                ctx,
+                Waiter::H3 {
+                    conn_id: conn_id.to_vec(),
+                    stream: stream_id,
+                },
+            );
         }
     }
 }
@@ -2504,7 +2632,7 @@ fn origin_host<'a>(req: &'a forward::HttpRequest, config: &'a config::Config) ->
 
 /// Why a socket-upstream launch failed, so the two callers can answer it their
 /// own way: the main socket branch answers 502 or 503, the custom-error-page
-/// branch falls back to the synchronous `apply_error_mode`.
+/// branch falls back to the internal page.
 enum SocketLaunchError {
     UnknownBackend,
     Empty,
@@ -2515,7 +2643,7 @@ enum SocketLaunchError {
 
 /// Encode already done by the caller; this takes the member, starts the
 /// non-blocking upstream, registers it, and parks it in `socket_upstreams`.
-/// Returns the receiver the caller's connection waits on.
+/// Returns the upstream's slot key, so the caller can store its waiter there.
 fn launch_socket_upstream(
     state: &mut ServerState,
     registry: &m6_core::mio::Registry,
@@ -2523,7 +2651,7 @@ fn launch_socket_upstream(
     method: &str,
     backend_name: &str,
     timeout: std::time::Duration,
-) -> Result<std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>, SocketLaunchError> {
+) -> Result<usize, SocketLaunchError> {
     let (socket_path, member_idx) = match state.pool_manager.get_pool_mut(backend_name) {
         Some(pool) => pool.take_member().map_err(|_| SocketLaunchError::Empty)?,
         None => return Err(SocketLaunchError::UnknownBackend),
@@ -2567,7 +2695,6 @@ fn launch_socket_upstream(
         }
         return Err(SocketLaunchError::Register(e));
     }
-    let (tx, rx) = std::sync::mpsc::channel();
     state
         .upstream_timeouts
         .touch(token, std::time::Instant::now());
@@ -2576,10 +2703,11 @@ fn launch_socket_upstream(
         upstream: Some(upstream),
         member_idx,
         backend_name: backend_name.to_string(),
-        tx: Some(tx),
+        waiter: None,
+        ctx: None,
         registered_interest: interest,
     };
-    Ok(rx)
+    Ok(owner.key)
 }
 
 fn handle_request_inner(
@@ -2812,8 +2940,7 @@ fn handle_request_inner(
     // so a public client cannot claim it -- the same rule that decides whether a
     // forwarded client address is trusted on that listener.
     if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
-        let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-        return RequestOutcome::Ready(s, h, b, n);
+        return request_error(404, req, client_ip, state, None, registry);
     }
 
     // Route lookup
@@ -2835,18 +2962,16 @@ fn handle_request_inner(
                 ];
                 return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string());
             }
-            // Prefer fetching the real custom error page over the local
-            // socket-pool path (`apply_error_mode`/`forward_to_backend` only
-            // know how to reach Unix-socket backends). On a node whose error
+            // Prefer fetching the real custom error page. On a node whose error
             // backend is itself a URL/H2C/H2S backend — every cache node,
             // whose only backend is the origin — dispatch that fetch async
             // and let it resolve through the normal Pending machinery.
-            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state, registry)
+            if let Some(outcome) =
+                dispatch_custom_error_async(404, req, client_ip, state, registry, None)
             {
                 return outcome;
             }
-            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(404, req, client_ip, state, None, registry);
         }
     };
 
@@ -2881,9 +3006,16 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some("no token".to_string()),
                     };
-                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                    add_bearer_challenge(&mut h);
-                    return RequestOutcome::Ready(s, h, b, n);
+                    match apply_error_mode(401, req, client_ip, state, Some(&ctx), registry) {
+                        ErrorOutcome::Ready(s, mut h, b, n) => {
+                            add_bearer_challenge(&mut h);
+                            return RequestOutcome::Ready(s, h, b, n);
+                        }
+                        ErrorOutcome::Pending { id, mut ctx } => {
+                            add_bearer_challenge(&mut ctx.extra_headers);
+                            return RequestOutcome::Pending { id, ctx };
+                        }
+                    }
                 }
                 Err(auth::Refusal::Invalid(e)) => {
                     warn!(path = %req.path, error = %e, "auth: token verification failed");
@@ -2892,9 +3024,16 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some(e.to_string()),
                     };
-                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                    add_bearer_challenge(&mut h);
-                    return RequestOutcome::Ready(s, h, b, n);
+                    match apply_error_mode(401, req, client_ip, state, Some(&ctx), registry) {
+                        ErrorOutcome::Ready(s, mut h, b, n) => {
+                            add_bearer_challenge(&mut h);
+                            return RequestOutcome::Ready(s, h, b, n);
+                        }
+                        ErrorOutcome::Pending { id, mut ctx } => {
+                            add_bearer_challenge(&mut ctx.extra_headers);
+                            return RequestOutcome::Pending { id, ctx };
+                        }
+                    }
                 }
                 Err(auth::Refusal::Insufficient) => {
                     warn!(
@@ -2907,8 +3046,7 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some(format!("requires: {require}")),
                     };
-                    let (s, h, b, n) = apply_error_mode(403, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n);
+                    return request_error(403, req, client_ip, state, Some(&ctx), registry);
                 }
                 // Forward verified claims to backend as X-Auth-Claims header
                 // (base64-encoded JSON so renderers can inspect them).
@@ -2965,16 +3103,17 @@ fn handle_request_inner(
             is_prefetch,
             start: std::time::Instant::now(),
             error_status_override: None,
+            extra_headers: Vec::new(),
         };
 
-        let rx = if url.starts_with("h2c://") {
+        let id = if url.starts_with("h2c://") {
             // Persistent non-blocking H2C client — event-loop managed.
             match ensure_h2c_conn(state, &url, registry).and_then(|()| {
                 state
                     .h2c_pool
                     .dispatch(&url, req, client_ip, &original_host, registry)
             }) {
-                Ok(rx) => rx,
+                Ok((conn, stream)) => UpstreamId::H2c { conn, stream },
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
                     let ctx = error::ErrorContext {
@@ -2982,8 +3121,7 @@ fn handle_request_inner(
                         backend: Some(backend_name.clone()),
                         detail: Some(e.to_string()),
                     };
-                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n);
+                    return request_error(502, req, client_ip, state, Some(&ctx), registry);
                 }
             }
         } else if url.starts_with("h2s://") {
@@ -2993,7 +3131,7 @@ fn handle_request_inner(
                     .h2s_pool
                     .dispatch(&url, req, client_ip, &original_host, registry)
             }) {
-                Ok(rx) => rx,
+                Ok((conn, stream)) => UpstreamId::H2s { conn, stream },
                 Err(e) => {
                     warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
                     let ctx = error::ErrorContext {
@@ -3001,22 +3139,28 @@ fn handle_request_inner(
                         backend: Some(backend_name.clone()),
                         detail: Some(e.to_string()),
                     };
-                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n);
+                    return request_error(502, req, client_ip, state, Some(&ctx), registry);
                 }
             }
         } else {
-            forward::dispatch_url_request(
+            let rx = forward::dispatch_url_request(
                 url,
                 req.clone(),
                 client_ip.to_string(),
                 original_host.to_string(),
                 Some(timeout),
                 _tls_config,
-            )
+            );
+            let idx = state.url_pending.len();
+            state.url_pending.push(UrlPending {
+                rx,
+                waiter: None,
+                ctx: None,
+            });
+            UpstreamId::Url(idx)
         };
         return RequestOutcome::Pending {
-            rx,
+            id,
             ctx: Box::new(ctx),
         };
     }
@@ -3038,12 +3182,11 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(e.to_string()),
             };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
         }
     };
 
-    let rx = match launch_socket_upstream(
+    let slot = match launch_socket_upstream(
         state,
         registry,
         request,
@@ -3051,7 +3194,7 @@ fn handle_request_inner(
         &backend_name,
         timeout,
     ) {
-        Ok(rx) => rx,
+        Ok(slot) => slot,
         Err(SocketLaunchError::UnknownBackend) => {
             warn!(backend = %backend_name, "unknown backend");
             let err_ctx = error::ErrorContext {
@@ -3059,8 +3202,7 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(format!("unknown backend: {backend_name}")),
             };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
         }
         Err(SocketLaunchError::Empty) => {
             warn!(backend = %backend_name, "socket pool empty");
@@ -3069,8 +3211,7 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some("pool empty".to_string()),
             };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
         }
         Err(SocketLaunchError::BacklogFull) => {
             // The listen backlog is full: the member is alive and busy (E2,
@@ -3081,9 +3222,17 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some("backend listen queue full".to_string()),
             };
-            let (s, mut h, b, n) = apply_error_mode(503, req, client_ip, state, Some(&err_ctx));
-            h.push(("Retry-After".to_string(), "1".to_string()));
-            return RequestOutcome::Ready(s, h, b, n);
+            match apply_error_mode(503, req, client_ip, state, Some(&err_ctx), registry) {
+                ErrorOutcome::Ready(s, mut h, b, n) => {
+                    h.push(("Retry-After".to_string(), "1".to_string()));
+                    return RequestOutcome::Ready(s, h, b, n);
+                }
+                ErrorOutcome::Pending { id, mut ctx } => {
+                    ctx.extra_headers
+                        .push(("Retry-After".to_string(), "1".to_string()));
+                    return RequestOutcome::Pending { id, ctx };
+                }
+            }
         }
         Err(SocketLaunchError::Connect(e)) => {
             warn!(backend = %backend_name, error = %e, "backend error");
@@ -3092,8 +3241,7 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(e.to_string()),
             };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
         }
         Err(SocketLaunchError::Register(e)) => {
             warn!(backend = %backend_name, error = %e, "registering socket upstream");
@@ -3102,8 +3250,7 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(e.to_string()),
             };
-            let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&err_ctx));
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
         }
     };
 
@@ -3118,9 +3265,10 @@ fn handle_request_inner(
         is_prefetch,
         start: backend_start,
         error_status_override: None,
+        extra_headers: Vec::new(),
     };
     RequestOutcome::Pending {
-        rx,
+        id: UpstreamId::Socket(slot),
         ctx: Box::new(ctx),
     }
 }
@@ -3166,16 +3314,17 @@ fn check_rate_limit(
 /// `error_status_override` so the completion returns the fetched body under the
 /// original failing status.
 ///
-/// Returns `None` when there's no custom error path configured, the request
-/// already targets it (anti-recursion), or the error backend cannot be reached
-/// this way -- the caller should fall back to the existing synchronous
-/// `apply_error_mode` in every `None` case.
+/// `error_ctx` supplies the route, backend and detail the error page renderer
+/// shows in verbose mode. Returns `None` when there is no custom error path
+/// configured, the request already targets it (anti-recursion), or the error
+/// backend cannot be reached -- the caller falls back to the internal page.
 fn dispatch_custom_error_async(
     status: u16,
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
     registry: &m6_core::mio::Registry,
+    error_ctx: Option<&error::ErrorContext>,
 ) -> Option<RequestOutcome> {
     let error_path = match &state.error_mode {
         ErrorMode::Custom { path } => path.clone(),
@@ -3199,24 +3348,21 @@ fn dispatch_custom_error_async(
         .map(|(_, h, b)| (h.clone(), b.clone()));
 
     if let Some((mut headers, body)) = served_locally {
-        // Logged here explicitly. Analytics for a route miss is recorded by
-        // the code around the dispatch, and returning early skips all of it --
-        // so without this, answering locally would have made every 404
-        // invisible in the request log. Trading origin round trips for
-        // blindness would be a bad bargain, and the visibility is the reason
-        // this shortcut is acceptable at all.
-        //
-        // `req.path` is the caller's real path, not whatever this body was
-        // rendered for, so the log still shows exactly what was asked for.
         let latency_ns = std::time::Instant::now().elapsed().as_nanos() as u64;
         analytics::finish_response(
             state.config.analytics.enabled,
             &mut headers,
             &req.headers,
-            &analytics::Event { node: &state.config.node.name, path: &req.path, status, cache_state: // Neither HIT nor MISS: the response cache was not consulted and
-            // no backend was contacted. Labelling it either would corrupt the
-            // hit rate in both directions.
-            "LOCAL", client_ip, latency_ns: Some(latency_ns) },
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status,
+                // Neither HIT nor MISS: the response cache was not consulted
+                // and no backend was contacted.
+                cache_state: "LOCAL",
+                client_ip,
+                latency_ns: Some(latency_ns),
+            },
         );
         return Some(RequestOutcome::Ready(
             status,
@@ -3230,7 +3376,18 @@ fn dispatch_custom_error_async(
     let original_host = origin_host(req, &state.config).to_string();
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
-    let error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+    let mut error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+    if let Some(c) = error_ctx {
+        if let Some(ref r) = c.route {
+            error_query.push_str(&format!("&route={}", urlencoded(r)));
+        }
+        if let Some(ref b) = c.backend {
+            error_query.push_str(&format!("&backend={}", urlencoded(b)));
+        }
+        if let Some(ref d) = c.detail {
+            error_query.push_str(&format!("&detail={}", urlencoded(d)));
+        }
+    }
     let error_req = forward::HttpRequest {
         method: "GET".to_string(),
         path: error_path,
@@ -3251,45 +3408,52 @@ fn dispatch_custom_error_async(
             kind: forward::PendingKind::Url,
             route_path: None,
             cacheable: false,
-            // A custom-error-page fetch on behalf of a real client, so it is not a
-            // background prefetch and its analytics line must still be written.
             is_prefetch: false,
             start: std::time::Instant::now(),
             error_status_override: Some(status),
+            extra_headers: Vec::new(),
         };
-        let rx = if url.starts_with("h2c://") {
+        let id = if url.starts_with("h2c://") {
             ensure_h2c_conn(state, &url, registry).ok()?;
-            state
+            let (conn, stream) = state
                 .h2c_pool
                 .dispatch(&url, &error_req, client_ip, &original_host, registry)
-                .ok()?
+                .ok()?;
+            UpstreamId::H2c { conn, stream }
         } else if url.starts_with("h2s://") {
             ensure_h2s_conn(state, &url, tls_config.clone(), registry).ok()?;
-            state
+            let (conn, stream) = state
                 .h2s_pool
                 .dispatch(&url, &error_req, client_ip, &original_host, registry)
-                .ok()?
+                .ok()?;
+            UpstreamId::H2s { conn, stream }
         } else {
-            forward::dispatch_url_request(
+            let rx = forward::dispatch_url_request(
                 url,
                 error_req,
                 client_ip.to_string(),
                 original_host.to_string(),
                 Some(timeout),
                 tls_config,
-            )
+            );
+            let idx = state.url_pending.len();
+            state.url_pending.push(UrlPending {
+                rx,
+                waiter: None,
+                ctx: None,
+            });
+            UpstreamId::Url(idx)
         };
         return Some(RequestOutcome::Pending {
-            rx,
+            id,
             ctx: Box::new(ctx),
         });
     }
 
     // Socket backend: a non-blocking upstream, the same way the socket branch
-    // reaches a normal route. Any failure falls back to the synchronous
-    // `apply_error_mode`, which handles it identically.
+    // reaches a normal route.
     let request = forward::encode_request(&error_req, client_ip, &original_host).ok()?;
-    let rx =
+    let slot =
         launch_socket_upstream(state, registry, request, "GET", &backend_name, timeout).ok()?;
 
     let ctx = forward::PendingUrlContext {
@@ -3303,9 +3467,10 @@ fn dispatch_custom_error_async(
         is_prefetch: false,
         start: std::time::Instant::now(),
         error_status_override: Some(status),
+        extra_headers: Vec::new(),
     };
     Some(RequestOutcome::Pending {
-        rx,
+        id: UpstreamId::Socket(slot),
         ctx: Box::new(ctx),
     })
 }
@@ -3324,18 +3489,21 @@ fn add_bearer_challenge(headers: &mut Vec<(String, String)>) {
 
 /// Apply the configured error mode for a given status code.
 ///
-/// For `Custom` mode, performs an internal GET to `<errors.path>?status=N&from=/original-path`.
-/// Falls back to `Internal` mode if the fetch fails or the request is already to the error path.
+/// For `Custom` mode, when the error page is not already held locally, this
+/// starts an upstream carrying `error_status_override` and returns `Pending`,
+/// so the fetch never blocks the loop. Falls back to `Internal` mode if the
+/// fetch cannot be started or the request is already to the error path.
 fn apply_error_mode(
     status: u16,
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
     ctx: Option<&error::ErrorContext>,
-) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+    registry: &m6_core::mio::Registry,
+) -> ErrorOutcome {
     let verbose = state.config.errors.verbose_fallback;
     match &state.error_mode {
-        ErrorMode::Status => (
+        ErrorMode::Status => ErrorOutcome::Ready(
             status,
             vec![("Content-Type".to_string(), "text/plain".to_string())],
             vec![],
@@ -3344,7 +3512,7 @@ fn apply_error_mode(
         ErrorMode::Internal => {
             let reason = error::status_reason(status);
             let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-            (
+            ErrorOutcome::Ready(
                 status,
                 vec![(
                     "Content-Type".to_string(),
@@ -3361,7 +3529,7 @@ fn apply_error_mode(
             if req.path == error_path {
                 let reason = error::status_reason(status);
                 let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-                return (
+                return ErrorOutcome::Ready(
                     status,
                     vec![(
                         "Content-Type".to_string(),
@@ -3372,62 +3540,14 @@ fn apply_error_mode(
                 );
             }
 
-            // Build error page request: GET <error_path>?status=N&from=/original-path[&route=...&backend=...&detail=...]
-            let mut error_query = format!("status={}&from={}", status, urlencoded(&req.path));
-            if let Some(c) = ctx {
-                if let Some(ref r) = c.route {
-                    error_query.push_str(&format!("&route={}", urlencoded(r)));
-                }
-                if let Some(ref b) = c.backend {
-                    error_query.push_str(&format!("&backend={}", urlencoded(b)));
-                }
-                if let Some(ref d) = c.detail {
-                    error_query.push_str(&format!("&detail={}", urlencoded(d)));
-                }
-            }
-            let error_req = forward::HttpRequest {
-                method: "GET".to_string(),
-                path: error_path.clone(),
-                query: Some(error_query),
-                version: "HTTP/3".to_string(),
-                headers: vec![(
-                    "Host".to_string(),
-                    m6_core::headers::get(&req.headers[..], "host")
-                        .unwrap_or_default()
-                        .to_string(),
-                )],
-                body: vec![],
-            };
-
-            // Look up the error backend via the route table.
-            let error_backend = match state.route_table.at(&error_path) {
-                Some(entry) => entry.backend.clone(),
+            match dispatch_custom_error_async(status, req, client_ip, state, registry, ctx) {
+                Some(RequestOutcome::Ready(s, h, b, n)) => ErrorOutcome::Ready(s, h, b, n),
+                Some(RequestOutcome::Pending { id, ctx }) => ErrorOutcome::Pending { id, ctx },
                 None => {
-                    warn!(error_path = %error_path, "custom error: no route for error path, falling back to internal");
+                    warn!(error_path = %error_path, "custom error: cannot fetch the error page, falling back to internal");
                     let reason = error::status_reason(status);
                     let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-                    return (
-                        status,
-                        vec![(
-                            "Content-Type".to_string(),
-                            "text/html; charset=utf-8".to_string(),
-                        )],
-                        body,
-                        "error".to_string(),
-                    );
-                }
-            };
-
-            match forward_to_backend(&error_req, &error_backend, client_ip, state) {
-                Ok(err_resp) => {
-                    // Return the error page body with the ORIGINAL status code.
-                    (status, err_resp.headers, err_resp.body, "error".to_string())
-                }
-                Err(e) => {
-                    warn!(error = %e, "custom error: error page fetch failed, falling back to internal");
-                    let reason = error::status_reason(status);
-                    let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-                    (
+                    ErrorOutcome::Ready(
                         status,
                         vec![(
                             "Content-Type".to_string(),
@@ -3442,46 +3562,19 @@ fn apply_error_mode(
     }
 }
 
-fn forward_to_backend(
+/// Apply an error mode and turn the outcome straight into a request outcome, so
+/// the request path returns either a ready response or a parked fetch.
+fn request_error(
+    status: u16,
     req: &forward::HttpRequest,
-    backend_name: &str,
     client_ip: &str,
     state: &mut ServerState,
-) -> Result<HttpResponse, String> {
-    let original_host = origin_host(req, &state.config);
-
-    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-
-    if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-        match pool.take_member() {
-            Ok((socket_path, member_idx)) => {
-                match forward::forward_request_timeout(
-                    socket_path,
-                    req,
-                    client_ip,
-                    original_host,
-                    Some(timeout),
-                ) {
-                    Ok(resp) => {
-                        pool.release(member_idx);
-                        Ok(resp)
-                    }
-                    // m6-http refused the request itself, before connecting:
-                    // the request's fault, not the backend's.
-                    Err(e) if forward::is_refusal(&e) => {
-                        pool.cancel(member_idx);
-                        Err(e.to_string())
-                    }
-                    Err(e) => {
-                        pool.mark_failed(member_idx);
-                        Err(e.to_string())
-                    }
-                }
-            }
-            Err(pool::PoolError::Empty) => Err("pool empty".to_string()),
-        }
-    } else {
-        Err(format!("unknown backend: {}", backend_name))
+    ctx: Option<&error::ErrorContext>,
+    registry: &m6_core::mio::Registry,
+) -> RequestOutcome {
+    match apply_error_mode(status, req, client_ip, state, ctx, registry) {
+        ErrorOutcome::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
+        ErrorOutcome::Pending { id, ctx } => RequestOutcome::Pending { id, ctx },
     }
 }
 
@@ -3732,11 +3825,6 @@ fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
     ));
 }
 
-/// Finish a socket-backend reply with the socket branch's own completion
-/// semantics: cache insert, error mode for any status >= 400 (with actionable
-/// headers preserved), and `finish_response` analytics. This is the body of the
-/// old synchronous socket branch, moved here so a reply the loop drove follows
-/// the identical path.
 /// The internal error page a failed custom-error-page fetch falls back to, for
 /// both the socket and URL override branches. Only the caller's warn label
 /// differs.
@@ -3776,12 +3864,17 @@ fn error_page_fallback(
     (original_status, headers, body, "error".to_string())
 }
 
+/// Finish a socket-backend reply with the socket branch's own completion
+/// semantics: cache insert, error mode for any status >= 400 (with actionable
+/// headers preserved), and `finish_response` analytics. A reply that needs a
+/// custom error page returns `Completion::Pending` with the error-page fetch.
 fn complete_socket_response(
     result: std::io::Result<forward::HttpResponse>,
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> FinalizedResponse {
+    registry: &m6_core::mio::Registry,
+) -> Completion {
     let req = &ctx.req;
     let backend_name = &ctx.backend_name;
     let content_encoding = &ctx.enc;
@@ -3796,6 +3889,7 @@ fn complete_socket_response(
         return match result {
             Ok(http_resp) => {
                 let mut headers = http_resp.headers;
+                headers.extend(ctx.extra_headers.clone());
                 state.error_pages.insert(
                     original_status,
                     (
@@ -3817,16 +3911,16 @@ fn complete_socket_response(
                         latency_ns: Some(latency_ns),
                     },
                 );
-                (
+                Completion::Ready((
                     original_status,
                     headers,
                     http_resp.body,
                     "error".to_string(),
-                )
+                ))
             }
             Err(e) => {
                 warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (socket), falling back to internal");
-                error_page_fallback(original_status, ctx, state)
+                Completion::Ready(error_page_fallback(original_status, ctx, state))
             }
         };
     }
@@ -3874,45 +3968,56 @@ fn complete_socket_response(
             backend: Some(backend_name.clone()),
             detail: Some(detail),
         };
-        let (s, mut h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx));
-        error::preserve_actionable_headers(&resp_headers, &mut h);
-        // The old socket branch returned Ready and its h1/h2/h3 caller applied
-        // alt-svc, so an error response carried it too.
-        set_alt_svc(&mut h, quic_port);
+        match apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx), registry) {
+            ErrorOutcome::Ready(s, mut h, b, n) => {
+                error::preserve_actionable_headers(&resp_headers, &mut h);
+                // The old socket branch returned Ready and its h1/h2/h3 caller
+                // applied alt-svc, so an error response carried it too.
+                set_alt_svc(&mut h, quic_port);
+                let backend_ns = ctx.start.elapsed().as_nanos() as u64;
+                analytics::finish_response(
+                    analytics_enabled,
+                    &mut h,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: s,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(backend_ns),
+                    },
+                );
+                Completion::Ready((s, h, b, n))
+            }
+            ErrorOutcome::Pending {
+                id,
+                ctx: mut new_ctx,
+            } => {
+                error::preserve_actionable_headers(&resp_headers, &mut new_ctx.extra_headers);
+                set_alt_svc(&mut new_ctx.extra_headers, quic_port);
+                Completion::Pending { id, ctx: new_ctx }
+            }
+        }
+    } else {
         let backend_ns = ctx.start.elapsed().as_nanos() as u64;
         analytics::finish_response(
             analytics_enabled,
-            &mut h,
+            &mut resp_headers,
             &req.headers,
             &analytics::Event {
                 node: &state.config.node.name,
                 path: &req.path,
-                status: s,
+                status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(backend_ns),
             },
         );
-        return (s, h, b, n);
+        set_alt_svc(&mut resp_headers, quic_port);
+
+        Completion::Ready((status, resp_headers, body, backend_name.clone()))
     }
-
-    let backend_ns = ctx.start.elapsed().as_nanos() as u64;
-    analytics::finish_response(
-        analytics_enabled,
-        &mut resp_headers,
-        &req.headers,
-        &analytics::Event {
-            node: &state.config.node.name,
-            path: &req.path,
-            status,
-            cache_state: "MISS",
-            client_ip: &ctx.client_ip,
-            latency_ns: Some(backend_ns),
-        },
-    );
-    set_alt_svc(&mut resp_headers, quic_port);
-
-    (status, resp_headers, body, backend_name.clone())
 }
 
 /// Called when a pending backend reply arrives, whether from a URL-backend
@@ -3929,19 +4034,25 @@ fn finalize_url_response(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> FinalizedResponse {
+    registry: &m6_core::mio::Registry,
+) -> Completion {
     let describedby = state.config.site.describedby.clone();
-    let mut r = if ctx.kind == forward::PendingKind::Socket {
-        complete_socket_response(http_result, ctx, quic_port, state)
+    let outcome = if ctx.kind == forward::PendingKind::Socket {
+        complete_socket_response(http_result, ctx, quic_port, state, registry)
     } else {
-        finalize_url_response_inner(http_result, ctx, quic_port, state)
+        finalize_url_response_inner(http_result, ctx, quic_port, state, registry)
     };
-    let compresses = state.config.backend_compresses(&r.3);
-    set_vary_accept_encoding(&mut r.1, compresses);
-    set_date(&mut r.1);
-    set_describedby_link(&mut r.1, &describedby);
-    invalidate_after_unsafe_method(state, &ctx.req, r.0, &r.1);
-    r
+    match outcome {
+        Completion::Ready((s, mut h, b, n)) => {
+            let compresses = state.config.backend_compresses(&n);
+            set_vary_accept_encoding(&mut h, compresses);
+            set_date(&mut h);
+            set_describedby_link(&mut h, &describedby);
+            invalidate_after_unsafe_method(state, &ctx.req, s, &h);
+            Completion::Ready((s, h, b, n))
+        }
+        pending => pending,
+    }
 }
 
 fn finalize_url_response_inner(
@@ -3949,7 +4060,8 @@ fn finalize_url_response_inner(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> FinalizedResponse {
+    registry: &m6_core::mio::Registry,
+) -> Completion {
     let req = &ctx.req;
     let enc = &ctx.enc;
 
@@ -3967,27 +4079,11 @@ fn finalize_url_response_inner(
     // another error page on top of it — if even this fetch fails (backend
     // down), fall back to the plain internal page under the original status.
     if let Some(original_status) = ctx.error_status_override {
-        // Bug fix: this dispatch fetches a real error page for a real
-        // client's real failing request (ctx.req/ctx.client_ip belong to
-        // them, not a discarded synthetic probe) — skipping analytics here
-        // meant any node running `[errors] mode = "custom"` had zero
-        // visibility into who was hitting error pages, which is the entire
-        // point of that feature.
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
         return match http_result {
             Ok(http_resp) => {
-                // finish_proxied_response: the error-page backend can itself
-                // be another m6-http instance (a cache node fetching origin's
-                // rendered error page), same reasoning as the main MISS tail.
                 let mut headers = http_resp.headers;
-                // Hold this document so the next route miss -- on any path --
-                // is answered locally instead of crossing the link again.
-                //
-                // Stored BEFORE analytics stamps per-request headers onto it:
-                // finish_proxied_response mints a Set-Cookie session id, and
-                // replaying one visitor's session cookie to every later 404
-                // would hand them all the same session. The held copy must be
-                // the document, not this exchange.
+                headers.extend(ctx.extra_headers.clone());
                 state.error_pages.insert(
                     original_status,
                     (
@@ -4009,23 +4105,22 @@ fn finalize_url_response_inner(
                         latency_ns: Some(latency_ns),
                     },
                 );
-                (
+                Completion::Ready((
                     original_status,
                     headers,
                     http_resp.body,
                     "error".to_string(),
-                )
+                ))
             }
             Err(e) => {
                 warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (async), falling back to internal");
-                error_page_fallback(original_status, ctx, state)
+                Completion::Ready(error_page_fallback(original_status, ctx, state))
             }
         };
     }
 
     let (status, resp_headers, body, used_backend, is_connection_failure) = match http_result {
         Ok(mut http_resp) => {
-            // Same request-side gate as the synchronous path above.
             // Same as the synchronous path: Date is stamped before the cache
             // decision so the stored entry carries the generation time.
             set_date(&mut http_resp.headers);
@@ -4034,13 +4129,6 @@ fn finalize_url_response_inner(
                 && should_cache(http_resp.status, &http_resp.headers)
             {
                 let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
-                // strip_set_cookie matters here specifically: this backend
-                // can itself be another m6-http instance (a cache node's
-                // only backend is the origin), whose response may already
-                // carry a Set-Cookie IT minted for this one request. Caching
-                // it verbatim would replay that one visitor's session cookie
-                // to every future visitor who hits this same cache entry —
-                // the content is shared and cacheable, the cookie isn't.
                 state.cache.insert(
                     key,
                     CachedResponse {
@@ -4077,53 +4165,47 @@ fn finalize_url_response_inner(
             backend: Some(ctx.backend_name.clone()),
             detail: Some(format!("backend returned {status}")),
         };
-        let (s, mut h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx));
-        // Bug fix: this is the final 502/504 a real client actually receives
-        // when the backend is unreachable — arguably the single most
-        // operationally important case to have in analytics (a backend-down
-        // incident should show up in the request/status log, not just an
-        // operational warn!()), and the pre-fix code skipped it unconditionally.
+        match apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx), registry) {
+            ErrorOutcome::Ready(s, mut h, b, n) => {
+                let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+                analytics::finish_response(
+                    analytics_on,
+                    &mut h,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: s,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
+                );
+                Completion::Ready((s, h, b, n))
+            }
+            ErrorOutcome::Pending { id, ctx } => Completion::Pending { id, ctx },
+        }
+    } else {
+        let mut headers_with_altsvc = resp_headers;
+        set_alt_svc(&mut headers_with_altsvc, quic_port);
+
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
-        analytics::finish_response(
+        analytics::finish_proxied_response(
             analytics_on,
-            &mut h,
+            &mut headers_with_altsvc,
             &req.headers,
             &analytics::Event {
                 node: &state.config.node.name,
                 path: &req.path,
-                status: s,
+                status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(latency_ns),
             },
         );
-        return (s, h, b, n);
+
+        Completion::Ready((status, headers_with_altsvc, body, used_backend))
     }
-
-    let mut headers_with_altsvc = resp_headers;
-    set_alt_svc(&mut headers_with_altsvc, quic_port);
-
-    // finish_proxied_response, not finish_response: this backend may itself
-    // be another m6-http instance (a cache node's only backend is the
-    // origin), whose response can already carry a _m6sid the origin just
-    // minted for this same request — see the doc comment on
-    // finish_proxied_response for why that matters.
-    let latency_ns = ctx.start.elapsed().as_nanos() as u64;
-    analytics::finish_proxied_response(
-        analytics_on,
-        &mut headers_with_altsvc,
-        &req.headers,
-        &analytics::Event {
-            node: &state.config.node.name,
-            path: &req.path,
-            status,
-            cache_state: "MISS",
-            client_ip: &ctx.client_ip,
-            latency_ns: Some(latency_ns),
-        },
-    );
-
-    (status, headers_with_altsvc, body, used_backend)
 }
 
 // ── QUIC packet flush helpers ─────────────────────────────────────────────────
@@ -4597,9 +4679,8 @@ fn run(args: Vec<String>) -> i32 {
         stats: Stats::new(),
         sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
         prefetch_queue: std::collections::VecDeque::new(),
-        background_pending: Vec::new(),
         socket_upstreams: Slots::new(INITIAL_CONNECTIONS, ceiling, SocketUpstreamEntry::empty),
-        parked: Vec::with_capacity(INITIAL_CONNECTIONS),
+        url_pending: Vec::new(),
         read_timeouts: Timeouts::new(
             INITIAL_CONNECTIONS,
             std::time::Duration::from_secs(READ_TIMEOUT_SECS),

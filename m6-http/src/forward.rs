@@ -6,6 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
 
+use m6_core::mio::Token;
+
 /// Hop-by-hop headers to remove before forwarding.
 pub const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -1471,6 +1473,51 @@ pub enum PendingKind {
     Socket,
 }
 
+/// Which upstream a pending request was dispatched to, so the loop can store
+/// who waits in that upstream's own slot and complete the waiter directly when
+/// the upstream finishes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpstreamId {
+    /// A socket upstream, by its `socket_upstreams` slot key.
+    Socket(usize),
+    /// An h2c pool stream, by the connection token and the outbound stream id.
+    H2c { conn: Token, stream: u32 },
+    /// An h2s pool stream, by the connection token and the outbound stream id.
+    H2s { conn: Token, stream: u32 },
+    /// A URL backend running on its own thread, by its pending-list index.
+    Url(usize),
+}
+
+/// Who is waiting for an upstream reply, so a completion can be written
+/// straight into the waiting stream in the same turn the upstream finished.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Waiter {
+    H1 {
+        conn: Token,
+    },
+    H2 {
+        conn: Token,
+        stream: u32,
+    },
+    H3 {
+        conn_id: Vec<u8>,
+        stream: u64,
+    },
+    /// A background fetch has no connection; the reply only fills the cache.
+    Background,
+}
+
+/// One request the loop dispatched and parked, reported by a connection turn so
+/// the loop's owner can store the waiter in the upstream's slot.
+pub struct PendingDispatch {
+    /// The server-side stream id, only for an HTTP/2 request.
+    pub stream: Option<u32>,
+    /// The upstream the request was dispatched to.
+    pub id: UpstreamId,
+    /// The request context the completion path finalizes with.
+    pub ctx: Box<PendingUrlContext>,
+}
+
 /// Context carried alongside a pending backend receiver so the event loop can
 /// finish processing (cache insertion, hints, error-mode) when the reply
 /// arrives, whether that reply came from a URL-backend thread or a socket
@@ -1505,6 +1552,10 @@ pub struct PendingUrlContext {
     /// ORIGINAL failing status so the fetched body can be returned under it.
     /// `None` for every ordinary request dispatch.
     pub error_status_override: Option<u16>,
+    /// Response headers to add when the fetched error page is served, such as
+    /// `WWW-Authenticate` for a 401 or `Retry-After` for a 503. Empty for every
+    /// ordinary dispatch.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// Dispatch a URL-backend request to a dedicated I/O thread.

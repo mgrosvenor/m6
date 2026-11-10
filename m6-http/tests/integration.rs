@@ -129,12 +129,6 @@ where
             let (s, h, b, be) = handler(req, ip);
             RequestOutcome::Ready(s, h, b, be)
         };
-        let mut on_response =
-            |_: &mut (),
-             _: std::io::Result<m6_http_lib::forward::HttpResponse>,
-             _: &m6_http_lib::forward::PendingUrlContext| {
-                (503, vec![], vec![], "none".to_string())
-            };
         while !stop2.load(Ordering::Relaxed) {
             match poll.poll(&mut events, Some(Duration::from_millis(2))) {
                 Ok(()) => {}
@@ -168,13 +162,8 @@ where
                         }
                     }
                     Token(k) => {
-                        let drive = listener.drive_one(
-                            k,
-                            &mut (),
-                            &mut on_request,
-                            &mut on_response,
-                            poll.registry(),
-                        );
+                        let drive =
+                            listener.drive_one(k, &mut (), &mut on_request, poll.registry());
                         if drive.done {
                             listener.close_one(k, poll.registry());
                         }

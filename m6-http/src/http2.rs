@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::time::Instant;
 
 use crate::fields::validate_request_headers;
-use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
+use crate::forward::{HttpRequest, PendingDispatch};
 use crate::http11::RequestOutcome;
 
 /// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over a private backbone).
@@ -268,10 +268,7 @@ struct H2Stream {
     resp_body: Option<Vec<u8>>,
     resp_sent: usize,
     /// Pending backend request: set by maybe_dispatch when backend is async.
-    pending_rx: Option<(
-        std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        Box<PendingUrlContext>,
-    )>,
+    pending: bool,
 }
 
 impl H2Stream {
@@ -285,7 +282,7 @@ impl H2Stream {
             recv_window: DEFAULT_WINDOW as i32,
             resp_body: None,
             resp_sent: 0,
-            pending_rx: None,
+            pending: false,
         }
     }
 }
@@ -369,6 +366,10 @@ pub struct Http2Conn {
     goaway_sent: bool,
     continuation_stream_id: Option<u32>,
     header_block_buf: Vec<u8>,
+    /// Requests this connection dispatched to a backend, drained by `drive`
+    /// into the loop owner's buffer. Reused so a turn that parks allocates
+    /// nothing.
+    pending_dispatch: Vec<PendingDispatch>,
 
     peer_initial_window: i32,
     peer_max_frame: u32,
@@ -407,6 +408,7 @@ impl Http2Conn {
             goaway_sent: false,
             continuation_stream_id: None,
             header_block_buf: Vec::new(),
+            pending_dispatch: Vec::with_capacity(16),
             peer_initial_window: DEFAULT_WINDOW as i32,
             peer_max_frame: DEFAULT_MAX_FRAME,
             conn_recv_window: DEFAULT_WINDOW as i32,
@@ -436,36 +438,24 @@ impl Http2Conn {
         !self.send_buf.is_empty()
     }
 
-    /// Whether any stream waits on a URL-backend channel, so the connection is
-    /// parked and driven once per iteration.
-    pub fn has_pending_url(&self) -> bool {
-        self.streams.values().any(|s| s.pending_rx.is_some())
-    }
-
     /// Drive one step: pump I/O, parse frames, dispatch requests. Returns
     /// whether any bytes were received, so the loop touches the idle timeout.
-    pub fn drive<S, F, G>(
+    /// Requests dispatched to a backend are appended to `pending`, for the
+    /// loop's owner to park.
+    pub fn drive<S, F>(
         &mut self,
         mut io: H2Io<'_>,
         client_ip: &str,
         state: &mut S,
         on_request: &mut F,
-        on_response: &mut G,
+        pending: &mut Vec<PendingDispatch>,
     ) -> bool
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(
-            &mut S,
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         if self.phase == Phase::Done {
             return false;
         }
-
-        // Poll any pending URL-backend receivers before processing new frames.
-        self.poll_pending_url(state, on_response);
 
         let mut moved = false;
         match self.fill_recv(&mut io) {
@@ -511,6 +501,10 @@ impl Http2Conn {
             tracing::trace!("h2 flush_io: {e}");
             self.phase = Phase::Done;
         }
+
+        // Hand the requests this turn dispatched to a backend up to the loop's
+        // owner, which stores each waiter in the upstream slot it names.
+        pending.append(&mut self.pending_dispatch);
 
         if self.phase == Phase::GoingAway
             && self
@@ -1631,7 +1625,7 @@ impl Http2Conn {
                     || is_headersonly(&s.headers))
                 && s.state != StreamState::Closed
                 && s.resp_body.is_none()  // not already dispatched
-                && s.pending_rx.is_none() // not already waiting on async
+                && !s.pending // not already waiting on async
             })
             .unwrap_or(false);
 
@@ -1718,10 +1712,15 @@ impl Http2Conn {
                     &method,
                 );
             }
-            RequestOutcome::Pending { rx, ctx } => {
+            RequestOutcome::Pending { id, ctx } => {
                 if let Some(s) = self.streams.get_mut(&stream_id) {
-                    s.pending_rx = Some((rx, ctx));
+                    s.pending = true;
                 }
+                self.pending_dispatch.push(PendingDispatch {
+                    stream: Some(stream_id),
+                    id,
+                    ctx,
+                });
             }
         }
     }
@@ -1797,61 +1796,36 @@ impl Http2Conn {
         self.flush_pending_streams();
     }
 
-    /// Poll all streams that have a pending URL-backend receiver.
-    fn poll_pending_url<S, G>(&mut self, state: &mut S, on_response: &mut G)
-    where
-        G: FnMut(
-            &mut S,
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
-    {
-        use std::sync::mpsc::TryRecvError;
-        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
-        for sid in stream_ids {
-            // Check without taking ownership first.
-            // rx sends io::Result<HttpResponse>, so try_recv() gives Result<io::Result<HttpResponse>, TryRecvError>.
-            let result: Option<std::io::Result<HttpResponse>> = match self.streams.get(&sid) {
-                Some(s) => match &s.pending_rx {
-                    Some((rx, _)) => match rx.try_recv() {
-                        Ok(r) => Some(r), // r is already io::Result<HttpResponse>
-                        Err(TryRecvError::Empty) => None,
-                        Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "url backend thread died",
-                        ))),
-                    },
-                    None => None,
-                },
-                None => None,
-            };
-            if let Some(http_result) = result {
-                // Move out the pending context.
-                let ctx = self
-                    .streams
-                    .get_mut(&sid)
-                    .and_then(|s| s.pending_rx.take())
-                    .map(|(_, ctx)| ctx);
-                if let Some(ctx) = ctx {
-                    let (status, resp_headers, resp_body, _) =
-                        on_response(state, http_result, &ctx);
-                    // Same HEAD framing as the sync path above.
-                    let advertised_len = resp_body.len();
-                    let resp_body = if ctx.req.method.eq_ignore_ascii_case("HEAD") {
-                        Vec::new()
-                    } else {
-                        resp_body
-                    };
-                    let header_block =
-                        self.encode_response_headers(status, &resp_headers, advertised_len);
-                    self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, sid, &header_block);
-                    if let Some(s) = self.streams.get_mut(&sid) {
-                        s.resp_body = Some(resp_body);
-                        s.resp_sent = 0;
-                    }
-                    self.flush_pending_streams();
-                }
-            }
+    /// Write a finished backend response into a waiting stream and flush the
+    /// connection now, so the reply starts leaving in this turn. A stream that
+    /// is gone (reset by the client) is a no-op, so a stale completion drops
+    /// its result rather than writing to a closed stream.
+    pub fn complete_stream(
+        &mut self,
+        io: &mut H2Io<'_>,
+        stream_id: u32,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        method: &str,
+    ) {
+        if !self.streams.get(&stream_id).is_some_and(|s| s.pending) {
+            return;
+        }
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.pending = false;
+        }
+        self.dispatch_h2_response(
+            stream_id,
+            H2Response {
+                status,
+                headers,
+                body,
+            },
+            method,
+        );
+        if self.flush_io(io).is_err() {
+            self.phase = Phase::Done;
         }
     }
 

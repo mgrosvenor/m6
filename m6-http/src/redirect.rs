@@ -163,12 +163,6 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         Duration::from_secs(crate::http11::READ_TIMEOUT_SECS),
     );
     let mut on_request = |_: &mut (), req: &HttpRequest, _: &str| redirect_for(req);
-    // No URL backends here, so no pending response can ever arrive.
-    let mut on_response = |_: &mut (),
-                           _: std::io::Result<crate::forward::HttpResponse>,
-                           _: &crate::forward::PendingUrlContext| {
-        (500, Vec::new(), Vec::new(), String::new())
-    };
 
     info!(bind = %bind, "HTTP->HTTPS redirect listener started");
 
@@ -234,13 +228,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                     }
                 }
                 Token(k) => {
-                    let drive = listener.drive_one(
-                        k,
-                        &mut (),
-                        &mut on_request,
-                        &mut on_response,
-                        poll.registry(),
-                    );
+                    let drive = listener.drive_one(k, &mut (), &mut on_request, poll.registry());
                     if drive.restarted {
                         read_timeouts.touch(Token(k), now);
                     }

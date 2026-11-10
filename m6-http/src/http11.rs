@@ -28,7 +28,7 @@ use std::time::Instant;
 use rustls::ServerConnection;
 use tracing::warn;
 
-use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
+use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
 use crate::http2::{H2Io, Http2Conn};
 use m6_core::event::{Slots, Taken};
 use m6_core::mio::unix::SourceFd;
@@ -40,13 +40,11 @@ use m6_core::mio::{Interest, Registry, Token};
 pub enum RequestOutcome {
     /// Response is available immediately (cache hit, socket backend, auth error, etc.)
     Ready(u16, Vec<(String, String)>, Vec<u8>, String),
-    /// Backend I/O dispatched; poll `rx` with `try_recv()`.
-    ///
-    /// `ctx` is boxed so the enum stays small: `Pending` is created and consumed
-    /// within one loop iteration, never stored in bulk, while `Ready` is the
-    /// common, allocation-light path.
+    /// Backend I/O dispatched. The caller parks the request by reporting the
+    /// `UpstreamId` and the request context back through `ConnDrive`, so the
+    /// loop's owner can store the waiter in that upstream's slot.
     Pending {
-        rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
+        id: UpstreamId,
         ctx: Box<PendingUrlContext>,
     },
 }
@@ -123,10 +121,11 @@ pub struct Conn {
 }
 
 /// What one connection's turn reports to the loop that owns the timeouts and
-/// the parked list.
+/// the pending dispatches.
 pub struct ConnDrive {
-    /// The connection now waits on a backend channel: park it.
-    pub parked: bool,
+    /// Requests this turn dispatched to a backend: the loop stores each one's
+    /// waiter in the upstream slot it names.
+    pub pending: Vec<PendingDispatch>,
     /// The connection is finished: deregister, free its token and close it.
     pub done: bool,
     /// An HTTP/1.1 request window began: touch the read timeout.
@@ -175,15 +174,6 @@ impl Conn {
         }
     }
 
-    /// Whether this connection now waits on a backend channel.
-    fn is_parked(&self) -> bool {
-        match &self.kind {
-            ConnKind::Http1(c) => matches!(c.state, H1State::WaitingBackend { .. }),
-            ConnKind::Http2(c) => c.has_pending_url(),
-            ConnKind::Handshake { .. } => false,
-        }
-    }
-
     /// The interest this connection should be registered with next.
     fn interest(&self) -> Interest {
         match &self.kind {
@@ -196,7 +186,7 @@ impl Conn {
             }
             ConnKind::Http1(h1) => match h1.state {
                 H1State::Reading { .. } => Interest::READABLE,
-                H1State::WaitingBackend { .. } => Interest::READABLE,
+                H1State::WaitingBackend => Interest::READABLE,
                 H1State::Writing { .. } => Interest::READABLE | Interest::WRITABLE,
                 H1State::Done => Interest::READABLE,
             },
@@ -217,13 +207,10 @@ enum H1State {
     Reading {
         buf: Vec<u8>,
     },
-    WaitingBackend {
-        rx: std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        /// Boxed: this context is much larger than the read and write buffers
-        /// the other variants hold, and an inline copy sized every H1 state,
-        /// including `Done`, to match it.
-        ctx: Box<PendingUrlContext>,
-    },
+    /// A request was dispatched to a backend; the upstream's completion writes
+    /// the response straight into this connection, so no receiver or context is
+    /// parked here.
+    WaitingBackend,
     Writing {
         buf: Vec<u8>,
         pos: usize,
@@ -283,6 +270,9 @@ pub struct Http11Listener {
     conns: Slots<Conn>,
     /// `[server] max_requests_per_connection`, copied into each connection.
     max_requests: u32,
+    /// Reused buffer a drive reports its pending dispatches through, so a turn
+    /// that parks a request allocates nothing.
+    pending: Vec<PendingDispatch>,
 }
 
 /// The connection table's starting size, shared by every owner in the process.
@@ -340,6 +330,7 @@ impl Http11Listener {
             tls_config,
             conns: Slots::new(initial, ceiling, Conn::empty),
             max_requests,
+            pending: Vec::with_capacity(8),
         })
     }
 
@@ -444,39 +435,26 @@ impl Http11Listener {
     }
 
     /// Drive one connection. Returns what happened, so the loop can manage the
-    /// parked list, the timeouts and the descriptor's interest.
-    pub fn drive_one<S, F, G>(
+    /// pending dispatches, the timeouts and the descriptor's interest.
+    pub fn drive_one<S, F>(
         &mut self,
         key: usize,
         state: &mut S,
         on_request: &mut F,
-        on_response: &mut G,
         registry: &Registry,
     ) -> ConnDrive
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(
-            &mut S,
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         let mut drive = ConnDrive {
-            parked: false,
+            pending: std::mem::take(&mut self.pending),
             done: false,
             restarted: false,
             moved: false,
             handshake: None,
         };
         let conn = self.conns.get_mut(key);
-        drive_conn(
-            conn,
-            self.max_requests,
-            state,
-            on_request,
-            on_response,
-            &mut drive,
-        );
+        drive_conn(conn, self.max_requests, state, on_request, &mut drive);
         if let Some(ns) = conn.handshake_ns.take() {
             drive.handshake = Some(HandshakeSample {
                 elapsed_ns: ns,
@@ -485,7 +463,6 @@ impl Http11Listener {
             });
         }
         drive.done = conn.is_done();
-        drive.parked = conn.is_parked();
         if !drive.done {
             let interest = conn.interest();
             if interest != conn.registered_interest {
@@ -498,6 +475,127 @@ impl Http11Listener {
             }
         }
         drive
+    }
+
+    /// Give back the pending-dispatch buffer the last drive took, cleared, so
+    /// the next drive reuses it rather than allocating.
+    pub fn return_pending(&mut self, mut pending: Vec<PendingDispatch>) {
+        pending.clear();
+        self.pending = pending;
+    }
+
+    /// Write a finished backend response into the HTTP/1.1 connection that was
+    /// waiting on it and drive the write now, so the first bytes leave in this
+    /// turn. A connection that is no longer waiting (closed, or reused by a
+    /// newer connection) is a no-op, so a stale completion drops its result.
+    pub fn complete_h1(
+        &mut self,
+        key: usize,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        method: &str,
+        registry: &Registry,
+    ) -> ConnDrive {
+        let mut drive = ConnDrive {
+            pending: Vec::new(),
+            done: false,
+            restarted: false,
+            moved: false,
+            handshake: None,
+        };
+        let conn = self.conns.get_mut(key);
+        let keep_alive = match &conn.kind {
+            ConnKind::Http1(h1) if matches!(h1.state, H1State::WaitingBackend) => h1.keep_alive,
+            _ => return drive,
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_response(status, headers, &body, method, keep_alive));
+        let ConnKind::Http1(h1) = &mut conn.kind else {
+            return drive;
+        };
+        h1.state = H1State::Writing { buf, pos: 0 };
+        let mut unit = ();
+        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+            unreachable!("a completed h1 connection is not reading a request")
+        };
+        if let Some(tls) = conn.tls.as_mut() {
+            drive_h1(
+                &mut H1Io::Tls {
+                    tls,
+                    stream: conn.stream.as_ref().expect("tls stream"),
+                },
+                h1,
+                &conn.client_ip,
+                &mut unit,
+                &mut on_request,
+                &mut drive,
+            );
+        } else {
+            drive_h1(
+                &mut H1Io::Plain {
+                    stream: conn.stream.as_ref().expect("plaintext stream"),
+                },
+                h1,
+                &conn.client_ip,
+                &mut unit,
+                &mut on_request,
+                &mut drive,
+            );
+        }
+        drive.done = conn.is_done();
+        if !drive.done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
+            }
+        }
+        drive
+    }
+
+    /// Write a finished backend response into a waiting HTTP/2 stream on a TLS
+    /// connection and flush now, so the first bytes leave in this turn. Returns
+    /// whether the connection is now done and must be closed.
+    pub fn complete_h2(
+        &mut self,
+        key: usize,
+        stream_id: u32,
+        response: (u16, Vec<(String, String)>, Vec<u8>),
+        method: &str,
+        registry: &Registry,
+    ) -> bool {
+        let (status, headers, body) = response;
+        let conn = self.conns.get_mut(key);
+        let done = {
+            let ConnKind::Http2(h2) = &mut conn.kind else {
+                return false;
+            };
+            {
+                let mut io = H2Io::Tls {
+                    tls: conn.tls.as_mut().expect("tls path"),
+                    stream: conn.stream.as_ref().expect("tls stream"),
+                };
+                h2.complete_stream(&mut io, stream_id, status, headers, body, method);
+            }
+            h2.is_done()
+        };
+        if !done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
+            }
+        }
+        done
     }
 
     /// Deregister and close one connection, freeing its slot for the next one.
@@ -573,6 +671,9 @@ pub struct H2cListener {
     /// edge-triggered, so the listener will not be reported again for them:
     /// the loop reads this and drains before its next wait.
     accept_again: bool,
+    /// Reused buffer a drive reports its pending dispatches through, so a turn
+    /// that parks a request allocates nothing.
+    pending: Vec<PendingDispatch>,
 }
 
 /// The most connections one `accept_pending` call handles. A peer that
@@ -774,6 +875,7 @@ impl H2cListener {
             peers: internal_peers,
             refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
             accept_again: false,
+            pending: Vec::with_capacity(8),
         })
     }
 
@@ -886,24 +988,18 @@ impl H2cListener {
     }
 
     /// Drive one cleartext HTTP/2 connection.
-    pub fn drive_one<S, F, G>(
+    pub fn drive_one<S, F>(
         &mut self,
         key: usize,
         state: &mut S,
         on_request: &mut F,
-        on_response: &mut G,
         registry: &Registry,
     ) -> ConnDrive
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(
-            &mut S,
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
     {
         let mut drive = ConnDrive {
-            parked: false,
+            pending: std::mem::take(&mut self.pending),
             done: false,
             restarted: false,
             moved: false,
@@ -917,11 +1013,10 @@ impl H2cListener {
             &conn.client_ip,
             state,
             on_request,
-            on_response,
+            &mut drive.pending,
         );
         drive.moved = moved;
         drive.done = conn.h2.as_ref().expect("h2c slot").is_done();
-        drive.parked = conn.h2.as_ref().expect("h2c slot").has_pending_url();
         if !drive.done {
             let interest = conn.interest();
             if interest != conn.registered_interest {
@@ -934,6 +1029,52 @@ impl H2cListener {
             }
         }
         drive
+    }
+
+    /// Give back the pending-dispatch buffer the last drive took, cleared, so
+    /// the next drive reuses it rather than allocating.
+    pub fn return_pending(&mut self, mut pending: Vec<PendingDispatch>) {
+        pending.clear();
+        self.pending = pending;
+    }
+
+    /// Write a finished backend response into a waiting HTTP/2 stream on a
+    /// cleartext connection and flush now, so the first bytes leave this turn.
+    /// Returns whether the connection is now done and must be closed.
+    pub fn complete_h2(
+        &mut self,
+        key: usize,
+        stream_id: u32,
+        response: (u16, Vec<(String, String)>, Vec<u8>),
+        method: &str,
+        registry: &Registry,
+    ) -> bool {
+        let (status, headers, body) = response;
+        let conn = self.conns.get_mut(key);
+        let done = {
+            let Some(h2) = conn.h2.as_mut() else {
+                return false;
+            };
+            {
+                let mut io = H2Io::Plain {
+                    stream: conn.stream.as_ref().expect("h2c stream"),
+                };
+                h2.complete_stream(&mut io, stream_id, status, headers, body, method);
+            }
+            h2.is_done()
+        };
+        if !done {
+            let interest = conn.interest();
+            if interest != conn.registered_interest {
+                if let Some(stream) = conn.stream.as_ref() {
+                    registry
+                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .ok();
+                }
+                conn.registered_interest = interest;
+            }
+        }
+        done
     }
 
     /// Deregister and close one connection, freeing its slot for the next one.
@@ -959,20 +1100,14 @@ pub enum H2cAccept {
 
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<S, F, G>(
+fn drive_conn<S, F>(
     conn: &mut Conn,
     max_requests: u32,
     state: &mut S,
     on_request: &mut F,
-    on_response: &mut G,
     drive: &mut ConnDrive,
 ) where
     F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
-    G: FnMut(
-        &mut S,
-        std::io::Result<HttpResponse>,
-        &PendingUrlContext,
-    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -988,7 +1123,6 @@ fn drive_conn<S, F, G>(
             &conn.client_ip,
             state,
             on_request,
-            on_response,
             drive,
         );
         return;
@@ -1004,7 +1138,7 @@ fn drive_conn<S, F, G>(
             &conn.client_ip,
             state,
             on_request,
-            on_response,
+            &mut drive.pending,
         );
         drive.moved |= moved;
         return;
@@ -1110,7 +1244,7 @@ fn drive_conn<S, F, G>(
                 &conn.client_ip,
                 state,
                 on_request,
-                on_response,
+                &mut drive.pending,
             );
             drive.moved |= moved;
             return;
@@ -1139,7 +1273,6 @@ fn drive_conn<S, F, G>(
         &conn.client_ip,
         state,
         on_request,
-        on_response,
         drive,
     );
 }
@@ -1222,21 +1355,15 @@ impl H1Io<'_> {
     }
 }
 
-fn drive_h1<S, F, G>(
+fn drive_h1<S, F>(
     io: &mut H1Io<'_>,
     h1: &mut H1Conn,
     client_ip: &str,
     state: &mut S,
     on_request: &mut F,
-    on_response: &mut G,
     drive: &mut ConnDrive,
 ) where
     F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
-    G: FnMut(
-        &mut S,
-        std::io::Result<HttpResponse>,
-        &PendingUrlContext,
-    ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
 {
     loop {
         match &h1.state {
@@ -1372,48 +1499,23 @@ fn drive_h1<S, F, G>(
                                 h1.state = H1State::Writing { buf, pos: 0 };
                                 continue;
                             }
-                            RequestOutcome::Pending { rx, ctx } => {
-                                h1.state = H1State::WaitingBackend { rx, ctx };
-                                break; // nothing more to do; poll next iteration
+                            RequestOutcome::Pending { id, ctx } => {
+                                drive.pending.push(PendingDispatch {
+                                    stream: None,
+                                    id,
+                                    ctx,
+                                });
+                                h1.state = H1State::WaitingBackend;
+                                break; // the upstream's completion resumes this connection
                             }
                         }
                     }
                 }
             }
-            H1State::WaitingBackend { .. } => {
-                use std::sync::mpsc::TryRecvError;
-                // Move state out so we can destructure and replace.
-                let old = std::mem::replace(&mut h1.state, H1State::Done);
-                let H1State::WaitingBackend { rx, ctx } = old else {
-                    break;
-                };
-                let http_result = match rx.try_recv() {
-                    Ok(r) => r,
-                    Err(TryRecvError::Empty) => {
-                        h1.state = H1State::WaitingBackend { rx, ctx }; // put back
-                        break;
-                    }
-                    Err(TryRecvError::Disconnected) => Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "url backend thread died",
-                    )),
-                };
-                let (status, resp_headers, body, _) = on_response(state, http_result, &ctx);
-                let mut buf = Vec::new();
-                buf.extend_from_slice(&build_response(
-                    status,
-                    &resp_headers,
-                    &body,
-                    &ctx.req.method,
-                    h1.keep_alive,
-                ));
-                h1.state = H1State::Writing { buf, pos: 0 };
-                // pump TLS to start sending immediately
-                if io.advance().is_err() {
-                    h1.state = H1State::Done;
-                    return;
-                }
-                continue; // fall through to Writing
+            H1State::WaitingBackend => {
+                // The upstream's own token completes this connection directly;
+                // there is nothing to poll here.
+                break;
             }
             H1State::Writing { buf, pos } => {
                 // Flush any ciphertext still pending from a previous turn: a

@@ -14,7 +14,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,19 +104,16 @@ fn get() -> HttpRequest {
     }
 }
 
-/// Drive `drive` until the response (or a failure) arrives.
+/// Drive `poll` until the response (or a failure) arrives.
 fn await_response(
-    rx: mpsc::Receiver<std::io::Result<HttpResponse>>,
-    mut drive: impl FnMut(),
+    mut poll: impl FnMut() -> Option<std::io::Result<HttpResponse>>,
 ) -> std::io::Result<HttpResponse> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        drive();
-        match rx.try_recv() {
-            Ok(r) => return r,
-            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
-            Err(mpsc::TryRecvError::Disconnected) => panic!("stream dropped without an answer"),
+        if let Some(r) = poll() {
+            return r;
         }
+        thread::sleep(Duration::from_millis(1));
     }
     panic!("no answer within the deadline");
 }
@@ -129,10 +126,16 @@ fn fetch_h2c(informational: usize) -> std::io::Result<HttpResponse> {
         stub_peer(sock, informational);
     });
     let mut conn = H2cClientConn::connect("127.0.0.1", port).unwrap();
-    let rx = conn
+    let stream_id = conn
         .dispatch(&get(), "127.0.0.1", "203.0.113.9", "example.test")
         .unwrap();
-    let r = await_response(rx, || conn.drive());
+    let r = await_response(|| {
+        conn.drive();
+        conn.drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+            .map(|c| c.result)
+    });
     drop(conn);
     let _ = peer.join();
     r
@@ -165,10 +168,16 @@ fn fetch_h2s(informational: usize) -> std::io::Result<HttpResponse> {
         stub_peer(rustls::StreamOwned::new(conn, tcp), informational);
     });
     let mut conn = H2sTlsClientConn::connect("localhost", port, Arc::new(client)).unwrap();
-    let rx = conn
+    let stream_id = conn
         .dispatch(&get(), "localhost", "203.0.113.9", "example.test")
         .unwrap();
-    let r = await_response(rx, || conn.drive());
+    let r = await_response(|| {
+        conn.drive();
+        conn.drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+            .map(|c| c.result)
+    });
     drop(conn);
     let _ = peer.join();
     r

@@ -6,10 +6,9 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::mpsc;
 
-use crate::forward::{HttpRequest, HttpResponse};
-use crate::h2_client::{client_init_frame, H2Client, Pool, Transport};
+use crate::forward::{HttpRequest, PendingUrlContext, Waiter};
+use crate::h2_client::{client_init_frame, H2Client, H2Completion, Pool, Transport};
 use m6_core::mio::{Registry, Token};
 
 /// The cleartext transport for `h2c://` backends.
@@ -145,14 +144,30 @@ impl H2cClientPool {
         client_ip: &str,
         original_host: &str,
         registry: &Registry,
-    ) -> io::Result<mpsc::Receiver<io::Result<HttpResponse>>> {
+    ) -> io::Result<(Token, u32)> {
         self.0
             .dispatch(base_url, req, client_ip, original_host, registry)
+    }
+
+    /// Store who waits for an outbound stream's reply.
+    pub fn set_waiter(
+        &mut self,
+        token: Token,
+        stream_id: u32,
+        waiter: Waiter,
+        ctx: Box<PendingUrlContext>,
+    ) {
+        self.0.set_waiter(token, stream_id, waiter, ctx);
     }
 
     /// Drive the one connection whose token fired.
     pub fn drive_one(&mut self, token: Token, registry: &Registry) -> bool {
         self.0.drive_one(token, registry)
+    }
+
+    /// Take the completions the last drives produced.
+    pub fn drain_completions(&mut self) -> Vec<H2Completion> {
+        self.0.drain_completions()
     }
 
     /// Deregister and drop the connection under `token`, if any.

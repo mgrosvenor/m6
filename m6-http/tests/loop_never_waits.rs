@@ -307,23 +307,26 @@ fn h2_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
         headers: vec![],
         body: vec![],
     };
-    let rx = conn
+    let stream_id = conn
         .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1")
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     loop {
         conn.drive();
-        match rx.try_recv() {
-            Ok(Ok(r)) => return Ok((r.status, String::from_utf8_lossy(&r.body).into_owned())),
-            Ok(Err(e)) => return Err(format!("response: {e}")),
-            Err(mpsc::TryRecvError::Empty) => {
-                if Instant::now() >= deadline {
-                    return Err("timeout".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => return Err(format!("wait: {e:?}")),
+        if let Some(c) = conn
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+        {
+            return match c.result {
+                Ok(r) => Ok((r.status, String::from_utf8_lossy(&r.body).into_owned())),
+                Err(e) => Err(format!("response: {e}")),
+            };
         }
+        if Instant::now() >= deadline {
+            return Err("timeout".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -557,7 +560,8 @@ fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
          [[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/large\"\nbackend = \"app\"\n\n\
-         [[route]]\npath = \"/echo\"\nbackend = \"app\"\n"
+         [[route]]\npath = \"/echo\"\nbackend = \"app\"\n\n\
+         [[route]]\npath = \"/miss/{{id}}\"\nbackend = \"app\"\n"
     )
 }
 
@@ -987,4 +991,294 @@ fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
         service.output()
     );
     assert_eq!(body, FAST_BODY);
+}
+
+// ── Direct completion guards ─────────────────────────────────────────────────
+
+/// How many times the accounting tick's "periodic stats" line has been written.
+fn periodic_lines(fx: &Fixture) -> usize {
+    fx.service.output().matches("periodic stats").count()
+}
+
+/// Wait for the next accounting tick, observed as a new "periodic stats" line.
+fn wait_for_periodic(fx: &Fixture, after: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if periodic_lines(fx) > after {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "no accounting tick within the deadline\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// The count of one named event-loop trigger in a `/perf` snapshot.
+fn trigger_count(loops: &[(String, u64)], name: &str) -> u64 {
+    loops
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(0)
+}
+
+/// A socket reply is written into the waiting h1 connection in the upstream's
+/// own turn, so it costs one `conn` event (the request read) and no writable
+/// `conn` wake. The broken form -- writing on the connection's next turn after
+/// setting write interest -- adds a `conn` writable wake per request.
+#[test]
+fn a_socket_reply_is_written_in_the_turn_it_arrives() {
+    let fx = Fixture::start(1, 30, "sameturn");
+    let mut conn = H1KeepAlive::connect(fx.port());
+    // One warm miss so the pool and the loop are live before the measured window.
+    let (warm, _) = conn.request("/fast", &[]);
+    assert_eq!(warm, 200, "warm /fast");
+
+    // Start the measured window at an accounting tick, then issue 50 misses.
+    let lines = periodic_lines(&fx);
+    wait_for_periodic(&fx, lines);
+    for i in 0..50 {
+        let (status, body) = conn.request(&format!("/miss/{i}"), &[]);
+        assert_eq!(status, 200, "/miss/{i}: {body}");
+        assert_eq!(body, FAST_BODY);
+    }
+    // The next tick snapshots the window that held the 50 misses.
+    wait_for_periodic(&fx, periodic_lines(&fx));
+
+    let loops = perf_event_loop(&mut conn);
+    let upstream = trigger_count(&loops, "upstream");
+    let conn_events = trigger_count(&loops, "conn");
+    assert!(
+        upstream >= 50,
+        "the upstream trigger rose {upstream}; expected at least 50\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+    assert!(
+        conn_events <= 60,
+        "the conn trigger rose {conn_events}; expected at most 60 (no writable wake)\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// A client that closes while its `/slow` is in flight does not leak the pool
+/// member: when the reply arrives for the gone waiter, the member's in-flight
+/// count returns to 0, so the next two concurrent misses spread across both.
+#[test]
+fn a_closed_client_does_not_leak_its_upstream() {
+    let fx = Fixture::start(2, 30, "leak");
+    probe::install_crypto();
+
+    // Open a connection, send /slow, and keep it open until member A reports
+    // the request was dispatched, then close it while the backend still holds.
+    let port = fx.port();
+    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let name =
+        rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("server name");
+    let tls =
+        rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name).expect("client conn");
+    let mut stream = StreamOwned::new(tls, tcp);
+    stream
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    stream.flush().expect("flush");
+    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + Duration::from_secs(5));
+    assert!(
+        seen,
+        "member A never received /slow\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+    drop(stream); // the client closes with the request still held by the backend
+
+    // Release member A's held reply; it lands on a gone waiter, so the member
+    // must be released back to the pool.
+    fx.release.store(true, Ordering::SeqCst);
+
+    // Two concurrent /slow must now spread across both members within 2 s.
+    let a = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
+    let b = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let a_seen = await_slow_seen(&fx.slow_seens[0], deadline);
+    let b_seen = await_slow_seen(&fx.slow_seens[1], deadline);
+    if !(a_seen && b_seen) {
+        let _ = a.join();
+        let _ = b.join();
+        panic!(
+            "both members must receive a request after the gone waiter released its member (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
+            fx.service.output()
+        );
+    }
+    let (a_status, a_body) = a.join().expect("a thread").expect("/slow a");
+    let (b_status, b_body) = b.join().expect("b thread").expect("/slow b");
+    assert_eq!(a_status, 200, "/slow a: {a_body}");
+    assert_eq!(b_status, 200, "/slow b: {b_body}");
+}
+
+/// A custom error page fetched from a socket backend is non-blocking: while the
+/// error-page backend holds its answer, a cache hit on another connection still
+/// answers within two seconds, and the original request then gets the page.
+#[test]
+fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch() {
+    const ERROR_PAGE_BODY: &str = "SITE ERROR PAGE BODY";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().to_path_buf();
+
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate");
+    let cert = site.join("cert.pem");
+    let key = site.join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).expect("cert");
+    std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
+
+    // One socket backend: /errors is held until released, /missing is a 404,
+    // everything else answers at once and is cacheable.
+    let pid = std::process::id();
+    let sock = PathBuf::from(format!("/tmp/m6lnw-{pid}-err.sock"));
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind backend socket");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let (error_seen_tx, error_seen_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let backend_stop = Arc::new(AtomicBool::new(false));
+    let backend = std::thread::spawn({
+        let stop = Arc::clone(&backend_stop);
+        let release = Arc::clone(&release);
+        move || {
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let stop = Arc::clone(&stop);
+                        let release = Arc::clone(&release);
+                        let error_seen_tx = error_seen_tx.clone();
+                        std::thread::spawn(move || {
+                            let mut stream = stream;
+                            let _ = stream.set_nonblocking(false);
+                            let mut got = Vec::new();
+                            let mut byte = [0u8; 1];
+                            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match stream.read(&mut byte) {
+                                    Ok(0) => return,
+                                    Ok(_) => got.push(byte[0]),
+                                    Err(_) => return,
+                                }
+                            }
+                            let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
+                            if head.starts_with("get /errors") {
+                                let _ = error_seen_tx.send(());
+                                while !release.load(Ordering::SeqCst)
+                                    && !stop.load(Ordering::SeqCst)
+                                {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                if !release.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ERROR_PAGE_BODY}",
+                                    ERROR_PAGE_BODY.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                                let _ = stream.flush();
+                            } else if head.starts_with("get /missing") {
+                                let resp = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                let _ = stream.write_all(resp);
+                                let _ = stream.flush();
+                            } else {
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nCache-Control: public, max-age=60\r\nConnection: close\r\n\r\n{FAST_BODY}",
+                                    FAST_BODY.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                                let _ = stream.flush();
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let glob = format!("/tmp/m6lnw-{pid}-err.sock");
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
+             [server]\nbackend_timeout_secs = 30\nmax_requests_per_connection = 10000\n\n\
+             [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+             [analytics]\nenabled = false\n\n\
+             [rate_limit]\nenabled = false\n\n\
+             [errors]\nmode = \"custom\"\npath = \"/errors\"\n\n\
+             [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\
+             [[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
+             [[route]]\npath = \"/missing\"\nbackend = \"app\"\n\n\
+             [[route]]\npath = \"/errors\"\nbackend = \"app\"\n"
+        ),
+    )
+    .expect("site.toml");
+    std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
+    let claim = claim_port();
+    let port = claim.port();
+    std::fs::write(
+        site.join("system.toml"),
+        system_toml(port, &cert, &key, &site.join("metrics.token")),
+    )
+    .expect("system.toml");
+
+    let mut service = Service::spawn(
+        "m6-http",
+        Command::new(binary("m6-http"))
+            .arg(&site)
+            .arg(site.join("system.toml")),
+    );
+    service.wait_for_tcp(port, Duration::from_secs(20));
+
+    // Warm /fast so a later request is a cache hit.
+    let (warm, _) = h1_get(port, "/fast", Duration::from_secs(5)).expect("warm /fast");
+    assert_eq!(warm, 200);
+
+    // /missing 404s and triggers the error-page fetch, which the backend holds.
+    let missing = std::thread::spawn(move || {
+        h1_get(port, "/missing", Duration::from_secs(20)).expect("/missing")
+    });
+
+    // Wait until the backend reports the /errors fetch.
+    let seen = await_slow_seen(&error_seen_rx, Instant::now() + Duration::from_secs(5));
+    assert!(
+        seen,
+        "the backend never received /errors\n--- m6-http ---\n{}",
+        service.output()
+    );
+
+    // While /errors is held, a cache hit on another connection answers in 2 s.
+    let fast = h1_get(port, "/fast", Duration::from_secs(2));
+    match fast {
+        Ok((status, body)) => {
+            assert_eq!(status, 200, "cache hit: {body}");
+            assert_eq!(body, FAST_BODY);
+        }
+        Err(e) => {
+            release.store(true, Ordering::SeqCst);
+            let _ = missing.join();
+            panic!(
+                "a cache hit stalled behind a held error-page fetch: {e}\n--- m6-http ---\n{}",
+                service.output()
+            );
+        }
+    }
+
+    // Release the error page; /missing must now get the custom page body.
+    release.store(true, Ordering::SeqCst);
+    let (status, body) = missing.join().expect("missing thread");
+    assert_eq!(status, 404, "the failing request keeps its 404: {body}");
+    assert_eq!(body, ERROR_PAGE_BODY);
+
+    backend_stop.store(true, Ordering::SeqCst);
+    let _ = backend.join();
+    let _ = std::fs::remove_file(&sock);
 }
