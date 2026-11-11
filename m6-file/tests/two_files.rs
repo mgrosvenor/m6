@@ -30,7 +30,7 @@ fn tree(site_toml_body: &str) -> tempfile::TempDir {
 
 fn config(app_root: &Path, extra: &str) -> std::path::PathBuf {
     let path = app_root.join("m6-file.conf");
-    std::fs::write(&path, format!("{extra}\n[thread_pool]\nsize = 2\n")).unwrap();
+    std::fs::write(&path, format!("{extra}\n")).unwrap();
     path
 }
 

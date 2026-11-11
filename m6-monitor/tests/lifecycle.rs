@@ -35,10 +35,6 @@ name = "unreachable"
 url  = "https://127.0.0.1:1"
 role = "origin"
 
-[thread_pool]
-size       = 1
-queue_size = 4
-
 [log]
 level  = "info"
 format = "text"

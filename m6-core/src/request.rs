@@ -134,7 +134,7 @@ impl Request {
     /// never route, and because both fields are cheap clones: the pattern is
     /// a short string already cloned with the route, and the settings are an
     /// `Arc`.
-    pub fn with_route(mut self, route: &crate::app::CompiledRoute) -> Self {
+    pub fn with_route(mut self, route: &crate::site::CompiledRoute) -> Self {
         self.route_pattern = Some(route.pattern.clone());
         self.route_settings = Some(std::sync::Arc::clone(&route.settings));
         self
@@ -171,9 +171,9 @@ impl Request {
     /// A key from the matched route's `[[route]]` table that core does not
     /// define.
     ///
-    /// This is how a handler registered with `App::handler` reads its own
-    /// per-route configuration. Core does not know what `root` means; the
-    /// handler does, and the route says it:
+    /// This is how a service's handler reads its own per-route
+    /// configuration. Core does not know what `root` means; the handler does,
+    /// and the route says it:
     ///
     /// ```toml
     /// [[route]]

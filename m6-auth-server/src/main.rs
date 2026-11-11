@@ -23,7 +23,6 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use m6_core::app::RouteMethod;
 use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
 use m6_core::mio::unix::SourceFd;
@@ -31,6 +30,7 @@ use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
+use m6_core::site::RouteMethod;
 
 use config::AuthConfig;
 use handlers::{AppState, Busy};

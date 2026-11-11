@@ -3,7 +3,7 @@
 //! Route matching is implemented twice. The edge maps a request path to a
 //! backend with the `matchit` crate (`m6_http_lib::router`), and `m6-core` maps
 //! a request path to a template or a handler with its own compiled segments
-//! and fixed-then-pattern lookup (`m6_core::app`).
+//! and fixed-then-pattern lookup (`m6_core::site`).
 //!
 //! A site author writes the same pattern vocabulary in both places: `site.toml`
 //! names `/blog/{stem}` and a backend's own config names `/blog/{stem}` too. So
@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use m6_core::app::{
+use m6_core::site::{
     check_route_conflicts, compile_pattern, CompiledRoute, Methods, RouteDecl,
     RouteTable as CoreTable,
 };
@@ -54,7 +54,7 @@ fn core_routes(patterns: &[&str]) -> CoreTable {
 }
 
 fn core_winner<'a>(routes: &'a CoreTable, path: &str) -> Option<&'a str> {
-    m6_core::app::find_route(path, "GET", routes).map(|(r, _)| r.pattern.as_str())
+    m6_core::site::find_route(path, "GET", routes).map(|(r, _)| r.pattern.as_str())
 }
 
 fn edge_winner<'a>(table: &'a RouteTable, path: &str) -> Option<&'a str> {

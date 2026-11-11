@@ -103,9 +103,9 @@
 //! # }
 //! ```
 //!
-//! A service keeps the connection in one `Arc<Mutex<Connection>>`, or opens one
-//! per worker through `App::with_thread_state`. Both are safe with the busy
-//! timeout and the migration rules above.
+//! A service opens its one connection at start and keeps it in its `main`.
+//! One thread owns it, so it needs no lock, and the busy timeout and the
+//! migration rules above make it safe.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

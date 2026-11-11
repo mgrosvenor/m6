@@ -28,14 +28,14 @@ fn html_response(html: String) -> Response {
     r
 }
 
-use m6_core::app::{
-    compile_pattern, find_route, match_route, CompiledRoute, Methods, RouteMethod, RouteTable,
-};
 use m6_core::compress::{brotli_compress, gzip_compress};
 use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
 use m6_core::request::{parse_cookies, parse_query_string};
 use m6_core::response::Response;
 use m6_core::server::write_response;
+use m6_core::site::{
+    compile_pattern, find_route, match_route, CompiledRoute, Methods, RouteMethod, RouteTable,
+};
 
 // ── Realistic content fixtures ────────────────────────────────────────────────
 
@@ -456,10 +456,6 @@ fn bench_socket_round_trip(c: &mut Criterion) {
 path     = "/blog/{stem}"
 template = "templates/page.html"
 
-[thread_pool]
-size       = 1
-queue_size = 64
-
 [params_cache]
 size = 64
 "#
@@ -789,10 +785,6 @@ fn main() {
 [[route]]
 path     = "/blog/{stem}"
 template = "templates/page.html"
-
-[thread_pool]
-size       = 1
-queue_size = 64
 
 [params_cache]
 size = 64

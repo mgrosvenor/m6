@@ -95,6 +95,52 @@ fn l1_valid_config_starts_and_socket_appears() {
     );
 }
 
+/// A config that still asks for a thread pool is refused at start: the
+/// operator hears about it with exit 2, and no socket is left behind.
+#[test]
+fn a_thread_pool_section_is_refused_at_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("site.toml"), "").unwrap();
+    let config = dir.path().join("m6-file.conf");
+    std::fs::write(&config, "[thread_pool]\nsize = 4\n").unwrap();
+    let socket = dir.path().join("refused.sock");
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(dir.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+    );
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-file did not refuse [thread_pool]\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    let output = svc.output();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "m6-file should exit 2 for [thread_pool]\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("[thread_pool]"),
+        "the error must name the table\n{output}"
+    );
+    assert!(
+        output.contains("run more instances"),
+        "the error must say what to do instead\n--- output ---\n{output}"
+    );
+    assert!(
+        !socket.exists(),
+        "a refused start must not leave a socket at {}",
+        socket.display()
+    );
+}
+
 #[test]
 fn l1_sigterm_exits_zero() {
     let (guard, socket_path) = spawn_server("l1-sigterm");
@@ -189,8 +235,8 @@ fn l2_query_relpath_cannot_replace_the_path_parameter() {
                Host: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
     assert!(
-        !resp.contains("[thread_pool]"),
-        "a query relpath served a file outside the root: {}",
+        !resp.contains("[compression]"),
+        "a query relpath served the service's config: {}",
         &resp[..resp.len().min(300)]
     );
     assert!(
@@ -1240,7 +1286,7 @@ fn site_with_two_trees() -> tempfile::TempDir {
 }
 
 fn write_config(path: &Path, routes: &str) {
-    std::fs::write(path, format!("[thread_pool]\nsize = 4\n\n{routes}")).unwrap();
+    std::fs::write(path, routes).unwrap();
 }
 
 /// The lifecycle contract, which m6-file gets from the same

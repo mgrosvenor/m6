@@ -84,10 +84,6 @@ access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "{}"
 
-[thread_pool]
-size = 4
-queue_size = 32
-
 [keys]
 private_key = "{}"
 public_key  = "{}"
