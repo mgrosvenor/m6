@@ -1540,7 +1540,7 @@ certbot renew
 
 ### 7.11. Horizontal scaling
 
-The template unit replaces the plain one: one template serves every instance, and two units with the same `SyslogIdentifier` would only make the journal harder to read.
+The template unit replaces the plain one: the plain unit's `/run/m6/m6-html.sock` matches the same `/run/m6/m6-html*.sock` pool glob, so leaving it running beside `m6-html@1` and `m6-html@2` puts three processes behind one pool.
 Add two m6-html instances with it, then restart m6-http so it reads the pool again:
 
 ```bash
