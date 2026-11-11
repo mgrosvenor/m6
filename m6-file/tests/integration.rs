@@ -3,7 +3,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -736,23 +736,23 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
 /// table, exhaust the limit.
 ///
 /// The launcher opens 40 descriptors before the exec, so a hard limit of 64
-/// leaves about 18 free although the table is 24. A batch of 25 streaming
-/// requests drives `accept` to EMFILE with the table below its ceiling: the
-/// arm must give its slot back, log exactly one line and return to the poll.
-/// The service stays alive and answers on an accepted connection, and the
-/// error does not repeat. No new listener event is made afterwards: under
-/// edge-triggered mio the listener is not re-armed after the failed accept,
-/// and with no descriptor free a new connection would re-enter the same accept
-/// pass and log a second error, which is the repeat this test is against. The
-/// re-arm is mio's, and the fix review's live probe records it.
+/// leaves only a few free although the table is 24. Clients are connected one
+/// at a time: after each one the test waits for that client's first response
+/// byte or for an accept error before connecting the next, and stops at the
+/// first error. That discovers the free descriptor count instead of assuming
+/// it, and the failed pass is the last listener event. The arm must log exactly
+/// one line, not repeat it over a stability window, keep the service alive and
+/// leave an accepted connection answered.
 #[test]
 fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
     const HARD: u64 = 64;
     /// Opened by the launcher before the exec. stdio, the listener, the signal
-    /// descriptor and the poll take about 46, so accept runs out after about
-    /// 18 connections against a 24-slot table.
+    /// descriptor and the poll take about 46, so accept runs out well before
+    /// the 24-slot table fills.
     const INHERITED: usize = 40;
-    const CLIENTS: usize = 25;
+    /// Enough for any plausible free count. Reaching it means the inherited
+    /// descriptors did not bring the service near its limit.
+    const MAX_CLIENTS: usize = 40;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path();
@@ -782,35 +782,58 @@ fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
     fn accept_errors(output: &str) -> usize {
         output.matches("accept error").count()
     }
+    fn answered(client: &UnixStream) -> bool {
+        let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        matches!(socket2::SockRef::from(client).peek(&mut byte), Ok(n) if n > 0)
+    }
 
-    // One batch, no client reading, so each accepted request holds its
-    // connection and, once served, its streamed file.
-    let mut clients: Vec<UnixStream> = (0..CLIENTS)
-        .map(|_| {
-            let mut client = UnixStream::connect(&socket_path).expect("connect");
-            client
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .expect("timeout");
-            client
-                .write_all(
-                    b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
-                )
-                .expect("send the request");
-            client
-        })
-        .collect();
+    let mut clients: Vec<UnixStream> = Vec::new();
+    loop {
+        assert!(
+            clients.len() < MAX_CLIENTS,
+            "{} inherited descriptors never brought accept to its limit at the table's ceiling\n\
+             --- output ---\n{}",
+            INHERITED,
+            svc.output()
+        );
+        let mut client = UnixStream::connect(&socket_path).expect("connect");
+        client.set_nonblocking(true).expect("non-blocking client");
+        let sent = client.write_all(
+            b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+        );
+        match sent {
+            Ok(()) => {}
+            // The kernel aborted the connection because its accept failed for
+            // want of a descriptor. The accept line is the outcome; wait for
+            // it below.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(e) => panic!(
+                "connection {} could not send its request: {e}\n--- output ---\n{}",
+                clients.len(),
+                svc.output()
+            ),
+        }
+        // Wait for this client's outcome before the next connection exists,
+        // so the failed pass is the last listener event.
+        let settled = wait::until(Duration::from_secs(10), || {
+            accept_errors(&svc.output()) >= 1 || answered(&client)
+        });
+        assert!(
+            settled,
+            "connection {} was neither answered nor refused within 10 s\n--- output ---\n{}",
+            clients.len(),
+            svc.output()
+        );
+        clients.push(client);
+        if accept_errors(&svc.output()) >= 1 {
+            break;
+        }
+    }
 
-    let reached = wait::until(Duration::from_secs(10), || {
-        accept_errors(&svc.output()) >= 1
-    });
-    assert!(
-        reached,
-        "{} inherited descriptors and {} streaming connections never reached the accept limit\n\
-         --- output ---\n{}",
-        INHERITED,
-        CLIENTS,
-        svc.output()
-    );
     assert_eq!(
         accept_errors(&svc.output()),
         1,
@@ -818,8 +841,8 @@ fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
         svc.output()
     );
 
-    // No growth over a short deadline: the loop returned to the poll and did
-    // not go back into the accept loop.
+    // No growth over a stability window: no connection arrives after the
+    // failed pass, so no listener event can start another one.
     assert!(
         !wait::until(Duration::from_millis(750), || accept_errors(&svc.output())
             > 1),
@@ -831,7 +854,12 @@ fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
     // An accepted connection is still answered. The streamed file may or may
     // not open, depending on how many connections were accepted before the
     // limit; either status proves the loop came back and served it.
-    let response = m6_core::testkit::read_one(&mut clients[0], "GET")
+    let mut first = clients.remove(0);
+    first.set_nonblocking(false).expect("blocking client");
+    first
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let response = m6_core::testkit::read_one(&mut first, "GET")
         .expect("an accepted connection was not answered");
     let status = String::from_utf8_lossy(&response[..response.len().min(32)]).to_string();
     assert!(
@@ -846,9 +874,11 @@ fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
         svc.output()
     );
     svc.assert_alive("after answering on an accepted connection");
-    drop(clients);
 }
 
+// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
+// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
+// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.
