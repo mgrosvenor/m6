@@ -115,22 +115,12 @@ pub use site::{CodeRoute, Handled, Site};
 ///     let mut deadlines = Timeouts::new(1024, read_timeout.unwrap_or(Duration::ZERO));
 ///     let mut events = Events::with_capacity(256);
 ///
-///     // Run: `docs/m6-app-anatomy.md` section 2 owns the loop. It waits with
-///     // `deadlines.timeout`, matches on the event token, accepts until the
-///     // listener would block, and runs one connection turn per token.
-/// #     run_loop(&mut poll, &mut listener, &mut conns, &mut deadlines, &mut events, &site)?;
-/// #     Ok(())
+///     // Run: `docs/m6-app-anatomy.md` section 2 owns the loop (the accept,
+///     // the connection turn, the signals and the stop phase). This example
+///     // shows the start only.
+///     drop((poll, listener, conns, deadlines, events, site));
+///     Ok(())
 /// }
-/// # fn run_loop(
-/// #     _poll: &mut Poll,
-/// #     _listener: &mut mio::net::UnixListener,
-/// #     _conns: &mut Slots<ServerConn>,
-/// #     _deadlines: &mut Timeouts,
-/// #     _events: &mut Events,
-/// #     _site: &Site,
-/// # ) -> anyhow::Result<()> {
-/// #     Ok(())
-/// # }
 /// ```
 ///
 /// The loop is one `match` on the event's token and one function per
