@@ -101,6 +101,18 @@ impl Service {
         }
     }
 
+    /// The child's process id, while it runs.
+    ///
+    /// Panics once the child has been reaped: there is no id left to name. A
+    /// test that measures the process from outside (its thread count, its
+    /// open files) needs this before it signals anything.
+    pub fn pid(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("service already reaped; its pid is gone")
+            .id()
+    }
+
     /// Send `sig` to the child.
     ///
     /// Panics with the name and pid if the child has already been reaped.
@@ -316,6 +328,38 @@ impl Drop for Service {
         // outliving the buffer they write into.
         self.finish_output();
     }
+}
+
+/// Spawn `n` instances of one service, each configured by `cmd` with its
+/// index.
+///
+/// One process runs one loop, so it serves one request at a time. A test that
+/// needs two requests in progress at once starts several instances, and the
+/// caller's closure gives each one its own socket through
+/// `M6_SOCKET_OVERRIDE`. Every instance is a [`Service`], so each drains its
+/// own output and is killed when its guard drops.
+///
+/// ```ignore
+/// let instances = spawn_instances("m6-html", 2, |i| {
+///     let mut c = Command::new(binary("m6-html"));
+///     c.arg(site_dir).arg(config).env(
+///         "M6_SOCKET_OVERRIDE",
+///         dir.path().join(format!("instance-{i}.sock")),
+///     );
+///     c
+/// });
+/// ```
+pub fn spawn_instances(
+    name: &str,
+    n: usize,
+    mut cmd: impl FnMut(usize) -> Command,
+) -> Vec<Service> {
+    (0..n)
+        .map(|i| {
+            let mut command = cmd(i);
+            Service::spawn(name, &mut command)
+        })
+        .collect()
 }
 
 fn spawn_drain(
