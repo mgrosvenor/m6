@@ -19,7 +19,8 @@
 //! blocking socket.** It is a stream adapter that reads bytes into a buffer and
 //! asks [`parse_request`] whether the message is complete, with no framing
 //! logic of its own. A service's loop frames requests with [`ServerConn`],
-//! which reads into its slot's buffer and calls the same function.
+//! which reads into its slot's buffer and frames through the same parser
+//! (`parse_head_uninit`).
 //!
 //! **This function is pure.** The edge's version stripped proxy-owned headers
 //! (`X-Forwarded-For` and friends) inline while parsing, which is ingress

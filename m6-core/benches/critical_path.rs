@@ -471,9 +471,8 @@ size = 64
     let cfg_path2 = cfg_path.clone();
 
     std::thread::spawn(move || {
-        // We can't call run_app() (it reads env args), so we replicate the
-        // minimal setup needed: build FrameworkState, accept on the socket.
-        // Instead, build a raw server using the public server + app modules.
+        // The bench needs a socket to measure, not a service: build the site's
+        // config and routes here and drive the blocking reference loop.
         let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
 
         let config = m6_core::config::load(&cfg_path2, &site_dir).unwrap();

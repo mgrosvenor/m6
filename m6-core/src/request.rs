@@ -105,8 +105,8 @@ impl Request {
 
     /// Attach route settings directly, without a `CompiledRoute`.
     ///
-    /// For a handler's own tests, which have a route's config but no framework
-    /// state to compile it from.
+    /// For a handler's own tests, which have a route's config but no compiled
+    /// route to read it from.
     pub fn with_route_settings(mut self, settings: std::sync::Arc<Map<String, Value>>) -> Self {
         self.route_settings = Some(settings);
         self

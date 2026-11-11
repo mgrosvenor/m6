@@ -456,7 +456,7 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
     }
 }
 
-/// The whole lifecycle contract of an `App` service, asserted in one call.
+/// The whole lifecycle contract of a service, asserted in one call.
 ///
 /// Spawn, wait for the socket, SIGTERM, then check the three things that make
 /// a shutdown clean rather than merely quiet:
@@ -472,7 +472,7 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
 /// # Why this is here and not written out per service
 ///
 /// It was written out per service, five times, and the sixth never got written:
-/// `m6-monitor` had no `tests/` directory at all. Every `App` service takes the
+/// `m6-monitor` had no `tests/` directory at all. Every service takes the
 /// same argv (`site_dir`, `config_path`) and honours the same
 /// `M6_SOCKET_OVERRIDE`, so there was never anything service-specific in those
 /// five copies except the name. A contract that each service opts into by hand

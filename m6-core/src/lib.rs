@@ -92,6 +92,9 @@ pub use site::{CodeRoute, Handled, Site};
 /// service's own, written out in its `main`.
 ///
 /// ```rust,no_run
+/// use std::io;
+/// use std::time::{Duration, Instant};
+///
 /// use m6_core::prelude::*;
 ///
 /// const ROUTES: &[CodeRoute] = &[CodeRoute {
@@ -107,41 +110,107 @@ pub use site::{CodeRoute, Handled, Site};
 ///     poll.registry()
 ///         .register(&mut listener, LISTENER, Interest::READABLE)?;
 ///     let mut conns = Slots::new(1024, 1024, || ServerConn::new(16 * 1024, 64 * 1024));
+///     let mut deadlines = Timeouts::new(1024, Duration::from_secs(30));
 ///     let mut events = Events::with_capacity(256);
+///
 ///     loop {
-///         poll.poll(&mut events, None)?;
+///         poll.poll(
+///             &mut events,
+///             Some(deadlines.timeout(Instant::now(), Duration::from_secs(1))),
+///         )?;
 ///         for event in &events {
-///             if event.token() == LISTENER {
-///                 while let Some(taken) = conns.take() {
-///                     let (mut stream, _) = listener.accept()?;
-///                     poll.registry().register(
-///                         &mut stream,
-///                         Token(taken.key),
-///                         Interest::READABLE,
-///                     )?;
-///                     conns.get_mut(taken.key).attach(stream);
+///             match event.token() {
+///                 // Accept until the kernel has no more, and give the slot
+///                 // back when there was nothing to accept after all.
+///                 LISTENER => {
+///                     while let Some(taken) = conns.take() {
+///                         let mut stream = match listener.accept() {
+///                             Ok((stream, _)) => stream,
+///                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+///                                 conns.free(taken.key);
+///                                 break;
+///                             }
+///                             Err(e) => return Err(e.into()),
+///                         };
+///                         poll.registry().register(
+///                             &mut stream,
+///                             Token(taken.key),
+///                             Interest::READABLE,
+///                         )?;
+///                         deadlines.touch(Token(taken.key), Instant::now());
+///                         conns.get_mut(taken.key).attach(stream);
+///                     }
 ///                 }
-///             } else {
-///                 let conn = conns.get_mut(event.token().0);
-///                 let mut heads = head_slots();
-///                 if let Read::Request(head) = conn.read(&mut heads)? {
-///                     let response = match site.handle(&head) {
-///                         Handled::Done(response) => response,
-///                         Handled::Code(0, req) => site.finish(&req, Response::text("ok")),
-///                         Handled::Code(..) | Handled::Named(..) => unreachable!(),
-///                     };
-///                     conn.respond_response(response);
+///                 // One connection: read, dispatch, write, and close when the
+///                 // peer or the response is done.
+///                 Token(k) => {
+///                     let conn = conns.get_mut(k);
+///                     let was = conn.interest();
+///                     let mut keep = true;
+///                     loop {
+///                         if conn.interest() == Interest::WRITABLE {
+///                             match conn.flush()? {
+///                                 Flush::More => break,
+///                                 Flush::Close => {
+///                                     keep = false;
+///                                     break;
+///                                 }
+///                                 Flush::Done => {}
+///                             }
+///                         }
+///                         let mut heads = head_slots();
+///                         let response = match conn.read(&mut heads)? {
+///                             Read::Request(head) => match site.handle(&head) {
+///                                 Handled::Done(response) => Some(response),
+///                                 Handled::Code(0, req) => {
+///                                     Some(site.finish(&req, Response::text("ok")))
+///                                 }
+///                                 Handled::Code(..) | Handled::Named(..) => unreachable!(),
+///                             },
+///                             Read::More => None,
+///                             Read::Closed => {
+///                                 keep = false;
+///                                 break;
+///                             }
+///                         };
+///                         if let Some(response) = response {
+///                             conn.respond_response(response);
+///                         }
+///                         match conn.flush()? {
+///                             Flush::Done => break,
+///                             Flush::More => break,
+///                             Flush::Close => {
+///                                 keep = false;
+///                                 break;
+///                             }
+///                         }
+///                     }
+///                     if !keep {
+///                         m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+///                     } else {
+///                         deadlines.touch(Token(k), Instant::now());
+///                         if conn.interest() != was {
+///                             let interest = conn.interest();
+///                             let stream = conn
+///                                 .stream()
+///                                 .expect("every registered token has a connection");
+///                             poll.registry().reregister(stream, Token(k), interest)?;
+///                         }
+///                     }
 ///                 }
-///                 conn.flush()?;
 ///             }
+///         }
+///         // Close a peer that sent nothing before its read deadline.
+///         while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+///             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
 ///         }
 ///     }
 /// }
 /// ```
 ///
-/// The signals, deadlines and accounting are the same idea: a descriptor, a
-/// token and a `match` arm each. `docs/m6-app-anatomy.md` walks through a
-/// service that has them.
+/// The signal arm and the stop phase are two more pieces of the same shape:
+/// `Signals` is a descriptor under its own token, and `Lifecycle::complete()`
+/// runs after the loop. `docs/m6-app-anatomy.md` has them in place.
 pub mod prelude {
     pub use crate::dict::Dict;
     pub use crate::error::{Error, Result};

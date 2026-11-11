@@ -55,7 +55,7 @@ pub enum Handled {
 
 /// A loaded site: everything the request path needs, read at start.
 pub struct Site {
-    /// The framework state the request path reads: the config, the compiled
+    /// The site state the request path reads: the config, the compiled
     /// routes, the params cache and the renderer.
     state: FrameworkState,
     config_path: PathBuf,
@@ -94,9 +94,9 @@ impl Site {
         Site::start(name, invocation, None, &signatures, &names, renderer)
     }
 
-    /// The start half of what was `run_app_with_shutdown`, for `App` and for a
-    /// test: `config` is the config the caller has already loaded, so a
-    /// service that needed it before this point does not read it twice.
+    /// The start half with a config the caller already loaded, shared by
+    /// `Site::load` and the tests: a service that needed the config before
+    /// this point does not read it twice.
     pub(crate) fn start(
         name: &str,
         invocation: Invocation,
@@ -285,7 +285,7 @@ impl Site {
     }
 
     /// `handle` for a caller that already owns a [`RawRequest`]: the one
-    /// dispatch, shared by the borrowed path and by `App`'s blocking workers.
+    /// dispatch, shared by the borrowed path and by a caller holding one.
     pub(crate) fn handle_raw(&self, raw: RawRequest) -> Handled {
         let started = std::time::Instant::now();
         let matched = find_route(raw.path(), raw.method(), &self.state.routes)
@@ -676,7 +676,7 @@ pub struct CompiledRoute {
     /// truthful answer: the max over every template and this route's own static
     /// params files.
     ///
-    /// Computed once when the framework state is built, so it costs nothing per
+    /// Computed once when the site state is built, so it costs nothing per
     /// request.
     ///
     /// `None` for a route whose params path contains a `{placeholder}`: the
@@ -1106,7 +1106,7 @@ impl ParamsCache {
 }
 
 // ---------------------------------------------------------------------------
-// Shared framework state
+// The site's shared state
 // ---------------------------------------------------------------------------
 
 pub(crate) struct FrameworkState {
@@ -1605,12 +1605,12 @@ impl FrameworkState {
     /// Render a template response.
     ///
     /// Builds the context as a plain `Map` rather than an engine type: the
-    /// merge order is the framework's business (global params, path params,
+    /// merge order is the site's business (global params, path params,
     /// auth claims first, then the handler's `render_with` extras on top), and
     /// the engine's business starts once it has the finished context.
     ///
     /// An associated function, not a method: it needs the renderer and nothing
-    /// else from the framework state, so a request can render after it has
+    /// else from the site state, so a request can render after it has
     /// released the read lock.
     pub(crate) fn render_response(
         renderer: &dyn Renderer,
@@ -1772,11 +1772,11 @@ pub(crate) fn check_site_toml(
     Ok(site_toml)
 }
 
-/// What every `App` service is started with.
+/// What a service is started with: the site directory, the config path and the
+/// optional command-line log level.
 ///
-/// One parser rather than four. `run_app` and the three stateful runners each
-/// had an identical copy of this, which is how `--dump-config` ended up
-/// existing only in m6-http: there was no one place to add it to.
+/// One parser for every service, so `--version`, `--dump-config` and
+/// `--log-level` are handled in one place and a new service inherits them.
 pub(crate) struct Invocation {
     pub(crate) site_dir: PathBuf,
     pub(crate) config_path: PathBuf,
@@ -1809,11 +1809,11 @@ pub(crate) fn program_name() -> String {
 /// node before installing it, and it covers every service: they all load their
 /// config through this same function.
 ///
-/// It is not a formality. The `App` migrations changed m6-file's config format,
-/// and the old binary against the new config and the new binary against the old
-/// one both fail, in opposite directions and neither loudly. A validation step
-/// that runs before the install is what turns that from an outage into a
-/// refused deploy.
+/// It is not a formality. A configuration format can change under a running
+/// deployment, and the old binary against the new config and the new binary
+/// against the old one both fail, in opposite directions and neither loudly.
+/// A validation step that runs before the install is what turns that from an
+/// outage into a refused deploy.
 pub(crate) fn parse_invocation(
     routes: &[(String, RouteMethod)],
     handlers: &[String],
@@ -2792,9 +2792,8 @@ mod wildcard_route_tests {
         match_route(&segs, &route(pattern))
     }
 
-    /// The capability `App` was missing, and the whole of why m6-file has a
-    /// different shape: a static file server needs one route to answer for a
-    /// path of unknown depth.
+    /// The capability a static file server needs, and the whole of why m6-file
+    /// has a different shape: one route answers for a path of unknown depth.
     #[test]
     fn a_wildcard_captures_the_rest_of_the_path() {
         assert_eq!(
@@ -3144,7 +3143,7 @@ tail = false
 
 #[cfg(test)]
 mod dict_cost {
-    //! What `App` spends per request before a handler or a template runs.
+    //! What the request path spends per request before a handler or a template runs.
     //!
     //! All `#[ignore]`d. These are measurements, not assertions: a timing
     //! assertion is the wall-clock trap `test_static_file_cache_hit` already

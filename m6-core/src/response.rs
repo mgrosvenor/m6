@@ -142,11 +142,10 @@ pub struct Response {
 impl From<crate::http::RawResponse> for Response {
     /// The low-level response type, lifted into the one handlers return.
     ///
-    /// `RawResponse` is what a service builds when it is writing its own
-    /// status, headers and body with no framework around it; `Response` is
-    /// what an `App` handler returns. They hold the same three things, so a
-    /// service migrating onto `App` does not have to rewrite handlers that
-    /// already produce a correct answer.
+    /// `RawResponse` is what a service builds when it writes its own status,
+    /// headers and body with no site around it; `Response` is what a request
+    /// arm returns. They hold the same three things, so a service does not
+    /// rewrite a handler that already produces a correct answer.
     ///
     /// `verbatim`, because a `RawResponse` was built to be written as-is: the
     /// service that produced it set its own `Content-Type` and length and had
@@ -575,7 +574,7 @@ fn is_no_store_name(raw: &str) -> bool {
     name.trim().eq_ignore_ascii_case("no-store")
 }
 
-/// Map an `Error` to a `Response` (status only, body set by framework).
+/// Map an `Error` to a `Response` (status only, body set by `site`).
 pub fn error_to_response(err: &Error) -> Response {
     match err {
         Error::NotFound => Response::not_found(),

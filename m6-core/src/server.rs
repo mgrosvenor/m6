@@ -98,13 +98,11 @@ pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 
 /// Serve HTTP/1.1 on one accepted connection until it ends.
 ///
-/// **This is the one backend connection loop.** m6-file, m6-html and
-/// m6-auth-server each had their own, and each of the three answered exactly
-/// one request and closed -- legal (RFC 9112 9.3 allows a server to close at
-/// any time) and expensive, because m6-http speaks HTTP/1.1 to its backends
-/// over unix sockets, so every cache miss paid a fresh connect and a fresh
-/// accept. Measured by h1spec as "Keep-alive default (HTTP/1.1)" failing on
-/// all three.
+/// **This is the blocking reference loop the benchmarks and tests drive.**
+/// Every service frames requests with [`crate::h1::ServerConn`]; this
+/// function stays for the two benchmarks and the one test that read a socket
+/// directly. It keeps the keep-alive rules one place, so a stand-in cannot
+/// measure a different connection lifetime from the one the contract states.
 ///
 /// The handler is given a [`crate::h1::Responder`] rather than the stream, so
 /// the two rules that must hold for every response -- no body on a HEAD, and
