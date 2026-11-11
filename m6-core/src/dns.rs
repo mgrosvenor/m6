@@ -30,9 +30,9 @@
 //! There is no retry and no second nameserver: a question goes to the first
 //! `nameserver` in /etc/resolv.conf and its answer is the answer. The caller
 //! owns the deadline, and a query dropped at its deadline closes its socket,
-//! which is what a timed-out lookup gives the thread version today. A truncated
-//! reply is a failure: an A, AAAA or PTR answer for the names a monitor asks
-//! about fits in UDP, and a TCP fallback would be a second mechanism.
+//! which reads as [`Ptr::Failed`]. A truncated reply is a failure: an A, AAAA
+//! or PTR answer for the names a monitor asks about fits in UDP, and a TCP
+//! fallback would be a second mechanism.
 //!
 //! The messages are built and parsed by `hickory-proto`, which allocates. That
 //! is at most `MAX_LOOKUPS_PER_POLL` lookups per monitor poll, off the request
@@ -341,8 +341,7 @@ fn asks_about(message: &Message, name: &Name, record_type: RecordType) -> bool {
     questions.len() == 1 && questions[0].name() == name && questions[0].query_type() == record_type
 }
 
-/// The PTR-then-forward check that `resolve::confirm` makes today, driven by
-/// readiness.
+/// The PTR-then-forward check, driven by readiness.
 ///
 /// The PTR step runs first. When it answers a name, the query is replaced by
 /// the A and AAAA questions for that name, so [`Confirm::fd`] changes and the

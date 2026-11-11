@@ -278,6 +278,15 @@ pub struct Poller {
     last_start: Option<Instant>,
     /// The deadlines for the outgoing slots, indexed by their table position.
     pub out_timeouts: Timeouts,
+    /// Test seam: make the next tunnel probe's connect fail at once with this
+    /// error. Set on the one poller the test drives, so no other test can see
+    /// it, and never built outside a test.
+    #[cfg(test)]
+    probe_connect_failure: std::cell::Cell<Option<io::ErrorKind>>,
+    /// Test seam: let this many step starts pass, then fail the next one at
+    /// once with this error.
+    #[cfg(test)]
+    step_start_failure: std::cell::Cell<Option<(usize, io::ErrorKind)>>,
 }
 
 impl Poller {
@@ -344,7 +353,29 @@ impl Poller {
             running,
             last_start: None,
             out_timeouts: Timeouts::new(slots, timeout),
+            #[cfg(test)]
+            probe_connect_failure: std::cell::Cell::new(None),
+            #[cfg(test)]
+            step_start_failure: std::cell::Cell::new(None),
         }
+    }
+
+    /// Make the next tunnel probe's connect fail at once with `kind`.
+    ///
+    /// A TCP connect is not synchronous on every platform: the same refused
+    /// address can answer at once here and at the readiness event there. A
+    /// test that must reach the tally's failure path uses this seam instead of
+    /// guessing the platform.
+    #[cfg(test)]
+    pub fn fail_next_probe_connect(&self, kind: io::ErrorKind) {
+        self.probe_connect_failure.set(Some(kind));
+    }
+
+    /// Let `starts` step starts pass, then make the next one fail at once
+    /// with `kind`, as a connect that cannot even open a socket does.
+    #[cfg(test)]
+    pub fn fail_step_start_after(&self, starts: usize, kind: io::ErrorKind) {
+        self.step_start_failure.set(Some((starts, kind)));
     }
 
     /// The outgoing table: one request slot per node, then the probe slots,
@@ -549,20 +580,9 @@ impl Poller {
                     let next = self.record_error(node, step, text);
                     if next == Step::Done {
                         // The node finished on a step that failed at start.
-                        // Doing here what `after` does keeps a deadline armed
-                        // by an earlier step from firing on a finished node
-                        // and driving the outstanding count below zero.
-                        self.close_slot(poll, out, node);
-                        self.out_timeouts.clear(Token(node));
-                        if let Out::Node { step, .. } = &mut out[node] {
-                            *step = Step::Done;
-                        }
-                        self.running.outstanding -= 1;
-                        return if self.running.outstanding == 0 {
-                            self.advance(poll, out, now)
-                        } else {
-                            Ok(Progress::Working)
-                        };
+                        // `after` is the one place that finishes a node, so a
+                        // deadline an earlier step armed cannot fire on it.
+                        return self.after(node, next, poll, out, now);
                     }
                     step = next;
                 }
@@ -707,6 +727,14 @@ impl Poller {
         };
         *slot_step = step;
         write_request(up, &authority, &path, token.as_deref());
+        #[cfg(test)]
+        if let Some((starts, kind)) = self.step_start_failure.get() {
+            if starts == 0 {
+                self.step_start_failure.set(None);
+                return Err(io::Error::from(kind));
+            }
+            self.step_start_failure.set(Some((starts - 1, kind)));
+        }
         up.start(&addr, tls.as_ref(), false, now + self.timeout)?;
         let fd = up.fd();
         let interest = up.interest();
@@ -855,6 +883,11 @@ impl Poller {
         };
         let slot = self.probe_slot();
         self.close_slot(poll, out, slot);
+        #[cfg(test)]
+        if let Some(kind) = self.probe_connect_failure.take() {
+            self.running.probes[node].failed(&io::Error::from(kind));
+            return Ok(false);
+        }
         let sock = match MioTcpStream::connect(addr) {
             Ok(sock) => sock,
             Err(e) => {
@@ -1660,24 +1693,19 @@ mod tests {
     /// does: its deadline is dropped and its slot marked done, so the finished
     /// node cannot fail a second time.
     ///
-    /// The deadline an earlier step armed fires after the poll has finished,
-    /// which is where the service's loop would meet it. Expiring it here must
-    /// find nothing to fail and must not drive the node's count below zero.
+    /// The failure is injected: a TCP connect that refuses at once on one
+    /// platform reaches its readiness event on another, so the platform is not
+    /// a sound trigger for this path.
     #[test]
     fn a_later_step_that_cannot_connect_finishes_the_node_once() {
-        let (public, seen) = serve(1, health_traffic);
+        let (public, seen) = serve(2, health_traffic);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
             role: "origin".into(),
             perf_token_file: None,
-            // Port zero refuses before a descriptor exists, so /perf fails in
-            // `start` rather than at a deadline.
-            tunnel: Some(crate::fleet::Tunnel {
-                address: "127.0.0.1:0".into(),
-                public_key: None,
-            }),
-            metrics_over_tunnel: true,
+            tunnel: None,
+            metrics_over_tunnel: false,
         };
         let mut fleet = fleet_of(n);
         fleet.timeout_ms = 100;
@@ -1692,6 +1720,9 @@ mod tests {
             crate::check::MAX_LOOKUPS_PER_POLL,
         )
         .unwrap();
+        // `/health` and `/perf` start; `/traffic` is the node's last step and
+        // fails at start, as a connect that cannot open a socket fails.
+        poller.fail_step_start_after(2, io::ErrorKind::AddrNotAvailable);
         let mut out = poller.out();
         let polled = drive_to_end(
             &mut poller,
@@ -1701,11 +1732,11 @@ mod tests {
         .unwrap();
         seen.join().unwrap();
         let r = &polled.readings[0];
-        assert!(r.perf_error.is_some(), "{r:?}");
+        assert!(r.perf.is_some() || r.perf_error.is_some(), "{r:?}");
         assert!(r.traffic_error.is_some(), "{r:?}");
         assert_eq!(r.unreachable, None, "{r:?}");
 
-        // The health step's deadline is still armed in the old code. It fires
+        // The perf step's deadline is still armed in the old code. It fires
         // now, on a finished node, and must find nothing.
         let poll = Poll::new().unwrap();
         let later = Instant::now() + Duration::from_secs(1);
@@ -1721,6 +1752,10 @@ mod tests {
 
     /// A tunnel connect that fails at once is a reading, not the end of the
     /// service: the probe reports the failure and the poll finishes.
+    ///
+    /// The failure is injected for the same reason as the later-step test's:
+    /// whether a refused connect answers synchronously is the platform's to
+    /// decide, and this test is about the tally.
     #[test]
     fn a_tunnel_address_that_cannot_connect_is_reported_not_fatal() {
         let (public, seen) = serve(3, health_traffic);
@@ -1729,18 +1764,35 @@ mod tests {
             url: format!("http://127.0.0.1:{public}"),
             role: "origin".into(),
             perf_token_file: None,
-            // Port zero refuses before a descriptor exists.
             tunnel: Some(crate::fleet::Tunnel {
-                address: "127.0.0.1:0".into(),
+                address: "192.0.2.1:9".into(),
                 public_key: None,
             }),
             metrics_over_tunnel: false,
         };
-        let polled = run(&fleet_of(n), Some("tok"));
+        let mut fleet = fleet_of(n);
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token.path(), "tok\n").unwrap();
+        fleet.perf_token_file = Some(token.path().to_string_lossy().into_owned());
+        let mut poller = one_shot_poller(
+            &fleet,
+            &tls(),
+            "127.0.0.1:53".parse().unwrap(),
+            crate::check::MAX_LOOKUPS_PER_POLL,
+        )
+        .unwrap();
+        poller.fail_next_probe_connect(io::ErrorKind::AddrNotAvailable);
+        let mut out = poller.out();
+        let polled = drive_to_end(
+            &mut poller,
+            &mut out,
+            Some(Instant::now() + Duration::from_secs(20)),
+        )
+        .unwrap();
         seen.join().unwrap();
         let t = polled.readings[0].tunnel.as_ref().unwrap();
         assert!(
-            matches!(t.probe.outcome, tunnel::Probe::Failed(_)),
+            matches!(&t.probe.outcome, tunnel::Probe::Failed(why) if !why.is_empty()),
             "{:?}",
             t.probe.outcome
         );
