@@ -207,6 +207,24 @@ fn http_request_within(socket_path: &Path, request: &str, read_timeout: Duration
     String::from_utf8_lossy(&resp).into_owned()
 }
 
+/// The bytes of a request with a body, for a test that sends it on a
+/// connection it keeps.
+fn request_with_body(method: &str, path: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        method,
+        path,
+        content_type,
+        body.len(),
+        body
+    )
+}
+
+/// The JSON login request the locked-database tests send.
+fn login_json_request(body: &str) -> String {
+    request_with_body("POST", "/auth/login", "application/json", body)
+}
+
 fn http_request_with_body(
     socket_path: &Path,
     method: &str,
@@ -214,15 +232,10 @@ fn http_request_with_body(
     content_type: &str,
     body: &str,
 ) -> String {
-    let req = format!(
-        "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
-        method,
-        path,
-        content_type,
-        body.len(),
-        body
-    );
-    http_request(socket_path, &req)
+    http_request(
+        socket_path,
+        &request_with_body(method, path, content_type, body),
+    )
 }
 
 fn parse_status(resp: &str) -> u16 {
@@ -1103,12 +1116,9 @@ fn a_locked_database_defers_and_the_service_keeps_serving() {
     );
 
     let body = r#"{"username":"alice","password":"correct_pass"}"#;
-    let request = format!(
-        "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    login.write_all(request.as_bytes()).expect("send the login");
+    login
+        .write_all(login_json_request(body).as_bytes())
+        .expect("send the login");
 
     // The login's refresh-token store meets the lock. While it is deferred,
     // another connection must be answered: a read deadline of one second
@@ -1165,12 +1175,11 @@ fn a_database_locked_past_a_second_answers_503() {
     let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
 
     let body = r#"{"username":"alice","password":"correct_pass"}"#;
-    let request = format!(
-        "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
+    let answer = http_request_within(
+        &env.socket_path,
+        &login_json_request(body),
+        Duration::from_secs(3),
     );
-    let answer = http_request_within(&env.socket_path, &request, Duration::from_secs(3));
     assert_eq!(
         parse_status(&answer),
         503,

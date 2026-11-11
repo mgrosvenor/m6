@@ -46,9 +46,14 @@ const EVENTS: usize = 256;
 const INITIAL_CONNECTIONS: usize = 1024;
 const READ_CAP: usize = 16 * 1024;
 const WRITE_CAP: usize = 64 * 1024;
-/// How soon the loop tries a request whose handler met a database lock.
+/// How soon the loop tries a request whose handler met a database lock. A
+/// retry costs little and the lock usually clears in milliseconds, so the
+/// waiting client barely notices while the loop serves the other connections
+/// between attempts.
 const BUSY_RETRY: Duration = Duration::from_millis(5);
-/// How long a request waits for a lock before the loop answers 503.
+/// How long a request waits for a lock before the loop answers 503. After a
+/// second the client needs an answer it can act on, and the lock may be held
+/// for a long time.
 const BUSY_GIVE_UP: Duration = Duration::from_secs(1);
 
 /// The four routes, in the order `Handled::Code` indexes them.
@@ -328,7 +333,11 @@ fn main() -> Result<()> {
                     Err(busy) if now.duration_since(retry.first) < BUSY_GIVE_UP => {
                         retry.verified = retry.verified.or(busy.verified);
                         retries[k] = Some(retry);
-                        busy_timeouts.touch(Token(k), now);
+                        // Armed from the end of this attempt, so the loop
+                        // polls and serves the other connections before the
+                        // next one, even when the attempt itself took longer
+                        // than the retry delay.
+                        busy_timeouts.touch(Token(k), Instant::now());
                         continue;
                     }
                     Err(_) => {
@@ -554,8 +563,9 @@ fn close(
 
 /// The answer once a deferred request has waited a second for the database.
 fn busy_response() -> Response {
+    let retry_after = BUSY_GIVE_UP.as_secs().to_string();
     Response::status(503)
-        .header("Retry-After", "1")
+        .header("Retry-After", &retry_after)
         .body("Service Unavailable")
 }
 

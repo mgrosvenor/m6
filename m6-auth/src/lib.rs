@@ -374,8 +374,12 @@ impl Db {
 
         match result {
             Ok((id, uname, hash, roles_json, created_at)) => {
+                // Read the whole user, groups included, before the expensive
+                // verify. The verify is then the last step, so a database read
+                // that fails busy leaves no password verified behind it.
+                let user = self.row_to_user(id, uname, roles_json, created_at)?;
                 if verify_bcrypt(password, &hash)? {
-                    Ok(Some(self.row_to_user(id, uname, roles_json, created_at)?))
+                    Ok(Some(user))
                 } else {
                     Ok(None)
                 }

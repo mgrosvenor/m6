@@ -469,9 +469,8 @@ The processes above share one file, and section 9 gives the rules that keep that
 **One database file serves every process that links this crate, and `Db::open` sets the pragmas that make that safe.**
 Table 2 gives the pragmas, and section 8 gives how a worker holds its handle.
 
-A statement that meets another process's lock waits up to the busy timeout and then returns `SQLITE_BUSY`.
-`m6-auth-server` sets its connection's timeout to zero after the open, so a locked statement does not hold every request in the service, and its loop retries the request (section 2).
-`m6-auth-cli` and a renderer keep the 5-second wait.
+A process's lock does not hold every request in `m6-auth-server`: its loop retries the locked statement and answers 503 after a second.
+`m6-auth.md` section 9 gives the retry.
 
 The crate keeps no copy of user data in memory.
 Every call reads or writes SQLite, so a user created by `m6-auth-cli` or a renderer is visible to the server's next query.

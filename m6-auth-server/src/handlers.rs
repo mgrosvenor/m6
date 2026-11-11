@@ -133,6 +133,56 @@ fn validate_next(next: Option<&str>) -> String {
     }
 }
 
+/// What the login sequence shared by the form and JSON handlers did.
+enum LoginOutcome {
+    /// The password was right and both tokens were issued.
+    Tokens(String, String),
+    /// No user has that password, or the username does not exist.
+    InvalidCredentials,
+    /// The database is locked. The user is the one the attempt verified, so the
+    /// loop's retry skips bcrypt.
+    Busy(Option<m6_auth::User>),
+    /// The answer the sequence built for a failure that is not a lock.
+    Response(RawResponse),
+}
+
+/// Take the user a retry already verified, or verify the password, then finish
+/// the login. The form and JSON handlers keep only their own parse and answer.
+fn verified_login(
+    state: &AppState,
+    db: &Db,
+    username: &str,
+    password: &str,
+    peer_ip: &str,
+    verified: Option<&m6_auth::User>,
+) -> LoginOutcome {
+    // The user a first attempt verified, kept for the loop when the token store
+    // meets a lock. Empty on a retry, which already holds it.
+    let mut verified_here: Option<m6_auth::User> = None;
+    let user: &m6_auth::User = match verified {
+        Some(user) => user,
+        None => match db.user_verify_password(username, password) {
+            Ok(Some(u)) => &*verified_here.insert(u),
+            Ok(None) => {
+                warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
+                note_login_failure(state, peer_ip);
+                return LoginOutcome::InvalidCredentials;
+            }
+            Err(e) if e.is_busy() => return LoginOutcome::Busy(None),
+            Err(e) => {
+                warn!(error = %e, "db error on login");
+                return LoginOutcome::Response(internal_error());
+            }
+        },
+    };
+
+    match finish_login(state, db, user, peer_ip) {
+        Ok((access_jwt, refresh_jwt)) => LoginOutcome::Tokens(access_jwt, refresh_jwt),
+        Err(LoginFailure::Busy) => LoginOutcome::Busy(verified_here),
+        Err(LoginFailure::Response(resp)) => LoginOutcome::Response(resp),
+    }
+}
+
 fn handle_login_form(
     req: &RawRequest,
     state: &AppState,
@@ -146,53 +196,32 @@ fn handle_login_form(
     let next_raw = form_field(&fields, "next");
     let next = validate_next(next_raw);
 
-    // The user a first attempt verified, kept for the loop when the token store
-    // meets a lock. Empty on a retry, which already holds it.
-    let mut verified_here: Option<m6_auth::User> = None;
-    let user: &m6_auth::User = match verified {
-        Some(user) => user,
-        None => match db.user_verify_password(username, password) {
-            Ok(Some(u)) => &*verified_here.insert(u),
-            Ok(None) => {
-                warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
-                note_login_failure(state, peer_ip);
-                let next_enc = url_encode_path(&next);
-                return Ok(RawResponse::new(302).header(
-                    "Location",
-                    format!("/login?error=invalid&next={}", next_enc),
-                ));
-            }
-            Err(e) if e.is_busy() => return Err(Busy { verified: None }),
-            Err(e) => {
-                warn!(error = %e, "db error on login");
-                return Ok(internal_error());
-            }
-        },
-    };
+    match verified_login(state, db, username, password, peer_ip, verified) {
+        LoginOutcome::Tokens(access_jwt, refresh_jwt) => {
+            let session_cookie = format!(
+                "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+                access_jwt, state.access_ttl
+            );
+            let refresh_cookie = format!(
+                "refresh={}; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age={}",
+                refresh_jwt, state.refresh_ttl
+            );
 
-    let (access_jwt, refresh_jwt) = match finish_login(state, db, user, peer_ip) {
-        Ok(pair) => pair,
-        Err(LoginFailure::Busy) => {
-            return Err(Busy {
-                verified: verified_here,
-            })
+            Ok(RawResponse::new(302)
+                .header("Location", next)
+                .header("Set-Cookie", session_cookie)
+                .header("Set-Cookie", refresh_cookie))
         }
-        Err(LoginFailure::Response(resp)) => return Ok(resp),
-    };
-
-    let session_cookie = format!(
-        "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
-        access_jwt, state.access_ttl
-    );
-    let refresh_cookie = format!(
-        "refresh={}; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age={}",
-        refresh_jwt, state.refresh_ttl
-    );
-
-    Ok(RawResponse::new(302)
-        .header("Location", next)
-        .header("Set-Cookie", session_cookie)
-        .header("Set-Cookie", refresh_cookie))
+        LoginOutcome::InvalidCredentials => {
+            let next_enc = url_encode_path(&next);
+            Ok(RawResponse::new(302).header(
+                "Location",
+                format!("/login?error=invalid&next={}", next_enc),
+            ))
+        }
+        LoginOutcome::Busy(verified) => Err(Busy { verified }),
+        LoginOutcome::Response(resp) => Ok(resp),
+    }
 }
 
 fn handle_login_json(
@@ -217,47 +246,24 @@ fn handle_login_json(
         }
     };
 
-    // The user a first attempt verified, kept for the loop when the token store
-    // meets a lock. Empty on a retry, which already holds it.
-    let mut verified_here: Option<m6_auth::User> = None;
-    let user: &m6_auth::User = match verified {
-        Some(user) => user,
-        None => match db.user_verify_password(&body.username, &body.password) {
-            Ok(Some(u)) => &*verified_here.insert(u),
-            Ok(None) => {
-                warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
-                note_login_failure(state, peer_ip);
-                return Ok(RawResponse::new(401)
-                    .content_type("application/json")
-                    .body(r#"{"error":"invalid_credentials"}"#));
-            }
-            Err(e) if e.is_busy() => return Err(Busy { verified: None }),
-            Err(e) => {
-                warn!(error = %e, "db error on login");
-                return Ok(internal_error());
-            }
-        },
-    };
+    match verified_login(state, db, &body.username, &body.password, peer_ip, verified) {
+        LoginOutcome::Tokens(access_jwt, refresh_jwt) => {
+            let resp_body = serde_json::json!({
+                "access_token":  access_jwt,
+                "refresh_token": refresh_jwt,
+                "expires_in":    state.access_ttl,
+            });
 
-    let (access_jwt, refresh_jwt) = match finish_login(state, db, user, peer_ip) {
-        Ok(pair) => pair,
-        Err(LoginFailure::Busy) => {
-            return Err(Busy {
-                verified: verified_here,
-            })
+            Ok(RawResponse::new(200)
+                .content_type("application/json")
+                .body(resp_body.to_string()))
         }
-        Err(LoginFailure::Response(resp)) => return Ok(resp),
-    };
-
-    let resp_body = serde_json::json!({
-        "access_token":  access_jwt,
-        "refresh_token": refresh_jwt,
-        "expires_in":    state.access_ttl,
-    });
-
-    Ok(RawResponse::new(200)
-        .content_type("application/json")
-        .body(resp_body.to_string()))
+        LoginOutcome::InvalidCredentials => Ok(RawResponse::new(401)
+            .content_type("application/json")
+            .body(r#"{"error":"invalid_credentials"}"#)),
+        LoginOutcome::Busy(verified) => Err(Busy { verified }),
+        LoginOutcome::Response(resp) => Ok(resp),
+    }
 }
 
 // ─── POST /auth/refresh ───────────────────────────────────────────────────────
