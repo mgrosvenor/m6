@@ -16,7 +16,7 @@
 //! | # | setting | value | reason |
 //! |---|---|---|---|
 //! | 1 | `journal_mode` | `DELETE` (rollback journal) | The journal file is removed at every commit, so at rest the database is exactly one file. Copying that file copies everything. WAL keeps `-wal` and `-shm` files beside it, and a copy of the main file alone can miss committed work. [`Journal::Wal`] is available for services that want it |
-//! | 2 | `busy_timeout` | 5 s ([`BUSY_TIMEOUT`]) | A second connection waits for a lock instead of failing at once with `SQLITE_BUSY` |
+//! | 2 | `busy_timeout` | 5 s ([`BUSY_TIMEOUT`]) | A second connection waits for a lock instead of failing at once with `SQLITE_BUSY`. A service in an event loop sets it to zero after its start-time open and defers the statement on `SQLITE_BUSY`, because a wait in the loop holds every request behind it |
 //! | 3 | `foreign_keys` | on | SQLite has them off in every new connection, so `ON DELETE CASCADE` does nothing without it. The value is read back after it is set |
 //! | 4 | `recursive_triggers` | on | SQLite fires DELETE triggers for rows removed by `INSERT OR REPLACE` only with this on. Without it the append-only rule can be bypassed |
 //!
@@ -117,6 +117,12 @@ pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use rusqlite::{TransactionBehavior, MAIN_DB};
 
 /// The busy timeout [`open`] sets: 5 seconds.
+///
+/// A service in an event loop sets its connection's busy timeout to zero after
+/// the start-time open and defers a statement that returns `SQLITE_BUSY`. A wait
+/// in the one loop holds every connection in the process, so the error is the
+/// part the loop can retry. A one-shot tool keeps the five seconds, because
+/// nothing else waits on it.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The journal mode of a database file.
