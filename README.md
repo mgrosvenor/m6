@@ -128,7 +128,7 @@ Client → m6-http (epoll, single-thread)
            │
            ├─ Route → backend pool (least-conn; Unix socket or URL)
            │
-           ├─ Renderer handles request (thread pool, blocking I/O)
+           ├─ Renderer handles request (one event loop per process)
            │
            └─ m6-http: inspect Cache-Control, store entry, return response
 ```
@@ -220,9 +220,9 @@ Criterion microbenchmarks (CPU cost, no I/O):
 Tera template renderer. Handles all HTML routes.
 
 **Architecture (via m6-render library):**
-- Fixed thread pool (default: CPU count) + bounded request queue
-- `FrameworkState` in `Arc<...>`, built once at start and shared read-only across the worker threads
-- Two-tier state: `Global` (shared, `Arc` clone per request) and `ThreadLocal` (zero sync overhead)
+- One process and one event loop, accepting on listener readiness
+- `Site` built once at start, holding the config, the route table and the renderer
+- Plain state in `main`, passed to each request arm
 - JSON params loaded from disk at startup; static params stored as `Arc<Map>` — pointer clone per request, no Map copy
 - Dynamic `{stem}`-keyed params resolved and LRU-cached
 - Accept-Encoding checked with zero-alloc byte windowing (`ae_contains`)
@@ -291,7 +291,7 @@ Full minify → brotli-6 pipeline (one-time cost, result cached by m6-http):
 Static file server. Serves assets, downloads, and any file from the site directory.
 
 **Architecture:**
-- Fixed thread pool + bounded request queue
+- One event loop and a connection table sized from the open-file limit
 - Route matching with `{relpath}` (catchall) and `{stem}` (single segment) params
 - Param validation: alphanumeric + `-_.` for stem; subdirs allowed for relpath; `..` → 404
 - Fast symlink guard: `symlink_metadata` check only; `canonicalize` only called when a symlink is found (avoids ~15 µs syscall on every request for normal files)
@@ -337,23 +337,15 @@ Shared library crate used by `m6-auth-server` and `m6-auth-cli`.
 
 ### m6-render (library)
 
-Framework library for writing custom renderers in Rust. Used by `m6-html` and any Rust custom renderer crate.
+Library for writing custom renderers in Rust. Used by `m6-html` and any Rust custom renderer crate.
 
-- `App::new()` / `App::with_global()` for stateful renderers
-- Request routing with path parameters (`{id}`, `{relpath}`)
+- `Site` for routing, the request dictionary, templates and the site-wide finish
+- Code routes as `CodeRoute` values, answered from one `match` on `Handled`
+- `ServerConn`, `Signals`, `Timeouts`, `Slots` and the reactor as the parts a service's own loop uses
 - `Request` / `Response` / `Error` types
-- Thread pool + bounded queue managed by the framework
 - Configuration read once at start, and a change takes a restart
 
-```rust
-fn main() {
-    App::with_global(init_global)
-        .route_get("/api/items",       handle_list)
-        .route_post("/api/items",      handle_create)
-        .route_get("/api/items/{id}",  handle_get)
-        .run().unwrap();
-}
-```
+`docs/m6-app-anatomy.md` walks through the loop a renderer writes.
 
 ---
 

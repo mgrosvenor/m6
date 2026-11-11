@@ -400,7 +400,7 @@ This section gives the concurrency model a member needs.
 A backend MUST be able to accept a new connection while it is handling another.
 It MAY use threads, processes or an event loop.
 
-The reference model, given in `m6-architecture.md` §7.1, is a fixed thread pool with a bounded queue.
+The reference model, given in `m6-architecture.md` §7.1, is one process with one event loop, scaling by running more instances.
 A full queue answers `503`, which is how backpressure reaches the proxy.
 
 That is the concurrency a member provides.

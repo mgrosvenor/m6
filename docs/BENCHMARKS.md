@@ -403,7 +403,7 @@ Section 10.2 gives the control error that inverted the first version of this res
 The first version of this measurement reported m6-core as 72% faster than plain Rust, and the cause was the control.
 `rust-plain` spawned a thread per connection while m6-core answered from a fixed pool, so the comparison measured the concurrency model.
 
-The concurrency section of [`m6-backend-protocol.md`](m6-backend-protocol.md) names a fixed thread pool with a bounded queue as the reference model, so `rust-plain` was not a faithful reference either.
+The concurrency section of [`m6-backend-protocol.md`](m6-backend-protocol.md) named a fixed thread pool with a bounded queue as the reference model at the time of the measurement, so `rust-plain` was not a faithful reference either.
 Giving it one took it from 17,608 to 46,826 req/s at concurrency 4, a 2.7x improvement, and inverted the sign of the answer.
 
 A control that differs from its subject in two ways measures neither.

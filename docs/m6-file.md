@@ -177,23 +177,22 @@ The boundary is the root the process was started with, so that directory should 
 
 ## 6. Configuration
 
-m6-file accepts two arguments, a root and a config path, and reads its thread pool size and routes from the config.
+m6-file accepts two arguments, a root and a config path, serves from one event loop, and reads its routes from the config.
 
 ```toml
-[thread_pool]
-size = 32
-
 [[route]]
 path    = "/assets/{*relpath}"
 handler = "files"
 root    = "assets/"
 ```
 
-Three facts about that config:
+Two facts about that config:
 
-- the pool defaults to the *CPU* (Central Processing Unit) count. A page requesting more assets at once than the pool has threads queues the surplus, which surfaces as "pool empty" backend errors.
 - a route naming a handler the binary does not have is fatal, so the service exits 2 at startup.
 - routes come from config, read once at start, so an asset tree is added by editing the config and restarting.
+
+The process serves every connection from one loop, so more load is more instances, each with its own socket in `site.toml`'s `[[backend]]` glob.
+A `[thread_pool]` table is refused at start for the same reason.
 
 m6-file answers `GET` and `HEAD`, and returns 405 for anything else.
 

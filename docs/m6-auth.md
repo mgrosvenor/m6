@@ -73,7 +73,7 @@ Take from it that every flag is optional and the two positional arguments are re
 
 **Table 2: the two positional arguments and the three flags.**
 
-For this binary the dump covers the site directory, the config paths, the socket, the thread pool, the server settings and any routes declared in the config.
+For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
 It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the four routes the service registers.
 It exits 0 before the service validates those sections.
 

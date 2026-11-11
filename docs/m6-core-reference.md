@@ -41,22 +41,24 @@ Sections 6 to 11 cover HTTP semantics, content, observability, errors, the test 
 
 ## 1. Using it
 
-This section shows the two shapes a service takes, the prelude and the hand-built loop, and what the prelude gives by default.
+This section shows the shape a service takes, the prelude, and what the prelude gives.
 
 m6-core is the only crate an m6 service links, and the intended first line is the prelude.
 
 ```rust
 use m6_core::prelude::*;
 
-fn main() -> Result<()> {
-    App::new()
-        .route("/blog/{stem}", |req| Response::render("templates/post.html", req))
-        .run()
+fn main() -> anyhow::Result<()> {
+    let site = Site::load("my-service", ROUTES, &[], &NoTemplates);
+    // The loop: a poll, a listener, the signal descriptor, the connection
+    // slots, the deadlines, and one `match` on the event token.
 }
 ```
 
+`docs/m6-app-anatomy.md` §2 has that loop in full.
+
 The prelude is deliberately small.
-It exports `App` and `AppContext`, `Site`, `Handled` and `CodeRoute`, `Dict`, `Error` and `Result`, `Request` and `Response`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
+It exports `Site`, `Handled`, `CodeRoute` and `RouteMethod`, `Dict`, `Error` and `Result`, `Request` and `Response`, `ServerConn`, `Read`, `Flush` and `head_slots`, the event module's `Signals`, `Signal`, `Timeouts`, `Slots` and `LoopTrace`, `mio` and its `Poll`, `Events`, `Interest` and `Token`, `listen_unix`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
 Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, lettre's `Message`, `SmtpTransport` and `Transport`, `ureq`, and `rusqlite`.
 
 A service that renders no templates says so, and takes core with `default-features = false` to stop linking Tera.
@@ -64,33 +66,23 @@ A service that renders no templates says so, and takes core with `default-featur
 ```rust
 use m6_core::prelude::*;
 
-fn main() -> Result<()> {
-    App::new()
-        .renderer(NoTemplates)
-        .route("/healthz", |_req| Ok(Response::text("ok")))
-        .run()
-}
+let site = Site::load("my-service", ROUTES, &[], &NoTemplates);
 ```
 
-There is a second shape.
-`m6-http` is a proxy with its own event loop and datagram sockets, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all.
-Every module is public, and most of the crate can be used without the `App` loop, so m6-core is a library first and a framework second.
-The second shape uses `site::Site` for the request path and writes the loop itself: the four EL-6 jobs moved those parts out of `App`.
-
-Both shapes link one crate, and the difference is where the service loop comes from.
-Section 2 gives the features that decide which parts compile.
+Every module is public, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all, so m6-core is a library of parts.
+The loop belongs to the service, and `docs/m6-app-anatomy.md` is the shape it follows.
 
 ## 2. Feature flags
 
 Features and modules are different axes, and `flash` and `csrf` have no module at all.
-They gate code inside `App` and one method each, `Response::flash` and `Request::verify_csrf`.
+They gate code inside `site` and one method each, `Response::flash` and `Request::verify_csrf`.
 A reader who greps for a `csrf` module finds nothing and wrongly concludes the feature is missing.
 Table 2 gives the nine features.
 
 | feature | default | what it adds |
 |---|---|---|
-| `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. Without it `App` uses `NoTemplates`. |
-| `minify` | **on** | `minify` module, and the minification step in `App`. Pulls minify-html, which brings a CSS engine, and minify-js. Without it a config that turns minification on fails to load and names this feature. |
+| `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. Without it a service passes `NoTemplates`. |
+| `minify` | **on** | `minify` module, and the minification step in `site`. Pulls minify-html, which brings a CSS engine, and minify-js. Without it a config that turns minification on fails to load and names this feature. |
 | `testkit` | off | The `testkit` module. Enable from `[dev-dependencies]` only. |
 | `multipart` | off | `multipart` module, `Request::file`. Pulls multer, tokio, bytes, futures-util. |
 | `flash` | off | `Response::flash` and *HMAC* (hash-based message authentication code) signed one-shot messages. Pulls hmac, sha2. |
@@ -122,12 +114,11 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 
 | group | module | what it is |
 |---|---|---|
-| **Building a service** | `app` | The `App` builder, routing, the thread pool, the request dictionary and the service lifecycle. The largest module. |
-| | `site` | `Site`, `CodeRoute` and `Handled`. The site's request path, as plain functions on a value the service owns. |
+| **Building a service** | `site` | `Site`, `CodeRoute`, `Handled` and `RouteMethod`, the route table, the request dictionary and the site-wide finish. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
-| | `server` | `UnixServer` and `serve_connection`, the socket-backend loop. |
-| | `signal` | `block()`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
-| | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing the loop needs from a template engine. |
+| | `server` | `socket_path_from_config` and the blocking request and response adapters the benchmarks use. |
+| | `signal` | `block()`, `Lifecycle`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
+| | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
 | | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, and percent-encoding. |
@@ -169,68 +160,30 @@ Sections 4 and 5 take the two largest groups in turn, and sections 6 to 10 take 
 
 ## 4. Building a service
 
-This section covers the modules that build a service: the `App` builder and its state, the configuration it reads, the socket loop, signal handling, the renderer seam.
+This section covers the modules a service's `main` builds from: the site's request path and routing, the configuration it reads, the socket helpers, signal handling and the renderer seam.
 It uses *HTTP* (Hypertext Transfer Protocol) for the wire protocol and *TOML* (Tom's Obvious, Minimal Language) for the configuration format.
 
-### 4.1. `app`
+### 4.1. The parts a loop uses
 
-The builder is `App::new()`, then `.route(...)` or a method-specific variant (`route_get`, `route_post`, `route_put`, `route_patch`, `route_delete`), then `.run()`.
-`.renderer(...)` supplies the template implementation.
+**A service's loop is written in its own `main` from four groups of parts.**
+Table 4 names them, and `docs/m6-app-anatomy.md` §2 is the loop in full.
 
-Four entry points choose what state the service needs, and each returns a different builder type with the same routing surface, so a service declares its state shape once and the type carries it.
-Table 4 gives the four.
-
-| entry point | builder | for |
+| part | module | what it supplies |
 |---|---|---|
-| `App::new()` | `App` | no state |
-| `App::with_global(init)` | `AppWithGlobal<G>` | one `G` shared across all workers |
-| `App::with_thread_state(init)` | `AppWithThreadState<T>` | a `T` per worker thread |
-| `App::with_state(init_global, init_thread)` | `AppWithState<G, T>` | both |
+| the reactor | `mio`, re-exported | `Poll`, `Events`, `Token`, `Interest` and the non-blocking sockets |
+| the signal descriptor | `event::Signals` | signals as a readable descriptor, and `Signal` values |
+| the deadlines | `event::Timeouts` | wake me at a time for a token, and the timeout to pass to the poll |
+| the connection table | `event::Slots` | slots made at start, their growth to a ceiling, and the free list |
+| the accounting | `event::LoopTrace` | the wait against the work, per trigger |
+| one connection | `h1::ServerConn` | read, parse, buffer and write through the slot's own buffers |
+| the listener | `net::listen_unix` | a non-blocking unix listener with its mode set |
+| the site | `site::Site` | routes, the request dictionary, templates and the finish |
 
-**Table 4: the four `App` entry points and the state each one carries.**
-Take from it that the global value is shared and the thread value is per worker.
+**Table 4: the parts a service's loop builds from.**
+Take from it that every part is a plain type with methods, and that none of them calls the service back.
 
-The global initialiser receives an `AppContext`, which carries the config map, the site directory, the config path and the resolved `site.toml`.
-A thread initialiser receives the config map and the global state, or `()` when there is none.
-Both return `Result`, so a service that cannot build its state fails at startup, before the first request.
-
-`.on_destroy_thread(...)` gives the thread value a teardown hook that runs when a worker thread ends.
-Shutdown does not wait for it, so a service must not rely on it to save state.
-
-Routing: `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
-`find_route` picks the winner.
-`RouteTable` indexes the compiled routes: a fixed route is one hash lookup on its path, and `find_route` tries the pattern routes only when no fixed route answers.
-`check_route_conflicts` runs once when a config loads and refuses what would need a tie-break: two fixed routes on one path, or two patterns that can both match some path, where the same request method reaches both.
-`Methods` is the set of methods a route answers, so a conflict needs the sets to meet and `find_route` tests one bit.
-m6-http builds `RouteDecl`s from `site.toml` and calls the same check.
-Route matching existed three times before this, twice hand-rolled with different precedence rules, so the same route table could resolve differently in two services.
-
-The thread pool: `ThreadPool::new(size, queue_size)`, or `new_with_exit(size, queue_size, on_thread_exit)` to run a callback when each worker thread ends.
-`submit` returns `false` when the queue is full, which is how the loop sheds load with a 503 instead of growing a backlog.
-`try_submit(resource, f)` hands a resource to the work and returns it back when the queue is full.
-
-The request dictionary: `FrameworkState::build_dict` is where the real knowledge lives. It is private to the crate, and `site::Site` is how a service reaches it without `App`.
-Three layers no longer run per request: config keys, global params files and a route's static params files are merged once at start into `route.base_dict`.
-The per-request order is:
-
-- Params files whose path holds a `{placeholder}`.
-- Path params, each validated.
-  A `{*name}` capture may span segments and a `{name}` capture may not.
-- Query params, inserted at top level and as a nested `query` map.
-  A query key with the name of one of the route's path params is only in `query`, so it cannot replace the validated path value.
-- POST form fields, from `application/x-www-form-urlencoded` only.
-  A field with the name of one of the route's path params is dropped, for the same reason.
-  A non-empty body of any other type logs a warning.
-- Cookies, as a nested `cookies` map.
-- Built-ins `request_path`, `datetime` and `year`, after the params files so a params file cannot override them.
-- Auth claims from `x-auth-claims`, each present only when its claim is: `auth_username` (claim `username`, else `sub`), `auth_sub`, `auth_groups` and `auth_roles`.
-- Flash message, when the feature is on: verify the HMAC, insert `flash`, and the response path adds the removal cookie.
-- CSRF token, when the feature is on and the dictionary holds none: reuse the `_csrf` cookie or generate one, and insert it.
-  A submitted form token stays in place for `verify_csrf` to compare.
-
-Error keys need no step, because they arrive as query parameters at the query step.
-
-`is_shutdown()` is a free function for handlers that run long enough to care.
+`m6-http` is a proxy with its own loop and datagram sockets, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all.
+Every module is public, so the parts are usable one at a time.
 
 ### 4.2. `config`
 
@@ -242,7 +195,6 @@ pub struct RendererConfig {
     pub user_config:   Map<String, Value>,   // arbitrary service keys
     pub global_params: Vec<String>,
     pub routes:        Vec<RouteConfig>,
-    pub thread_pool:   ThreadPoolConfig,     // size, queue_size
     pub params_cache:  ParamsCacheConfig,    // size
     pub server:        ServerConfig,         // read_timeout, socket_mode
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
@@ -255,16 +207,16 @@ pub struct RendererConfig {
 `site_toml` names the `site.toml` this service reads.
 `RendererConfig::resolve_site_toml(site_dir)` returns the path: `<site_dir>/site.toml` when the key is absent, the value as given when it is absolute, and `site_dir` joined with it when it is relative.
 A non-string or empty value fails `config::load`.
-`AppContext::site_toml` carries the resolved path to the global initialiser, set whether or not the file exists.
+`Site::site_toml` carries the resolved path, set whether or not the file exists.
 A service that names a `site_toml` that does not exist, cannot be read or is not valid TOML exits 2 at start.
 
 A `RouteConfig` carries nine fields: `path`, `template`, `params`, `status`, `cache`, `methods`, `headers`, `handler` and `settings`.
-`handler` names a code handler registered with `App::handler`, and `settings` keeps the per-route keys core does not define.
+`handler` names a handler the service passes to `Site::load`, and `settings` keeps the per-route keys core does not define.
 `MinificationConfig::is_enabled(mime)` answers the per-type question, and `toml_to_json` is the conversion used throughout.
 
 `[server] read_timeout_s` is the read deadline applied to every accepted connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30).
-`0` means no timeout, which is what every `App` service did before the key existed.
-It is read once at startup, like the pool dimensions: it is set on a socket at accept time.
+`0` means no timeout.
+It is read once at startup and applied at accept time.
 
 `[server] socket_mode` is the mode applied to the unix socket after bind, defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`).
 It is an **octal string**, as systemd writes it, because TOML has no octal literal and `660` as a decimal integer is `0o1224`.
@@ -273,18 +225,17 @@ A chmod that fails stops the service at start with exit 2.
 Neither key silently falls back.
 A value that cannot be understood, a negative timeout or a mode above `0777` fails `config::load` and the service does not start.
 A service that will not start says so on the first line of its journal, and a service running at a socket mode nobody chose looks exactly like one running at the right mode.
-An App service answers `--dump-config` too, so a deploy can validate its config before starting it, and it exits 2 when the config is refused.
+A service answers `--dump-config` too, so a deploy can validate its config before starting it, and it exits 2 when the config is refused.
 
 ### 4.3. `server`
 
-`UnixServer::bind(path)` claims a unix socket and unlinks it on `Drop`.
-`accept_one(handler)` takes one connection, and `listener()` exposes the raw `UnixListener` for a service running its own `poll(2)` loop.
+`socket_path_from_config(config_path)` derives the socket path so that services and deploy scripts agree without a second convention, and `M6_SOCKET_OVERRIDE` replaces it.
 
-`serve_connection(stream, handler)` is the loop itself.
-It hands the handler a `RawRequest` and a `&mut h1::Responder`, so a handler writes through the response writer and cannot frame one itself.
-`MAX_REQUESTS_PER_CONN` is 100.
+`apply_socket_mode(path, mode)`, `bind_tcp_reuseaddr(addr)` and `DEFAULT_SOCKET_MODE`, `DEFAULT_READ_TIMEOUT_SECS` and `MAX_REQUESTS_PER_CONN` are the start-time helpers and limits shared by every service and `m6-http`.
 
-`socket_path_from_config(config_path)` derives the socket path so that services and deploy scripts agree without a second convention.
+`serve_connection(stream, handler)` is the blocking per-connection loop, and `parse_request` and `write_response` are its companions.
+They remain for the benchmarks and tests that drive a socket directly.
+A service's loop uses `h1::ServerConn` instead.
 
 ### 4.4. `signal`
 
@@ -294,7 +245,7 @@ The kernel delivers process-directed SIGTERM there, the default disposition kill
 A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
 
 `ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up the handler, and it asserts that the mask is set and refuses to start otherwise.
-`complete()`, `is_shutdown()` and `wait()` are the lifecycle, and `is_shutdown()` is also re-exported from `app`.
+`complete()`, `is_shutdown()` and `wait()` are the lifecycle.
 
 `REOPEN_SIGNAL` is SIGUSR1.
 `block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.
@@ -306,7 +257,7 @@ SIGHUP is not handled.
 ### 4.5. `render` and `template`
 
 `render` is the seam.
-A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one at start, shared by every worker.
+A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one at start.
 `NoTemplates` implements both traits and errors if anything asks it to render, which is how the site renderers that render nothing stopped linking Tera, comrak and pest in order to get a server loop.
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
@@ -371,13 +322,41 @@ let resp = match site.handle(&head) {
 };
 ```
 
-`finish` renders a template the response names, then applies the route's `Cache-Control`, `Last-Modified` and headers, the CSRF and flash cookies, minification and compression, in the order the old request path did.
+`finish` renders a template the response names, then applies the route's `Cache-Control`, `Last-Modified` and headers, the CSRF and flash cookies, minification and compression, in the order the request path requires.
+
+**Routing.** `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, and `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
+`find_route` picks the winner.
+`RouteTable` indexes the compiled routes: a fixed route is one hash lookup on its path, and `find_route` tries the pattern routes only when no fixed route answers.
+`check_route_conflicts` runs once when a config loads and refuses what would need a tie-break: two fixed routes on one path, or two patterns that can both match some path, where the same request method reaches both.
+`Methods` is the set of methods a route answers, so a conflict needs the sets to meet and `find_route` tests one bit.
+m6-http builds `RouteDecl`s from `site.toml` and calls the same check.
+
+**The request dictionary.** `FrameworkState::build_dict` is where the real knowledge lives, and `Site` is the one way a service reaches it.
+Three layers do not run per request: config keys, global params files and a route's static params files are merged once at start into `route.base_dict`.
+The per-request order is:
+
+- Params files whose path holds a `{placeholder}`.
+- Path params, each validated.
+  A `{*name}` capture may span segments and a `{name}` capture may not.
+- Query params, inserted at top level and as a nested `query` map.
+  A query key with the name of one of the route's path params is only in `query`, so it cannot replace the validated path value.
+- POST form fields, from `application/x-www-form-urlencoded` only.
+  A field with the name of one of the route's path params is dropped, for the same reason.
+  A non-empty body of any other type logs a warning.
+- Cookies, as a nested `cookies` map.
+- Built-ins `request_path`, `datetime` and `year`, after the params files so a params file cannot override them.
+- Auth claims from `x-auth-claims`, each present only when its claim is: `auth_username` (claim `username`, else `sub`), `auth_sub`, `auth_groups` and `auth_roles`.
+- Flash message, when the feature is on: verify the HMAC, insert `flash`, and the response path adds the removal cookie.
+- CSRF token, when the feature is on and the dictionary holds none: reuse the `_csrf` cookie or generate one, and insert it.
+  A submitted form token stays in place for `verify_csrf` to compare.
+
+Error keys need no step, because they arrive as query parameters at the query step.
 
 **Allocation.** `Site` allocates on the start and stop paths freely.
 The page path allocates on every request today: the owned `Request` and its dictionary, Tera and compression.
 EL-6a measures that count in `site_allocs` and ALLOC-3 reduces it.
 
-Those six modules are a service's own parts: the builder, its configuration, its socket, its signals, its renderer and the site's request path.
+Those modules are a service's own parts: its configuration, its socket helpers, its signals, its renderer and the site's request path.
 Section 5 turns to the objects a handler receives and returns.
 
 ---
@@ -599,6 +578,9 @@ Two caps, guarding different things: 8 KB of head, then 16 MB of body. It used
 to read one byte per `read()` call, measured at 377 syscalls for an ordinary
 browser's 377-byte request head, because `server` hands it a raw `UnixStream`
 with nothing buffering.
+
+The benchmarks and `m6-file`'s `query_of` test drive it. A service's loop frames
+requests with `h1::ServerConn`.
 
 `ParseError::status()` and `.reason()` give the response for a parse failure.
 

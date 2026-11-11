@@ -398,9 +398,9 @@ The relative path is why the m6 and m6-examples checkouts must sit side by side.
 ### 4.2. `render-contact/src/main.rs`
 
 `main.rs` has two functions plus `main`.
-`init_global` builds the *SMTP* transport from the config.
+`load_state` builds the *SMTP* transport from the config.
 `handle_post` reads the form and sends the message.
-`main` registers both and runs the service.
+`main` loads the site, calls `load_state` at start, and runs the loop.
 
 ```rust
 use lettre::transport::smtp::authentication::Credentials;
@@ -412,8 +412,8 @@ struct Global {
     to:     String,
 }
 
-fn init_global(ctx: &AppContext) -> Result<Global> {
-    let config = ctx.config;
+fn load_state(site: &Site) -> Result<Global> {
+    let config = site.user_config();
     let host = config["smtp"]["host"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.host missing")))?;
     let port = config["smtp"]["port"].as_u64()
@@ -459,14 +459,28 @@ fn handle_post(req: &Request, global: &Global) -> Result<Response> {
     Response::render_with("templates/contact.html", req, json!({"sent": true, "name": name}))
 }
 
-fn main() -> Result<()> {
-    App::with_global(init_global)
-        .route_post("/contact", handle_post)
-        .run()
+const ROUTES: &[CodeRoute] = &[
+    CodeRoute { pattern: "/contact", method: RouteMethod::Get },
+    CodeRoute { pattern: "/contact", method: RouteMethod::Post },
+];
+
+fn main() -> anyhow::Result<()> {
+    let site = Site::load("render-contact", ROUTES, &[], &TeraFactory);
+    let state = match load_state(&site) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("render-contact: {e}");
+            std::process::exit(2);
+        }
+    };
+    // The loop from `m6-app-anatomy.md` section 2, with the POST arm calling
+    // `handle_post(&req, &state)` and the GET arm rendering the template.
+    let _ = state;
+    Ok(())
 }
 ```
 
-`init_global` runs once at startup, and `App::with_global` shares its result across requests.
+`load_state` runs once at startup, and the loop passes its value to each request arm.
 `handle_post` reads three fields, `name`, `email` and `message`, sends them, then renders the template again with `sent` set.
 The route's template in the config serves a GET to `/contact`, so the form appears on first visit.
 
@@ -853,20 +867,26 @@ base64     = "0.22"
 The renderer also owns the `/contact` form.
 
 ```rust
-fn main() -> Result<()> {
-    App::new()
-        .route_get("/contact",               handle_contact_get)
-        .route_post("/contact",              handle_contact_post)
-        .route_get("/cms",                   handle_dashboard)
-        .route_get("/cms/new",               handle_new)
-        .route_get("/cms/edit/{stem}",       handle_edit)
-        .route_post("/api/drafts",           handle_create_draft)
-        .route_patch("/api/drafts/{stem}",   handle_update_draft)
-        .route_post("/api/publish/{stem}",   handle_publish)
-        .route_post("/api/unpublish/{stem}", handle_unpublish)
-        .route_delete("/api/drafts/{stem}",  handle_delete_draft)
-        .route_delete("/api/posts/{stem}",   handle_delete_post)
-        .run()
+const ROUTES: &[CodeRoute] = &[
+    CodeRoute { pattern: "/contact",               method: RouteMethod::Get },
+    CodeRoute { pattern: "/contact",               method: RouteMethod::Post },
+    CodeRoute { pattern: "/cms",                   method: RouteMethod::Get },
+    CodeRoute { pattern: "/cms/new",               method: RouteMethod::Get },
+    CodeRoute { pattern: "/cms/edit/{stem}",       method: RouteMethod::Get },
+    CodeRoute { pattern: "/api/drafts",            method: RouteMethod::Post },
+    CodeRoute { pattern: "/api/drafts/{stem}",     method: RouteMethod::Patch },
+    CodeRoute { pattern: "/api/publish/{stem}",    method: RouteMethod::Post },
+    CodeRoute { pattern: "/api/unpublish/{stem}",  method: RouteMethod::Post },
+    CodeRoute { pattern: "/api/drafts/{stem}",     method: RouteMethod::Delete },
+    CodeRoute { pattern: "/api/posts/{stem}",      method: RouteMethod::Delete },
+];
+
+fn main() -> anyhow::Result<()> {
+    let site = Site::load("render-cms", ROUTES, &[], &TeraFactory);
+    // The loop from `m6-app-anatomy.md` section 2, with one `Handled::Code`
+    // arm per route above, in the same order.
+    let _ = site;
+    Ok(())
 }
 ```
 
@@ -1103,6 +1123,56 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 
 [Install]
 WantedBy=multi-user.target
+```
+
+For more than one m6-html instance, use a template unit instead of one copy per instance.
+The instance number becomes `%i`, and `M6_SOCKET_OVERRIDE` names a socket the pool glob matches.
+
+`/etc/systemd/system/m6-html@.service`:
+
+```ini
+[Unit]
+Description=m6-html renderer (instance %i)
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+Environment=M6_SOCKET_OVERRIDE=/run/m6/m6-html-%i.sock
+
+ExecStart=/usr/local/bin/m6-html \
+    /var/www/my-blog \
+    /var/www/my-blog/configs/m6-html.conf
+
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m6-html-%i
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6
+ReadOnlyPaths=/var/www/my-blog /etc/m6
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The matching `[[backend]]` in `site.toml` names the glob:
+
+```toml
+[[backend]]
+name    = "m6-html"
+sockets = "/run/m6/m6-html-*.sock"
 ```
 
 `/etc/systemd/system/m6-file.service`:
@@ -1486,33 +1556,20 @@ certbot renew
 
 ### 7.11. Horizontal scaling
 
-Add a second m6-html instance to handle more traffic, then restart m6-http so it reads the pool again:
+Add a second m6-html instance with the template unit, then restart m6-http so it reads the pool again:
 
 ```bash
-cp /var/www/my-blog/configs/m6-html.conf \
-   /var/www/my-blog/configs/m6-html-2.conf
-
-cp /etc/systemd/system/m6-html.service \
-   /etc/systemd/system/m6-html-2.service
-
-sed -i \
-  -e 's/Description=m6-html renderer/Description=m6-html renderer (instance 2)/' \
-  -e 's/m6-html.conf/m6-html-2.conf/' \
-  -e 's/SyslogIdentifier=m6-html/SyslogIdentifier=m6-html-2/' \
-  /etc/systemd/system/m6-html-2.service
-
-systemctl daemon-reload
-systemctl enable m6-html-2
-systemctl start m6-html-2
+systemctl enable --now m6-html@1 m6-html@2
+systemctl restart m6-http
 ```
 
-The socket name follows the config stem, so `m6-html-2.conf` writes `/run/m6/m6-html-2.sock`.
+The instance number sets the socket, so `m6-html@2` writes `/run/m6/m6-html-2.sock` and the pool glob in `site.toml` matches both.
 m6-http reads the pool once at start, so restart it to add the instance, then it load-balances traffic across both.
 
 To scale back down:
 
 ```bash
-systemctl stop m6-html-2
+systemctl disable --now m6-html@2
 ```
 
 The socket disappears and m6-http backs the member off, and it serves again once a listener is bound there.
@@ -1919,7 +1976,7 @@ The checks cover public access, a 401 without a token, token create, list and re
 ## 12. Example 11, admin dashboard API
 
 Example 11 is a self-hosting management API and dashboard for an m6 site.
-It is a custom renderer, `render-admin`, built on `App::with_global`.
+It is a custom renderer, `render-admin`, with its own loop and plain state in `main`.
 Every `/api/admin/*` route is protected by `require = "role:admin"`.
 
 ```bash
