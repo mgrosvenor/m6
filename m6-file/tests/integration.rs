@@ -877,9 +877,6 @@ fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
 }
 
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
-// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
-// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
-// ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.
 ///
