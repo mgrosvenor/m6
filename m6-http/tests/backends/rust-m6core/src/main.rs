@@ -151,8 +151,8 @@ fn main() -> std::io::Result<()> {
     // The whole connection table, every buffer in it, the deadlines and the
     // events: made here, never grown except by `Slots`.
     let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
-    // The deadline is only read when a connection is touched, and a config
-    // without `read_timeout_s` touches none.
+    // A config with `read_timeout_s = 0` keeps the zero duration and never
+    // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);

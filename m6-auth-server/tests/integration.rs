@@ -110,9 +110,6 @@ public_key  = "{}"
 }
 
 /// Spawn `m6-auth-server` and wait until it accepts a connection.
-///
-/// Readiness is a successful connect, not an existing path: `bind` creates the
-/// socket file and `listen` comes after, so the file appearing proves nothing.
 fn spawn_server(env: &TestEnv) -> Service {
     let mut svc = Service::spawn(
         "m6-auth-server",
@@ -121,14 +118,52 @@ fn spawn_server(env: &TestEnv) -> Service {
             .arg(&env.config_path)
             .env("M6_SOCKET_OVERRIDE", &env.socket_path),
     );
-    svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
+    wait_until_serving(&mut svc, &env.socket_path);
+    svc
+}
+
+/// Wait until `svc` has created `socket` and accepts a connection on it.
+///
+/// Readiness is a successful connect, not an existing path: `bind` creates the
+/// socket file and `listen` comes after, so the file appearing proves nothing.
+fn wait_until_serving(svc: &mut Service, socket: &Path) {
+    svc.wait_for_path(socket, Duration::from_secs(10));
     assert!(
-        wait::for_unix(&env.socket_path, Duration::from_secs(10)),
+        wait::for_unix(socket, Duration::from_secs(10)),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
-        env.socket_path.display(),
+        socket.display(),
         svc.output()
     );
-    svc
+}
+
+/// Spawn `m6-auth-server` expecting it to refuse `what` at start, and return
+/// its output.
+///
+/// The service must exit 2 within 10 s. A service still running is the failure
+/// this panics on, before any caller's message assertion can hide it.
+fn start_failure(env: &TestEnv, what: &str) -> String {
+    let mut svc = Service::spawn(
+        "m6-auth-server",
+        Command::new(binary("m6-auth-server"))
+            .arg(&env.site_dir)
+            .arg(&env.config_path)
+            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
+    );
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-auth-server did not stop for {what}\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "m6-auth-server should exit 2 for {what}\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.output()
 }
 
 /// Create a test user via the database before the server starts.
@@ -904,31 +939,10 @@ fn a_mismatched_key_pair_at_start_exits_2() {
     let (private_b, _public_b) = generate_test_rsa_keys();
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
 
-    let mut svc = Service::spawn(
-        "m6-auth-server",
-        Command::new(binary("m6-auth-server"))
-            .arg(&env.site_dir)
-            .arg(&env.config_path)
-            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
-    );
-    let status = svc
-        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
-        .unwrap_or_else(|| {
-            panic!(
-                "m6-auth-server did not exit for a mismatched key pair\n--- output ---\n{}",
-                svc.output()
-            )
-        });
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "m6-auth-server should exit 2 for a mismatched key pair\n--- output ---\n{}",
-        svc.output()
-    );
+    let output = start_failure(&env, "a mismatched key pair");
     assert!(
-        svc.output().contains("not a pair"),
-        "the error must say the keys are not a pair\n--- output ---\n{}",
-        svc.output()
+        output.contains("not a pair"),
+        "the error must say the keys are not a pair\n--- output ---\n{output}"
     );
 }
 
@@ -955,13 +969,7 @@ fn instances_opening_an_empty_database_at_once_produce_one_schema() {
         cmd
     });
     for (svc, socket) in instances.iter_mut().zip(&sockets) {
-        svc.wait_for_path(socket, Duration::from_secs(10));
-        assert!(
-            wait::for_unix(socket, Duration::from_secs(10)),
-            "an instance created {} but never accepted a connection\n--- output ---\n{}",
-            socket.display(),
-            svc.output()
-        );
+        wait_until_serving(svc, socket);
     }
 
     // One whole schema: a user created through another connection is visible
@@ -1016,31 +1024,10 @@ fn a_database_that_cannot_be_opened_stops_the_service_at_start() {
     let db_path = env.site_dir.join("data/auth.db");
     std::fs::create_dir(&db_path).expect("put a directory where the database was");
 
-    let mut svc = Service::spawn(
-        "m6-auth-server",
-        Command::new(binary("m6-auth-server"))
-            .arg(&env.site_dir)
-            .arg(&env.config_path)
-            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
-    );
-    let status = svc
-        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
-        .unwrap_or_else(|| {
-            panic!(
-                "m6-auth-server did not stop for a database that cannot be opened\n--- output ---\n{}",
-                svc.output()
-            )
-        });
-    assert_eq!(
-        status.code(),
-        Some(2),
-        "m6-auth-server should exit 2 for a database that cannot be opened\n--- output ---\n{}",
-        svc.output()
-    );
+    let output = start_failure(&env, "a database that cannot be opened");
     assert!(
-        svc.output().contains(&db_path.display().to_string()),
-        "the error must name the database path\n--- output ---\n{}",
-        svc.output()
+        output.contains(&db_path.display().to_string()),
+        "the error must name the database path\n--- output ---\n{output}"
     );
     assert!(
         !env.socket_path.exists(),

@@ -1,4 +1,4 @@
-//! The authentication service: one process, one thread and one event loop.
+//! The authentication service: one process and one event loop.
 //!
 //! The loop serves four routes, all literal paths, over one SQLite connection
 //! opened at start and kept for the life of the process. The signing keys, the
@@ -70,8 +70,10 @@ const ROUTES: [CodeRoute; 4] = [
 /// Build what the loop owns: the config, the keys, the rate limiter and the
 /// one database connection.
 ///
-/// A failure here, like a failure to open the database, is a start failure: it
-/// exits 2 with the path that failed.
+/// Returns `Err` for `main` to print and exit 2. The database branches name the
+/// path they failed on: the directory that cannot be created and the database
+/// that cannot be opened. The config and key branches name the setting or key
+/// that failed.
 fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
     let cfg =
         AuthConfig::load(site.config_path(), site.site_toml()).context("loading auth config")?;
@@ -84,7 +86,8 @@ fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
     .context("loading key material")?;
 
     if let Some(parent) = cfg.db_path.parent() {
-        std::fs::create_dir_all(parent).context("creating db directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating the database directory {}", parent.display()))?;
     }
     let db = m6_auth::Db::open(&cfg.db_path)
         .map_err(|e| anyhow::anyhow!("opening the database {}: {e}", cfg.db_path.display()))?;
@@ -154,8 +157,8 @@ fn main() -> Result<()> {
     // The whole connection table, every buffer in it, the deadlines and the
     // events: made here, never grown except by `Slots`.
     let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
-    // The deadline is only read when a connection is touched, and a config
-    // without `read_timeout_s` touches none.
+    // A config with `read_timeout_s = 0` keeps the zero duration and never
+    // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
