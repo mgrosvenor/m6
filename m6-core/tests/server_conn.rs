@@ -615,19 +615,28 @@ fn parse_errors_answer_as_today() -> bool {
             request.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "a".repeat(800)).as_bytes());
         }
         let mut writer = h.client.try_clone().expect("a client clone");
-        // The head is larger than the socket's buffer: the writer blocks until
-        // the server reads, and the server is this thread.
+        // The head is larger than the socket's buffer, so the writer blocks
+        // until the server reads and the two make progress in turn. The first
+        // turn can see exactly the cap and answer Done, so keep turning until
+        // the refusal is queued; that signal, not a read timeout, is what the
+        // test waits on.
         let writing = std::thread::spawn(move || {
             let _ = writer.write_all(&request);
         });
-        h.wait_readable();
-        let flush = h.turn();
-        let mut response = [0u8; 4096];
-        let n = h.client.read(&mut response).expect("read");
+        let mut flush = Flush::Done;
+        for _ in 0..64 {
+            h.wait_readable();
+            flush = h.turn();
+            if flush == Flush::Close {
+                break;
+            }
+        }
         // Close the server end so the writer cannot stay blocked on a full
         // socket after the refusal.
         drop(h.conn.detach());
         let _ = writing.join();
+        let mut response = [0u8; 4096];
+        let n = h.client.read(&mut response).expect("read the refusal");
         let text = String::from_utf8_lossy(&response[..n]).to_string();
         if flush != Flush::Close || !text.starts_with("HTTP/1.1 413 Payload Too Large\r\n") {
             println!("  header too large: {flush:?} {text:?}");

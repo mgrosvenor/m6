@@ -258,10 +258,19 @@ thread_local! {
     static CHUNK_SIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-// Bytes of chunk-size and trailer lines scanned, for the bounded-scan test.
+// Bytes of chunk-size and trailer lines scanned, and the longest single scan,
+// for the bounded-scan tests.
 #[cfg(test)]
 thread_local! {
     static CHUNK_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CHUNK_SCAN_MAX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one scan window for the bounded-scan tests.
+#[cfg(test)]
+fn count_scan(bytes: usize) {
+    CHUNK_SCAN_BYTES.with(|sum| sum.set(sum.get() + bytes));
+    CHUNK_SCAN_MAX.with(|max| max.set(max.get().max(bytes)));
 }
 
 /// Parse one chunk-size line at `i`, returning the size and the index after
@@ -280,9 +289,11 @@ fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), ChunkSizeError>
     let available = &buf[i..];
     let window = &available[..available.len().min(MAX_HEADER_BYTES + 2)];
     #[cfg(test)]
-    CHUNK_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + window.len()));
+    count_scan(window.len());
     let Some(eol) = find_crlf(window) else {
-        return if available.len() > MAX_HEADER_BYTES {
+        // A valid line of exactly the cap ends its CR at index MAX and its LF
+        // one past it, so one byte past the cap is still the same line to come.
+        return if available.len() > MAX_HEADER_BYTES + 1 {
             Err(ChunkSizeError::Bad)
         } else {
             Err(ChunkSizeError::Incomplete)
@@ -327,9 +338,9 @@ fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize, mut trailer_bytes:
         let available = &buf[i..];
         let window = &available[..available.len().min(MAX_HEADER_BYTES + 2)];
         #[cfg(test)]
-        CHUNK_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + window.len()));
+        count_scan(window.len());
         let Some(eol) = find_crlf(window) else {
-            return if available.len() > MAX_HEADER_BYTES || trailer_bytes > MAX_HEADER_BYTES {
+            return if available.len() > MAX_HEADER_BYTES + 1 || trailer_bytes > MAX_HEADER_BYTES {
                 Chunked::Bad
             } else {
                 Chunked::More(ChunkProgress {
@@ -1887,12 +1898,13 @@ mod framing_overflow_tests {
         line.extend(std::iter::repeat_n(b'a', 16 * 1024));
 
         CHUNK_SCAN_BYTES.with(|bytes| bytes.set(0));
+        CHUNK_SCAN_MAX.with(|max| max.set(0));
         let refused = feed_until_refused(&mut client, &mut conn, &line);
-        let scanned = CHUNK_SCAN_BYTES.with(|bytes| bytes.get());
+        let longest = CHUNK_SCAN_MAX.with(|max| max.get());
         assert!(refused, "a long chunk extension must be refused");
         assert!(
-            scanned <= 4 * MAX_HEADER_BYTES,
-            "scanned {scanned} bytes of the extension"
+            longest <= MAX_HEADER_BYTES + 2,
+            "one scan looked at {longest} bytes of the extension"
         );
         assert_refusal(&mut client);
     }
@@ -1906,14 +1918,46 @@ mod framing_overflow_tests {
         let field = vec![b'a'; 16 * 1024];
 
         CHUNK_SCAN_BYTES.with(|bytes| bytes.set(0));
+        CHUNK_SCAN_MAX.with(|max| max.set(0));
         let refused = feed_until_refused(&mut client, &mut conn, &field);
-        let scanned = CHUNK_SCAN_BYTES.with(|bytes| bytes.get());
+        let longest = CHUNK_SCAN_MAX.with(|max| max.get());
         assert!(refused, "a long trailer field must be refused");
         assert!(
-            scanned <= 4 * MAX_HEADER_BYTES,
-            "scanned {scanned} bytes of the trailer"
+            longest <= MAX_HEADER_BYTES + 2,
+            "one scan looked at {longest} bytes of the trailer"
         );
         assert_refusal(&mut client);
+    }
+
+    /// A chunk-size line of exactly the head cap is valid, even when its CR and
+    /// LF arrive in separate reads. Refusing at the CR would answer 400 to a
+    /// line the cap allows.
+    #[test]
+    fn a_chunk_line_at_the_cap_with_a_split_crlf_is_served() {
+        let extension = "a".repeat(MAX_HEADER_BYTES - 2);
+        let mut raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        raw.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
+        raw.extend_from_slice(b"a\r\n0\r\n\r\n");
+        // Everything through the CR, with no LF yet, is pending.
+        assert!(matches!(
+            parse_request(&raw[..raw.len() - 6]),
+            ParseResult::Incomplete
+        ));
+        match parse_request(&raw) {
+            ParseResult::Complete(req) => assert_eq!(req.body, b"a"),
+            _ => panic!("a chunk line of exactly the cap must be served"),
+        }
+    }
+
+    /// One byte more than the cap is refused: the allowance is the possible CR
+    /// at the cap, not a longer line.
+    #[test]
+    fn a_chunk_line_one_past_the_cap_is_refused() {
+        let extension = "a".repeat(MAX_HEADER_BYTES);
+        let mut raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        raw.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
+        raw.extend_from_slice(b"a\r\n0\r\n\r\n");
+        assert!(matches!(parse_request(&raw), ParseResult::Error));
     }
 
     /// A connection with a chunked request's head already sent. Both ends are
