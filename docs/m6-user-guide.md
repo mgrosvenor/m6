@@ -1156,7 +1156,7 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-The `[[backend]]` entry from Example 05 already names `sockets = "/run/m6/m6-html*.sock"`, which matches the instance sockets too, because `m6-html@1` writes `/run/m6/m6-html-1.sock`.
+The `[[backend]]` entry in the production `site.toml` (§7.3) names `sockets = "/run/m6/m6-html*.sock"`, which matches the instance sockets too, because `m6-html@1` writes `/run/m6/m6-html-1.sock`.
 A deployment that runs only the template unit can narrow the glob to `/run/m6/m6-html-*.sock`.
 
 `/etc/systemd/system/m6-file.service`:
@@ -1540,9 +1540,11 @@ certbot renew
 
 ### 7.11. Horizontal scaling
 
-Add a second m6-html instance with the template unit, then restart m6-http so it reads the pool again:
+The template unit replaces the plain one: one template serves every instance, and two units with the same `SyslogIdentifier` would only make the journal harder to read.
+Add two m6-html instances with it, then restart m6-http so it reads the pool again:
 
 ```bash
+systemctl disable --now m6-html.service
 systemctl enable --now m6-html@1 m6-html@2
 systemctl restart m6-http
 ```
