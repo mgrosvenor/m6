@@ -2800,6 +2800,53 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_limits_and_relative_paths() {
+        let site = Path::new("/srv/site");
+        let toml = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+        assert_eq!(config_from(None, site).unwrap(), None);
+        assert_eq!(config_from(Some(&toml("{}")), site).unwrap(), None);
+        let c = config_from(Some(&toml(r#"{"history_file":"h.db"}"#)), site)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.file, Path::new("/srv/site/h.db"));
+        assert_eq!(c.max_bytes, 256 << 20);
+        let c = config_from(
+            Some(&toml(r#"{"history_file":"/var/h.db","history_max_mb":1}"#)),
+            site,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (c.file.as_path(), c.max_bytes),
+            (Path::new("/var/h.db"), 1 << 20)
+        );
+        for bad in [
+            r#"{"history_file":""}"#,
+            r#"{"history_file":3}"#,
+            r#"{"history_file":"h","history_max_mb":0}"#,
+            r#"{"history_file":"h","history_max_mb":1048577}"#,
+            r#"{"history_file":"h","history_max_mb":"big"}"#,
+        ] {
+            let e = config_from(Some(&toml(bad)), site).unwrap_err().to_string();
+            assert!(e.contains("history_"), "{bad}: {e}");
+        }
+        assert!(config_from(
+            Some(&toml(r#"{"history_file":"h","history_max_mb":1048576}"#)),
+            site
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn node_param_takes_one_decoded_value() {
+        assert_eq!(node_param("from=1&to=2"), Ok(None));
+        assert_eq!(node_param("node=edge%2Da&x=1"), Ok(Some("edge-a".into())));
+        assert!(node_param("node=a&node=b").is_err());
+        assert!(node_param("node=").is_err());
+        assert!(node_param("node").is_err());
+    }
+
+    #[test]
     fn history_digest_states_and_their_findings() {
         let off = start(None).unwrap();
         assert_eq!(off.digest().state, "off");

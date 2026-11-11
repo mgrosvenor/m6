@@ -33,7 +33,7 @@ use m6_core::dns::{Confirm, Ptr};
 use m6_core::event::Timeouts;
 use m6_core::mio::net::TcpStream as MioTcpStream;
 use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Interest, Poll, Token};
+use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::monitoring::{HealthReport, PerfReport, TrafficReport};
 
 use crate::check::{VerdictCache, Verdicts};
@@ -459,9 +459,7 @@ impl Poller {
                 self.out_timeouts.clear(Token(slot));
                 self.close_slot(poll, out, slot);
                 self.running.probes[node].lost();
-                self.running.probing = None;
-                self.running.probe_cursor = node + 1;
-                self.advance(poll, out, now)?
+                self.end_probe_sequence(poll, out, node, now)?
             }
             Out::Dns { addr, .. } => {
                 let addr = addr.clone();
@@ -550,6 +548,15 @@ impl Poller {
                     let text = format!("{}: Network Error: {e}", self.step_url(node, step));
                     let next = self.record_error(node, step, text);
                     if next == Step::Done {
+                        // The node finished on a step that failed at start.
+                        // Doing here what `after` does keeps a deadline armed
+                        // by an earlier step from firing on a finished node
+                        // and driving the outstanding count below zero.
+                        self.close_slot(poll, out, node);
+                        self.out_timeouts.clear(Token(node));
+                        if let Out::Node { step, .. } = &mut out[node] {
+                            *step = Step::Done;
+                        }
                         self.running.outstanding -= 1;
                         return if self.running.outstanding == 0 {
                             self.advance(poll, out, now)
@@ -831,6 +838,10 @@ impl Poller {
     // ── Tunnel probes ──────────────────────────────────────────────────────
 
     /// Start one non-blocking connect for the node's probe sequence.
+    ///
+    /// `Ok(false)` means the connect or its registration failed at once: the
+    /// failure is in the node's tally and the caller ends the sequence. A
+    /// down interface is a reading, never the end of the service.
     fn start_probe(
         &mut self,
         poll: &Poll,
@@ -838,17 +849,28 @@ impl Poller {
         node: usize,
         n: usize,
         now: Instant,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let Some(addr) = self.nodes[node].tunnel.as_ref().map(|t| t.addr) else {
-            return Ok(());
+            return Ok(false);
         };
         let slot = self.probe_slot();
         self.close_slot(poll, out, slot);
-        let sock = MioTcpStream::connect(addr)?;
+        let sock = match MioTcpStream::connect(addr) {
+            Ok(sock) => sock,
+            Err(e) => {
+                self.running.probes[node].failed(&e);
+                return Ok(false);
+            }
+        };
         let fd = sock.as_raw_fd();
         let mut source = SourceFd(&fd);
-        poll.registry()
-            .register(&mut source, Token(CLIENT_BASE + slot), Interest::WRITABLE)?;
+        if let Err(e) =
+            poll.registry()
+                .register(&mut source, Token(CLIENT_BASE + slot), Interest::WRITABLE)
+        {
+            self.running.probes[node].failed(&e);
+            return Ok(false);
+        }
         let started = now;
         out[slot] = Out::Probe {
             node,
@@ -862,7 +884,7 @@ impl Poller {
         if n == 0 {
             self.out_timeouts.touch(Token(slot), now);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn probe_slot(&self) -> usize {
@@ -925,9 +947,23 @@ impl Poller {
         let budget_left = (probing.started + self.timeout).saturating_duration_since(now);
         let next = n + 1;
         if next < tunnel::PROBES_PER_POLL && !budget_left.is_zero() {
-            self.start_probe(poll, out, node, next, now)?;
+            if !self.start_probe(poll, out, node, next, now)? {
+                return self.end_probe_sequence(poll, out, node, now);
+            }
             return Ok(Progress::Working);
         }
+        self.end_probe_sequence(poll, out, node, now)
+    }
+
+    /// End the node's probe sequence and move on: the connects that can be
+    /// made are, so the reading is built from what the tally holds.
+    fn end_probe_sequence(
+        &mut self,
+        poll: &Poll,
+        out: &mut [Out],
+        node: usize,
+        now: Instant,
+    ) -> io::Result<Progress> {
         self.running.probing = None;
         self.running.probe_cursor = node + 1;
         self.out_timeouts.clear(Token(self.probe_slot()));
@@ -996,11 +1032,14 @@ impl Poller {
         match result {
             Ok(None) => {
                 // The PTR step ended, so the descriptor to wait on is the
-                // forward query's. Register it before the next readiness edge.
+                // forward query's: the old socket is closed, and closing a
+                // descriptor removes its registration. Register the new one
+                // under the same token. This is an add, never a modify: on
+                // epoll a re-register is EPOLL_CTL_MOD and fails for a
+                // descriptor the set does not hold.
                 if before != after {
-                    let mut source = SourceFd(&after);
-                    poll.registry().reregister(
-                        &mut source,
+                    poll.registry().register(
+                        &mut SourceFd(&after),
                         Token(CLIENT_BASE + slot),
                         Interest::READABLE,
                     )?;
@@ -1058,7 +1097,9 @@ impl Poller {
                     self.running.probe_cursor = node;
                     self.running.probing = Some(Probing { node, started: now });
                     self.running.probes[node].reset();
-                    self.start_probe(poll, out, node, 0, now)?;
+                    if !self.start_probe(poll, out, node, 0, now)? {
+                        return self.end_probe_sequence(poll, out, node, now);
+                    }
                     return Ok(Progress::Working);
                 }
             }
@@ -1132,6 +1173,90 @@ impl Poller {
             verdicts,
             at: now,
         }))
+    }
+}
+
+/// The poller a one-shot run builds: the fleet resolved, its tokens read, its
+/// timeout, header checks and lookup cap. `--check` and the poll's own tests
+/// both use it, so the two cannot drift.
+pub fn one_shot_poller(
+    fleet: &crate::fleet::Fleet,
+    tls: &std::sync::Arc<rustls::ClientConfig>,
+    nameserver: SocketAddr,
+    lookup_cap: usize,
+) -> anyhow::Result<Poller> {
+    let nodes = fleet.resolve(tls)?;
+    let tokens = {
+        let fallback = fleet.perf_token();
+        fleet
+            .nodes
+            .iter()
+            .map(|n| n.perf_token(fallback.as_deref()))
+            .collect::<Vec<_>>()
+    };
+    Ok(Poller::new(Setup {
+        nodes,
+        timeout: Duration::from_millis(fleet.timeout_ms),
+        header_checks: fleet.header_check.clone(),
+        tokens,
+        nameserver,
+        wg_file: fleet.wg_handshakes_file.clone(),
+        wg_max_age_s: fleet.tunnel_handshake_max_age_s,
+        lookup_cap,
+    }))
+}
+
+/// Drive a poller from its first request to the end of its poll, with a
+/// reactor of its own.
+///
+/// A service's own loop makes the same `start`, `drive` and `expire` calls
+/// while it serves clients. A one-shot run has no clients, so this is the
+/// loop it needs.
+pub fn drive_to_end(
+    poller: &mut Poller,
+    out: &mut [Out],
+    deadline: Option<Instant>,
+) -> io::Result<Polled> {
+    const TICK: Duration = Duration::from_secs(1);
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(64);
+    let mut progress = poller.start(&poll, out, Instant::now())?;
+    loop {
+        if let Progress::Done(polled) = progress {
+            return Ok(polled);
+        }
+        let now = Instant::now();
+        if deadline.is_some_and(|d| now >= d) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the poll did not finish",
+            ));
+        }
+        match poll.poll(&mut events, Some(poller.timeout(now, TICK))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        let mut finished = false;
+        for ev in &events {
+            let Some(slot) = ev.token().0.checked_sub(CLIENT_BASE) else {
+                continue;
+            };
+            progress = poller.drive(&poll, out, slot, Instant::now())?;
+            if matches!(progress, Progress::Done(_)) {
+                finished = true;
+                break;
+            }
+        }
+        if finished {
+            continue;
+        }
+        while let Some(next) = poller.expire(&poll, out, Instant::now())? {
+            progress = next;
+            if matches!(progress, Progress::Done(_)) {
+                break;
+            }
+        }
     }
 }
 
@@ -1224,61 +1349,36 @@ mod tests {
     }
 
     /// Run the poll to completion with its own reactor, as `--check` does.
-    fn run(
+    fn run(fleet: &crate::fleet::Fleet, token: Option<&str>) -> Polled {
+        run_with(fleet, token, "127.0.0.1:53".parse().unwrap())
+    }
+
+    /// Run the poll as `--check` does, with a chosen nameserver so the lookup
+    /// path can be scripted.
+    fn run_with(
         fleet: &crate::fleet::Fleet,
-        header_checks: Vec<HeaderCheck>,
-        timeout: Duration,
         token: Option<&str>,
+        nameserver: std::net::SocketAddr,
     ) -> Polled {
         let tls = tls();
-        let nodes = fleet.resolve(&tls).unwrap();
-        let tokens: Vec<Option<String>> = fleet.nodes.iter().map(|n| n.perf_token(token)).collect();
-        let mut poller = Poller::new(Setup {
-            nodes,
-            timeout,
-            header_checks,
-            tokens,
-            nameserver: "127.0.0.1:53".parse().unwrap(),
-            wg_file: fleet.wg_handshakes_file.clone(),
-            wg_max_age_s: fleet.tunnel_handshake_max_age_s,
-            lookup_cap: crate::check::MAX_LOOKUPS_PER_POLL,
+        let mut fleet = fleet.clone();
+        let token_file = token.map(|t| {
+            let f = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(f.path(), format!("{t}\n")).unwrap();
+            fleet.perf_token_file = Some(f.path().to_string_lossy().into_owned());
+            f
         });
-        let mut poll = Poll::new().unwrap();
+        let mut poller =
+            one_shot_poller(&fleet, &tls, nameserver, crate::check::MAX_LOOKUPS_PER_POLL).unwrap();
         let mut out = poller.out();
-        let mut events = m6_core::mio::Events::with_capacity(64);
-        let mut progress = poller.start(&poll, &mut out, Instant::now()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Progress::Done(polled) = progress {
-                return polled;
-            }
-            assert!(Instant::now() < deadline, "the poll did not finish");
-            let now = Instant::now();
-            let wait = poller.timeout(now, Duration::from_millis(100));
-            match poll.poll(&mut events, Some(wait)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => panic!("{e}"),
-            }
-            let mut finished = false;
-            for ev in &events {
-                let slot = ev.token().0 - CLIENT_BASE;
-                progress = poller.drive(&poll, &mut out, slot, Instant::now()).unwrap();
-                if matches!(progress, Progress::Done(_)) {
-                    finished = true;
-                    break;
-                }
-            }
-            if finished {
-                continue;
-            }
-            while let Some(next) = poller.expire(&poll, &mut out, Instant::now()).unwrap() {
-                progress = next;
-                if matches!(progress, Progress::Done(_)) {
-                    break;
-                }
-            }
-        }
+        let polled = drive_to_end(
+            &mut poller,
+            &mut out,
+            Some(Instant::now() + Duration::from_secs(20)),
+        )
+        .unwrap();
+        drop(token_file);
+        polled
     }
 
     /// A one-connection-per-request HTTP/1.1 server on a loopback port. It
@@ -1343,12 +1443,7 @@ mod tests {
         let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
         let (tunnel, tunnel_seen) = serve(2, |_| (404, r#"{"error":"not found"}"#));
         let n = tunnel_node(public, tunnel);
-        let polled = run(
-            &fleet_of(n),
-            Vec::new(),
-            Duration::from_secs(5),
-            Some("tok"),
-        );
+        let polled = run(&fleet_of(n), Some("tok"));
         let r = &polled.readings[0];
         assert_eq!(r.health.as_ref().map(|h| h.status.as_str()), Some("ok"));
 
@@ -1372,12 +1467,7 @@ mod tests {
         let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
         let (tunnel, tunnel_seen) = serve(2, |_| (403, r#"{"error":"forbidden"}"#));
         let n = tunnel_node(public, tunnel);
-        let polled = run(
-            &fleet_of(n),
-            Vec::new(),
-            Duration::from_secs(5),
-            Some("tok"),
-        );
+        let polled = run(&fleet_of(n), Some("tok"));
         public_seen.join().unwrap();
         tunnel_seen.join().unwrap();
         let r = &polled.readings[0];
@@ -1397,9 +1487,12 @@ mod tests {
     fn a_hung_node_reads_unreachable_at_its_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let held = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_millis(500));
+            // Hold the request open until the poll has failed it, never for a
+            // guessed time.
+            let _ = release_rx.recv();
             drop(stream);
         });
         let n = Node {
@@ -1410,8 +1503,10 @@ mod tests {
             tunnel: None,
             metrics_over_tunnel: false,
         };
+        let mut fleet = fleet_of(n);
+        fleet.timeout_ms = 100;
         let started = Instant::now();
-        let polled = run(&fleet_of(n), Vec::new(), Duration::from_millis(100), None);
+        let polled = run(&fleet, None);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the poll waited past its deadline"
@@ -1421,6 +1516,7 @@ mod tests {
             why.ends_with("Network Error: timed out reading response"),
             "{why}"
         );
+        drop(release_tx);
         held.join().unwrap();
     }
 
@@ -1450,7 +1546,9 @@ mod tests {
             roles: vec![],
             cache_bust: false,
         }];
-        let polled = run(&fleet_of(n), checks, Duration::from_secs(5), Some("tok"));
+        let mut fleet = fleet_of(n);
+        fleet.header_check = checks;
+        let polled = run(&fleet, Some("tok"));
         let seen = seen.join().unwrap();
         assert_eq!(seen.len(), 4, "{seen:?}");
         assert_eq!(seen[0].0, "GET /health HTTP/1.1");
@@ -1462,5 +1560,240 @@ mod tests {
             "a request line carries a double slash: {seen:?}"
         );
         assert_eq!(polled.readings[0].header_checks.len(), 1);
+    }
+
+    // ── The steps that can fail at start, and the lookup path ─────────────
+
+    const HEALTH: &str = r#"{"status":"ok","node":"origin"}"#;
+    const TRAFFIC: &str = r#"{"node":"origin","window_minutes":1,"total_requests":10,"status":{},"notable":[],"heavy_hitters":[],"crawlers":[{"user_agent":"ExampleBot/1.0","requests":3,"client_ips":["192.0.2.7"],"paths":["/"]}],"forged_bot_requests":0,"forgers":[],"probe_noise":[],"logging":{"events_total":1,"seconds_since_last":1}}"#;
+
+    fn health_traffic(path: &str) -> (u16, &'static str) {
+        match path {
+            "/health" => (200, HEALTH),
+            "/traffic" => (200, TRAFFIC),
+            _ => (404, r#"{"error":"not found"}"#),
+        }
+    }
+
+    /// A UDP nameserver on loopback that answers one PTR question with
+    /// `crawl.example.com.` and the forward A and AAAA questions for it: A
+    /// answers `192.0.2.7`, AAAA answers nothing. Three datagrams, then it
+    /// stops.
+    ///
+    /// A DNS reply is the header, the question copied back and one answer, so
+    /// this needs no crate: it echoes the query's id, copies its question, and
+    /// appends a resource record that points at the question's name.
+    fn scripted_nameserver() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            for _ in 0..3 {
+                let (n, peer) = sock.recv_from(&mut buf).unwrap();
+                let query = &buf[..n];
+                let zero = query[12..].iter().position(|b| *b == 0).unwrap();
+                let qend = 12 + zero + 5; // qname, its root zero, qtype, qclass
+                let qtype = u16::from_be_bytes([query[qend - 4], query[qend - 3]]);
+                let mut reply = Vec::with_capacity(64);
+                reply.extend_from_slice(&query[..2]); // the id
+                reply.extend_from_slice(&[0x81, 0x80]); // response, recursion
+                reply.extend_from_slice(&[0x00, 0x01]); // one question
+                reply.extend_from_slice(&(u16::from(qtype != 28)).to_be_bytes()); // answers
+                reply.extend_from_slice(&[0, 0, 0, 0]);
+                reply.extend_from_slice(&query[12..qend]);
+                if qtype != 28 {
+                    reply.extend_from_slice(&[
+                        0xC0,
+                        0x0C, // the question's name
+                        0x00,
+                        qtype as u8,
+                        0x00,
+                        0x01,
+                        0x00,
+                        0x00,
+                        0x00,
+                        0x3C,
+                    ]);
+                    let rdata: &[u8] = if qtype == 12 {
+                        b"\x05crawl\x07example\x03com\x00"
+                    } else {
+                        &[192, 0, 2, 7]
+                    };
+                    reply.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+                    reply.extend_from_slice(rdata);
+                }
+                sock.send_to(&reply, peer).unwrap();
+            }
+        });
+        (addr, handle)
+    }
+
+    /// The DNS stage drives a real `Confirm` through the poller: the PTR
+    /// answer becomes a name only after the forward A answer carries the
+    /// address, and the lookup's second socket is registered while the first
+    /// is gone.
+    #[test]
+    fn the_dns_stage_drives_a_real_confirm() {
+        let (public, seen) = serve(3, health_traffic);
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            perf_token_file: None,
+            tunnel: None,
+            metrics_over_tunnel: false,
+        };
+        let (nameserver, server) = scripted_nameserver();
+        let polled = run_with(&fleet_of(n), Some("tok"), nameserver);
+        server.join().unwrap();
+        seen.join().unwrap();
+        assert_eq!(
+            polled.verdicts.get("192.0.2.7"),
+            // The resolver's own answer keeps the root label's dot.
+            Some(&m6_core::resolve::Ptr::Name("crawl.example.com.".into())),
+            "{:?}",
+            polled.verdicts
+        );
+    }
+
+    /// A later step whose connect fails at once finishes the node as `after`
+    /// does: its deadline is dropped and its slot marked done, so the finished
+    /// node cannot fail a second time.
+    ///
+    /// The deadline an earlier step armed fires after the poll has finished,
+    /// which is where the service's loop would meet it. Expiring it here must
+    /// find nothing to fail and must not drive the node's count below zero.
+    #[test]
+    fn a_later_step_that_cannot_connect_finishes_the_node_once() {
+        let (public, seen) = serve(1, health_traffic);
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            perf_token_file: None,
+            // Port zero refuses before a descriptor exists, so /perf fails in
+            // `start` rather than at a deadline.
+            tunnel: Some(crate::fleet::Tunnel {
+                address: "127.0.0.1:0".into(),
+                public_key: None,
+            }),
+            metrics_over_tunnel: true,
+        };
+        let mut fleet = fleet_of(n);
+        fleet.timeout_ms = 100;
+        let tls = tls();
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token.path(), "tok\n").unwrap();
+        fleet.perf_token_file = Some(token.path().to_string_lossy().into_owned());
+        let mut poller = one_shot_poller(
+            &fleet,
+            &tls,
+            "127.0.0.1:53".parse().unwrap(),
+            crate::check::MAX_LOOKUPS_PER_POLL,
+        )
+        .unwrap();
+        let mut out = poller.out();
+        let polled = drive_to_end(
+            &mut poller,
+            &mut out,
+            Some(Instant::now() + Duration::from_secs(20)),
+        )
+        .unwrap();
+        seen.join().unwrap();
+        let r = &polled.readings[0];
+        assert!(r.perf_error.is_some(), "{r:?}");
+        assert!(r.traffic_error.is_some(), "{r:?}");
+        assert_eq!(r.unreachable, None, "{r:?}");
+
+        // The health step's deadline is still armed in the old code. It fires
+        // now, on a finished node, and must find nothing.
+        let poll = Poll::new().unwrap();
+        let later = Instant::now() + Duration::from_secs(1);
+        let mut expired = 0;
+        while poller.expire(&poll, &mut out, later).unwrap().is_some() {
+            expired += 1;
+        }
+        assert_eq!(
+            expired, 0,
+            "a finished node's stale deadline fired {expired} time(s)"
+        );
+    }
+
+    /// A tunnel connect that fails at once is a reading, not the end of the
+    /// service: the probe reports the failure and the poll finishes.
+    #[test]
+    fn a_tunnel_address_that_cannot_connect_is_reported_not_fatal() {
+        let (public, seen) = serve(3, health_traffic);
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            perf_token_file: None,
+            // Port zero refuses before a descriptor exists.
+            tunnel: Some(crate::fleet::Tunnel {
+                address: "127.0.0.1:0".into(),
+                public_key: None,
+            }),
+            metrics_over_tunnel: false,
+        };
+        let polled = run(&fleet_of(n), Some("tok"));
+        seen.join().unwrap();
+        let t = polled.readings[0].tunnel.as_ref().unwrap();
+        assert!(
+            matches!(t.probe.outcome, tunnel::Probe::Failed(_)),
+            "{:?}",
+            t.probe.outcome
+        );
+    }
+
+    /// A closed tunnel port answers with a reset: the probe reads `Refused`
+    /// with a round trip, which is the branch a dead-but-reachable peer takes.
+    #[test]
+    fn a_closed_tunnel_port_reads_as_refused() {
+        let (public, seen) = serve(1, health_traffic);
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            perf_token_file: None,
+            tunnel: Some(crate::fleet::Tunnel {
+                address: closed.to_string(),
+                public_key: None,
+            }),
+            metrics_over_tunnel: false,
+        };
+        let polled = run(&fleet_of(n), None);
+        seen.join().unwrap();
+        let t = polled.readings[0].tunnel.as_ref().unwrap();
+        assert_eq!(
+            t.probe.outcome,
+            tunnel::Probe::Refused,
+            "{:?}",
+            t.probe.outcome
+        );
+        assert!(!t.probe.samples.is_empty(), "{t:?}");
+    }
+
+    #[test]
+    fn a_401_says_the_token_was_rejected_for_perf_and_traffic() {
+        let (public, public_seen) = serve(1, |_| (200, HEALTH));
+        let (tunnel, tunnel_seen) = serve(2, |_| (401, r#"{"error":"unauthorized"}"#));
+        let n = tunnel_node(public, tunnel);
+        let polled = run(&fleet_of(n), Some("tok"));
+        public_seen.join().unwrap();
+        tunnel_seen.join().unwrap();
+        let r = &polled.readings[0];
+        assert_eq!(
+            r.perf_error.as_deref(),
+            Some("401: token rejected by this node")
+        );
+        assert_eq!(
+            r.traffic_error.as_deref(),
+            Some("401: token rejected by this node")
+        );
     }
 }

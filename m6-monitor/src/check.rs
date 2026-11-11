@@ -35,11 +35,12 @@ use crate::poll::NodeReading;
 /// Reverse-lookup results by address, read by [`render`].
 pub type Verdicts = std::collections::HashMap<String, m6_core::resolve::Ptr>;
 
-/// The most new addresses looked up in one poll.
+/// The most new addresses one poll starts a lookup for.
 ///
-/// Each lookup can take the full two-second deadline, and they run one after
-/// another on the poller thread, so this bounds how long a poll is held up by
-/// a resolver that never answers: 8 x 2 s. An address past the cap reads
+/// Each lookup carries the fleet's `timeout_ms` deadline, and the poll keeps up
+/// to this many in flight at once, starting the next as each answer or
+/// deadline frees a slot. A resolver that never answers therefore costs one
+/// fleet timeout per batch, not one per address. An address past the cap reads
 /// "not looked up" in this poll and is tried in the next.
 pub const MAX_LOOKUPS_PER_POLL: usize = 8;
 

@@ -74,17 +74,28 @@ pub struct TlsClient {
 ///
 /// A store that yields no certificate is an error, never an empty trust set: a
 /// client that trusts nothing fails every handshake with an error that blames
-/// the peer.
+/// the peer. So is a store whose every certificate fails to parse. There is no
+/// third branch and no verifier that accepts anything.
 pub fn system_roots() -> io::Result<rustls::RootCertStore> {
-    let native = rustls_native_certs::load_native_certs();
-    if native.certs.is_empty() {
+    roots_from(rustls_native_certs::load_native_certs().certs)
+}
+
+/// The trust store built from the certificates a platform store returned.
+///
+/// Split from [`system_roots`] so the two fail-closed branches have a test:
+/// a store with no certificate, and a store with none that parses.
+fn roots_from(
+    certs: impl IntoIterator<Item = rustls::pki_types::CertificateDer<'static>>,
+) -> io::Result<rustls::RootCertStore> {
+    let certs: Vec<_> = certs.into_iter().collect();
+    if certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "the platform certificate store loaded no certificate",
         ));
     }
     let mut roots = rustls::RootCertStore::empty();
-    let (added, ignored) = roots.add_parsable_certificates(native.certs);
+    let (added, ignored) = roots.add_parsable_certificates(certs);
     if added == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1781,5 +1792,42 @@ mod socket_tests {
             name: name_a,
         };
         assert!(!up.tls_identity_matches(Some(&tls_c)));
+    }
+
+    // ── The host's trust store ────────────────────────────────────────────
+
+    /// An empty store is an error, never an empty trust set: a client with no
+    /// roots fails every handshake and blames the peer.
+    #[test]
+    fn a_trust_store_with_no_certificate_is_an_error() {
+        let e = roots_from(Vec::new()).expect_err("no certificate must be an error");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string().contains("certificate store"),
+            "the error must name the store: {e}"
+        );
+    }
+
+    /// A store whose certificates all fail to parse is an error too, never a
+    /// store that quietly trusts nothing and never a permissive verifier.
+    #[test]
+    fn a_trust_store_whose_certificates_do_not_parse_is_an_error() {
+        let junk = rustls::pki_types::CertificateDer::from(vec![0u8; 4]);
+        let e = roots_from([junk]).expect_err("an unparsable certificate must be an error");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            e.to_string().contains("none could be parsed"),
+            "the error must say nothing parsed: {e}"
+        );
+    }
+
+    /// A parses, so the success path is the third case and the two above are
+    /// the only failures.
+    #[test]
+    fn a_parsable_certificate_becomes_a_root() {
+        let ck = rcgen::generate_simple_self_signed(vec!["example.com".to_string()]).expect("cert");
+        let root = ck.cert.der().clone();
+        let roots = roots_from([root]).expect("one parsable certificate");
+        assert_eq!(roots.len(), 1);
     }
 }

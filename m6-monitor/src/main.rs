@@ -255,7 +255,8 @@ fn run_service() -> Result<()> {
     #[cfg(feature = "count-allocations")]
     let mut client_allocs = 0u64;
 
-    // The first poll starts with the service, as the old poller thread did.
+    // The first poll starts with the service, so the page and the check have a
+    // reading before the first interval passes.
     let first = poller
         .start(&poll, &mut out, Instant::now())
         .unwrap_or_else(|e| fail("starting the first poll", e));
@@ -536,19 +537,30 @@ fn answer<'a>(
     }
     match site.handle(head) {
         Handled::Done(response) => Answer::Response(response),
-        Handled::Code(index, req) => {
-            let response = match index {
-                3 => history_ndjson(&req, history),
-                4 => crawlers_ndjson(&req, history),
-                _ => unreachable!("the first three routes are answered before the dispatch"),
-            };
-            let response = match response {
-                Ok(response) => site.finish(&req, response),
-                Err(e) => site.finish(&req, m6_core::response::error_to_response(&e)),
-            };
-            Answer::Response(response)
-        }
+        // `find_route` trims outer slashes, so `/digest/`, `//` and a
+        // relative `digest` arrive here as the code routes the byte-equal arm
+        // above answers. They are answered from the snapshot the same way,
+        // because a slash is not a reason to abort the loop.
+        Handled::Code(index, req) => match index {
+            0 => page_answer(snapshot),
+            1 => Answer::Response(digest_json(snapshot, interval)),
+            2 => Answer::Response(check_text(snapshot, interval)),
+            3 => Answer::Response(routed(history_ndjson(&req, history), &req, site)),
+            4 => Answer::Response(routed(crawlers_ndjson(&req, history), &req, site)),
+            // Five routes give indices nought to four. A sixth cannot exist;
+            // a 404 is a cheaper answer than ending the process if one ever did.
+            _ => Answer::Response(site.finish(&req, Response::not_found())),
+        },
         Handled::Named(..) => unreachable!("m6-monitor registers no named handler"),
+    }
+}
+
+/// Finish a paged route's answer, with an error turned into the site's own
+/// error response.
+fn routed(response: m6_core::Result<Response>, req: &Request, site: &Site) -> Response {
+    match response {
+        Ok(response) => site.finish(req, response),
+        Err(e) => site.finish(req, m6_core::response::error_to_response(&e)),
     }
 }
 
@@ -610,6 +622,9 @@ fn digest_json(snapshot: Option<&Snapshot>, interval: Duration) -> Response {
 }
 
 /// The whole A-to-H report, as text, from the latest snapshot.
+///
+/// Its first line is the age of the reading at this request, so the body is
+/// built per request for the same reason `/digest`'s is.
 fn check_text(snapshot: Option<&Snapshot>, interval: Duration) -> Response {
     let Some(snap) = snapshot else {
         return Response::text("no fleet poll has completed yet\n").with_status(503);
@@ -757,68 +772,21 @@ fn run_check(config_path: &Path) -> Result<()> {
             .with_root_certificates(m6_core::client::system_roots()?)
             .with_no_client_auth(),
     );
-    let nodes = fleet.resolve(&tls)?;
-    let tokens = {
-        let fallback = fleet.perf_token();
-        fleet
-            .nodes
-            .iter()
-            .map(|n| n.perf_token(fallback.as_deref()))
-            .collect::<Vec<_>>()
-    };
-    let nameserver = m6_core::dns::nameserver()?;
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
         log_reopen_age_s: fleet.log_reopen_max_age_s,
         ..Default::default()
     };
-    let mut poller = poll::Poller::new(poll::Setup {
-        nodes,
-        timeout: Duration::from_millis(fleet.timeout_ms),
-        header_checks: fleet.header_check.clone(),
-        tokens,
-        nameserver,
-        wg_file: fleet.wg_handshakes_file.clone(),
-        wg_max_age_s: fleet.tunnel_handshake_max_age_s,
-        lookup_cap: check::MAX_LOOKUPS_PER_CHECK,
-    });
-    let mut poll = Poll::new()?;
-    let mut out = poller.out();
-    let mut events = Events::with_capacity(64);
-    let mut progress = poller.start(&poll, &mut out, Instant::now())?;
-    let polled = loop {
-        if let poll::Progress::Done(polled) = progress {
-            break polled;
-        }
-        let now = Instant::now();
-        match poll.poll(&mut events, Some(poller.timeout(now, TICK))) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        }
-        let mut finished = false;
-        for ev in &events {
-            let Some(slot) = ev.token().0.checked_sub(poll::CLIENT_BASE) else {
-                continue;
-            };
-            progress = poller.drive(&poll, &mut out, slot, Instant::now())?;
-            if matches!(progress, poll::Progress::Done(_)) {
-                finished = true;
-                break;
-            }
-        }
-        if finished {
-            continue;
-        }
-        while let Some(next) = poller.expire(&poll, &mut out, Instant::now())? {
-            progress = next;
-            if matches!(progress, poll::Progress::Done(_)) {
-                break;
-            }
-        }
-    };
     // One run, one cache, with the wider one-shot cap. `--check` keeps no
     // history, so its digest says so.
+    let mut poller = poll::one_shot_poller(
+        &fleet,
+        &tls,
+        m6_core::dns::nameserver()?,
+        check::MAX_LOOKUPS_PER_CHECK,
+    )?;
+    let mut out = poller.out();
+    let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
     let d = digest::build(&polled.readings, &thresholds, now_iso8601());
     print!("{}", check::render(&d, &polled.readings, &polled.verdicts));
     if d.level == digest::Level::Fault {

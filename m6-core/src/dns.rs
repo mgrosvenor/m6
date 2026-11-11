@@ -1,11 +1,12 @@
 //! One DNS question on its own non-blocking UDP socket, for checking a
 //! crawler's claim.
 //!
-//! [`Confirm`] is the reverse-then-forward check that [`crate::resolve`]'s
-//! worker thread makes: resolve the address to a name, then resolve the name
-//! forward and require the address among the results. The monitor's own loop
-//! (EL-9) will wait on descriptors with a deadline, so a lookup driven by that
-//! loop needs no thread. [`Query`] owns one UDP socket connected to one
+//! [`Confirm`] is the reverse-then-forward check: resolve the address to a
+//! name, then resolve the name forward and require the address among the
+//! results. It owns its sockets and never waits, so the caller's own loop
+//! registers [`Confirm::fd`], drives [`Confirm::drive`] when the descriptor is
+//! readable, and drops the confirmation at its deadline. `m6-monitor`'s fleet
+//! poll is that caller. [`Query`] owns one UDP socket connected to one
 //! nameserver. Nothing in this module waits.
 //!
 //! # Three outcomes, and they are not two
