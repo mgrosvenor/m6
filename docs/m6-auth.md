@@ -379,7 +379,7 @@ The edge check is local, so the header it sets carries the result to a backend, 
 
 A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
 The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
-The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.1.
+The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.6.
 
 Token verification, the edge check and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.

@@ -50,7 +50,7 @@ Take from it that a blocking call belongs in start or stop, and that the run pha
 
 The rule follows from the measure.
 Latency is the number that matters, and one blocked loop stalls every connection in the process, while a hand-off to another thread costs a context switch and a cold cache.
-`EVENT-LOOP-PRIMER.md` in the batch 9 work queue holds the owner's decisions in full.
+The owner's decision is that start and stop may block freely, and the loop is for runtime only.
 
 Four documents divide this subject, and Table 2 says which one to open.
 
@@ -239,6 +239,7 @@ fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
             Flush::Close => return Ok(false),
         }
     }
+}
 ```
 
 The loop has one `match` on the event's token.
@@ -441,7 +442,7 @@ handler = "files"
 root    = "assets/"
 ```
 
-That is `m6-file` in full.
+`m6-file` is this one route plus the loop from §2, with `files` as its one named handler.
 Configuration routes are compiled at start.
 A route naming a handler that was never registered exits 2 at startup, and the response comes back as `Handled::Named(index, req)` for the service's `match` to call.
 
@@ -523,7 +524,7 @@ Every service logs the same three lines under its own name, and `Lifecycle` emit
 <name> shutdown complete
 ```
 
-The name comes from `site.name()`, which is the program's own name from `argv[0]`, and the started line carries the socket.
+The name comes from `site.name()`, the literal the service passes to `Site::load`, and the started line carries the socket.
 One emitter is what makes searching a journal for `shutdown complete` mean the same thing for every unit.
 The signal line is written before the loop breaks, because a fast service used to exit with the completion line written and the signal line still queued in the writer.
 

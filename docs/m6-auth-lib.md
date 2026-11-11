@@ -507,7 +507,7 @@ Take from it that the server and the CLI have their own references, and the life
 |---|---|
 | `m6-auth.md` | the auth service: configuration, HTTP endpoints, rate limiting and the token lifetimes |
 | `m6-auth-cli.md` | the command line that uses these operations |
-| `m6-app-anatomy.md` | the app lifecycle, the state tiers and how a renderer links core from another repository |
+| `m6-app-anatomy.md` | the service lifecycle, where state lives and how a renderer links core from another repository |
 | `../README.md` | where this document sits in the documentation table |
 
 **Table 10: further reading, and what each document owns.**

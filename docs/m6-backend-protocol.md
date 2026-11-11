@@ -61,14 +61,14 @@ The backend MUST take these steps in this order.
   A group used to admit the proxy MUST contain only users trusted as the proxy is trusted, because every user who can connect can send the proxy-owned fields in §2.5.
   With mode `0666` and a `0755` directory, any local user on the host can connect and bypass the proxy.
   The socket is not reachable from the network.
-  The m6 `App` default is `0660`, which lets the proxy connect when its user is in the socket's group.
+  The m6 service default is `0660`, which lets the proxy connect when its user is in the socket's group.
   A backend that runs as its own user SHOULD set `0666` only when the parent directory limits traversal to the same trusted users.
   A backend that any user outside that set can reach MUST NOT trust the fields in §2.2 and §2.3.
   A socket the proxy cannot connect to serves no traffic at all.
 - **Listen with a backlog of at least 64.**
 
 The service manager can create the parent directory, for example systemd's `RuntimeDirectory=` with `RuntimeDirectoryMode=0750`.
-The m6 `App` creates a missing parent directory before it binds.
+An m6 service creates a missing parent directory before it binds.
 A backend that creates the directory itself SHOULD use mode `0750` and run in the proxy's group, because the proxy lists the directory to find sockets.
 
 ### 1.3. Connection lifetime
@@ -401,7 +401,7 @@ A backend MUST be able to accept a new connection while it is handling another.
 It MAY use threads, processes or an event loop.
 
 The reference model, given in `m6-architecture.md` §7.1, is one process with one event loop, scaling by running more instances.
-A full queue answers `503`, which is how backpressure reaches the proxy.
+A backend at its connection ceiling stops accepting, and clients wait in the kernel's listen backlog. The proxy's own deadline answers a request that waits there too long.
 
 That is the concurrency a member provides.
 Section 8 gives the lifecycle that puts a member in the pool and takes it out.

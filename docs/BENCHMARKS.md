@@ -392,7 +392,7 @@ Two things are true at the same time.
 - **The cost is real and it is the largest single finding of the backend example comparison.**
   A backend answering trivial requests at a high rate pays 36.8% of its throughput for the convenience, and carries 8.8x the resident memory.
 - **The cost is measured on the shape that maximises it.**
-  The route's own work is one 660-byte copy, so the framework carries the request.
+  The route's own work is one 660-byte copy, so m6-core carries the request.
   Behind the edge cache the hit rate is 0.87 to 0.90 and a hit is served in single-digit microseconds, so 87% to 90% of requests never reach a backend at all.
   Read the 36.8% as this route shape's cost.
 

@@ -1,7 +1,7 @@
 # m6-file
 
 m6-file serves files from disk.
-It is an *App* (a service built on m6-core's application framework) with one handler, registered under the name `files`.
+It is an m6 service built on `m6-core`: one process, one event loop, and one handler registered under the name `files`.
 Every route it answers comes from its own config, not from m6-http's.
 Until now that was readable only in the source.
 This document covers its two route tables, how it resolves a path, what its handler owns, and how to configure it.
@@ -212,6 +212,6 @@ Related reading:
 |---|---|
 | [`m6-site-layout.md`](m6-site-layout.md) | where m6-file's root belongs relative to other apps |
 | [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table, including `[[route_group]]` |
-| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing an App of your own |
+| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing a service of your own |
 
 **Table 5: further reading, and what each document covers.**

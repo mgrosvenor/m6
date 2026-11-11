@@ -142,7 +142,7 @@ If writing this were much harder than the Go one, the contract would have drifte
 
 ### 4.6. Rust with `m6-core`: the default inside the ecosystem
 
-This is the same example with the socket lifecycle, the event loop, signals, config, logging and content handling supplied.
+This is the same example with the socket lifecycle, request framing, signals, config, logging and content handling supplied.
 For a new backend by someone already in the m6 codebase, it is the starting point.
 Its value is measured by its diff against the previous one.
 

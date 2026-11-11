@@ -5,7 +5,7 @@ This document describes every module in m6-core.
 Where it and the code disagree, the code is right and this document is a defect.
 
 m6-core is the crate every m6 service links.
-It supplies the server loop, routing, configuration, the request dictionary and the response helpers, so a service that wants one of those does not write it again.
+It supplies the loop parts, routing, configuration, the request dictionary and the response helpers, so a service that wants one of those does not write it again.
 
 This document is the reference for that crate: every module and the interface it exposes.
 Table 1 gives the two m6-core documents and the job each one does.
@@ -258,7 +258,7 @@ SIGHUP is not handled.
 
 `render` is the seam.
 A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one at start.
-`NoTemplates` implements both traits and errors if anything asks it to render, which is how the site renderers that render nothing stopped linking Tera, comrak and pest in order to get a server loop.
+`NoTemplates` implements both traits and errors if anything asks it to render, which is how a service that renders nothing links no template engine.
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
 
@@ -380,7 +380,7 @@ The readers and writers refuse a `..` component but not an absolute path, which 
 
 `verify_csrf()` (feature `csrf`) and `file(name) -> Upload` (feature `multipart`).
 
-Free functions, all used by the framework and all worth knowing: `parse_query_string`, `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`, `parse_cookies`, `parse_auth_claims`, `validate_path_param` and `single_query_value`.
+Free functions, all used by `site` and all worth knowing: `parse_query_string`, `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`, `parse_cookies`, `parse_auth_claims`, `validate_path_param` and `single_query_value`.
 
 `single_query_value(query, key)` returns the raw value of a key that may appear once: `None` when absent, `RepeatedKey` when repeated.
 `time_range`, `ndjson::Cursor` and a service's own filter parameters all read through it, so one query string follows one rule.

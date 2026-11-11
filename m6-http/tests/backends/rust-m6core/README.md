@@ -3,8 +3,9 @@
 An m6 backend example. `docs/m6-backend-examples.md` §4 is where the set is
 explained; this file says whether you are in the right place.
 
-The same as `../rust-plain`, with the socket lifecycle, thread pool, signal
-handling, config, logging and content handling **supplied rather than written**.
+The same as `../rust-plain`, with the socket lifecycle, request framing,
+signal handling, config, logging and content handling **supplied rather than
+written**.
 For a new backend by someone already in the m6 codebase, this is the starting
 point.
 
@@ -16,7 +17,7 @@ configured rather than argument-driven, and the socket comes from config or
 **Read it beside `../rust-plain/src/main.rs`.** What that file writes by hand and
 this one does not write at all: the binding sequence including the `chmod` that
 is the single most common cause of a backend that starts and is never contacted,
-signal handling and the unlink on the way out, the accept loop and its pool,
+signal handling and the unlink on the way out, the event loop and its connection table,
 parsing a request line and header section, draining exactly `Content-Length`
 bytes, writing a status line and an accurate `Content-Length`, and suppressing
 the body on HEAD. What is left is four routes and their bodies.

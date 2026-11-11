@@ -354,7 +354,7 @@ It repeats the date descending sort that m6-md already applied, so the page keep
 ```
 
 [`m6-md.md`](m6-md.md) owns the frontmatter rules, the command line, the output format and `not_found()`.
-[`m6-core-reference.md`](m6-core-reference.md) owns the template engine and its m6 filters at §4.5, and the built-in keys at §4.1.
+[`m6-core-reference.md`](m6-core-reference.md) owns the template engine and its m6 filters at §4.5, and the built-in keys at §4.6.
 The `sort`, `reverse`, `filter`, `length` and `first` filters are Tera's standard filters.
 
 Example 02 adds a content pipeline in front of the same three processes.
@@ -464,22 +464,14 @@ const ROUTES: &[CodeRoute] = &[
     CodeRoute { pattern: "/contact", method: RouteMethod::Post },
 ];
 
-fn main() -> anyhow::Result<()> {
-    let site = Site::load("render-contact", ROUTES, &[], &TeraFactory);
-    let state = match load_state(&site) {
-        Ok(state) => state,
-        Err(e) => {
-            eprintln!("render-contact: {e}");
-            std::process::exit(2);
-        }
-    };
-    // The loop from `m6-app-anatomy.md` section 2, with the POST arm calling
-    // `handle_post(&req, &state)` and the GET arm rendering the template.
-    let _ = state;
-    Ok(())
-}
+// Part E's `main` runs the loop from `m6-app-anatomy.md` section 2. Its start:
+let site = Site::load("render-contact", ROUTES, &[], &TeraFactory);
+let state = load_state(&site)?;
+// Its POST arm calls `handle_post(&req, &state)`.
+// Its GET arm renders the template the config route names.
 ```
 
+The snippet stops at start: part E adds the loop and its two `Handled::Code` arms.
 `load_state` runs once at startup, and the loop passes its value to each request arm.
 `handle_post` reads three fields, `name`, `email` and `message`, sends them, then renders the template again with `sent` set.
 The route's template in the config serves a GET to `/contact`, so the form appears on first visit.
@@ -579,7 +571,7 @@ M6_SOCKET_OVERRIDE=/tmp/m6/render-contact.sock \
 `$EXAMPLES` is the m6-examples checkout root.
 
 [`m6-app-anatomy.md`](m6-app-anatomy.md) owns the custom renderer guide.
-[`m6-app-anatomy.md`](m6-app-anatomy.md) §4 owns the renderer config keys, §5.3 owns `init_global`, and [`m6-site-toml.md`](m6-site-toml.md) §3.2 owns `secrets_file`.
+[`m6-app-anatomy.md`](m6-app-anatomy.md) §4 owns the renderer config keys, §5.3 owns where state lives (a plain value in `main`), and [`m6-site-toml.md`](m6-site-toml.md) §3.2 owns `secrets_file`.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[backend]]` and `[[route]]` keys.
 
 Example 03 adds one custom renderer and one form route.
@@ -863,7 +855,7 @@ base64     = "0.22"
 
 ### 6.4. `render-cms/src/main.rs`
 
-`main` registers the CMS routes as code handlers, and `configs/render-cms.conf` marks the routes it lists `cache = "no-store"`.
+The routes are `CodeRoute` values, and `configs/render-cms.conf` marks the routes it lists `cache = "no-store"`.
 The renderer also owns the `/contact` form.
 
 ```rust
@@ -881,15 +873,12 @@ const ROUTES: &[CodeRoute] = &[
     CodeRoute { pattern: "/api/posts/{stem}",      method: RouteMethod::Delete },
 ];
 
-fn main() -> anyhow::Result<()> {
-    let site = Site::load("render-cms", ROUTES, &[], &TeraFactory);
-    // The loop from `m6-app-anatomy.md` section 2, with one `Handled::Code`
-    // arm per route above, in the same order.
-    let _ = site;
-    Ok(())
-}
+// Part E's `main` runs the loop from `m6-app-anatomy.md` section 2, with one
+// `Handled::Code` arm per route above, in the same order. Its start:
+let site = Site::load("render-cms", ROUTES, &[], &TeraFactory);
 ```
 
+The snippet stops at start: part E adds the loop and its `match` arms.
 The handlers use the file helpers m6-core puts on `Request`.
 `handle_create_draft` writes `content/drafts/{stem}.json`.
 `handle_publish` reads that draft, renders its Markdown body to HTML, writes `content/posts/{stem}.json`, rebuilds the index and deletes the draft.
@@ -925,7 +914,7 @@ The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http.
 It has 15 sections, numbered 0 to 14, and every check has one expected answer.
 The summary line prints the pass count, the fail count and the total, and the script deletes its own draft before it ends.
 
-[`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `App` route methods.
+[`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `CodeRoute` values a service passes to `Site::load`.
 [`m6-md.md`](m6-md.md) owns the Markdown conversion.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[route]]`, `require` and `allowed_methods` keys.
 [`m6-http.md`](m6-http.md) owns the cache and its clearing rules.
@@ -1167,13 +1156,8 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-The matching `[[backend]]` in `site.toml` names the glob:
-
-```toml
-[[backend]]
-name    = "m6-html"
-sockets = "/run/m6/m6-html-*.sock"
-```
+The `[[backend]]` entry from Example 05 already names `sockets = "/run/m6/m6-html*.sock"`, which matches the instance sockets too, because `m6-html@1` writes `/run/m6/m6-html-1.sock`.
+A deployment that runs only the template unit can narrow the glob to `/run/m6/m6-html-*.sock`.
 
 `/etc/systemd/system/m6-file.service`:
 
