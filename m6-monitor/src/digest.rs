@@ -294,8 +294,6 @@ pub enum HandshakeState {
     NoPublicKey,
     /// Tunnels are configured but `wg_handshakes_file` is not set.
     NoHandshakesFile,
-    /// Not read, for a reason reported by another finding.
-    Unknown,
     FileMissing,
     FileError,
     /// The handshakes file is older than the limit, so no age is judged.
@@ -311,7 +309,6 @@ impl HandshakeState {
             Self::PeerAbsent => "peer_absent",
             Self::NoPublicKey => "no_public_key",
             Self::NoHandshakesFile => "no_handshakes_file",
-            Self::Unknown => "unknown",
             Self::FileMissing => "file_missing",
             Self::FileError => "file_error",
             Self::FileStale => "file_stale",
@@ -347,10 +344,6 @@ impl TunnelDigest {
             HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
             HandshakeState::NoPublicKey => "unknown (no public_key)".to_string(),
             HandshakeState::NoHandshakesFile => "unknown (no wg_handshakes_file)".to_string(),
-            HandshakeState::Unknown => format!(
-                "unknown ({})",
-                self.handshake_detail.as_deref().unwrap_or("-")
-            ),
             HandshakeState::FileMissing => "file missing".to_string(),
             HandshakeState::FileError => "file unreadable".to_string(),
             HandshakeState::FileStale => "unknown (handshakes file is stale)".to_string(),
@@ -375,7 +368,6 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
     let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
         Handshake::NoPublicKey => (HandshakeState::NoPublicKey, None, None),
         Handshake::NoHandshakesFile => (HandshakeState::NoHandshakesFile, None, None),
-        Handshake::Unknown(why) => (HandshakeState::Unknown, None, Some((*why).to_string())),
         Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
         Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
         Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
@@ -628,8 +620,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 HandshakeState::NoHandshakesFile
                 | HandshakeState::FileStale
                 | HandshakeState::FileMissing
-                | HandshakeState::FileError
-                | HandshakeState::Unknown => {}
+                | HandshakeState::FileError => {}
             }
         }
 

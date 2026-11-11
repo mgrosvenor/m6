@@ -75,17 +75,21 @@
 //! vacuumed. The first row of a poll goes first, even if the clock has moved
 //! back, because `poll.id` only increases.
 //!
-//! # Writing never slows polling
+//! # Writing is the poll's own work
 //!
-//! The poller builds a batch and hands it to a writer thread through a queue
-//! of 8 polls. A full queue drops the poll and counts it, so the poller never
-//! waits. A write that fails drops the connection, and the next poll opens it
-//! again. The state `behind` lasts until a write succeeds after a drop.
+//! The poll builds a batch once per interval and hands it to the loop's own
+//! [`History`] value, which writes every held batch oldest first, each in one
+//! short transaction. A transaction that meets a locked file returns
+//! `SQLITE_BUSY` at once and leaves its batch, and the ones behind it, for the
+//! next poll, so the loop never waits on the file. A hold of more than 8 polls
+//! drops the oldest and counts it. A write that fails for any other reason
+//! drops its batch, closes the connection and reports `failing`, and the next
+//! poll opens it again.
 //!
 //! A prune that fails, or that deletes every earlier poll and is still over the
 //! cap, does not lose the poll just written. The states are `prune_failed` and
 //! `over_cap`, each with its own Warn, and the next write that prunes cleanly
-//! clears them.
+//! clears them. The state `behind` means a batch is held for a locked file.
 //!
 //! # Reading it
 //!
@@ -149,9 +153,8 @@
 //! each with its children, and writes them into the page until the page is
 //! full or the range ends. A page of 4 MiB usually fills after 1,500 to 4,000
 //! rows, so the rest of the range is not read. The file uses a rollback
-//! journal, so the writer waits for the transaction to end, up to its busy
-//! timeout of 5 seconds. A write that waits longer fails and that poll is not
-//! stored.
+//! journal, so a write that meets a page read fails `SQLITE_BUSY` at once and
+//! its poll is held for the next one rather than lost.
 //!
 //! # Caveats
 //!
@@ -169,9 +172,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use m6_core::monitoring::CrawlerReport;
@@ -708,6 +708,10 @@ impl Store {
             "DROP TRIGGER IF EXISTS agent_append_only_update; \
              DROP TRIGGER IF EXISTS agent_append_only_delete;",
         )?;
+        // After the open a write never waits: a statement that meets another
+        // connection returns SQLITE_BUSY at once and its poll stays held for
+        // the next one. The open and its migrations keep the ordinary wait.
+        conn.busy_timeout(std::time::Duration::ZERO)?;
         let mut last_crawl_at = HashMap::new();
         {
             let mut stmt =
@@ -1068,7 +1072,6 @@ struct Status {
     crawl_windows: u64,
     failures: u64,
     pruned: u64,
-    dropped_acked: u64,
     last_write: Option<Instant>,
     used_bytes: Option<u64>,
     file_bytes: Option<u64>,
@@ -1076,25 +1079,13 @@ struct Status {
     newest_ms: Option<i64>,
 }
 
-struct Shared {
-    cfg: Option<Config>,
-    status: Mutex<Status>,
-    dropped: AtomicU64,
-    stopped: AtomicBool,
-}
-
-impl Shared {
-    fn status(&self) -> std::sync::MutexGuard<'_, Status> {
-        self.status.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 /// The history as the digest reports it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HistoryDigest {
-    /// `off`, `ok`, `not_open`, `failing`, `prune_failed`, `over_cap`, `behind`
-    /// or `stopped`. In `failing` a poll was not written. In `prune_failed` and
-    /// `over_cap` it was, and the file may pass its cap.
+    /// `off`, `ok`, `not_open`, `failing`, `prune_failed`, `over_cap` or
+    /// `behind`. In `failing` a poll was not written. In `prune_failed` and
+    /// `over_cap` it was, and the file may pass its cap. In `behind` a poll
+    /// met a locked file and is held for the next one.
     pub state: &'static str,
     pub file: Option<String>,
     pub max_bytes: Option<u64>,
@@ -1111,22 +1102,33 @@ pub struct HistoryDigest {
     pub last_error: Option<String>,
 }
 
-/// Read side of the status, and the path for the endpoints.
-#[derive(Clone)]
-pub struct HistoryHandle(Arc<Shared>);
+/// The history store, owned by the loop that writes it.
+///
+/// One poll adds one batch and writes every held batch that will go. A
+/// transaction that meets another connection leaves its batch, and the ones
+/// behind it, for the next poll, so the loop never waits on the file. `record`
+/// is the only write path and it runs once per poll interval.
+pub struct History {
+    cfg: Option<Config>,
+    store: Option<Store>,
+    status: Status,
+    /// Batches held for a locked file, oldest first.
+    queue: std::collections::VecDeque<Batch>,
+    /// Polls dropped because the hold was full.
+    dropped: u64,
+}
 
-impl HistoryHandle {
+impl History {
+    /// The file the two endpoints read, or `None` when history is off.
     pub fn file(&self) -> Option<&Path> {
-        self.0.cfg.as_ref().map(|c| c.file.as_path())
+        self.cfg.as_ref().map(|c| c.file.as_path())
     }
 
+    /// The history as the digest and the check report it.
     pub fn digest(&self) -> HistoryDigest {
-        let s = self.0.status();
-        let dropped = self.0.dropped.load(Ordering::Relaxed);
-        let state = if self.0.cfg.is_none() {
+        let s = &self.status;
+        let state = if self.cfg.is_none() {
             "off"
-        } else if self.0.stopped.load(Ordering::Relaxed) {
-            "stopped"
         } else if s.open_error.is_some() {
             "not_open"
         } else if s.last_error.is_some() {
@@ -1135,7 +1137,7 @@ impl HistoryHandle {
             "prune_failed"
         } else if s.over_cap {
             "over_cap"
-        } else if dropped > s.dropped_acked {
+        } else if !self.queue.is_empty() {
             "behind"
         } else {
             "ok"
@@ -1143,8 +1145,8 @@ impl HistoryHandle {
         let at = |ms: Option<i64>| ms.map(|m| rfc3339_utc_ms(m).to_string());
         HistoryDigest {
             state,
-            file: self.0.cfg.as_ref().map(|c| c.file.display().to_string()),
-            max_bytes: self.0.cfg.as_ref().map(|c| c.max_bytes),
+            file: self.cfg.as_ref().map(|c| c.file.display().to_string()),
+            max_bytes: self.cfg.as_ref().map(|c| c.max_bytes),
             file_bytes: s.file_bytes,
             used_bytes: s.used_bytes,
             oldest_at: at(s.oldest_ms),
@@ -1153,7 +1155,7 @@ impl HistoryHandle {
             writes: s.writes,
             crawl_windows: s.crawl_windows,
             failures: s.failures,
-            dropped,
+            dropped: self.dropped,
             pruned: s.pruned,
             last_error: s
                 .open_error
@@ -1162,6 +1164,105 @@ impl HistoryHandle {
                 .or_else(|| s.prune_error.clone())
                 .or_else(|| s.over_cap.then(|| OVER_CAP.to_string())),
         }
+    }
+
+    /// Add one poll and write every held batch that will go.
+    ///
+    /// A full hold drops the oldest poll and counts it, so the newest polls are
+    /// the ones a locked file keeps.
+    pub fn record(&mut self, b: Batch) {
+        if self.cfg.is_none() {
+            return;
+        }
+        if self.queue.len() >= QUEUE_POLLS {
+            self.queue.pop_front();
+            self.dropped += 1;
+        }
+        self.queue.push_back(b);
+        self.write_held();
+    }
+
+    /// Stop: one last attempt at what is held, then say what is left.
+    pub fn flush(&mut self) {
+        self.write_held();
+        if !self.queue.is_empty() {
+            tracing::warn!(
+                held = self.queue.len(),
+                "history batches were still held when the monitor stopped"
+            );
+        }
+    }
+
+    /// Write the held batches front to back until one meets a lock or fails.
+    fn write_held(&mut self) {
+        while !self.queue.is_empty() {
+            if self.store.is_none() {
+                let Some(cfg) = self.cfg.clone() else {
+                    self.queue.clear();
+                    return;
+                };
+                match Store::open(&cfg) {
+                    Ok(s) => {
+                        self.store = Some(s);
+                        if self.status.open_error.take().is_some() {
+                            tracing::info!(file = %cfg.file.display(), "history file opened");
+                        }
+                    }
+                    Err(e) => {
+                        self.queue.pop_front();
+                        self.fail(format!("{e:#}"), true);
+                        return;
+                    }
+                }
+            }
+            let b = self.queue.front().expect("the queue is not empty");
+            let result = self.store.as_mut().expect("opened above").write(b);
+            let w = match result {
+                Ok(w) => w,
+                Err(e) if is_busy(&e) => return,
+                Err(e) => {
+                    self.queue.pop_front();
+                    self.store = None;
+                    self.fail(format!("{e:#}"), false);
+                    return;
+                }
+            };
+            self.queue.pop_front();
+            let st = &mut self.status;
+            if st.last_error.take().is_some() {
+                tracing::info!("history writes recovered");
+            }
+            st.writes += 1;
+            st.crawl_windows += w.crawl_windows;
+            st.pruned += w.pruned;
+            st.last_write = Some(Instant::now());
+            st.used_bytes = Some(w.used_bytes);
+            st.file_bytes = Some(w.file_bytes);
+            st.oldest_ms = w.oldest_ms;
+            st.newest_ms = w.newest_ms;
+            if w.prune_error.is_some() && w.prune_error != st.prune_error {
+                tracing::error!(error = ?w.prune_error, "history could not prune");
+            }
+            if w.cap_unmet && !st.over_cap {
+                tracing::error!("{OVER_CAP}");
+            }
+            st.prune_error = w.prune_error;
+            st.over_cap = w.cap_unmet;
+        }
+    }
+
+    fn fail(&mut self, msg: String, open: bool) {
+        let st = &mut self.status;
+        st.failures += 1;
+        let slot = if open {
+            &mut st.open_error
+        } else {
+            &mut st.last_error
+        };
+        if slot.as_deref() != Some(msg.as_str()) {
+            tracing::error!(error = %msg, "history is not being written");
+        }
+        *slot = Some(msg);
     }
 }
 
@@ -1188,11 +1289,10 @@ pub fn finding(h: &HistoryDigest) -> Option<Finding> {
             h.max_bytes.unwrap_or(0) >> 20
         ),
         "behind" => format!(
-            "the history writer is behind and has dropped {} poll(s) since start: \
+            "the history is behind and has dropped {} poll(s) since start: \
              is the disk slow or the file locked?",
             h.dropped
         ),
-        "stopped" => "the history writer has stopped, so no history is being kept".to_string(),
         _ => return None,
     };
     Some(Finding {
@@ -1202,179 +1302,52 @@ pub fn finding(h: &HistoryDigest) -> Option<Finding> {
     })
 }
 
-/// The poller's side. `record` never blocks.
-pub struct Recorder {
-    tx: Option<SyncSender<Batch>>,
-    shared: Arc<Shared>,
+/// Whether a write failed because another connection holds the file.
+///
+/// This is the one failure that is not an error: it means try again next poll.
+/// `SQLITE_BUSY` is a lock and `SQLITE_LOCKED` a table lock in this connection's
+/// own file, and both leave the transaction uncommitted.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| match cause.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::SqliteFailure(f, _)) => matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            _ => false,
+        })
 }
 
-impl Recorder {
-    pub fn record(&self, b: Batch) {
-        let Some(tx) = &self.tx else { return };
-        match tx.try_send(b) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.shared.stopped.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-/// Applies batches to the store and keeps the status.
-struct Writer {
-    store: Option<Store>,
-    cfg: Config,
-    shared: Arc<Shared>,
-}
-
-impl Writer {
-    fn handle(&mut self, b: &Batch) {
-        if self.store.is_none() {
-            match Store::open(&self.cfg) {
-                Ok(s) => {
-                    self.store = Some(s);
-                    let mut st = self.shared.status();
-                    if st.open_error.take().is_some() {
-                        tracing::info!(file = %self.cfg.file.display(), "history file opened");
-                    }
-                }
-                Err(e) => {
-                    self.fail(format!("{e:#}"), true);
-                    return;
-                }
-            }
-        }
-        let Some(store) = self.store.as_mut() else {
-            return;
-        };
-        match store.write(b) {
-            Ok(w) => {
-                let mut st = self.shared.status();
-                if st.last_error.take().is_some() {
-                    tracing::info!("history writes recovered");
-                }
-                st.writes += 1;
-                st.crawl_windows += w.crawl_windows;
-                st.pruned += w.pruned;
-                st.last_write = Some(Instant::now());
-                st.used_bytes = Some(w.used_bytes);
-                st.file_bytes = Some(w.file_bytes);
-                st.oldest_ms = w.oldest_ms;
-                st.newest_ms = w.newest_ms;
-                st.dropped_acked = self.shared.dropped.load(Ordering::Relaxed);
-                if w.prune_error.is_some() && w.prune_error != st.prune_error {
-                    tracing::error!(error = ?w.prune_error, "history could not prune");
-                }
-                if w.cap_unmet && !st.over_cap {
-                    tracing::error!("{OVER_CAP}");
-                }
-                st.prune_error = w.prune_error;
-                st.over_cap = w.cap_unmet;
-            }
-            Err(e) => {
-                self.store = None;
-                self.fail(format!("{e:#}"), false);
-            }
-        }
-    }
-
-    fn fail(&self, msg: String, open: bool) {
-        let mut st = self.shared.status();
-        st.failures += 1;
-        let slot = if open {
-            &mut st.open_error
-        } else {
-            &mut st.last_error
-        };
-        if slot.as_deref() != Some(msg.as_str()) {
-            tracing::error!(error = %msg, "history is not being written");
-        }
-        *slot = Some(msg);
-    }
-}
-
-/// Marks the history stopped when the writer thread ends for any reason.
-struct StopGuard(Arc<Shared>);
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.0.stopped.store(true, Ordering::Relaxed);
-    }
-}
-
-fn new_shared(cfg: Option<Config>) -> Arc<Shared> {
-    Arc::new(Shared {
-        cfg,
-        status: Mutex::new(Status::default()),
-        dropped: AtomicU64::new(0),
-        stopped: AtomicBool::new(false),
-    })
-}
-
-/// Open the file and start the writer thread.
+/// Open the file as the loop's own store.
 ///
 /// A fatal error (a file from a newer release, a bad migration list) is `Err`
-/// and the service exits 2. Any other failure starts the writer with no file
-/// and state `not_open`, and the next poll tries again.
-pub fn start(cfg: Option<Config>) -> anyhow::Result<(Recorder, HistoryHandle)> {
-    let shared = new_shared(cfg.clone());
-    let Some(cfg) = cfg else {
-        return Ok((
-            Recorder {
-                tx: None,
-                shared: Arc::clone(&shared),
-            },
-            HistoryHandle(shared),
-        ));
+/// and the service exits 2. Any other failure leaves the store closed and state
+/// `not_open`, and the next poll tries again. The connection's busy timeout is
+/// set to zero after the open, so a write that meets a lock returns at once and
+/// its batch stays held.
+pub fn start(cfg: Option<Config>) -> anyhow::Result<History> {
+    let mut history = History {
+        cfg: cfg.clone(),
+        store: None,
+        status: Status::default(),
+        queue: std::collections::VecDeque::with_capacity(QUEUE_POLLS),
+        dropped: 0,
     };
-    let store = match Store::open(&cfg) {
-        Ok(s) => Some(s),
+    let Some(cfg) = cfg else {
+        return Ok(history);
+    };
+    match Store::open(&cfg) {
+        Ok(s) => history.store = Some(s),
         Err(e) if is_fatal(&e) => {
             return Err(e.context(format!("history file {}", cfg.file.display())))
         }
         Err(e) => {
             let msg = format!("{e:#}");
             tracing::error!(error = %msg, "history is not being written");
-            shared.status().open_error = Some(msg);
-            None
+            history.status.open_error = Some(msg);
         }
-    };
-    let (tx, rx) = sync_channel(QUEUE_POLLS);
-    spawn_writer(
-        rx,
-        Writer {
-            store,
-            cfg,
-            shared: Arc::clone(&shared),
-        },
-    )?;
-    Ok((
-        Recorder {
-            tx: Some(tx),
-            shared: Arc::clone(&shared),
-        },
-        HistoryHandle(shared),
-    ))
-}
-
-fn spawn_writer(rx: Receiver<Batch>, mut w: Writer) -> anyhow::Result<()> {
-    let guard = StopGuard(Arc::clone(&w.shared));
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "monitor threads; removed by EL-9"
-    )]
-    std::thread::Builder::new()
-        .name("m6-monitor-history".into())
-        .spawn(move || {
-            let _guard = guard;
-            for b in rx {
-                w.handle(&b);
-            }
-        })?;
-    Ok(())
+    }
+    Ok(history)
 }
 
 // ── reading ──────────────────────────────────────────────────────────────────
@@ -2721,37 +2694,74 @@ mod tests {
         assert_eq!(b.level, 2);
     }
 
+    /// A write that meets another connection's lock returns at once and its
+    /// batch is kept. The next poll writes the held batch and its own.
     #[test]
-    fn record_never_blocks_when_the_writer_is_stuck() {
+    fn a_busy_history_database_keeps_the_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = new_shared(Some(cfg(dir.path(), 1)));
-        let (tx, _rx) = sync_channel(QUEUE_POLLS);
-        let rec = Recorder {
-            tx: Some(tx),
-            shared: Arc::clone(&shared),
-        };
-        let h = HistoryHandle(shared);
-        let b = make(T0, &[reading("a")]);
+        let mut h = start(Some(cfg(dir.path(), 64))).unwrap();
+        let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
         let started = Instant::now();
-        for _ in 0..QUEUE_POLLS + 3 {
-            rec.record(b.clone());
-        }
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        h.record(make(T0, &[reading("a")]));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "record waited on the lock: {:?}",
+            started.elapsed()
+        );
         let d = h.digest();
-        assert_eq!(d.dropped, 3);
+        assert_eq!(d.writes, 0);
         assert_eq!(d.state, "behind");
+
+        lock.execute_batch("COMMIT").unwrap();
+        h.record(make(T0 + 1, &[reading("a")]));
+        let d = h.digest();
+        assert_eq!(d.writes, 2, "the held batch and the new one");
+        assert_eq!(d.state, "ok");
     }
 
-    fn writer(c: Config) -> (Writer, HistoryHandle) {
-        let shared = new_shared(Some(c.clone()));
-        (
-            Writer {
-                store: None,
-                cfg: c,
-                shared: Arc::clone(&shared),
-            },
-            HistoryHandle(shared),
-        )
+    /// A hold of more than `QUEUE_POLLS` polls drops the oldest and counts it,
+    /// so the newest polls are what a long lock keeps.
+    #[test]
+    fn a_full_hold_drops_the_oldest_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = start(Some(cfg(dir.path(), 64))).unwrap();
+        let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for i in 0..QUEUE_POLLS as i64 + 2 {
+            h.record(make(T0 + i, &[reading("a")]));
+        }
+        let d = h.digest();
+        assert_eq!(d.dropped, 2);
+        assert_eq!(d.writes, 0);
+
+        lock.execute_batch("COMMIT").unwrap();
+        h.flush();
+        assert_eq!(h.digest().writes, QUEUE_POLLS as u64);
+        let rows: Vec<i64> = h
+            .store
+            .as_ref()
+            .unwrap()
+            .conn
+            .prepare("SELECT at_ms FROM poll ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let want: Vec<i64> = (2..QUEUE_POLLS as i64 + 2).map(|i| T0 + i).collect();
+        assert_eq!(rows, want, "the newest {QUEUE_POLLS} polls are kept");
+    }
+
+    fn history(c: Config) -> History {
+        History {
+            cfg: Some(c),
+            store: None,
+            status: Status::default(),
+            queue: std::collections::VecDeque::with_capacity(QUEUE_POLLS),
+            dropped: 0,
+        }
     }
 
     #[test]
@@ -2759,15 +2769,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("sub");
         std::fs::write(&blocker, b"a file where the directory should be").unwrap();
-        let (mut w, h) = writer(cfg(dir.path(), 1));
+        let mut h = history(cfg(dir.path(), 1));
         let b = make(T0, &[reading("a")]);
-        w.handle(&b);
+        h.record(b.clone());
         let d = h.digest();
         assert_eq!(d.state, "not_open");
         assert_eq!(d.failures, 1);
         assert!(finding(&d).is_some());
         std::fs::remove_file(&blocker).unwrap();
-        w.handle(&b);
+        h.record(b);
         let d = h.digest();
         assert_eq!((d.state, d.writes), ("ok", 1));
         assert_eq!(d.last_error, None);
@@ -2777,108 +2787,55 @@ mod tests {
     #[test]
     fn a_failed_write_is_failing_until_one_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, h) = writer(cfg(dir.path(), 1));
-        w.handle(&make(T0, &[reading("a")]));
+        let mut h = history(cfg(dir.path(), 1));
+        h.record(make(T0, &[reading("a")]));
         let mut bad = make(T0 + 1, &[reading("a")]);
         let dup = bad.rows[0].channels[0].clone();
         bad.rows[0].channels.push(dup);
-        w.handle(&bad);
+        h.record(bad);
         assert_eq!(h.digest().state, "failing");
-        w.handle(&make(T0 + 2, &[reading("a")]));
+        h.record(make(T0 + 2, &[reading("a")]));
         let d = h.digest();
         assert_eq!((d.state, d.writes, d.failures), ("ok", 2, 1));
     }
 
     #[test]
-    fn config_defaults_limits_and_relative_paths() {
-        let site = Path::new("/srv/site");
-        let toml = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
-        assert_eq!(config_from(None, site).unwrap(), None);
-        assert_eq!(config_from(Some(&toml("{}")), site).unwrap(), None);
-        let c = config_from(Some(&toml(r#"{"history_file":"h.db"}"#)), site)
-            .unwrap()
-            .unwrap();
-        assert_eq!(c.file, Path::new("/srv/site/h.db"));
-        assert_eq!(c.max_bytes, 256 << 20);
-        let c = config_from(
-            Some(&toml(r#"{"history_file":"/var/h.db","history_max_mb":1}"#)),
-            site,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            (c.file.as_path(), c.max_bytes),
-            (Path::new("/var/h.db"), 1 << 20)
-        );
-        for bad in [
-            r#"{"history_file":""}"#,
-            r#"{"history_file":3}"#,
-            r#"{"history_file":"h","history_max_mb":0}"#,
-            r#"{"history_file":"h","history_max_mb":1048577}"#,
-            r#"{"history_file":"h","history_max_mb":"big"}"#,
-        ] {
-            let e = config_from(Some(&toml(bad)), site).unwrap_err().to_string();
-            assert!(e.contains("history_"), "{bad}: {e}");
-        }
-        assert!(config_from(
-            Some(&toml(r#"{"history_file":"h","history_max_mb":1048576}"#)),
-            site
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn node_param_takes_one_decoded_value() {
-        assert_eq!(node_param("from=1&to=2"), Ok(None));
-        assert_eq!(node_param("node=edge%2Da&x=1"), Ok(Some("edge-a".into())));
-        assert!(node_param("node=a&node=b").is_err());
-        assert!(node_param("node=").is_err());
-        assert!(node_param("node").is_err());
-    }
-
-    #[test]
     fn history_digest_states_and_their_findings() {
-        let off = HistoryHandle(new_shared(None));
+        let off = start(None).unwrap();
         assert_eq!(off.digest().state, "off");
         assert!(finding(&off.digest()).is_none());
 
         let dir = tempfile::tempdir().unwrap();
-        let shared = new_shared(Some(cfg(dir.path(), 1)));
-        let h = HistoryHandle(Arc::clone(&shared));
-        let f = |h: &HistoryHandle| finding(&h.digest()).map(|f| (f.level, f.node, f.text));
-        assert_eq!(h.digest().state, "ok");
-        assert_eq!(f(&h), None);
-
-        shared.status().open_error = Some("denied".into());
+        let mut h = start(Some(cfg(dir.path(), 1))).unwrap();
         let path = cfg(dir.path(), 1).file.display().to_string();
+        assert_eq!(h.digest().state, "ok");
+        assert!(finding(&h.digest()).is_none());
+
+        h.status.open_error = Some("denied".into());
         assert_eq!(
-            f(&h).unwrap(),
-            (
+            finding(&h.digest()).map(|f| (f.level, f.node, f.text)),
+            Some((
                 Level::Warn,
                 "monitor".into(),
                 format!(
                     "history file {path} could not be opened, so no history is being kept: denied"
                 )
-            )
+            ))
         );
-        shared.status().open_error = None;
-        shared.status().last_error = Some("disk full".into());
+        h.status.open_error = None;
+        h.status.last_error = Some("disk full".into());
         assert_eq!(
-            f(&h).unwrap().2,
+            finding(&h.digest()).unwrap().text,
             "the last history write failed, so that poll is missing from the history: disk full"
         );
-        shared.status().last_error = None;
-        shared.dropped.store(2, Ordering::Relaxed);
+        h.status.last_error = None;
+        h.dropped = 2;
+        h.queue.push_back(make(T0, &[reading("a")]));
+        assert_eq!(h.digest().state, "behind");
         assert_eq!(
-            f(&h).unwrap().2,
-            "the history writer is behind and has dropped 2 poll(s) since start: is the disk slow or the file locked?"
+            finding(&h.digest()).unwrap().text,
+            "the history is behind and has dropped 2 poll(s) since start: is the disk slow or the file locked?"
         );
-        shared.stopped.store(true, Ordering::Relaxed);
-        assert_eq!(
-            f(&h).unwrap().2,
-            "the history writer has stopped, so no history is being kept"
-        );
-        assert_eq!(h.digest().state, "stopped");
     }
 
     fn crawl_reading(name: &str, crawlers: Vec<CrawlerReport>) -> NodeReading {
@@ -3210,8 +3167,8 @@ mod tests {
     fn a_failed_prune_is_not_a_lost_poll() {
         let dir = tempfile::tempdir().unwrap();
         let c = tight(dir.path(), 20_000);
-        let (mut w, h) = writer(c.clone());
-        w.handle(&make(T0, &[reading("a")]));
+        let mut h = start(Some(c.clone())).unwrap();
+        h.record(make(T0, &[reading("a")]));
         let blocker = sqlite::open(&c.file).unwrap();
         blocker
             .execute_batch(
@@ -3221,7 +3178,7 @@ mod tests {
             .unwrap();
         let mut writes = 1;
         for k in 1..200 {
-            w.handle(&make(T0 + k * 1000, &[reading("a")]));
+            h.record(make(T0 + k * 1000, &[reading("a")]));
             writes += 1;
             if h.digest().state != "ok" {
                 break;
@@ -3239,7 +3196,7 @@ mod tests {
             .unwrap();
         assert_eq!(polls, writes as i64);
         blocker.execute_batch("DROP TRIGGER keep_polls").unwrap();
-        w.handle(&make(T0 + 1_000_000, &[reading("a")]));
+        h.record(make(T0 + 1_000_000, &[reading("a")]));
         let d = h.digest();
         assert_eq!(d.state, "ok", "{d:?}");
         assert!(d.pruned > 0);
@@ -3249,11 +3206,12 @@ mod tests {
     #[test]
     fn a_cap_that_cannot_be_met_is_over_cap_and_keeps_the_poll() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, h) = writer(Config {
+        let mut h = start(Some(Config {
             max_bytes: 4096,
             ..cfg(dir.path(), 1)
-        });
-        w.handle(&make(T0, &[reading("a")]));
+        }))
+        .unwrap();
+        h.record(make(T0, &[reading("a")]));
         let d = h.digest();
         assert_eq!((d.state, d.writes, d.failures), ("over_cap", 1, 0));
         let f = finding(&d).unwrap();
