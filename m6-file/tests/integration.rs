@@ -540,6 +540,85 @@ fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
     svc.assert_alive("after streaming a 4 MiB body to a slow reader");
 }
 
+/// A request pipelined behind a streamed body is answered after that body,
+/// not in the middle of it.
+///
+/// Both requests arrive in one write, so the second is already buffered when
+/// the first answer starts. The first answer is a 1 MiB streamed file and the
+/// client takes a 64 KiB receive buffer, so the loop's first flush blocks with
+/// the body still owed. The loop must finish that body before it reads and
+/// answers the second request: reading first would replace the body's reader
+/// and write the second answer's head into the first body.
+#[test]
+fn a_request_pipelined_behind_a_streamed_body_waits_for_the_body() {
+    const BIG: usize = 1024 * 1024;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    let big: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
+    std::fs::write(site.join("assets").join("small.txt"), b"small").unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("pipeline.sock");
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site)
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "m6-file never accepted a connection"
+    );
+
+    let mut client = UnixStream::connect(&socket_path).expect("connect");
+    socket2::SockRef::from(&client)
+        .set_recv_buffer_size(64 * 1024)
+        .expect("a 64 KiB receive buffer");
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    client
+        .write_all(
+            b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n\
+              GET /assets/small.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("send both requests in one write");
+
+    let first = m6_core::testkit::read_one(&mut client, "GET").expect("the first response");
+    let split = first
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("the first response has a header/body split");
+    let (status, headers, body_len) = split_response(&first);
+    assert!(status.contains("200"), "the first response was {status}");
+    assert!(
+        headers.contains(&format!("content-length: {BIG}")),
+        "the first response must promise the file's length, got {headers:?}"
+    );
+    assert_eq!(body_len, BIG, "the first body was not the whole file");
+    assert!(
+        first[split + 4..] == big[..],
+        "the first body did not match the file"
+    );
+
+    let second = m6_core::testkit::read_one(&mut client, "GET").expect("the second response");
+    let (status, _, body_len) = split_response(&second);
+    assert!(status.contains("200"), "the second response was {status}");
+    assert_eq!(body_len, 5, "the second body is the small file");
+    assert!(
+        second[second.len() - 5..] == *b"small",
+        "the second body did not match the file"
+    );
+
+    svc.assert_alive("after answering a request pipelined behind a streamed body");
+}
+
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.
@@ -907,8 +986,9 @@ fn write_config(path: &Path, routes: &str) {
     std::fs::write(path, format!("[thread_pool]\nsize = 4\n\n{routes}")).unwrap();
 }
 
-/// The lifecycle contract, which m6-file now gets from the same assertion as
-/// every other `App` service rather than from its own hand-written copy.
+/// The lifecycle contract, which m6-file gets from the same
+/// `assert_app_lifecycle` every service uses rather than from its own
+/// hand-written copy.
 #[test]
 fn lifecycle() {
     let site = site_with_two_trees();

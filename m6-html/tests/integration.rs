@@ -249,21 +249,33 @@ fn l1_sigterm_exits_zero() {
 const LOG_WRITER_THREADS: usize = 1;
 
 /// An answered request was served on the thread that accepted it, not on a
-/// worker of its own. The measured process count is the loop plus, for now,
-/// the log writer: a thread per connection would show up here.
+/// worker of its own. Nine connections are answered and left open while the
+/// count is taken: a thread per connection would still be blocked in its next
+/// read on each of them, so it would show up here.
 #[test]
 fn a_request_is_served_on_the_accepting_thread() {
     let (server, socket_path) = spawn_server("thread-count");
 
-    let resp = http_request(
-        &socket_path,
-        "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    );
-    assert!(
-        resp.contains("200 OK"),
-        "the request was not served: {}",
-        &resp[..resp.len().min(200)]
-    );
+    // Keep-alive: the write side stays open, so the server holds each
+    // connection instead of reading EOF and closing it. A connection that
+    // closed would let a per-connection thread exit before the count.
+    let mut clients = Vec::new();
+    for _ in 0..9 {
+        let mut client = UnixStream::connect(&socket_path).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client timeout");
+        client
+            .write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("send the request");
+        let response = m6_core::testkit::read_one(&mut client, "GET").expect("one response");
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "the request was not served: {}",
+            String::from_utf8_lossy(&response[..response.len().min(200)])
+        );
+        clients.push(client);
+    }
     let pid = server.svc.pid();
 
     // The writer is started by logging before the socket exists, so it is
@@ -278,10 +290,113 @@ fn a_request_is_served_on_the_accepting_thread() {
     assert_eq!(
         threads,
         1 + LOG_WRITER_THREADS,
-        "m6-html (pid {pid}) runs {threads} threads after answering a request: one loop \
-         thread and tracing-appender's writer until LOG-2\n--- output ---\n{}",
+        "m6-html (pid {pid}) runs {threads} threads with {} keep-alive connections open: \
+         one loop thread and tracing-appender's writer until LOG-2\n--- output ---\n{}",
+        clients.len(),
         server.svc.output()
     );
+    drop(clients);
+}
+
+/// The connection table is clamped to the open-file ceiling, so a client
+/// beyond it waits in the kernel's backlog instead of ending the process.
+///
+/// The child runs with a hard limit of 64 descriptors, so the ceiling is 48
+/// and the table holds 48. The 49th connection stays in the backlog until one
+/// of the 48 closes; then the listener is registered again and it is answered.
+/// A hard limit below the reserved descriptors is a start failure, exit 2.
+#[test]
+fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("limit.sock");
+    let mut svc = Service::spawn("m6-html", &mut limited_shell_command(64, &socket_path));
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+        !http_request(
+            &socket_path,
+            "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .is_empty()
+    });
+    assert!(
+        ready,
+        "m6-html never answered a request\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("after the first answered request");
+
+    // The ceiling is the hard limit minus the 16 descriptors the listener,
+    // the signal and poll descriptors and stdio reserve. One hard limit's
+    // worth of connections is more than the process can hold, so the whole
+    // table fills and the rest wait in the kernel's backlog.
+    const HARD: usize = 64;
+    const CEILING: usize = HARD - 16;
+    let mut held: Vec<UnixStream> = (0..HARD)
+        .map(|_| UnixStream::connect(&socket_path).expect("connect"))
+        .collect();
+    svc.assert_alive("with the table at its ceiling and connections in the backlog");
+
+    // Free a slot. The first connection waiting in the backlog is the next
+    // one the listener takes, so that one is answered.
+    let mut spare = held.remove(CEILING);
+    drop(held.remove(0));
+    spare
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    spare
+        .write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the request");
+    let response = m6_core::testkit::read_one(&mut spare, "GET").unwrap_or_else(|e| {
+        panic!(
+            "the connection that waited in the backlog was not served after a slot freed: {e}\n\
+             --- output ---\n{}",
+            svc.output()
+        )
+    });
+    assert!(
+        String::from_utf8_lossy(&response).contains("200 OK"),
+        "the backlog connection was answered with {}",
+        String::from_utf8_lossy(&response[..response.len().min(200)])
+    );
+    svc.assert_alive("after answering a connection that waited in the backlog");
+
+    // A hard limit that cannot hold a table is a start failure, exit 2, and
+    // nothing is bound.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("none.sock");
+    let mut svc = Service::spawn("m6-html", &mut limited_shell_command(16, &socket_path));
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .expect("m6-html should exit when the limit cannot hold a table");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("open file limit"),
+        "the failure must name the limit\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "a start failure must not bind the socket: {}",
+        socket_path.display()
+    );
+}
+
+/// `m6-html` in a shell that lowers both file-descriptor limits first.
+///
+/// The shell `exec`s the service, so the service keeps the shell's pid and the
+/// testkit's signal and output plumbing (the `Service` drains the streams it
+/// inherited) still points at the one process.
+fn limited_shell_command(hard: u64, socket_path: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!(
+            "ulimit -Sn {hard}; ulimit -Hn {hard}; exec \"$0\" \"$@\""
+        ))
+        .arg(binary("m6-html"))
+        .arg(fixtures_dir())
+        .arg(config_path())
+        .env("M6_SOCKET_OVERRIDE", socket_path);
+    cmd
 }
 
 /// The thread count of a running process.
@@ -697,32 +812,29 @@ fn l8_concurrent_requests_all_routes() {
         let sp = socket_path.clone();
         let (req, expected) = routes[i % routes.len()];
         let handle = std::thread::spawn(move || {
-            // Retry up to 3 times to handle transient 503s from a full queue.
-            let mut last_resp = String::new();
-            for _attempt in 0..3 {
-                let resp = http_request(&sp, req);
-                if !resp.is_empty() {
-                    last_resp = resp;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            let response = http_request(&sp, req);
             assert!(
-                !last_resp.is_empty(),
-                "request {} ({}): got empty response after retries",
+                !response.is_empty(),
+                "request {} ({}): got no response",
                 i,
                 req.split_whitespace().nth(1).unwrap_or("?"),
             );
-            // Accept 200 or 503 (server queue full) — the test verifies no crashes.
-            // For routes that must return 200, also accept 503 under load.
-            let ok = last_resp.contains(expected) || last_resp.contains("503");
+            // There is no queue and no 503 path in this service any more:
+            // every accepted connection is served on the loop.
             assert!(
-                ok,
-                "request {} ({}): expected {} or 503, got: {}",
+                !response.contains("503"),
+                "request {} ({}): got a 503 from a service with no queue: {}",
+                i,
+                req.split_whitespace().nth(1).unwrap_or("?"),
+                &response[..response.len().min(200)]
+            );
+            assert!(
+                response.contains(expected),
+                "request {} ({}): expected {}, got: {}",
                 i,
                 req.split_whitespace().nth(1).unwrap_or("?"),
                 expected,
-                &last_resp[..last_resp.len().min(200)]
+                &response[..response.len().min(200)]
             );
         });
         handles.push(handle);

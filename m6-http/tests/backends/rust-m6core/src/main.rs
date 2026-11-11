@@ -41,6 +41,8 @@
 //! the rule is phrased as "a service being nearly a no-op on top of core is the
 //! goal, not a smell".
 
+#![deny(unsafe_code)]
+
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -122,6 +124,12 @@ fn main() -> std::io::Result<()> {
     let read_timeout = site.read_timeout();
     let ceiling =
         raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    if ceiling == 0 {
+        fail("the open file limit", "leaves no connection table");
+    }
+    // A table larger than the descriptors the limit allows could never report
+    // itself full: `Slots::is_full` would stay false past the kernel's limit.
+    let initial = INITIAL_CONNECTIONS.min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
@@ -142,12 +150,10 @@ fn main() -> std::io::Result<()> {
 
     // The whole connection table, every buffer in it, the deadlines and the
     // events: made here, never grown except by `Slots`.
-    let mut conns = Slots::new(INITIAL_CONNECTIONS, ceiling, || {
-        ServerConn::new(READ_CAP, WRITE_CAP)
-    });
+    let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
     // The deadline is only read when a connection is touched, and a config
     // without `read_timeout_s` touches none.
-    let mut deadlines = Timeouts::new(INITIAL_CONNECTIONS, read_timeout.unwrap_or(Duration::ZERO));
+    let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
     let mut accepting = true;
@@ -191,7 +197,16 @@ fn main() -> std::io::Result<()> {
                                 conns.free(taken.key);
                                 break;
                             }
-                            Err(e) => return Err(e),
+                            Err(e) => {
+                                // A transient failure, such as a descriptor
+                                // shortage elsewhere in the process, sheds
+                                // this attempt and not the service. The table
+                                // is clamped to the limit, so our own
+                                // connections cannot exhaust the descriptors.
+                                conns.free(taken.key);
+                                eprintln!("m6-example-rust-m6core: accept error: {e}");
+                                continue;
+                            }
                         };
                         poll.registry().register(
                             &mut stream,
@@ -242,7 +257,7 @@ fn main() -> std::io::Result<()> {
                                 deadlines.touch(Token(k), now);
                             }
                         }
-                        _ => close(&poll, &mut conns, &mut deadlines, k)?,
+                        _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
                     }
                 }
             }
@@ -251,7 +266,7 @@ fn main() -> std::io::Result<()> {
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
         while let Some(Token(k)) = deadlines.expired(Instant::now()) {
-            close(&poll, &mut conns, &mut deadlines, k)?;
+            m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
         if !accepting && !conns.is_full() {
@@ -283,6 +298,17 @@ fn main() -> std::io::Result<()> {
 /// block. Returns whether the connection stays open.
 fn turn(conn: &mut ServerConn, site: &Site, status_body: &[u8]) -> io::Result<bool> {
     loop {
+        // Write what is owed before reading anything. A streamed body is not
+        // in the output buffer, so a read here would let the next request's
+        // answer replace it mid-body. Once the flush empties the buffer, the
+        // read below serves any request the client pipelined behind it.
+        if conn.interest() == Interest::WRITABLE {
+            match conn.flush()? {
+                Flush::Done => {}
+                Flush::More => return Ok(true),
+                Flush::Close => return Ok(false),
+            }
+        }
         // Made where it is used: the head borrows the slots, and a mutable
         // reference to a long-lived array cannot be reborrowed per turn.
         let mut heads = head_slots();
@@ -387,21 +413,6 @@ fn html_page(title: &str, detail: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><meta charset=\"utf-8\">\n<title>{title}</title>\n<h1>{title}</h1>\n<p>{detail}</p>\n</html>\n"
     )
-}
-
-/// Deregister, forget the deadline, close the socket and free the slot.
-fn close(
-    poll: &Poll,
-    conns: &mut Slots<ServerConn>,
-    deadlines: &mut Timeouts,
-    k: usize,
-) -> io::Result<()> {
-    deadlines.clear(Token(k));
-    if let Some(mut stream) = conns.get_mut(k).detach() {
-        poll.registry().deregister(&mut stream)?;
-        conns.free(k);
-    } // `stream` drops here, which closes the socket
-    Ok(())
 }
 
 /// A failure at start is an error: print it and exit 2.

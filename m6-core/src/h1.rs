@@ -29,6 +29,7 @@
 //! `m6_http_lib::forward::strip_untrusted_inbound` already exists and does
 //! exactly this, and a backend has no proxy headers to strip.
 
+use crate::event::{Slots, Timeouts};
 use crate::http::RawRequest;
 use crate::parse::{MAX_BODY_BYTES, MAX_HEADER_BYTES};
 use crate::response::{Body, Response};
@@ -1738,6 +1739,27 @@ impl ServerConn {
             self.out_buf.shrink_to(self.out_write_cap);
         }
     }
+}
+
+/// Deregister a connection, forget its deadline, close its socket and free
+/// its slot.
+///
+/// The one order every service's loop needs on a close, a read error or a
+/// passed deadline: the deadline first, so an expiry cannot name a token that
+/// is about to be handed out again, then detach, deregister and free. Shared
+/// with the services so the order cannot drift between their loops.
+pub fn close_conn(
+    poll: &mio::Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    token: usize,
+) -> io::Result<()> {
+    deadlines.clear(mio::Token(token));
+    if let Some(mut stream) = conns.get_mut(token).detach() {
+        poll.registry().deregister(&mut stream)?;
+        conns.free(token);
+    } // the stream drops here, which closes the socket
+    Ok(())
 }
 
 /// What one framing parse of the buffered bytes says to do next.
