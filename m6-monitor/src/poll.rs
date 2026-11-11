@@ -234,6 +234,9 @@ struct Running {
     dns_active: usize,
     /// Lookups not yet finished.
     dns_left: usize,
+    /// The allocation count when the poll began, under the test feature.
+    #[cfg(feature = "count-allocations")]
+    alloc_start: usize,
 }
 
 /// The node whose tunnel is being probed.
@@ -325,6 +328,8 @@ impl Poller {
             dns_next: 0,
             dns_active: 0,
             dns_left: 0,
+            #[cfg(feature = "count-allocations")]
+            alloc_start: 0,
         };
         Poller {
             nodes,
@@ -388,6 +393,10 @@ impl Poller {
         self.running.dns_started = false;
         self.running.dns_left = 0;
         self.last_start = Some(now);
+        #[cfg(feature = "count-allocations")]
+        {
+            self.running.alloc_start = m6_core::testkit::alloc_count::now();
+        }
         for i in 0..self.nodes.len() {
             self.readings[i].reset();
             self.running.probes[i].reset();
@@ -1108,6 +1117,14 @@ impl Poller {
                 "fleet poll completed"
             );
         }
+        // The poll is where this service allocates: parsing reports and
+        // building the digest, the page and the history batch. Counted under
+        // the test feature, so the number is measured rather than assumed.
+        #[cfg(feature = "count-allocations")]
+        tracing::debug!(
+            poll_allocs = m6_core::testkit::alloc_count::now() - self.running.alloc_start,
+            "fleet poll allocations"
+        );
         let verdicts = self.cache.verdicts(&self.readings);
         self.running.active = false;
         Ok(Progress::Done(Polled {

@@ -5,7 +5,6 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::Command;
