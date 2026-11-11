@@ -1934,13 +1934,21 @@ mod framing_overflow_tests {
     /// line the cap allows.
     #[test]
     fn a_chunk_line_at_the_cap_with_a_split_crlf_is_served() {
+        // `1;` plus 8190 bytes is exactly MAX_HEADER_BYTES of line content, so
+        // its CR sits at index MAX_HEADER_BYTES and its LF one past it.
         let extension = "a".repeat(MAX_HEADER_BYTES - 2);
-        let mut raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let head = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
         raw.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
         raw.extend_from_slice(b"a\r\n0\r\n\r\n");
-        // Everything through the CR, with no LF yet, is pending.
+        // Everything through the chunk-size line's CR, with no LF yet: the
+        // prefix is pending, not an error. Cutting at any other CR (for example
+        // the chunk data's) would not test the cap.
+        let through_line_cr = head.len() + 2 + (MAX_HEADER_BYTES - 2) + 1;
+        assert_eq!(raw[through_line_cr - 1], b'\r');
+        assert_eq!(raw[through_line_cr], b'\n');
         assert!(matches!(
-            parse_request(&raw[..raw.len() - 6]),
+            parse_request(&raw[..through_line_cr]),
             ParseResult::Incomplete
         ));
         match parse_request(&raw) {
@@ -1953,10 +1961,19 @@ mod framing_overflow_tests {
     /// at the cap, not a longer line.
     #[test]
     fn a_chunk_line_one_past_the_cap_is_refused() {
-        let extension = "a".repeat(MAX_HEADER_BYTES);
-        let mut raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        // One byte more than the cap: content MAX_HEADER_BYTES + 1, extension
+        // MAX_HEADER_BYTES - 1, and the CR split from its LF.
+        let extension = "a".repeat(MAX_HEADER_BYTES - 1);
+        let head = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
         raw.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
         raw.extend_from_slice(b"a\r\n0\r\n\r\n");
+        let through_line_cr = head.len() + 2 + (MAX_HEADER_BYTES - 1) + 1;
+        assert_eq!(raw[through_line_cr - 1], b'\r');
+        assert!(matches!(
+            parse_request(&raw[..through_line_cr]),
+            ParseResult::Error
+        ));
         assert!(matches!(parse_request(&raw), ParseResult::Error));
     }
 
