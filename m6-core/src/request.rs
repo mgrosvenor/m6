@@ -142,9 +142,9 @@ impl Request {
 
     /// The raw request, borrowed.
     ///
-    /// For a handler that was written against `RawRequest` before its service
-    /// became an `App` service, and for anything that needs the request as the
-    /// wire delivered it rather than through the accessors above.
+    /// For a handler written against `RawRequest`, and for anything that needs
+    /// the request as the wire delivered it rather than through the accessors
+    /// above.
     pub fn raw(&self) -> &RawRequest {
         &self.raw
     }
@@ -680,9 +680,9 @@ pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
 /// answering 400 confirms that the attempt was recognised as traversal, which
 /// tells the sender their payload reached the router and is worth varying. A
 /// 404 tells them nothing they did not already know, and is the behaviour
-/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before it
-/// became an `App` service. A value that is merely malformed -- a space, a
-/// control byte -- discloses nothing by being named as malformed.
+/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before the
+/// route matcher moved into core. A value that is merely malformed -- a space,
+/// a control byte -- discloses nothing by being named as malformed.
 ///
 /// m6-file used to answer both, inconsistently: 404 for traversal in a
 /// catch-all and 400 for the same `..` in an ordinary parameter, because the

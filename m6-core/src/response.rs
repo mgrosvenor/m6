@@ -27,11 +27,11 @@ use crate::request::Request;
 /// that are not there. Here they cannot: `as_bytes` returns `None` for a
 /// stream and the transforms have nothing to work on.
 ///
-/// This is what `App` was missing. `m6-file` streams a file straight to the
-/// wire (`send_stream`), and one minified JavaScript bundle of several
+/// A body from a reader is what `m6-file` needs. It streams a file straight to
+/// the wire (`send_stream`), and one minified JavaScript bundle of several
 /// megabytes used to be read into a `Vec` on every cache miss to be copied
-/// straight out again. A migration onto a `Response` that could only hold bytes
-/// would have put that allocation back, on the service that serves every asset
+/// straight out again. A `Response` that could only hold bytes would put that
+/// allocation back, on the service that serves every asset
 /// on the site.
 pub enum Body {
     /// Bytes already in memory.
@@ -606,7 +606,7 @@ mod body_tests {
         (head, out[sep + 4..].to_vec())
     }
 
-    /// The capability `App` was missing: a body written from a reader, with the
+    /// A body written from a reader, with the
     /// length promised up front and never held in memory.
     #[test]
     fn a_streamed_body_reaches_the_wire_with_its_length() {

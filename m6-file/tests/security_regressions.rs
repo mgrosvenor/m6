@@ -4,7 +4,7 @@
 //! The reproduction asserts the **secure** behaviour. It failed when written
 //! and passes now that the finding is fixed.
 //!
-//! Rewritten when m6-file became an `App` service: it is now driven through
+//! Rewritten when m6-file took core's route table: it is now driven through
 //! the handler's real entry point with the `Request` the service loop builds,
 //! rather than through a `HandlerContext` that no longer exists. The property
 //! under test is unchanged, and deliberately so: this is the test that caught

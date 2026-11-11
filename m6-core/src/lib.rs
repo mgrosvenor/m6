@@ -92,8 +92,7 @@ pub use site::{CodeRoute, Handled, Site};
 /// service's own, written out in its `main`.
 ///
 /// ```rust,no_run
-/// use std::io;
-/// use std::time::{Duration, Instant};
+/// use std::time::Duration;
 ///
 /// use m6_core::prelude::*;
 ///
@@ -104,6 +103,7 @@ pub use site::{CodeRoute, Handled, Site};
 /// const LISTENER: Token = Token(usize::MAX);
 ///
 /// fn main() -> anyhow::Result<()> {
+///     // Start: blocking and allocation are fine.
 ///     let site = Site::load("example", ROUTES, &[], &NoTemplates);
 ///     let mut poll = Poll::new()?;
 ///     let mut listener = listen_unix(site.socket_path(), site.socket_mode())?;
@@ -113,104 +113,26 @@ pub use site::{CodeRoute, Handled, Site};
 ///     let mut deadlines = Timeouts::new(1024, Duration::from_secs(30));
 ///     let mut events = Events::with_capacity(256);
 ///
-///     loop {
-///         poll.poll(
-///             &mut events,
-///             Some(deadlines.timeout(Instant::now(), Duration::from_secs(1))),
-///         )?;
-///         for event in &events {
-///             match event.token() {
-///                 // Accept until the kernel has no more, and give the slot
-///                 // back when there was nothing to accept after all.
-///                 LISTENER => {
-///                     while let Some(taken) = conns.take() {
-///                         let mut stream = match listener.accept() {
-///                             Ok((stream, _)) => stream,
-///                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-///                                 conns.free(taken.key);
-///                                 break;
-///                             }
-///                             Err(e) => return Err(e.into()),
-///                         };
-///                         poll.registry().register(
-///                             &mut stream,
-///                             Token(taken.key),
-///                             Interest::READABLE,
-///                         )?;
-///                         deadlines.touch(Token(taken.key), Instant::now());
-///                         conns.get_mut(taken.key).attach(stream);
-///                     }
-///                 }
-///                 // One connection: read, dispatch, write, and close when the
-///                 // peer or the response is done.
-///                 Token(k) => {
-///                     let conn = conns.get_mut(k);
-///                     let was = conn.interest();
-///                     let mut keep = true;
-///                     loop {
-///                         if conn.interest() == Interest::WRITABLE {
-///                             match conn.flush()? {
-///                                 Flush::More => break,
-///                                 Flush::Close => {
-///                                     keep = false;
-///                                     break;
-///                                 }
-///                                 Flush::Done => {}
-///                             }
-///                         }
-///                         let mut heads = head_slots();
-///                         let response = match conn.read(&mut heads)? {
-///                             Read::Request(head) => match site.handle(&head) {
-///                                 Handled::Done(response) => Some(response),
-///                                 Handled::Code(0, req) => {
-///                                     Some(site.finish(&req, Response::text("ok")))
-///                                 }
-///                                 Handled::Code(..) | Handled::Named(..) => unreachable!(),
-///                             },
-///                             Read::More => None,
-///                             Read::Closed => {
-///                                 keep = false;
-///                                 break;
-///                             }
-///                         };
-///                         if let Some(response) = response {
-///                             conn.respond_response(response);
-///                         }
-///                         match conn.flush()? {
-///                             Flush::Done => break,
-///                             Flush::More => break,
-///                             Flush::Close => {
-///                                 keep = false;
-///                                 break;
-///                             }
-///                         }
-///                     }
-///                     if !keep {
-///                         m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
-///                     } else {
-///                         deadlines.touch(Token(k), Instant::now());
-///                         if conn.interest() != was {
-///                             let interest = conn.interest();
-///                             let stream = conn
-///                                 .stream()
-///                                 .expect("every registered token has a connection");
-///                             poll.registry().reregister(stream, Token(k), interest)?;
-///                         }
-///                     }
-///                 }
-///             }
-///         }
-///         // Close a peer that sent nothing before its read deadline.
-///         while let Some(Token(k)) = deadlines.expired(Instant::now()) {
-///             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
-///         }
-///     }
+///     // Run: `docs/m6-app-anatomy.md` section 2 owns the loop. It waits with
+///     // `deadlines.timeout`, matches on the event token, accepts until the
+///     // listener would block, and runs one connection turn per token.
+///     run_loop(&mut poll, &mut listener, &mut conns, &mut deadlines, &mut events, &site)
 /// }
+/// # fn run_loop(
+/// #     _poll: &mut Poll,
+/// #     _listener: &mut mio::net::UnixListener,
+/// #     _conns: &mut Slots<ServerConn>,
+/// #     _deadlines: &mut Timeouts,
+/// #     _events: &mut Events,
+/// #     _site: &Site,
+/// # ) -> anyhow::Result<()> {
+/// #     Ok(())
+/// # }
 /// ```
 ///
-/// The signal arm and the stop phase are two more pieces of the same shape:
-/// `Signals` is a descriptor under its own token, and `Lifecycle::complete()`
-/// runs after the loop. `docs/m6-app-anatomy.md` has them in place.
+/// The loop is one `match` on the event's token and one function per
+/// connection. `docs/m6-app-anatomy.md` §2 shows it in full, with the accept,
+/// the connection turn, the signals and the stop phase.
 pub mod prelude {
     pub use crate::dict::Dict;
     pub use crate::error::{Error, Result};

@@ -1783,8 +1783,10 @@ pub(crate) struct Invocation {
     pub(crate) cli_log_level: Option<String>,
 }
 
-/// The binary's own name, from `argv[0]`, for the lifecycle lines and
-/// `--version`.
+/// The binary's own name, from `argv[0]`, for `--version`.
+///
+/// The lifecycle lines take `Site::name`, the literal the service passes to
+/// `Site::load`.
 ///
 /// Not `CARGO_PKG_NAME`: that macro expands where it is written, which is
 /// m6-core, so every service would announce itself as "m6-core" and a deploy

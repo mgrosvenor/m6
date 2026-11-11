@@ -5,9 +5,9 @@
 //!   2. Full Unix socket round-trip through the blocking reference loop
 //!      `m6_core::server::serve_connection`.
 //!
-//! `bench_route_match` was removed when m6-file became an `App` service: the
-//! router it measured was m6-file's own, and there is one router now. Core's
-//! is benchmarked in `m6-core/benches/critical_path.rs`.
+//! `bench_route_match` was removed when m6-file took core's router: the router
+//! it measured was m6-file's own, and there is one router now. Core's is
+//! benchmarked in `m6-core/benches/critical_path.rs`.
 
 #![allow(
     clippy::disallowed_methods,

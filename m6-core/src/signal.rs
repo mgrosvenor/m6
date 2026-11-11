@@ -4,9 +4,9 @@
 //! inherited only by threads created after it, and a service's logging writer
 //! is a thread; if it starts first it takes SIGTERM at the default disposition
 //! and the process dies instead of shutting down. `install_with_hooks` asserts the
-//! mask is set, and that assertion has since caught a real case: the stateful
-//! `App` runners never called `block()`, so SIGTERM handling was quietly wrong
-//! for every service built on them.
+//! mask is set, and that assertion has since caught a real case: a set of
+//! service runners started logging first, so SIGTERM handling was quietly
+//! wrong for every service built on them.
 //!
 //! **Log before setting the flag, not after.** The flag is what releases the
 //! main thread, which logs "shutdown complete" and returns from `main`, and
@@ -196,7 +196,7 @@ fn wake(socket: Option<&Path>, wake_fd: Option<RawFd>) {
         // the shutdown flag on wake and exits without reading it.
         #[expect(
             clippy::disallowed_methods,
-            reason = "App and m6-md only: removed by EL-6d (App) and EL-12 (m6-md)"
+            reason = "m6-md only: removed by EL-12 (m6-md)"
         )]
         let _ = std::os::unix::net::UnixStream::connect(path);
     }
@@ -328,7 +328,7 @@ impl ShutdownHandle {
         let thread_name = Arc::clone(&name);
         #[expect(
             clippy::disallowed_methods,
-            reason = "App and m6-md only: removed by EL-6d (App) and EL-12 (m6-md)"
+            reason = "m6-md only: removed by EL-12 (m6-md)"
         )]
         std::thread::Builder::new()
             .name("m6-signal".into())
@@ -389,13 +389,10 @@ impl ShutdownHandle {
 
     /// `"<name> started"`, with the socket when there is one.
     ///
-    /// Emitted by `install`, which every service calls once it is bound and
-    /// ready to serve. Startup used to be logged as unevenly as shutdown: two
-    /// services said "starting" and never "started", `m6-md` said nothing at
-    /// all, and all three render apps logged `"m6-render started"` rather than
-    /// their own name. Apps still log their own domain fields (route counts,
-    /// thread pool size, bind address); the lifecycle line is core's, so it
-    /// reads the same for every unit.
+    /// Emitted by `Lifecycle::started`, and by `install` for the one service
+    /// that still takes a shutdown handle. Services log their own domain fields
+    /// (route counts, bind address); the lifecycle line is core's, so it reads
+    /// the same for every unit.
     fn log_started(&self) {
         log_started_line(&self.name, self.socket.as_deref().map(|p| p.as_path()));
     }
@@ -426,7 +423,7 @@ impl ShutdownHandle {
         while !self.is_shutdown() {
             #[expect(
                 clippy::disallowed_methods,
-                reason = "App and m6-md only: removed by EL-6d (App) and EL-12 (m6-md)"
+                reason = "m6-md only: removed by EL-12 (m6-md)"
             )]
             std::thread::sleep(Duration::from_millis(sleep_ms));
             sleep_ms = (sleep_ms * 2).min(100);
