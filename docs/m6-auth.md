@@ -49,7 +49,7 @@ Take from it that every route is literal, so the service has no route configurat
 The method column is part of the contract.
 A `GET` on login, refresh or logout does not match the route.
 
-The service shares the signing keys, the token lifetimes and the rate limiter between its worker threads, and each worker thread has its own database connection.
+The service owns the signing keys, the token lifetimes, the rate limiter and one database connection, all built at start.
 It does not manage users or groups.
 `m6-auth-cli` (the *CLI*, command-line interface) writes those rows directly, and the service reads them at login and refresh.
 
@@ -388,13 +388,13 @@ Section 9 covers the database that holds the users the chain begins with.
 
 The service stores users, groups, memberships and refresh tokens in *SQLite*.
 The `m6-auth` library owns the schema, the password hashes and every query.
-The service opens the database once at startup to check it, then each worker thread opens its own connection through `m6_auth::Db::open` on its first request.
-A worker whose open fails answers that request with 500 and tries again on its next request.
+The service opens one connection through `m6_auth::Db::open` at start and keeps it for the life of the process.
+A database that cannot be opened stops the service with exit 2, and the error names the path.
 
 `Db::open` sets *WAL* (write-ahead logging), a 5-second busy timeout and foreign keys.
 WAL lets readers and one writer proceed together.
 A second writer waits up to 5 seconds and then fails.
-Each worker has its own connection, so a login that is checking a password holds no lock another request needs.
+The one connection is used by the one loop, so a login that is checking a password holds the process for its bcrypt verify and every other connection waits for it.
 
 The database path is the `[storage] path` key, an absolute path.
 The service creates the parent directory when it is missing.
@@ -433,7 +433,7 @@ Section 11 covers the process around it.
 
 ## 11. Lifecycle
 
-The service uses the core `App` lifecycle: one process, a bounded worker pool, a Unix socket and a signal handler.
+The service runs one process and one event loop, with a Unix socket and a signal handler.
 This section gives the signals, the exit codes and the log lines, beginning with the signals.
 
 ### 11.1. Signals
