@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use m6_core::testkit::binary;
 
+mod support;
+
 const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const KEY_B: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
 const KEY_C: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
@@ -119,10 +121,9 @@ tunnel = {{ address = "127.0.0.1:1", public_key = "{KEY_A}" }}
 /// as lost.
 #[test]
 fn a_tunnel_probe_does_not_hold_the_loop() {
-    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use m6_core::testkit::{read_one, Service};
+    use m6_core::testkit::Service;
 
     let config = r#"
 poll_interval_s = 60
@@ -153,26 +154,8 @@ level = "warn"
     );
     svc.wait_for_path(&sock, Duration::from_secs(10));
 
-    let request = |target: &str| -> (u16, String) {
-        let mut s = UnixStream::connect(&sock).expect("connect");
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        write!(
-            s,
-            "GET {target} HTTP/1.1\r\nHost: m6\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let raw = read_one(&mut s, "GET").expect("a response inside two seconds");
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        let status = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        (status, text)
-    };
-
     let started = Instant::now();
-    let (status, body) = request("/digest");
+    let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "/digest took {:?} while the tunnel probe waited",
@@ -186,7 +169,7 @@ level = "warn"
     // The budget passes and the poll completes with the tunnel lost.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let (status, body) = request("/digest");
+        let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
         if status == 200 && body.contains("no answer") {
             break;
         }

@@ -17,13 +17,12 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use m6_core::testkit::{read_one, Service};
+use m6_core::testkit::Service;
+
+mod support;
 
 const CONFIG: &str = r#"
 poll_interval_s = 60
@@ -40,24 +39,6 @@ role = "origin"
 level  = "debug"
 format = "text"
 "#;
-
-fn get(sock: &Path, target: &str) -> (u16, String) {
-    let mut s = UnixStream::connect(sock).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    write!(
-        s,
-        "GET {target} HTTP/1.1\r\nHost: m6\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let raw = read_one(&mut s, "GET").expect("a response");
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    (status, text)
-}
 
 #[test]
 fn the_client_path_allocates_nothing() {
@@ -91,7 +72,7 @@ fn the_client_path_allocates_nothing() {
     // A thousand requests to the page's stored bytes. Each connection carries
     // one request, so the counted client arm is one turn per request.
     for _ in 0..1000 {
-        let (status, _) = get(&sock, "/");
+        let (status, _) = support::get(&sock, "/", Duration::from_secs(5));
         assert!(
             status == 200 || status == 503,
             "the page answered {status}\n--- output ---\n{}",

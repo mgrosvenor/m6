@@ -10,14 +10,14 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::Write;
 use std::net::TcpListener;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use m6_core::testkit::{assert_app_lifecycle, binary, read_one, Service};
+use m6_core::testkit::{assert_app_lifecycle, binary, Service};
+
+mod support;
 
 /// A config m6-monitor will actually start on.
 ///
@@ -65,26 +65,6 @@ fn spawn(dir: &Path, config: &Path, sock: &Path) -> Service {
     );
     svc.wait_for_path(sock, Duration::from_secs(10));
     svc
-}
-
-/// One request on the monitor's socket, with a two-second read deadline. A
-/// reply that does not arrive by then is a failure, never a slow pass.
-fn get(sock: &Path, target: &str) -> (u16, String) {
-    let mut s = UnixStream::connect(sock).expect("connect to the monitor");
-    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    write!(
-        s,
-        "GET {target} HTTP/1.1\r\nHost: m6\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let raw = read_one(&mut s, "GET").expect("a response inside two seconds");
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    (status, text)
 }
 
 #[test]
@@ -216,7 +196,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     // The poll is outstanding: the answer must come from the loop, not after
     // the node's deadline.
     let started = Instant::now();
-    let (status, body) = get(&sock, "/digest");
+    let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "/digest took {:?} while a node hung",
@@ -230,7 +210,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     // The deadline passes, the poll finishes, and the node reads unreachable.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (status, body) = get(&sock, "/digest");
+        let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
         if status == 200 && body.contains("\"unreachable\"") {
             break;
         }
@@ -246,35 +226,80 @@ fn the_monitor_serves_while_a_node_hangs() {
     svc.terminate(Duration::from_secs(5));
 }
 
+/// A slash a client adds changes nothing: `/digest/`, `//` and a relative
+/// `digest` are the same routes, and answering one never aborts the loop.
+///
+/// The routes are matched by exactly the paths the service declares, while
+/// the site dispatch trims outer slashes, so those requests arrive as code
+/// routes. Answering them from the snapshot keeps a stray slash from ending
+/// the process.
+#[test]
+fn a_trailing_or_doubled_slash_still_answers() {
+    let (dir, config, sock) = setup(CONFIG);
+    let mut svc = spawn(dir.path(), &config, &sock);
+
+    // A completed poll is a 200 from /digest.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while support::get(&sock, "/digest", Duration::from_secs(2)).0 != 200 {
+        assert!(
+            Instant::now() < deadline,
+            "no poll completed\n--- output ---\n{}",
+            svc.output()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    for (target, marker) in [
+        ("/digest/", "\"nodes\""),
+        ("//", "m6 fleet"),
+        ("digest", "\"nodes\""),
+    ] {
+        let (status, body) = support::get(&sock, target, Duration::from_secs(2));
+        assert!(
+            status == 200 || status == 503,
+            "GET {target} answered {status}\n--- output ---\n{}",
+            svc.output()
+        );
+        assert!(
+            body.contains(marker),
+            "GET {target} answered without {marker:?}: {body}\n--- output ---\n{}",
+            svc.output()
+        );
+    }
+    // The loop is still serving after all three.
+    let (status, _) = support::get(&sock, "/digest", Duration::from_secs(2));
+    assert_eq!(status, 200, "the monitor stopped after a slashed path");
+    svc.terminate(Duration::from_secs(5));
+}
+
 /// The monitor runs one loop thread, plus the log writer until LOG-2 replaces
-/// it. A poll thread, a thread per node or a history writer would each show up
-/// in the count, so the count with a three-node fleet that has a tunnel and a
-/// history must stay where one plain node put it.
+/// it. Three counts test that: one node, the same three-node fleet without a
+/// history, and that fleet with one. A poll thread or a history writer adds a
+/// thread to the same fleet, and a thread per node adds three.
 ///
 /// macOS has platform threads of its own: reading the host's certificate store
 /// (`client::system_roots`) goes through the Security framework, whose idle
 /// libdispatch workers come and go, so this sandbox sees three or four of them
-/// at different moments. The bound below allows for all four. Linux reads the
-/// store with no thread, so the trusted session's run asserts the exact
-/// `1 + LOG_WRITER_THREADS`, and that is the proof of the count.
+/// at different moments and their count is not stable between starts. The
+/// exact count (`1 + LOG_WRITER_THREADS`) and the same-fleet history
+/// comparison are therefore asserted on Linux, which is the trusted proof. On
+/// macOS the counts are bounded instead, and this test makes no exact claim.
 #[test]
 fn the_monitor_runs_one_thread() {
     let (dir, config, sock) = setup(CONFIG);
     let svc = spawn(dir.path(), &config, &sock);
     let one = settled_threads(svc.pid(), &svc);
     drop(svc);
-    assert_no_poll_threads(one);
+    assert_single_loop("one node", one);
 
-    // Three nodes, each with a tunnel and a handshake file, and a history. A
-    // thread per node, a thread per probe or a history writer adds one per
-    // node or one in all, and the bound with one node already leaves no room
-    // for a fleet's worth of threads.
+    // The same three-node fleet twice, so a history writer shows as the one
+    // difference between two otherwise identical runs.
     let handshakes = dir.path().join("wg-handshakes");
     std::fs::write(&handshakes, "").unwrap();
     let mut config_text = CONFIG.replace(
         "\n[[monitor.nodes]]",
         &format!(
-            "\nwg_handshakes_file = {:?}\nhistory_file = \"history.sqlite3\"\n\n[[monitor.nodes]]",
+            "\nwg_handshakes_file = {:?}\n\n[[monitor.nodes]]",
             handshakes.display().to_string()
         ),
     );
@@ -285,19 +310,25 @@ fn the_monitor_runs_one_thread() {
     }
     let (dir2, config2, sock2) = setup(&config_text);
     let svc2 = spawn(dir2.path(), &config2, &sock2);
-    let three = settled_threads(svc2.pid(), &svc2);
-    let output = svc2.output();
+    let plain = settled_threads(svc2.pid(), &svc2);
     drop(svc2);
-    assert!(
-        three <= one + 1,
-        "three nodes, tunnels and a history run {three} threads against {one} for one node: \
-         the poll and the history add no fleet-sized set of threads\n--- output ---\n{output}"
+    assert_single_loop("three nodes with tunnels", plain);
+
+    let config_text = config_text.replace(
+        "\nwg_handshakes_file",
+        "\nhistory_file = \"history.sqlite3\"\nwg_handshakes_file",
     );
+    let (dir3, config3, sock3) = setup(&config_text);
+    let svc3 = spawn(dir3.path(), &config3, &sock3);
+    let with_history = settled_threads(svc3.pid(), &svc3);
+    let output = svc3.output();
+    drop(svc3);
+    assert_history_adds_none(plain, with_history, &output);
 }
 
-/// The count the loop and the log writer make, on the platform whose
-/// certificate store is a plain file read.
-fn assert_no_poll_threads(count: usize) {
+/// The loop and the log writer, exactly, where the certificate store is a
+/// plain file read.
+fn assert_single_loop(what: &str, count: usize) {
     // The log writer is a thread even when the log goes to stdout, so the loop
     // and the writer are two. LOG-2 replaces tracing-appender and this becomes
     // one.
@@ -305,16 +336,39 @@ fn assert_no_poll_threads(count: usize) {
     assert_eq!(
         count,
         1 + LOG_WRITER_THREADS,
-        "m6-monitor runs {count} threads: one loop thread and tracing-appender's \
-         writer until LOG-2"
+        "{what}: m6-monitor runs {count} threads, not the one loop thread and \
+         tracing-appender's writer until LOG-2"
     );
     // macOS adds the platform store's idle libdispatch workers, at most four.
+    // A thread per node would take a three-node fleet past this.
     #[cfg(target_os = "macos")]
     assert!(
         count <= 1 + LOG_WRITER_THREADS + 4,
-        "m6-monitor runs {count} threads, more than the loop, the log writer and \
-         the platform store's four workers"
+        "{what}: m6-monitor runs {count} threads, more than the loop, the log \
+         writer and the platform store's four workers"
     );
+    let _ = what;
+}
+
+/// A history adds no thread. The exact comparison is Linux's; macOS allows the
+/// platform's one-worker swing between two starts, so it makes no exact claim.
+fn assert_history_adds_none(plain: usize, with_history: usize, output: &str) {
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        with_history,
+        plain,
+        "a history added {} thread(s)\n--- output ---\n{output}",
+        with_history as isize - plain as isize
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            with_history <= plain + 1,
+            "a history added threads beyond the platform's one-worker swing: \
+             {with_history} with it against {plain} without\n--- output ---\n{output}"
+        );
+        let _ = (with_history, plain, output);
+    }
 }
 
 /// `LOG_WRITER_THREADS` is 1 until LOG-2 replaces tracing-appender; it becomes
