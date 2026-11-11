@@ -470,8 +470,8 @@ impl Ptr {
 /// Letters, digits, `-`, `_` and `.`, at most 253 characters once the trailing
 /// dot a resolver may return is removed: the shape of a host name.
 ///
-/// `pub(crate)` because `resolve.rs`'s worker thread applies the same check
-/// until EL-9 removes that path.
+/// `pub(crate)` because `Confirm` applies it to the PTR name before the
+/// forward lookup.
 pub(crate) fn is_host_name(name: &str) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name);
     !name.is_empty()

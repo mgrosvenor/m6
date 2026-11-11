@@ -34,6 +34,18 @@ pub const MAX_INFORMATIONAL: usize = 8;
 /// nothing.
 pub const MAX_HEADERS: usize = 64;
 
+/// The slots [`Upstream::reply`] parses a response head into.
+///
+/// The caller owns them, as httparse intends: the storage sits outside the
+/// parse, the parse borrows it, and no reference to the parser outlives the
+/// call. [`reply_slots`] makes a set without writing anything.
+pub type ReplySlots<'a> = [std::mem::MaybeUninit<httparse::Header<'a>>; MAX_HEADERS];
+
+/// A new set of empty slots.
+pub fn reply_slots<'a>() -> ReplySlots<'a> {
+    [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS]
+}
+
 /// Ceiling on a response head (status line and headers). Matches the blocking
 /// reader's stack buffer, so the two never disagree about what fits.
 const MAX_HEAD: usize = 8192;
@@ -50,6 +62,38 @@ pub enum Addr {
 pub struct TlsClient {
     pub config: Arc<rustls::ClientConfig>,
     pub name: rustls::pki_types::ServerName<'static>,
+}
+
+/// The host's certificate store, for a client that makes TLS connections.
+///
+/// Start only: it reads the platform store, which blocks. A service that
+/// trusts the host's store trusts what its operator's tools trust, and a
+/// renewal there reaches the service at its next restart, as every other
+/// start-time read does. The alternative, a bundled store, is a second answer
+/// to which certificates are trusted and it goes stale inside the binary.
+///
+/// A store that yields no certificate is an error, never an empty trust set: a
+/// client that trusts nothing fails every handshake with an error that blames
+/// the peer.
+pub fn system_roots() -> io::Result<rustls::RootCertStore> {
+    let native = rustls_native_certs::load_native_certs();
+    if native.certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the platform certificate store loaded no certificate",
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, ignored) = roots.add_parsable_certificates(native.certs);
+    if added == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the platform certificate store loaded {ignored} certificate(s) and none could be parsed"
+            ),
+        ));
+    }
+    Ok(roots)
 }
 
 /// A parsed response head and body, borrowing the slot and the caller's header
@@ -773,10 +817,7 @@ impl Upstream {
     ///
     /// `slots` is an uninitialised array of [`MAX_HEADERS`] entries, so building
     /// it costs nothing: httparse writes only the entries it fills.
-    pub fn reply<'a>(
-        &'a self,
-        slots: &'a mut [std::mem::MaybeUninit<httparse::Header<'a>>],
-    ) -> Option<Reply<'a>> {
+    pub fn reply<'a>(&'a self, slots: &'a mut ReplySlots<'a>) -> Option<Reply<'a>> {
         self.framing?;
         let head = &self.read_buf[self.head_start..self.head_end + 4];
         let mut resp = httparse::Response::new(&mut []);

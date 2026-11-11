@@ -150,7 +150,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Observability** | `log` | `init`, `init_with_analytics`, `LogHandle` and `LogPulse`. Tracing setup and the liveness pulse. |
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
-| | `resolve` | Reverse DNS with forward confirmation, `reverse_confirmed`, on a bounded number of lookup threads. |
+| | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
 | | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
 | | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded` and `TlsCertificate`. |
 | | `firewall` | `FirewallState` from nftables' own JSON. |
@@ -810,24 +810,24 @@ with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 
 ### 8.4. `resolve`
 
-Reverse DNS with a deadline, for checking a claim against its source.
-It runs in a monitor and never in a serving path, because a lookup is a network round trip.
+Reverse DNS, for checking a claim against its source. A lookup is a network round trip, so it runs in a monitor's own loop and never in a serving path.
 
-`reverse_confirmed(addr, timeout)` and `reverse_confirmed_default(addr)` resolve the PTR name of an address, then resolve that name forward, and return a `Ptr`:
+The rule lives in [`crate::dns`]. `Confirm::start(ip, ns)` asks the PTR question for an address on one UDP socket, then asks the name it gets forward, and answers `Ptr` only after that second answer. The caller owns the deadline and reads [`Ptr`], whose four outcomes are Table 8.4.
 
 | `Ptr` | meaning |
 |---|---|
 | `Name(n)` | the PTR name `n` resolves back to the address |
 | `Unconfirmed(n)` | the PTR name `n` exists and its forward lookup completed without the address, a false claim |
 | `None` | the address has no PTR record, unverified |
-| `Failed` | a lookup failed, timed out or found no free thread slot, unverified |
+| `Failed` | the lookup did not complete: a socket error, a truncated reply or the deadline, unverified |
 
-Table 2: the outcomes of a confirmed reverse lookup.
+*Table 8.4: the outcomes of a confirmed reverse lookup.*
 
-`Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com`.
-`DEFAULT_TIMEOUT` is two seconds and covers both lookups together.
-At most `MAX_LOOKUP_THREADS` (8) lookup threads are alive at once, counting those abandoned at their deadline, and a lookup with no free slot reads `Failed` at once.
-`telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
+`Confirm` never waits. `fd()` gives the descriptor to register, `drive()` moves the current question as far as it goes without waiting and changes `fd()` when the PTR step ends, and the outcome arrives once. A query dropped at its deadline closes its socket, which reads as `Failed`. A truncated reply is a failure, because an A, AAAA or PTR answer fits in UDP and a TCP fallback would be a second mechanism. `dns::nameserver()` reads the first nameserver in `/etc/resolv.conf` once, at start.
+
+`Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com`. `telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
+
+This module re-exports `Ptr`, because callers name `resolve::Ptr` and this section states the rule. The one caller is `m6-monitor`'s fleet poll, which drives `Confirm` on its own loop and keeps the answers.
 
 ### 8.5. `host`
 
