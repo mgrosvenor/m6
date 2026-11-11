@@ -1034,3 +1034,23 @@ fn a_database_that_cannot_be_opened_stops_the_service_at_start() {
         "the socket was created before the database open failed"
     );
 }
+
+/// The database's directory cannot be created because a regular file sits at
+/// its path, so the service exits 2 and the error names the directory.
+///
+/// The database that cannot be opened test fails inside `Db::open`. This one
+/// fails earlier, in the `create_dir_all` that makes `[storage] path`'s parent,
+/// which is the branch whose message names the directory.
+#[test]
+fn a_storage_directory_that_cannot_be_created_names_the_path() {
+    let env = setup_test_env("db-dir-is-a-file");
+    let data_dir = env.site_dir.join("data");
+    std::fs::remove_dir(&data_dir).expect("remove the data directory");
+    std::fs::write(&data_dir, b"not a directory").expect("put a file where the data directory was");
+
+    let output = start_failure(&env, "a storage directory that cannot be created");
+    assert!(
+        output.contains(&data_dir.display().to_string()),
+        "the error must name the database directory\n--- output ---\n{output}"
+    );
+}
