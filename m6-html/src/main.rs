@@ -116,14 +116,15 @@ fn main() -> Result<()> {
                                 break;
                             }
                             Err(e) => {
-                                // A transient failure, such as a descriptor
-                                // shortage elsewhere in the process, sheds
-                                // this attempt and not the service. The table
-                                // is clamped to the limit, so our own
-                                // connections cannot exhaust the descriptors.
+                                // A failure here sheds this accept pass and
+                                // not the service: give the slot back, say so
+                                // once, and wait for the next listener event.
+                                // The budget leaves room for every connection
+                                // and every file it streams, so this is a
+                                // transient error outside the table.
                                 conns.free(taken.key);
                                 eprintln!("m6-html: accept error: {e}");
-                                continue;
+                                break;
                             }
                         };
                         poll.registry().register(

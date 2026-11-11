@@ -619,6 +619,134 @@ fn a_request_pipelined_behind_a_streamed_body_waits_for_the_body() {
     svc.assert_alive("after answering a request pipelined behind a streamed body");
 }
 
+/// A streamed file holds a second descriptor, so the table is half the
+/// descriptor budget. Under a hard limit of 64 the table is 24: twenty
+/// connections holding a 2 MiB stream each use 46 descriptors, and the next
+/// batch of connections must not reach the accept loop's descriptor limit.
+/// The service stays alive, never logs an accept error, and keeps answering
+/// on an existing connection. A table sized without the file descriptor
+/// reaches EMFILE when the second batch arrives.
+#[test]
+fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
+    const HARD: u64 = 64;
+    /// The descriptors `raise_open_file_limit` leaves after its 16 reserved.
+    const DESCRIPTORS: usize = HARD as usize - 16;
+    /// Held streams, so the accept pass that follows runs with their file
+    /// descriptors already in use.
+    const HELD: usize = 20;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    // Large enough that an unread body cannot fit a socket buffer, so the
+    // streamed file's descriptor stays open behind its connection.
+    let big: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
+    std::fs::write(site.join("assets").join("a.txt"), b"asset").unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("stream-limit.sock");
+    let mut svc = Service::spawn(
+        "m6-file",
+        &mut limited_shell_command(HARD, &socket_path, site, &config),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "m6-file never accepted a connection"
+    );
+
+    let request =
+        b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let mut held: Vec<UnixStream> = (0..HELD)
+        .map(|_| {
+            let mut client = UnixStream::connect(&socket_path).expect("connect");
+            client.write_all(request).expect("send the request");
+            client
+        })
+        .collect();
+
+    // Every held connection must be accepted and its file open: one byte of
+    // its body is the signal, and `peek` reads nothing.
+    let started = wait::until(Duration::from_secs(10), || {
+        held.iter().all(|client| {
+            let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+            matches!(socket2::SockRef::from(client).peek(&mut byte), Ok(n) if n > 0)
+        })
+    });
+    assert!(
+        started,
+        "the first streams never started\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("with twenty streams holding their files");
+
+    // A batch that cannot fit beside the held streams. With the whole
+    // descriptor budget the accept loop reaches EMFILE here.
+    let mut more: Vec<UnixStream> = (0..DESCRIPTORS)
+        .map(|_| {
+            let mut client = UnixStream::connect(&socket_path).expect("connect");
+            client.write_all(request).expect("send the request");
+            client
+        })
+        .collect();
+
+    // The loop keeps serving: finish one held body, then ask again on the
+    // same connection. A loop spinning in a failed accept answers neither,
+    // and a loop that exits answers nothing at all.
+    let mut first = held.remove(0);
+    first.set_nonblocking(false).expect("blocking");
+    first
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let body = m6_core::testkit::read_one(&mut first, "GET").expect("the held streamed body");
+    let (status, headers, body_len) = split_response(&body);
+    assert!(status.contains("200"), "the held response was {status}");
+    assert!(
+        headers.contains(&format!("content-length: {}", big.len())),
+        "the response must promise the file's length, got {headers:?}"
+    );
+    assert_eq!(body_len, big.len(), "the streamed body was short");
+
+    first
+        .write_all(
+            b"GET /assets/a.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+        )
+        .expect("send the second request");
+    let second = m6_core::testkit::read_one(&mut first, "GET")
+        .expect("the loop did not answer on an existing connection");
+    let (status, _, body_len) = split_response(&second);
+    assert!(status.contains("200"), "the second response was {status}");
+    assert_eq!(body_len, 5, "the second body is the small file");
+
+    svc.assert_alive("after answering on an existing connection");
+    assert!(
+        !svc.output().contains("accept error"),
+        "the descriptor budget was not enough for a stream per connection\n--- output ---\n{}",
+        svc.output()
+    );
+    more.clear();
+}
+
+/// `m6-file` in a shell that lowers both file-descriptor limits first.
+///
+/// The shell `exec`s the service, so the service keeps the shell's pid and the
+/// testkit's signal and output plumbing still points at one process.
+fn limited_shell_command(hard: u64, socket_path: &Path, site: &Path, config: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!(
+            "ulimit -Sn {hard}; ulimit -Hn {hard}; exec \"$0\" \"$@\""
+        ))
+        .arg(binary("m6-file"))
+        .arg(site)
+        .arg(config)
+        .env("M6_SOCKET_OVERRIDE", socket_path);
+    cmd
+}
+
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.

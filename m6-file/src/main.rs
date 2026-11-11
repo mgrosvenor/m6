@@ -55,13 +55,20 @@ fn main() -> Result<()> {
     // ── start: blocking and allocation are fine ──────────────────────────
     let site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
     let read_timeout = site.read_timeout();
-    let ceiling =
+    let descriptors =
         raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    // A streamed file holds a second descriptor for as long as its body is
+    // being written, so the table takes half of what the limit leaves: one
+    // descriptor per connection and one per streamed body. A larger table
+    // could never report itself full before the kernel runs out, because
+    // `Slots::is_full` counts connections and not the files behind them.
+    let ceiling = descriptors / 2;
     if ceiling == 0 {
-        fail("the open file limit", "leaves no connection table");
+        fail(
+            "the open file limit",
+            "leaves no connection table and no room for a streamed file",
+        );
     }
-    // A table larger than the descriptors the limit allows could never report
-    // itself full: `Slots::is_full` would stay false past the kernel's limit.
     let initial = INITIAL_CONNECTIONS.min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
@@ -131,14 +138,15 @@ fn main() -> Result<()> {
                                 break;
                             }
                             Err(e) => {
-                                // A transient failure, such as a descriptor
-                                // shortage elsewhere in the process, sheds
-                                // this attempt and not the service. The table
-                                // is clamped to the limit, so our own
-                                // connections cannot exhaust the descriptors.
+                                // A failure here sheds this accept pass and
+                                // not the service: give the slot back, say so
+                                // once, and wait for the next listener event.
+                                // The budget leaves room for every connection
+                                // and every file it streams, so this is a
+                                // transient error outside the table.
                                 conns.free(taken.key);
                                 eprintln!("m6-file: accept error: {e}");
-                                continue;
+                                break;
                             }
                         };
                         poll.registry().register(
