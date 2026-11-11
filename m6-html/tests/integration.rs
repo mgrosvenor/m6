@@ -309,7 +309,12 @@ fn a_request_is_served_on_the_accepting_thread() {
 fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket_path = dir.path().join("limit.sock");
-    let mut svc = Service::spawn("m6-html", &mut limited_shell_command(64, &socket_path));
+    let mut command = m6_core::testkit::lowered_fd_limit_command(64, 0, binary("m6-html"));
+    command
+        .arg(fixtures_dir())
+        .arg(config_path())
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-html", &mut command);
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
     let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
         !http_request(
@@ -364,7 +369,12 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
     // nothing is bound.
     let dir = tempfile::tempdir().expect("tempdir");
     let socket_path = dir.path().join("none.sock");
-    let mut svc = Service::spawn("m6-html", &mut limited_shell_command(16, &socket_path));
+    let mut command = m6_core::testkit::lowered_fd_limit_command(16, 0, binary("m6-html"));
+    command
+        .arg(fixtures_dir())
+        .arg(config_path())
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-html", &mut command);
     let status = svc
         .wait_for_exit(Instant::now() + Duration::from_secs(10))
         .expect("m6-html should exit when the limit cannot hold a table");
@@ -379,24 +389,6 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
         "a start failure must not bind the socket: {}",
         socket_path.display()
     );
-}
-
-/// `m6-html` in a shell that lowers both file-descriptor limits first.
-///
-/// The shell `exec`s the service, so the service keeps the shell's pid and the
-/// testkit's signal and output plumbing (the `Service` drains the streams it
-/// inherited) still points at the one process.
-fn limited_shell_command(hard: u64, socket_path: &Path) -> Command {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(format!(
-            "ulimit -Sn {hard}; ulimit -Hn {hard}; exec \"$0\" \"$@\""
-        ))
-        .arg(binary("m6-html"))
-        .arg(fixtures_dir())
-        .arg(config_path())
-        .env("M6_SOCKET_OVERRIDE", socket_path);
-    cmd
 }
 
 /// The thread count of a running process.

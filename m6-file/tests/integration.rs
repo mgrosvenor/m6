@@ -648,10 +648,12 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
     std::fs::write(&config, ASSETS_ROUTE).unwrap();
 
     let socket_path = dir.path().join("stream-limit.sock");
-    let mut svc = Service::spawn(
-        "m6-file",
-        &mut limited_shell_command(HARD, &socket_path, site, &config),
-    );
+    let mut command = m6_core::testkit::lowered_fd_limit_command(HARD, 0, binary("m6-file"));
+    command
+        .arg(site)
+        .arg(&config)
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-file", &mut command);
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
     assert!(
         wait::for_unix(&socket_path, Duration::from_secs(10)),
@@ -730,21 +732,121 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
     more.clear();
 }
 
-/// `m6-file` in a shell that lowers both file-descriptor limits first.
+/// The accept arm is reached and survives when inherited descriptors, not the
+/// table, exhaust the limit.
 ///
-/// The shell `exec`s the service, so the service keeps the shell's pid and the
-/// testkit's signal and output plumbing still points at one process.
-fn limited_shell_command(hard: u64, socket_path: &Path, site: &Path, config: &Path) -> Command {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(format!(
-            "ulimit -Sn {hard}; ulimit -Hn {hard}; exec \"$0\" \"$@\""
-        ))
-        .arg(binary("m6-file"))
+/// The launcher opens 40 descriptors before the exec, so a hard limit of 64
+/// leaves about 18 free although the table is 24. A batch of 25 streaming
+/// requests drives `accept` to EMFILE with the table below its ceiling: the
+/// arm must give its slot back, log exactly one line and return to the poll.
+/// The service stays alive and answers on an accepted connection, and the
+/// error does not repeat. No new listener event is made afterwards: under
+/// edge-triggered mio the listener is not re-armed after the failed accept,
+/// and with no descriptor free a new connection would re-enter the same accept
+/// pass and log a second error, which is the repeat this test is against. The
+/// re-arm is mio's, and the fix review's live probe records it.
+#[test]
+fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
+    const HARD: u64 = 64;
+    /// Opened by the launcher before the exec. stdio, the listener, the signal
+    /// descriptor and the poll take about 46, so accept runs out after about
+    /// 18 connections against a 24-slot table.
+    const INHERITED: usize = 40;
+    const CLIENTS: usize = 25;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    // Larger than any socket buffer, so a served request keeps its file
+    // descriptor until the client reads.
+    let big: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("pressure.sock");
+    let mut command =
+        m6_core::testkit::lowered_fd_limit_command(HARD, INHERITED, binary("m6-file"));
+    command
         .arg(site)
-        .arg(config)
-        .env("M6_SOCKET_OVERRIDE", socket_path);
-    cmd
+        .arg(&config)
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-file", &mut command);
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "m6-file never accepted a connection"
+    );
+
+    fn accept_errors(output: &str) -> usize {
+        output.matches("accept error").count()
+    }
+
+    // One batch, no client reading, so each accepted request holds its
+    // connection and, once served, its streamed file.
+    let mut clients: Vec<UnixStream> = (0..CLIENTS)
+        .map(|_| {
+            let mut client = UnixStream::connect(&socket_path).expect("connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            client
+                .write_all(
+                    b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+                )
+                .expect("send the request");
+            client
+        })
+        .collect();
+
+    let reached = wait::until(Duration::from_secs(10), || {
+        accept_errors(&svc.output()) >= 1
+    });
+    assert!(
+        reached,
+        "{} inherited descriptors and {} streaming connections never reached the accept limit\n\
+         --- output ---\n{}",
+        INHERITED,
+        CLIENTS,
+        svc.output()
+    );
+    assert_eq!(
+        accept_errors(&svc.output()),
+        1,
+        "the accept arm logged one line per pass, not one\n--- output ---\n{}",
+        svc.output()
+    );
+
+    // No growth over a short deadline: the loop returned to the poll and did
+    // not go back into the accept loop.
+    assert!(
+        !wait::until(Duration::from_millis(750), || accept_errors(&svc.output())
+            > 1),
+        "the accept error repeated\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("after an accept error from inherited descriptors");
+
+    // An accepted connection is still answered. The streamed file may or may
+    // not open, depending on how many connections were accepted before the
+    // limit; either status proves the loop came back and served it.
+    let response = m6_core::testkit::read_one(&mut clients[0], "GET")
+        .expect("an accepted connection was not answered");
+    let status = String::from_utf8_lossy(&response[..response.len().min(32)]).to_string();
+    assert!(
+        status.contains("200") || status.contains("404"),
+        "the accepted connection was answered with {status}"
+    );
+
+    assert_eq!(
+        accept_errors(&svc.output()),
+        1,
+        "a second accept-error line appeared\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("after answering on an accepted connection");
+    drop(clients);
 }
 
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────

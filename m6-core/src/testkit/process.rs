@@ -5,6 +5,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -360,6 +361,33 @@ pub fn spawn_instances(
             Service::spawn(name, &mut command)
         })
         .collect()
+}
+
+/// `program` in a shell that lowers both open-file limits to `hard` and
+/// `exec`s it.
+///
+/// The client uses this to hold a service to a chosen descriptor budget. The
+/// shell `exec`s the program, so the service keeps the shell's pid and the
+/// testkit's signal and output plumbing still points at one process.
+///
+/// `inherited` descriptors beyond stdio are opened on `/dev/null` before the
+/// exec and stay open, which puts the service at a known distance from its
+/// limit. Zero opens none.
+pub fn lowered_fd_limit_command(
+    hard: u64,
+    inherited: usize,
+    program: impl AsRef<OsStr>,
+) -> Command {
+    let opens: String = (0..inherited)
+        .map(|i| format!("exec {}<>/dev/null; ", 3 + i))
+        .collect();
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!(
+            "ulimit -Sn {hard}; ulimit -Hn {hard}; {opens}exec \"$0\" \"$@\""
+        ))
+        .arg(program.as_ref());
+    cmd
 }
 
 fn spawn_drain(
