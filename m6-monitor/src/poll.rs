@@ -883,12 +883,17 @@ impl Poller {
         };
         let slot = self.probe_slot();
         self.close_slot(poll, out, slot);
+        // The connect's own result. A test can stand in for it with its one-shot
+        // seam, so the match below is still the one place a failed connect is
+        // handled, in the test build as in the release one.
         #[cfg(test)]
-        if let Some(kind) = self.probe_connect_failure.take() {
-            self.running.probes[node].failed(&io::Error::from(kind));
-            return Ok(false);
-        }
-        let sock = match MioTcpStream::connect(addr) {
+        let connect = match self.probe_connect_failure.take() {
+            Some(kind) => Err(io::Error::from(kind)),
+            None => MioTcpStream::connect(addr),
+        };
+        #[cfg(not(test))]
+        let connect = MioTcpStream::connect(addr);
+        let sock = match connect {
             Ok(sock) => sock,
             Err(e) => {
                 self.running.probes[node].failed(&e);
