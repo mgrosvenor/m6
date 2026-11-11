@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{binary, Service};
 
@@ -238,6 +238,95 @@ fn l1_sigterm_exits_zero() {
         socket_path.display()
     );
     m6_core::testkit::assert_lifecycle_logged("m6-html", &guard.svc.output());
+}
+
+// ---------------------------------------------------------------------------
+// L1b — One loop thread
+// ---------------------------------------------------------------------------
+
+/// The writer `tracing-appender` starts for the log: one thread per process
+/// until LOG-2 logs in process. LOG-2 changes this constant to 0.
+const LOG_WRITER_THREADS: usize = 1;
+
+/// An answered request was served on the thread that accepted it, not on a
+/// worker of its own. The measured process count is the loop plus, for now,
+/// the log writer: a thread per connection would show up here.
+#[test]
+fn a_request_is_served_on_the_accepting_thread() {
+    let (server, socket_path) = spawn_server("thread-count");
+
+    let resp = http_request(
+        &socket_path,
+        "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        resp.contains("200 OK"),
+        "the request was not served: {}",
+        &resp[..resp.len().min(200)]
+    );
+    let pid = server.svc.pid();
+
+    // The writer is started by logging before the socket exists, so it is
+    // already there. The wait is for the count to settle, never a fixed sleep:
+    // the assertion below is the signal and the deadline is the bound.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut threads = thread_count(pid);
+    while threads != 1 + LOG_WRITER_THREADS && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        threads = thread_count(pid);
+    }
+    assert_eq!(
+        threads,
+        1 + LOG_WRITER_THREADS,
+        "m6-html (pid {pid}) runs {threads} threads after answering a request: one loop \
+         thread and tracing-appender's writer until LOG-2\n--- output ---\n{}",
+        server.svc.output()
+    );
+}
+
+/// The thread count of a running process.
+///
+/// Linux lists `/proc/<pid>/task`. macOS has no `/proc`: `libproc` answers the
+/// same question with one 64-bit thread id per thread, which is what `ps -M`
+/// prints, without spawning a tool.
+#[cfg(target_os = "linux")]
+fn thread_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn thread_count(pid: u32) -> usize {
+    /// `PROC_PIDLISTTHREADS` from `<sys/proc_info.h>`.
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+
+    let mut ids = [0u64; 256];
+    // SAFETY: `ids` is a live buffer of exactly the length passed, and
+    // `proc_pidinfo` writes at most that many bytes into it.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDLISTTHREADS,
+            0,
+            ids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&ids) as libc::c_int,
+        )
+    };
+    (bytes.max(0) as usize) / std::mem::size_of::<u64>()
+}
+
+/// The BSDs list a process's threads with `ps -H`, one line each.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn thread_count(pid: u32) -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-H", "-p", &pid.to_string()])
+        .output()
+        .expect("ps must run to count a process's threads");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
 }
 
 // ---------------------------------------------------------------------------

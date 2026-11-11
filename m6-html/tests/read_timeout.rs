@@ -1,22 +1,22 @@
-//! The read timeout on an accepted connection, proven against the real binary.
+//! The read deadline on an accepted connection, proven against the real binary.
 //!
-//! `App` set no read timeout at all, so `serve_connection` blocked in `read`
-//! waiting for a request line that a silent peer was never going to send. The
-//! worker was held until the peer went away, and with a bounded pool a handful
-//! of silent peers is the entire pool. The service answers 503 or nothing while
-//! looking healthy: no panic, no error, no log line.
+//! A peer that connects and says nothing holds a connection slot, never a
+//! thread, so it can no longer starve a worker pool. The deadline is what lets
+//! the slot go: the loop closes the connection when `Timeouts` reports its read
+//! deadline passed, with no response, and logs nothing, because a `400` written
+//! into an idle pooled connection would be read as the answer to the next
+//! request sent on it.
 //!
 //! These tests are written against the fixture config `m6-html-timeout.conf`,
-//! which sets a two-worker pool and a three second deadline. Both fail against an
-//! `App` with no timeout: the first hangs until the harness timeout, the second
-//! never gets its request answered.
+//! which sets a three second deadline. Its `[thread_pool]` table is inert: the
+//! service reads no pool, and EL-6d refuses the key.
 
 #![allow(
     clippy::disallowed_methods,
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -113,66 +113,72 @@ fn a_silent_peer_is_disconnected_without_a_response() {
     server.svc.assert_alive("after disconnecting a silent peer");
 }
 
-/// The outage this exists to prevent: silent peers must not take the pool.
+/// Silent peers hold connection slots, and a slot never stops the loop.
 ///
-/// The config gives two workers and a two-deep queue, so the four connections
-/// opened here are the whole of it. Without a deadline every one of those is
-/// held until its peer goes away, and a real request is never served.
+/// The old shape filled a two-worker, two-deep pool and answered a real request
+/// with a `503` until the pool drained. There is no pool now, and no queue a
+/// peer can fill: this opens 64 connections (more than the old pool held) and
+/// requires a real request on another connection to be answered within 2 s,
+/// while all 64 are still open. A service that served one connection to
+/// completion before accepting the next fails the deadline; a service that
+/// answered the 64 with a refusal fails the last loop.
 #[test]
-fn silent_peers_do_not_starve_the_thread_pool() {
-    let (mut server, socket_path) = spawn_server("starve");
+fn silent_peers_do_not_block_other_connections() {
+    let (mut server, socket_path) = spawn_server("silent-peers");
 
-    // Open more connections than the pool can hold, all at once.
-    //
-    // Two workers plus a two-deep queue holds four; the rest are refused with a
-    // 503 straight away and cost nothing. Opening eight in a tight loop makes
-    // saturation independent of how many slots the readiness request from
-    // `spawn_server` still happens to occupy, which is what a fixed four got
-    // wrong: whichever connection arrives fifth takes the 503, and when that
-    // was a hog rather than the probe, only three were left holding.
-    //
-    // Adding them one per attempt does not work either, and the reason is worth
-    // keeping: a silent peer is released after the deadline, so with a slow
-    // probe between attempts the hogs die as fast as they are added and the
-    // pool never accumulates. All at once, then probe, is the only shape that
-    // races neither the deadline nor the queue.
-    let hogs: Vec<UnixStream> = (0..8)
+    let mut silent: Vec<UnixStream> = (0..64)
         .filter_map(|_| UnixStream::connect(&socket_path).ok())
         .collect();
     assert_eq!(
-        hogs.len(),
-        8,
-        "could not open the connections to fill the pool"
-    );
-
-    // A short per-probe timeout so a queued probe gives up and retries quickly
-    // rather than sitting out the whole hold.
-    let saturated = m6_core::testkit::wait::until(Duration::from_secs(3), || {
-        get_root(&socket_path, Duration::from_millis(300)).is_some_and(|r| r.contains("503"))
-    });
-    assert!(
-        saturated,
-        "eight silent peers never filled a two-worker, two-deep pool, so this \
-         test would not be measuring recovery from anything\n\
-         --- output ---\n{}",
+        silent.len(),
+        64,
+        "could not open the silent connections\n--- output ---\n{}",
         server.svc.output()
     );
 
-    // Recovery is not instant and is not meant to be. The two workers time out
-    // after a second and pick up the two queued connections, which time out a
-    // second after that. Until then a 503 is the honest answer, so it counts
-    // as "not yet" rather than as a result: what is asserted is that the pool
-    // comes back at all, not how fast.
-    let recovered = m6_core::testkit::wait::until(Duration::from_secs(30), || {
-        get_root(&socket_path, Duration::from_secs(5)).is_some_and(|r| r.contains("200 OK"))
+    // One request on a connection of its own, with the config's three second
+    // deadline still ahead of the 64 silent peers.
+    let started = Instant::now();
+    let response = get_root(&socket_path, Duration::from_secs(2)).unwrap_or_else(|| {
+        panic!(
+            "a real request was not answered within 2 s while 64 silent connections were open\n\
+             --- output ---\n{}",
+            server.svc.output()
+        )
     });
     assert!(
-        recovered,
-        "the pool never recovered while four silent peers held it\n\
-         --- output ---\n{}",
-        server.svc.output()
+        response.contains("200 OK"),
+        "the answer was not a served page: {}",
+        &response[..response.len().min(200)]
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the answer took {:?}, beyond the 2 s deadline",
+        started.elapsed()
     );
 
-    drop(hogs);
-    server.svc.assert_alive("after the pool recovered");
+    // All 64 are still open, and none has been sent anything. A response here
+    // would be the old pool's 503; a close would mean the loop served them to
+    // completion rather than holding them. Nothing can be waiting to read from
+    // a peer that never sent a request, so a one-byte non-blocking read asks
+    // the question without waiting.
+    for (i, stream) in silent.iter_mut().enumerate() {
+        stream
+            .set_nonblocking(true)
+            .expect("set the silent connection non-blocking");
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("silent connection {i} failed: {e}"),
+            Ok(0) => panic!("silent connection {i} was closed by the server"),
+            Ok(n) => panic!(
+                "silent connection {i} was sent {:?}",
+                String::from_utf8_lossy(&byte[..n])
+            ),
+        }
+    }
+
+    server
+        .svc
+        .assert_alive("after answering beside 64 silent connections");
 }

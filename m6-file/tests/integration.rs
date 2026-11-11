@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
 
@@ -425,6 +425,119 @@ fn l5_concurrent_requests() {
     for handle in handles {
         handle.join().unwrap();
     }
+}
+
+/// A streamed body never stops the loop for another client.
+///
+/// The handler serves a 4 MiB identity file as a stream, so the loop writes it
+/// one chunk per writable turn. This client takes a 64 KiB receive buffer and
+/// reads nothing until a second request on another connection has been
+/// answered, which a blocking `write_all` of the body could never allow: the
+/// writer would fill 64 KiB and stop the process there.
+#[test]
+fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    // Not a text type: identity coding and no minification, so the body is the
+    // file on disk and the handler streams it.
+    let body: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &body).unwrap();
+    std::fs::write(site.join("assets").join("a.txt"), b"asset").unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("stream.sock");
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site)
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "m6-file never accepted a connection"
+    );
+
+    // The slow reader: a 64 KiB receive buffer, a request sent, nothing read.
+    let mut slow = UnixStream::connect(&socket_path).expect("connect the slow reader");
+    socket2::SockRef::from(&slow)
+        .set_recv_buffer_size(64 * 1024)
+        .expect("a 64 KiB receive buffer");
+    slow.write_all(
+        b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+    )
+    .expect("send the slow reader's request");
+
+    // Wait until its response has started arriving, which is the signal that
+    // the server accepted it and is writing. `peek` reads nothing.
+    slow.set_nonblocking(true)
+        .expect("non-blocking slow reader");
+    let writing = wait::until(Duration::from_secs(10), || {
+        let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        matches!(socket2::SockRef::from(&slow).peek(&mut byte), Ok(n) if n > 0)
+    });
+    assert!(
+        writing,
+        "the 4 MiB response never started arriving\n--- output ---\n{}",
+        svc.output()
+    );
+
+    // A second connection must be answered while the first one's body is still
+    // held by this client, which is the whole test.
+    let started = Instant::now();
+    let mut probe = UnixStream::connect(&socket_path).expect("connect the probe");
+    probe
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("probe timeout");
+    probe
+        .write_all(
+            b"GET /assets/a.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+        )
+        .expect("send the probe's request");
+    let response = m6_core::testkit::read_one(&mut probe, "GET").unwrap_or_else(|e| {
+        panic!(
+            "a second request was not answered while a 4 MiB body waited for its reader: \
+             {e}\n--- output ---\n{}",
+            svc.output()
+        )
+    });
+    let (status, _, _) = split_response(&response);
+    assert!(status.contains("200"), "the probe was not served: {status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the probe took {:?}, beyond the 2 s deadline",
+        started.elapsed()
+    );
+
+    // Now read the whole streamed body and check it arrived intact.
+    slow.set_nonblocking(false).expect("blocking slow reader");
+    slow.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("slow reader timeout");
+    let raw = m6_core::testkit::read_one(&mut slow, "GET").expect("the 4 MiB response");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("the response has a header/body split");
+    let (status, headers, body_len) = split_response(&raw);
+    assert!(
+        status.contains("200"),
+        "the slow reader was not served: {status}"
+    );
+    assert!(
+        headers.contains(&format!("content-length: {}", body.len())),
+        "the response must promise the file's length, got {headers:?}"
+    );
+    assert_eq!(body_len, body.len(), "the streamed body was short");
+    assert!(
+        raw[split + 4..] == body[..],
+        "the streamed body did not match the file"
+    );
+
+    svc.assert_alive("after streaming a 4 MiB body to a slow reader");
 }
 
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────

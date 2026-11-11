@@ -1,6 +1,261 @@
-use m6_core::prelude::*;
+//! The page service: one process, one thread and one event loop.
+//!
+//! The loop accepts on the listener's readability, reads and answers each
+//! connection until its socket would block, and waits for the next readiness
+//! event. Each connection slot keeps its own buffers, made at start, so
+//! serving a request allocates only where the page path does.
+//!
+//! Routes come from config. m6-html passes no code routes and no handler
+//! names, so every route it serves is a template.
 
-fn main() -> anyhow::Result<()> {
-    App::new().run()?;
+use std::io;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::h1::{head_slots, Flush, Read, ServerConn};
+use m6_core::mio::unix::SourceFd;
+use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::net::listen_unix;
+use m6_core::signal::{Action, Lifecycle};
+use m6_core::{Handled, Site, TeraFactory};
+
+const LISTENER: Token = Token(usize::MAX);
+const SIGNALS: Token = Token(usize::MAX - 1);
+/// The accounting tick, and the longest the loop waits when nothing happens.
+const TICK: Duration = Duration::from_secs(1);
+const EVENTS: usize = 256;
+/// Slots and buffers made at start, before any connection exists.
+const INITIAL_CONNECTIONS: usize = 1024;
+const READ_CAP: usize = 16 * 1024;
+const WRITE_CAP: usize = 64 * 1024;
+
+fn main() -> Result<()> {
+    // Block the signals before anything else: the mask is inherited only by
+    // threads created after this point, and logging starts one.
+    m6_core::signal::block();
+
+    // ── start: blocking and allocation are fine ──────────────────────────
+    let site = Site::load("m6-html", &[], &[], &TeraFactory);
+    let read_timeout = site.read_timeout();
+    let ceiling =
+        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
+    let mut listener = listen_unix(site.socket_path(), site.socket_mode())
+        .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
+    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
+    poll.registry()
+        .register(&mut listener, LISTENER, Interest::READABLE)
+        .unwrap_or_else(|e| fail("registering the listener", e));
+    poll.registry()
+        .register(
+            &mut SourceFd(&signals.raw_fd()),
+            SIGNALS,
+            Interest::READABLE,
+        )
+        .unwrap_or_else(|e| fail("registering the signal descriptor", e));
+
+    let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
+    lifecycle.started();
+
+    // The whole connection table, every buffer in it, the deadlines and the
+    // events: made here, never grown except by `Slots`.
+    let mut conns = Slots::new(INITIAL_CONNECTIONS, ceiling, || {
+        ServerConn::new(READ_CAP, WRITE_CAP)
+    });
+    // The deadline is only read when a connection is touched, and a config
+    // without `read_timeout_s` touches none.
+    let mut deadlines = Timeouts::new(INITIAL_CONNECTIONS, read_timeout.unwrap_or(Duration::ZERO));
+    let mut events = Events::with_capacity(EVENTS);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut accepting = true;
+    let mut last = Instant::now();
+    let mut last_report = last;
+
+    // ── run: nothing blocks ──────────────────────────────────────────────
+    'run: loop {
+        // An interrupted wait is not an error: wait again. mio passes EINTR
+        // up rather than retrying.
+        match poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+        let now = Instant::now();
+        trace.waited(now - last);
+        // One sample per iteration, under the kind of its first event, as
+        // m6-http reports the trace.
+        let trigger = match events.iter().next().map(|ev| ev.token()) {
+            Some(LISTENER) => 0,
+            Some(SIGNALS) => 2,
+            Some(_) => 1,
+            None => 3,
+        };
+
+        for ev in &events {
+            match ev.token() {
+                // New connections: take a free slot for each, register it,
+                // start its read deadline.
+                LISTENER => {
+                    while let Some(taken) = conns.take() {
+                        if let Some(new_len) = taken.grew_to {
+                            deadlines.grow(new_len);
+                        }
+                        let mut stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // No connection was pending after all: give
+                                // the slot back rather than leaking it.
+                                conns.free(taken.key);
+                                break;
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
+                        poll.registry().register(
+                            &mut stream,
+                            Token(taken.key),
+                            Interest::READABLE,
+                        )?;
+                        if read_timeout.is_some() {
+                            deadlines.touch(Token(taken.key), now);
+                        }
+                        conns.get_mut(taken.key).attach(stream);
+                    }
+                    if conns.is_full() {
+                        // At the ceiling: stop accepting. New clients wait in
+                        // the kernel's backlog.
+                        poll.registry().deregister(&mut listener)?;
+                        accepting = false;
+                    }
+                }
+                SIGNALS => {
+                    let mut stop = false;
+                    while let Some(signal) = signals.read() {
+                        if lifecycle.on_signal(signal) == Action::Stop {
+                            stop = true;
+                        }
+                    }
+                    if stop {
+                        break 'run;
+                    }
+                }
+                // One connection's turn, then wait for what it still needs,
+                // touch its deadline, or close it.
+                Token(k) => {
+                    let conn = conns.get_mut(k);
+                    let was = conn.interest();
+                    match turn(conn, &site) {
+                        Ok(true) => {
+                            // Re-register only when the turn changed what the
+                            // connection waits for: a kept-alive request that
+                            // read and wrote everything leaves READABLE alone.
+                            if conn.interest() != was {
+                                let interest = conn.interest();
+                                let stream = conn
+                                    .stream()
+                                    .expect("every registered token has an attached connection");
+                                poll.registry().reregister(stream, Token(k), interest)?;
+                            }
+                            if read_timeout.is_some() {
+                                deadlines.touch(Token(k), now);
+                            }
+                        }
+                        _ => close(&poll, &mut conns, &mut deadlines, k)?,
+                    }
+                }
+            }
+        }
+
+        // Close every connection whose read deadline passed, with no
+        // response: it did not send a request in time.
+        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+            close(&poll, &mut conns, &mut deadlines, k)?;
+        }
+        // A slot came free while the table was full: accept again.
+        if !accepting && !conns.is_full() {
+            poll.registry()
+                .register(&mut listener, LISTENER, Interest::READABLE)?;
+            accepting = true;
+        }
+
+        // The accounting tick: report and clear the loop's wait and work per
+        // trigger. These services serve no metrics page, so the report is the
+        // tick's own accounting rather than a served number.
+        let end = Instant::now();
+        trace.worked(trigger, end - now);
+        last = end;
+        if end - last_report >= TICK {
+            let _ = trace.report();
+            last_report = end;
+        }
+    }
+
+    // ── stop: blocking and allocation are fine ───────────────────────────
+    // Connections still open are dropped: a SIGTERM does not wait for a
+    // request in flight. `complete` removes the socket and logs the line.
+    lifecycle.complete();
     Ok(())
+}
+
+/// One connection's turn: read, answer and write until the socket would
+/// block. Returns whether the connection stays open.
+fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
+    loop {
+        // Made where it is used: the head borrows the slots, and a mutable
+        // reference to a long-lived array cannot be reborrowed per turn.
+        let mut heads = head_slots();
+        let read = conn.read(&mut heads)?;
+        // The head borrows the slot, so its answer is built here and written
+        // after the match, when the borrow has ended.
+        let (response, idle) = match read {
+            Read::Request(head) => {
+                let response = match site.handle(&head) {
+                    Handled::Done(response) => response,
+                    Handled::Code(..) | Handled::Named(..) => unreachable!(
+                        "m6-html passes no code routes and no handler names, so every route \
+                         is answered by its template"
+                    ),
+                };
+                (Some(response), false)
+            }
+            // Nothing complete yet; a refusal may have been queued for a
+            // malformed request, and is written below.
+            Read::More => (None, true),
+            Read::Closed => return Ok(false),
+        };
+        if let Some(response) = response {
+            conn.respond_response(response);
+        }
+        match conn.flush()? {
+            // The answer is out and the connection keeps alive. A pipelined
+            // request may already be buffered, so read again before waiting.
+            Flush::Done if !idle => {}
+            // Nothing more to read this turn, or the socket would block with
+            // output still queued: the caller re-registers for what is left.
+            Flush::Done | Flush::More => return Ok(true),
+            // Everything is written and this connection closes.
+            Flush::Close => return Ok(false),
+        }
+    }
+}
+
+/// Deregister, forget the deadline, close the socket and free the slot.
+fn close(
+    poll: &Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    k: usize,
+) -> io::Result<()> {
+    deadlines.clear(Token(k));
+    if let Some(mut stream) = conns.get_mut(k).detach() {
+        poll.registry().deregister(&mut stream)?;
+        conns.free(k);
+    } // `stream` drops here, which closes the socket
+    Ok(())
+}
+
+/// A failure at start is an error: print it and exit 2.
+fn fail(what: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!("m6-html: {what}: {error}");
+    std::process::exit(2)
 }
