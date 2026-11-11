@@ -196,7 +196,7 @@ fn wake(socket: Option<&Path>, wake_fd: Option<RawFd>) {
         // the shutdown flag on wake and exits without reading it.
         #[expect(
             clippy::disallowed_methods,
-            reason = "m6-md only: removed by EL-12 (m6-md)"
+            reason = "the shutdown handle's test only: removed by EL-12"
         )]
         let _ = std::os::unix::net::UnixStream::connect(path);
     }
@@ -328,7 +328,7 @@ impl ShutdownHandle {
         let thread_name = Arc::clone(&name);
         #[expect(
             clippy::disallowed_methods,
-            reason = "m6-md only: removed by EL-12 (m6-md)"
+            reason = "the shutdown handle's test only: removed by EL-12"
         )]
         std::thread::Builder::new()
             .name("m6-signal".into())
@@ -389,10 +389,10 @@ impl ShutdownHandle {
 
     /// `"<name> started"`, with the socket when there is one.
     ///
-    /// Emitted by `Lifecycle::started`, and by `install` for the one service
-    /// that still takes a shutdown handle. Services log their own domain fields
-    /// (route counts, bind address); the lifecycle line is core's, so it reads
-    /// the same for every unit.
+    /// Emitted by `Lifecycle::started`. The shutdown handle calls it through
+    /// `install`, which only its test uses now. Services log their own domain
+    /// fields (route counts, bind address); the lifecycle line is core's, so
+    /// it reads the same for every unit.
     fn log_started(&self) {
         log_started_line(&self.name, self.socket.as_deref().map(|p| p.as_path()));
     }
@@ -423,7 +423,7 @@ impl ShutdownHandle {
         while !self.is_shutdown() {
             #[expect(
                 clippy::disallowed_methods,
-                reason = "m6-md only: removed by EL-12 (m6-md)"
+                reason = "the shutdown handle's test only: removed by EL-12"
             )]
             std::thread::sleep(Duration::from_millis(sleep_ms));
             sleep_ms = (sleep_ms * 2).min(100);

@@ -110,13 +110,16 @@ pub use site::{CodeRoute, Handled, Site};
 ///     poll.registry()
 ///         .register(&mut listener, LISTENER, Interest::READABLE)?;
 ///     let mut conns = Slots::new(1024, 1024, || ServerConn::new(16 * 1024, 64 * 1024));
-///     let mut deadlines = Timeouts::new(1024, Duration::from_secs(30));
+///     // `read_timeout_s = 0` means no deadline, which is the zero duration.
+///     let read_timeout = site.read_timeout();
+///     let mut deadlines = Timeouts::new(1024, read_timeout.unwrap_or(Duration::ZERO));
 ///     let mut events = Events::with_capacity(256);
 ///
 ///     // Run: `docs/m6-app-anatomy.md` section 2 owns the loop. It waits with
 ///     // `deadlines.timeout`, matches on the event token, accepts until the
 ///     // listener would block, and runs one connection turn per token.
-///     run_loop(&mut poll, &mut listener, &mut conns, &mut deadlines, &mut events, &site)
+/// #     run_loop(&mut poll, &mut listener, &mut conns, &mut deadlines, &mut events, &site)?;
+/// #     Ok(())
 /// }
 /// # fn run_loop(
 /// #     _poll: &mut Poll,

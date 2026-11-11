@@ -28,7 +28,7 @@ testkit = ["dep:rustls-pki-types"]
 # `multipart` gates the multipart body parser and the streaming types it needs.
 multipart = ["dep:multer", "dep:bytes", "dep:futures-util", "dep:futures-executor"]
 
-# Tera templating, with comrak for Markdown. Without it `App` uses
+# Tera templating, with comrak for Markdown. Without it a service passes
 # `NoTemplates`, and a route that names a template is a configuration error.
 templates = ["dep:tera", "dep:comrak"]
 
