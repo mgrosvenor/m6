@@ -131,8 +131,8 @@ fn main() -> Result<()> {
 /// A completed fleet poll and the three answers built from it.
 ///
 /// The loop owns it: the poll writes it by plain assignment when it finishes
-/// and every request reads it through a shared borrow. No `Arc`, no `RwLock`,
-/// no second owner.
+/// and every request reads it through a shared borrow. One owner, no lock and
+/// no shared handle.
 struct Snapshot {
     digest: digest::Digest,
     readings: Vec<poll::NodeReading>,
