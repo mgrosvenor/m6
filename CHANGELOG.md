@@ -54,6 +54,8 @@ No existing field changes, so no migration is needed.
 Before upgrading, run `m6-http <site> <system config> --dump-config` on every node and fix what it names: add `[node] name = "<node>"` to each system config, and move every node key out of `site.toml`.
 Every m6 service refuses an unknown log level (in `site.toml`, its own config or `--log-level`), a `site.toml` that is missing or is not valid TOML (the default path included), an unknown key in one of m6-core's own tables (`[thread_pool]`, `[params_cache]`, `[server]`, `[log]`, `[compression]`), and a socket whose mode it cannot set.
 
+**A backend host name that does not resolve when m6-http starts now stops it with exit 2.** Host names in `url` and HTTP/2 backends are resolved once at start, so a backend whose address changes needs m6-http restarted.
+
 ### Added
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
@@ -96,6 +98,10 @@ A probe compiles and runs a trivial program with the same flags before the suite
 The default is 100, as before, and 0 is a config error.
 The key is read at start, so a change needs a restart.
 A client that makes more requests than this on one connection reconnects, with a new TLS handshake.
+
+**m6_core::client::Upstream, a non-blocking HTTP/1.1 client for an event loop.** It connects to a unix socket or a TCP address, optionally over TLS, writes one request and parses the response as bytes arrive, and can carry the next request on the same connection. Its buffers are allocated once, so a request over a unix socket or plain TCP allocates nothing. m6-http's unix-socket backends use it.
+
+**m6_core::dns, a DNS question on its own non-blocking UDP socket.** dns::Query asks one PTR, or one A and AAAA pair, of the first nameserver in /etc/resolv.conf, and dns::Confirm makes the reverse-then-forward check a crawler claim needs, each driven by the caller's event loop. Messages are built and parsed by hickory-proto. Nothing else in m6 resolves names while serving: host names are resolved once at start.
 
 ### Security
 
@@ -151,6 +157,8 @@ Verified by this pull request's own CI run.
 
 **The signal-mask guard fails closed (#178).**
 When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
+
+**URL backends and HTTP/2 upstreams no longer block or wait on a timer.** An http:// or https:// backend ran each request on its own thread with a new TCP and TLS connection, and its reply was noticed on a 10 ms poll. An h2c or h2s upstream connected, and for h2s completed its TLS handshake, inside the event loop, so an unreachable upstream stalled every request on the node. All of them now connect, write and read in the loop, http(s) connections are reused, and backend_timeout_secs applies to HTTP/2 upstream streams too. An idle m6-http wakes about once a second instead of 100 times.
 
 ### Docs
 

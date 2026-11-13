@@ -1350,13 +1350,6 @@ fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
     let result = {
         let entry = cx.state.upstreams.get_mut(slot);
         let upstream = &mut entry.upstream;
-        let interest = upstream.interest();
-        if interest != entry.registered_interest {
-            cx.registry
-                .reregister(&mut SourceFd(&upstream.fd()), token, interest)
-                .ok();
-            entry.registered_interest = interest;
-        }
         match upstream.drive() {
             Ok(true) => {
                 let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
@@ -1375,7 +1368,22 @@ fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
                     }
                 }
             }
-            Ok(false) => None,
+            Ok(false) => {
+                // The request is not finished, and `drive` moved the phase on:
+                // Connecting waits for WRITABLE, then the request or the
+                // ClientHello is written and it waits for READABLE. The new
+                // interest is registered after the drive, because under epoll
+                // edge-triggering a mask written before it waits for an edge
+                // that may never arrive. Only a change costs a reregister.
+                let interest = upstream.interest();
+                if interest != entry.registered_interest {
+                    cx.registry
+                        .reregister(&mut SourceFd(&upstream.fd()), token, interest)
+                        .ok();
+                    entry.registered_interest = interest;
+                }
+                None
+            }
             Err(e) => {
                 cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
                 Some(Err(e))
