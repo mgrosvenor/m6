@@ -105,8 +105,8 @@ impl Request {
 
     /// Attach route settings directly, without a `CompiledRoute`.
     ///
-    /// For a handler's own tests, which have a route's config but no framework
-    /// state to compile it from.
+    /// For a handler's own tests, which have a route's config but no compiled
+    /// route to read it from.
     pub fn with_route_settings(mut self, settings: std::sync::Arc<Map<String, Value>>) -> Self {
         self.route_settings = Some(settings);
         self
@@ -134,7 +134,7 @@ impl Request {
     /// never route, and because both fields are cheap clones: the pattern is
     /// a short string already cloned with the route, and the settings are an
     /// `Arc`.
-    pub fn with_route(mut self, route: &crate::app::CompiledRoute) -> Self {
+    pub fn with_route(mut self, route: &crate::site::CompiledRoute) -> Self {
         self.route_pattern = Some(route.pattern.clone());
         self.route_settings = Some(std::sync::Arc::clone(&route.settings));
         self
@@ -142,9 +142,9 @@ impl Request {
 
     /// The raw request, borrowed.
     ///
-    /// For a handler that was written against `RawRequest` before its service
-    /// became an `App` service, and for anything that needs the request as the
-    /// wire delivered it rather than through the accessors above.
+    /// For a handler written against `RawRequest`, and for anything that needs
+    /// the request as the wire delivered it rather than through the accessors
+    /// above.
     pub fn raw(&self) -> &RawRequest {
         &self.raw
     }
@@ -171,9 +171,9 @@ impl Request {
     /// A key from the matched route's `[[route]]` table that core does not
     /// define.
     ///
-    /// This is how a handler registered with `App::handler` reads its own
-    /// per-route configuration. Core does not know what `root` means; the
-    /// handler does, and the route says it:
+    /// This is how a service's handler reads its own per-route
+    /// configuration. Core does not know what `root` means; the handler does,
+    /// and the route says it:
     ///
     /// ```toml
     /// [[route]]
@@ -680,9 +680,9 @@ pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
 /// answering 400 confirms that the attempt was recognised as traversal, which
 /// tells the sender their payload reached the router and is worth varying. A
 /// 404 tells them nothing they did not already know, and is the behaviour
-/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before it
-/// became an `App` service. A value that is merely malformed -- a space, a
-/// control byte -- discloses nothing by being named as malformed.
+/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before the
+/// route matcher moved into core. A value that is merely malformed -- a space,
+/// a control byte -- discloses nothing by being named as malformed.
 ///
 /// m6-file used to answer both, inconsistently: 404 for traversal in a
 /// catch-all and 400 for the same `..` in an ordinary parameter, because the

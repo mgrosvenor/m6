@@ -34,6 +34,18 @@ pub const MAX_INFORMATIONAL: usize = 8;
 /// nothing.
 pub const MAX_HEADERS: usize = 64;
 
+/// The slots [`Upstream::reply`] parses a response head into.
+///
+/// The caller owns them, as httparse intends: the storage sits outside the
+/// parse, the parse borrows it, and no reference to the parser outlives the
+/// call. [`reply_slots`] makes a set without writing anything.
+pub type ReplySlots<'a> = [std::mem::MaybeUninit<httparse::Header<'a>>; MAX_HEADERS];
+
+/// A new set of empty slots.
+pub fn reply_slots<'a>() -> ReplySlots<'a> {
+    [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS]
+}
+
 /// Ceiling on a response head (status line and headers). Matches the blocking
 /// reader's stack buffer, so the two never disagree about what fits.
 const MAX_HEAD: usize = 8192;
@@ -50,6 +62,49 @@ pub enum Addr {
 pub struct TlsClient {
     pub config: Arc<rustls::ClientConfig>,
     pub name: rustls::pki_types::ServerName<'static>,
+}
+
+/// The host's certificate store, for a client that makes TLS connections.
+///
+/// Start only: it reads the platform store, which blocks. A service that
+/// trusts the host's store trusts what its operator's tools trust, and a
+/// renewal there reaches the service at its next restart, as every other
+/// start-time read does. The alternative, a bundled store, is a second answer
+/// to which certificates are trusted and it goes stale inside the binary.
+///
+/// A store that yields no certificate is an error, never an empty trust set: a
+/// client that trusts nothing fails every handshake with an error that blames
+/// the peer. So is a store whose every certificate fails to parse. There is no
+/// third branch and no verifier that accepts anything.
+pub fn system_roots() -> io::Result<rustls::RootCertStore> {
+    roots_from(rustls_native_certs::load_native_certs().certs)
+}
+
+/// The trust store built from the certificates a platform store returned.
+///
+/// Split from [`system_roots`] so the two fail-closed branches have a test:
+/// a store with no certificate, and a store with none that parses.
+fn roots_from(
+    certs: impl IntoIterator<Item = rustls::pki_types::CertificateDer<'static>>,
+) -> io::Result<rustls::RootCertStore> {
+    let certs: Vec<_> = certs.into_iter().collect();
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the platform certificate store loaded no certificate",
+        ));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the platform certificate store loaded {ignored} certificate(s) and none could be parsed"
+            ),
+        ));
+    }
+    Ok(roots)
 }
 
 /// A parsed response head and body, borrowing the slot and the caller's header
@@ -800,10 +855,7 @@ impl Upstream {
     ///
     /// `slots` is an uninitialised array of [`MAX_HEADERS`] entries, so building
     /// it costs nothing: httparse writes only the entries it fills.
-    pub fn reply<'a>(
-        &'a self,
-        slots: &'a mut [std::mem::MaybeUninit<httparse::Header<'a>>],
-    ) -> Option<Reply<'a>> {
+    pub fn reply<'a>(&'a self, slots: &'a mut ReplySlots<'a>) -> Option<Reply<'a>> {
         self.framing?;
         let head = &self.read_buf[self.head_start..self.head_end + 4];
         let mut resp = httparse::Response::new(&mut []);
@@ -2123,5 +2175,42 @@ mod socket_tests {
         let reply = up.reply(&mut slots).expect("reply");
         assert_eq!((reply.status, reply.body), (200, &b"ok"[..]));
         peer.join().expect("peer");
+    }
+
+    // ── The host's trust store ────────────────────────────────────────────
+
+    /// An empty store is an error, never an empty trust set: a client with no
+    /// roots fails every handshake and blames the peer.
+    #[test]
+    fn a_trust_store_with_no_certificate_is_an_error() {
+        let e = roots_from(Vec::new()).expect_err("no certificate must be an error");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string().contains("certificate store"),
+            "the error must name the store: {e}"
+        );
+    }
+
+    /// A store whose certificates all fail to parse is an error too, never a
+    /// store that quietly trusts nothing and never a permissive verifier.
+    #[test]
+    fn a_trust_store_whose_certificates_do_not_parse_is_an_error() {
+        let junk = rustls::pki_types::CertificateDer::from(vec![0u8; 4]);
+        let e = roots_from([junk]).expect_err("an unparsable certificate must be an error");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            e.to_string().contains("none could be parsed"),
+            "the error must say nothing parsed: {e}"
+        );
+    }
+
+    /// A parses, so the success path is the third case and the two above are
+    /// the only failures.
+    #[test]
+    fn a_parsable_certificate_becomes_a_root() {
+        let ck = rcgen::generate_simple_self_signed(vec!["example.com".to_string()]).expect("cert");
+        let root = ck.cert.der().clone();
+        let roots = roots_from([root]).expect("one parsable certificate");
+        assert_eq!(roots.len(), 1);
     }
 }

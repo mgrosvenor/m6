@@ -73,7 +73,7 @@ Take from it that every flag is optional and the two positional arguments are re
 
 **Table 2: the two positional arguments and the three flags.**
 
-For this binary the dump covers the site directory, the config paths, the socket, the thread pool, the server settings and any routes declared in the config.
+For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
 It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the four routes the service registers.
 It exits 0 before the service validates those sections.
 
@@ -379,7 +379,7 @@ The edge check is local, so the header it sets carries the result to a backend, 
 
 A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
 The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
-The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.1.
+The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.6.
 
 Token verification, the edge check and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.

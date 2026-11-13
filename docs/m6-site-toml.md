@@ -259,7 +259,7 @@ password = "mail-password"
 
 The rule is that `site.toml` holds the state every node shares, and the process config holds the state of one node.
 Table 1 maps each key to its file and names the reason.
-Take from it that App `[log]` is the one key with two homes, and every other key has one.
+Take from it that the service `[log]` is the one key with two homes, and every other key has one.
 
 | Setting | File it belongs in | Reason |
 |---|---|---|
@@ -273,9 +273,9 @@ Take from it that App `[log]` is the one key with two homes, and every other key
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
-| App `[thread_pool]`, `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | App config | The app's own state |
-| App `[log]` | Both | `site.toml` sets the site default and the app config overrides it |
-| App `site_toml` | App config | Names where `site.toml` is |
+| Service `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | Service config | The service's own state |
+| Service `[log]` | Both | `site.toml` sets the site default and the service config overrides it |
+| Service `site_toml` | Service config | Names where `site.toml` is |
 | Mail credentials | `secrets_file` | Secret, held outside the repo |
 
 **Table 1: which file owns each key.**

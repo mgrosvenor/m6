@@ -396,34 +396,35 @@ m6-auth = { path = "../../../m6/m6-auth" }
 `m6` is not published to a registry, so a path dependency needs a checkout in that position, and a git dependency pinned to a revision is the alternative.
 Section 9 of `m6-app-anatomy.md` gives both forms and what each one costs.
 
-A per-thread initialiser receives the configuration map and opens one `Db` per worker.
+A service opens one `Db` at start, keeps it in `main`, and passes it to the request arms.
 
 ```rust
 use m6_auth::{AuthError, Db};
 use m6_core::prelude::*;
 use std::path::Path;
 
-struct Worker {
+struct State {
     db: Db,
 }
 
-fn open_worker(config: &Map<String, Value>, _global: &()) -> Result<Worker> {
-    let path = config
+fn open_state(site: &Site) -> anyhow::Result<State> {
+    let path = site
+        .user_config()
         .get("auth_db")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::BadRequest("missing auth_db".to_string()))?;
-    let db = Db::open(Path::new(path)).map_err(|e| Error::Other(e.into()))?;
-    Ok(Worker { db })
+        .ok_or_else(|| anyhow::anyhow!("the config has no auth_db"))?;
+    let db = Db::open(Path::new(path))?;
+    Ok(State { db })
 }
 
-fn show_form(req: &Request, _global: &(), _worker: &mut Worker) -> Result<Response> {
+fn show_form(req: &Request) -> Result<Response> {
     Response::render("templates/signup.html", req)
 }
 
-fn signup(req: &Request, _global: &(), worker: &mut Worker) -> Result<Response> {
+fn signup(req: &Request, state: &mut State) -> Result<Response> {
     let username = req.field("username")?;
     let password = req.field("password")?;
-    match worker.db.user_create(&username, &password, &["user"]) {
+    match state.db.user_create(&username, &password, &["user"]) {
         Ok(_) => Ok(Response::redirect("/login?registered=1")),
         Err(AuthError::UserExists(_)) => Response::render_with(
             "templates/signup.html",
@@ -434,19 +435,33 @@ fn signup(req: &Request, _global: &(), worker: &mut Worker) -> Result<Response> 
     }
 }
 
-fn main() -> Result<()> {
-    App::with_thread_state(open_worker)
-        .on_destroy_thread(|worker| {
-            let _ = worker.db.close();
-        })
-        .route_get("/signup", show_form)
-        .route_post("/signup", signup)
-        .run()
+fn main() -> anyhow::Result<()> {
+    let site = Site::load(
+        "render-signup",
+        &[
+            CodeRoute { pattern: "/signup", method: RouteMethod::Get },
+            CodeRoute { pattern: "/signup", method: RouteMethod::Post },
+        ],
+        &[],
+        &TeraFactory,
+    );
+    let mut state = match open_state(&site) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("render-signup: {e}");
+            std::process::exit(2);
+        }
+    };
+    // The loop from `m6-app-anatomy.md` section 2 follows here, with the arms
+    // `Handled::Code(0, req) => show_form(&req)` and
+    // `Handled::Code(1, req) => signup(&req, &mut state)`.
+    let _ = state;
+    Ok(())
 }
 ```
 
-`auth_db` comes from the renderer's configuration map, so the database path stays out of the tracked configuration.
-Core merges the file named by `secrets_file` into that map, and the key is read with `config.get("auth_db")`.
+`auth_db` comes from the service's configuration map, so the database path stays out of the tracked configuration.
+Core merges the file named by `secrets_file` into that map, and the key is read with `site.user_config().get("auth_db")`.
 
 ```toml
 # render-signup.toml
@@ -456,9 +471,9 @@ secrets_file = "/etc/m6/render-signup.secrets.toml"
 auth_db = "/srv/example.com/data/auth.db"
 ```
 
-The key is absolute because a per-thread initialiser receives no site directory to resolve a relative path against.
-`m6-auth-server` and `m6-auth-cli` take only an absolute `[storage] path`, so the renderer names the same file, and `m6_core::config::secret_path("auth_db", ...)` gives it the same check.
-`m6-app-anatomy.md` section 5.3 gives the two state tiers and what each initialiser receives.
+The key is absolute because `m6-auth-server`'s `[storage] path` is absolute, so the renderer names the same file.
+`m6_core::config::secret_path("auth_db", value)` gives it the same check.
+`m6-app-anatomy.md` section 5.3 gives where state lives and why a plain value in `main` needs no lock.
 
 `m6-auth-server` opens one `Db` at start and keeps it for the life of the process, and a database that cannot be opened stops it with exit 2.
 
@@ -467,7 +482,7 @@ The processes above share one file, and section 9 gives the rules that keep that
 ## 9. Concurrent access
 
 **One database file serves every process that links this crate, and `Db::open` sets the pragmas that make that safe.**
-Table 2 gives the pragmas, and section 8 gives how a worker holds its handle.
+Table 2 gives the pragmas, and section 8 gives where the service holds its one handle.
 
 A process's lock does not hold every request in `m6-auth-server`: its loop retries the locked statement and answers 503 after a second.
 `m6-auth.md` section 9 gives the retry.
@@ -492,7 +507,7 @@ Take from it that the server and the CLI have their own references, and the life
 |---|---|
 | `m6-auth.md` | the auth service: configuration, HTTP endpoints, rate limiting and the token lifetimes |
 | `m6-auth-cli.md` | the command line that uses these operations |
-| `m6-app-anatomy.md` | the app lifecycle, the state tiers and how a renderer links core from another repository |
+| `m6-app-anatomy.md` | the service lifecycle, where state lives and how a renderer links core from another repository |
 | `../README.md` | where this document sits in the documentation table |
 
 **Table 10: further reading, and what each document owns.**

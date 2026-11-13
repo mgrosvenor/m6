@@ -33,7 +33,7 @@ pub struct RouteConfig {
     pub methods: Option<Vec<String>>,
     /// Extra response headers as `[[key, value]]` pairs.
     pub headers: Vec<(String, String)>,
-    /// Name of a handler registered in code with `App::handler`.
+    /// Name of a handler the service registers in code.
     ///
     /// A handler is code and cannot appear while the process runs; a *route*
     /// is config. Naming the binding in config puts the half that changes on
@@ -52,13 +52,6 @@ pub struct RouteConfig {
     pub settings: std::sync::Arc<Map<String, Value>>,
 }
 
-/// Thread-pool configuration parsed from `[thread_pool]`.
-#[derive(Debug, Clone, Default)]
-pub struct ThreadPoolConfig {
-    pub size: usize,
-    pub queue_size: usize,
-}
-
 /// LRU params-cache configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ParamsCacheConfig {
@@ -70,11 +63,9 @@ pub struct ParamsCacheConfig {
 pub struct ServerConfig {
     /// Read timeout applied to every accepted connection.
     ///
-    /// `None` means no timeout, which is what every `App` service did before
-    /// this key existed: a peer that connects and then says nothing holds a
-    /// pool worker until it disconnects, and a handful of such peers take the
-    /// whole pool. Configure `read_timeout_s = 0` to ask for that old
-    /// behaviour back deliberately.
+    /// `None` means no timeout: a peer that connects and then says nothing
+    /// holds its connection slot until it disconnects. Configure
+    /// `read_timeout_s = 0` to ask for that deliberately.
     pub read_timeout: Option<std::time::Duration>,
     /// Mode applied to the unix socket after bind, from `socket_mode`.
     ///
@@ -108,8 +99,6 @@ pub struct RendererConfig {
     pub global_params: Vec<String>,
     /// Route entries.
     pub routes: Vec<RouteConfig>,
-    /// Thread-pool settings.
-    pub thread_pool: ThreadPoolConfig,
     /// Params-cache settings.
     pub params_cache: ParamsCacheConfig,
     /// Connection-level settings.
@@ -390,7 +379,12 @@ fn check_keys(tv: &toml::Value, table: &str, known: &[&str]) -> anyhow::Result<(
 }
 
 fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererConfig> {
-    check_keys(&tv, "thread_pool", &["size", "queue_size"])?;
+    if tv.get("thread_pool").is_some() {
+        anyhow::bail!(
+            "[thread_pool] is removed: a service runs one event loop on one core; \
+             run more instances of the service to use more cores"
+        );
+    }
     check_keys(&tv, "params_cache", &["size"])?;
     check_keys(&tv, "server", &["read_timeout_s", "socket_mode"])?;
     check_keys(&tv, "log", &["level", "format"])?;
@@ -405,24 +399,6 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             }
         }
     }
-
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    // --- thread_pool ---
-    let tp_size = tv
-        .get("thread_pool")
-        .and_then(|t| t.get("size"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as usize)
-        .unwrap_or(cpus);
-    let tp_queue = tv
-        .get("thread_pool")
-        .and_then(|t| t.get("queue_size"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as usize)
-        .unwrap_or(tp_size * 8);
 
     // --- params_cache ---
     let pc_size = tv
@@ -550,10 +526,6 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         user_config,
         global_params,
         routes,
-        thread_pool: ThreadPoolConfig {
-            size: tp_size,
-            queue_size: tp_queue,
-        },
         params_cache: ParamsCacheConfig { size: pc_size },
         server: ServerConfig {
             read_timeout,
@@ -648,9 +620,9 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
         // on disk, a handler computes an answer. Letting a handler route
         // inherit `public` would put dynamic output in a shared cache by
         // omission, which is the shape of defect that is found by someone else
-        // seeing another user's page. Code routes registered with
-        // `App::route_get` already defaulted to `no-store` for this reason;
-        // this is the same rule reaching the config-declared form.
+        // seeing another user's page. A code route defaults to `no-store` for
+        // the same reason; this is that rule reaching the config-declared
+        // form.
         let cache = item
             .get("cache")
             .and_then(|v| v.as_str())
@@ -814,10 +786,6 @@ site_name = "Test"
 [[route]]
 path = "/"
 template = "templates/home.html"
-
-[thread_pool]
-size = 4
-queue_size = 32
 "#
         )
         .unwrap();
@@ -825,8 +793,6 @@ queue_size = 32
         let cfg = load(f.path(), Path::new("/tmp")).unwrap();
         assert_eq!(cfg.global_params, vec!["data/site.json"]);
         assert_eq!(cfg.routes.len(), 1);
-        assert_eq!(cfg.thread_pool.size, 4);
-        assert_eq!(cfg.thread_pool.queue_size, 32);
         assert_eq!(cfg.user_config.get("site_name").unwrap(), "Test");
     }
 
@@ -1027,10 +993,23 @@ queue_size = 32
     }
 
     #[test]
+    fn thread_pool_is_refused() {
+        let err = load_text("[thread_pool]\nsize = 4\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "[thread_pool] is removed: a service runs one event loop on one core; \
+                 run more instances of the service to use more cores"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_unknown_key_in_a_core_table_is_refused_and_named() {
         for (body, table, key) in [
             ("[server]\nread_timeout = 5\n", "server", "read_timeout"),
-            ("[thread_pool]\nsise = 2\n", "thread_pool", "sise"),
             ("[log]\nlevle = \"info\"\n", "log", "levle"),
             (
                 "[compression.\"text/html\"]\nbrottli = 5\n",

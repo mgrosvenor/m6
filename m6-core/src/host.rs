@@ -8,9 +8,9 @@
 //! the number is.
 //!
 //! Core wants these for itself too, not only to report them. The service loop
-//! already sheds load with a 503 when its queue is full; admission that is
-//! aware of load average, and a cache sized against the memory limit that
-//! actually applies, are runtime concerns rather than reporting ones.
+//! already stops accepting at its connection ceiling; admission that is aware
+//! of load average, and a cache sized against the memory limit that actually
+//! applies, are runtime concerns rather than reporting ones.
 //!
 //! # Why this is not three lines of `std::fs::read_to_string`
 //!

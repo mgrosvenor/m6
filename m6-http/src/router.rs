@@ -1,7 +1,7 @@
 /// Route table and request matching.
 use std::path::Path;
 
-use m6_core::app::{check_route_conflicts, Methods, RouteDecl};
+use m6_core::site::{check_route_conflicts, Methods, RouteDecl};
 use matchit::Router as MatchitRouter;
 
 use crate::config::Config;

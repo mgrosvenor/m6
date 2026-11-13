@@ -1,11 +1,12 @@
 //! One DNS question on its own non-blocking UDP socket, for checking a
 //! crawler's claim.
 //!
-//! [`Confirm`] is the reverse-then-forward check that [`crate::resolve`]'s
-//! worker thread makes: resolve the address to a name, then resolve the name
-//! forward and require the address among the results. The monitor's own loop
-//! (EL-9) will wait on descriptors with a deadline, so a lookup driven by that
-//! loop needs no thread. [`Query`] owns one UDP socket connected to one
+//! [`Confirm`] is the reverse-then-forward check: resolve the address to a
+//! name, then resolve the name forward and require the address among the
+//! results. It owns its sockets and never waits, so the caller's own loop
+//! registers [`Confirm::fd`], drives [`Confirm::drive`] when the descriptor is
+//! readable, and drops the confirmation at its deadline. `m6-monitor`'s fleet
+//! poll is that caller. [`Query`] owns one UDP socket connected to one
 //! nameserver. Nothing in this module waits.
 //!
 //! # Three outcomes, and they are not two
@@ -29,9 +30,9 @@
 //! There is no retry and no second nameserver: a question goes to the first
 //! `nameserver` in /etc/resolv.conf and its answer is the answer. The caller
 //! owns the deadline, and a query dropped at its deadline closes its socket,
-//! which is what a timed-out lookup gives the thread version today. A truncated
-//! reply is a failure: an A, AAAA or PTR answer for the names a monitor asks
-//! about fits in UDP, and a TCP fallback would be a second mechanism.
+//! which reads as [`Ptr::Failed`]. A truncated reply is a failure: an A, AAAA
+//! or PTR answer for the names a monitor asks about fits in UDP, and a TCP
+//! fallback would be a second mechanism.
 //!
 //! The messages are built and parsed by `hickory-proto`, which allocates. That
 //! is at most `MAX_LOOKUPS_PER_POLL` lookups per monitor poll, off the request
@@ -340,8 +341,7 @@ fn asks_about(message: &Message, name: &Name, record_type: RecordType) -> bool {
     questions.len() == 1 && questions[0].name() == name && questions[0].query_type() == record_type
 }
 
-/// The PTR-then-forward check that `resolve::confirm` makes today, driven by
-/// readiness.
+/// The PTR-then-forward check, driven by readiness.
 ///
 /// The PTR step runs first. When it answers a name, the query is replaced by
 /// the A and AAAA questions for that name, so [`Confirm::fd`] changes and the
@@ -470,8 +470,8 @@ impl Ptr {
 /// Letters, digits, `-`, `_` and `.`, at most 253 characters once the trailing
 /// dot a resolver may return is removed: the shape of a host name.
 ///
-/// `pub(crate)` because `resolve.rs`'s worker thread applies the same check
-/// until EL-9 removes that path.
+/// `pub(crate)` because `Confirm` applies it to the PTR name before the
+/// forward lookup.
 pub(crate) fn is_host_name(name: &str) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name);
     !name.is_empty()

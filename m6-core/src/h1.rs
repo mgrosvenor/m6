@@ -15,13 +15,12 @@
 //! moving anything onto it is what caught that; the survivor is the parser the
 //! edge already used, because it is the only one that has been attacked.
 //!
-//! **`parse.rs` still exists, and is on the production path of every socket
-//! backend** through [`crate::server::serve_connection`]. What was deleted is
-//! the parser that used to be *inside* it: it is now a stream adapter that
-//! reads bytes into a buffer and asks [`parse_request`] whether the message is
-//! complete, with no framing logic of its own. Reading that table as "the file
-//! is gone" costs whoever does it a detour through
-//! `server::serve_connection` looking for a second parser that is not there.
+//! **`parse.rs` remains for the benchmarks and tests that still drive a
+//! blocking socket.** It is a stream adapter that reads bytes into a buffer and
+//! asks [`parse_request`] whether the message is complete, with no framing
+//! logic of its own. A service's loop frames requests with [`ServerConn`],
+//! which reads into its slot's buffer and frames through the same parser
+//! (`parse_head_uninit`).
 //!
 //! **This function is pure.** The edge's version stripped proxy-owned headers
 //! (`X-Forwarded-For` and friends) inline while parsing, which is ingress
@@ -934,8 +933,7 @@ pub struct Responder<'a, W: std::io::Write> {
     /// Stored as the decision rather than as the method string, which is the
     /// only thing it was ever used for (`eq_ignore_ascii_case("HEAD")`).
     /// Holding a `&'a str` tied the responder's lifetime to the request that
-    /// produced it, which is why `serve_connection` could not hand the request
-    /// to its handler and every `App` service cloned one per request instead.
+    /// produced it, so it is a decision copied out of the head.
     is_head: bool,
     /// Decided by the connection from the request, before the handler runs.
     keep_alive: bool,
@@ -1014,8 +1012,8 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
     /// has been told exactly how many are coming. That makes a short read a
     /// framing fault and not a small disappointment: whatever is written next
     /// on a reused connection would be read as the tail of this body. So a
-    /// reader that ends early returns `UnexpectedEof` here, and
-    /// `serve_connection` closes the connection rather than continuing on it.
+    /// reader that ends early returns `UnexpectedEof` here, and `ServerConn`
+    /// closes the connection rather than continuing on it.
     /// The peer then sees fewer bytes than promised followed by EOF, which it
     /// must discard. That is the honest failure; silently sending fewer bytes
     /// than the header claims is the smuggling primitive this codebase rejects

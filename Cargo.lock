@@ -1920,6 +1920,7 @@ dependencies = [
  "resolv-conf",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2038,13 +2039,14 @@ name = "m6-monitor"
 version = "1.15.0"
 dependencies = [
  "anyhow",
+ "libc",
  "m6-core",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
  "tracing",
- "ureq",
 ]
 
 [[package]]

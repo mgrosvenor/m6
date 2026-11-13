@@ -291,7 +291,7 @@ start_edge() {
   fi
 
   printf 'PUBLIC CONTENT\n' > "$site/public/open.txt"
-  # m6-file is an `App` service: the handler is named in config, and the
+  # m6-file is a service: the handler is named in config, and the
   # wildcard is explicit. The old spelling now fails at startup, which is the
   # point of that check -- but it failed HERE first, unnoticed, because
   # `start_edge` only ran under h2 and h2spec is absent on the laptop.

@@ -28,7 +28,7 @@ testkit = ["dep:rustls-pki-types"]
 # `multipart` gates the multipart body parser and the streaming types it needs.
 multipart = ["dep:multer", "dep:bytes", "dep:futures-util", "dep:futures-executor"]
 
-# Tera templating, with comrak for Markdown. Without it `App` uses
+# Tera templating, with comrak for Markdown. Without it a service passes
 # `NoTemplates`, and a route that names a template is a configuration error.
 templates = ["dep:tera", "dep:comrak"]
 
@@ -115,6 +115,10 @@ rusqlite      = { version = "0.41", optional = true, features = ["bundled", "fal
 # features m6-http names, so the workspace builds one rustls, not two.
 rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", optional = true }
+# The host's own certificate store, for `client::system_roots`. The same
+# version m6-http uses, so the workspace links one of it and the lock gains no
+# package.
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 tempfile  = "3"

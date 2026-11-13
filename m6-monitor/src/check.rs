@@ -35,11 +35,12 @@ use crate::poll::NodeReading;
 /// Reverse-lookup results by address, read by [`render`].
 pub type Verdicts = std::collections::HashMap<String, m6_core::resolve::Ptr>;
 
-/// The most new addresses looked up in one poll.
+/// The most new addresses one poll starts a lookup for.
 ///
-/// Each lookup can take the full two-second deadline, and they run one after
-/// another on the poller thread, so this bounds how long a poll is held up by
-/// a resolver that never answers: 8 x 2 s. An address past the cap reads
+/// Each lookup carries the fleet's `timeout_ms` deadline, and the poll keeps up
+/// to this many in flight at once, starting the next as each answer or
+/// deadline frees a slot. A resolver that never answers therefore costs one
+/// fleet timeout per batch, not one per address. An address past the cap reads
 /// "not looked up" in this poll and is tried in the next.
 pub const MAX_LOOKUPS_PER_POLL: usize = 8;
 
@@ -61,14 +62,16 @@ pub const MAX_CACHED_VERDICTS: usize = 512;
 
 /// Lookup results kept across polls, so a report only reads them.
 ///
-/// The poller thread calls [`VerdictCache::refresh`] before it takes the
-/// snapshot's write lock. [`render`] never resolves anything, so `/check`
-/// cannot be stalled by a resolver and cannot hold up the poller.
+/// The poll calls [`VerdictCache::due`] to learn which addresses need a lookup
+/// and [`VerdictCache::record`] for each answer its loop receives. [`render`]
+/// never resolves anything, so `/check` cannot be stalled by a resolver and
+/// cannot hold up the poll.
 pub struct VerdictCache {
     entries: std::collections::HashMap<String, (std::time::Instant, m6_core::resolve::Ptr)>,
     cap: usize,
 }
 
+#[cfg(test)]
 impl Default for VerdictCache {
     fn default() -> Self {
         Self::with_cap(MAX_LOOKUPS_PER_POLL)
@@ -77,6 +80,7 @@ impl Default for VerdictCache {
 
 impl VerdictCache {
     /// A cache for the poller: at most [`MAX_LOOKUPS_PER_POLL`] lookups a poll.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -89,18 +93,57 @@ impl VerdictCache {
         }
     }
 
-    /// Look up the crawler addresses in `readings` that are not cached or
-    /// have expired, at most the cache's cap of them, and return the
-    /// results for every address the report will show.
-    pub fn refresh(
+    /// The addresses in `readings` that need a lookup now: not cached, not
+    /// expired, and at most the cache's cap, in the order the report shows
+    /// them. `out` is reused every poll.
+    pub fn due(
         &mut self,
         readings: &[NodeReading],
         now: std::time::Instant,
-        lookup: &dyn Fn(&str) -> m6_core::resolve::Ptr,
-    ) -> Verdicts {
-        use m6_core::resolve::Ptr;
+        out: &mut Vec<String>,
+    ) {
         self.entries.retain(|_, (expires, _)| *expires > now);
-        let mut looked_up = 0;
+        out.clear();
+        for ip in readings
+            .iter()
+            .filter_map(|r| r.traffic.as_ref())
+            .flat_map(|t| t.crawlers.iter())
+            .flat_map(|c| c.client_ips.iter().take(CHECKED_ADDRESSES))
+        {
+            if out.contains(ip) || self.entries.contains_key(ip) {
+                continue;
+            }
+            out.push(ip.clone());
+            if out.len() == self.cap {
+                break;
+            }
+        }
+    }
+
+    /// Store one lookup's answer, replacing an older one for the address.
+    pub fn record(&mut self, addr: &str, ptr: m6_core::resolve::Ptr, now: std::time::Instant) {
+        let ttl = if ptr == m6_core::resolve::Ptr::Failed {
+            FAILED_TTL
+        } else {
+            VERDICT_TTL
+        };
+        if self.entries.len() >= MAX_CACHED_VERDICTS && !self.entries.contains_key(addr) {
+            // Drop the entry closest to expiry.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (e, _))| *e)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(addr.to_string(), (now + ttl, ptr));
+    }
+
+    /// What the report reads: one answer for every address in `readings` that
+    /// has one.
+    pub fn verdicts(&self, readings: &[NodeReading]) -> Verdicts {
         let mut out = Verdicts::new();
         for ip in readings
             .iter()
@@ -111,32 +154,31 @@ impl VerdictCache {
             if out.contains_key(ip) {
                 continue;
             }
-            if !self.entries.contains_key(ip) && looked_up < self.cap {
-                looked_up += 1;
-                let ptr = lookup(ip);
-                let ttl = if ptr == Ptr::Failed {
-                    FAILED_TTL
-                } else {
-                    VERDICT_TTL
-                };
-                if self.entries.len() >= MAX_CACHED_VERDICTS {
-                    // Drop the entry closest to expiry.
-                    if let Some(oldest) = self
-                        .entries
-                        .iter()
-                        .min_by_key(|(_, (e, _))| *e)
-                        .map(|(k, _)| k.clone())
-                    {
-                        self.entries.remove(&oldest);
-                    }
-                }
-                self.entries.insert(ip.clone(), (now + ttl, ptr));
-            }
             if let Some((_, ptr)) = self.entries.get(ip) {
                 out.insert(ip.clone(), ptr.clone());
             }
         }
         out
+    }
+
+    /// Look up every due address through `lookup`, then return the report's
+    /// answers. The unit tests drive the cache through this; the service's
+    /// loop and `--check` call [`due`](Self::due) and [`record`](Self::record)
+    /// around their own non-blocking lookups.
+    #[cfg(test)]
+    pub fn refresh(
+        &mut self,
+        readings: &[NodeReading],
+        now: std::time::Instant,
+        lookup: &dyn Fn(&str) -> m6_core::resolve::Ptr,
+    ) -> Verdicts {
+        let mut due = Vec::new();
+        self.due(readings, now, &mut due);
+        for addr in &due {
+            let ptr = lookup(addr);
+            self.record(addr, ptr, now);
+        }
+        self.verdicts(readings)
     }
 }
 
@@ -1425,6 +1467,56 @@ mod tests {
         );
         assert_eq!(calls.get(), 12);
         assert_eq!(v.len(), 12);
+    }
+
+    /// The poll's split path and the one-shot path agree: `due` never returns
+    /// more than the cap, a `record` for each answer, then `verdicts` gives the
+    /// same map `refresh` gives from the same lookups. The next poll continues
+    /// with the addresses the cap held back, without repeating one.
+    #[test]
+    fn crawler_lookups_go_through_confirm() {
+        use m6_core::resolve::Ptr;
+        let answer = |ip: &str| {
+            if ip.ends_with(".1") {
+                Ptr::Name("crawl.example.com".into())
+            } else if ip.ends_with(".2") {
+                Ptr::None
+            } else {
+                Ptr::Failed
+            }
+        };
+        let mut readings = Vec::new();
+        for n in 0..4 {
+            let ips: Vec<String> = (1..=3).map(|k| format!("192.0.2.{}", n * 3 + k)).collect();
+            let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
+            readings.extend(sighted(&ips));
+        }
+        let now = std::time::Instant::now();
+
+        let mut cache = VerdictCache::new();
+        let mut due = Vec::new();
+        cache.due(&readings, now, &mut due);
+        assert_eq!(due.len(), MAX_LOOKUPS_PER_POLL, "the cap holds");
+        for ip in &due {
+            let ptr = answer(ip);
+            cache.record(ip, ptr, now);
+        }
+        let split = cache.verdicts(&readings);
+
+        let mut through_refresh = VerdictCache::new();
+        let refreshed = through_refresh.refresh(&readings, now, &answer);
+        assert_eq!(split.len(), refreshed.len());
+        for (addr, ptr) in &refreshed {
+            assert_eq!(split.get(addr), Some(ptr), "{addr}");
+        }
+
+        let mut rest = Vec::new();
+        cache.due(&readings, now, &mut rest);
+        assert_eq!(rest.len(), 12 - MAX_LOOKUPS_PER_POLL, "the rest, once");
+        assert!(
+            rest.iter().all(|ip| !due.contains(ip)),
+            "an address looked up is not due again: {rest:?} after {due:?}"
+        );
     }
 
     /// A stored result is reused until it expires, a failure expires sooner,
