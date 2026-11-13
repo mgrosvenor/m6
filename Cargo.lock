@@ -2017,7 +2017,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

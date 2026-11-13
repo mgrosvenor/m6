@@ -56,6 +56,12 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **A backend host name that does not resolve when m6-http starts now stops it with exit 2.** Host names in `url` and HTTP/2 backends are resolved once at start, so a backend whose address changes needs m6-http restarted.
 
+**m6-html and m6-file no longer read `[thread_pool]`** (it is refused at start from a later release). To use more cores, run more instances: a systemd template unit with `M6_SOCKET_OVERRIDE` per instance and a glob in `site.toml`'s `[[backend]]` sockets.
+
+**A database path m6-auth-server cannot open now stops it at start with exit 2**, instead of answering 500 to each request.
+
+**m6-http verifies an https:// or h2s:// backend against the host's certificate authorities only, and a host with none stops it at start with exit 2.** A backend that relied on the bundled Mozilla list on a host with no CA certificates needs the host's CA package installed.
+
 ### Added
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
@@ -102,6 +108,8 @@ A client that makes more requests than this on one connection reconnects, with a
 **m6_core::client::Upstream, a non-blocking HTTP/1.1 client for an event loop.** It connects to a unix socket or a TCP address, optionally over TLS, writes one request and parses the response as bytes arrive, and can carry the next request on the same connection. Its buffers are allocated once, so a request over a unix socket or plain TCP allocates nothing. m6-http's unix-socket backends use it.
 
 **m6_core::dns, a DNS question on its own non-blocking UDP socket.** dns::Query asks one PTR, or one A and AAAA pair, of the first nameserver in /etc/resolv.conf, and dns::Confirm makes the reverse-then-forward check a crawler claim needs, each driven by the caller's event loop. Messages are built and parsed by hickory-proto. Nothing else in m6 resolves names while serving: host names are resolved once at start.
+
+**m6-core supplies the parts a service's own event loop is built from.** h1::ServerConn serves one HTTP/1.1 connection from buffers made at start, reading and writing until the socket would block, with no allocation per request. net::listen_unix and net::listen_tcp open a non-blocking listener. site::Site loads a site's config, templates and params at start, and handle and finish answer a request with the routing, rendering, minification and compression App used, returning the service's own routes to the service to answer.
 
 ### Security
 
@@ -322,6 +330,16 @@ They fail if a backend 404 or 500 loses the fetched page or its status, if a fai
 
 **The build-host sync now keeps `tools/perf-history.jsonl`, and the script brings it back after perfcheck so the committed performance history records every run (#193).**
 The sync used to delete the file the build host wrote, so the history never entered git. The sync now sends the committed history to the host, perfcheck appends its record there, and the script replaces the local file with the result only if the copy is complete and no shorter. The clean-tree guard ignores the file, a copy-back failure fails the run without stopping the examples, and `.gitattributes` merges the file by union so two branches that each add a record do not conflict.
+
+**m6-html and m6-file each run one event loop in one thread.** They accepted on one thread and handed each connection to a worker over a locked queue, about 15 µs per request, and a worker held its connection for its whole keep-alive life. Now each service's main accepts, reads, answers and writes with every socket non-blocking: an idle keep-alive connection costs a buffer, not a thread, and a large file streams as the client reads it. Connections beyond what the process can serve wait in the kernel's listen queue: there is no 503 for a full queue. Run several instances to use several cores.
+
+**m6-auth-server runs one event loop with one database connection.** It handed each connection to a worker thread, and each worker opened its own database connection on its first request, answering 500 when that open failed. Now one loop serves every connection, the database is opened once at start, and a database that cannot be opened stops the service with exit 2. The login rate limit is per process.
+
+**m6-auth-server never waits on a database lock.** It waited up to 5 seconds for SQLite's lock, which in a single-threaded service holds every request. It now sets SQLite's busy timeout to zero once started, retries a request that found the database locked every 5 ms from its event loop while serving others, and answers 503 with Retry-After after one second. A retried login does not verify the password twice. m6-auth-cli keeps its 5-second wait.
+
+### Removed
+
+m6-http's bundled webpki-roots store, a second store beside the host's.
 
 ### Verified
 

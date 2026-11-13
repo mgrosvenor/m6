@@ -7,7 +7,7 @@
 //! and nothing would fail. Each test below states the scenario and the wrong
 //! outcome it catches.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -448,6 +448,120 @@ fn a_relative_tls_key_exits_2_and_names_the_setting() {
     assert!(
         svc.output().contains("[server] tls_key"),
         "the error did not name [server] tls_key\n--- output ---\n{}",
+        svc.output()
+    );
+}
+
+/// Write a site holding the `[[backend]]` line `backend` and a route to it,
+/// and a system config bound to `bind`. Returns the site and system paths.
+fn url_backend_site(dir: &Path, bind: &str, backend: &str) -> (PathBuf, PathBuf) {
+    let site = dir.join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+             [log]\nlevel = \"info\"\nformat = \"plain\"\n\n\
+             {backend}\n\n\
+             [[route]]\npath = \"/\"\nbackend = \"remote\"\n"
+        ),
+    )
+    .expect("site.toml");
+    let system = dir.join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{bind}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
+        ),
+    )
+    .expect("system config");
+    (site, system)
+}
+
+/// An empty PEM file and an empty directory, which `SSL_CERT_FILE` and
+/// `SSL_CERT_DIR` make replace the host's certificate store.
+fn empty_store(dir: &Path) -> (PathBuf, PathBuf) {
+    let file = dir.join("empty-ca.pem");
+    std::fs::write(&file, "").expect("empty CA file");
+    let dir_path = dir.join("empty-ca-dir");
+    std::fs::create_dir(&dir_path).expect("empty CA dir");
+    (file, dir_path)
+}
+
+/// Scenario: an `https://` backend is verified against a system store holding
+/// no certificate authority. Wrong outcome: m6-http starts and answers 502 for
+/// the route forever instead of refusing at start and naming the backend.
+#[test]
+fn a_verifying_url_backend_with_an_empty_system_store_exits_2() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (site, system) = url_backend_site(
+        dir.path(),
+        &claim.addr(),
+        "[[backend]]\nname = \"remote\"\nurl = \"https://192.0.2.10\"",
+    );
+    let (empty_file, empty_dir) = empty_store(dir.path());
+
+    let mut cmd = Command::new(testkit::binary("m6-http"));
+    cmd.arg(&site)
+        .arg(&system)
+        .env("SSL_CERT_FILE", &empty_file)
+        .env("SSL_CERT_DIR", &empty_dir);
+    let mut svc = Service::spawn("m6-http-empty-roots", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-http did not exit for an empty system store\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    let output = svc.output();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("[[backend]] remote"),
+        "the error must name the backend, got: {output}"
+    );
+    assert!(
+        output.contains("system store"),
+        "the error must name the store, got: {output}"
+    );
+}
+
+/// Scenario: an `https://` backend sets `tls_skip_verify = true`, with no
+/// certificate authority in the system store. Wrong outcome: the store check
+/// refuses a backend that never reads the store.
+#[test]
+fn a_url_backend_that_skips_verification_starts_with_an_empty_system_store() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (site, system) = url_backend_site(
+        dir.path(),
+        &claim.addr(),
+        "[[backend]]\nname = \"remote\"\nurl = \"https://192.0.2.10\"\ntls_skip_verify = true",
+    );
+    let (empty_file, empty_dir) = empty_store(dir.path());
+
+    let mut cmd = Command::new(testkit::binary("m6-http"));
+    cmd.arg(&site)
+        .arg(&system)
+        .env("SSL_CERT_FILE", &empty_file)
+        .env("SSL_CERT_DIR", &empty_dir);
+    let mut svc = Service::spawn("m6-http-empty-roots-skip", &mut cmd);
+    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    let status = svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-http should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
         svc.output()
     );
 }
