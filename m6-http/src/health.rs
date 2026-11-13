@@ -134,6 +134,9 @@ use std::time::{Duration, Instant};
 
 use m6_core::monitoring::TrafficReport;
 use m6_core::telemetry::AnalyticsRecord;
+// The one marker for a value a cap cut short. The slot and the report use the
+// same value, so the two cuts cannot drift apart.
+use m6_core::telemetry::USER_AGENT_TRUNCATED as TRUNCATED;
 
 /// Where the privileged collector leaves `nft -j list ruleset` output.
 const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
@@ -169,13 +172,6 @@ const IP_CAP: usize = 45;
 
 /// The most bytes a slot keeps of a user agent, marker included.
 const UA_CAP: usize = 256;
-
-/// What a capped field ends in when its cap cut it.
-///
-/// The same marker `m6_core::telemetry` puts on a user agent it cuts at 160
-/// characters. Without it a report cannot tell a short value from the prefix
-/// of a long one, and a cut path would read as the path the client sent.
-const TRUNCATED: &str = "...";
 
 /// The three analytics lines m6-http writes per request or poll.
 ///
@@ -225,12 +221,14 @@ impl<const N: usize> Field<N> {
     ///
     /// A value the cap cuts ends in [`TRUNCATED`], so every reader of a slot
     /// can tell a cut value from a whole one. The marker reserves its own
-    /// bytes inside the cap.
-    fn set(&mut self, s: &str) {
+    /// bytes inside the cap. The return value is the machine-readable form of
+    /// the same fact, which the report needs because the marker is a rendering
+    /// choice and a cut field can hide a probe marker.
+    fn set(&mut self, s: &str) -> bool {
         if s.len() <= N {
             self.bytes[..s.len()].copy_from_slice(s.as_bytes());
             self.len = s.len() as u16;
-            return;
+            return false;
         }
         let mut end = N - TRUNCATED.len();
         while !s.is_char_boundary(end) {
@@ -239,6 +237,7 @@ impl<const N: usize> Field<N> {
         self.bytes[..end].copy_from_slice(&s.as_bytes()[..end]);
         self.bytes[end..end + TRUNCATED.len()].copy_from_slice(TRUNCATED.as_bytes());
         self.len = (end + TRUNCATED.len()) as u16;
+        true
     }
 
     fn mark_absent(&mut self) {
@@ -262,7 +261,8 @@ impl<const N: usize> Field<N> {
 /// One logged event, as `/traffic` needs it.
 ///
 /// Fixed size, so the ring is one allocation and a push is one copy. The
-/// fields are the ones the report reads, plus the time and the kind.
+/// fields are the ones the report reads, plus the time, the kind and whether a
+/// cap cut the event.
 #[derive(Clone)]
 struct TrafficSlot {
     at_us: u64,
@@ -271,6 +271,13 @@ struct TrafficSlot {
     path: Field<PATH_CAP>,
     client_ip: Field<IP_CAP>,
     user_agent: Field<UA_CAP>,
+    /// A cap cut the path or the user agent.
+    ///
+    /// The slot keeps the marker on the cut value, and this bit beside it is
+    /// what the report reads. A cut field can hide a probe marker past the
+    /// cap, so the request counts as probe-shaped. The bit is assigned on
+    /// every push, so a reused slot never carries the previous event's answer.
+    truncated: bool,
 }
 
 impl TrafficSlot {
@@ -282,6 +289,7 @@ impl TrafficSlot {
             path: Field::empty(),
             client_ip: Field::empty(),
             user_agent: Field::empty(),
+            truncated: false,
         }
     }
 }
@@ -361,12 +369,16 @@ impl TrafficWindow {
         slot.at_us = at_us;
         slot.kind = kind;
         slot.status = status;
-        slot.path.set(path);
+        let path_cut = slot.path.set(path);
         slot.client_ip.set(client_ip);
-        match user_agent {
+        let user_agent_cut = match user_agent {
             Some(ua) => slot.user_agent.set(ua),
-            None => slot.user_agent.mark_absent(),
-        }
+            None => {
+                slot.user_agent.mark_absent();
+                false
+            }
+        };
+        slot.truncated = path_cut || user_agent_cut;
         self.next += 1;
         if self.next == self.slots.len() {
             self.next = 0;
@@ -450,9 +462,11 @@ pub(crate) fn unix_micros_now() -> u64 {
 ///
 /// The records of the last hour are turned back into the records the log
 /// lines would have parsed to, and `TrafficReport::from_records` builds the
-/// report body, so the figures match the ones a log read produces. The report
-/// also states how long a window it actually covers and how many events the
-/// ring overwrote inside that window.
+/// report body, so the figures match the ones a log read produces. A value the
+/// slot cut is the one difference, and `truncated` tells the record, because a
+/// cut field can hide a probe marker. The report also states how long a window
+/// it actually covers and how many events the ring overwrote inside that
+/// window.
 fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
     let now_us = unix_micros_now();
     let cutoff = now_us.saturating_sub(WINDOW_US);
@@ -468,6 +482,7 @@ fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
             slot.path.as_str(),
             slot.client_ip.as_str(),
             slot.user_agent.as_opt(),
+            slot.truncated,
         ));
     }
     let mut report = TrafficReport::from_records(node, &records, window.covered_minutes(now_us));
@@ -773,6 +788,31 @@ mod traffic_endpoint_tests {
         assert_eq!(report.window_minutes, 60, "the ring holds over an hour");
     }
 
+    /// A drop cell is reported for one window and then forgotten. The cell
+    /// stays in the ring until a later event reuses its minute 61 minutes on,
+    /// so the read-time filter is what keeps a past burst out of a quiet hour.
+    /// `dropped_in_window` takes the time, so this needs no sleep.
+    #[test]
+    fn a_drop_leaves_the_count_once_the_window_passes_it() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        // One drop inside the window and one at the oldest minute the window
+        // still covers. The report includes an event exactly at the cutoff, so
+        // the edge drop counts too.
+        window.count_drop(now, now);
+        window.count_drop(now - WINDOW_US, now);
+        assert_eq!(
+            window.dropped_in_window(now),
+            2,
+            "both drops are inside the window"
+        );
+        assert_eq!(
+            window.dropped_in_window(now + 61 * MICROS_PER_MINUTE),
+            0,
+            "a past burst's drops are not reported against a quiet hour"
+        );
+    }
+
     /// A path longer than its cap is cut on a character boundary and marked as
     /// cut. Cutting at the byte cap regardless can split a multi-byte
     /// character, and the slot would then not be UTF-8.
@@ -826,6 +866,63 @@ mod traffic_endpoint_tests {
         let shown = &report.notable[0].user_agents[0];
         assert!(shown.ends_with(TRUNCATED), "shown as whole: {shown:?}");
         assert!(shown.chars().count() <= 160);
+    }
+
+    /// The owner's test: a path that hides a probe marker past the 512-byte
+    /// cap is still probe-shaped. "Not shown" is not "not a probe", and an
+    /// honest client does not send a 512-byte path.
+    #[test]
+    fn a_probe_marker_past_the_path_cap_is_still_probe_shaped() {
+        let mut window = TrafficWindow::new();
+        let path = format!("/{}/.env", "a".repeat(PATH_CAP + 8));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            404,
+            &path,
+            "192.0.2.1",
+            None,
+        );
+        let report = build_report("origin", &window);
+        // `probe_noise` is the report's record of `ClientSummary::probe_paths`
+        // for an address below the notable threshold.
+        assert_eq!(report.probe_noise.len(), 1, "the cut request is flagged");
+        let shown = report.probe_noise[0]
+            .strip_prefix("192.0.2.1 ")
+            .expect("the noise line names the address");
+        assert!(!shown.contains(".env"), "the marker was cut: {shown:?}");
+        assert!(
+            !m6_core::telemetry::looks_like_probe(shown),
+            "the stored bytes carry no marker, so the flag is what catches it"
+        );
+        assert_eq!(
+            report.forgers,
+            vec!["192.0.2.1".to_string()],
+            "the address reads as scanning"
+        );
+    }
+
+    /// A user agent the cap cut counts as probe-shaped too, on an ordinary
+    /// path: the part not shown may carry a marker.
+    #[test]
+    fn a_cut_user_agent_counts_as_probe_shaped() {
+        let mut window = TrafficWindow::new();
+        let ua = format!("Mozilla/5.0 {}", "x".repeat(UA_CAP));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            200,
+            "/",
+            "192.0.2.2",
+            Some(&ua),
+        );
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.probe_noise,
+            vec!["192.0.2.2 /".to_string()],
+            "a cut user agent is probe-shaped"
+        );
+        assert_eq!(report.forgers, vec!["192.0.2.2".to_string()]);
     }
 }
 

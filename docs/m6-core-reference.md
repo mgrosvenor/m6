@@ -725,9 +725,11 @@ exactly like a quiet hour.
 
 `AnalyticsRecord` and `AnalyticsFields` are that missing definition, `Serialize`
 as well as `Deserialize` so the write side can adopt them.
-`AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent)`
+`AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)`
 builds the record the analytics line with those values parses to, which is how
 `/traffic` turns its in-memory window back into records.
+`truncated` is the window's own fact that a cap cut the path or user agent, and
+it is not part of the line.
 `parse_analytics(...)` reads a stream. `PeriodicStats::parse(line)` reads the
 `periodic stats` log line, `strip_ansi` first because the journal carries
 colour. `aggregate_windows(...) -> StatsAggregate` sums them.

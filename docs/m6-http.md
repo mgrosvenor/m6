@@ -200,7 +200,10 @@ It starts empty after a restart, and `window_minutes` says how much of the hour 
 When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
 A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the analytics log keeps them whole.
 The notable-client sample is then cut at 160 characters, marked the same way.
-Probe and injection detection sees at most the first 512 bytes of a path and the first 256 bytes of a user agent, so a marker after them is not reported.
+In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
+Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
+The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
+The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
 ---
 

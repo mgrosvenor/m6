@@ -40,6 +40,20 @@ pub struct AnalyticsRecord {
     #[serde(default)]
     pub level: String,
     pub fields: AnalyticsFields,
+    /// The traffic window cut this record's path or user agent.
+    ///
+    /// A record built from the window comes out of a fixed slot, so its path is
+    /// cut at 512 bytes and its user agent at 256. A marker can sit past either
+    /// cap, and the shown bytes then carry no marker even though the request
+    /// does. [`from_parts`](Self::from_parts) takes this bit from the slot
+    /// instead of looking for the trailing marker, because the marker is a
+    /// rendering choice and this is a fact.
+    ///
+    /// Serde skips it: an analytics line carries whole values, so nothing
+    /// parsed from one is cut, and this is report-side knowledge rather than
+    /// part of the format.
+    #[serde(skip)]
+    pub truncated: bool,
 }
 
 /// The event's fields, as emitted by `m6_http::analytics`.
@@ -93,6 +107,11 @@ impl AnalyticsRecord {
     /// back into a record, so a window produces the report the same lines
     /// would have produced from the file.
     ///
+    /// The one difference is a value the window cut: the record keeps the
+    /// prefix the slot kept, and `truncated` says the rest is missing. The
+    /// report has to know, because a probe marker in the missing part is still
+    /// a probe marker the request carried.
+    ///
     /// The timestamp is written as the logging envelope writes it: UTC, fixed
     /// width, microsecond precision. Fixed width matters because the report
     /// compares timestamps as strings.
@@ -103,6 +122,7 @@ impl AnalyticsRecord {
         path: &str,
         client_ip: &str,
         user_agent: Option<&str>,
+        truncated: bool,
     ) -> Self {
         let at = i64::try_from(at_us).expect("a Unix time in microseconds fits in i64");
         let timestamp = chrono::DateTime::from_timestamp_micros(at)
@@ -120,6 +140,7 @@ impl AnalyticsRecord {
                 user_agent: user_agent.map(str::to_string),
                 ..AnalyticsFields::default()
             },
+            truncated,
         }
     }
 }
@@ -661,6 +682,12 @@ pub struct ClientSummary {
     pub user_agents: Vec<String>,
     pub status: BTreeMap<u16, u64>,
     pub paths: Vec<(String, u64)>,
+    /// Probe-shaped paths and how many requests showed each one.
+    ///
+    /// A request counts when `looks_like_probe` matches its path, or when its
+    /// record says the traffic window cut its path or user agent. The second
+    /// case is what makes a marker past the window's cap visible: the shown
+    /// path need carry none, because the request may.
     pub probe_paths: Vec<(String, u64)>,
     pub injection_paths: Vec<(String, u64)>,
     pub first_seen: String,
@@ -789,7 +816,12 @@ pub const UA_ROTATION_MIN_REQUESTS: u64 = 20;
 pub const USER_AGENTS_KEPT: usize = 4;
 /// Characters kept per user agent. Real ones run to about 150.
 pub const USER_AGENT_MAX_CHARS: usize = 160;
-/// Marks an agent the cap cut short.
+/// Marks a value a cap cut short.
+///
+/// Without it a report cannot tell a short value from the prefix of a long one,
+/// and a cut path would read as the path the client sent. The user-agent sample
+/// uses it at [`USER_AGENT_MAX_CHARS`], and `m6-http`'s traffic window uses this
+/// same value for a path or user agent it cut, so the two marks cannot drift.
 pub const USER_AGENT_TRUNCATED: &str = "...";
 
 /// A capped, deterministic sample of a client's user agents.
@@ -850,6 +882,11 @@ impl TrafficSummary {
             n: u64,
             uas: HashSet<String>,
             paths: HashMap<String, u64>,
+            /// Probe-shaped requests by the path the report shows, counted when
+            /// the record is read. A record whose path or user agent the
+            /// traffic window cut is probe-shaped, and that fact lives on the
+            /// record, not on the stored path.
+            probe_paths: HashMap<String, u64>,
             status: BTreeMap<u16, u64>,
             first: String,
             last: String,
@@ -893,6 +930,7 @@ impl TrafficSummary {
                 n: 0,
                 uas: HashSet::new(),
                 paths: HashMap::new(),
+                probe_paths: HashMap::new(),
                 status: BTreeMap::new(),
                 first: rec.timestamp.clone(),
                 last: rec.timestamp.clone(),
@@ -900,6 +938,13 @@ impl TrafficSummary {
             acc.n += 1;
             acc.uas.insert(rec.user_agent().to_string());
             *acc.paths.entry(f.path.clone()).or_default() += 1;
+            // A cut path or user agent counts as probe-shaped: an honest client
+            // does not send a 512-byte path or a 256-byte agent, and the
+            // marker may be in the part the window did not keep. Decided from
+            // the record's bit, not from the trailing marker.
+            if rec.truncated || looks_like_probe(&f.path) {
+                *acc.probe_paths.entry(f.path.clone()).or_default() += 1;
+            }
             *acc.status.entry(f.status).or_default() += 1;
             if rec.timestamp < acc.first {
                 acc.first = rec.timestamp.clone();
@@ -950,8 +995,8 @@ impl TrafficSummary {
             .filter(|(ip, a)| {
                 let rotating =
                     a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
-                let scanning = a.paths.keys().any(|p| looks_like_probe(p))
-                    || a.paths.keys().any(|p| looks_like_injection(p));
+                let scanning =
+                    !a.probe_paths.is_empty() || a.paths.keys().any(|p| looks_like_injection(p));
                 let _ = ip;
                 rotating || scanning
             })
@@ -1010,11 +1055,8 @@ impl TrafficSummary {
             .map(|(ip, a)| {
                 let mut paths: Vec<(String, u64)> = a.paths.into_iter().collect();
                 paths.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-                let probe_paths: Vec<(String, u64)> = paths
-                    .iter()
-                    .filter(|(p, _)| looks_like_probe(p))
-                    .cloned()
-                    .collect();
+                let mut probe_paths: Vec<(String, u64)> = a.probe_paths.into_iter().collect();
+                probe_paths.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
                 let injection_paths: Vec<(String, u64)> = paths
                     .iter()
                     .filter(|(p, _)| looks_like_injection(p))
@@ -1119,6 +1161,7 @@ mod tests {
                 user_agent: Some(ua.to_string()),
                 ..Default::default()
             },
+            truncated: false,
         }
     }
 
@@ -1156,8 +1199,10 @@ mod tests {
     /// monitor poll, and a rate-limited request.
     ///
     /// The line carries the six values the window keeps, which are the six
-    /// `from_parts` takes. A field the window does not keep is empty in both,
-    /// which is what makes the whole `AnalyticsFields` comparable.
+    /// `from_parts` takes from it. The seventh, `truncated`, is the window's
+    /// own knowledge and never enters the line, so these three cases say no.
+    /// A field the window does not keep is empty in both, which is what makes
+    /// the whole `AnalyticsFields` comparable.
     #[test]
     fn from_parts_matches_the_logged_line() {
         let at_us = 1_789_106_714_986_903u64;
@@ -1183,14 +1228,38 @@ mod tests {
                 r#"{{"timestamp":"{timestamp}","level":"INFO","fields":{{"message":"{message}","path":"{path}","status":{status},"client_ip":"{client_ip}"{ua}}}}}"#
             );
             let parsed = parse_analytics(&line, "").next().expect("one record");
-            let built =
-                AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent);
+            let built = AnalyticsRecord::from_parts(
+                at_us, message, status, path, client_ip, user_agent, false,
+            );
             assert_eq!(
                 serde_json::to_value(&built).expect("serialisable"),
                 serde_json::to_value(&parsed).expect("serialisable"),
                 "{message} {status} {path}"
             );
         }
+    }
+
+    /// The truncation bit stays on the record and out of the analytics format.
+    /// A line carries whole values, so a reader of the line can never see this
+    /// field, and a consumer that serialises the built record must not start
+    /// writing a key no analytics line has.
+    #[test]
+    fn a_cut_record_keeps_the_flag_out_of_the_line() {
+        let built = AnalyticsRecord::from_parts(
+            1_789_106_714_986_903,
+            "request",
+            404,
+            "/aaaaaaaa...",
+            "192.0.2.1",
+            None,
+            true,
+        );
+        assert!(built.truncated);
+        let json = serde_json::to_value(&built).expect("serialisable");
+        assert!(
+            json.get("truncated").is_none(),
+            "the flag is report-side only: {json}"
+        );
     }
 
     #[test]
