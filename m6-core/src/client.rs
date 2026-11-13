@@ -176,6 +176,15 @@ pub struct Upstream {
     deadline: Instant,
     method_is_head: bool,
     reusable: bool,
+    /// Whether the whole request has been written to the socket. An early reply
+    /// can arrive before the write finishes; reuse then truncates the request
+    /// and desynchronises the backend, so reuse requires this.
+    request_finished: bool,
+    /// Test seam: when set, the next `write_tls` on this connection reports a
+    /// WouldBlock once. Per-connection, so the parallel test runner cannot
+    /// cross the flag between tests.
+    #[cfg(test)]
+    block_next_write: std::cell::Cell<bool>,
     /// The address of the open connection, for keep-alive reuse.
     connected: Option<Addr>,
     /// The TLS identity of the open connection: the verified server name and the
@@ -210,6 +219,9 @@ impl Upstream {
             deadline: Instant::now(),
             method_is_head: false,
             reusable: false,
+            request_finished: false,
+            #[cfg(test)]
+            block_next_write: std::cell::Cell::new(false),
             connected: None,
             connected_name: None,
             connected_config: None,
@@ -235,6 +247,7 @@ impl Upstream {
         // reply and is cleared with the rest of the per-request state below.
         let can_reuse = self.stream.is_some()
             && self.reusable
+            && self.request_finished
             && self.connected.as_ref() == Some(addr)
             && self.tls_identity_matches(tls);
 
@@ -254,6 +267,7 @@ impl Upstream {
         self.deadline = deadline;
         self.method_is_head = method_is_head;
         self.reusable = false;
+        self.request_finished = false;
 
         if can_reuse {
             self.phase = Phase::Transfer;
@@ -336,10 +350,12 @@ impl Upstream {
             }
         }
         // Reuse the previous address's buffer when the slot reconnects, so a
-        // fresh connection does not allocate a path each time.
-        match &mut self.connected {
-            Some(existing) => existing.clone_from(addr),
-            None => self.connected = Some(addr.clone()),
+        // fresh connection does not allocate a path each time. `Addr` derives
+        // `Clone`, so clone into the inner variant by hand.
+        match (&mut self.connected, addr) {
+            (Some(Addr::Unix(existing)), Addr::Unix(path)) => existing.clone_from(path),
+            (Some(Addr::Tcp(existing)), Addr::Tcp(ip)) => *existing = *ip,
+            (_, addr) => self.connected = Some(addr.clone()),
         }
         self.connected_name = tls.map(|t| t.name.clone());
         self.connected_config = tls.map(|t| t.config.clone());
@@ -481,10 +497,16 @@ impl Upstream {
                 // Flush any TLS ciphertext that is still buffered. If it would
                 // block, report it so a later drive retries the flush.
                 if let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) {
+                    #[cfg(test)]
+                    if !flush_tls(tls, stream, &self.block_next_write)? {
+                        return Ok(false);
+                    }
+                    #[cfg(not(test))]
                     if !flush_tls(tls, stream)? {
                         return Ok(false);
                     }
                 }
+                self.request_finished = true;
                 return Ok(true);
             }
             if self.tls.is_some() {
@@ -492,6 +514,11 @@ impl Upstream {
                 let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) else {
                     return Ok(true);
                 };
+                #[cfg(test)]
+                if !flush_tls(tls, stream, &self.block_next_write)? {
+                    return Ok(false);
+                }
+                #[cfg(not(test))]
                 if !flush_tls(tls, stream)? {
                     return Ok(false);
                 }
@@ -801,10 +828,10 @@ impl Upstream {
         self.deadline
     }
 
-    /// The last reply had keep-alive framing and the connection can carry
-    /// another request.
+    /// The last reply had keep-alive framing and the whole request was written,
+    /// so the connection can carry another request.
     pub fn reusable(&self) -> bool {
-        self.reusable
+        self.reusable && self.request_finished
     }
 
     /// Drop the connection (closes the socket). The buffers stay, including the
@@ -824,10 +851,22 @@ fn connect_in_progress(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EINPROGRESS)
 }
 
+// Test seam (per-connection): when the caller's `block_next_write` flag is set,
+// the next `write_tls` reports a WouldBlock once, so the flush's retry is
+// exercised without filling the socket send buffer.
+
 /// Flush TLS ciphertext to the socket. Returns `Ok(true)` when all pending
 /// bytes are written, `Ok(false)` when the socket would block.
-fn flush_tls(tls: &mut ClientConnection, stream: &mut Stream) -> io::Result<bool> {
+fn flush_tls(
+    tls: &mut ClientConnection,
+    stream: &mut Stream,
+    #[cfg(test)] block_next_write: &std::cell::Cell<bool>,
+) -> io::Result<bool> {
     while tls.wants_write() {
+        #[cfg(test)]
+        if !tls.is_handshaking() && block_next_write.replace(false) {
+            return Ok(false);
+        }
         match tls.write_tls(stream) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
@@ -1003,8 +1042,7 @@ pub fn parse_framing(
     } else if chunked {
         Framing::Chunked
     } else if let Some(len) = content_length {
-        // Refuse before reading, so a hostile declared length cannot grow the
-        // buffer, and the size never reaches the addition below unchecked.
+        // The cap is the bound the buffer is sized for, so refuse above it.
         if len > MAX_BODY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1018,13 +1056,9 @@ pub fn parse_framing(
 
     // Reusable only when self-delimited and persistent: HTTP/1.1 unless the
     // backend asked to close, HTTP/1.0 only when it asked to keep alive.
+    // `Connection: close` always wins.
     let self_delimited = matches!(framing, Framing::ContentLength(_) | Framing::Chunked);
-    *reusable = self_delimited
-        && if http10 {
-            connection_keep_alive
-        } else {
-            !connection_close
-        };
+    *reusable = self_delimited && !connection_close && (!http10 || connection_keep_alive);
 
     Ok(framing)
 }
@@ -1370,9 +1404,9 @@ mod tests {
         );
     }
 
-    /// `usize::MAX` is refused rather than overflowing the body-end addition.
+    /// A declared Content-Length that cannot fit is refused, not delivered.
     #[test]
-    fn a_content_length_of_usize_max_is_refused_not_panicking() {
+    fn a_declared_content_length_above_the_limit_is_refused() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n";
         let err = parse(raw, false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "got: {err}");
@@ -1402,6 +1436,7 @@ mod tests {
         let raw = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let mut up = Upstream::new(8192, 1024);
         up.method_is_head = false;
+        up.request_finished = true;
         up.read_buf[..raw.len()].copy_from_slice(raw);
         up.read_len = raw.len();
         up.eof = true;
@@ -1412,11 +1447,23 @@ mod tests {
             b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello";
         let mut up2 = Upstream::new(8192, 1024);
         up2.method_is_head = false;
+        up2.request_finished = true;
         up2.read_buf[..keep_alive.len()].copy_from_slice(keep_alive);
         up2.read_len = keep_alive.len();
         up2.eof = true;
         assert!(up2.parse_progress().unwrap());
         assert!(up2.reusable(), "HTTP/1.0 keep-alive is reusable");
+
+        let close_wins =
+            b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive, close\r\n\r\nhello";
+        let mut up3 = Upstream::new(8192, 1024);
+        up3.method_is_head = false;
+        up3.request_finished = true;
+        up3.read_buf[..close_wins.len()].copy_from_slice(close_wins);
+        up3.read_len = close_wins.len();
+        up3.eof = true;
+        assert!(up3.parse_progress().unwrap());
+        assert!(!up3.reusable(), "Connection: close wins over keep-alive");
     }
 }
 
@@ -1668,77 +1715,358 @@ mod socket_tests {
     }
 
     /// A backend that answers at once without reading the request is still read
-    /// while the request write would block (RFC 9110 6.1).
+    /// while the request write would block (RFC 9110 6.1), and the next `start`
+    /// reconnects instead of riding the truncated stream.
     #[test]
     fn a_backend_that_answers_without_reading_is_read_while_writing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("early.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
         let peer = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().expect("accept");
-            // Never read the request; write a 413 at once and hold the socket.
-            let _ = s.write_all(
-                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-            std::thread::sleep(Duration::from_millis(100));
+            let (mut s1, _) = listener.accept().expect("accept");
+            accept_tx.send(()).expect("report the first accept");
+            // Never read the request; write a keep-alive 413 at once and hold
+            // the socket open until the client is done.
+            let _ = s1.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
+            std::thread::park();
+            // The client's second start reconnects here.
+            let Ok((_s2, _)) = listener.accept() else {
+                return;
+            };
+            accept_tx.send(()).expect("report the second accept");
         });
 
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
-        up.request_buf()
-            .extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
-        up.request_buf()
-            .extend(std::iter::repeat_n(b'x', 1_048_576));
-        up.start(
-            &Addr::Unix(path),
-            None,
-            false,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .expect("start");
+        let req = up.request_buf();
+        req.extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
+        req.extend(std::iter::repeat_n(b'x', 1_048_576));
+        up.start(&Addr::Unix(path.clone()), None, false, deadline)
+            .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (413, &b""[..]));
+        assert!(
+            !up.reusable(),
+            "an early reply before the request is written must not reuse"
+        );
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the first start must connect"
+        );
+
+        // A second start must not ride the truncated stream: it reconnects.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        up.start(&Addr::Unix(path), None, false, deadline)
+            .expect("start");
+        peer.thread().unpark();
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the second start must reconnect, not reuse"
+        );
         peer.join().expect("peer");
     }
 
-    /// A different TLS identity (name or config) for the same address must not
-    /// reuse the connection authenticated for the first identity.
+    /// A different TLS identity (name) for the same address reconnects instead
+    /// of reusing the connection authenticated for the first identity.
     #[test]
-    fn a_different_tls_identity_does_not_reuse_the_connection() {
+    fn a_different_tls_identity_reconnects_instead_of_reusing() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = || {
-            Arc::new(
-                rustls::ClientConfig::builder_with_provider(provider.clone())
-                    .with_safe_default_protocol_versions()
-                    .expect("versions")
-                    .with_root_certificates(rustls::RootCertStore::empty())
-                    .with_no_client_auth(),
-            )
-        };
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let config_a = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server2 = server.clone();
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((tcp, _)) = listener.accept() else {
+                    break;
+                };
+                accept_tx.send(()).expect("report the accept");
+                let conn = rustls::ServerConnection::new(server2.clone()).expect("server conn");
+                let mut stream = rustls::StreamOwned::new(conn, tcp);
+                loop {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let mut complete = false;
+                    while !complete {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                got.extend_from_slice(&buf[..n]);
+                                complete = got.windows(4).any(|w| w == b"\r\n\r\n");
+                            }
+                        }
+                    }
+                    if !complete {
+                        break;
+                    }
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    let _ = stream.flush();
+                }
+            }
+        });
+
         let name_a =
             rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
         let name_b =
             rustls::pki_types::ServerName::try_from("example.com".to_string()).expect("name");
-
-        let mut up = Upstream::new(8192, 1024);
-        let config_a = config();
-        up.connected_name = Some(name_a.clone());
-        up.connected_config = Some(config_a.clone());
         let tls_a = TlsClient {
             config: config_a.clone(),
-            name: name_a.clone(),
+            name: name_a,
         };
-        assert!(up.tls_identity_matches(Some(&tls_a)));
-
         let tls_b = TlsClient {
             config: config_a,
             name: name_b,
         };
-        assert!(!up.tls_identity_matches(Some(&tls_b)));
 
-        let tls_c = TlsClient {
-            config: config(),
-            name: name_a,
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut up = Upstream::new(64 * 1024, 16 * 1024);
+        // Request 1 with identity A: the server accepts once.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls_a), false, deadline)
+            .expect("start");
+        assert_eq!(drive_to_completion(&mut up).expect("drive").0, 200);
+        assert!(up.reusable());
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "request 1 must connect"
+        );
+
+        // Request 2 with identity A reuses the open connection, so the server
+        // accepts nothing new.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls_a), false, deadline)
+            .expect("start");
+        assert_eq!(drive_to_completion(&mut up).expect("drive").0, 200);
+        assert!(
+            accept_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the same identity must reuse the connection"
+        );
+
+        // Request 3 with identity B reconnects: the server accepts a second
+        // time, and the handshake fails because the certificate is for a
+        // different name.
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls_b), false, deadline)
+            .expect("start");
+        assert!(drive_to_completion(&mut up).is_err());
+        assert!(
+            accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a different identity must reconnect"
+        );
+        // Close the failed handshake so the server's read returns instead of
+        // blocking on a close the client never sends.
+        up.close();
+
+        peer.join().expect("peer");
+    }
+
+    /// A TLS request with a body completes: the client encrypts and flushes the
+    /// request and the server answers.
+    #[test]
+    fn a_tls_request_with_a_body_completes() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(server).expect("server conn");
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = stream.flush();
+        });
+
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
+        let tls = TlsClient {
+            config: client,
+            name,
         };
-        assert!(!up.tls_identity_matches(Some(&tls_c)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        up.request_buf().extend_from_slice(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
+        );
+        up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
+            .expect("start");
+        let (status, _, body) = drive_to_completion(&mut up).expect("drive");
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        peer.join().expect("peer");
+    }
+
+    /// The final flush's WouldBlock is retried: the seam blocks the flush once,
+    /// the write reports the block, and the next drive flushes the tail.
+    #[test]
+    fn a_blocked_final_flush_is_retried() {
+        use mio::unix::SourceFd;
+        use mio::{Events, Poll, Token};
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Just over rustls's 64 KiB send-buffer limit, so the write fills the
+        // buffer before the handshake and the seam fires on the post-handshake
+        // final flush, not the buffered pre-handshake write.
+        let body_len = 65 * 1024usize;
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(server).expect("server conn");
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head_end = got.windows(4).position(|w| w == b"\r\n\r\n").expect("head") + 4;
+            let mut total = got.len();
+            while total < head_end + body_len {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => total += n,
+                }
+            }
+            assert_eq!(total - head_end, body_len, "the retry must send the body");
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            let _ = stream.flush();
+        });
+
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
+        let tls = TlsClient {
+            config: client,
+            name,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        let mut req = Vec::new();
+        req.extend_from_slice(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 66560\r\n\r\n",
+        );
+        req.extend(std::iter::repeat_n(b'x', body_len));
+        up.request_buf().extend_from_slice(&req);
+        up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
+            .expect("start");
+
+        // Force the next final flush to report a WouldBlock, then drive.
+        up.block_next_write.set(true);
+
+        let mut poll = Poll::new().expect("poll");
+        let mut events = Events::with_capacity(8);
+        let token = Token(0);
+        let mut interest = up.interest();
+        poll.registry()
+            .register(&mut SourceFd(&up.fd()), token, interest)
+            .expect("register");
+        let mut blocked = false;
+        loop {
+            poll.poll(&mut events, Some(Duration::from_millis(100)))
+                .expect("poll");
+            if events.iter().any(|e| e.token() == token) {
+                let next = up.interest();
+                if next != interest {
+                    poll.registry()
+                        .reregister(&mut SourceFd(&up.fd()), token, next)
+                        .expect("reregister");
+                    interest = next;
+                }
+                if up.drive().expect("drive") {
+                    break;
+                }
+                // The seam leaves the request written but the ciphertext pending.
+                if !up.request_finished
+                    && up.write_offset >= up.request.len()
+                    && up.tls.as_ref().is_some_and(|t| t.wants_write())
+                {
+                    blocked = true;
+                }
+            }
+            if Instant::now() >= up.deadline() {
+                panic!("timed out");
+            }
+        }
+        assert!(blocked, "the final flush must have blocked once");
+        let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
+            [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS];
+        let reply = up.reply(&mut slots).expect("reply");
+        assert_eq!((reply.status, reply.body), (200, &b"ok"[..]));
+        peer.join().expect("peer");
     }
 }
