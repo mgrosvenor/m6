@@ -56,11 +56,13 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **A backend host name that does not resolve when m6-http starts now stops it with exit 2.** Host names in `url` and HTTP/2 backends are resolved once at start, so a backend whose address changes needs m6-http restarted.
 
-**m6-html and m6-file no longer read `[thread_pool]`** (it is refused at start from a later release). To use more cores, run more instances: a systemd template unit with `M6_SOCKET_OVERRIDE` per instance and a glob in `site.toml`'s `[[backend]]` sockets.
-
 **A database path m6-auth-server cannot open now stops it at start with exit 2**, instead of answering 500 to each request.
 
 **m6-http verifies an https:// or h2s:// backend against the host's certificate authorities only, and a host with none stops it at start with exit 2.** A backend that relied on the bundled Mozilla list on a host with no CA certificates needs the host's CA package installed.
+
+**A service config that still has `[thread_pool]` is refused at start.** Delete it from every service config. To use more cores, run more instances (a systemd template unit with `M6_SOCKET_OVERRIDE` per instance and a glob in `site.toml`'s `[[backend]]` sockets). Code built on `App`: replace `App::new()` and its `route_*` calls with a main that loads `site::Site`, opens its listener with `net::listen_unix` and runs the loop in docs/m6-app-anatomy.md, with your routes as `CodeRoute` values and one match on `Handled`.
+
+**m6-monitor reads the fleet list and every node's host name at start.** A change to the fleet, or to a node's address, needs a restart. A node whose host name does not resolve at start stops m6-monitor with exit 2, naming the node.
 
 ### Added
 
@@ -337,9 +339,15 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 **m6-auth-server never waits on a database lock.** It waited up to 5 seconds for SQLite's lock, which in a single-threaded service holds every request. It now sets SQLite's busy timeout to zero once started, retries a request that found the database locked every 5 ms from its event loop while serving others, and answers 503 with Retry-After after one second. A retried login does not verify the password twice. m6-auth-cli keeps its 5-second wait.
 
+**m6-monitor runs one thread with its own event loop.** It ran a background poll thread, one thread per node per poll with blocking HTTP requests, a thread per tunnel probe, a history writer thread and a thread per reverse DNS lookup. Each poll is now a set of non-blocking requests, connects and DNS queries driven by its loop, the page, digest and check are built once per poll and served from memory, and history is written in one short transaction per poll, never waiting on a locked database. The reports are unchanged. The monitor trusts the host's certificate store instead of a bundled one.
+
+**/traffic no longer reads the analytics log.** m6-http read up to 24 MiB of its log file inside its event loop to answer /traffic. It now keeps the last 32,768 events it logs in memory, in space allocated at start, and builds the report from those in the last hour. A report after a restart covers only the time since the restart, and window_minutes says how long that is. A node that wraps the ring inside the hour reports the shorter span it holds and counts the events it dropped. A path is stored up to 512 bytes and a user agent up to 256, and a cut value ends in `...`: the log keeps them whole. A request whose path or user agent was cut counts as probe-shaped, so a marker cannot be hidden past the cut.
+
 ### Removed
 
 m6-http's bundled webpki-roots store, a second store beside the host's.
+
+**App, its builders, AppContext, with_thread_state and `[thread_pool]` are gone: m6-core is not a framework.** Every service writes its own main with its own event loop, and m6-core supplies the parts: h1::ServerConn, site::Site, net::listen_unix, and the event module's Signals, Timeouts, Slots and LoopTrace (see docs/m6-app-anatomy.md). The params cache takes no lock.
 
 ### Verified
 
