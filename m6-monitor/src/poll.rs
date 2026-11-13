@@ -1367,8 +1367,11 @@ mod tests {
     /// One shared TLS config for http-only nodes. Nothing in these tests
     /// connects with it.
     fn tls() -> std::sync::Arc<rustls::ClientConfig> {
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
         std::sync::Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth(),
         )
