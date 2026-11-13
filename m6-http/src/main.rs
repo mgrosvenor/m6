@@ -17,6 +17,7 @@ use quiche::h3::NameValue;
 use rand::RngCore;
 use tracing::{debug, error, info, warn};
 
+use m6_core::client::Upstream;
 use m6_http_lib::analytics;
 use m6_http_lib::analytics::H3Headers;
 use m6_http_lib::auth;
@@ -28,6 +29,7 @@ use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
 use m6_http_lib::forward::{self, UpstreamId, Waiter};
+use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
@@ -131,7 +133,7 @@ use m6_http_lib::http11::{
     RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
     MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
-use m6_http_lib::pool::PoolManager;
+use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::router::RouteTable;
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 
@@ -153,7 +155,9 @@ enum Source {
     /// An outbound h2c or h2s pool connection, found by its token.
     H2cUpstream,
     H2sUpstream,
-    SocketUpstream(usize),
+    /// An in-loop upstream in the shared table: a socket member or a URL
+    /// backend request.
+    Upstream(usize),
 }
 
 /// The [`LoopTrace`] trigger index for an iteration's first event, and the
@@ -165,7 +169,7 @@ fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
         Some(TOKEN_SIGNAL) => 4,
         Some(Token(k)) => match sources.get(k) {
             Source::TlsConn(_) | Source::H2cConn(_) => 1,
-            Source::H2cUpstream | Source::H2sUpstream | Source::SocketUpstream(_) => 2,
+            Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) => 2,
             Source::Vacant => 5,
         },
         None => 5,
@@ -219,11 +223,34 @@ enum PendingH3Response {
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
-/// One in-flight socket-backend request the loop drives. When it completes or
-/// expires the loop writes the result straight into the waiting stream named by
-/// `waiter`, with the request context it carries.
-struct SocketUpstreamEntry {
-    upstream: Option<forward::SocketUpstream>,
+/// What owns an upstream slot.
+#[derive(Clone, Copy)]
+enum UpstreamKind {
+    /// One request on a socket-pool member. The member is released, or backed
+    /// off, when it finishes.
+    Member,
+    /// A URL backend, by its entry in `PoolManager`. A finished connection the
+    /// backend kept open goes back to that backend's idle list.
+    Url(usize),
+    /// A URL backend slot sitting on that backend's idle list. Its descriptor
+    /// stays registered for read, so a peer close wakes the loop and the slot
+    /// is dropped before any request reuses it.
+    IdleUrl(usize),
+}
+
+/// One in-flight backend request the loop drives, whether its destination is a
+/// socket member or a URL backend. When it completes or expires the loop writes
+/// the result straight into the waiting stream named by `waiter`, with the
+/// request context it carries. The `Upstream` slot, its buffers and the address
+/// are made at start and reused, so a miss allocates nothing on the write or
+/// parse path; a new connection reuses the slot's existing allocations.
+struct UpstreamEntry {
+    upstream: Upstream,
+    addr: m6_core::client::Addr,
+    kind: UpstreamKind,
+    /// The token this slot's descriptor is registered under. An idle URL slot
+    /// keeps its token while it waits, so a close can wake the loop.
+    token: Token,
     member_idx: usize,
     backend_name: String,
     waiter: Option<Waiter>,
@@ -231,10 +258,13 @@ struct SocketUpstreamEntry {
     registered_interest: Interest,
 }
 
-impl SocketUpstreamEntry {
-    fn empty() -> SocketUpstreamEntry {
-        SocketUpstreamEntry {
-            upstream: None,
+impl UpstreamEntry {
+    fn empty() -> UpstreamEntry {
+        UpstreamEntry {
+            upstream: Upstream::new(64 * 1024, 16 * 1024),
+            addr: m6_core::client::Addr::Unix(std::path::PathBuf::new()),
+            kind: UpstreamKind::Member,
+            token: Token(usize::MAX),
             member_idx: 0,
             backend_name: String::new(),
             waiter: None,
@@ -242,14 +272,6 @@ impl SocketUpstreamEntry {
             registered_interest: Interest::READABLE,
         }
     }
-}
-
-/// One URL-backend request on its own thread, polled once per iteration because
-/// the thread has no descriptor. The one channel kind that remains until EL-5b.
-struct UrlPending {
-    rx: std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-    waiter: Option<Waiter>,
-    ctx: Option<Box<forward::PendingUrlContext>>,
 }
 
 struct ServerState {
@@ -270,14 +292,11 @@ struct ServerState {
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
     prefetch_queue: std::collections::VecDeque<Refresh>,
-    /// In-flight socket-backend requests, one per slot, driven when their
-    /// descriptor fires. Each entry carries the non-blocking upstream, the pool
-    /// member it was taken from, the backend name, and who waits for the reply.
-    socket_upstreams: Slots<SocketUpstreamEntry>,
-    /// URL-backend requests on their own thread, polled once per iteration
-    /// because the thread has no descriptor. The one channel kind that remains
-    /// until EL-5b.
-    url_pending: Vec<UrlPending>,
+    /// In-flight backend requests, one per slot, driven when their descriptor
+    /// fires. Each entry carries the non-blocking upstream, what it belongs to
+    /// (a pool member or a URL backend), the backend name, and who waits for
+    /// the reply.
+    upstreams: Slots<UpstreamEntry>,
     /// The read timeout (handshakes and HTTP/1.1), as deadlines.
     read_timeouts: Timeouts,
     /// The HTTP/2 idle timeout, as deadlines.
@@ -1180,8 +1199,8 @@ fn park(
     waiter: Waiter,
 ) {
     match id {
-        UpstreamId::Socket(slot) => {
-            let e = state.socket_upstreams.get_mut(slot);
+        UpstreamId::Slot(slot) => {
+            let e = state.upstreams.get_mut(slot);
             e.waiter = Some(waiter);
             e.ctx = Some(ctx);
         }
@@ -1190,11 +1209,6 @@ fn park(
         }
         UpstreamId::H2s { conn, stream } => {
             state.h2s_pool.set_waiter(conn, stream, waiter, ctx);
-        }
-        UpstreamId::Url(idx) => {
-            let e = &mut state.url_pending[idx];
-            e.waiter = Some(waiter);
-            e.ctx = Some(ctx);
         }
     }
 }
@@ -1299,108 +1313,234 @@ fn complete_waiter(
     }
 }
 
-/// Drive the one socket upstream whose descriptor fired.
-fn drive_socket_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
-    let Source::SocketUpstream(slot) = *cx.state.sources.get(token.0) else {
+/// Complete each finished h2 stream into the waiter it names.
+#[allow(clippy::too_many_arguments)] // the loop's whole context, as CompletionCtx::new takes it
+fn complete_h2_streams(
+    completions: Vec<H2Completion>,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::mio::Registry,
+    quic_port: u16,
+    udp: &UdpSocket,
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+) {
+    for c in completions {
+        if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
+            let mut cx = CompletionCtx::new(
+                state,
+                tcp,
+                h2c,
+                registry,
+                quic_port,
+                udp,
+                connections,
+                Instant::now(),
+            );
+            complete_waiter(c.result, ctx, waiter, &mut cx);
+        }
+    }
+}
+
+/// Drive the one upstream whose descriptor fired.
+fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
+    let Source::Upstream(slot) = *cx.state.sources.get(token.0) else {
         return;
     };
     let result = {
-        let entry = cx.state.socket_upstreams.get_mut(slot);
-        let Some(upstream) = entry.upstream.as_mut() else {
-            return;
-        };
-        let interest = upstream.interest();
-        if interest != entry.registered_interest {
-            cx.registry
-                .reregister(&mut SourceFd(&upstream.raw_fd()), token, interest)
-                .ok();
-            entry.registered_interest = interest;
-        }
+        let entry = cx.state.upstreams.get_mut(slot);
+        let upstream = &mut entry.upstream;
         match upstream.drive() {
-            Some(result) => {
-                cx.registry
-                    .deregister(&mut SourceFd(&upstream.raw_fd()))
-                    .ok();
-                Some(result)
+            Ok(true) => {
+                let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
+                    m6_core::client::MAX_HEADERS] =
+                    [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
+                match upstream.reply(&mut slots) {
+                    Some(reply) => {
+                        cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                        Some(Ok(forward::HttpResponse::from_reply(&reply)))
+                    }
+                    None => {
+                        cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                        Some(Err(std::io::Error::other(
+                            "upstream reported a reply but none parsed",
+                        )))
+                    }
+                }
             }
-            None => None,
+            Ok(false) => {
+                // The request is not finished, and `drive` moved the phase on:
+                // Connecting waits for WRITABLE, then the request or the
+                // ClientHello is written and it waits for READABLE. The new
+                // interest is registered after the drive, because under epoll
+                // edge-triggering a mask written before it waits for an edge
+                // that may never arrive. Only a change costs a reregister.
+                let interest = upstream.interest();
+                if interest != entry.registered_interest {
+                    cx.registry
+                        .reregister(&mut SourceFd(&upstream.fd()), token, interest)
+                        .ok();
+                    entry.registered_interest = interest;
+                }
+                None
+            }
+            Err(e) => {
+                cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                Some(Err(e))
+            }
         }
     };
     let Some(result) = result else {
         return;
     };
-    let entry = cx.state.socket_upstreams.get_mut(slot);
-    let member_idx = entry.member_idx;
-    let backend_name = std::mem::take(&mut entry.backend_name);
-    let waiter = entry.waiter.take();
-    let ctx = entry.ctx.take();
-    entry.upstream.take();
-    cx.state.socket_upstreams.free(slot);
-    *cx.state.sources.get_mut(token.0) = Source::Vacant;
-    cx.state.sources.free(token.0);
-    cx.state.upstream_timeouts.clear(token);
-    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
-        if result.is_err() {
-            pool.mark_failed(member_idx);
-        } else {
-            pool.release(member_idx);
-        }
-    }
+    let (waiter, ctx) = retire_upstream(token, slot, &result, cx);
     if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
         complete_waiter(result, ctx, waiter, cx);
     }
 }
 
-/// Close the socket upstream whose deadline passed.
-fn expire_socket_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
-    let Source::SocketUpstream(slot) = *cx.state.sources.get(token.0) else {
+/// Take a finished upstream out of the loop: free its token, its deadline and
+/// its slot, and tell its owner how the request went.
+///
+/// A socket member is released or backed off. A URL backend whose reply left
+/// the connection reusable keeps its slot on that backend's idle list, still
+/// registered for read, so the backend closing it wakes the loop and the slot
+/// is dropped before any request can be handed the dead connection.
+fn retire_upstream(
+    token: Token,
+    slot: usize,
+    result: &std::io::Result<forward::HttpResponse>,
+    cx: &mut CompletionCtx<'_>,
+) -> (Option<Waiter>, Option<Box<forward::PendingUrlContext>>) {
+    let (kind, member_idx, waiter, ctx, reusable) = {
+        let entry = cx.state.upstreams.get_mut(slot);
+        (
+            entry.kind,
+            entry.member_idx,
+            entry.waiter.take(),
+            entry.ctx.take(),
+            entry.upstream.reusable(),
+        )
+    };
+    let mut kept = false;
+    match kind {
+        UpstreamKind::Member => {
+            let entry = cx.state.upstreams.get_mut(slot);
+            entry.upstream.close();
+            // Release the member using a borrow of the slot's name, before the
+            // slot is freed, so the name buffer survives for the next launch.
+            if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
+                if result.is_err() {
+                    pool.mark_failed(member_idx);
+                } else {
+                    pool.release(member_idx);
+                }
+            }
+            cx.state.upstreams.free(slot);
+        }
+        UpstreamKind::Url(idx) => {
+            kept = result.is_ok()
+                && reusable
+                && cx.state.pool_manager.url_backend_mut(idx).idle.push(slot);
+            if kept {
+                let entry = cx.state.upstreams.get_mut(slot);
+                entry.kind = UpstreamKind::IdleUrl(idx);
+                let interest = Interest::READABLE;
+                cx.registry
+                    .register(&mut SourceFd(&entry.upstream.fd()), token, interest)
+                    .ok();
+                entry.registered_interest = interest;
+            } else {
+                cx.state.upstreams.get_mut(slot).upstream.close();
+                cx.state.upstreams.free(slot);
+            }
+        }
+        // An idle slot has no request to retire; its own event path drops it.
+        UpstreamKind::IdleUrl(_) => {
+            cx.state.upstreams.get_mut(slot).upstream.close();
+            cx.state.upstreams.free(slot);
+        }
+    }
+    if !kept {
+        *cx.state.sources.get_mut(token.0) = Source::Vacant;
+        cx.state.sources.free(token.0);
+    }
+    cx.state.upstream_timeouts.clear(token);
+    (waiter, ctx)
+}
+
+/// Drop an idle URL connection whose descriptor fired.
+///
+/// It has no request, so a readable event means the backend closed it or sent
+/// something unexpected. Either way the connection is not reusable, and it is
+/// closed here so no request is handed it.
+fn drop_idle_url(
+    slot: usize,
+    backend_idx: usize,
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+) {
+    let token = state.upstreams.get(slot).token;
+    registry
+        .deregister(&mut SourceFd(&state.upstreams.get(slot).upstream.fd()))
+        .ok();
+    state.upstreams.get_mut(slot).upstream.close();
+    state.upstreams.free(slot);
+    state
+        .pool_manager
+        .url_backend_mut(backend_idx)
+        .idle
+        .remove(slot);
+    *state.sources.get_mut(token.0) = Source::Vacant;
+    state.sources.free(token.0);
+    state.upstream_timeouts.clear(token);
+    debug!(
+        backend = %state.pool_manager.url_backend(backend_idx).name,
+        "idle url connection dropped"
+    );
+}
+
+/// Close the upstream whose deadline passed.
+fn expire_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
+    let Source::Upstream(slot) = *cx.state.sources.get(token.0) else {
         return;
     };
-    let entry = cx.state.socket_upstreams.get_mut(slot);
-    if let Some(upstream) = entry.upstream.take() {
-        cx.registry
-            .deregister(&mut SourceFd(&upstream.raw_fd()))
-            .ok();
-    }
-    let member_idx = entry.member_idx;
-    let backend_name = std::mem::take(&mut entry.backend_name);
-    let waiter = entry.waiter.take();
-    let ctx = entry.ctx.take();
-    cx.state.socket_upstreams.free(slot);
-    *cx.state.sources.get_mut(token.0) = Source::Vacant;
-    cx.state.sources.free(token.0);
-    if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
-        pool.mark_failed(member_idx);
-    }
+    cx.registry
+        .deregister(&mut SourceFd(&cx.state.upstreams.get(slot).upstream.fd()))
+        .ok();
+    let timed_out = Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "backend timed out",
+    ));
+    let (waiter, ctx) = retire_upstream(token, slot, &timed_out, cx);
     if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
-        complete_waiter(
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "backend timed out",
-            )),
-            ctx,
-            waiter,
-            cx,
-        );
+        complete_waiter(timed_out, ctx, waiter, cx);
     }
 }
 
-/// Ensure an h2c pool connection exists for `url`, registering a new one under
+/// Ensure an h2c pool connection exists for a URL backend, registering it under
 /// its own token. A token is taken first, so a full table fails before any
 /// connection is created, and every failure frees what it took.
 fn ensure_h2c_conn(
     state: &mut ServerState,
-    url: &str,
+    backend_idx: usize,
     registry: &m6_core::mio::Registry,
-) -> std::io::Result<()> {
-    let token =
-        take_token(state).ok_or_else(|| std::io::Error::other("no token for h2c upstream"))?;
-    let created = match state.h2c_pool.ensure_connection(url) {
+) -> Result<(), UrlDispatchError> {
+    let Some(token) = take_token(state) else {
+        return Err(UrlDispatchError::NoSlot);
+    };
+    let created = {
+        let backend = state.pool_manager.url_backend(backend_idx);
+        state
+            .h2c_pool
+            .ensure_connection(&backend.url, backend.addr())
+    };
+    let created = match created {
         Ok(c) => c,
         Err(e) => {
             *state.sources.get_mut(token.0) = Source::Vacant;
             state.sources.free(token.0);
-            return Err(e);
+            return Err(UrlDispatchError::Failed(e));
         }
     };
     if !created {
@@ -1410,42 +1550,53 @@ fn ensure_h2c_conn(
         return Ok(());
     }
     let registered = {
-        let conn = state.h2c_pool.connection_mut(url).expect("just created");
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let conn = state
+            .h2c_pool
+            .connection_mut(&backend.url)
+            .expect("just created");
         conn.set_token(token);
-        conn.set_interest(Interest::READABLE | Interest::WRITABLE);
-        registry.register(
-            &mut SourceFd(&conn.raw_fd()),
-            token,
-            Interest::READABLE | Interest::WRITABLE,
-        )
+        let interest = conn.phase_interest();
+        conn.set_interest(interest);
+        registry.register(&mut SourceFd(&conn.raw_fd()), token, interest)
     };
     if let Err(e) = registered {
         state.h2c_pool.remove_by_token(token, registry);
         *state.sources.get_mut(token.0) = Source::Vacant;
         state.sources.free(token.0);
-        return Err(e);
+        return Err(UrlDispatchError::Failed(e));
     }
     *state.sources.get_mut(token.0) = Source::H2cUpstream;
     Ok(())
 }
 
-/// Ensure an h2s pool connection exists for `url`, registering a new one under
+/// Ensure an h2s pool connection exists for a URL backend, registering it under
 /// its own token. A token is taken first, so a full table fails before any
 /// connection is created, and every failure frees what it took.
 fn ensure_h2s_conn(
     state: &mut ServerState,
-    url: &str,
-    tls: std::sync::Arc<rustls::ClientConfig>,
+    backend_idx: usize,
     registry: &m6_core::mio::Registry,
-) -> std::io::Result<()> {
-    let token =
-        take_token(state).ok_or_else(|| std::io::Error::other("no token for h2s upstream"))?;
-    let created = match state.h2s_pool.ensure_connection(url, tls) {
+) -> Result<(), UrlDispatchError> {
+    let Some(token) = take_token(state) else {
+        return Err(UrlDispatchError::NoSlot);
+    };
+    let created = {
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let tls = backend
+            .tls
+            .as_ref()
+            .expect("an h2s backend's TLS client is built at start");
+        state
+            .h2s_pool
+            .ensure_connection(&backend.url, backend.addr(), tls)
+    };
+    let created = match created {
         Ok(c) => c,
         Err(e) => {
             *state.sources.get_mut(token.0) = Source::Vacant;
             state.sources.free(token.0);
-            return Err(e);
+            return Err(UrlDispatchError::Failed(e));
         }
     };
     if !created {
@@ -1454,20 +1605,21 @@ fn ensure_h2s_conn(
         return Ok(());
     }
     let registered = {
-        let conn = state.h2s_pool.connection_mut(url).expect("just created");
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let conn = state
+            .h2s_pool
+            .connection_mut(&backend.url)
+            .expect("just created");
         conn.set_token(token);
-        conn.set_interest(Interest::READABLE | Interest::WRITABLE);
-        registry.register(
-            &mut SourceFd(&conn.raw_fd()),
-            token,
-            Interest::READABLE | Interest::WRITABLE,
-        )
+        let interest = conn.phase_interest();
+        conn.set_interest(interest);
+        registry.register(&mut SourceFd(&conn.raw_fd()), token, interest)
     };
     if let Err(e) = registered {
         state.h2s_pool.remove_by_token(token, registry);
         *state.sources.get_mut(token.0) = Source::Vacant;
         state.sources.free(token.0);
-        return Err(e);
+        return Err(UrlDispatchError::Failed(e));
     }
     *state.sources.get_mut(token.0) = Source::H2sUpstream;
     Ok(())
@@ -1574,14 +1726,17 @@ fn event_loop(
     let mut accepting = tcp.is_some() || h2c.is_some();
 
     'run: loop {
-        // The wait is the earliest deadline among the read, h2 idle and socket
-        // upstream timeouts, the QUIC timeout and the accounting tick. It stays
-        // capped at 10 ms until EL-5b removes the cap.
-        let tick = std::time::Duration::from_millis(10);
+        // The wait is the earliest of three bounds: the 1 s accounting tick,
+        // every deadline table (connections, upstreams and h2 streams), and
+        // quiche's own timeout over the QUIC connections. Nothing else needs a
+        // shorter wait: every reply arrives on a descriptor.
+        let tick = std::time::Duration::from_secs(1);
         let now0 = std::time::Instant::now();
         let mut poll_timeout = state.read_timeouts.timeout(now0, tick);
         poll_timeout = poll_timeout.min(state.h2_idle_timeouts.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.upstream_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.h2c_pool.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.h2s_pool.timeout(now0, tick));
         let quic_timeout = connections
             .values()
             .filter_map(|c| c.conn.timeout())
@@ -1687,21 +1842,16 @@ fn event_loop(
                             state.sources.free(k);
                         }
                         let completions = state.h2c_pool.drain_completions();
-                        for c in completions {
-                            if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
-                                let mut cx = CompletionCtx::new(
-                                    &mut *state,
-                                    &mut tcp,
-                                    &mut h2c,
-                                    poll.registry(),
-                                    quic_port,
-                                    &udp,
-                                    &mut connections,
-                                    now,
-                                );
-                                complete_waiter(c.result, ctx, waiter, &mut cx);
-                            }
-                        }
+                        complete_h2_streams(
+                            completions,
+                            state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
+                            quic_port,
+                            &udp,
+                            &mut connections,
+                        );
                     }
                     Source::H2sUpstream => {
                         if state.h2s_pool.drive_one(Token(k), poll.registry()) {
@@ -1710,34 +1860,33 @@ fn event_loop(
                             state.sources.free(k);
                         }
                         let completions = state.h2s_pool.drain_completions();
-                        for c in completions {
-                            if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
-                                let mut cx = CompletionCtx::new(
-                                    &mut *state,
-                                    &mut tcp,
-                                    &mut h2c,
-                                    poll.registry(),
-                                    quic_port,
-                                    &udp,
-                                    &mut connections,
-                                    now,
-                                );
-                                complete_waiter(c.result, ctx, waiter, &mut cx);
-                            }
-                        }
-                    }
-                    Source::SocketUpstream(_) => {
-                        let mut cx = CompletionCtx::new(
-                            &mut *state,
+                        complete_h2_streams(
+                            completions,
+                            state,
                             &mut tcp,
                             &mut h2c,
                             poll.registry(),
                             quic_port,
                             &udp,
                             &mut connections,
-                            now,
                         );
-                        drive_socket_upstream_one(Token(k), &mut cx);
+                    }
+                    Source::Upstream(slot) => {
+                        if let UpstreamKind::IdleUrl(backend_idx) = state.upstreams.get(slot).kind {
+                            drop_idle_url(slot, backend_idx, state, poll.registry());
+                        } else {
+                            let mut cx = CompletionCtx::new(
+                                &mut *state,
+                                &mut tcp,
+                                &mut h2c,
+                                poll.registry(),
+                                quic_port,
+                                &udp,
+                                &mut connections,
+                                now,
+                            );
+                            drive_upstream_one(Token(k), &mut cx);
+                        }
                     }
                     Source::Vacant => {}
                 },
@@ -1763,8 +1912,41 @@ fn event_loop(
                 &mut connections,
                 now,
             );
-            expire_socket_upstream(token, &mut cx);
+            expire_upstream(token, &mut cx);
         }
+        let now2 = Instant::now();
+        let (dead, completions) = state.h2c_pool.expire(now2, poll.registry());
+        for token in dead {
+            state.h2c_pool.remove_by_token(token, poll.registry());
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+        }
+        complete_h2_streams(
+            completions,
+            state,
+            &mut tcp,
+            &mut h2c,
+            poll.registry(),
+            quic_port,
+            &udp,
+            &mut connections,
+        );
+        let (dead, completions) = state.h2s_pool.expire(now2, poll.registry());
+        for token in dead {
+            state.h2s_pool.remove_by_token(token, poll.registry());
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+        }
+        complete_h2_streams(
+            completions,
+            state,
+            &mut tcp,
+            &mut h2c,
+            poll.registry(),
+            quic_port,
+            &udp,
+            &mut connections,
+        );
 
         // A slot came free while the token table was full: accept again.
         if !accepting && !state.sources.is_full() {
@@ -1774,40 +1956,6 @@ fn event_loop(
 
         // Drive connection timeouts and flush pending sends.
         flush_all(&udp, &mut connections);
-
-        // Poll pending URL-backend replies, the one channel kind that remains:
-        // their thread has no descriptor that wakes the loop.
-        let mut idx = 0;
-        while idx < state.url_pending.len() {
-            use std::sync::mpsc::TryRecvError;
-            let got = match state.url_pending[idx].rx.try_recv() {
-                Ok(r) => Some(r),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "url backend thread died",
-                ))),
-            };
-            match got {
-                Some(result) => {
-                    let entry = state.url_pending.swap_remove(idx);
-                    if let (Some(waiter), Some(ctx)) = (entry.waiter, entry.ctx) {
-                        let mut cx = CompletionCtx::new(
-                            &mut *state,
-                            &mut tcp,
-                            &mut h2c,
-                            poll.registry(),
-                            quic_port,
-                            &udp,
-                            &mut connections,
-                            now,
-                        );
-                        complete_waiter(result, ctx, waiter, &mut cx);
-                    }
-                }
-                None => idx += 1,
-            }
-        }
 
         // Remove closed/timed-out connections.
         connections.retain(|_, c| !c.conn.is_closed());
@@ -1847,9 +1995,7 @@ fn event_loop(
                         unreachable!("a background fetch is a miss, never a cached hit")
                     }
                     RequestOutcome::Pending { id, ctx } => {
-                        if state.url_pending.len() < MAX_REFRESH_QUEUE {
-                            park(state, id, ctx, Waiter::Background);
-                        }
+                        park(state, id, ctx, Waiter::Background);
                     }
                 }
             }
@@ -2832,6 +2978,169 @@ fn origin_host<'a>(req: &'a forward::HttpRequest, config: &'a config::Config) ->
         .unwrap_or(config.site.domain.as_str())
 }
 
+/// Why a URL dispatch failed, so the caller can answer it.
+enum UrlDispatchError {
+    /// No upstream slot came free: the process is at its open-file ceiling.
+    NoSlot,
+    Failed(std::io::Error),
+}
+
+/// Dispatch one request to a URL backend: an h2 stream for the h2 schemes, a
+/// loop-driven `client::Upstream` slot for http and https.
+fn dispatch_url_backend(
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    backend_idx: usize,
+) -> Result<UpstreamId, UrlDispatchError> {
+    debug!(
+        backend = %state.pool_manager.url_backend(backend_idx).name,
+        "url backend dispatch"
+    );
+    match state.pool_manager.url_backend(backend_idx).scheme {
+        pool::UrlScheme::H2c => {
+            ensure_h2c_conn(state, backend_idx, registry)?;
+            let original_host = origin_host(req, &state.config).to_string();
+            let backend = state.pool_manager.url_backend(backend_idx);
+            let (conn, stream) = state
+                .h2c_pool
+                .dispatch(&backend.url, req, client_ip, &original_host, registry)
+                .map_err(UrlDispatchError::Failed)?;
+            Ok(UpstreamId::H2c { conn, stream })
+        }
+        pool::UrlScheme::H2s => {
+            ensure_h2s_conn(state, backend_idx, registry)?;
+            let original_host = origin_host(req, &state.config).to_string();
+            let backend = state.pool_manager.url_backend(backend_idx);
+            let (conn, stream) = state
+                .h2s_pool
+                .dispatch(&backend.url, req, client_ip, &original_host, registry)
+                .map_err(UrlDispatchError::Failed)?;
+            Ok(UpstreamId::H2s { conn, stream })
+        }
+        pool::UrlScheme::Http | pool::UrlScheme::Https => {
+            launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
+        }
+    }
+}
+
+/// Start one request to a URL backend on a loop-driven `client::Upstream`.
+///
+/// The request takes an idle slot whose connection to this backend is open and
+/// watched when one is free, and otherwise a free slot, which makes a new
+/// connection. The slot's key is returned so the caller can park the waiter
+/// there.
+fn launch_url_upstream(
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    backend_idx: usize,
+) -> Result<usize, UrlDispatchError> {
+    let addr = state.pool_manager.url_backend(backend_idx).addr();
+    let now = Instant::now();
+    let deadline = now + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+    let head = req.method.eq_ignore_ascii_case("HEAD");
+
+    // An idle connection first: its key is not in the free list, and its
+    // descriptor is registered under the token it kept while waiting.
+    let (key, token, watched) = match state.pool_manager.url_backend_mut(backend_idx).idle.take() {
+        Some(key) => {
+            let token = state.upstreams.get(key).token;
+            (key, token, true)
+        }
+        None => {
+            let Some(token) = take_token(state) else {
+                return Err(UrlDispatchError::NoSlot);
+            };
+            let Some(taken) = state.upstreams.take() else {
+                *state.sources.get_mut(token.0) = Source::Vacant;
+                state.sources.free(token.0);
+                return Err(UrlDispatchError::NoSlot);
+            };
+            (taken.key, token, false)
+        }
+    };
+
+    let encoded = {
+        // Disjoint fields: the backend's authority and the request's origin are
+        // read while the slot's request buffer is written.
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let original_host = origin_host(req, &state.config);
+        let entry = state.upstreams.get_mut(key);
+        forward::encode_url_request(
+            entry.upstream.request_buf(),
+            req,
+            &backend.host,
+            client_ip,
+            original_host,
+        )
+    };
+    if let Err(e) = encoded {
+        if watched {
+            // The connection is untouched, so keep it for the next request.
+            state
+                .pool_manager
+                .url_backend_mut(backend_idx)
+                .idle
+                .push(key);
+        } else {
+            state.upstreams.free(key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+        }
+        return Err(UrlDispatchError::Failed(e));
+    }
+    if watched {
+        // Drop the idle registration so a failed start cannot leave a stale
+        // one; the slot's descriptor is registered again below.
+        registry
+            .deregister(&mut SourceFd(&state.upstreams.get(key).upstream.fd()))
+            .ok();
+    }
+    let started = {
+        let tls = state.pool_manager.url_backend(backend_idx).tls.as_ref();
+        let entry = state.upstreams.get_mut(key);
+        entry
+            .upstream
+            .start(&m6_core::client::Addr::Tcp(addr), tls, head, deadline)
+            .map_err(UrlDispatchError::Failed)
+    };
+    if let Err(e) = started {
+        state.upstreams.get_mut(key).upstream.close();
+        state.upstreams.free(key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(e);
+    }
+    let interest = state.upstreams.get_mut(key).upstream.interest();
+    let registered = registry.register(
+        &mut SourceFd(&state.upstreams.get(key).upstream.fd()),
+        token,
+        interest,
+    );
+    if let Err(e) = registered {
+        state.upstreams.get_mut(key).upstream.close();
+        state.upstreams.free(key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(UrlDispatchError::Failed(e));
+    }
+    state.upstream_timeouts.touch(token, now);
+    *state.sources.get_mut(token.0) = Source::Upstream(key);
+    let entry = state.upstreams.get_mut(key);
+    entry.token = token;
+    entry.addr = m6_core::client::Addr::Tcp(addr);
+    entry.kind = UpstreamKind::Url(backend_idx);
+    entry.member_idx = 0;
+    entry.backend_name.clear();
+    entry.waiter = None;
+    entry.ctx = None;
+    entry.registered_interest = interest;
+    Ok(key)
+}
+
 /// Why a socket-upstream launch failed, so the two callers can answer it their
 /// own way: the main socket branch answers 502 or 503, the custom-error-page
 /// branch falls back to the internal page.
@@ -2843,14 +3152,14 @@ enum SocketLaunchError {
     Register(std::io::Error),
 }
 
-/// Encode already done by the caller; this takes the member, starts the
-/// non-blocking upstream, registers it, and parks it in `socket_upstreams`.
+/// Encode the request into the slot's buffer, take the member, start the
+/// non-blocking upstream, register it, and park it in `upstreams`.
 /// Returns the upstream's slot key, so the caller can store its waiter there.
 fn launch_socket_upstream(
     state: &mut ServerState,
     registry: &m6_core::mio::Registry,
-    request: Vec<u8>,
-    method: &str,
+    req: &forward::HttpRequest,
+    client_ip: &str,
     backend_name: &str,
     timeout: std::time::Duration,
 ) -> Result<usize, SocketLaunchError> {
@@ -2859,56 +3168,93 @@ fn launch_socket_upstream(
         None => return Err(SocketLaunchError::UnknownBackend),
     };
     let deadline = std::time::Instant::now() + timeout;
-    let upstream = match forward::SocketUpstream::start(socket_path, request, method, deadline) {
-        Ok(u) => u,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+    let Some(owner) = state.upstreams.take() else {
+        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+            pool.cancel(member_idx);
+        }
+        return Err(SocketLaunchError::BacklogFull);
+    };
+    // Update the slot's address in place while the member's path is still
+    // borrowed, then the borrow ends and the token table can be taken.
+    {
+        let entry = state.upstreams.get_mut(owner.key);
+        match &mut entry.addr {
+            m6_core::client::Addr::Unix(existing) => {
+                existing.clear();
+                existing.push(socket_path);
+            }
+            m6_core::client::Addr::Tcp(_) => {
+                entry.addr = m6_core::client::Addr::Unix(socket_path.to_path_buf());
+            }
+        }
+    }
+    let Some(token) = take_token(state) else {
+        state.upstreams.free(owner.key);
+        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+            pool.cancel(member_idx);
+        }
+        return Err(SocketLaunchError::BacklogFull);
+    };
+
+    let started = {
+        let entry = state.upstreams.get_mut(owner.key);
+        let original_host = origin_host(req, &state.config);
+        let buf = entry.upstream.request_buf();
+        if let Err(e) = forward::encode_request(buf, req, client_ip, original_host) {
+            Err(e)
+        } else {
+            entry.upstream.start(
+                &entry.addr,
+                None,
+                req.method.eq_ignore_ascii_case("HEAD"),
+                deadline,
+            )
+        }
+    };
+    if let Err(e) = started {
+        state.upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        if e.kind() == std::io::ErrorKind::WouldBlock {
             if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
                 pool.cancel(member_idx);
             }
             return Err(SocketLaunchError::BacklogFull);
         }
-        Err(e) => {
-            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-                pool.mark_failed(member_idx);
-            }
-            return Err(SocketLaunchError::Connect(e));
-        }
-    };
-    let Some(token) = take_token(state) else {
-        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-            pool.cancel(member_idx);
-        }
-        return Err(SocketLaunchError::BacklogFull);
-    };
-    let Some(owner) = state.socket_upstreams.take() else {
-        state.sources.free(token.0);
-        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-            pool.cancel(member_idx);
-        }
-        return Err(SocketLaunchError::BacklogFull);
-    };
-    let interest = upstream.interest();
-    if let Err(e) = registry.register(&mut SourceFd(&upstream.raw_fd()), token, interest) {
-        state.socket_upstreams.free(owner.key);
-        *state.sources.get_mut(token.0) = Source::Vacant;
-        state.sources.free(token.0);
         if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
             pool.mark_failed(member_idx);
         }
-        return Err(SocketLaunchError::Register(e));
+        return Err(SocketLaunchError::Connect(e));
     }
+
+    let interest = {
+        let entry = state.upstreams.get_mut(owner.key);
+        let interest = entry.upstream.interest();
+        if let Err(e) = registry.register(&mut SourceFd(&entry.upstream.fd()), token, interest) {
+            entry.upstream.close();
+            state.upstreams.free(owner.key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
+                pool.mark_failed(member_idx);
+            }
+            return Err(SocketLaunchError::Register(e));
+        }
+        interest
+    };
     state
         .upstream_timeouts
         .touch(token, std::time::Instant::now());
-    *state.sources.get_mut(token.0) = Source::SocketUpstream(owner.key);
-    *state.socket_upstreams.get_mut(owner.key) = SocketUpstreamEntry {
-        upstream: Some(upstream),
-        member_idx,
-        backend_name: backend_name.to_string(),
-        waiter: None,
-        ctx: None,
-        registered_interest: interest,
-    };
+    *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
+    let entry = state.upstreams.get_mut(owner.key);
+    entry.kind = UpstreamKind::Member;
+    entry.token = token;
+    entry.member_idx = member_idx;
+    entry.backend_name.clear();
+    entry.backend_name.push_str(backend_name);
+    entry.waiter = None;
+    entry.ctx = None;
+    entry.registered_interest = interest;
     Ok(owner.key)
 }
 
@@ -3288,12 +3634,8 @@ fn handle_request_inner(
         route.require.is_none() && m6_http_lib::cache::method_may_write_cache(&req.method);
     let backend_name = route.backend.clone();
 
-    // Check if URL backend — dispatch async.
-    let original_host = origin_host(req, &state.config).to_string();
-    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-
-    if let Some((url, _tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
-        let url = url.to_string();
+    // A URL backend: an h2 stream, or a loop-driven upstream slot.
+    if let Some(backend_idx) = state.pool_manager.find_url(&backend_name) {
         let ctx = forward::PendingUrlContext {
             req: req.clone(),
             client_ip: client_ip.to_string(),
@@ -3307,59 +3649,28 @@ fn handle_request_inner(
             error_status_override: None,
             extra_headers: Vec::new(),
         };
-
-        let id = if url.starts_with("h2c://") {
-            // Persistent non-blocking H2C client — event-loop managed.
-            match ensure_h2c_conn(state, &url, registry).and_then(|()| {
-                state
-                    .h2c_pool
-                    .dispatch(&url, req, client_ip, &original_host, registry)
-            }) {
-                Ok((conn, stream)) => UpstreamId::H2c { conn, stream },
-                Err(e) => {
-                    warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
-                    let ctx = error::ErrorContext {
-                        route: Some(route.path.clone()),
-                        backend: Some(backend_name.clone()),
-                        detail: Some(e.to_string()),
-                    };
-                    return request_error(502, req, client_ip, state, Some(&ctx), registry);
-                }
+        let id = match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
+            Ok(id) => id,
+            Err(UrlDispatchError::NoSlot) => {
+                return backend_unavailable(
+                    req,
+                    client_ip,
+                    state,
+                    registry,
+                    &route.path,
+                    &backend_name,
+                    "backend connection table full",
+                );
             }
-        } else if url.starts_with("h2s://") {
-            // Persistent non-blocking H2S (HTTP/2 over TLS) client — event-loop managed.
-            match ensure_h2s_conn(state, &url, _tls_config.clone(), registry).and_then(|()| {
-                state
-                    .h2s_pool
-                    .dispatch(&url, req, client_ip, &original_host, registry)
-            }) {
-                Ok((conn, stream)) => UpstreamId::H2s { conn, stream },
-                Err(e) => {
-                    warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
-                    let ctx = error::ErrorContext {
-                        route: Some(route.path.clone()),
-                        backend: Some(backend_name.clone()),
-                        detail: Some(e.to_string()),
-                    };
-                    return request_error(502, req, client_ip, state, Some(&ctx), registry);
-                }
+            Err(UrlDispatchError::Failed(e)) => {
+                warn!(backend = %backend_name, error = %e, "url backend dispatch failed");
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some(e.to_string()),
+                };
+                return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
             }
-        } else {
-            let rx = forward::dispatch_url_request(
-                url,
-                req.clone(),
-                client_ip.to_string(),
-                original_host.to_string(),
-                Some(timeout),
-                _tls_config,
-            );
-            let idx = state.url_pending.len();
-            state.url_pending.push(UrlPending {
-                rx,
-                waiter: None,
-                ctx: None,
-            });
-            UpstreamId::Url(idx)
         };
         return RequestOutcome::Pending {
             id,
@@ -3371,31 +3682,11 @@ fn handle_request_inner(
     // arrives on the entry's channel and is finished by complete_socket_response
     // (reached from finalize_url_response), which keeps the socket branch's own
     // completion semantics.
-    let original_host = origin_host(req, &state.config);
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
     let backend_start = std::time::Instant::now();
 
-    let request = match forward::encode_request(req, client_ip, original_host) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(backend = %backend_name, error = %e, "backend error");
-            let err_ctx = error::ErrorContext {
-                route: Some(route.path.clone()),
-                backend: Some(backend_name.clone()),
-                detail: Some(e.to_string()),
-            };
-            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
-        }
-    };
-
-    let slot = match launch_socket_upstream(
-        state,
-        registry,
-        request,
-        &req.method,
-        &backend_name,
-        timeout,
-    ) {
+    let slot = match launch_socket_upstream(state, registry, req, client_ip, &backend_name, timeout)
+    {
         Ok(slot) => slot,
         Err(SocketLaunchError::UnknownBackend) => {
             warn!(backend = %backend_name, "unknown backend");
@@ -3419,22 +3710,15 @@ fn handle_request_inner(
             // The listen backlog is full: the member is alive and busy (E2,
             // the kernel is the queue). Release the slot without marking it
             // failed and answer 503.
-            let err_ctx = error::ErrorContext {
-                route: Some(route.path.clone()),
-                backend: Some(backend_name.clone()),
-                detail: Some("backend listen queue full".to_string()),
-            };
-            match apply_error_mode(503, req, client_ip, state, Some(&err_ctx), registry) {
-                ErrorOutcome::Ready(s, mut h, b, n) => {
-                    h.push(("Retry-After".to_string(), "1".to_string()));
-                    return RequestOutcome::Ready(s, h, b, n);
-                }
-                ErrorOutcome::Pending { id, mut ctx } => {
-                    ctx.extra_headers
-                        .push(("Retry-After".to_string(), "1".to_string()));
-                    return RequestOutcome::Pending { id, ctx };
-                }
-            }
+            return backend_unavailable(
+                req,
+                client_ip,
+                state,
+                registry,
+                &route.path,
+                &backend_name,
+                "backend listen queue full",
+            );
         }
         Err(SocketLaunchError::Connect(e)) => {
             warn!(backend = %backend_name, error = %e, "backend error");
@@ -3460,7 +3744,7 @@ fn handle_request_inner(
         req: req.clone(),
         client_ip: client_ip.to_string(),
         enc: content_encoding.to_string(),
-        backend_name: backend_name.clone(),
+        backend_name,
         kind: forward::PendingKind::Socket,
         route_path: Some(route.path.clone()),
         cacheable,
@@ -3470,8 +3754,40 @@ fn handle_request_inner(
         extra_headers: Vec::new(),
     };
     RequestOutcome::Pending {
-        id: UpstreamId::Socket(slot),
+        id: UpstreamId::Slot(slot),
         ctx: Box::new(ctx),
+    }
+}
+
+/// Answer 503 with `Retry-After: 1` through the error mode.
+///
+/// An upstream the process cannot start a connection to right now answers
+/// this: a full upstream table for a URL backend, a full listen queue for a
+/// socket one. Both are transient, so the client is told to retry.
+fn backend_unavailable(
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    state: &mut ServerState,
+    registry: &m6_core::mio::Registry,
+    route_path: &str,
+    backend_name: &str,
+    detail: &str,
+) -> RequestOutcome {
+    let err_ctx = error::ErrorContext {
+        route: Some(route_path.to_string()),
+        backend: Some(backend_name.to_string()),
+        detail: Some(detail.to_string()),
+    };
+    match apply_error_mode(503, req, client_ip, state, Some(&err_ctx), registry) {
+        ErrorOutcome::Ready(s, mut h, b, n) => {
+            h.push(("Retry-After".to_string(), "1".to_string()));
+            RequestOutcome::Ready(s, h, b, n)
+        }
+        ErrorOutcome::Pending { id, mut ctx } => {
+            ctx.extra_headers
+                .push(("Retry-After".to_string(), "1".to_string()));
+            RequestOutcome::Pending { id, ctx }
+        }
     }
 }
 
@@ -3512,7 +3828,7 @@ fn check_rate_limit(
 
 /// Try to fetch the configured `[errors] mode = "custom"` error page without
 /// blocking the loop: a URL/H2C/H2S backend is dispatched to its own thread or
-/// pool, and a socket backend to a non-blocking `SocketUpstream`, both carrying
+/// pool, and a socket backend to a non-blocking `client::Upstream`, both carrying
 /// `error_status_override` so the completion returns the fetched body under the
 /// original failing status.
 ///
@@ -3599,9 +3915,9 @@ fn dispatch_custom_error_async(
         body: vec![],
     };
 
-    // URL backend: dispatch to its thread or pool, as before.
-    if let Some((url, tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
-        let url = url.to_string();
+    // URL backend: an h2 stream, or a loop-driven upstream slot. A failed
+    // dispatch returns None, and the caller falls back to the internal page.
+    if let Some(backend_idx) = state.pool_manager.find_url(&backend_name) {
         let ctx = forward::PendingUrlContext {
             req: req.clone(),
             client_ip: client_ip.to_string(),
@@ -3615,37 +3931,7 @@ fn dispatch_custom_error_async(
             error_status_override: Some(status),
             extra_headers: Vec::new(),
         };
-        let id = if url.starts_with("h2c://") {
-            ensure_h2c_conn(state, &url, registry).ok()?;
-            let (conn, stream) = state
-                .h2c_pool
-                .dispatch(&url, &error_req, client_ip, &original_host, registry)
-                .ok()?;
-            UpstreamId::H2c { conn, stream }
-        } else if url.starts_with("h2s://") {
-            ensure_h2s_conn(state, &url, tls_config.clone(), registry).ok()?;
-            let (conn, stream) = state
-                .h2s_pool
-                .dispatch(&url, &error_req, client_ip, &original_host, registry)
-                .ok()?;
-            UpstreamId::H2s { conn, stream }
-        } else {
-            let rx = forward::dispatch_url_request(
-                url,
-                error_req,
-                client_ip.to_string(),
-                original_host.to_string(),
-                Some(timeout),
-                tls_config,
-            );
-            let idx = state.url_pending.len();
-            state.url_pending.push(UrlPending {
-                rx,
-                waiter: None,
-                ctx: None,
-            });
-            UpstreamId::Url(idx)
-        };
+        let id = dispatch_url_backend(state, registry, &error_req, client_ip, backend_idx).ok()?;
         return Some(RequestOutcome::Pending {
             id,
             ctx: Box::new(ctx),
@@ -3654,9 +3940,15 @@ fn dispatch_custom_error_async(
 
     // Socket backend: a non-blocking upstream, the same way the socket branch
     // reaches a normal route.
-    let request = forward::encode_request(&error_req, client_ip, &original_host).ok()?;
-    let slot =
-        launch_socket_upstream(state, registry, request, "GET", &backend_name, timeout).ok()?;
+    let slot = launch_socket_upstream(
+        state,
+        registry,
+        &error_req,
+        client_ip,
+        &backend_name,
+        timeout,
+    )
+    .ok()?;
 
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
@@ -3672,7 +3964,7 @@ fn dispatch_custom_error_async(
         extra_headers: Vec::new(),
     };
     Some(RequestOutcome::Pending {
-        id: UpstreamId::Socket(slot),
+        id: UpstreamId::Slot(slot),
         ctx: Box::new(ctx),
     })
 }
@@ -4706,14 +4998,20 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Build pool manager
-    let pool_manager = match PoolManager::from_config(&config.backends) {
+    // Build pool manager. Every URL backend's host is resolved here, once,
+    // before the loop: a name that does not resolve is a config error, and a
+    // change of address needs a restart.
+    let mut pool_manager = match PoolManager::from_config(&config.backends) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("config error: {e}");
             return 2;
         }
     };
+    if let Err(e) = pool_manager.resolve() {
+        eprintln!("config error: {e}");
+        return 2;
+    }
 
     // Compute error mode
     let error_mode = ErrorMode::from_config(&config.errors);
@@ -4878,8 +5176,7 @@ fn run(args: Vec<String>) -> i32 {
         sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
         generations: vec![0; INITIAL_CONNECTIONS],
         prefetch_queue: std::collections::VecDeque::new(),
-        socket_upstreams: Slots::new(INITIAL_CONNECTIONS, ceiling, SocketUpstreamEntry::empty),
-        url_pending: Vec::new(),
+        upstreams: Slots::new(INITIAL_CONNECTIONS, ceiling, UpstreamEntry::empty),
         read_timeouts: Timeouts::new(
             INITIAL_CONNECTIONS,
             std::time::Duration::from_secs(READ_TIMEOUT_SECS),
@@ -4892,8 +5189,8 @@ fn run(args: Vec<String>) -> i32 {
             INITIAL_CONNECTIONS,
             std::time::Duration::from_secs(backend_timeout_secs),
         ),
-        h2c_pool: H2cClientPool::new(),
-        h2s_pool: H2sTlsClientPool::new(),
+        h2c_pool: H2cClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
+        h2s_pool: H2sTlsClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         tls_iface,
         h2c_iface,
         rate_limiter: RateLimiter::new(),

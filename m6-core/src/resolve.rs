@@ -60,6 +60,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::dns::is_host_name;
+pub use crate::dns::Ptr;
+
 /// The most lookup threads alive at once, abandoned ones included.
 ///
 /// A monitoring run checks a handful of addresses, so eight leaves room for
@@ -180,55 +183,6 @@ impl Lookup for System {
     }
 }
 
-/// The result of asking what name an address has.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ptr {
-    /// A name was returned. From [`reverse_confirmed`] it is also
-    /// forward-confirmed: resolving it returns the address.
-    Name(String),
-    /// A PTR name was found and the forward lookup of that name completed
-    /// without returning the address. Whoever controls the reverse zone can
-    /// publish any name, so this is a false claim.
-    Unconfirmed(String),
-    /// The lookup completed and the address has no PTR record. Unverified,
-    /// which is not the same as false.
-    None,
-    /// The lookup did not complete in time, or the resolver refused. Says
-    /// nothing about the address.
-    Failed,
-}
-
-impl Ptr {
-    /// The name, if there is one.
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Ptr::Name(n) => Some(n),
-            _ => None,
-        }
-    }
-
-    /// Whether this name supports a claim to be `domain`.
-    ///
-    /// A suffix match on a dot boundary, so `bot.example.com` matches
-    /// `example.com` and `example.com.attacker.net` does not. The trailing dot
-    /// a resolver may return is ignored. Case-insensitive, because DNS is.
-    ///
-    /// This is the check every crawler operator documents, and the dot
-    /// boundary is the whole of it: `notexample.com` ends with `example.com`
-    /// as a string and is a different domain.
-    pub fn verifies(&self, domain: &str) -> bool {
-        let Ptr::Name(name) = self else {
-            return false;
-        };
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
-        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        if domain.is_empty() {
-            return false;
-        }
-        name == domain || name.ends_with(&format!(".{domain}"))
-    }
-}
-
 /// Default deadline for one lookup.
 ///
 /// Short on purpose. This runs once per distinct address in a monitoring run,
@@ -275,16 +229,6 @@ fn confirm(ip: IpAddr, timeout: Duration, lookup: Arc<dyn Lookup>, slots: &Arc<S
         }
         Some(Forward::Failed) | None => Ptr::Failed,
     }
-}
-
-/// Letters, digits, `-`, `_` and `.`, at most 253 characters: the shape of a
-/// host name as a resolver returns it, with or without the trailing dot.
-fn is_host_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 254
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// [`reverse_confirmed`] with the default deadline.
@@ -441,51 +385,6 @@ fn blocking_forward(name: &str) -> Forward {
 )]
 mod tests {
     use super::*;
-
-    /// The dot boundary is the whole of the check, so it gets the most tests.
-    /// A suffix match without it accepts `example.com.attacker.net`, which is
-    /// a domain the attacker controls and which ends with the string being
-    /// looked for.
-    #[test]
-    fn verification_matches_on_a_dot_boundary_only() {
-        let n = |s: &str| Ptr::Name(s.to_string());
-        assert!(n("crawl-1-2-3.example.com").verifies("example.com"));
-        assert!(n("example.com").verifies("example.com"));
-        // The trailing dot a resolver may return.
-        assert!(n("crawl.example.com.").verifies("example.com"));
-        // DNS is case-insensitive.
-        assert!(n("Crawl.Example.COM").verifies("example.com"));
-
-        // The attack this exists to refuse.
-        assert!(!n("example.com.attacker.net").verifies("example.com"));
-        // A different domain that happens to end with the same letters.
-        assert!(!n("notexample.com").verifies("example.com"));
-        // A subdomain match must not run the other way.
-        assert!(!n("example.com").verifies("crawl.example.com"));
-    }
-
-    /// An absent name and a failed lookup both fail verification, and neither
-    /// is reported as the other.
-    #[test]
-    fn an_absent_name_and_a_failed_lookup_are_different_and_neither_verifies() {
-        assert!(!Ptr::None.verifies("example.com"));
-        assert!(!Ptr::Failed.verifies("example.com"));
-        assert_ne!(Ptr::None, Ptr::Failed);
-        assert_eq!(Ptr::None.name(), None);
-        assert_eq!(Ptr::Failed.name(), None);
-        assert_eq!(
-            Ptr::Name("a.example.com".into()).name(),
-            Some("a.example.com")
-        );
-    }
-
-    /// An empty domain must never verify. A sighting whose expected domain is
-    /// unknown would otherwise be reported as confirmed by any name at all.
-    #[test]
-    fn an_empty_domain_never_verifies() {
-        assert!(!Ptr::Name("anything.example.com".into()).verifies(""));
-        assert!(!Ptr::Name("anything.example.com".into()).verifies("."));
-    }
 
     /// Anything that is not a numeric address is a caller error and never
     /// reaches a resolver.

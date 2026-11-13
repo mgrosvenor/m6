@@ -21,9 +21,8 @@ name = "m6_core"
 # unifies features, and m6-html turns both on there.
 default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
-# links it; enable it from a crate's [dev-dependencies] entry. It also pulls in
-# rustls, which the TLS echo program needs and no production binary links.
-testkit = ["dep:rustls", "dep:rustls-pki-types"]
+# links it; enable it from a crate's [dev-dependencies] entry.
+testkit = ["dep:rustls-pki-types"]
 
 # Request/response extras, off by default so a binary links only what it uses.
 # `multipart` gates the multipart body parser and the streaming types it needs.
@@ -64,7 +63,7 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
-nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource"] }
+nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net"] }
 socket2    = "0.6"
 httparse   = "1"
 httpdate   = "1"
@@ -88,6 +87,11 @@ md-5        = "0.10"
 # The reactor: poll, tokens, interests, events and non-blocking sockets.
 # Re-exported as `m6_core::mio`, so a service links only m6-core.
 mio         = { version = "1", features = ["os-poll", "os-ext", "net"] }
+# DNS messages for the monitor's crawler check. Only the message codec is
+# wanted: the socket and the loop are m6's, and `std` is the whole feature set
+# this crate needs.
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+resolv-conf   = { version = "0.7", default-features = false }
 
 minify-html   = { version = "0.15", optional = true }
 minify-js     = { version = "0.5",  optional = true }
@@ -104,10 +108,9 @@ ureq          = { version = "2",    optional = true, features = ["json"] }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
 rusqlite      = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
-# The TLS echo program, `examples/echo_tls.rs`, uses rustls with exactly the
-# features m6-http names, so the workspace builds one rustls, not two. Optional
-# and gated behind `testkit` so no production binary links it.
-rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+# `client::Upstream` and the TLS echo program use rustls with exactly the
+# features m6-http names, so the workspace builds one rustls, not two.
+rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", optional = true }
 
 [dev-dependencies]
@@ -120,6 +123,12 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # a `time::OffsetDateTime` and rcgen does not re-export the type.
 rcgen     = "0.13"
 time      = "0.3"
+# `client.rs`'s Linux-only `a_full_backlog_is_would_block` builds a listener
+# with backlog 0, which `std` cannot ask for. The `socket` module sits behind
+# nix's `socket` feature, enabled here rather than on the production entry
+# above so a built service links neither it nor memoffset. Same crate version
+# the workspace already resolves, so no new package.
+nix       = { version = "0.31", features = ["socket"] }
 
 # The echo programs prove the loop serves with no heap allocation outside table
 # growth. They use the counting allocator behind `testkit`. They are `[[bin]]`
@@ -153,6 +162,14 @@ harness = false
 # main thread so the count is the checks' own.
 [[test]]
 name    = "event_allocs"
+harness = false
+required-features = ["testkit"]
+
+# `client::Upstream`'s no-allocation proof: a thousand plain requests allocate
+# nothing. Its own `main` so the counting allocator is installed before any
+# thread, and the count is only this binary's own.
+[[test]]
+name    = "upstream_no_alloc"
 harness = false
 required-features = ["testkit"]
 

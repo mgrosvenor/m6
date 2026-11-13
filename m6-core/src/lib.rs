@@ -1,9 +1,11 @@
 pub mod app;
+pub mod client;
 pub mod compress;
 pub mod conditional;
 pub mod config;
 pub mod cookie;
 pub mod dict;
+pub mod dns;
 pub mod error;
 pub mod event;
 pub mod firewall;

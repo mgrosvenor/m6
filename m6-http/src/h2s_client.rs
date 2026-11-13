@@ -4,14 +4,16 @@
 //! transport. One `H2sTlsClientConn` is maintained per backend URL.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustls::ClientConnection;
 
 use crate::forward::{HttpRequest, PendingUrlContext, Waiter};
-use crate::h2_client::{client_init_frame, H2Client, H2Completion, Pool, Transport};
+use crate::h2_client::{H2Client, H2Completion, Pool, Transport};
+use m6_core::client::TlsClient;
 use m6_core::mio::{Registry, Token};
 
 /// The TLS transport for `h2s://` backends.
@@ -21,65 +23,33 @@ pub struct H2sTransport {
 }
 
 impl Transport for H2sTransport {
-    fn connect(host: &str, port: u16, tls: Option<Arc<rustls::ClientConfig>>) -> io::Result<Self> {
-        let tls_config = tls.ok_or_else(|| {
+    fn connect(addr: SocketAddr, tls: Option<&TlsClient>) -> io::Result<Self> {
+        let tls = tls.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{}: missing TLS config", Self::prefix()),
             )
         })?;
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "blocking upstream connect; removed by EL-5b"
-        )]
-        let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
-        tcp.set_nodelay(true)?;
-
-        let server_name =
-            rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{}: invalid server name: {}", Self::prefix(), host),
-                )
-            })?;
-
-        let conn = ClientConnection::new(tls_config, server_name)
+        let tcp = crate::h2_client::nonblocking_tcp_connect(addr)?;
+        let tls_conn = ClientConnection::new(tls.config.clone(), tls.name.clone())
             .map_err(|e| io::Error::other(format!("{}: TLS init: {}", Self::prefix(), e)))?;
-
-        // Use StreamOwned for the blocking setup phase (TLS handshake + initial frames).
-        let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
-
-        // This write triggers the TLS handshake.
-        tls_stream.write_all(&client_init_frame())?;
-        tls_stream.flush()?;
-
-        // Verify ALPN negotiation.
-        if tls_stream.conn.alpn_protocol() != Some(b"h2".as_slice()) {
-            let got = tls_stream
-                .conn
-                .alpn_protocol()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .unwrap_or_else(|| "none".to_string());
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{}: server did not negotiate h2 (got: {})",
-                    Self::prefix(),
-                    got
-                ),
-            ));
-        }
-
-        let (mut tls_conn, tcp) = tls_stream.into_parts();
-        tcp.set_nonblocking(true)?;
-
-        // Drain any plaintext that arrived during the TLS handshake (e.g. the
-        // server's SETTINGS frame). It stays in the rustls buffer and will be
-        // picked up by the first drive() call.
-        let _ = tls_conn.process_new_packets();
-
         Ok(Self { tcp, tls_conn })
+    }
+
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        self.tcp.take_error()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.tcp.peer_addr().is_ok()
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.tls_conn.is_handshaking()
+    }
+
+    fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.tls_conn.alpn_protocol()
     }
 
     fn raw_fd(&self) -> RawFd {
@@ -189,37 +159,60 @@ impl std::ops::DerefMut for H2sTlsClientConn {
 }
 
 impl H2sTlsClientConn {
-    /// Connect to an H2S backend at `host:port`.
+    /// Connect to an H2S backend at `host:port` and wait for it to open.
+    ///
+    /// A test and benchmark helper: a service resolves the address at start and
+    /// drives its pooled connection in the loop.
     pub fn connect(
         host: &str,
         port: u16,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> io::Result<Self> {
-        Ok(Self(H2Client::connect(host, port, Some(tls_config))?))
+        let addr = m6_core::net::resolve(host, port)?;
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: invalid server name: {host}", H2sTransport::prefix()),
+            )
+        })?;
+        let tls = TlsClient {
+            config: tls_config,
+            name,
+        };
+        let mut client = H2Client::connect(addr, Some(&tls))?;
+        client.wait_until_open()?;
+        Ok(Self(client))
     }
 }
 
 /// Persistent H2S connection pool, keyed by backend URL.
 pub struct H2sTlsClientPool(Pool<H2sTransport>);
 
-impl Default for H2sTlsClientPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl H2sTlsClientPool {
-    pub fn new() -> Self {
-        Self(Pool::new())
+    /// `stream_timeout` is `backend_timeout_secs`: an h2 stream's deadline.
+    pub fn new(stream_timeout: Duration) -> Self {
+        Self(Pool::new(stream_timeout))
     }
 
     /// Ensure a connection exists for `base_url`. Returns whether one was made.
     pub fn ensure_connection(
         &mut self,
         base_url: &str,
-        tls_config: Arc<rustls::ClientConfig>,
+        addr: SocketAddr,
+        tls: &TlsClient,
     ) -> io::Result<bool> {
-        self.0.ensure_connection(base_url, Some(tls_config))
+        self.0.ensure_connection(base_url, addr, Some(tls))
+    }
+
+    /// Time until the earliest stream deadline, capped at `tick`.
+    pub fn timeout(&self, now: Instant, tick: Duration) -> Duration {
+        self.0.timeout(now, tick)
+    }
+
+    /// Fail every stream past its deadline, cancelling it at the peer. Returns
+    /// the completions and the tokens of connections left dead.
+    pub fn expire(&mut self, now: Instant, registry: &Registry) -> (Vec<Token>, Vec<H2Completion>) {
+        self.0.expire(now, registry)
     }
 
     /// The connection for `base_url`, to register and set its token.

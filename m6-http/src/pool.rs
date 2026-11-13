@@ -174,12 +174,117 @@ pub enum PoolError {
 }
 
 /// A URL-based backend (remote HTTP/HTTPS upstream).
-struct UrlBackend {
-    name: String,
-    url: String,
-    /// TLS client config built once at startup (avoids per-request cert loading).
-    tls_config: std::sync::Arc<rustls::ClientConfig>,
-    skip_verify: bool,
+pub struct UrlBackend {
+    pub name: String,
+    /// The base URL, kept as the h2 pools' key.
+    pub url: String,
+    /// The authority's host, without the port: the `Host` a forwarded request
+    /// names and the name a TLS connection verifies. Resolved at start.
+    pub host: String,
+    pub scheme: UrlScheme,
+    /// The host's address, resolved once at [`PoolManager::resolve`]. A change
+    /// of address needs a restart.
+    addr: Option<std::net::SocketAddr>,
+    /// The TLS client config and server name for a TLS scheme, built at start.
+    pub tls: Option<m6_core::client::TlsClient>,
+    /// Keys of this backend's slots whose connection is open and registered
+    /// for read, so a peer close is seen and the key removed before a request
+    /// reuses it. A fixed array made at start.
+    pub idle: IdleSlots,
+    /// Skip TLS certificate verification. Test and development only.
+    pub skip_verify: bool,
+}
+
+impl UrlBackend {
+    /// The address resolved at start. The loop never starts before it is set.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr.expect("a URL backend is resolved at start")
+    }
+}
+
+/// Which protocol a URL backend speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UrlScheme {
+    Http,
+    Https,
+    H2c,
+    H2s,
+}
+
+impl UrlScheme {
+    /// The scheme named by `url`, or `None` for one m6 does not serve.
+    fn of(url: &str) -> Option<UrlScheme> {
+        if url.starts_with("http://") {
+            Some(UrlScheme::Http)
+        } else if url.starts_with("https://") {
+            Some(UrlScheme::Https)
+        } else if url.starts_with("h2c://") {
+            Some(UrlScheme::H2c)
+        } else if url.starts_with("h2s://") {
+            Some(UrlScheme::H2s)
+        } else {
+            None
+        }
+    }
+
+    /// The prefix `parse_host_port` takes, and the scheme's default port.
+    fn prefix_and_port(self) -> (&'static str, u16) {
+        match self {
+            UrlScheme::Http => ("http", 80),
+            UrlScheme::Https => ("https", 443),
+            UrlScheme::H2c => ("h2c", 80),
+            UrlScheme::H2s => ("h2s", 443),
+        }
+    }
+}
+
+/// The most idle connections one URL backend keeps open for reuse.
+const MAX_IDLE_URL_CONNECTIONS: usize = 8;
+
+/// Keys of open idle connections to one URL backend, last in first out.
+///
+/// A key stays only while its connection is open and its descriptor is watched
+/// for a close. `remove` is how a close is taken out of the list.
+pub struct IdleSlots {
+    keys: [usize; MAX_IDLE_URL_CONNECTIONS],
+    len: usize,
+}
+
+impl IdleSlots {
+    fn new() -> IdleSlots {
+        IdleSlots {
+            keys: [0; MAX_IDLE_URL_CONNECTIONS],
+            len: 0,
+        }
+    }
+
+    /// A key whose connection is open, or `None` when none is idle.
+    pub fn take(&mut self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.keys[self.len])
+    }
+
+    /// Store `key` for reuse. False when the list is full, so the caller closes
+    /// the connection and frees the slot instead.
+    pub fn push(&mut self, key: usize) -> bool {
+        if self.len == self.keys.len() {
+            return false;
+        }
+        self.keys[self.len] = key;
+        self.len += 1;
+        true
+    }
+
+    /// Take `key` out, because its connection is gone.
+    pub fn remove(&mut self, key: usize) {
+        if let Some(pos) = self.keys[..self.len].iter().position(|k| *k == key) {
+            self.keys.copy_within(pos + 1..self.len, pos);
+            self.len -= 1;
+        }
+    }
 }
 
 fn build_tls_client_config_alpn(skip_verify: bool, alpn: &[u8]) -> rustls::ClientConfig {
@@ -214,6 +319,17 @@ fn build_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
 /// Used for `h2s://` backends.
 pub fn build_h2_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
     build_tls_client_config_alpn(skip_verify, b"h2")
+}
+
+/// The config and server name a TLS URL backend authenticates with, built once
+/// at start beside its resolved address.
+fn tls_client(
+    host: &str,
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> anyhow::Result<m6_core::client::TlsClient> {
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid server name {host:?}: {e}"))?;
+    Ok(m6_core::client::TlsClient { config, name })
 }
 
 /// A no-op TLS certificate verifier for testing with self-signed certs.
@@ -294,21 +410,53 @@ impl PoolManager {
                 }
                 mgr.pools.push((b.name.clone(), pool));
             } else if let Some(ref url) = b.url {
-                // h2s:// backends need ALPN "h2"; all others use "http/1.1".
-                let tls_config = if url.starts_with("h2s://") {
-                    std::sync::Arc::new(build_h2_tls_client_config(b.tls_skip_verify))
-                } else {
-                    std::sync::Arc::new(build_tls_client_config(b.tls_skip_verify))
-                };
+                let scheme = UrlScheme::of(url).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[[backend]] {name}: url {url:?} must start with http://, https://, h2c:// or h2s://",
+                        name = b.name
+                    )
+                })?;
                 mgr.url_backends.push(UrlBackend {
                     name: b.name.clone(),
                     url: url.clone(),
-                    tls_config,
+                    host: String::new(),
+                    scheme,
+                    addr: None,
+                    tls: None,
+                    idle: IdleSlots::new(),
                     skip_verify: b.tls_skip_verify,
                 });
             }
         }
         Ok(mgr)
+    }
+
+    /// Resolve every URL backend's host once, and build its TLS client. Start
+    /// only: this blocks in the system resolver, and a name that does not
+    /// resolve stops the service with the backend and host named.
+    pub fn resolve(&mut self) -> anyhow::Result<()> {
+        for b in &mut self.url_backends {
+            let (prefix, default_port) = b.scheme.prefix_and_port();
+            let (host, port) = crate::h2_client::parse_host_port(&b.url, prefix, default_port)
+                .map_err(|e| anyhow::anyhow!("[[backend]] {}: {e}", b.name))?;
+            let addr = m6_core::net::resolve(&host, port).map_err(|e| {
+                anyhow::anyhow!("[[backend]] {}: {host} does not resolve: {e}", b.name)
+            })?;
+            b.addr = Some(addr);
+            b.tls = match b.scheme {
+                UrlScheme::Https => Some(tls_client(
+                    &host,
+                    std::sync::Arc::new(build_tls_client_config(b.skip_verify)),
+                )?),
+                UrlScheme::H2s => Some(tls_client(
+                    &host,
+                    std::sync::Arc::new(build_h2_tls_client_config(b.skip_verify)),
+                )?),
+                UrlScheme::Http | UrlScheme::H2c => None,
+            };
+            b.host = host;
+        }
+        Ok(())
     }
 
     pub fn get_pool_mut(&mut self, name: &str) -> Option<&mut BackendPool> {
@@ -329,15 +477,17 @@ impl PoolManager {
             .map(|b| b.url.as_str())
     }
 
-    /// Returns (url, tls_config, skip_verify) for a URL backend.
-    pub fn get_url_info(
-        &self,
-        name: &str,
-    ) -> Option<(&str, std::sync::Arc<rustls::ClientConfig>, bool)> {
-        self.url_backends
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| (b.url.as_str(), b.tls_config.clone(), b.skip_verify))
+    /// The URL backend named `name`, or `None` when the name is a socket pool.
+    pub fn find_url(&self, name: &str) -> Option<usize> {
+        self.url_backends.iter().position(|b| b.name == name)
+    }
+
+    pub fn url_backend(&self, idx: usize) -> &UrlBackend {
+        &self.url_backends[idx]
+    }
+
+    pub fn url_backend_mut(&mut self, idx: usize) -> &mut UrlBackend {
+        &mut self.url_backends[idx]
     }
 
     /// Total active (non-failed) members across all pools — for stats reporting.
