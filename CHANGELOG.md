@@ -333,6 +333,8 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 **m6-auth-server runs one event loop with one database connection.** It handed each connection to a worker thread, and each worker opened its own database connection on its first request, answering 500 when that open failed. Now one loop serves every connection, the database is opened once at start, and a database that cannot be opened stops the service with exit 2. The login rate limit is per process.
 
+**m6-auth-server never waits on a database lock.** It waited up to 5 seconds for SQLite's lock, which in a single-threaded service holds every request. It now sets SQLite's busy timeout to zero once started, retries a request that found the database locked every 5 ms from its event loop while serving others, and answers 503 with Retry-After after one second. A retried login does not verify the password twice. m6-auth-cli keeps its 5-second wait.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
