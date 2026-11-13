@@ -167,7 +167,7 @@
 //! when a node is down, which is when a history is wanted.
 //!
 //! To start fresh, stop the service, delete the file and start it again.
-//! Migration 1 is permanent: a later release adds columns in migration 2.
+//! Migrations 1 and 2 are permanent: a later release adds columns in migration 3.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -262,10 +262,24 @@ CREATE TABLE crawl_status (
   PRIMARY KEY (window_id, code)) STRICT, WITHOUT ROWID;
 ";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: SCHEMA_V1,
-}];
+/// The index the last-200 read answers from. Migration 2 adds it to a file
+/// made by release 1, and it holds only the rows that count as a 200, so the
+/// read touches one row per node however long the history is.
+const SCHEMA_V2: &str = "
+CREATE INDEX IF NOT EXISTS health_ok_node_at ON health (node_id, at_ms)
+  WHERE reachable = 1 AND status = 'ok';
+";
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        sql: SCHEMA_V2,
+    },
+];
 
 /// Lookup tables that are never pruned. `agent` is not here: a user agent is
 /// text a visitor chooses, so its rows go when no sighting names them.
@@ -764,14 +778,13 @@ impl Store {
 
     /// When each node last answered `/health` with 200, by node name.
     ///
-    /// A read of one indexed row per node, taken when the digest is built so
-    /// the age the check prints is the age in the file rather than a number
-    /// kept in memory and able to drift from it.
+    /// One row per node, read from the partial index `health_ok_node_at`:
+    /// each node's newest row is the first entry of its range, so the cost is
+    /// the number of nodes and not the length of the history. It runs when the
+    /// digest is built, so the age the check prints is the age in the file
+    /// rather than a number kept in memory and able to drift from it.
     fn last_ok_at(&self) -> rusqlite::Result<HashMap<String, i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT n.name, max(h.at_ms) FROM health h JOIN node n ON n.id = h.node_id \
-             WHERE h.reachable = 1 AND h.status = 'ok' GROUP BY n.name",
-        )?;
+        let mut stmt = self.conn.prepare(LAST_OK_SQL)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect();
@@ -1105,8 +1118,16 @@ pub struct LastOk {
     pub age_s: u64,
 }
 
-/// The wall clock in milliseconds, for the ages the digest reports.
-fn now_ms() -> i64 {
+/// Each node's newest 200 row. The `WHERE` repeats the index's own, which is
+/// what lets the planner use the partial index.
+const LAST_OK_SQL: &str = "SELECT n.name, \
+    (SELECT h.at_ms FROM health h WHERE h.node_id = n.id AND h.reachable = 1 \
+       AND h.status = 'ok' ORDER BY h.at_ms DESC LIMIT 1) AS at_ms \
+    FROM node n WHERE at_ms IS NOT NULL";
+
+/// The wall clock in milliseconds. The one clock helper in the crate: the
+/// digest's ages, the poll's stamp and the tests all read it.
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -2119,8 +2140,11 @@ mod tests {
             name: name.into(),
             role: "origin".into(),
             url: "http://x".into(),
-            health: None,
-            health_status: None,
+            health: Some(m6_core::monitoring::HealthReport {
+                status: "ok".into(),
+                node: name.into(),
+            }),
+            health_status: Some(200),
             perf: Some(p),
             perf_error: None,
             header_checks: vec![],
@@ -2162,7 +2186,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open(dir.path());
         assert!(cfg(dir.path(), 1).file.exists());
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 1);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 2);
         let mut stmt = s
             .conn
             .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%'")
@@ -2204,7 +2228,32 @@ mod tests {
         let s = open(dir.path());
         assert_eq!(count(&s, "poll"), 1);
         assert_eq!(count(&s, "health"), 1);
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 1);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 2);
+    }
+
+    /// The last-200 read is answered from the partial index. The plan must name
+    /// it and must not scan the health table, which grows with the history.
+    #[test]
+    fn the_last_ok_read_uses_the_partial_index_and_no_table_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        let mut stmt = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LAST_OK_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("health_ok_node_at"), "{plan}");
+        assert!(
+            !plan
+                .lines()
+                .any(|l| l.contains("SCAN h") || l.contains("SCAN health")),
+            "{plan}"
+        );
     }
 
     #[test]
@@ -2212,7 +2261,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(open(dir.path()));
         let c = Connection::open(cfg(dir.path(), 1).file).unwrap();
-        c.pragma_update(None, "user_version", 2).unwrap();
+        c.pragma_update(None, "user_version", 3).unwrap();
         drop(c);
         let err = Store::open(&cfg(dir.path(), 1)).err().expect("refused");
         assert!(is_fatal(&err), "{err:#}");

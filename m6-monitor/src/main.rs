@@ -732,7 +732,7 @@ fn publish(
     let poll::Progress::Done(polled) = progress else {
         return;
     };
-    let at_ms = unix_ms();
+    let at_ms = history::now_ms();
     let mut d = digest::build(&polled.readings, thresholds, now_iso8601());
     let h = history.digest();
     if let Some(f) = history::finding(&h) {
@@ -812,12 +812,6 @@ fn run_check(config_path: &Path) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
-}
-
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn bytes(n: u64) -> String {

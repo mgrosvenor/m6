@@ -665,12 +665,18 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             continue;
         }
 
-        if r.status() == "degraded" {
-            findings.push(Finding {
+        match r.status() {
+            "ok" => {}
+            "degraded" => findings.push(Finding {
                 level: Level::Fault,
                 node: r.name.clone(),
                 text: format!("reports degraded: {DEGRADED_REASON}"),
-            });
+            }),
+            other => findings.push(Finding {
+                level: Level::Fault,
+                node: r.name.clone(),
+                text: format!("reports health status {other}"),
+            }),
         }
 
         if let Some(p) = &r.perf {
