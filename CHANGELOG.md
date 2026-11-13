@@ -64,6 +64,8 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **m6-monitor reads the fleet list and every node's host name at start.** A change to the fleet, or to a node's address, needs a restart. A node whose host name does not resolve at start stops m6-monitor with exit 2, naming the node.
 
+**m6-monitor's history file gains the index `health_ok_node_at` at start**, with no action needed. `[monitor] health_last_ok_max_age_s` is optional; its default is three poll intervals.
+
 ### Added
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
@@ -114,6 +116,8 @@ A client that makes more requests than this on one connection reconnects, with a
 **m6-core supplies the parts a service's own event loop is built from.** h1::ServerConn serves one HTTP/1.1 connection from buffers made at start, reading and writing until the socket would block, with no allocation per request. net::listen_unix and net::listen_tcp open a non-blocking listener. site::Site loads a site's config, templates and params at start, and handle and finish answer a request with the routing, rendering, minification and compression App used, returning the service's own routes to the service to answer.
 
 **m6-log, a buffered JSONL logger for an event loop.** Lines are written into a 16 KiB buffer allocated at start and flushed when full, every second and at stop, as nginx's buffered access log does. Warnings and errors are written at once. No thread, no lock, no allocation per line. A destination that cannot take more is never waited on: lines are kept, then dropped and counted, as HAProxy does.
+
+**m6-monitor's hourly check reports each node's `/health` and the age of its last 200.** A node is ok only when `/health` answers 200 with status ok, and every other node is a fault on its line and in the verdict.
 
 ### Security
 
@@ -344,6 +348,8 @@ The sync used to delete the file the build host wrote, so the history never ente
 **m6-monitor runs one thread with its own event loop.** It ran a background poll thread, one thread per node per poll with blocking HTTP requests, a thread per tunnel probe, a history writer thread and a thread per reverse DNS lookup. Each poll is now a set of non-blocking requests, connects and DNS queries driven by its loop, the page, digest and check are built once per poll and served from memory, and history is written in one short transaction per poll, never waiting on a locked database. The reports are unchanged. The monitor trusts the host's certificate store instead of a bundled one.
 
 **/traffic no longer reads the analytics log.** m6-http read up to 24 MiB of its log file inside its event loop to answer /traffic. It now keeps the last 32,768 events it logs in memory, in space allocated at start, and builds the report from those in the last hour. A report after a restart covers only the time since the restart, and window_minutes says how long that is. A node that wraps the ring inside the hour reports the shorter span it holds and counts the events it dropped. A path is stored up to 512 bytes and a user agent up to 256, and a cut value ends in `...`: the log keeps them whole. A request whose path or user agent was cut counts as probe-shaped, so a marker cannot be hidden past the cut.
+
+**A node answering `/health` with 200 and an unrecognised status, or with no usable answer, is now a fault in m6-monitor's digest.**
 
 ### Removed
 
