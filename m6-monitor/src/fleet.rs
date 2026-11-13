@@ -814,8 +814,11 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
     fn resolving_an_ip_literal_node_needs_no_lookup() {
         let fleet =
             load("[[monitor.nodes]]\nname = \"a\"\nurl = \"http://127.0.0.1:9\"\n").unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth(),
         );

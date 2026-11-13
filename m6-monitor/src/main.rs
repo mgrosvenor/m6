@@ -172,8 +172,11 @@ fn run_service() -> Result<()> {
     }));
     let fleet = fleet::Fleet::from_config(site.config_path())
         .unwrap_or_else(|e| fail("reading the fleet", format!("{e:#}")));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls = Arc::new(
-        rustls::ClientConfig::builder()
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap_or_else(|e| fail("building the TLS client config", e))
             .with_root_certificates(
                 m6_core::client::system_roots()
                     .unwrap_or_else(|e| fail("reading the host certificate store", e)),
@@ -767,8 +770,10 @@ fn nodes_in(out: &[poll::Out]) -> usize {
 /// cannot disagree.
 fn run_check(config_path: &Path) -> Result<()> {
     let fleet = fleet::Fleet::from_config(config_path)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls = Arc::new(
-        rustls::ClientConfig::builder()
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
             .with_root_certificates(m6_core::client::system_roots()?)
             .with_no_client_auth(),
     );
@@ -1055,5 +1060,43 @@ mod tests {
         assert!(html.contains("&lt;i&gt;edge&lt;/i&gt;"), "{html}");
         assert!(html.contains("&lt;b&gt;cache&lt;/b&gt;"), "{html}");
         assert!(html.contains("&lt;u&gt;ok&lt;/u&gt;"), "{html}");
+    }
+
+    /// Every client config in this service names its provider.
+    ///
+    /// The automatic client-config builder asks rustls for the process
+    /// default. In a workspace-wide test build rustls is compiled with both
+    /// providers, because m6-http's dev-dependency `tokio-rustls` pulls
+    /// `aws-lc-rs` in, so there is no default and the first call panics. A
+    /// per-crate build compiles only ring and hides it, which is how a
+    /// per-crate gate passed while the workspace build failed. Naming ring at
+    /// each call site keeps the monitor starting whatever else is in the
+    /// build. Nothing is installed process-wide: that is state a library
+    /// must not set.
+    #[test]
+    fn every_client_config_names_its_provider() {
+        let needle = ["ClientConfig::", "builder("].concat();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = 0;
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read m6-monitor/src") {
+            let path = entry.expect("directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read a source file");
+            files += 1;
+            for (line, body) in text.lines().enumerate() {
+                if body.contains(&needle) {
+                    found.push(format!("{}:{}: {}", path.display(), line + 1, body.trim()));
+                }
+            }
+        }
+        assert!(files > 0, "read no source files under {}", dir.display());
+        assert!(
+            found.is_empty(),
+            "a client config without a named provider:\n{}",
+            found.join("\n")
+        );
     }
 }
