@@ -110,15 +110,17 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
         poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))
             .expect("poll");
         if events.iter().any(|ev| ev.token() == token) {
+            if up.drive().expect("drive") {
+                return;
+            }
+            // Drive first: under epoll edge-triggering, interest registered
+            // before the drive waits for an edge that never comes.
             let interest = up.interest();
             if interest != registered {
                 poll.registry()
                     .reregister(&mut SourceFd(&up.fd()), token, interest)
                     .expect("reregister");
                 registered = interest;
-            }
-            if up.drive().expect("drive") {
-                return;
             }
         }
         if std::time::Instant::now() >= up.deadline() {
