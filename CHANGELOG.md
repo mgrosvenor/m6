@@ -160,6 +160,8 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 **URL backends and HTTP/2 upstreams no longer block or wait on a timer.** An http:// or https:// backend ran each request on its own thread with a new TCP and TLS connection, and its reply was noticed on a 10 ms poll. An h2c or h2s upstream connected, and for h2s completed its TLS handshake, inside the event loop, so an unreachable upstream stalled every request on the node. All of them now connect, write and read in the loop, http(s) connections are reused, and backend_timeout_secs applies to HTTP/2 upstream streams too. An idle m6-http wakes about once a second instead of 100 times.
 
+**A backend that refuses a request no longer takes its pool member out of rotation.** When a backend closed the connection while m6-http was still sending the request (m6-file answering an oversized header, then closing without draining it), m6-http marked the member failed and backed it off for a second, so the next request to that backend answered 502. A member that never received the whole request is now released. A member that took the whole request and then failed, a silent member and a refused connect still back off.
+
 ### Docs
 
 **`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
