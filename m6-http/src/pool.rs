@@ -120,10 +120,11 @@ impl BackendPool {
         }
     }
 
-    /// A request to this member completed: release its connection and clear
-    /// its failures. The count is transport failures in a row (connect, I/O,
-    /// timeout), so any completed exchange clears it, whatever the status: a
-    /// member that answers 503 is reachable.
+    /// Release a member and clear its failures. A member is released when the
+    /// exchange completed, whatever the status (a member that answers 503 is
+    /// reachable), or when the peer closed before the whole request was
+    /// written: a request it never took whole says nothing about its health.
+    /// A timeout or a failure after the whole request was written marks it failed.
     pub fn release(&mut self, idx: usize) {
         if let Some(m) = self.members.get_mut(idx) {
             if m.connections > 0 {
