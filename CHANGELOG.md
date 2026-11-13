@@ -113,6 +113,8 @@ A client that makes more requests than this on one connection reconnects, with a
 
 **m6-core supplies the parts a service's own event loop is built from.** h1::ServerConn serves one HTTP/1.1 connection from buffers made at start, reading and writing until the socket would block, with no allocation per request. net::listen_unix and net::listen_tcp open a non-blocking listener. site::Site loads a site's config, templates and params at start, and handle and finish answer a request with the routing, rendering, minification and compression App used, returning the service's own routes to the service to answer.
 
+**m6-log, a buffered JSONL logger for an event loop.** Lines are written into a 16 KiB buffer allocated at start and flushed when full, every second and at stop, as nginx's buffered access log does. Warnings and errors are written at once. No thread, no lock, no allocation per line. A destination that cannot take more is never waited on: lines are kept, then dropped and counted, as HAProxy does.
+
 ### Security
 
 **SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected; no configuration changes.
