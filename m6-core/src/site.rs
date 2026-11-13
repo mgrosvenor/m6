@@ -467,7 +467,14 @@ impl Site {
         // Minification, then compression: minifying first compresses better.
         // Both are skipped for a `verbatim` response, which a handler has
         // already decided. A streamed body has no bytes and no flag.
-        if !resp.verbatim {
+        //
+        // A cache keeps what it stores, so minification is paid once per fill
+        // and its saving collected on every hit. A `no-store` response has no
+        // second hit, so the cost lands on every request, where it is about
+        // what rendering the page costs, for a few bytes saved after
+        // compression. The default ETag is skipped by the same rule in
+        // `response.rs`.
+        if !resp.verbatim && !crate::response::cache_control_no_store(&resp.headers) {
             if let Some(bytes) = resp.body.as_bytes() {
                 if !bytes.is_empty() {
                     let content_type =
@@ -1129,6 +1136,154 @@ mod tests {
             Handled::Code(1, _) => {}
             Handled::Code(index, _) => panic!("`/health` is index 1, got {index}"),
             _ => panic!("a code route must come back as Code"),
+        }
+    }
+}
+
+/// The finish path's minification rule: a response a cache keeps is minified
+/// once per fill, and a response no cache keeps goes out as it rendered.
+#[cfg(test)]
+mod minify_tests {
+    use super::*;
+    use crate::h1::{parse_head, HeadResult};
+
+    /// The `/login` template. The two-space runs and the blank line are what a
+    /// minifier removes, so finding them in the finished body is the evidence
+    /// that it did not run.
+    const LOGIN_PAGE: &str = "<p>  a  </p>\n\n<p>  b  </p>";
+
+    /// A site over a temp directory and the given config, with the templates
+    /// already written: the renderer reads the directory at start, so a file
+    /// written after would never be seen. Copied from `tests::site_from` with
+    /// the `/login` page added.
+    fn site_from(toml: &str, named: &[&str]) -> (Site, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("templates")).unwrap();
+        std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
+        std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
+        let config_path = dir.path().join("m6-site.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        let config = crate::config::load(&config_path, dir.path()).unwrap();
+        let state =
+            FrameworkState::build(config, dir.path().to_path_buf(), &[], test_renderer()).unwrap();
+        let site = Site::from_state(state, named.iter().map(|n| (*n).to_string()).collect());
+        (site, dir)
+    }
+
+    /// A renderer that renders the templates written by [`site_from`].
+    fn test_renderer() -> &'static dyn RendererFactory {
+        #[cfg(feature = "templates")]
+        {
+            &crate::template::TeraFactory
+        }
+        #[cfg(not(feature = "templates"))]
+        {
+            &crate::render::NoTemplates
+        }
+    }
+
+    /// One `GET` through `Site::handle`, with the client's `Accept-Encoding`.
+    fn handle_get(site: &Site, path: &str, accept_encoding: &str) -> Handled {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {accept_encoding}\r\n\r\n"
+        );
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(request.as_bytes(), &mut slots) {
+            HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        site.handle(&head)
+    }
+
+    /// A cache keeps nothing of a `no-store` page, so minifying it is paid on
+    /// every request and never repaid. The page must leave `handle` with the
+    /// bytes the template rendered, spaces and blank line intact.
+    #[test]
+    fn a_no_store_page_is_sent_unminified() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
+             cache = \"no-store\"\n",
+            &[],
+        );
+        match handle_get(&site, "/login", "identity") {
+            Handled::Done(resp) => {
+                let body = resp.body.as_bytes().expect("a rendered page is buffered");
+                assert_eq!(
+                    body,
+                    LOGIN_PAGE.as_bytes(),
+                    "a no-store page must carry the template's whitespace: {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+            _ => panic!("a template route comes back Done"),
+        }
+    }
+
+    /// A cacheable page is minified once and served to many hits, which is
+    /// where its saving is collected. Its whitespace must be gone.
+    #[test]
+    fn a_cacheable_page_is_still_minified() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n",
+            &[],
+        );
+        match handle_get(&site, "/login", "identity") {
+            Handled::Done(resp) => {
+                let body = resp.body.as_bytes().expect("a rendered page is buffered");
+                assert!(
+                    !body.windows(2).any(|pair| pair == b"  "),
+                    "a public page is minified, so no two spaces remain: {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+            _ => panic!("a template route comes back Done"),
+        }
+    }
+
+    /// A config route naming a handler defaults to `no-store`, so its answer
+    /// is unminified for the same reason. JSON is a minified type by default,
+    /// and this body is deliberately spaced.
+    #[test]
+    fn a_no_store_json_answer_is_sent_unminified() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/api\"\nhandler = \"json\"\n",
+            &["json"],
+        );
+        let req = match handle_get(&site, "/api", "identity") {
+            Handled::Named(0, req) => req,
+            Handled::Named(index, _) => panic!("`json` is index 0, got {index}"),
+            _ => panic!("a config route naming a handler comes back Named"),
+        };
+        let answer = Response::status(200)
+            .header("Content-Type", "application/json")
+            .body(b"{ \"a\": 1 }".to_vec());
+        let resp = site.finish(&req, answer);
+        assert_eq!(
+            resp.body
+                .as_bytes()
+                .expect("a handler's JSON answer is buffered"),
+            b"{ \"a\": 1 }".as_slice(),
+            "a no-store JSON answer must not be minified"
+        );
+    }
+
+    /// A `no-store` response skips minification, not compression: a client
+    /// that accepts brotli still gets the page compressed.
+    #[test]
+    fn a_no_store_page_is_still_compressed() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
+             cache = \"no-store\"\n",
+            &[],
+        );
+        match handle_get(&site, "/login", "br") {
+            Handled::Done(resp) => assert_eq!(
+                crate::headers::get(&resp.headers[..], "content-encoding"),
+                Some("br"),
+                "a no-store page is still compressed: {:?}",
+                resp.headers
+            ),
+            _ => panic!("a template route comes back Done"),
         }
     }
 }
