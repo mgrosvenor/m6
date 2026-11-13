@@ -77,6 +77,26 @@ Complete request forwarded — method, path, query string, all headers, body.
 
 ---
 
+## Request Header Limits
+
+A request head is bounded before routing, the cache lookup and every backend, so an over-limit request is answered by the edge and no backend sees it.
+Two limits apply, and both follow the numbers the mainstream servers use: nginx's `large_client_header_buffers 4 8k`, Varnish's `http_req_hdr_len 8k` and `http_req_size 32k`, and Apache's `LimitRequestFieldSize 8190`.
+`MAX_HEADER_LINE` is 8 KiB for one field, counted as its name plus its value.
+`MAX_REQUEST_HEAD` is 32 KiB for the request line plus every field.
+HTTP/2 and HTTP/3 count a decoded head as RFC 9113 6.5.2 defines it for `SETTINGS_MAX_HEADER_LIST_SIZE`: name plus value plus 32 bytes per field.
+
+A field over `MAX_HEADER_LINE`, or a head over `MAX_REQUEST_HEAD`, is answered 400 with the error page titled "Request Header Or Cookie Too Large", which is nginx's own text for this refusal.
+A request line over `MAX_HEADER_LINE` is answered 414 Request-URI Too Large, counting the method, target and version on HTTP/1.1 and `:method` plus `:path` on HTTP/2 and HTTP/3.
+Both limits are defined once in m6-core as `m6_core::headers::MAX_HEADER_LINE` and `m6_core::headers::MAX_REQUEST_HEAD`, and the HTTP/1.1 parser, both backends and the edge read those definitions.
+
+HTTP/2 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_HEADER_LIST_SIZE` and enforces it while decoding.
+The 256 KiB `MAX_HEADER_BLOCK` bound on the compressed header block stays, because it is the defence against HPACK expansion.
+HTTP/3 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the pinned quiche enforces it by closing the connection with H3_EXCESSIVE_LOAD.
+A single field over `MAX_HEADER_LINE` and a request line over it are answered on the HTTP/3 stream, as they are on the other two protocols.
+The HTTP/1.1 head limit is separate from the 20 MiB cap on a whole request, and that cap stays.
+
+---
+
 ## Caching
 
 | Backend returns | Behaviour |
