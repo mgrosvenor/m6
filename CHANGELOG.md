@@ -341,6 +341,8 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 **m6-monitor runs one thread with its own event loop.** It ran a background poll thread, one thread per node per poll with blocking HTTP requests, a thread per tunnel probe, a history writer thread and a thread per reverse DNS lookup. Each poll is now a set of non-blocking requests, connects and DNS queries driven by its loop, the page, digest and check are built once per poll and served from memory, and history is written in one short transaction per poll, never waiting on a locked database. The reports are unchanged. The monitor trusts the host's certificate store instead of a bundled one.
 
+**/traffic no longer reads the analytics log.** m6-http read up to 24 MiB of its log file inside its event loop to answer /traffic. It now keeps the last 32,768 events it logs in memory, in space allocated at start, and builds the report from those in the last hour. A report after a restart covers only the time since the restart, and window_minutes says how long that is. A node that wraps the ring inside the hour reports the shorter span it holds and counts the events it dropped. A path is stored up to 512 bytes and a user agent up to 256, and a cut value ends in `...`: the log keeps them whole. A request whose path or user agent was cut counts as probe-shaped, so a marker cannot be hidden past the cut.
+
 ### Removed
 
 m6-http's bundled webpki-roots store, a second store beside the host's.
