@@ -960,9 +960,9 @@ mod tests {
     use super::*;
     use crate::h1::parse_head;
 
-    /// A renderer that renders nothing: these tests route and finish, they do
-    /// not render templates.
-    fn test_renderer() -> &'static dyn RendererFactory {
+    /// The renderer for the test sites: the template engine when the
+    /// `templates` feature is on, and the no-op renderer otherwise.
+    pub(super) fn test_renderer() -> &'static dyn RendererFactory {
         #[cfg(feature = "templates")]
         {
             &crate::template::TeraFactory
@@ -973,14 +973,20 @@ mod tests {
         }
     }
 
+    /// The `/login` template. The two-space runs and the blank line are what a
+    /// minifier removes, so `minify_tests` looks for them in a finished body as
+    /// the evidence that it did not run.
+    pub(super) const LOGIN_PAGE: &str = "<p>  a  </p>\n\n<p>  b  </p>";
+
     /// A site over a temp directory and the given config, with nothing loaded
     /// from the command line or the log.
-    fn site_from(toml: &str, named: &[&str]) -> (Site, tempfile::TempDir) {
+    pub(super) fn site_from(toml: &str, named: &[&str]) -> (Site, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("templates")).unwrap();
         // Written before the site is built: the renderer loads templates at
         // start, so a file written after would never be seen.
         std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
+        std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
         let config_path = dir.path().join("m6-site.toml");
         std::fs::write(&config_path, toml).unwrap();
         let config = crate::config::load(&config_path, dir.path()).unwrap();
@@ -1144,43 +1150,9 @@ mod tests {
 /// once per fill, and a response no cache keeps goes out as it rendered.
 #[cfg(test)]
 mod minify_tests {
+    use super::tests::{site_from, LOGIN_PAGE};
     use super::*;
     use crate::h1::{parse_head, HeadResult};
-
-    /// The `/login` template. The two-space runs and the blank line are what a
-    /// minifier removes, so finding them in the finished body is the evidence
-    /// that it did not run.
-    const LOGIN_PAGE: &str = "<p>  a  </p>\n\n<p>  b  </p>";
-
-    /// A site over a temp directory and the given config, with the templates
-    /// already written: the renderer reads the directory at start, so a file
-    /// written after would never be seen. Copied from `tests::site_from` with
-    /// the `/login` page added.
-    fn site_from(toml: &str, named: &[&str]) -> (Site, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("templates")).unwrap();
-        std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
-        std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
-        let config_path = dir.path().join("m6-site.toml");
-        std::fs::write(&config_path, toml).unwrap();
-        let config = crate::config::load(&config_path, dir.path()).unwrap();
-        let state =
-            FrameworkState::build(config, dir.path().to_path_buf(), &[], test_renderer()).unwrap();
-        let site = Site::from_state(state, named.iter().map(|n| (*n).to_string()).collect());
-        (site, dir)
-    }
-
-    /// A renderer that renders the templates written by [`site_from`].
-    fn test_renderer() -> &'static dyn RendererFactory {
-        #[cfg(feature = "templates")]
-        {
-            &crate::template::TeraFactory
-        }
-        #[cfg(not(feature = "templates"))]
-        {
-            &crate::render::NoTemplates
-        }
-    }
 
     /// One `GET` through `Site::handle`, with the client's `Accept-Encoding`.
     fn handle_get(site: &Site, path: &str, accept_encoding: &str) -> Handled {
@@ -1265,25 +1237,5 @@ mod minify_tests {
             b"{ \"a\": 1 }".as_slice(),
             "a no-store JSON answer must not be minified"
         );
-    }
-
-    /// A `no-store` response skips minification, not compression: a client
-    /// that accepts brotli still gets the page compressed.
-    #[test]
-    fn a_no_store_page_is_still_compressed() {
-        let (site, _dir) = site_from(
-            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
-             cache = \"no-store\"\n",
-            &[],
-        );
-        match handle_get(&site, "/login", "br") {
-            Handled::Done(resp) => assert_eq!(
-                crate::headers::get(&resp.headers[..], "content-encoding"),
-                Some("br"),
-                "a no-store page is still compressed: {:?}",
-                resp.headers
-            ),
-            _ => panic!("a template route comes back Done"),
-        }
     }
 }

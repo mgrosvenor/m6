@@ -3464,7 +3464,8 @@ mod config_route_handler_tests {
         (state, site_dir)
     }
 
-    /// What a browser sees: a script labelled `text/javascript` comes back
+    /// What a browser sees: a script route with no `cache` key defaults to
+    /// `no-store`, and the script labelled `text/javascript` still comes back
     /// brotli-compressed under the default config.
     #[test]
     fn a_text_javascript_response_is_brotli_compressed_by_default() {
@@ -3508,6 +3509,10 @@ mod config_route_handler_tests {
         let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
         assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(
+            head.contains("cache-control: no-store"),
+            "the route has no `cache` key, so it defaults to no-store: {head}"
+        );
         assert!(head.contains("content-encoding: br"), "{head}");
     }
 

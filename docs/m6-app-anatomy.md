@@ -166,7 +166,7 @@ Table 4 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type, plus `inline_js`. A `no-store` response is never minified. A build without the `minify` feature refuses a config that turns it on |
+| `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 11 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info`. `format`, default `json` |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |

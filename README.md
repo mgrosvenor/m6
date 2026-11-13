@@ -233,7 +233,7 @@ Tera template renderer. Handles all HTML routes.
 - `Arc<Map>` params cache: pointer clone per request instead of full Map allocation
 - Route matching: Vec linear scan, ~42–83 ns (faster than HashMap for 3–8 routes)
 - Template render: ~200 ns (Tera cached compiled template)
-- Minification runs once per cached response, which m6-http then serves compressed. A `no-store` response is sent unminified, because it would be minified on every request
+- Minification runs once per cached response, which m6-http then serves compressed. A `no-store` response is the exception, in Table 11 of `docs/m6-architecture.md`
 - Socket round-trip: ~13 µs
 
 **Benchmark results (release, Apple M4, criterion + percentile reporter):**
