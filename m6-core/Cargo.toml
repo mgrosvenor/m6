@@ -64,6 +64,9 @@ tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
 nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net"] }
+# `client::Upstream`'s connect, and the Linux-only backlog test's listener,
+# which needs backlog 0 that `std` cannot ask for. Already a normal dependency,
+# so the test links nothing new.
 socket2    = "0.6"
 httparse   = "1"
 httpdate   = "1"
@@ -123,12 +126,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # a `time::OffsetDateTime` and rcgen does not re-export the type.
 rcgen     = "0.13"
 time      = "0.3"
-# `client.rs`'s Linux-only `a_full_backlog_is_would_block` builds a listener
-# with backlog 0, which `std` cannot ask for. The `socket` module sits behind
-# nix's `socket` feature, enabled here rather than on the production entry
-# above so a built service links neither it nor memoffset. Same crate version
-# the workspace already resolves, so no new package.
-nix       = { version = "0.31", features = ["socket"] }
 
 # The echo programs prove the loop serves with no heap allocation outside table
 # growth. They use the counting allocator behind `testkit`. They are `[[bin]]`
