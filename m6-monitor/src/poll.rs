@@ -1380,12 +1380,14 @@ mod tests {
     fn fleet_of(node: Node) -> crate::fleet::Fleet {
         crate::fleet::Fleet {
             nodes: vec![node],
+            poll_interval_s: crate::DEFAULT_POLL_SECS,
             perf_token_file: None,
             timeout_ms: 5_000,
             header_check: Vec::new(),
             wg_handshakes_file: None,
             tunnel_handshake_max_age_s: 600,
             log_reopen_max_age_s: None,
+            health_last_ok_max_age_s: None,
         }
     }
 

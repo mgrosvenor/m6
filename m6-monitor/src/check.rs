@@ -1,5 +1,11 @@
 //! The hourly health check, printed.
 //!
+//! HEALTH comes first, because it is the question the check exists to answer:
+//! this poll's `/health` for each node, and the age of the node's last 200 from
+//! the history. A node that has not answered 200 for longer than
+//! `health_last_ok_max_age_s`, which defaults to three poll intervals, is
+//! flagged there and in the verdict.
+//!
 //! Apart from section H's tunnel check, this takes every figure from the
 //! nodes' own HTTP endpoints. It does not log in
 //! to any node or run `journalctl`, `systemctl`, `df` or `curl` there, and it
@@ -29,7 +35,7 @@
 
 use std::fmt::Write as _;
 
-use crate::digest::{fmt_uptime, header_check_text, Digest, Level};
+use crate::digest::{fmt_uptime, header_check_text, Digest, Finding, Level};
 use crate::poll::NodeReading;
 
 /// Reverse-lookup results by address, read by [`render`].
@@ -198,6 +204,30 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         d.nodes.len()
     );
     let _ = writeln!(o, "{bar}");
+
+    // ── HEALTH ───────────────────────────────────────────────────────────────
+    //
+    // The first section, because a reader of a fleet report asks whether the
+    // nodes are serving before anything else. Both facts are already collected:
+    // the poll asks every node for `/health` and the service keeps every poll
+    // in its history, so this reads rather than adds a poll.
+    let limit_s = d.thresholds.health_last_ok_age_s;
+    let _ = writeln!(
+        o,
+        "\nHEALTH  (this poll's /health per node and the age of its last 200 from \
+         history. Older than {limit_s}s is flagged)"
+    );
+    for r in readings {
+        let l = health_line(r, d.history.as_ref(), limit_s);
+        let label = if l.fault || l.stale {
+            "FAULT"
+        } else if l.unknown {
+            "unknown"
+        } else {
+            "ok"
+        };
+        let _ = writeln!(o, "  {:<5} {:<7} {}, {}", r.name, label, l.status, l.age);
+    }
 
     // ── A. logging ───────────────────────────────────────────────────────────
     let _ = writeln!(o, "\nA. LOGGING");
@@ -912,6 +942,129 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
     o
 }
 
+/// What the HEALTH section says about this poll's `/health`.
+enum HealthState {
+    /// 200, and the body says ok.
+    Ok,
+    /// A state the digest already faults: unreachable, or degraded.
+    Fault(String),
+    /// An answer that is neither, such as a code m6-http never sends. Shown
+    /// and not judged, as the digest judges it.
+    Unknown(String),
+}
+
+/// Read this poll's `/health` off the reading.
+///
+/// `health_status` is the code the poll saw and `health` is the body it parsed,
+/// and the two are read together because either alone misleads: a 503 is a node
+/// answering honestly rather than a failed request, and a 200 whose body did not
+/// parse is not a healthy node.
+fn health_state(r: &NodeReading) -> HealthState {
+    if let Some(why) = &r.unreachable {
+        return HealthState::Fault(format!("unreachable: {why}"));
+    }
+    match (r.health_status, &r.health) {
+        (Some(200), Some(h)) if h.status == "ok" => HealthState::Ok,
+        (Some(code), Some(h)) if h.status == "degraded" => HealthState::Fault(format!(
+            "{code} degraded: {}",
+            crate::digest::DEGRADED_REASON
+        )),
+        (Some(code), Some(h)) => HealthState::Unknown(format!("{code} {}", h.status)),
+        (Some(code), None) => HealthState::Unknown(format!("{code} with no readable health body")),
+        (None, _) => HealthState::Unknown("no /health answer and no reason given".into()),
+    }
+}
+
+/// One node's HEALTH line.
+struct HealthLine {
+    /// Whether this poll's own answer is a fault.
+    fault: bool,
+    /// Whether this poll's answer is neither ok nor a fault.
+    unknown: bool,
+    /// Whether the last 200 is older than the limit.
+    stale: bool,
+    /// `200`, the degraded reason, or the unknown state's text.
+    status: String,
+    /// `last 200 45s ago`, or which absence the line is reporting.
+    age: String,
+}
+
+fn health_line(
+    r: &NodeReading,
+    history: Option<&crate::history::HistoryDigest>,
+    limit_s: u64,
+) -> HealthLine {
+    let (fault, unknown, status, ok_now) = match health_state(r) {
+        HealthState::Ok => (false, false, "200".to_string(), true),
+        HealthState::Fault(why) => (true, false, why, false),
+        HealthState::Unknown(why) => (false, true, why, false),
+    };
+    let (age, stale) = if ok_now {
+        // This poll's 200 is the node's last 200, and history cannot make it
+        // older. A node that has just recovered must not be flagged for the
+        // time it was away.
+        ("last 200 0s ago".to_string(), false)
+    } else {
+        last_ok(r, history, limit_s)
+    };
+    HealthLine {
+        fault,
+        unknown,
+        stale,
+        status,
+        age,
+    }
+}
+
+/// The age of a node's last 200, and whether it is over `limit_s`.
+fn last_ok(
+    r: &NodeReading,
+    history: Option<&crate::history::HistoryDigest>,
+    limit_s: u64,
+) -> (String, bool) {
+    let Some(h) = history else {
+        return (
+            "last 200 unknown (--check keeps no history)".to_string(),
+            false,
+        );
+    };
+    if h.state == "off" {
+        return ("last 200 unknown (history off)".to_string(), false);
+    }
+    let Some(list) = &h.last_ok else {
+        return (
+            "last 200 unknown (history could not be read)".to_string(),
+            false,
+        );
+    };
+    match list.iter().find(|l| l.node == r.name) {
+        None => ("last 200 unknown (no 200 in history)".to_string(), false),
+        Some(l) if l.age_s > limit_s => (
+            format!("last 200 {}s ago, over the {limit_s}s limit", l.age_s),
+            true,
+        ),
+        Some(l) => (format!("last 200 {}s ago", l.age_s), false),
+    }
+}
+
+/// The verdict's finding for a node whose last 200 is over the limit.
+///
+/// The HEALTH line already prints the fault. This puts the same judgement in
+/// the FAULTS list and the exit status, so a line that reads FAULT cannot sit
+/// above an ALL CLEAR.
+pub(crate) fn stale_last_ok_finding(
+    r: &NodeReading,
+    history: Option<&crate::history::HistoryDigest>,
+    limit_s: u64,
+) -> Option<Finding> {
+    let l = health_line(r, history, limit_s);
+    l.stale.then(|| Finding {
+        level: Level::Fault,
+        node: r.name.clone(),
+        text: l.age,
+    })
+}
+
 /// Whether each address behind a sighting supports the agent's claim.
 ///
 /// One line per address, because a sighting with three addresses where two
@@ -1150,13 +1303,18 @@ mod tests {
         render(&d, std::slice::from_ref(&r))
     }
 
+    /// A node that answers `/health` with 200, the state every section of this
+    /// report describes unless a test says otherwise.
     pub(super) fn reading(name: &str, t: Option<TrafficReport>) -> NodeReading {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
             url: "https://origin.example.com".into(),
-            health: None,
-            health_status: None,
+            health: Some(m6_core::monitoring::HealthReport {
+                status: "ok".into(),
+                node: name.into(),
+            }),
+            health_status: Some(200),
             perf: None,
             perf_error: None,
             traffic: t,
@@ -1965,6 +2123,7 @@ mod history_tests {
             dropped: 2,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         }
     }
 
@@ -1991,6 +2150,7 @@ mod history_tests {
             dropped: 0,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         }));
         assert!(o.contains("I. HISTORY"), "{o}");
         assert!(
@@ -2079,5 +2239,202 @@ mod history_tests {
             o.contains("not kept by --check; the running service keeps it"),
             "{o}"
         );
+    }
+}
+
+/// The HEALTH section: this poll's `/health` per node, and the age of each
+/// node's last 200 from the history the service already keeps.
+///
+/// These run against a real history file, so the age the section prints is the
+/// age the service would have rather than a number handed to the renderer.
+#[cfg(test)]
+mod health_tests {
+    use super::tests::reading;
+    use super::*;
+
+    fn degraded(name: &str) -> NodeReading {
+        let mut r = reading(name, None);
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "degraded".into(),
+            node: name.into(),
+        });
+        r.health_status = Some(503);
+        r
+    }
+
+    fn unreachable(name: &str, why: &str) -> NodeReading {
+        let mut r = reading(name, None);
+        r.health = None;
+        r.health_status = None;
+        r.unreachable = Some(why.into());
+        r
+    }
+
+    /// The line a node is printed on. The first section a node appears in is
+    /// HEALTH, so one match is enough to find its line there.
+    fn line_of<'a>(out: &'a str, node: &str) -> &'a str {
+        let start = format!("  {node}");
+        out.lines()
+            .find(|l| l.starts_with(&start))
+            .unwrap_or_else(|| panic!("no line for {node}:\n{out}"))
+    }
+
+    fn check(rs: &[NodeReading], history: Option<crate::history::HistoryDigest>) -> String {
+        let mut d = crate::digest::build(
+            rs,
+            &crate::digest::Thresholds::default(),
+            "2026-11-14T00:00:00Z".into(),
+        );
+        d.history = history;
+        super::tests::render(&d, rs)
+    }
+
+    /// A history holding one poll, `age_s` seconds before now, in which `node`
+    /// answered 200.
+    fn history_with_last_ok(
+        node: &str,
+        age_s: u64,
+    ) -> (crate::history::HistoryDigest, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let cfg = crate::history::Config {
+            file: dir.path().join("history.sqlite3"),
+            max_bytes: 64 << 20,
+        };
+        let mut history = crate::history::start(Some(cfg)).expect("history opens");
+        let r = reading(node, None);
+        let at_ms = unix_ms() - i64::try_from(age_s).expect("a small age") * 1000;
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-11-14T00:00:00Z".into(),
+        );
+        history.record(crate::history::batch(at_ms, std::slice::from_ref(&r), &d));
+        (history.digest(), dir)
+    }
+
+    fn unix_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    }
+
+    /// Three nodes that answer 200 are the baseline: one `ok` line each, first
+    /// in the report, and nothing for the verdict to raise.
+    #[test]
+    fn three_healthy_nodes_print_ok_in_the_first_section() {
+        let rs = [
+            reading("origin", None),
+            reading("edge-a", None),
+            reading("edge-b", None),
+        ];
+        let out = check(&rs, None);
+        let health = out
+            .find("HEALTH")
+            .unwrap_or_else(|| panic!("no HEALTH section:\n{out}"));
+        let logging = out
+            .find("A. LOGGING")
+            .unwrap_or_else(|| panic!("no logging section:\n{out}"));
+        assert!(health < logging, "HEALTH must come first:\n{out}");
+        for name in ["origin", "edge-a", "edge-b"] {
+            let line = line_of(&out, name);
+            assert!(line.contains("ok"), "{name} is healthy:\n{out}");
+            assert!(line.contains("200"), "{name} answered 200:\n{out}");
+        }
+        assert!(!out.contains("FAULT"), "{out}");
+    }
+
+    /// A degraded node is a fault, and the reason the body's verdict carries is
+    /// printed beside the code rather than left to the operator to look up.
+    #[test]
+    fn a_degraded_node_prints_fault_with_the_reason() {
+        let (h, _dir) = history_with_last_ok("edge-a", 30);
+        let out = check(&[degraded("edge-a")], Some(h));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("FAULT"), "{out}");
+        assert!(line.contains("503 degraded"), "{out}");
+        assert!(
+            line.contains("a configured socket pool has no live member"),
+            "{out}"
+        );
+        assert!(line.contains("last 200"), "{out}");
+    }
+
+    /// A node that cannot be reached is a fault too, with the error that
+    /// stopped the request.
+    #[test]
+    fn an_unreachable_node_prints_fault_with_the_error() {
+        let (h, _dir) = history_with_last_ok("edge-b", 30);
+        let out = check(&[unreachable("edge-b", "connection refused")], Some(h));
+        let line = line_of(&out, "edge-b");
+        assert!(line.contains("FAULT"), "{out}");
+        assert!(line.contains("unreachable"), "{out}");
+        assert!(line.contains("connection refused"), "{out}");
+        assert!(line.contains("last 200"), "{out}");
+    }
+
+    /// A node that has not answered 200 for longer than the limit says so on
+    /// its line, with the age and the limit.
+    #[test]
+    fn a_last_200_older_than_the_limit_prints_fault_with_the_reason() {
+        let (h, _dir) = history_with_last_ok("edge-a", 300);
+        let out = check(&[degraded("edge-a")], Some(h));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("FAULT"), "{out}");
+        assert!(line.contains("last 200"), "{out}");
+        assert!(line.contains("over the 90s limit"), "{out}");
+    }
+
+    /// The other side of the threshold: a recent 200 is shown and not called
+    /// stale, so the comparison has to be doing the deciding.
+    #[test]
+    fn a_last_200_inside_the_limit_is_not_called_stale() {
+        let (h, _dir) = history_with_last_ok("edge-a", 30);
+        let out = check(&[degraded("edge-a")], Some(h));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("last 200"), "{out}");
+        assert!(!line.contains("over the"), "{out}");
+    }
+
+    /// The limit is a setting, so a deployment that wants a longer one gets it
+    /// rather than the default.
+    #[test]
+    fn the_limit_comes_from_the_thresholds() {
+        let (h, _dir) = history_with_last_ok("edge-a", 300);
+        let r = degraded("edge-a");
+        let mut d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds {
+                health_last_ok_age_s: 600,
+                ..Default::default()
+            },
+            "2026-11-14T00:00:00Z".into(),
+        );
+        d.history = Some(h);
+        let out = super::tests::render(&d, std::slice::from_ref(&r));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("last 200"), "{out}");
+        assert!(!line.contains("over the"), "{out}");
+    }
+
+    /// The section and the verdict cannot disagree: the same stale judgement
+    /// is added to the FAULTS list that the exit status reads.
+    #[test]
+    fn a_stale_last_200_reaches_the_verdict() {
+        let (h, _dir) = history_with_last_ok("edge-a", 300);
+        let r = degraded("edge-a");
+        let mut d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-11-14T00:00:00Z".into(),
+        );
+        d.history = Some(h);
+        let f = stale_last_ok_finding(&r, d.history.as_ref(), d.thresholds.health_last_ok_age_s)
+            .expect("a node over the limit raises a finding");
+        assert_eq!(f.level, Level::Fault);
+        assert!(f.text.contains("over the 90s limit"), "{}", f.text);
+        d.add_finding(f);
+        let out = super::tests::render(&d, std::slice::from_ref(&r));
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+        assert!(out.contains("last 200"), "{out}");
     }
 }

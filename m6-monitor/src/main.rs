@@ -203,6 +203,7 @@ fn run_service() -> Result<()> {
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
         log_reopen_age_s: fleet.log_reopen_max_age_s,
+        health_last_ok_age_s: fleet.health_last_ok_limit_s(),
         ..Default::default()
     };
     let mut poller = poll::Poller::new(poll::Setup {
@@ -738,6 +739,18 @@ fn publish(
         d.add_finding(f);
     }
     d.history = Some(h);
+    // The HEALTH section's own judgement reaches the verdict through the same
+    // list as every other fault, so a line that reads FAULT cannot sit above
+    // an ALL CLEAR. The digest already raises the unreachable and degraded
+    // ones, and this adds the age of the last 200, which only the history
+    // knows.
+    for r in &polled.readings {
+        if let Some(f) =
+            check::stale_last_ok_finding(r, d.history.as_ref(), thresholds.health_last_ok_age_s)
+        {
+            d.add_finding(f);
+        }
+    }
     history.record(history::batch(at_ms, &polled.readings, &d));
     let page_status = if d.level == digest::Level::Fault {
         503
@@ -780,6 +793,7 @@ fn run_check(config_path: &Path) -> Result<()> {
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
         log_reopen_age_s: fleet.log_reopen_max_age_s,
+        health_last_ok_age_s: fleet.health_last_ok_limit_s(),
         ..Default::default()
     };
     // One run, one cache, with the wider one-shot cap. `--check` keeps no

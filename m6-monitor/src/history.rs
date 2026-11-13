@@ -762,6 +762,22 @@ impl Store {
         }
     }
 
+    /// When each node last answered `/health` with 200, by node name.
+    ///
+    /// A read of one indexed row per node, taken when the digest is built so
+    /// the age the check prints is the age in the file rather than a number
+    /// kept in memory and able to drift from it.
+    fn last_ok_at(&self) -> rusqlite::Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.name, max(h.at_ms) FROM health h JOIN node n ON n.id = h.node_id \
+             WHERE h.reachable = 1 AND h.status = 'ok' GROUP BY n.name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect();
+        rows
+    }
+
     /// Write one poll in one transaction, then prune. On error the caller drops
     /// this store, so a rolled-back id is never reused from a cache.
     fn write(&mut self, b: &Batch) -> anyhow::Result<Written> {
@@ -1079,6 +1095,23 @@ struct Status {
     newest_ms: Option<i64>,
 }
 
+/// The age of one node's last `/health` answer of 200, from the history.
+///
+/// A node missing from the list has never answered 200 in the history that is
+/// being kept, which the check reports as an absence rather than as an age.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LastOk {
+    pub node: String,
+    pub age_s: u64,
+}
+
+/// The wall clock in milliseconds, for the ages the digest reports.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// The history as the digest reports it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HistoryDigest {
@@ -1100,6 +1133,10 @@ pub struct HistoryDigest {
     pub dropped: u64,
     pub pruned: u64,
     pub last_error: Option<String>,
+    /// The age of each node's last 200. `None` when history is off or the
+    /// file could not be read, and `Some` with no entries when no node has
+    /// answered 200 in the history yet.
+    pub last_ok: Option<Vec<LastOk>>,
 }
 
 /// The history store, owned by the loop that writes it.
@@ -1163,7 +1200,27 @@ impl History {
                 .or_else(|| s.last_error.clone())
                 .or_else(|| s.prune_error.clone())
                 .or_else(|| s.over_cap.then(|| OVER_CAP.to_string())),
+            last_ok: self.last_ok(),
         }
+    }
+
+    /// The age of each node's last 200, read from the store.
+    ///
+    /// The history is the record of what the nodes answered, so the age comes
+    /// from the rows rather than from a counter the writer keeps: a row that
+    /// was pruned stops being a last 200, and the absence is then reported.
+    fn last_ok(&self) -> Option<Vec<LastOk>> {
+        let at = self.store.as_ref()?.last_ok_at().ok()?;
+        let now = now_ms();
+        let mut out: Vec<LastOk> = at
+            .into_iter()
+            .map(|(node, at_ms)| LastOk {
+                node,
+                age_s: u64::try_from(now.saturating_sub(at_ms)).unwrap_or(0) / 1000,
+            })
+            .collect();
+        out.sort_by(|a, b| a.node.cmp(&b.node));
+        Some(out)
     }
 
     /// Add one poll and write every held batch that will go.
@@ -2798,6 +2855,60 @@ mod tests {
         h.record(make(T0 + 2, &[reading("a")]));
         let d = h.digest();
         assert_eq!((d.state, d.writes, d.failures), ("ok", 2, 1));
+    }
+
+    /// The age of each node's last 200 is read from the rows, and a restarted
+    /// monitor reads the same answer out of the file.
+    #[test]
+    fn the_age_of_the_last_200_comes_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = history(cfg(dir.path(), 64));
+        let mut r = reading("origin");
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
+        let d = h.digest();
+        let last_ok = d.last_ok.clone().expect("the history was read");
+        assert_eq!(last_ok.len(), 1, "{last_ok:?}");
+        assert_eq!(last_ok[0].node, "origin");
+        assert!(
+            (300..=301).contains(&last_ok[0].age_s),
+            "300 seconds ago reads as {:?}",
+            last_ok[0]
+        );
+        // A new process asks the file the same question.
+        let reopened = start(Some(cfg(dir.path(), 64))).unwrap();
+        let again = reopened.digest().last_ok.expect("the history was read");
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].node, "origin");
+        assert!((300..=301).contains(&again[0].age_s), "{again:?}");
+    }
+
+    /// A degraded poll is not a 200, so the age keeps running from the last
+    /// answer that was.
+    #[test]
+    fn a_degraded_poll_does_not_reset_the_age_of_the_last_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = history(cfg(dir.path(), 64));
+        let mut r = reading("origin");
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "degraded".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(503);
+        h.record(make(now_ms() - 1000, std::slice::from_ref(&r)));
+        let last_ok = h.digest().last_ok.expect("the history was read");
+        assert_eq!(last_ok.len(), 1, "{last_ok:?}");
+        assert!((300..=301).contains(&last_ok[0].age_s), "{last_ok:?}");
     }
 
     #[test]
