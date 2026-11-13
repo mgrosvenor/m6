@@ -284,7 +284,7 @@ fn reopen_in(slot: Option<&ReopenableFile>, rec: &ReopenRecord) -> Reopened {
     }
 }
 
-/// Reopen the analytics file at its path. Called on [`crate::signal::REOPEN_SIGNAL`].
+/// Reopen the analytics file at its path. Called on [`crate::platform::Signal::ReopenLogs`].
 pub fn reopen_log_file() -> Reopened {
     reopen_in(LOG_FILE.get().map(|a| &**a), &REOPENS)
 }

@@ -19,9 +19,9 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use m6_core::event::raise_open_file_limit;
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform::process::raise_fd_limit;
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::http11::{
     make_tls_server_config, HitHeaders, Http11Listener, RequestHead, RequestOutcome,
@@ -102,7 +102,7 @@ where
         .install_default()
         .ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
-    let ceiling = raise_open_file_limit().unwrap_or(4096);
+    let ceiling = raise_fd_limit().unwrap_or(4096);
     let mut listener = Http11Listener::bind(
         "127.0.0.1:0",
         tls_cfg,

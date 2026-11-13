@@ -33,9 +33,11 @@
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
 use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
-use m6_core::event::{raise_open_file_limit, Signals, Timeouts};
+use m6_core::event::Timeouts;
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -150,7 +152,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
     lifecycle.started();
 
-    let ceiling = raise_open_file_limit()?;
+    let ceiling = raise_fd_limit()?;
     let mut listener = Http11Listener::bind_plain(
         bind,
         crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN,

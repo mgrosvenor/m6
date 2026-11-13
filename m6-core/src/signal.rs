@@ -24,32 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use nix::errno::Errno;
-use nix::sys::signal::{SigSet, Signal};
-
 /// Global shutdown state. Global rather than per-handle so every clone, and
 /// every thread, observes the same value.
 static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// The signal that makes a process reopen its log file.
-///
-/// A rotation tool renames the file and sends this signal.
-/// Not SIGHUP: by convention it asks a daemon to re-read its configuration,
-/// which m6 never does (a change takes a restart), and it also arrives when a
-/// terminal closes.
-/// SIGUSR1 is the reopen convention logrotate users already know.
-/// Before this constant existed SIGUSR1 killed every m6 process at the default disposition.
-pub const REOPEN_SIGNAL: Signal = Signal::SIGUSR1;
-
-/// The signals this module owns: shutdown and log reopen.
-fn managed() -> SigSet {
-    let mut mask = SigSet::empty();
-    mask.add(Signal::SIGTERM);
-    mask.add(Signal::SIGINT);
-    mask.add(REOPEN_SIGNAL);
-    mask
-}
 
 /// Block SIGTERM, SIGINT and SIGUSR1 in the calling thread.
 ///
@@ -62,44 +40,17 @@ fn managed() -> SigSet {
 /// Idempotent, so calling it again from [`ShutdownHandle::install`] costs
 /// nothing.
 pub fn block() {
-    let _ = managed().thread_block();
-}
-
-/// Whether a signal-mask reading proves the calling thread blocks the signals
-/// this module owns.
-///
-/// A reading that fails returns `false`, so [`ShutdownHandle::install`] refuses
-/// to start. A guard that cannot check must refuse to start, per m6's rule that
-/// a check that cannot measure fails.
-fn mask_ok(r: Result<SigSet, Errno>) -> bool {
-    match r {
-        Ok(m) => {
-            m.contains(Signal::SIGTERM) && m.contains(Signal::SIGINT) && m.contains(REOPEN_SIGNAL)
-        }
-        Err(_) => false,
-    }
-}
-
-/// Whether the calling thread currently blocks the signals this module owns.
-fn blocked_here() -> bool {
-    mask_ok(SigSet::thread_get_mask())
+    crate::platform::block();
 }
 
 /// Assert the calling thread blocks the signals, with the reason shared by
-/// [`ShutdownHandle::install`] and [`crate::event::Signals::new`], so the two
+/// [`ShutdownHandle::install`] and [`crate::platform::Signals::new`], so the two
 /// refusal messages cannot drift.
 pub(crate) fn require_blocked() {
-    assert!(
-        blocked_here(),
-        "m6_core::signal::block() must be the first statement of main, before \
-         anything spawns a thread. Without it the signal mask is not inherited \
-         by threads that already exist (the tracing-appender writer, for one), \
-         the kernel delivers SIGTERM to one of them, and the process dies at \
-         the default disposition instead of shutting down."
-    );
+    crate::platform::require_blocked();
 }
 
-/// Reopen the log file for [`REOPEN_SIGNAL`] and say what happened.
+/// Reopen the log file for [`crate::platform::Signal::ReopenLogs`] and say what happened.
 fn reopen_on_signal(name: &str) {
     match crate::log::reopen_log_file() {
         crate::log::Reopened::NoFile => {
@@ -203,9 +154,7 @@ fn wake(socket: Option<&Path>, wake_fd: Option<RawFd>) {
     if let Some(fd) = wake_fd {
         // Return a poller parked in epoll/kqueue. A full pipe is fine: bytes
         // already pending mean the wake is already going to happen.
-        let byte = 1u8;
-        // SAFETY: the caller owns this fd and keeps it open for the process.
-        unsafe { libc::write(fd, std::ptr::addr_of!(byte).cast(), 1) };
+        crate::platform::write_wake_byte(fd);
     }
 }
 
@@ -247,8 +196,8 @@ fn handle_terminate(name: &str, socket: Option<&Path>, count: u32) -> Action {
 
 /// The signal thread's per-signal decisions, without the thread.
 ///
-/// A loop that reads [`crate::event::Signals`] as a descriptor owns one of
-/// these and asks it what each signal means. The first [`crate::event::Signal::Terminate`]
+/// A loop that reads [`crate::platform::Signals`] as a descriptor owns one of
+/// these and asks it what each signal means. The first [`crate::platform::Signal::Shutdown`]
 /// answers [`Action::Stop`]; a second before the loop has ended forces an exit,
 /// exactly as the signal thread did.
 pub struct Lifecycle {
@@ -272,13 +221,13 @@ impl Lifecycle {
     }
 
     /// What to do after one signal. [`Action::Stop`] means the loop breaks.
-    pub fn on_signal(&mut self, s: crate::event::Signal) -> Action {
+    pub fn on_signal(&mut self, s: crate::platform::Signal) -> Action {
         match s {
-            crate::event::Signal::ReopenLogs => {
+            crate::platform::Signal::ReopenLogs => {
                 reopen_on_signal(&self.name);
                 Action::Continue
             }
-            crate::event::Signal::Terminate => {
+            crate::platform::Signal::Shutdown => {
                 self.terminations += 1;
                 handle_terminate(&self.name, self.socket.as_deref(), self.terminations)
             }
@@ -333,15 +282,14 @@ impl ShutdownHandle {
         std::thread::Builder::new()
             .name("m6-signal".into())
             .spawn(move || {
-                let wait_mask = managed();
-                let _ = wait_mask.thread_block();
+                crate::platform::block();
                 let sock = thread_socket.as_deref().map(|p| p.as_path());
                 let name = &*thread_name;
 
-                while let Ok(sig) = wait_mask.wait() {
+                while let Ok(sig) = crate::platform::wait_for_signal() {
                     // Before the terminate count, so a reopen is never a step
                     // toward a forced exit.
-                    if sig == REOPEN_SIGNAL {
+                    if sig == crate::platform::Signal::ReopenLogs {
                         reopen_on_signal(name);
                         continue;
                     }
@@ -473,51 +421,15 @@ mod tests {
         FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The ordering rule is enforced, not merely documented.
-    ///
-    /// Each of these sets its own precondition explicitly rather than relying
-    /// on the ambient mask, because under `--test-threads=1` every test in the
-    /// file runs on the same thread and a mask set by one would otherwise leak
-    /// into the next.
+    /// The ordering rule is enforced, not merely documented. The mask is
+    /// unblocked first so the assertion is the thing that fails. Under
+    /// `--test-threads=1` every test runs on one thread, so the precondition
+    /// is set explicitly rather than taken from the ambient mask.
     #[test]
     #[should_panic(expected = "must be the first statement of main")]
     fn installing_without_blocking_first_is_refused() {
-        let _ = managed().thread_unblock();
+        crate::platform::unblock_for_test();
         let _ = ShutdownHandle::install(Service::new("test"));
-    }
-
-    #[test]
-    fn block_blocks_every_signal_this_module_owns() {
-        let _ = managed().thread_unblock();
-        assert!(
-            !blocked_here(),
-            "precondition: signals start unblocked here"
-        );
-        block();
-        assert!(blocked_here());
-        let _ = managed().thread_unblock();
-    }
-
-    #[test]
-    fn an_unreadable_mask_is_not_ok() {
-        assert!(!mask_ok(Err(Errno::EINVAL)));
-    }
-
-    #[test]
-    fn a_mask_holding_every_managed_signal_is_ok() {
-        assert!(mask_ok(Ok(managed())));
-    }
-
-    #[test]
-    fn a_mask_missing_a_managed_signal_is_not_ok() {
-        for missing in [Signal::SIGTERM, Signal::SIGINT, REOPEN_SIGNAL] {
-            let mut mask = managed();
-            mask.remove(missing);
-            assert!(
-                !mask_ok(Ok(mask)),
-                "a mask missing {missing:?} must not pass"
-            );
-        }
     }
 
     #[test]

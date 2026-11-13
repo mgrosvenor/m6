@@ -63,11 +63,14 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
-nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net"] }
+# The platform layer's safe system calls: signal masks, signalfd and kqueue,
+# poll, statvfs, rlimits, if_nametoindex, waitpid. Named only in
+# `src/platform/`, which `tests/platform_gate.rs` enforces.
+nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net", "process", "user"] }
 # `client::Upstream`'s connect, and the Linux-only backlog test's listener,
 # which needs backlog 0 that `std` cannot ask for. Already a normal dependency,
 # so the test links nothing new.
-socket2    = "0.6"
+socket2    = { version = "0.6", features = ["all"] }
 httparse   = "1"
 httpdate   = "1"
 rand       = "0.8"
@@ -87,8 +90,8 @@ slug        = "0.1"
 # binary, it identifies one. Same RustCrypto family as sha2, so it shares
 # `digest` and adds one crate.
 md-5        = "0.10"
-# The reactor: poll, tokens, interests, events and non-blocking sockets.
-# Re-exported as `m6_core::mio`, so a service links only m6-core.
+# The reactor behind `platform::Poll`: epoll on Linux, kqueue on macOS. Named
+# only in `src/platform/`.
 mio         = { version = "1", features = ["os-poll", "os-ext", "net"] }
 # DNS messages for the monitor's crawler check. Only the message codec is
 # wanted: the socket and the loop are m6's, and `std` is the whole feature set
@@ -119,6 +122,18 @@ rustls-pki-types = { version = "1", optional = true }
 # version m6-http uses, so the workspace links one of it and the lock gains no
 # package.
 rustls-native-certs = "0.8"
+
+# Per OS family, so the Linux build links no `sysinfo` and the macOS build no
+# `rustix` process code. These two tables are the one place outside
+# `src/platform/` that names a `target_os`, and the gate test allows them.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `pidfd_open`, which `nix` does not wrap. Already in the lock through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Host readings (memory, load, uptime, interface counters) where there is no
+# /proc. Default features off: `multithread` would start a rayon pool.
+sysinfo = { version = "0.31", default-features = false, features = ["system", "network"] }
 
 [dev-dependencies]
 tempfile  = "3"
@@ -153,10 +168,10 @@ required-features = ["testkit"]
 name    = "log_reopen"
 harness = false
 
-# Signals as a descriptor, proved against a real `mio` poll. Its own `main` so
-# `block()` runs before any thread, as `log_reopen` does.
+# The platform layer's signal contract. Its own `main` so `block()` runs before
+# any thread, as `log_reopen` does.
 [[test]]
-name    = "event_signals"
+name    = "platform_signals"
 harness = false
 
 # The three allocation checks (`Timeouts`, `Slots`, `LoopTrace`), each on the

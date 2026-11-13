@@ -1,10 +1,9 @@
 //! The parts a service's own event loop is built from.
 //!
-//! The reactor is `mio`, re-exported as [`crate::mio`]. This module adds only
-//! what `mio` lacks: [`Signals`] (signals as a readable descriptor),
-//! [`Timeouts`] (deadlines that never allocate), [`Slots`] (a connection table
-//! that doubles when full and never shrinks) and [`LoopTrace`] (wait time
-//! against work time per trigger).
+//! The reactor and the signal descriptor are [`crate::platform`]'s. This
+//! module adds [`Timeouts`] (deadlines that never allocate), [`Slots`] (a
+//! connection table that doubles when full and never shrinks) and
+//! [`LoopTrace`] (wait time against work time per trigger).
 //!
 //! The loop these parts serve follows six rules. Start and stop may block
 //! freely. The loop never blocks. One thread runs the loop. The poll is
@@ -12,164 +11,9 @@
 //! allocates nothing (table growth excepted). A service's loop uses no
 //! `unsafe`.
 
-use std::io;
-use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
-use mio::Token;
-use nix::sys::signal::{SigSet, Signal as Sig};
-
-// ── Signals ──────────────────────────────────────────────────────────────────
-
-/// A signal the loop cares about.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Signal {
-    /// SIGTERM or SIGINT: stop.
-    Terminate,
-    /// SIGUSR1: reopen the log file.
-    ReopenLogs,
-}
-
-/// SIGTERM, SIGINT and SIGUSR1 as one readable descriptor.
-///
-/// Linux uses `signalfd`, macOS and the BSDs use a kqueue registered for
-/// `EVFILT_SIGNAL`. [`new`](Self::new) blocks the three signals for the process
-/// and asserts [`crate::signal::block`] already ran, because a thread started
-/// before the mask is set takes the signal at its default disposition.
-pub struct Signals {
-    #[cfg(target_os = "linux")]
-    fd: nix::sys::signalfd::SignalFd,
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    kq: nix::sys::event::Kqueue,
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "openbsd"
-)))]
-compile_error!("m6 runs on Linux, macOS and the BSDs");
-
-/// The three signals this module owns, as a mask.
-fn managed() -> SigSet {
-    let mut set = SigSet::empty();
-    set.add(Sig::SIGTERM);
-    set.add(Sig::SIGINT);
-    set.add(crate::signal::REOPEN_SIGNAL);
-    set
-}
-
-/// Map a signal number to the loop's two outcomes.
-fn signal_from_signo(signo: i32) -> Option<Signal> {
-    match Sig::try_from(signo).ok()? {
-        Sig::SIGTERM | Sig::SIGINT => Some(Signal::Terminate),
-        Sig::SIGUSR1 => Some(Signal::ReopenLogs),
-        _ => None,
-    }
-}
-
-impl Signals {
-    #[cfg(target_os = "linux")]
-    pub fn new() -> io::Result<Signals> {
-        crate::signal::require_blocked();
-        let set = managed();
-        set.thread_block()?;
-        let fd = nix::sys::signalfd::SignalFd::with_flags(
-            &set,
-            nix::sys::signalfd::SfdFlags::SFD_NONBLOCK | nix::sys::signalfd::SfdFlags::SFD_CLOEXEC,
-        )?;
-        Ok(Signals { fd })
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-    pub fn new() -> io::Result<Signals> {
-        crate::signal::require_blocked();
-        let set = managed();
-        set.thread_block()?;
-        ignore_default_disposition()?;
-        let kq = nix::sys::event::Kqueue::new()?;
-        for sig in [Sig::SIGTERM, Sig::SIGINT, crate::signal::REOPEN_SIGNAL] {
-            let ev = nix::sys::event::KEvent::new(
-                sig as libc::c_int as libc::uintptr_t,
-                nix::sys::event::EventFilter::EVFILT_SIGNAL,
-                nix::sys::event::EvFlags::EV_ADD | nix::sys::event::EvFlags::EV_ENABLE,
-                nix::sys::event::FilterFlag::empty(),
-                0,
-                0,
-            );
-            kq.kevent(std::slice::from_ref(&ev), &mut [], None)?;
-        }
-        Ok(Signals { kq })
-    }
-
-    /// The readable descriptor, for `mio::unix::SourceFd`. A kqueue descriptor
-    /// is itself readable in `mio`'s kqueue when a signal event is pending.
-    pub fn raw_fd(&self) -> RawFd {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            self.fd.as_raw_fd()
-        }
-        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-        {
-            use std::os::fd::{AsFd, AsRawFd};
-            self.kq.as_fd().as_raw_fd()
-        }
-    }
-
-    /// One pending signal, or `None` when there are no more. The caller loops
-    /// until `None`: the descriptor is edge-triggered, so every pending signal
-    /// must be drained on one wake.
-    pub fn read(&mut self) -> Option<Signal> {
-        #[cfg(target_os = "linux")]
-        {
-            let info = self.fd.read_signal().ok()??;
-            signal_from_signo(info.ssi_signo as i32)
-        }
-        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-        {
-            let mut out = nix::sys::event::KEvent::new(
-                0,
-                nix::sys::event::EventFilter::EVFILT_SIGNAL,
-                nix::sys::event::EvFlags::empty(),
-                nix::sys::event::FilterFlag::empty(),
-                0,
-                0,
-            );
-            let zero = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            let n = self
-                .kq
-                .kevent(&[], std::slice::from_mut(&mut out), Some(zero))
-                .ok()?;
-            if n == 0 {
-                return None;
-            }
-            signal_from_signo(out.ident() as i32)
-        }
-    }
-}
-
-/// Set the three signals to `SIG_IGN`, so a delivery never runs a handler.
-///
-/// kqueue delivers `EVFILT_SIGNAL` events even while the disposition is
-/// `SIG_IGN`, and ignoring keeps a stray delivery from a thread whose mask is
-/// not set from taking the process down at the default disposition.
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-#[allow(unsafe_code)] // SIG_IGN installs no handler code, so no signal runs an unsound function pointer.
-fn ignore_default_disposition() -> io::Result<()> {
-    use nix::sys::signal::{SaFlags, SigAction, SigHandler};
-    let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    for sig in [Sig::SIGTERM, Sig::SIGINT, crate::signal::REOPEN_SIGNAL] {
-        // SAFETY: `SIG_IGN` runs no handler code, so the disposition is the
-        // kernel's own and cannot call back into unsound Rust.
-        unsafe { nix::sys::signal::sigaction(sig, &action)? };
-    }
-    Ok(())
-}
+use crate::platform::Token;
 
 // ── Timeouts ─────────────────────────────────────────────────────────────────
 
@@ -335,17 +179,6 @@ impl<T> Slots<T> {
     pub fn is_full(&self) -> bool {
         self.free.is_empty() && self.items.len() >= self.ceiling
     }
-}
-
-// ── Open-file limit ──────────────────────────────────────────────────────────
-
-/// The process's soft open-file limit, raised to the hard limit: the connection
-/// table's ceiling. Start only.
-pub fn raise_open_file_limit() -> io::Result<usize> {
-    use nix::sys::resource::{getrlimit, setrlimit, Resource};
-    let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
-    setrlimit(Resource::RLIMIT_NOFILE, hard, hard)?;
-    Ok(hard.saturating_sub(16) as usize) // room for the listener, the signal fd, the poll, stdio
 }
 
 // ── LoopTrace ────────────────────────────────────────────────────────────────
@@ -628,19 +461,5 @@ mod tests {
             r[0].work_mean_ns,
             Duration::from_millis(1).as_nanos() as u64
         );
-    }
-
-    /// `Signals::new` without `block()` first refuses to start. The mask is
-    /// unblocked first so the assertion is the thing that fails, as
-    /// `signal::installing_without_blocking_first_is_refused` does.
-    #[test]
-    #[should_panic(expected = "must be the first statement of main")]
-    fn signals_new_refuses_an_unblocked_mask() {
-        let mut set = SigSet::empty();
-        set.add(Sig::SIGTERM);
-        set.add(Sig::SIGINT);
-        set.add(crate::signal::REOPEN_SIGNAL);
-        let _ = set.thread_unblock();
-        let _ = Signals::new();
     }
 }

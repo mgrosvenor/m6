@@ -1941,8 +1941,10 @@ pub fn fill_page<T: Keyed>(
 mod tests {
     use super::*;
     use crate::digest::{self, Thresholds};
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice};
     use m6_core::monitoring::{LoggingHealth, TrafficReport};
+    use m6_core::platform::host::{
+        Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice,
+    };
     use m6_core::telemetry::ChannelSnapshot;
 
     const T0: i64 = 1_800_000_000_000;
@@ -2025,7 +2027,7 @@ mod tests {
                 total_bytes: 2000,
                 available_bytes: 500,
             }),
-            thermal: vec![m6_core::host::ThermalZone {
+            thermal: vec![m6_core::platform::host::ThermalZone {
                 name: "cpu".into(),
                 celsius: 45.5,
             }],

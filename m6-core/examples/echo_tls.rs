@@ -1,10 +1,11 @@
 //! The TLS version of the echo server: the same loop, with rustls (the ring
 //! provider, as m6-http uses) between the socket and the buffer.
 //!
-//! Usage: echo_tls ADDR CERT KEY. ECHO_IDLE_MS and ECHO_CONNS as echo.
+//! Usage: echo_tls ADDR CERT KEY. ECHO_IDLE_MS, ECHO_DRAIN_MS and ECHO_CONNS
+//! as echo.
 //!
-//! This is the approved loop shape every m6 service copies, with TLS in the
-//! slot's own buffers.
+//! The reference loop of `echo.rs`, with TLS in the slot's own buffers, built
+//! on `m6_core::platform` alone.
 
 #![deny(unsafe_code)]
 
@@ -12,11 +13,10 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use m6_core::event::{raise_open_file_limit, Signal, Signals, Slots, Timeouts};
-use m6_core::mio::event::Event;
-use m6_core::mio::net::{TcpListener, TcpStream};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::event::{Slots, Timeouts};
+use m6_core::platform::net::{listen_tcp, TcpStream};
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::{self, Event, Events, Interest, Poll, Signal, Signals, Token};
 use rustls::ServerConnection;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -74,19 +74,17 @@ fn main() -> io::Result<()> {
     config.send_tls13_tickets = 0; // as the C server: no session tickets
     let config = Arc::new(config);
     let idle = Duration::from_millis(env_or("ECHO_IDLE_MS", 10_000));
+    let drain = Duration::from_millis(env_or("ECHO_DRAIN_MS", 1_000));
     let initial = env_or("ECHO_CONNS", 1024) as usize;
-    let ceiling = env_or("ECHO_MAX_CONNS", raise_open_file_limit()? as u64) as usize;
+    let ceiling = env_or("ECHO_MAX_CONNS", raise_fd_limit()? as u64) as usize;
 
     let mut poll = Poll::new()?;
-    let mut listener = TcpListener::bind(addr)?;
+    let mut listener = listen_tcp(addr)?;
     let mut signals = Signals::new()?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
-    poll.registry().register(
-        &mut SourceFd(&signals.raw_fd()),
-        SIGNALS,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)?;
 
     // The whole connection table, every buffer in it, the free list, the
     // timeouts and the events: allocated here, never grown except by `Slots`.
@@ -94,6 +92,8 @@ fn main() -> io::Result<()> {
     let mut idle_timeouts = Timeouts::new(initial, idle);
     let mut events = Events::with_capacity(EVENTS);
     let mut accepting = true;
+    let mut open = 0usize;
+    let mut drain_until: Option<Instant> = None;
     eprintln!(
         "listening on {}, {} connection slots",
         listener.local_addr()?,
@@ -101,18 +101,20 @@ fn main() -> io::Result<()> {
     );
     let allocated_at_start = m6_core::testkit::alloc_count::now();
     let mut growth_allocations = 0;
+    let mut now = platform::now();
 
     // ---- run: nothing blocks, nothing allocates ----
     'run: loop {
-        match poll.poll(
-            &mut events,
-            Some(idle_timeouts.timeout(Instant::now(), TICK)),
-        ) {
+        let mut timeout = idle_timeouts.timeout(now, TICK);
+        if let Some(until) = drain_until {
+            timeout = timeout.min(until.saturating_duration_since(now));
+        }
+        match poll.poll(&mut events, Some(timeout)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
-        let now = Instant::now();
+        now = platform::now();
         for ev in &events {
             match ev.token() {
                 LISTENER => {
@@ -142,6 +144,7 @@ fn main() -> io::Result<()> {
                             Interest::READABLE,
                         )?;
                         idle_timeouts.touch(Token(taken.key), now);
+                        open += 1;
                         let c = slots.get_mut(taken.key);
                         c.tls =
                             Some(ServerConnection::new(config.clone()).map_err(io::Error::other)?);
@@ -157,10 +160,23 @@ fn main() -> io::Result<()> {
                         );
                     }
                 }
-                SIGNALS => match signals.read() {
-                    Some(Signal::Terminate) => break 'run,
-                    Some(Signal::ReopenLogs) | None => {}
-                },
+                SIGNALS => {
+                    while let Some(request) = signals.read() {
+                        match request {
+                            Signal::Shutdown if drain_until.is_none() => {
+                                if accepting {
+                                    poll.registry().deregister(&mut listener)?;
+                                    accepting = false;
+                                }
+                                drain_until = Some(now + drain);
+                            }
+                            Signal::Shutdown => {}
+                            Signal::ReopenLogs => {
+                                io::stderr().write_all(b"log reopen requested\n")?;
+                            }
+                        }
+                    }
+                }
                 Token(k) => {
                     let c = slots.get_mut(k);
                     match service(c, ev) {
@@ -173,15 +189,24 @@ fn main() -> io::Result<()> {
                             }
                             idle_timeouts.touch(Token(k), now);
                         }
-                        None => close(&poll, &mut slots, &mut idle_timeouts, k)?,
+                        None => {
+                            close(&poll, &mut slots, &mut idle_timeouts, k)?;
+                            open -= 1;
+                        }
                     }
                 }
             }
         }
-        while let Some(Token(k)) = idle_timeouts.expired(Instant::now()) {
+        while let Some(Token(k)) = idle_timeouts.expired(now) {
             close(&poll, &mut slots, &mut idle_timeouts, k)?;
+            open -= 1;
         }
-        if !accepting && !slots.is_full() {
+        if let Some(until) = drain_until {
+            if open == 0 || now >= until {
+                break 'run;
+            }
+        }
+        if !accepting && drain_until.is_none() && !slots.is_full() {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
@@ -191,7 +216,6 @@ fn main() -> io::Result<()> {
     // ---- stop: blocking and allocation are fine ----
     let outside_growth =
         m6_core::testkit::alloc_count::now() - allocated_at_start - growth_allocations;
-    let open = open_count(&slots);
     eprintln!(
         "stopping, {open} connection(s) open, {} slots, {outside_growth} allocation(s) during the run outside table growth",
         slots.len()
@@ -294,13 +318,6 @@ fn close(
         slots.free(k);
     } // `stream` drops here, which closes the socket
     Ok(())
-}
-
-/// The number of open connections, so the stopping line can report it.
-fn open_count(slots: &Slots<Conn>) -> usize {
-    (0..slots.len())
-        .filter(|k| slots.get(*k).stream.is_some())
-        .count()
 }
 
 impl Conn {

@@ -55,11 +55,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{close_conn, head_slots, Flush, Read, RequestHead, ServerConn};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
@@ -216,8 +218,7 @@ fn run_service() -> Result<()> {
         lookup_cap: check::MAX_LOOKUPS_PER_POLL,
     });
 
-    let ceiling =
-        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");
     }

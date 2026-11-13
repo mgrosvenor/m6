@@ -1194,7 +1194,7 @@ mod tests {
     fn a_node_up_minutes_reads_minutes_in_the_check() {
         let mut r = reading("origin", None);
         r.perf = Some(crate::digest::tests::perf(
-            m6_core::host::HostSnapshot {
+            m6_core::platform::host::HostSnapshot {
                 cpus: 1,
                 ..Default::default()
             },
@@ -1841,8 +1841,8 @@ mod tunnel_tests {
     #[test]
     fn wg_interface_drops_are_shown_when_the_node_reports_them() {
         let mut r = with_tunnel("edge-a", Handshake::At { age_s: 1 });
-        let mut host = m6_core::host::HostSnapshot::default();
-        host.net.push(m6_core::host::NetDevice {
+        let mut host = m6_core::platform::host::HostSnapshot::default();
+        host.net.push(m6_core::platform::host::NetDevice {
             name: "wg0".into(),
             rx_drop: 3,
             tx_drop: 4,
@@ -1866,7 +1866,7 @@ mod tunnel_tests {
         });
         r.health_status = Some(200);
         let mut p: PerfReport = crate::digest::tests::perf(
-            m6_core::host::HostSnapshot {
+            m6_core::platform::host::HostSnapshot {
                 cpus: 1,
                 ..Default::default()
             },

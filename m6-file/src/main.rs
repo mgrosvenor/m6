@@ -25,11 +25,13 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::{Handled, NoTemplates, Site};
 
@@ -55,8 +57,7 @@ fn main() -> Result<()> {
     // ── start: blocking and allocation are fine ──────────────────────────
     let site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
     let read_timeout = site.read_timeout();
-    let descriptors =
-        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is
     // being written, so the table takes half of what the limit leaves: one
     // descriptor per connection and one per streamed body. A larger table

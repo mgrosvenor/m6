@@ -122,9 +122,11 @@ impl<'a> CompletionCtx<'a> {
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::mio::unix::SourceFd;
 use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
@@ -5102,7 +5104,7 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let ceiling = match raise_open_file_limit() {
+    let ceiling = match raise_fd_limit() {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "raising the open-file limit failed");
