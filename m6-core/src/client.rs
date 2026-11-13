@@ -1702,22 +1702,17 @@ mod socket_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_full_backlog_is_would_block() {
-        use nix::sys::socket::{
-            bind, connect, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
-        };
+        use socket2::{Domain, SockAddr, Socket, Type};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("full.sock");
-        let addr = UnixAddr::new(&path).expect("unix addr");
-        let listener = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::SOCK_CLOEXEC,
-            None,
-        )
-        .expect("listener socket");
-        bind(listener.as_raw_fd(), &addr).expect("bind");
-        listen(&listener, Backlog::new(0).expect("backlog 0")).expect("listen");
+        let addr = SockAddr::unix(&path).expect("unix addr");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("listener socket");
+        listener.bind(&addr).expect("bind");
+        listener.listen(0).expect("listen");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
 
         // Fill the queue. Each filler is non-blocking, so the connect that finds
         // the queue full returns EAGAIN rather than waiting for an accept. The
@@ -1728,16 +1723,11 @@ mod socket_tests {
                 fillers.len() < 256,
                 "the backlog never filled: 256 connects all succeeded"
             );
-            let fd = socket(
-                AddressFamily::Unix,
-                SockType::Stream,
-                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-                None,
-            )
-            .expect("filler socket");
-            match connect(fd.as_raw_fd(), &addr) {
-                Ok(()) => fillers.push(fd),
-                Err(nix::errno::Errno::EAGAIN) => break,
+            let filler = Socket::new(Domain::UNIX, Type::STREAM, None).expect("filler socket");
+            filler.set_nonblocking(true).expect("nonblocking filler");
+            match filler.connect(&addr) {
+                Ok(()) => fillers.push(filler),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => panic!("filler connect: {e}"),
             }
         }
