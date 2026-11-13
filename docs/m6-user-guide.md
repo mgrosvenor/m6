@@ -1476,6 +1476,10 @@ A write that fails is a warning on node `monitor` and never stops polling.
 A prune that fails, or a cap that deleting every earlier poll cannot meet, is its own warning, and the poll is still stored.
 To start fresh, stop the service, delete the file and start it again.
 
+The `/check` report starts with a HEALTH section, one line per node, showing this poll's `/health` answer and the age of the node's last 200 from this history.
+`[monitor] health_last_ok_max_age_s` sets the age above which the line is flagged, and it defaults to three `poll_interval_s` values.
+A node is ok only when `/health` answers 200 and the body status is `ok`. Every other node is a fault on its line and in the verdict: a 503 whatever its body says, a 200 with any other status, and no answer at all. The last 200 is read from an index that holds only the 200 rows, so reading it does not slow as the history grows.
+
 `GET /history` and `GET /crawlers` answer on the service's Unix socket and nowhere else.
 Both take `from` and `to` as *RFC 3339* UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.
 A page holds at most 4 MiB and 10,000 rows.
