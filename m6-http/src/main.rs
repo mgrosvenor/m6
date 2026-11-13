@@ -1404,12 +1404,11 @@ fn retire_upstream(
     result: &std::io::Result<forward::HttpResponse>,
     cx: &mut CompletionCtx<'_>,
 ) -> (Option<Waiter>, Option<Box<forward::PendingUrlContext>>) {
-    let (kind, member_idx, backend_name, waiter, ctx, reusable) = {
+    let (kind, member_idx, waiter, ctx, reusable) = {
         let entry = cx.state.upstreams.get_mut(slot);
         (
             entry.kind,
             entry.member_idx,
-            std::mem::take(&mut entry.backend_name),
             entry.waiter.take(),
             entry.ctx.take(),
             entry.upstream.reusable(),
@@ -1418,15 +1417,18 @@ fn retire_upstream(
     let mut kept = false;
     match kind {
         UpstreamKind::Member => {
-            cx.state.upstreams.get_mut(slot).upstream.close();
-            cx.state.upstreams.free(slot);
-            if let Some(pool) = cx.state.pool_manager.get_pool_mut(&backend_name) {
+            let entry = cx.state.upstreams.get_mut(slot);
+            entry.upstream.close();
+            // Release the member using a borrow of the slot's name, before the
+            // slot is freed, so the name buffer survives for the next launch.
+            if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
                 if result.is_err() {
                     pool.mark_failed(member_idx);
                 } else {
                     pool.release(member_idx);
                 }
             }
+            cx.state.upstreams.free(slot);
         }
         UpstreamKind::Url(idx) => {
             kept = result.is_ok()
@@ -3221,6 +3223,7 @@ fn launch_socket_upstream(
         let entry = state.upstreams.get_mut(owner.key);
         let interest = entry.upstream.interest();
         if let Err(e) = registry.register(&mut SourceFd(&entry.upstream.fd()), token, interest) {
+            entry.upstream.close();
             state.upstreams.free(owner.key);
             *state.sources.get_mut(token.0) = Source::Vacant;
             state.sources.free(token.0);
@@ -3239,7 +3242,8 @@ fn launch_socket_upstream(
     entry.kind = UpstreamKind::Member;
     entry.token = token;
     entry.member_idx = member_idx;
-    entry.backend_name = backend_name.to_string();
+    entry.backend_name.clear();
+    entry.backend_name.push_str(backend_name);
     entry.waiter = None;
     entry.ctx = None;
     entry.registered_interest = interest;
@@ -3732,7 +3736,7 @@ fn handle_request_inner(
         req: req.clone(),
         client_ip: client_ip.to_string(),
         enc: content_encoding.to_string(),
-        backend_name: backend_name.clone(),
+        backend_name,
         kind: forward::PendingKind::Socket,
         route_path: Some(route.path.clone()),
         cacheable,
