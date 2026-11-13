@@ -381,7 +381,9 @@ pub fn lowered_fd_limit_command(
     let opens: String = (0..inherited)
         .map(|i| format!("exec {}<>/dev/null; ", 3 + i))
         .collect();
-    let mut cmd = Command::new("sh");
+    // bash, not sh: dash takes only single-digit descriptor numbers in a
+    // redirection, so on Ubuntu `exec 10<>/dev/null` runs a command named `10`.
+    let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(format!(
             "ulimit -Sn {hard}; ulimit -Hn {hard}; {opens}exec \"$0\" \"$@\""
