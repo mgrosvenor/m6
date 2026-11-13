@@ -1433,12 +1433,8 @@ fn retire_upstream(
             // Release the member using a borrow of the slot's name, before the
             // slot is freed, so the name buffer survives for the next launch.
             if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
-                // A member that answered, or that closed while the request was
-                // still being sent, is healthy: it never got the whole request,
-                // so this is a refusal, and its reply may be waiting unread. A
-                // member that went silent, or that failed after taking the
-                // whole request, is not. A refused connect is marked failed
-                // where the request starts.
+                // A refusal's reply may be waiting unread. A refused connect
+                // was already marked failed at launch.
                 if result.is_err() && (timed_out || request_written) {
                     pool.mark_failed(member_idx);
                 } else {

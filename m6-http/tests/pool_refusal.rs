@@ -9,7 +9,7 @@
 
 #![allow(
     clippy::disallowed_methods,
-    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+    reason = "test code: threads and blocking clients drive the service from outside"
 )]
 
 use std::io::{Read, Write};
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use m6_core::testkit::{binary, claim_port, read_one, Service};
+use m6_http_lib::probe;
 
 /// The largest request head the test backend accepts, mirroring the 8 KiB cap
 /// in the blocking parser a backend service runs.
@@ -40,9 +41,6 @@ impl Backend {
     fn start(path: PathBuf) -> Backend {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("bind backend socket");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
         let stop = Arc::new(AtomicBool::new(false));
         let handle = spawn_accept(listener, Arc::clone(&stop));
         Backend {
@@ -56,6 +54,9 @@ impl Backend {
 impl Drop for Backend {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Wake the blocking accept so its loop sees `stop` and returns. The
+        // listener is still bound here, so this connects to it.
+        let _ = UnixStream::connect(&self.path);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -65,16 +66,14 @@ impl Drop for Backend {
 
 fn spawn_accept(listener: UnixListener, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    std::thread::spawn(move || serve(stream));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => break,
+        // A blocking accept, so the backend polls nothing and the order of the
+        // test is driven only by the requests arriving. `Drop` wakes this with
+        // one connection to the path after setting `stop`.
+        while let Ok((stream, _)) = listener.accept() {
+            if stop.load(Ordering::SeqCst) {
+                return;
             }
+            std::thread::spawn(move || serve(stream));
         }
     })
 }
@@ -83,7 +82,6 @@ fn spawn_accept(listener: UnixListener, stop: Arc<AtomicBool>) -> std::thread::J
 /// refuses: it closes with the rest of the request unread, the state `m6-file`
 /// leaves when it rejects an oversized header.
 fn serve(mut stream: UnixStream) {
-    let _ = stream.set_nonblocking(false);
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -100,67 +98,18 @@ fn serve(mut stream: UnixStream) {
     let _ = stream.flush();
 }
 
-fn tls_client() -> Arc<rustls::ClientConfig> {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::DigitallySignedStruct;
-
-    #[derive(Debug)]
-    struct NoVerify;
-    impl ServerCertVerifier for NoVerify {
-        fn verify_server_cert(
-            &self,
-            _: &CertificateDer,
-            _: &[CertificateDer],
-            _: &ServerName,
-            _: &[u8],
-            _: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
-    }
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
-    let mut c = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-    c.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(c)
-}
-
 /// Send `raw` on a fresh HTTP/1.1-over-TLS connection and return the response
 /// bytes, or an empty vector when the server closed without answering.
 fn send(port: u16, raw: &[u8]) -> Vec<u8> {
+    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect m6-http");
     tcp.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");
     tcp.set_write_timeout(Some(Duration::from_secs(10)))
         .expect("write timeout");
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name");
-    let conn = rustls::ClientConnection::new(tls_client(), name).expect("client connection");
+    let conn = rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name)
+        .expect("client connection");
     let mut stream = rustls::StreamOwned::new(conn, tcp);
     stream.write_all(raw).expect("write request");
     stream.flush().expect("flush");
