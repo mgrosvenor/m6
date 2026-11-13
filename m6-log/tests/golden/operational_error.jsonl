@@ -1,0 +1,1 @@
+{"timestamp":"2026-11-13T16:56:34.676572Z","level":"ERROR","fields":{"message":"H2C listener bind failed; it is configured, so refusing to run without it","bind":"192.0.2.1:8443","error":"Address already in use (os error 48)"},"target":"m6_http"}
