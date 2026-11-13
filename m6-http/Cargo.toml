@@ -157,3 +157,9 @@ harness = false
 [[test]]
 name = "alloc_cached_hit"
 harness = false
+
+# The /traffic window's per-event allocation check, on the main thread for the
+# same reason.
+[[test]]
+name = "traffic_window_alloc"
+harness = false

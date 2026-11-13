@@ -85,6 +85,43 @@ impl AnalyticsRecord {
     pub fn user_agent(&self) -> &str {
         self.fields.user_agent.as_deref().unwrap_or("")
     }
+
+    /// The record the analytics line with these values parses to.
+    ///
+    /// `/traffic` keeps a window of what this process logged, as the fields
+    /// the report reads, and builds its report from those. This turns them
+    /// back into a record, so a window produces the report the same lines
+    /// would have produced from the file.
+    ///
+    /// The timestamp is written as the logging envelope writes it: UTC, fixed
+    /// width, microsecond precision. Fixed width matters because the report
+    /// compares timestamps as strings.
+    pub fn from_parts(
+        at_us: u64,
+        message: &str,
+        status: u16,
+        path: &str,
+        client_ip: &str,
+        user_agent: Option<&str>,
+    ) -> Self {
+        let at = i64::try_from(at_us).expect("a Unix time in microseconds fits in i64");
+        let timestamp = chrono::DateTime::from_timestamp_micros(at)
+            .expect("a Unix time in microseconds is in range")
+            .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+            .to_string();
+        Self {
+            timestamp,
+            level: "INFO".to_string(),
+            fields: AnalyticsFields {
+                message: message.to_string(),
+                path: path.to_string(),
+                status,
+                client_ip: client_ip.to_string(),
+                user_agent: user_agent.map(str::to_string),
+                ..AnalyticsFields::default()
+            },
+        }
+    }
 }
 
 /// Parse an NDJSON stream, keeping records at or after `since`.
@@ -1111,6 +1148,49 @@ mod tests {
     fn a_torn_last_line_does_not_lose_the_rest() {
         let text = "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"fields\":{\"message\":\"request\"}}\n{\"timestamp\":\"2026-01";
         assert_eq!(parse_analytics(text, "").count(), 1);
+    }
+
+    /// `from_parts` is the only way `/traffic` gets a record from its window,
+    /// so what it builds has to be the record the line with those values
+    /// parses to. One case for each kind of line m6-http logs: a request, a
+    /// monitor poll, and a rate-limited request.
+    ///
+    /// The line carries the six values the window keeps, which are the six
+    /// `from_parts` takes. A field the window does not keep is empty in both,
+    /// which is what makes the whole `AnalyticsFields` comparable.
+    #[test]
+    fn from_parts_matches_the_logged_line() {
+        let at_us = 1_789_106_714_986_903u64;
+        let timestamp = "2026-09-11T06:05:14.986903Z";
+        // message, status, path, client_ip, user agent
+        let cases: [(&str, u16, &str, &str, Option<&str>); 3] = [
+            (
+                "request",
+                200,
+                "/capabilities",
+                "198.51.100.23",
+                Some("curl/8.7.1"),
+            ),
+            ("monitor", 200, "/health", "192.0.2.9", None),
+            ("request", 429, "/", "203.0.113.5", Some("ExampleBot/1.0")),
+        ];
+        for (message, status, path, client_ip, user_agent) in cases {
+            let ua = match user_agent {
+                Some(ua) => format!(r#","user_agent":"{ua}""#),
+                None => String::new(),
+            };
+            let line = format!(
+                r#"{{"timestamp":"{timestamp}","level":"INFO","fields":{{"message":"{message}","path":"{path}","status":{status},"client_ip":"{client_ip}"{ua}}}}}"#
+            );
+            let parsed = parse_analytics(&line, "").next().expect("one record");
+            let built =
+                AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent);
+            assert_eq!(
+                serde_json::to_value(&built).expect("serialisable"),
+                serde_json::to_value(&parsed).expect("serialisable"),
+                "{message} {status} {path}"
+            );
+        }
     }
 
     #[test]

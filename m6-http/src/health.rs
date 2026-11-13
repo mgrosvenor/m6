@@ -130,84 +130,277 @@ mod monitoring_exclusion_tests {
 
 // ── /traffic ─────────────────────────────────────────────────────────────────
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use m6_core::monitoring::TrafficReport;
-
-/// Last summary and when it was built.
-///
-/// One node, one cache. Behind a Mutex because building a summary reads a file
-/// and there is no reason to let two scrapes do it at once; the lock is held
-/// across the read deliberately, so a second caller waits for the first
-/// answer rather than starting a second 47MB tail.
-static CACHE: Mutex<Option<(Instant, TrafficReport)>> = Mutex::new(None);
+use m6_core::telemetry::AnalyticsRecord;
 
 /// Where the privileged collector leaves `nft -j list ruleset` output.
 const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 
-/// Read the last `window_minutes` of the analytics log and summarise it.
-///
-/// The newest rotated file is read as well, so the window survives a rotation.
-/// It is read only when the live tail did not fill the budget and the file was written inside the window, and a gzip file only when it is small (see `m6_core::log::read_recent_counted`).
-/// This runs inline on the event loop, so the work is bounded.
-///
-/// The tail is bounded rather than reading the whole file: an hour of traffic
-/// is at most a few hundred KB and the file is tens of MB, so reading it all
-/// would be almost entirely wasted work. 24MB is a wide margin over the
-/// busiest hour observed (370KB, during a 890-request probe).
-fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<TrafficReport> {
-    const TAIL_BYTES: usize = 24 * 1024 * 1024;
+/// The most events `/traffic` keeps. Allocated once at start.
+const TRAFFIC_SLOTS: usize = 32_768;
 
-    // The newest rotated file is read before the live one, so the summary
-    // spans a rotation. A mid-record start is expected after a cut, and
-    // `ndjson::read_str` skips what it cannot parse, so it costs nothing.
-    let since_time =
-        std::time::SystemTime::now() - Duration::from_secs(window_minutes.saturating_mul(60));
-    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES, since_time)?;
+/// How far back `/traffic` reports, in minutes.
+///
+/// The ring holds far more than an hour at the busiest rate observed (about
+/// 1,000 lines in an hour), so the hour is applied when the report is built
+/// rather than when an event is kept.
+const TRAFFIC_WINDOW_MINUTES: u64 = 60;
 
-    let since = m6_core::util::iso8601_minutes_ago(window_minutes);
-    let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
+/// The most bytes a slot keeps of a path. The report shows the cut path, the
+/// log keeps the whole one.
+const PATH_CAP: usize = 512;
+
+/// The most bytes a slot keeps of a client address. An IPv6 address is at most
+/// 45 characters.
+const IP_CAP: usize = 45;
+
+/// The most bytes a slot keeps of a user agent.
+const UA_CAP: usize = 256;
+
+/// The three analytics lines m6-http writes per request or poll.
+///
+/// A request and a rate-limited request both log `"message":"request"`: the
+/// rate limiter logs that row with status 429. A monitor poll logs
+/// `"message":"monitor"`, which keeps it out of the site traffic counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Request,
+    Monitor,
+    RateLimited,
+}
+
+impl Kind {
+    fn message(self) -> &'static str {
+        match self {
+            Kind::Request | Kind::RateLimited => "request",
+            Kind::Monitor => "monitor",
+        }
+    }
+}
+
+/// A capped string in a fixed array, copied into a slot without allocating.
+#[derive(Clone)]
+struct Field<const N: usize> {
+    /// Byte length, or `ABSENT` when the event carried no such value.
+    len: u16,
+    bytes: [u8; N],
+}
+
+impl<const N: usize> Field<N> {
+    /// The length that marks a value the event did not carry.
+    ///
+    /// Only the user agent uses it. An absent user agent is not an empty one,
+    /// and the record has to keep the difference because the report is built
+    /// from the record the log line would have parsed to.
+    const ABSENT: u16 = u16::MAX;
+
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; N],
+        }
+    }
+
+    /// Copy `s` in, cut at `N` bytes on a character boundary.
+    fn set(&mut self, s: &str) {
+        let mut end = s.len().min(N);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.bytes[..end].copy_from_slice(&s.as_bytes()[..end]);
+        self.len = end as u16;
+    }
+
+    fn mark_absent(&mut self) {
+        self.len = Self::ABSENT;
+    }
+
+    fn as_str(&self) -> &str {
+        let len = if self.len == Self::ABSENT {
+            0
+        } else {
+            usize::from(self.len)
+        };
+        std::str::from_utf8(&self.bytes[..len]).unwrap_or_default()
+    }
+
+    fn as_opt(&self) -> Option<&str> {
+        (self.len != Self::ABSENT).then(|| self.as_str())
+    }
+}
+
+/// One logged event, as `/traffic` needs it.
+///
+/// Fixed size, so the ring is one allocation and a push is one copy. The
+/// fields are the ones the report reads, plus the time and the kind.
+#[derive(Clone)]
+struct TrafficSlot {
+    at_us: u64,
+    kind: Kind,
+    status: u16,
+    path: Field<PATH_CAP>,
+    client_ip: Field<IP_CAP>,
+    user_agent: Field<UA_CAP>,
+}
+
+impl TrafficSlot {
+    fn empty() -> Self {
+        Self {
+            at_us: 0,
+            kind: Kind::Request,
+            status: 0,
+            path: Field::empty(),
+            client_ip: Field::empty(),
+            user_agent: Field::empty(),
+        }
+    }
+}
+
+/// The last events this process logged, for `/traffic`. Allocated at start.
+///
+/// A ring of fixed slots and a write index. A logged request copies a few
+/// hundred bytes into the next slot, overwriting the oldest when the ring is
+/// full: no allocation and no system call. The report reads the slots.
+///
+/// The window is a count of events rather than a size in bytes, and the hour
+/// is applied when the report is built.
+pub struct TrafficWindow {
+    slots: Box<[TrafficSlot]>,
+    next: usize,
+    filled: usize,
+    started: Instant,
+}
+
+impl Default for TrafficWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrafficWindow {
+    /// Allocate the ring once, at start, at the full configured size.
+    pub fn new() -> Self {
+        Self {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            started: Instant::now(),
+        }
+    }
+
+    /// Record one logged event, overwriting the oldest slot when the ring is
+    /// full.
+    ///
+    /// One copy into a slot that was allocated at start. No allocation and no
+    /// system call, which is what keeps the cost of logging a request in
+    /// memory instead of a file read.
+    pub fn push(
+        &mut self,
+        at_us: u64,
+        kind: Kind,
+        status: u16,
+        path: &str,
+        client_ip: &str,
+        user_agent: Option<&str>,
+    ) {
+        let slot = &mut self.slots[self.next];
+        slot.at_us = at_us;
+        slot.kind = kind;
+        slot.status = status;
+        slot.path.set(path);
+        slot.client_ip.set(client_ip);
+        match user_agent {
+            Some(ua) => slot.user_agent.set(ua),
+            None => slot.user_agent.mark_absent(),
+        }
+        self.next += 1;
+        if self.next == self.slots.len() {
+            self.next = 0;
+        }
+        if self.filled < self.slots.len() {
+            self.filled += 1;
+        }
+    }
+
+    /// The minutes the ring covers: the configured hour, or less since start.
+    ///
+    /// A report soon after a restart says how long it covers, so an empty
+    /// figure is not read as an hour with no traffic.
+    fn covered_minutes(&self) -> u64 {
+        (self.started.elapsed().as_secs() / 60).min(TRAFFIC_WINDOW_MINUTES)
+    }
+
+    /// The recorded slots from oldest to newest.
+    fn oldest_first(&self) -> impl Iterator<Item = &TrafficSlot> {
+        let len = self.slots.len();
+        let start = if self.filled == len { self.next } else { 0 };
+        let slots = &self.slots;
+        (0..self.filled).map(move |i| &slots[(start + i) % len])
+    }
+}
+
+/// Unix microseconds, the precision the analytics envelope records.
+pub(crate) fn unix_micros_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
+/// Build the `/traffic` summary from the window.
+///
+/// The records of the last hour are turned back into the records the log
+/// lines would have parsed to, and `TrafficReport::from_records` builds the
+/// report body, so the figures match the ones a log read produces.
+fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
+    let cutoff = unix_micros_now().saturating_sub(TRAFFIC_WINDOW_MINUTES * 60 * 1_000_000);
+    let mut records: Vec<AnalyticsRecord> = Vec::with_capacity(window.filled);
+    for slot in window.oldest_first() {
+        if slot.at_us < cutoff {
+            continue;
+        }
+        records.push(AnalyticsRecord::from_parts(
+            slot.at_us,
+            slot.kind.message(),
+            slot.status,
+            slot.path.as_str(),
+            slot.client_ip.as_str(),
+            slot.user_agent.as_opt(),
+        ));
+    }
+    let mut report = TrafficReport::from_records(node, &records, window.covered_minutes());
     // Written by the m6-firewall-stats timer. A node without the timer
     // reports no firewall state rather than an empty one.
     report.firewall =
         m6_core::firewall::FirewallState::from_file(std::path::Path::new(FIREWALL_JSON))
             .unwrap_or(None);
-    Ok(report)
+    report
 }
 
 /// Serve `/traffic` to a caller [`metrics_gate`] has already let through:
-/// this node's summary of its own traffic.
+/// this node's summary of its own traffic, built from the window in memory.
 ///
 /// Gate first, then work, as for `/perf`, so an anonymous caller never causes
-/// a file read.
+/// the report to be built.
 ///
-/// The cache is what makes a file read safe to expose at all. Without it a
-/// monitor polling every thirty seconds makes every node re-read its analytics
-/// tail every thirty seconds, forever, to produce an answer that changes
-/// slowly. With it the read happens at most once per TTL however often the
-/// endpoint is scraped. The lock is held across the read deliberately: a
-/// second caller arriving mid-read waits for the first answer rather than
-/// starting a second tail.
+/// The cache keeps the build and its allocation to at most one per `cache_for`,
+/// however often the endpoint is scraped. It is a plain field of the loop's
+/// state: one thread owns the loop, so there is no lock to take.
 pub fn traffic_authorised(
     node: &str,
-    log_path: &str,
-    window_minutes: u64,
+    window: &TrafficWindow,
+    cache: &mut Option<(Instant, TrafficReport)>,
     cache_for: Duration,
 ) -> PerfOutcome {
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((built, report)) = cache.as_ref() {
         if built.elapsed() < cache_for {
             return PerfOutcome::Traffic(Box::new(report.clone()));
         }
     }
-    match build_report(node, log_path, window_minutes) {
-        Ok(r) => {
-            *cache = Some((Instant::now(), r.clone()));
-            PerfOutcome::Traffic(Box::new(r))
-        }
-        Err(e) => PerfOutcome::TrafficError(format!("{e}")),
-    }
+    let report = build_report(node, window);
+    *cache = Some((Instant::now(), report.clone()));
+    PerfOutcome::Traffic(Box::new(report))
 }
 
 /// The verdict of the metrics gate for one request.
@@ -276,20 +469,13 @@ pub fn metrics_gate(
 #[cfg(test)]
 mod traffic_endpoint_tests {
     use super::*;
-    use std::io::Write;
-
-    fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
-        format!(
-            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"origin","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
-        )
-    }
 
     /// No token configured means the endpoint does not exist: a 404, so it
     /// does not advertise a door. A wrong token is refused by the gate,
-    /// which runs before `traffic_authorised` and so before any file is
-    /// opened.
+    /// which runs before `traffic_authorised` and so before the report is
+    /// built.
     #[test]
-    fn the_legacy_gate_refuses_before_the_log_is_read() {
+    fn the_legacy_gate_refuses_before_the_report_is_built() {
         let none = HealthConfig::default();
         let Gate::Refused(out) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
             panic!("no token configured must refuse");
@@ -307,54 +493,29 @@ mod traffic_endpoint_tests {
         ));
     }
 
-    /// An unreadable log is reported, not silently served as a quiet hour.
-    /// This codebase has made that mistake: an absent file at the expected
-    /// path looked exactly like a feature switched off.
     #[test]
-    fn an_unreadable_log_is_a_503_with_a_reason() {
-        let out = traffic_authorised(
-            "origin",
-            "/definitely/not/a/file",
-            60,
-            Duration::from_secs(0),
+    fn summarises_the_window_and_serves_it() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        window.push(
+            now - 2_000_000,
+            Kind::Request,
+            200,
+            "/",
+            "1.2.3.4",
+            Some("Chrome/131"),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 503);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(!v["error"].as_str().unwrap_or("").is_empty());
-    }
-
-    #[test]
-    fn summarises_a_real_log_and_serves_it() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        let now = m6_core::util::now_iso8601();
-        let ts = now.trim_end_matches('Z');
-        writeln!(
-            f,
-            "{}",
-            row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            row(
-                &format!("{ts}.200Z"),
-                "5.6.7.8",
-                "/robots.txt",
-                200,
-                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"
-            )
-        )
-        .unwrap();
-        f.flush().unwrap();
-
-        let out = traffic_authorised(
-            "origin",
-            f.path().to_str().unwrap(),
-            60,
-            Duration::from_secs(0),
+        window.push(
+            now - 1_000_000,
+            Kind::Request,
+            200,
+            "/robots.txt",
+            "5.6.7.8",
+            Some("Mozilla/5.0 (compatible; ExampleBot/1.0)"),
         );
+
+        let mut cache = None;
+        let out = traffic_authorised("origin", &window, &mut cache, Duration::from_secs(0));
         let (code, headers, body) = out.into_response();
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -363,7 +524,7 @@ mod traffic_endpoint_tests {
         assert!(v["crawlers"][0]["user_agent"]
             .as_str()
             .unwrap()
-            .contains("ClaudeBot"));
+            .contains("ExampleBot"));
         assert!(v["logging"].is_object(), "logging health travels with it");
         // Never cached by anything in between.
         assert!(headers
@@ -371,34 +532,90 @@ mod traffic_endpoint_tests {
             .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 
-    /// After an hourly rotation the live file is nearly empty, and the
-    /// monitor's sixty minute sections must not shrink with it.
+    /// The age filter keeps the window to an hour: 61 minutes old is out,
+    /// 59 is in.
     #[test]
-    fn the_window_spans_the_newest_rotated_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = m6_core::util::now_iso8601();
-        let ts = now.trim_end_matches('Z');
-        let live = dir.path().join("analytics.ndjson");
-        std::fs::write(
-            &live,
-            format!(
-                "{}\n",
-                row(&format!("{ts}.300Z"), "1.2.3.4", "/c", 200, "x")
-            ),
-        )
-        .unwrap();
-        let rotated = format!(
-            "{}\n{}\n",
-            row(&format!("{ts}.100Z"), "1.2.3.4", "/a", 200, "x"),
-            row(&format!("{ts}.200Z"), "1.2.3.4", "/b", 200, "x")
+    fn the_window_drops_records_older_than_an_hour() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        window.push(
+            now - 61 * 60 * 1_000_000,
+            Kind::Request,
+            404,
+            "/old",
+            "192.0.2.1",
+            None,
         );
-        // Plain here. The gzip path is covered by `m6_core::log`'s tests.
-        std::fs::write(dir.path().join("analytics.ndjson-2026010101"), rotated).unwrap();
-        let out = traffic_authorised("origin", live.to_str().unwrap(), 60, Duration::from_secs(0));
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["total_requests"], 3);
+        window.push(
+            now - 59 * 60 * 1_000_000,
+            Kind::Request,
+            200,
+            "/new",
+            "192.0.2.2",
+            None,
+        );
+        let report = build_report("origin", &window);
+        assert_eq!(report.total_requests, 1, "only the last hour counts");
+        assert_eq!(report.status.get(&200), Some(&1));
+        assert_eq!(report.status.get(&404), None);
+    }
+
+    /// A full ring keeps the newest events and drops the oldest, rather than
+    /// stopping and reporting a frozen hour forever.
+    #[test]
+    fn the_ring_overwrites_the_oldest() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 418, "/oldest", "192.0.2.1", None);
+        }
+        for _ in 0..TRAFFIC_SLOTS {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.2", None);
+        }
+        window.push(now, Kind::Request, 429, "/newest", "192.0.2.3", None);
+
+        let report = build_report("origin", &window);
+        assert_eq!(report.total_requests, TRAFFIC_SLOTS as u64);
+        assert_eq!(
+            report.status.get(&418),
+            None,
+            "the ten oldest slots were overwritten"
+        );
+        assert_eq!(
+            report.status.get(&429),
+            Some(&1),
+            "the newest event is present"
+        );
+    }
+
+    /// A path longer than its cap is cut on a character boundary. Cutting at
+    /// the byte cap regardless can split a multi-byte character, and the slot
+    /// would then not be UTF-8.
+    #[test]
+    fn a_long_path_is_cut_on_a_character_boundary() {
+        let mut window = TrafficWindow::new();
+        // "/" plus 300 two-byte characters: 601 bytes, and byte 512 falls in
+        // the middle of a character.
+        let path = format!("/{}", "é".repeat(300));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            200,
+            &path,
+            "192.0.2.1",
+            None,
+        );
+        let stored = window.slots[0].path.as_str();
+        assert!(stored.len() <= PATH_CAP, "stored {} bytes", stored.len());
+        assert!(!stored.is_empty(), "the cut keeps as much as it can");
+        assert!(
+            path.starts_with(stored),
+            "the stored value is a prefix of the request path"
+        );
+        assert!(
+            std::str::from_utf8(stored.as_bytes()).is_ok(),
+            "the cut left valid UTF-8"
+        );
     }
 }
 

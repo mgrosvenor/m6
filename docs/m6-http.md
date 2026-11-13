@@ -194,7 +194,10 @@ Rotate the analytics file by renaming it and sending `SIGUSR1`.
 The process creates the file at its path again, and the path reappearing means the renamed file is finished.
 If the reopen fails, the process keeps writing to the previous file and logs an error.
 `/perf` reports the last reopen under `logging.reopen`.
-`/traffic` also reads the newest rotated file next to the log (`<name>-YYYYmmddHH`, plain or `.gz`), so its window spans a rotation.
+`/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
+The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
+It starts empty after a restart, and `window_minutes` says how much of the hour the process has covered.
+In the report a path is cut at 512 bytes and a user agent at 256, while the analytics log keeps them whole.
 
 ---
 

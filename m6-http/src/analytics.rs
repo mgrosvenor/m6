@@ -9,6 +9,8 @@
 /// a handful of string operations, not a database/ruleset lookup.
 use quiche::h3::NameValue as _;
 
+use crate::health::{Kind, TrafficWindow};
+
 pub use m6_core::http::{header, HeaderSource};
 
 pub const SESSION_COOKIE: &str = "_m6sid";
@@ -163,6 +165,7 @@ pub fn record(
     enabled: bool,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
+    window: &mut TrafficWindow,
 ) -> Option<String> {
     if !enabled {
         return None;
@@ -170,6 +173,14 @@ pub fn record(
     let (session_id, session_new) = get_or_create_session(request_headers);
     let features = extract_features(request_headers);
     log_request(ev, &session_id, session_new, &features);
+    window.push(
+        crate::health::unix_micros_now(),
+        Kind::Request,
+        ev.status,
+        ev.path,
+        ev.client_ip,
+        features.user_agent.as_deref(),
+    );
     session_new.then(|| session_cookie_header_value(&session_id))
 }
 
@@ -199,9 +210,10 @@ pub fn finish_response(
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
+    window: &mut TrafficWindow,
 ) {
     let html = is_html_response(resp_headers);
-    if let Some(sc) = record(enabled, request_headers, ev) {
+    if let Some(sc) = record(enabled, request_headers, ev, window) {
         if html {
             resp_headers.push(("Set-Cookie".to_string(), sc));
         }
@@ -250,6 +262,7 @@ pub fn finish_proxied_response(
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
+    window: &mut TrafficWindow,
 ) {
     if !enabled {
         return;
@@ -257,9 +270,17 @@ pub fn finish_proxied_response(
     if let Some(session_id) = session_from_response_headers(resp_headers) {
         let features = extract_features(request_headers);
         log_request(ev, &session_id, false, &features);
+        window.push(
+            crate::health::unix_micros_now(),
+            Kind::Request,
+            ev.status,
+            ev.path,
+            ev.client_ip,
+            features.user_agent.as_deref(),
+        );
         return;
     }
-    finish_response(enabled, resp_headers, request_headers, ev);
+    finish_response(enabled, resp_headers, request_headers, ev, window);
 }
 
 /// Emit one structured analytics line. Routed by `m6_core::log`'s
@@ -302,6 +323,7 @@ fn log_request(ev: &Event<'_>, session_id: &str, session_new: bool, features: &R
 ///
 /// No session is minted: a monitor is not a visitor, and issuing it a session
 /// cookie would put an unbounded number of one-request sessions into the data.
+#[allow(clippy::too_many_arguments)] // one poll's fields plus the window it records into
 pub fn log_monitor(
     enabled: bool,
     request_headers: &(impl HeaderSource + ?Sized),
@@ -310,6 +332,7 @@ pub fn log_monitor(
     status: u16,
     client_ip: &str,
     latency_ns: Option<u64>,
+    window: &mut TrafficWindow,
 ) {
     if !enabled {
         return;
@@ -325,12 +348,26 @@ pub fn log_monitor(
         latency_ns = latency_ns,
         "monitor"
     );
+    window.push(
+        crate::health::unix_micros_now(),
+        Kind::Monitor,
+        status,
+        path,
+        client_ip,
+        features.user_agent.as_deref(),
+    );
 }
 
 /// Log a request rejected by the per-IP rate limiter, before it ever reaches
 /// routing/cache lookup — a separate, lighter event from `log_request` since
 /// almost nothing about the request has been processed yet at that point.
-pub fn log_rate_limited(node: &str, path: &str, client_ip: &str, user_agent: Option<&str>) {
+pub fn log_rate_limited(
+    node: &str,
+    path: &str,
+    client_ip: &str,
+    user_agent: Option<&str>,
+    window: &mut TrafficWindow,
+) {
     tracing::info!(
         target: "analytics",
         node = node,
@@ -342,6 +379,14 @@ pub fn log_rate_limited(node: &str, path: &str, client_ip: &str, user_agent: Opt
         bot_reason = "rate-exceeded",
         user_agent = user_agent,
         "request"
+    );
+    window.push(
+        crate::health::unix_micros_now(),
+        Kind::RateLimited,
+        429,
+        path,
+        client_ip,
+        user_agent,
     );
 }
 
@@ -512,6 +557,7 @@ mod tests {
     #[test]
     fn record_returns_none_when_disabled() {
         let headers = Vec::<(String, String)>::new();
+        let mut window = TrafficWindow::new();
         let sc = record(
             false,
             &headers,
@@ -523,6 +569,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert!(sc.is_none());
     }
@@ -530,6 +577,7 @@ mod tests {
     #[test]
     fn record_returns_cookie_only_when_session_new() {
         let headers = Vec::<(String, String)>::new(); // no _m6sid cookie present
+        let mut window = TrafficWindow::new();
         let sc = record(
             true,
             &headers,
@@ -541,6 +589,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: Some(123),
             },
+            &mut window,
         );
         assert!(
             sc.is_some(),
@@ -552,6 +601,7 @@ mod tests {
     #[test]
     fn record_reuses_existing_session_no_cookie() {
         let headers = vec![("Cookie".to_string(), "_m6sid=existing-id".to_string())];
+        let mut window = TrafficWindow::new();
         let sc = record(
             true,
             &headers,
@@ -563,6 +613,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: Some(123),
             },
+            &mut window,
         );
         assert!(
             sc.is_none(),
@@ -577,6 +628,7 @@ mod tests {
         let vec_headers = vec![("Cookie".to_string(), "_m6sid=shared-id".to_string())];
         let h3_raw = quiche_headers(&[("cookie", "_m6sid=shared-id")]);
         let h3_headers = H3Headers(&h3_raw);
+        let mut window = TrafficWindow::new();
 
         let vec_sc = record(
             true,
@@ -589,6 +641,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         let h3_sc = record(
             true,
@@ -601,6 +654,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert_eq!(
             vec_sc, None,
@@ -619,6 +673,7 @@ mod tests {
             "text/html; charset=utf-8".to_string(),
         )];
         let req_headers = Vec::<(String, String)>::new();
+        let mut window = TrafficWindow::new();
         finish_response(
             true,
             &mut resp_headers,
@@ -631,6 +686,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert_eq!(
             resp_headers.len(),
@@ -644,6 +700,7 @@ mod tests {
     fn finish_response_skips_set_cookie_for_non_html() {
         let mut resp_headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
         let req_headers = Vec::<(String, String)>::new();
+        let mut window = TrafficWindow::new();
         finish_response(
             true,
             &mut resp_headers,
@@ -656,6 +713,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert_eq!(
             resp_headers.len(),
@@ -668,6 +726,7 @@ mod tests {
     fn finish_response_appends_nothing_when_disabled() {
         let mut resp_headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
         let req_headers = Vec::<(String, String)>::new();
+        let mut window = TrafficWindow::new();
         finish_response(
             false,
             &mut resp_headers,
@@ -680,6 +739,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert_eq!(
             resp_headers.len(),
@@ -730,6 +790,7 @@ mod tests {
                 .to_string(),
         )];
         let req_headers = Vec::<(String, String)>::new(); // the original client request never had a cookie
+        let mut window = TrafficWindow::new();
         finish_proxied_response(
             true,
             &mut resp_headers,
@@ -742,6 +803,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
 
         let set_cookies: Vec<&(String, String)> = resp_headers
@@ -761,6 +823,7 @@ mod tests {
         // _m6sid — behaves exactly like finish_response in that case.
         let mut resp_headers = vec![("Content-Type".to_string(), "text/html".to_string())];
         let req_headers = Vec::<(String, String)>::new();
+        let mut window = TrafficWindow::new();
         finish_proxied_response(
             true,
             &mut resp_headers,
@@ -773,6 +836,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert_eq!(
             resp_headers.len(),
@@ -789,6 +853,7 @@ mod tests {
             "_m6sid=origin-minted-id; Max-Age=1800".to_string(),
         )];
         let req_headers = Vec::<(String, String)>::new();
+        let mut window = TrafficWindow::new();
         finish_proxied_response(
             false,
             &mut resp_headers,
@@ -801,6 +866,7 @@ mod tests {
                 client_ip: "1.2.3.4",
                 latency_ns: None,
             },
+            &mut window,
         );
         assert_eq!(
             resp_headers.len(),

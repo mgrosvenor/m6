@@ -339,6 +339,18 @@ struct ServerState {
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
     /// correction, a VM resuming) cannot make uptime jump or go negative.
     started: std::time::Instant,
+    /// The last events this process logged, for `/traffic`.
+    ///
+    /// A ring allocated at start, pushed once per logged event and never
+    /// allocated while serving. `/traffic` builds its report from it, so the
+    /// analytics log is not read inside the loop.
+    traffic: health::TrafficWindow,
+    /// The last `/traffic` summary and when it was built.
+    ///
+    /// Held so the report is built at most once per `traffic_cache_s`, however
+    /// often the endpoint is scraped. It is a plain field because one thread
+    /// owns the loop.
+    traffic_report: Option<(Instant, m6_core::monitoring::TrafficReport)>,
     /// Reused buffer a cache lookup builds its key into, so a lookup never
     /// allocates. Capacity 512 matches the old stack buffer's bound.
     lookup_key_buf: String,
@@ -782,6 +794,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                     client_ip,
                     latency_ns: Some(elapsed_ns),
                 },
+                &mut state.traffic,
             );
             return Routed::Ready(412, hdrs, Vec::new(), "cache".to_string());
         }
@@ -811,6 +824,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                     client_ip,
                     latency_ns: Some(elapsed_ns),
                 },
+                &mut state.traffic,
             );
             return Routed::Ready(304, hdrs, Vec::new(), "cache".to_string());
         }
@@ -834,6 +848,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                 client_ip,
                 latency_ns: Some(elapsed_ns),
             },
+            &mut state.traffic,
         )
         .filter(|_| analytics::is_html_response(&cached.headers));
         return Routed::Cached {
@@ -2549,6 +2564,7 @@ fn handle_h3_request(
                     client_ip: &client_ip,
                     latency_ns: Some(elapsed_ns),
                 },
+                &mut state.traffic,
             );
             let html = analytics::is_html_response(&cached.headers);
             let mut headers = not_modified_headers(&cached.headers);
@@ -2600,6 +2616,7 @@ fn handle_h3_request(
                 client_ip: &client_ip,
                 latency_ns: Some(elapsed_ns),
             },
+            &mut state.traffic,
         );
         // Build headers with Link: preload / Vary / Set-Cookie appended as
         // needed. Vary is now always added on a cache hit (the cache key is
@@ -3378,6 +3395,7 @@ fn handle_request_inner(
             code,
             client_ip,
             None,
+            &mut state.traffic,
         );
         return RequestOutcome::Ready(code, headers, body, health::HEALTH_BACKEND.to_string());
     }
@@ -3435,15 +3453,17 @@ fn handle_request_inner(
             code,
             client_ip,
             None,
+            &mut state.traffic,
         );
         return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
     }
 
     // ── Traffic summary, the third monitoring path ──────────────────────────
-    // Its own path for the same reason /perf is not /health: this one reads
-    // the tail of the analytics log, so its cost is a property of the path
-    // rather than of a header on a cheaper one. Cached, so a polling monitor
-    // cannot make the node re-read the log on every scrape.
+    // Its own path for the same reason /perf is not /health: this one builds
+    // a report from the window of events the process kept in memory, so its
+    // cost is a property of the path rather than of a header on a cheaper
+    // one. Cached, so a polling monitor cannot make the node rebuild it on
+    // every scrape.
     if state.config.health.enabled && req.path == state.config.health.traffic_path {
         let outcome = match health::metrics_gate(
             &state.config.health,
@@ -3455,8 +3475,8 @@ fn handle_request_inner(
             health::Gate::Refused(refused) => refused,
             health::Gate::Open => health::traffic_authorised(
                 &state.config.node.name,
-                &state.config.analytics.log_path,
-                60,
+                &state.traffic,
+                &mut state.traffic_report,
                 std::time::Duration::from_secs(state.config.health.traffic_cache_s),
             ),
         };
@@ -3469,6 +3489,7 @@ fn handle_request_inner(
             code,
             client_ip,
             None,
+            &mut state.traffic,
         );
         return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
     }
@@ -3814,7 +3835,13 @@ fn check_rate_limit(
         return None;
     }
     if state.config.analytics.enabled {
-        analytics::log_rate_limited(&state.config.node.name, path, client_ip, user_agent);
+        analytics::log_rate_limited(
+            &state.config.node.name,
+            path,
+            client_ip,
+            user_agent,
+            &mut state.traffic,
+        );
     }
     let headers = vec![
         (
@@ -3886,6 +3913,7 @@ fn dispatch_custom_error_async(
                 client_ip,
                 latency_ns: Some(latency_ns),
             },
+            &mut state.traffic,
         );
         return Some(RequestOutcome::Ready(
             status,
@@ -4346,6 +4374,7 @@ fn error_page_fallback(
             client_ip: &ctx.client_ip,
             latency_ns: Some(latency_ns),
         },
+        &mut state.traffic,
     );
     (original_status, headers, body, "error".to_string())
 }
@@ -4396,6 +4425,7 @@ fn complete_socket_response(
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
                     },
+                    &mut state.traffic,
                 );
                 Completion::Ready((
                     original_status,
@@ -4473,6 +4503,7 @@ fn complete_socket_response(
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(backend_ns),
                     },
+                    &mut state.traffic,
                 );
                 Completion::Ready((s, h, b, n))
             }
@@ -4499,6 +4530,7 @@ fn complete_socket_response(
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(backend_ns),
             },
+            &mut state.traffic,
         );
         set_alt_svc(&mut resp_headers, quic_port);
 
@@ -4590,6 +4622,7 @@ fn finalize_url_response_inner(
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
                     },
+                    &mut state.traffic,
                 );
                 Completion::Ready((
                     original_status,
@@ -4666,6 +4699,7 @@ fn finalize_url_response_inner(
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
                     },
+                    &mut state.traffic,
                 );
                 Completion::Ready((s, h, b, n))
             }
@@ -4688,6 +4722,7 @@ fn finalize_url_response_inner(
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(latency_ns),
             },
+            &mut state.traffic,
         );
 
         Completion::Ready((status, headers_with_altsvc, body, used_backend))
@@ -5201,6 +5236,8 @@ fn run(args: Vec<String>) -> i32 {
         rate_limiter: RateLimiter::new(),
         error_pages: HashMap::new(),
         started: std::time::Instant::now(),
+        traffic: health::TrafficWindow::new(),
+        traffic_report: None,
         lookup_key_buf: String::with_capacity(512),
         alt_svc_line,
         describedby_line,

@@ -1317,7 +1317,20 @@ impl TrafficReport {
     pub fn build(node: &str, ndjson: &str, since: &str, window_minutes: u64) -> Self {
         let records: Vec<crate::telemetry::AnalyticsRecord> =
             crate::telemetry::parse_analytics(ndjson, since).collect();
-        let summary = crate::telemetry::TrafficSummary::from_records(&records);
+        Self::from_records(node, &records, window_minutes)
+    }
+
+    /// Summarise records that are already parsed.
+    ///
+    /// `/traffic` keeps its records in memory and never reads the log, so the
+    /// report a window produces and the report the same lines would produce
+    /// from the file run through this one body.
+    pub fn from_records(
+        node: &str,
+        records: &[crate::telemetry::AnalyticsRecord],
+        window_minutes: u64,
+    ) -> Self {
+        let summary = crate::telemetry::TrafficSummary::from_records(records);
 
         let notable: Vec<NotableClient> = summary
             .clients
