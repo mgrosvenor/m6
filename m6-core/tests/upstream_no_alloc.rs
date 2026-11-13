@@ -215,14 +215,6 @@ fn tls_request(
         poll.poll(events, Some(Duration::from_millis(100)))
             .expect("poll");
         if events.iter().any(|ev| ev.token() == token) {
-            let next = up.interest();
-            if next != interest {
-                poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, next)
-                    .expect("reregister");
-                interest = next;
-                *registered = Some(next);
-            }
             if up.drive().expect("drive") {
                 let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
                     m6_core::client::MAX_HEADERS] =
@@ -230,6 +222,16 @@ fn tls_request(
                 let reply = up.reply(&mut slots).expect("reply");
                 assert_eq!(reply.status, 200);
                 return;
+            }
+            // Drive first: under epoll edge-triggering, interest registered
+            // before the drive waits for an edge that never comes.
+            let next = up.interest();
+            if next != interest {
+                poll.registry()
+                    .reregister(&mut SourceFd(&up.fd()), token, next)
+                    .expect("reregister");
+                interest = next;
+                *registered = Some(next);
             }
         }
         if Instant::now() >= up.deadline() {

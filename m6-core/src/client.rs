@@ -1546,18 +1546,23 @@ mod socket_tests {
         loop {
             poll.poll(&mut events, Some(Duration::from_millis(100)))?;
             if events.iter().any(|ev| ev.token() == token) {
-                let interest = up.interest();
-                if interest != registered {
-                    poll.registry()
-                        .reregister(&mut SourceFd(&up.fd()), token, interest)?;
-                    registered = interest;
-                }
                 if up.drive()? {
                     let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
                         [const { std::mem::MaybeUninit::uninit() }; MAX_HEADERS];
                     let reply = up.reply(&mut slots).expect("reply after complete drive");
                     let headers = reply_headers(&reply);
                     return Ok((reply.status, headers, reply.body.to_vec()));
+                }
+                // `drive` moves the phase on, so the interest it wants now can
+                // differ from the one registered before the call. The
+                // reregister belongs AFTER the drive: under epoll
+                // edge-triggering, a change made before it waits for an edge
+                // that may never arrive.
+                let interest = up.interest();
+                if interest != registered {
+                    poll.registry()
+                        .reregister(&mut SourceFd(&up.fd()), token, interest)?;
+                    registered = interest;
                 }
             }
             if Instant::now() >= up.deadline() {
@@ -1742,14 +1747,53 @@ mod socket_tests {
     /// On Linux, a connect to a full Unix-socket backlog returns WouldBlock, so
     /// the caller answers 503. On macOS the kernel answers ECONNREFUSED, so this
     /// test builds only on Linux.
+    ///
+    /// `std::net::UnixListener::bind` listens with backlog 128, so a single
+    /// connect never fills it and `start` would succeed. Build the listener
+    /// with backlog 0 instead, then fill the queue with non-blocking connects.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_full_backlog_is_would_block() {
+        use nix::sys::socket::{
+            bind, connect, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
+        };
+
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("full.sock");
-        // Backlog 1, never accept: the first connection fills the queue.
-        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
-        let _first = std::os::unix::net::UnixStream::connect(&path).expect("fill the backlog");
+        let addr = UnixAddr::new(&path).expect("unix addr");
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("listener socket");
+        bind(listener.as_raw_fd(), &addr).expect("bind");
+        listen(&listener, Backlog::new(0).expect("backlog 0")).expect("listen");
+
+        // Fill the queue. Each filler is non-blocking, so the connect that finds
+        // the queue full returns EAGAIN rather than waiting for an accept. The
+        // bound fails the test rather than hanging if the kernel never says so.
+        let mut fillers = Vec::new();
+        loop {
+            assert!(
+                fillers.len() < 256,
+                "the backlog never filled: 256 connects all succeeded"
+            );
+            let fd = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                None,
+            )
+            .expect("filler socket");
+            match connect(fd.as_raw_fd(), &addr) {
+                Ok(()) => fillers.push(fd),
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(e) => panic!("filler connect: {e}"),
+            }
+        }
+        assert!(!fillers.is_empty(), "the first filler connect succeeds");
 
         let mut up = Upstream::new(64 * 1024, 16 * 1024);
         up.request_buf()
@@ -1763,6 +1807,7 @@ mod socket_tests {
             )
             .expect_err("a full backlog is WouldBlock");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        drop(fillers);
         drop(listener);
     }
 
@@ -2088,26 +2133,37 @@ mod socket_tests {
             .register(&mut SourceFd(&up.fd()), token, interest)
             .expect("register");
         let mut blocked = false;
+        let mut reregistered_after_block = false;
         loop {
             poll.poll(&mut events, Some(Duration::from_millis(100)))
                 .expect("poll");
             if events.iter().any(|e| e.token() == token) {
+                if up.drive().expect("drive") {
+                    break;
+                }
+                // The seam leaves the request written but the ciphertext pending.
+                let blocked_now = !up.request_finished
+                    && up.write_offset >= up.request.len()
+                    && up.tls.as_ref().is_some_and(|t| t.wants_write());
+                blocked |= blocked_now;
+                // Reregister after the drive, never before: `drive` moves the
+                // phase on, and under epoll edge-triggering a mask written
+                // before it waits for an edge that may never arrive. A changed
+                // interest needs the call anyway. The seam's WouldBlock needs
+                // it even when the interest is unchanged: the kernel never
+                // returned EAGAIN, so epoll has no readiness change to deliver,
+                // and EPOLL_CTL_MOD is what re-reports current readiness. Once
+                // is enough; reregistering every pass would spin.
                 let next = up.interest();
-                if next != interest {
+                let force = blocked_now && !reregistered_after_block;
+                if next != interest || force {
                     poll.registry()
                         .reregister(&mut SourceFd(&up.fd()), token, next)
                         .expect("reregister");
                     interest = next;
                 }
-                if up.drive().expect("drive") {
-                    break;
-                }
-                // The seam leaves the request written but the ciphertext pending.
-                if !up.request_finished
-                    && up.write_offset >= up.request.len()
-                    && up.tls.as_ref().is_some_and(|t| t.wants_write())
-                {
-                    blocked = true;
+                if force {
+                    reregistered_after_block = true;
                 }
             }
             if Instant::now() >= up.deadline() {

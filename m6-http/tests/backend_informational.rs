@@ -70,18 +70,20 @@ fn drive_upstream(
     loop {
         poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))?;
         if events.iter().any(|ev| ev.token() == token) {
-            let interest = up.interest();
-            if interest != registered {
-                poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, interest)?;
-                registered = interest;
-            }
             if up.drive()? {
                 let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
                     m6_core::client::MAX_HEADERS] =
                     [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
                 let reply = up.reply(&mut slots).expect("reply after complete drive");
                 return Ok(forward::HttpResponse::from_reply(&reply));
+            }
+            // Drive first: under epoll edge-triggering, interest registered
+            // before the drive waits for an edge that never comes.
+            let interest = up.interest();
+            if interest != registered {
+                poll.registry()
+                    .reregister(&mut SourceFd(&up.fd()), token, interest)?;
+                registered = interest;
             }
         }
         if std::time::Instant::now() >= up.deadline() {
