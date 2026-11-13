@@ -254,9 +254,11 @@ fn a_backend_that_closes_while_the_request_is_written_does_not_take_the_pool_dow
     big.extend(std::iter::repeat_n(b'A', 1024 * 1024));
     big.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     let first = send(port, &big);
+    let first_status = status(&first);
     assert!(
-        first.is_empty() || first.starts_with(b"HTTP/1."),
-        "the refused request neither answered nor closed: {:?}",
+        first.is_empty() || first_status == 413 || first_status == 502,
+        "the refused request answered with status {}: {:?}",
+        first_status,
         String::from_utf8_lossy(&first)
     );
 
