@@ -69,3 +69,42 @@ fn check_pair(jwt: &JwtEngine, issuer: &str) -> anyhow::Result<()> {
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("the private and public key are not a pair: {e}"))
 }
+
+/// A freshly generated RSA key pair for one test, made with `openssl` the way
+/// the integration tests make theirs.
+#[cfg(test)]
+pub(crate) fn test_key_material() -> KeyMaterial {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let private = dir.path().join("test.key");
+    let public = dir.path().join("test.pub");
+
+    let generated = std::process::Command::new("openssl")
+        .arg("genrsa")
+        .arg("-out")
+        .arg(&private)
+        .arg("2048")
+        .output()
+        .expect("run openssl genrsa");
+    assert!(
+        generated.status.success(),
+        "openssl genrsa failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let exported = std::process::Command::new("openssl")
+        .arg("rsa")
+        .arg("-in")
+        .arg(&private)
+        .arg("-pubout")
+        .arg("-out")
+        .arg(&public)
+        .output()
+        .expect("run openssl rsa -pubout");
+    assert!(
+        exported.status.success(),
+        "openssl rsa -pubout failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+
+    KeyMaterial::load(&private, &public, "test.example.com".to_string())
+        .expect("load the test keys")
+}

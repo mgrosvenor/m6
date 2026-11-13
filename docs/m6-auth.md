@@ -393,7 +393,12 @@ A database that cannot be opened stops the service with exit 2, and the error na
 
 `Db::open` sets *WAL* (write-ahead logging), a 5-second busy timeout and foreign keys.
 WAL lets readers and one writer proceed together.
-A second writer waits up to 5 seconds and then fails.
+The service sets the busy timeout to zero after that open, because a wait in the one loop holds every connection behind it.
+A statement that meets another process's lock returns `SQLITE_BUSY` at once.
+The loop defers that request and tries it again every 5 ms while it serves the other connections.
+A request that is still locked after one second is answered with 503 and `Retry-After: 1`.
+A retried login does not verify the password twice, because the retry keeps the user the first attempt verified.
+`m6-auth-cli` keeps the 5-second wait, because it serves one command at a time.
 The one connection is used by the one loop, so a login that is checking a password holds the process for its bcrypt verify and every other connection waits for it.
 
 The database path is the `[storage] path` key, an absolute path.

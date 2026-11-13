@@ -47,6 +47,8 @@ Section 2 opens the database those types describe.
 ```rust
 pub fn open(path: &Path) -> Result<Self>;
 
+pub fn no_busy_wait(&self) -> Result<()>;
+
 pub fn close(self) -> std::result::Result<(), Box<(Connection, rusqlite::Error)>>;
 ```
 
@@ -64,6 +66,11 @@ Take from it that the journal mode and the busy timeout make concurrent access w
 
 **Table 2: the three pragmas `Db::open` sets, and why each one matters.**
 The busy timeout is in milliseconds, so 5000 is 5 s.
+
+The 5-second wait suits a process that runs one command at a time.
+`Db::no_busy_wait` sets the connection's timeout to zero, and `m6-auth-server` calls it after its start-time open, so a statement that meets another process's lock returns `SQLITE_BUSY` at once and its event loop retries the request.
+`m6-auth-cli` and a renderer keep the 5-second wait.
+`m6-auth.md` section 9 gives the server's retry.
 
 `Db::open` runs `CREATE TABLE IF NOT EXISTS` for each table in the schema.
 It creates a missing table and leaves an existing one untouched, and the crate records no schema version and holds no migration list.
@@ -284,6 +291,14 @@ pub enum AuthError {
 }
 ```
 
+`AuthError::is_busy` reports whether a `Db` error is SQLite's `SQLITE_BUSY` or `SQLITE_LOCKED`, the two codes that mean a lock and that a caller can retry.
+
+```rust
+impl AuthError {
+    pub fn is_busy(&self) -> bool;
+}
+```
+
 Table 8 gives the nine variants and the calls that return each.
 Take from it that six variants name a row, and the other three wrap a failure from a dependency.
 
@@ -453,6 +468,9 @@ The processes above share one file, and section 9 gives the rules that keep that
 
 **One database file serves every process that links this crate, and `Db::open` sets the pragmas that make that safe.**
 Table 2 gives the pragmas, and section 8 gives how a worker holds its handle.
+
+A process's lock does not hold every request in `m6-auth-server`: its loop retries the locked statement and answers 503 after a second.
+`m6-auth.md` section 9 gives the retry.
 
 The crate keeps no copy of user data in memory.
 Every call reads or writes SQLite, so a user created by `m6-auth-cli` or a renderer is visible to the server's next query.

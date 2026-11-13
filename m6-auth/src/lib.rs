@@ -3,6 +3,7 @@ pub mod jwt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -66,6 +67,23 @@ pub enum AuthError {
 }
 
 pub type Result<T> = std::result::Result<T, AuthError>;
+
+impl AuthError {
+    /// Whether SQLite refused the statement because a lock is held, which the
+    /// caller can retry once the lock is gone.
+    ///
+    /// SQLite reports a lock as `SQLITE_BUSY` while it is waiting and as
+    /// `SQLITE_LOCKED` when the statement conflicts with one on the same
+    /// connection. Every other failure is not retryable.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            AuthError::Db(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    || e.code == rusqlite::ErrorCode::DatabaseLocked
+        )
+    }
+}
 
 // ── Schema ───────────────────────────────────────────────────────────────────
 
@@ -148,6 +166,18 @@ impl Db {
             .open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
+    }
+
+    /// Stop waiting for another connection's lock, so a statement that meets one
+    /// fails with `SQLITE_BUSY` at once.
+    ///
+    /// A service in an event loop calls this after its start-time open and
+    /// defers a request that gets the error, because a wait here would hold the
+    /// loop and every request behind it. A one-shot tool keeps `Db::open`'s
+    /// five-second wait.
+    pub fn no_busy_wait(&self) -> Result<()> {
+        self.0.busy_timeout(Duration::ZERO)?;
+        Ok(())
     }
 
     /// Close the database, handing the `Connection` back on failure so the
@@ -344,8 +374,12 @@ impl Db {
 
         match result {
             Ok((id, uname, hash, roles_json, created_at)) => {
+                // Read the whole user, groups included, before the expensive
+                // verify. The verify is then the last step, so a database read
+                // that fails busy leaves no password verified behind it.
+                let user = self.row_to_user(id, uname, roles_json, created_at)?;
                 if verify_bcrypt(password, &hash)? {
-                    Ok(Some(self.row_to_user(id, uname, roles_json, created_at)?))
+                    Ok(Some(user))
                 } else {
                     Ok(None)
                 }
@@ -1134,5 +1168,33 @@ mod tests {
             .api_token_create(&u.id, "alice", "tok-2", "same_hash", i64::MAX)
             .expect_err("duplicate hash");
         assert!(matches!(err, AuthError::Db(_)));
+    }
+
+    /// Only SQLite's two lock codes are retryable. A caller that treats every
+    /// `SqliteFailure` as busy would retry a constraint failure forever.
+    #[test]
+    fn is_busy_is_true_only_for_busy_and_locked() {
+        let failed = |code| {
+            AuthError::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(
+            failed(rusqlite::ffi::SQLITE_BUSY).is_busy(),
+            "SQLITE_BUSY is a lock"
+        );
+        assert!(
+            failed(rusqlite::ffi::SQLITE_LOCKED).is_busy(),
+            "SQLITE_LOCKED is a lock"
+        );
+        assert!(
+            !failed(rusqlite::ffi::SQLITE_CONSTRAINT).is_busy(),
+            "a constraint failure is not a lock"
+        );
+        assert!(
+            !AuthError::UserNotFound("alice".to_string()).is_busy(),
+            "an answered row is not a lock"
+        );
     }
 }
