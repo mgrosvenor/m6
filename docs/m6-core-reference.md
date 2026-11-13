@@ -712,7 +712,6 @@ a silent log becomes a fault rather than a zero.
 `reopen_log_file() -> Reopened` reopens the analytics file at the absolute path it was opened with.
 `reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
 `writes_log_file()` says whether this process has a file to reopen.
-`newest_rotated(live)` finds the newest rotated sibling of a log file, plain or gzip.
 `read_tail(path, max_bytes)` reads the end of one file.
 
 ### 8.2. `telemetry`
@@ -785,10 +784,10 @@ Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the
 `reopen` is `None` for a process that writes no log file, and `seconds_since_last_reopen` is `None` until the first reopen.
 Both are `serde(default)`, so a node older than the fields still parses.
 
-`TrafficReport::build(node, ndjson, since, window_minutes)` summarises an
-NDJSON stream and `TrafficReport::from_records(node, records, window_minutes)`
-summarises records that are already parsed, which is how `m6-http` answers
-`/traffic` from its in-memory window. `LoggingHealth::read()`
+`TrafficReport::from_records(node, records, window_minutes)` summarises records
+that are already parsed, which is how `m6-http` answers `/traffic` from its
+in-memory window. `events_dropped` says how many events that window overwrote
+before they left it, so a short window is not read as a quiet hour. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
 `CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.

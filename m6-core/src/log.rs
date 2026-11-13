@@ -299,43 +299,6 @@ pub fn writes_log_file() -> bool {
     LOG_FILE.get().is_some()
 }
 
-/// The newest rotated sibling of a log file, if there is one.
-///
-/// A rotation tool that renames the live file with a date extension leaves
-/// `<name>-YYYYmmddHH`, which is what logrotate's `dateext` produces for an
-/// hourly rotation, and compression adds `.gz`.
-/// The highest stamp is the newest.
-/// An uncompressed file is preferred when both exist, because the `.gz` may still be written.
-pub fn newest_rotated(live: &Path) -> Option<std::path::PathBuf> {
-    let dir = live.parent().filter(|d| !d.as_os_str().is_empty());
-    let dir = dir.unwrap_or_else(|| Path::new("."));
-    let name = live.file_name()?.to_str()?;
-    let prefix = format!("{name}-");
-    let mut best: Option<(String, bool, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let file = entry.file_name();
-        let Some(file) = file.to_str() else { continue };
-        let Some(rest) = file.strip_prefix(&prefix) else {
-            continue;
-        };
-        let (stamp, gz) = match rest.strip_suffix(".gz") {
-            Some(stamp) => (stamp, true),
-            None => (rest, false),
-        };
-        if stamp.len() != 10 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let better = match &best {
-            None => true,
-            Some((s, was_gz, _)) => stamp > s.as_str() || (stamp == s.as_str() && *was_gz && !gz),
-        };
-        if better {
-            best = Some((stamp.to_string(), gz, entry.path()));
-        }
-    }
-    best.map(|(_, _, path)| path)
-}
-
 /// Append the last `max_bytes` of a plain or gzip file to `out`.
 ///
 /// A plain file is read from a seek, so only the tail is read.
@@ -754,33 +717,6 @@ mod reopen_tests {
         assert!(matches!(reopen_in(None, &rec), Reopened::NoFile));
         assert_eq!(rec.successes(), 0);
         assert_eq!(rec.failures(), 0);
-    }
-
-    #[test]
-    fn newest_rotated_picks_the_highest_stamp_and_prefers_the_plain_twin() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        for n in [
-            "a.ndjson",
-            "a.ndjson.1",
-            "a.ndjson-2026102600.gz",
-            "a.ndjson-2026102601.gz",
-            "a.ndjson-2026102601",
-            "a.ndjson-short.gz",
-            "other.ndjson-2026102609.gz",
-        ] {
-            std::fs::write(tmp.path().join(n), b"").unwrap();
-        }
-        assert_eq!(
-            newest_rotated(&live),
-            Some(tmp.path().join("a.ndjson-2026102601"))
-        );
-        std::fs::remove_file(tmp.path().join("a.ndjson-2026102601")).unwrap();
-        assert_eq!(
-            newest_rotated(&live),
-            Some(tmp.path().join("a.ndjson-2026102601.gz"))
-        );
-        assert_eq!(newest_rotated(&tmp.path().join("none.log")), None);
     }
 
     #[test]

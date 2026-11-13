@@ -1025,6 +1025,7 @@ mod tests {
         TrafficReport {
             node: "origin".into(),
             window_minutes: 60,
+            events_dropped: 0,
             total_requests: 0,
             status: Default::default(),
             notable: vec![],

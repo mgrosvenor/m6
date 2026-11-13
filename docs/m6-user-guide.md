@@ -1448,8 +1448,9 @@ When the reopen fails, the wait times out and `postrotate` fails.
 Setting `[monitor] log_reopen_max_age_s` makes it a fault when a node's last reopen is older than that many seconds.
 A limit of twice the rotation interval suits an hourly rotation, so 7200 seconds with the schedule above.
 The limit is only as true as the schedule, so set it after logrotate runs hourly.
-`/traffic` reads the newest rotated file next to the log when the live file does not cover its window, so its sixty minute window does not shrink just after a rotation.
-It skips a rotated file last written before the window, and a `.gz` file larger than the 24 MB read budget on disk or once decoded.
+`/traffic` answers from a window in memory and reads no log file, so rotation leaves its figures alone.
+The window covers the last 60 minutes this process served, starts empty after a restart, and `window_minutes` says how much of the hour it holds.
+The `/traffic` paragraph in [`m6-http.md`](m6-http.md) gives the field caps and the count of events a full window dropped.
 
 ### 7.9. Monitor history
 

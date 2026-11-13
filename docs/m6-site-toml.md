@@ -462,7 +462,7 @@ Take from it that the endpoint layout is site-wide and the three access keys bel
 | `enabled` | bool | `true` | Turns all three endpoints off |
 | `path` | string | `"/health"` | Always public |
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
-| `traffic_path` | string | `"/traffic"` | A summary of the last hour of the analytics log |
+| `traffic_path` | string | `"/traffic"` | A summary of the last hour this process served, from memory. See [`m6-http.md`](m6-http.md) |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
 | `metrics_token_file` | string | none | The legacy gate, a file holding a bearer string. An absolute path. A file that is missing, unreadable or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
 | `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`, and it comes from the Authorization header or the session cookie as a route `require` reads it |

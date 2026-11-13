@@ -196,8 +196,11 @@ If the reopen fails, the process keeps writing to the previous file and logs an 
 `/perf` reports the last reopen under `logging.reopen`.
 `/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
 The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
-It starts empty after a restart, and `window_minutes` says how much of the hour the process has covered.
-In the report a path is cut at 512 bytes and a user agent at 256, while the analytics log keeps them whole.
+It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
+When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
+A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the analytics log keeps them whole.
+The notable-client sample is then cut at 160 characters, marked the same way.
+Probe and injection detection sees at most the first 512 bytes of a path and the first 256 bytes of a user agent, so a marker after them is not reported.
 
 ---
 

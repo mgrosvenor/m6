@@ -9,7 +9,7 @@
 /// a handful of string operations, not a database/ruleset lookup.
 use quiche::h3::NameValue as _;
 
-use crate::health::{Kind, TrafficWindow};
+use crate::health::{unix_micros_now, Kind, TrafficWindow};
 
 pub use m6_core::http::{header, HeaderSource};
 
@@ -151,6 +151,21 @@ fn extract_features(headers: &(impl HeaderSource + ?Sized)) -> RequestFeatures {
     }
 }
 
+/// Push one served request into `/traffic`'s window.
+///
+/// `record` and `finish_proxied_response` log the same request shape, so they
+/// read the time and the fields in one place.
+fn push_request(window: &mut TrafficWindow, ev: &Event<'_>, user_agent: Option<&str>) {
+    window.push(
+        unix_micros_now(),
+        Kind::Request,
+        ev.status,
+        ev.path,
+        ev.client_ip,
+        user_agent,
+    );
+}
+
 /// THE single chokepoint for finishing a response's analytics: mint-or-reuse
 /// a session, log exactly one structured analytics line, and return the
 /// Set-Cookie value iff a new session was minted (`None` if disabled or the
@@ -173,14 +188,7 @@ pub fn record(
     let (session_id, session_new) = get_or_create_session(request_headers);
     let features = extract_features(request_headers);
     log_request(ev, &session_id, session_new, &features);
-    window.push(
-        crate::health::unix_micros_now(),
-        Kind::Request,
-        ev.status,
-        ev.path,
-        ev.client_ip,
-        features.user_agent.as_deref(),
-    );
+    push_request(window, ev, features.user_agent.as_deref());
     session_new.then(|| session_cookie_header_value(&session_id))
 }
 
@@ -270,14 +278,7 @@ pub fn finish_proxied_response(
     if let Some(session_id) = session_from_response_headers(resp_headers) {
         let features = extract_features(request_headers);
         log_request(ev, &session_id, false, &features);
-        window.push(
-            crate::health::unix_micros_now(),
-            Kind::Request,
-            ev.status,
-            ev.path,
-            ev.client_ip,
-            features.user_agent.as_deref(),
-        );
+        push_request(window, ev, features.user_agent.as_deref());
         return;
     }
     finish_response(enabled, resp_headers, request_headers, ev, window);
@@ -349,7 +350,7 @@ pub fn log_monitor(
         "monitor"
     );
     window.push(
-        crate::health::unix_micros_now(),
+        unix_micros_now(),
         Kind::Monitor,
         status,
         path,
@@ -381,7 +382,7 @@ pub fn log_rate_limited(
         "request"
     );
     window.push(
-        crate::health::unix_micros_now(),
+        unix_micros_now(),
         Kind::RateLimited,
         429,
         path,
