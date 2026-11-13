@@ -260,6 +260,9 @@ url              = "h2s://dev.example.com:443"
 tls_skip_verify  = true   # dev/test only
 ```
 
+An `https://` or `h2s://` backend is verified against the host's certificate authorities.
+A host with none stops m6-http at start with exit 2, naming the backend.
+
 m6-http performs TLS negotiation with ALPN `h2` at startup of the first request. If the server does not accept `h2` in ALPN, the connection attempt fails with a 502. The connection is maintained persistently by `H2sTlsClientPool`, event-loop driven — identical to `H2cClientPool` but with a TLS record layer. Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
 
 ---

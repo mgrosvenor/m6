@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::BackendConfig;
-use rustls_native_certs;
-use webpki_roots;
 
 /// State of a single backend socket member.
 #[derive(Debug)]
@@ -288,7 +286,10 @@ impl IdleSlots {
     }
 }
 
-fn build_tls_client_config_alpn(skip_verify: bool, alpn: &[u8]) -> rustls::ClientConfig {
+fn build_tls_client_config_alpn(
+    skip_verify: bool,
+    alpn: &[u8],
+) -> anyhow::Result<rustls::ClientConfig> {
     if skip_verify {
         // Danger: accept any certificate. Test/dev only.
         let mut cfg = rustls::ClientConfig::builder()
@@ -296,29 +297,38 @@ fn build_tls_client_config_alpn(skip_verify: bool, alpn: &[u8]) -> rustls::Clien
             .with_custom_certificate_verifier(std::sync::Arc::new(SkipVerifier))
             .with_no_client_auth();
         cfg.alpn_protocols = vec![alpn.to_vec()];
-        cfg
+        Ok(cfg)
     } else {
         let mut root_store = rustls::RootCertStore::empty();
         let native_roots = rustls_native_certs::load_native_certs();
+        let first_error = native_roots
+            .errors
+            .first()
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default();
         for cert in native_roots.certs {
             let _ = root_store.add(cert);
         }
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if root_store.is_empty() {
+            anyhow::bail!(
+                "no certificate authority in the system store (load_native_certs found none{first_error}): install the host's CA certificates, or set tls_skip_verify on this backend"
+            );
+        }
         let mut cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
         cfg.alpn_protocols = vec![alpn.to_vec()];
-        cfg
+        Ok(cfg)
     }
 }
 
-fn build_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
+fn build_tls_client_config(skip_verify: bool) -> anyhow::Result<rustls::ClientConfig> {
     build_tls_client_config_alpn(skip_verify, b"http/1.1")
 }
 
 /// Build a TLS client config advertising HTTP/2 via ALPN.
 /// Used for `h2s://` backends.
-pub fn build_h2_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
+pub fn build_h2_tls_client_config(skip_verify: bool) -> anyhow::Result<rustls::ClientConfig> {
     build_tls_client_config_alpn(skip_verify, b"h2")
 }
 
@@ -444,16 +454,18 @@ impl PoolManager {
                 anyhow::anyhow!("[[backend]] {}: {host} does not resolve: {e}", b.name)
             })?;
             b.addr = Some(addr);
-            b.tls = match b.scheme {
-                UrlScheme::Https => Some(tls_client(
-                    &host,
-                    std::sync::Arc::new(build_tls_client_config(b.skip_verify)),
-                )?),
-                UrlScheme::H2s => Some(tls_client(
-                    &host,
-                    std::sync::Arc::new(build_h2_tls_client_config(b.skip_verify)),
-                )?),
+            let tls_config = match b.scheme {
+                UrlScheme::Https => Some(build_tls_client_config(b.skip_verify)),
+                UrlScheme::H2s => Some(build_h2_tls_client_config(b.skip_verify)),
                 UrlScheme::Http | UrlScheme::H2c => None,
+            };
+            b.tls = match tls_config {
+                Some(config) => {
+                    let config =
+                        config.map_err(|e| anyhow::anyhow!("[[backend]] {}: {e}", b.name))?;
+                    Some(tls_client(&host, std::sync::Arc::new(config))?)
+                }
+                None => None,
             };
             b.host = host;
         }
