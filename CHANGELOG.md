@@ -60,6 +60,8 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **A database path m6-auth-server cannot open now stops it at start with exit 2**, instead of answering 500 to each request.
 
+**m6-http verifies an https:// or h2s:// backend against the host's certificate authorities only, and a host with none stops it at start with exit 2.** A backend that relied on the bundled Mozilla list on a host with no CA certificates needs the host's CA package installed.
+
 ### Added
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
@@ -334,6 +336,10 @@ The sync used to delete the file the build host wrote, so the history never ente
 **m6-auth-server runs one event loop with one database connection.** It handed each connection to a worker thread, and each worker opened its own database connection on its first request, answering 500 when that open failed. Now one loop serves every connection, the database is opened once at start, and a database that cannot be opened stops the service with exit 2. The login rate limit is per process.
 
 **m6-auth-server never waits on a database lock.** It waited up to 5 seconds for SQLite's lock, which in a single-threaded service holds every request. It now sets SQLite's busy timeout to zero once started, retries a request that found the database locked every 5 ms from its event loop while serving others, and answers 503 with Retry-After after one second. A retried login does not verify the password twice. m6-auth-cli keeps its 5-second wait.
+
+### Removed
+
+m6-http's bundled webpki-roots store, a second store beside the host's.
 
 ### Verified
 
