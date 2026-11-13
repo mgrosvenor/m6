@@ -1,0 +1,281 @@
+//! A backend that stops reading a request and closes must not take its member
+//! out of rotation.
+//!
+//! The bug this catches: `m6-file` rejects an oversized header by answering 413
+//! and closing without draining the rest of the request. `m6-http` is still
+//! writing that request when the peer goes, so the drive fails and the pool
+//! marks its only member failed. Every request inside the one-second backoff
+//! then answers 502, including the next ordinary one.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use m6_core::testkit::{binary, claim_port, read_one, Service};
+
+/// The largest request head the test backend accepts, mirroring the 8 KiB cap
+/// in the blocking parser a backend service runs.
+const HEAD_CAP: usize = 8 * 1024;
+
+/// A backend that reads a request head up to `HEAD_CAP` and closes, without a
+/// reply and without draining the rest of the request, when the head is larger
+/// than that. Every other request is answered.
+struct Backend {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Backend {
+    fn start(path: PathBuf) -> Backend {
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind backend socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_accept(listener, Arc::clone(&stop));
+        Backend {
+            path,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn spawn_accept(listener: UnixListener, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    std::thread::spawn(move || serve(stream));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Read the head byte by byte. A head over the cap is a request this backend
+/// refuses: it closes with the rest of the request unread, the state `m6-file`
+/// leaves when it rejects an oversized header.
+fn serve(mut stream: UnixStream) {
+    let _ = stream.set_nonblocking(false);
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        if head.len() > HEAD_CAP {
+            return;
+        }
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    let _ = stream.write_all(resp);
+    let _ = stream.flush();
+}
+
+fn tls_client() -> Arc<rustls::ClientConfig> {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::DigitallySignedStruct;
+
+    #[derive(Debug)]
+    struct NoVerify;
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer,
+            _: &[CertificateDer],
+            _: &ServerName,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let mut c = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    c.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(c)
+}
+
+/// Send `raw` on a fresh HTTP/1.1-over-TLS connection and return the response
+/// bytes, or an empty vector when the server closed without answering.
+fn send(port: u16, raw: &[u8]) -> Vec<u8> {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect m6-http");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("write timeout");
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name");
+    let conn = rustls::ClientConnection::new(tls_client(), name).expect("client connection");
+    let mut stream = rustls::StreamOwned::new(conn, tcp);
+    stream.write_all(raw).expect("write request");
+    stream.flush().expect("flush");
+    read_one(&mut stream, "GET").unwrap_or_default()
+}
+
+fn status(resp: &[u8]) -> u16 {
+    String::from_utf8_lossy(resp)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn site_toml(glob: &str) -> String {
+    format!(
+        "[site]\nname = \"qua017-refusal\"\ndomain = \"localhost\"\n\n\
+         [log]\nlevel = \"warn\"\nformat = \"text\"\n\n\
+         [errors]\nmode = \"internal\"\n\n\
+         [analytics]\nenabled = false\n\n\
+         [rate_limit]\nenabled = false\n\n\
+         [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\
+         [[route]]\npath = \"/public/{{relpath}}\"\nbackend = \"app\"\n"
+    )
+}
+
+fn system_toml(bind_port: u16, cert: &str, key: &str) -> String {
+    format!(
+        "[server]\nbind = \"127.0.0.1:{bind_port}\"\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n\n\
+         [node]\nname = \"qua017-node\"\n"
+    )
+}
+
+/// A backend that refuses a request by closing while the request is still being
+/// written must not back its member off: the next ordinary request is served.
+///
+/// The order is driven explicitly: the first request's head is larger than the
+/// backend's cap, so the backend reads its cap and closes while `m6-http` still
+/// has request bytes to send. The second request then goes to the same member.
+#[test]
+fn a_backend_that_closes_while_the_request_is_written_does_not_take_the_pool_down() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().to_path_buf();
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate");
+    let cert = site.join("cert.pem");
+    let key = site.join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).expect("cert");
+    std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
+
+    let sock = site.join("m6-file-1.sock");
+    let glob = site.join("m6-file-*.sock").display().to_string();
+    let backend = Backend::start(sock);
+
+    let claim = claim_port();
+    let port = claim.port();
+    std::fs::write(site.join("site.toml"), site_toml(&glob)).expect("site.toml");
+    std::fs::write(
+        site.join("system.toml"),
+        system_toml(
+            port,
+            &cert.display().to_string(),
+            &key.display().to_string(),
+        ),
+    )
+    .expect("system.toml");
+
+    let mut http = Service::spawn(
+        "m6-http",
+        Command::new(binary("m6-http"))
+            .arg(&site)
+            .arg(site.join("system.toml")),
+    );
+    http.wait_for_tcp(port, Duration::from_secs(20));
+    let ready = m6_core::testkit::wait::until(Duration::from_secs(20), || {
+        status(&send(
+            port,
+            b"GET /public/probe.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )) == 200
+    });
+    assert!(
+        ready,
+        "m6-http never served a backend request\n--- m6-http ---\n{}",
+        http.output()
+    );
+
+    // A head of 1 MiB: m6-http forwards it, the backend reads its 8 KiB cap
+    // and closes with most of the request still unwritten.
+    let mut big = b"GET /public/refused.txt HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
+    big.extend(std::iter::repeat_n(b'A', 1024 * 1024));
+    big.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    let first = send(port, &big);
+    assert!(
+        first.is_empty() || first.starts_with(b"HTTP/1."),
+        "the refused request neither answered nor closed: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+
+    // The member must still be in rotation for the request after the refusal.
+    let second = send(
+        port,
+        b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        second.starts_with(b"HTTP/1.1 200"),
+        "the request after a refused one answered {}: {:?}\n--- m6-http ---\n{}",
+        status(&second),
+        String::from_utf8_lossy(&second),
+        http.output()
+    );
+    assert!(
+        String::from_utf8_lossy(&second).ends_with("OK"),
+        "the served response is the backend's: {:?}",
+        String::from_utf8_lossy(&second)
+    );
+    drop(backend);
+}
