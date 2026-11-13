@@ -23,8 +23,8 @@
 //! The line format, buffering, loss on crash, levels, reopen and dropped-line
 //! counting are described in `docs/m6-log.md`.
 //!
-//! The writer sees one thread. The Sinks and the level are thread-local, and a
-//! process-wide marker records the thread that called [`init`]. A log call from
+//! The writer sees one thread. The Sinks and the level are thread-local, and each
+//! thread that calls [`init`] marks itself, and a process-wide flag records that one did. A log call from
 //! another thread is a programming error that the macros assert against in a
 //! debug build. A release build has no assert, and it drops the other thread's
 //! line because only the initialising thread has the Sinks.
@@ -38,7 +38,7 @@ mod sink;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 pub use line::{line_at, Field, Level, Line, MAX_FIELD};
@@ -48,11 +48,14 @@ thread_local! {
     static LEVEL: Cell<Level> = const { Cell::new(Level::Info) };
     static OPERATIONAL: RefCell<Option<Sink>> = const { RefCell::new(None) };
     static ANALYTICS: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    /// Whether this thread called [`init`], so it owns Sinks.
+    static INITIALISED_HERE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The thread that called [`init`], so a debug build can name another thread's
-/// log call. The design has one thread per process.
-static INIT_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+/// Whether any thread has called [`init`]. With `INITIALISED_HERE`, it lets a
+/// debug build name a log call from a thread that did not call `init`, without
+/// a lock. The design has one thread per process.
+static ANY_INIT: AtomicBool = AtomicBool::new(false);
 
 /// Open the log: set the level and open both Sinks.
 ///
@@ -66,7 +69,8 @@ pub fn init(level: Level, analytics: Option<&Path>) -> io::Result<()> {
         None => None,
     };
     LEVEL.with(|slot| slot.set(level));
-    let _ = INIT_THREAD.set(std::thread::current().id());
+    INITIALISED_HERE.with(|here| here.set(true));
+    ANY_INIT.store(true, Ordering::Relaxed);
     OPERATIONAL.with(|slot| *slot.borrow_mut() = Some(operational));
     ANALYTICS.with(|slot| *slot.borrow_mut() = analytics);
     Ok(())
@@ -155,6 +159,18 @@ pub fn operational_written() -> u64 {
     OPERATIONAL.with(|slot| slot.borrow().as_ref().map_or(0, Sink::written))
 }
 
+/// Lines the analytics Sink has accepted, for the tests.
+#[doc(hidden)]
+pub fn analytics_lines() -> u64 {
+    ANALYTICS.with(|slot| slot.borrow().as_ref().map_or(0, Sink::lines))
+}
+
+/// Lines the analytics Sink has dropped, for the tests.
+#[doc(hidden)]
+pub fn analytics_dropped() -> u64 {
+    ANALYTICS.with(|slot| slot.borrow().as_ref().map_or(0, Sink::dropped))
+}
+
 /// Bytes the analytics Sink has written to its destination, for the tests.
 #[doc(hidden)]
 pub fn analytics_written() -> u64 {
@@ -172,13 +188,10 @@ pub fn __level_enabled(level: Level) -> bool {
 pub fn __with_operational(f: impl FnOnce(&mut Sink)) -> bool {
     #[cfg(debug_assertions)]
     {
-        if let Some(initialised) = INIT_THREAD.get() {
-            assert_eq!(
-                *initialised,
-                std::thread::current().id(),
-                "m6-log: a log call from a thread that did not call init"
-            );
-        }
+        assert!(
+            !ANY_INIT.load(Ordering::Relaxed) || INITIALISED_HERE.with(Cell::get),
+            "m6-log: a log call from a thread that did not call init"
+        );
     }
     OPERATIONAL.with(|slot| match slot.borrow_mut().as_mut() {
         Some(sink) => {

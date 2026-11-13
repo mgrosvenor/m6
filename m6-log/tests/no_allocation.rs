@@ -46,7 +46,6 @@ fn main() {
     m6_log::init(Level::Trace, Some(std::path::Path::new("/dev/null"))).expect("the logger");
 
     let before = COUNT.load(Ordering::Relaxed);
-    let mut analytics_accepted = 0u64;
     for n in 0..LINES {
         m6_log::error!(n = n, "line");
         m6_log::warn!(n = n, "line");
@@ -67,11 +66,13 @@ fn main() {
                 .end();
         });
         assert!(accepted, "the analytics Sink was not open");
-        analytics_accepted += u64::from(accepted);
     }
     let allocated = COUNT.load(Ordering::Relaxed) - before;
     let operational_lines = m6_log::operational_lines();
     let operational_written = m6_log::operational_written();
+    let operational_dropped = m6_log::operational_dropped();
+    let analytics_lines = m6_log::analytics_lines();
+    let analytics_dropped = m6_log::analytics_dropped();
     let analytics_written = m6_log::analytics_written();
     m6_log::stop().expect("a clean stop");
     eprintln!(
@@ -84,9 +85,11 @@ fn main() {
         "the macro lines did not reach the operational Sink"
     );
     assert_eq!(
-        analytics_accepted, LINES,
-        "the analytics line did not reach its Sink"
+        analytics_lines, LINES,
+        "the analytics lines were not all written"
     );
+    assert_eq!(operational_dropped, 0, "operational lines were dropped");
+    assert_eq!(analytics_dropped, 0, "analytics lines were dropped");
     assert!(
         operational_written > 0,
         "the operational Sink wrote nothing"
