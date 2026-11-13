@@ -194,7 +194,16 @@ Rotate the analytics file by renaming it and sending `SIGUSR1`.
 The process creates the file at its path again, and the path reappearing means the renamed file is finished.
 If the reopen fails, the process keeps writing to the previous file and logs an error.
 `/perf` reports the last reopen under `logging.reopen`.
-`/traffic` also reads the newest rotated file next to the log (`<name>-YYYYmmddHH`, plain or `.gz`), so its window spans a rotation.
+`/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
+The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
+It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
+When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
+A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the analytics log keeps them whole.
+The notable-client sample is then cut at 160 characters, marked the same way.
+In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
+Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
+The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
+The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
 ---
 

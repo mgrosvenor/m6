@@ -130,84 +130,394 @@ mod monitoring_exclusion_tests {
 
 // ── /traffic ─────────────────────────────────────────────────────────────────
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use m6_core::monitoring::TrafficReport;
-
-/// Last summary and when it was built.
-///
-/// One node, one cache. Behind a Mutex because building a summary reads a file
-/// and there is no reason to let two scrapes do it at once; the lock is held
-/// across the read deliberately, so a second caller waits for the first
-/// answer rather than starting a second 47MB tail.
-static CACHE: Mutex<Option<(Instant, TrafficReport)>> = Mutex::new(None);
+use m6_core::telemetry::AnalyticsRecord;
+// The one marker for a value a cap cut short. The slot and the report use the
+// same value, so the two cuts cannot drift apart.
+use m6_core::telemetry::USER_AGENT_TRUNCATED as TRUNCATED;
 
 /// Where the privileged collector leaves `nft -j list ruleset` output.
 const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 
-/// Read the last `window_minutes` of the analytics log and summarise it.
-///
-/// The newest rotated file is read as well, so the window survives a rotation.
-/// It is read only when the live tail did not fill the budget and the file was written inside the window, and a gzip file only when it is small (see `m6_core::log::read_recent_counted`).
-/// This runs inline on the event loop, so the work is bounded.
-///
-/// The tail is bounded rather than reading the whole file: an hour of traffic
-/// is at most a few hundred KB and the file is tens of MB, so reading it all
-/// would be almost entirely wasted work. 24MB is a wide margin over the
-/// busiest hour observed (370KB, during a 890-request probe).
-fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<TrafficReport> {
-    const TAIL_BYTES: usize = 24 * 1024 * 1024;
+/// The most events `/traffic` keeps. Allocated once at start.
+const TRAFFIC_SLOTS: usize = 32_768;
 
-    // The newest rotated file is read before the live one, so the summary
-    // spans a rotation. A mid-record start is expected after a cut, and
-    // `ndjson::read_str` skips what it cannot parse, so it costs nothing.
-    let since_time =
-        std::time::SystemTime::now() - Duration::from_secs(window_minutes.saturating_mul(60));
-    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES, since_time)?;
+/// How far back `/traffic` reports, in minutes.
+///
+/// The ring holds far more than an hour at the busiest rate observed (about
+/// 1,000 lines in an hour), so the hour is applied when the report is built
+/// rather than when an event is kept. A node busy enough to wrap the ring
+/// inside the hour reports the shorter span it still holds and counts what it
+/// lost.
+const TRAFFIC_WINDOW_MINUTES: u64 = 60;
 
-    let since = m6_core::util::iso8601_minutes_ago(window_minutes);
-    let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
+/// Microseconds in one minute.
+const MICROS_PER_MINUTE: u64 = 60 * 1_000_000;
+
+/// The reporting window in microseconds.
+const WINDOW_US: u64 = TRAFFIC_WINDOW_MINUTES * MICROS_PER_MINUTE;
+
+/// One drop cell per minute of the window plus the minute in progress.
+const DROP_CELLS: usize = TRAFFIC_WINDOW_MINUTES as usize + 1;
+
+/// The most bytes a slot keeps of a path, marker included. The report shows
+/// the cut path, the log keeps the whole one.
+const PATH_CAP: usize = 512;
+
+/// The most bytes a slot keeps of a client address. An IPv6 address is at most
+/// 45 characters.
+const IP_CAP: usize = 45;
+
+/// The most bytes a slot keeps of a user agent, marker included.
+const UA_CAP: usize = 256;
+
+/// The three analytics lines m6-http writes per request or poll.
+///
+/// A request and a rate-limited request both log `"message":"request"`: the
+/// rate limiter logs that row with status 429. A monitor poll logs
+/// `"message":"monitor"`, which keeps it out of the site traffic counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Request,
+    Monitor,
+    RateLimited,
+}
+
+impl Kind {
+    fn message(self) -> &'static str {
+        match self {
+            Kind::Request | Kind::RateLimited => "request",
+            Kind::Monitor => "monitor",
+        }
+    }
+}
+
+/// A capped string in a fixed array, copied into a slot without allocating.
+#[derive(Clone)]
+struct Field<const N: usize> {
+    /// Byte length, or `ABSENT` when the event carried no such value.
+    len: u16,
+    bytes: [u8; N],
+}
+
+impl<const N: usize> Field<N> {
+    /// The length that marks a value the event did not carry.
+    ///
+    /// Only the user agent uses it. An absent user agent is not an empty one,
+    /// and the record has to keep the difference because the report is built
+    /// from the record the log line would have parsed to.
+    const ABSENT: u16 = u16::MAX;
+
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; N],
+        }
+    }
+
+    /// Copy `s` in, cut at `N` bytes on a character boundary.
+    ///
+    /// A value the cap cuts ends in [`TRUNCATED`], so every reader of a slot
+    /// can tell a cut value from a whole one. The marker reserves its own
+    /// bytes inside the cap. The return value is the machine-readable form of
+    /// the same fact, which the report needs because the marker is a rendering
+    /// choice and a cut field can hide a probe marker.
+    fn set(&mut self, s: &str) -> bool {
+        if s.len() <= N {
+            self.bytes[..s.len()].copy_from_slice(s.as_bytes());
+            self.len = s.len() as u16;
+            return false;
+        }
+        let mut end = N - TRUNCATED.len();
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.bytes[..end].copy_from_slice(&s.as_bytes()[..end]);
+        self.bytes[end..end + TRUNCATED.len()].copy_from_slice(TRUNCATED.as_bytes());
+        self.len = (end + TRUNCATED.len()) as u16;
+        true
+    }
+
+    fn mark_absent(&mut self) {
+        self.len = Self::ABSENT;
+    }
+
+    fn as_str(&self) -> &str {
+        let len = if self.len == Self::ABSENT {
+            0
+        } else {
+            usize::from(self.len)
+        };
+        std::str::from_utf8(&self.bytes[..len]).unwrap_or_default()
+    }
+
+    fn as_opt(&self) -> Option<&str> {
+        (self.len != Self::ABSENT).then(|| self.as_str())
+    }
+}
+
+/// One logged event, as `/traffic` needs it.
+///
+/// Fixed size, so the ring is one allocation and a push is one copy. The
+/// fields are the ones the report reads, plus the time, the kind and whether a
+/// cap cut the event.
+#[derive(Clone)]
+struct TrafficSlot {
+    at_us: u64,
+    kind: Kind,
+    status: u16,
+    path: Field<PATH_CAP>,
+    client_ip: Field<IP_CAP>,
+    user_agent: Field<UA_CAP>,
+    /// A cap cut the path or the user agent.
+    ///
+    /// The slot keeps the marker on the cut value, and this bit beside it is
+    /// what the report reads. A cut field can hide a probe marker past the
+    /// cap, so the request counts as probe-shaped. The bit is assigned on
+    /// every push, so a reused slot never carries the previous event's answer.
+    truncated: bool,
+}
+
+impl TrafficSlot {
+    fn empty() -> Self {
+        Self {
+            at_us: 0,
+            kind: Kind::Request,
+            status: 0,
+            path: Field::empty(),
+            client_ip: Field::empty(),
+            user_agent: Field::empty(),
+            truncated: false,
+        }
+    }
+}
+
+/// The last events this process logged, for `/traffic`. Allocated at start.
+///
+/// A ring of fixed slots and a write index. A logged request copies a few
+/// hundred bytes into the next slot, overwriting the oldest when the ring is
+/// full: no allocation and no system call. The report reads the slots.
+///
+/// The window is a count of events rather than a size in bytes, and the hour
+/// is applied when the report is built. When the ring wraps inside the hour,
+/// the report says which span it still holds and how many events it dropped.
+pub struct TrafficWindow {
+    slots: Box<[TrafficSlot]>,
+    next: usize,
+    filled: usize,
+    started: Instant,
+    /// Events overwritten while still inside the window, one cell per minute
+    /// of the event's timestamp. A cell counts one minute only, so a later
+    /// event in the same minute slot replaces a stale count. Nothing allocates
+    /// and nothing expires on a timer.
+    drops: [DropCell; DROP_CELLS],
+}
+
+/// The events dropped in one minute of event time.
+#[derive(Clone, Copy)]
+struct DropCell {
+    /// Minutes since the Unix epoch, or `NONE` for a cell never written.
+    minute: u64,
+    count: u64,
+}
+
+impl DropCell {
+    const NONE: u64 = u64::MAX;
+    const EMPTY: Self = Self {
+        minute: Self::NONE,
+        count: 0,
+    };
+}
+
+impl Default for TrafficWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrafficWindow {
+    /// Allocate the ring once, at start, at the full configured size.
+    pub fn new() -> Self {
+        Self {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            started: Instant::now(),
+            drops: [DropCell::EMPTY; DROP_CELLS],
+        }
+    }
+
+    /// Record one logged event, overwriting the oldest slot when the ring is
+    /// full.
+    ///
+    /// One copy into a slot that was allocated at start. No allocation and no
+    /// system call, which is what keeps the cost of logging a request in
+    /// memory instead of a file read.
+    pub fn push(
+        &mut self,
+        at_us: u64,
+        kind: Kind,
+        status: u16,
+        path: &str,
+        client_ip: &str,
+        user_agent: Option<&str>,
+    ) {
+        let slot = &mut self.slots[self.next];
+        let overwritten_at_us = slot.at_us;
+        slot.at_us = at_us;
+        slot.kind = kind;
+        slot.status = status;
+        let path_cut = slot.path.set(path);
+        slot.client_ip.set(client_ip);
+        let user_agent_cut = match user_agent {
+            Some(ua) => slot.user_agent.set(ua),
+            None => {
+                slot.user_agent.mark_absent();
+                false
+            }
+        };
+        slot.truncated = path_cut || user_agent_cut;
+        self.next += 1;
+        if self.next == self.slots.len() {
+            self.next = 0;
+        }
+        if self.filled < self.slots.len() {
+            self.filled += 1;
+        } else {
+            self.count_drop(overwritten_at_us, at_us);
+        }
+    }
+
+    /// Count an event the ring just overwrote, if it was still in the window.
+    ///
+    /// `now_us` is the pushed event's time: the overwritten event leaves the
+    /// ring at the same moment, so it belonged in a report only when it was
+    /// not already older than the window.
+    fn count_drop(&mut self, dropped_at_us: u64, now_us: u64) {
+        if dropped_at_us < now_us.saturating_sub(WINDOW_US) {
+            return;
+        }
+        let minute = dropped_at_us / MICROS_PER_MINUTE;
+        let cell = &mut self.drops[(minute % DROP_CELLS as u64) as usize];
+        if cell.minute != minute {
+            cell.minute = minute;
+            cell.count = 0;
+        }
+        cell.count += 1;
+    }
+
+    /// The minutes the ring covers: the configured hour, less the time since
+    /// start, less the span the ring still holds once it has wrapped.
+    ///
+    /// The last term keeps a full ring honest. Overwriting events that are
+    /// still inside the hour means the report no longer covers the hour, and
+    /// the age of the oldest retained slot is the span it does cover. A report
+    /// soon after a restart says how long it covers, so an empty figure is not
+    /// read as an hour with no traffic.
+    fn covered_minutes(&self, now_us: u64) -> u64 {
+        let elapsed = (self.started.elapsed().as_secs() / 60).min(TRAFFIC_WINDOW_MINUTES);
+        if self.filled < self.slots.len() {
+            return elapsed;
+        }
+        let Some(oldest) = self.oldest_first().next() else {
+            return elapsed;
+        };
+        elapsed.min(now_us.saturating_sub(oldest.at_us) / MICROS_PER_MINUTE)
+    }
+
+    /// Events the ring overwrote while they were still inside the window.
+    ///
+    /// The count is by the minute of the overwritten event, and a cell older
+    /// than the window is left out, so a flood an hour ago is not reported
+    /// against a quiet hour now. The report states it, so a short window is
+    /// not read as a quiet one.
+    fn dropped_in_window(&self, now_us: u64) -> u64 {
+        let first_minute = now_us.saturating_sub(WINDOW_US) / MICROS_PER_MINUTE;
+        self.drops
+            .iter()
+            .filter(|c| c.minute != DropCell::NONE && c.minute >= first_minute)
+            .map(|c| c.count)
+            .sum()
+    }
+
+    /// The recorded slots from oldest to newest.
+    fn oldest_first(&self) -> impl Iterator<Item = &TrafficSlot> {
+        let len = self.slots.len();
+        let start = if self.filled == len { self.next } else { 0 };
+        let slots = &self.slots;
+        (0..self.filled).map(move |i| &slots[(start + i) % len])
+    }
+}
+
+/// Unix microseconds, the precision the analytics envelope records.
+pub(crate) fn unix_micros_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
+/// Build the `/traffic` summary from the window.
+///
+/// The records of the last hour are turned back into the records the log
+/// lines would have parsed to, and `TrafficReport::from_records` builds the
+/// report body, so the figures match the ones a log read produces. A value the
+/// slot cut is the one difference, and `truncated` tells the record, because a
+/// cut field can hide a probe marker. The report also states how long a window
+/// it actually covers and how many events the ring overwrote inside that
+/// window.
+fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
+    let now_us = unix_micros_now();
+    let cutoff = now_us.saturating_sub(WINDOW_US);
+    let mut records: Vec<AnalyticsRecord> = Vec::with_capacity(window.filled);
+    for slot in window.oldest_first() {
+        if slot.at_us < cutoff {
+            continue;
+        }
+        records.push(AnalyticsRecord::from_parts(
+            slot.at_us,
+            slot.kind.message(),
+            slot.status,
+            slot.path.as_str(),
+            slot.client_ip.as_str(),
+            slot.user_agent.as_opt(),
+            slot.truncated,
+        ));
+    }
+    let mut report = TrafficReport::from_records(node, &records, window.covered_minutes(now_us));
+    report.events_dropped = window.dropped_in_window(now_us);
     // Written by the m6-firewall-stats timer. A node without the timer
     // reports no firewall state rather than an empty one.
     report.firewall =
         m6_core::firewall::FirewallState::from_file(std::path::Path::new(FIREWALL_JSON))
             .unwrap_or(None);
-    Ok(report)
+    report
 }
 
 /// Serve `/traffic` to a caller [`metrics_gate`] has already let through:
-/// this node's summary of its own traffic.
+/// this node's summary of its own traffic, built from the window in memory.
 ///
 /// Gate first, then work, as for `/perf`, so an anonymous caller never causes
-/// a file read.
+/// the report to be built.
 ///
-/// The cache is what makes a file read safe to expose at all. Without it a
-/// monitor polling every thirty seconds makes every node re-read its analytics
-/// tail every thirty seconds, forever, to produce an answer that changes
-/// slowly. With it the read happens at most once per TTL however often the
-/// endpoint is scraped. The lock is held across the read deliberately: a
-/// second caller arriving mid-read waits for the first answer rather than
-/// starting a second tail.
+/// The cache keeps the build and its allocation to at most one per `cache_for`,
+/// however often the endpoint is scraped. It is a plain field of the loop's
+/// state: one thread owns the loop, so there is no lock to take.
 pub fn traffic_authorised(
     node: &str,
-    log_path: &str,
-    window_minutes: u64,
+    window: &TrafficWindow,
+    cache: &mut Option<(Instant, TrafficReport)>,
     cache_for: Duration,
 ) -> PerfOutcome {
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((built, report)) = cache.as_ref() {
         if built.elapsed() < cache_for {
             return PerfOutcome::Traffic(Box::new(report.clone()));
         }
     }
-    match build_report(node, log_path, window_minutes) {
-        Ok(r) => {
-            *cache = Some((Instant::now(), r.clone()));
-            PerfOutcome::Traffic(Box::new(r))
-        }
-        Err(e) => PerfOutcome::TrafficError(format!("{e}")),
-    }
+    let report = build_report(node, window);
+    *cache = Some((Instant::now(), report.clone()));
+    PerfOutcome::Traffic(Box::new(report))
 }
 
 /// The verdict of the metrics gate for one request.
@@ -276,20 +586,13 @@ pub fn metrics_gate(
 #[cfg(test)]
 mod traffic_endpoint_tests {
     use super::*;
-    use std::io::Write;
-
-    fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
-        format!(
-            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"origin","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
-        )
-    }
 
     /// No token configured means the endpoint does not exist: a 404, so it
     /// does not advertise a door. A wrong token is refused by the gate,
-    /// which runs before `traffic_authorised` and so before any file is
-    /// opened.
+    /// which runs before `traffic_authorised` and so before the report is
+    /// built.
     #[test]
-    fn the_legacy_gate_refuses_before_the_log_is_read() {
+    fn the_legacy_gate_refuses_before_the_report_is_built() {
         let none = HealthConfig::default();
         let Gate::Refused(out) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
             panic!("no token configured must refuse");
@@ -307,54 +610,29 @@ mod traffic_endpoint_tests {
         ));
     }
 
-    /// An unreadable log is reported, not silently served as a quiet hour.
-    /// This codebase has made that mistake: an absent file at the expected
-    /// path looked exactly like a feature switched off.
     #[test]
-    fn an_unreadable_log_is_a_503_with_a_reason() {
-        let out = traffic_authorised(
-            "origin",
-            "/definitely/not/a/file",
-            60,
-            Duration::from_secs(0),
+    fn summarises_the_window_and_serves_it() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        window.push(
+            now - 2_000_000,
+            Kind::Request,
+            200,
+            "/",
+            "192.0.2.10",
+            Some("Chrome/131"),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 503);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(!v["error"].as_str().unwrap_or("").is_empty());
-    }
-
-    #[test]
-    fn summarises_a_real_log_and_serves_it() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        let now = m6_core::util::now_iso8601();
-        let ts = now.trim_end_matches('Z');
-        writeln!(
-            f,
-            "{}",
-            row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            row(
-                &format!("{ts}.200Z"),
-                "5.6.7.8",
-                "/robots.txt",
-                200,
-                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"
-            )
-        )
-        .unwrap();
-        f.flush().unwrap();
-
-        let out = traffic_authorised(
-            "origin",
-            f.path().to_str().unwrap(),
-            60,
-            Duration::from_secs(0),
+        window.push(
+            now - 1_000_000,
+            Kind::Request,
+            200,
+            "/robots.txt",
+            "192.0.2.11",
+            Some("Mozilla/5.0 (compatible; ExampleBot/1.0)"),
         );
+
+        let mut cache = None;
+        let out = traffic_authorised("origin", &window, &mut cache, Duration::from_secs(0));
         let (code, headers, body) = out.into_response();
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -363,7 +641,7 @@ mod traffic_endpoint_tests {
         assert!(v["crawlers"][0]["user_agent"]
             .as_str()
             .unwrap()
-            .contains("ClaudeBot"));
+            .contains("ExampleBot"));
         assert!(v["logging"].is_object(), "logging health travels with it");
         // Never cached by anything in between.
         assert!(headers
@@ -371,34 +649,280 @@ mod traffic_endpoint_tests {
             .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 
-    /// After an hourly rotation the live file is nearly empty, and the
-    /// monitor's sixty minute sections must not shrink with it.
+    /// The age filter keeps the window to an hour: 61 minutes old is out,
+    /// 59 is in.
     #[test]
-    fn the_window_spans_the_newest_rotated_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = m6_core::util::now_iso8601();
-        let ts = now.trim_end_matches('Z');
-        let live = dir.path().join("analytics.ndjson");
-        std::fs::write(
-            &live,
-            format!(
-                "{}\n",
-                row(&format!("{ts}.300Z"), "1.2.3.4", "/c", 200, "x")
-            ),
-        )
-        .unwrap();
-        let rotated = format!(
-            "{}\n{}\n",
-            row(&format!("{ts}.100Z"), "1.2.3.4", "/a", 200, "x"),
-            row(&format!("{ts}.200Z"), "1.2.3.4", "/b", 200, "x")
+    fn the_window_drops_records_older_than_an_hour() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        window.push(
+            now - 61 * 60 * 1_000_000,
+            Kind::Request,
+            404,
+            "/old",
+            "192.0.2.1",
+            None,
         );
-        // Plain here. The gzip path is covered by `m6_core::log`'s tests.
-        std::fs::write(dir.path().join("analytics.ndjson-2026010101"), rotated).unwrap();
-        let out = traffic_authorised("origin", live.to_str().unwrap(), 60, Duration::from_secs(0));
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["total_requests"], 3);
+        window.push(
+            now - 59 * 60 * 1_000_000,
+            Kind::Request,
+            200,
+            "/new",
+            "192.0.2.2",
+            None,
+        );
+        let report = build_report("origin", &window);
+        assert_eq!(report.total_requests, 1, "only the last hour counts");
+        assert_eq!(report.status.get(&200), Some(&1));
+        assert_eq!(report.status.get(&404), None);
+    }
+
+    /// A full ring keeps the newest events and drops the oldest, rather than
+    /// stopping and reporting a frozen hour forever.
+    #[test]
+    fn the_ring_overwrites_the_oldest() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 418, "/oldest", "192.0.2.1", None);
+        }
+        for _ in 0..TRAFFIC_SLOTS {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.2", None);
+        }
+        window.push(now, Kind::Request, 429, "/newest", "192.0.2.3", None);
+
+        let report = build_report("origin", &window);
+        assert_eq!(report.total_requests, TRAFFIC_SLOTS as u64);
+        assert_eq!(
+            report.status.get(&418),
+            None,
+            "the ten oldest slots were overwritten"
+        );
+        assert_eq!(
+            report.status.get(&429),
+            Some(&1),
+            "the newest event is present"
+        );
+    }
+
+    /// A ring that wraps inside the hour reports the span it still holds and
+    /// the number of events it overwrote while they were still inside the
+    /// hour, rather than claiming a full 60 minutes over a short total.
+    #[test]
+    fn a_full_ring_reports_the_span_it_holds_and_what_it_dropped() {
+        let now = unix_micros_now();
+        let mut window = TrafficWindow {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            // An hour since start, so the span is the ring's, not elapsed time.
+            started: Instant::now() - Duration::from_secs(3600),
+            drops: [DropCell::EMPTY; DROP_CELLS],
+        };
+        // Fill the ring over 50 minutes and 30 seconds, leaving a margin over
+        // 50 whole minutes after the overwrites below.
+        let span_us = 50 * MICROS_PER_MINUTE + 30 * 1_000_000;
+        let step = span_us / (TRAFFIC_SLOTS as u64 - 1);
+        for i in 0..TRAFFIC_SLOTS {
+            window.push(
+                now - span_us + i as u64 * step,
+                Kind::Request,
+                200,
+                "/kept",
+                "192.0.2.1",
+                None,
+            );
+        }
+        // Every one of these overwrites an event still inside the hour.
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.1", None);
+        }
+
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.events_dropped, 10,
+            "ten events were overwritten inside the hour"
+        );
+        assert_eq!(
+            report.window_minutes, 50,
+            "the ring holds 50 minutes, not the 60 it claims"
+        );
+    }
+
+    /// An overwrite of an event that had already left the hour is not counted
+    /// against the hour, so the count does not grow for the life of the
+    /// process.
+    #[test]
+    fn drops_older_than_the_window_are_not_counted() {
+        let now = unix_micros_now();
+        let mut window = TrafficWindow {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            started: Instant::now() - Duration::from_secs(7200),
+            drops: [DropCell::EMPTY; DROP_CELLS],
+        };
+        // 70 minutes of events, so the ten overwritten below are older than
+        // the hour.
+        let span_us = 70 * MICROS_PER_MINUTE;
+        let step = span_us / (TRAFFIC_SLOTS as u64 - 1);
+        for i in 0..TRAFFIC_SLOTS {
+            window.push(
+                now - span_us + i as u64 * step,
+                Kind::Request,
+                200,
+                "/kept",
+                "192.0.2.1",
+                None,
+            );
+        }
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.1", None);
+        }
+
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.events_dropped, 0,
+            "the overwritten events were already outside the hour"
+        );
+        assert_eq!(report.window_minutes, 60, "the ring holds over an hour");
+    }
+
+    /// A drop cell is reported for one window and then forgotten. The cell
+    /// stays in the ring until a later event reuses its minute 61 minutes on,
+    /// so the read-time filter is what keeps a past burst out of a quiet hour.
+    /// `dropped_in_window` takes the time, so this needs no sleep.
+    #[test]
+    fn a_drop_leaves_the_count_once_the_window_passes_it() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        // One drop inside the window and one at the oldest minute the window
+        // still covers. The report includes an event exactly at the cutoff, so
+        // the edge drop counts too.
+        window.count_drop(now, now);
+        window.count_drop(now - WINDOW_US, now);
+        assert_eq!(
+            window.dropped_in_window(now),
+            2,
+            "both drops are inside the window"
+        );
+        assert_eq!(
+            window.dropped_in_window(now + 61 * MICROS_PER_MINUTE),
+            0,
+            "a past burst's drops are not reported against a quiet hour"
+        );
+    }
+
+    /// A path longer than its cap is cut on a character boundary and marked as
+    /// cut. Cutting at the byte cap regardless can split a multi-byte
+    /// character, and the slot would then not be UTF-8.
+    #[test]
+    fn a_long_path_is_cut_on_a_character_boundary() {
+        let mut window = TrafficWindow::new();
+        // "/" plus 300 two-byte characters: 601 bytes, and byte 512 falls in
+        // the middle of a character.
+        let path = format!("/{}", "é".repeat(300));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            200,
+            &path,
+            "192.0.2.1",
+            None,
+        );
+        let stored = window.slots[0].path.as_str();
+        assert!(stored.len() <= PATH_CAP, "stored {} bytes", stored.len());
+        let kept = stored
+            .strip_suffix(TRUNCATED)
+            .expect("a cut path ends in the marker");
+        assert!(!kept.is_empty(), "the cut keeps as much as it can");
+        assert!(
+            path.starts_with(kept),
+            "the stored value is a prefix of the request path"
+        );
+    }
+
+    /// A user agent the slot cap cut is marked where the report reads it, so
+    /// the report's 160-character cut cannot mistake the stored prefix for a
+    /// short agent and present it as whole.
+    #[test]
+    fn a_cut_user_agent_is_marked_in_the_report() {
+        let mut window = TrafficWindow::new();
+        // 200 two-byte characters is 400 bytes, so the 256-byte cap keeps 126
+        // characters: fewer than the report's 160-character mark.
+        let ua = "é".repeat(200);
+        for path in ["/.env", "/wp-admin/setup.php", "/@fs/etc/passwd"] {
+            window.push(
+                unix_micros_now(),
+                Kind::Request,
+                404,
+                path,
+                "192.0.2.1",
+                Some(&ua),
+            );
+        }
+        let report = build_report("origin", &window);
+        assert_eq!(report.notable.len(), 1, "three probes from one address");
+        let shown = &report.notable[0].user_agents[0];
+        assert!(shown.ends_with(TRUNCATED), "shown as whole: {shown:?}");
+        assert!(shown.chars().count() <= 160);
+    }
+
+    /// The owner's test: a path that hides a probe marker past the 512-byte
+    /// cap is still probe-shaped. "Not shown" is not "not a probe", and an
+    /// honest client does not send a 512-byte path.
+    #[test]
+    fn a_probe_marker_past_the_path_cap_is_still_probe_shaped() {
+        let mut window = TrafficWindow::new();
+        let path = format!("/{}/.env", "a".repeat(PATH_CAP + 8));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            404,
+            &path,
+            "192.0.2.1",
+            None,
+        );
+        let report = build_report("origin", &window);
+        // `probe_noise` is the report's record of `ClientSummary::probe_paths`
+        // for an address below the notable threshold.
+        assert_eq!(report.probe_noise.len(), 1, "the cut request is flagged");
+        let shown = report.probe_noise[0]
+            .strip_prefix("192.0.2.1 ")
+            .expect("the noise line names the address");
+        assert!(!shown.contains(".env"), "the marker was cut: {shown:?}");
+        assert!(
+            !m6_core::telemetry::looks_like_probe(shown),
+            "the stored bytes carry no marker, so the flag is what catches it"
+        );
+        assert_eq!(
+            report.forgers,
+            vec!["192.0.2.1".to_string()],
+            "the address reads as scanning"
+        );
+    }
+
+    /// A user agent the cap cut counts as probe-shaped too, on an ordinary
+    /// path: the part not shown may carry a marker.
+    #[test]
+    fn a_cut_user_agent_counts_as_probe_shaped() {
+        let mut window = TrafficWindow::new();
+        let ua = format!("Mozilla/5.0 {}", "x".repeat(UA_CAP));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            200,
+            "/",
+            "192.0.2.2",
+            Some(&ua),
+        );
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.probe_noise,
+            vec!["192.0.2.2 /".to_string()],
+            "a cut user agent is probe-shaped"
+        );
+        assert_eq!(report.forgers, vec!["192.0.2.2".to_string()]);
     }
 }
 

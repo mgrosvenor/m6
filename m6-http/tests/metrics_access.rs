@@ -136,6 +136,16 @@ impl Fixture {
     /// the verify key path, `{TOKEN}` the legacy token file, `{H2C}` a claimed
     /// extra address.
     fn new(site: &str, server: &str, system: &str) -> Fixture {
+        Self::build(site, server, system, false)
+    }
+
+    /// Like [`Fixture::new`], with analytics on, so each request is logged and
+    /// copied into `/traffic`'s window.
+    fn logging(site: &str, server: &str, system: &str) -> Fixture {
+        Self::build(site, server, system, true)
+    }
+
+    fn build(site: &str, server: &str, system: &str, analytics: bool) -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
@@ -172,10 +182,11 @@ impl Fixture {
             format!(
                 "[site]\nname = \"metrics-access\"\ndomain = \"localhost\"\n\n\
                  [errors]\nmode = \"internal\"\n\n\
-                 [analytics]\nenabled = false\nlog_path = \"{}\"\n\n\
+                 [analytics]\nenabled = {}\nlog_path = \"{}\"\n\n\
                  [rate_limit]\nenabled = false\n\n\
                  [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"b\"\n\n{}",
+                analytics,
                 d.join("analytics.ndjson").display(),
                 backend_glob.display(),
                 sub(site),
@@ -812,6 +823,56 @@ fn traffic_follows_the_same_rule() {
             assert_eq!(r.status, want, "{proto}: {}", r.text());
         }
     }
+}
+
+/// `/traffic` reports the requests this process served, from the window it
+/// keeps in memory. The analytics log is deleted before the scrape, so an
+/// answer that still counts the five requests proves the file was not read.
+///
+/// `traffic_cache_s = 0` makes every scrape build the report, so the counts are
+/// the window's and not a cached report's.
+#[test]
+fn traffic_reports_requests_served_since_start() {
+    let site = format!("{PRIVATE_ROUTE}[health]\ntraffic_cache_s = 0\n");
+    let fx = Fixture::logging(&site, "", &gated());
+    // The fixture's backend is a placeholder with no listener. Replace it with
+    // one that answers, so the requests are served and each logs an analytics
+    // line, which is what puts it in the window. The pool reads its glob at
+    // start, so the socket exists before the spawn either way.
+    let backend_sock = fx.dir.path().join("b-1.sock");
+    std::fs::remove_file(&backend_sock).expect("remove the placeholder socket");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&backend_sock).expect("bind the backend socket");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            // One request per connection, so the pool opens a fresh one.
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok");
+            let _ = stream.flush();
+        }
+    });
+    let run = fx.start();
+    let auth = bearer(&run.token(&["monitor"]));
+    // Five public requests. The status the client sees is the status the
+    // analytics line records.
+    let mut seen: std::collections::BTreeMap<u16, u64> = std::collections::BTreeMap::new();
+    for _ in 0..5 {
+        let r = run.h1("/", &[]);
+        assert_ne!(r.status, 0, "a public request must be answered");
+        *seen.entry(r.status).or_default() += 1;
+    }
+    // The window is memory, not the file: remove the log before the scrape.
+    std::fs::remove_file(run.fx.dir.path().join("analytics.ndjson"))
+        .expect("the analytics log exists while the process runs");
+    let r = run.h1("/traffic", &[("Authorization", &auth)]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    let report: m6_core::monitoring::TrafficReport =
+        serde_json::from_slice(&r.body).expect("a traffic report");
+    assert_eq!(report.total_requests, 5, "{}", r.text());
+    assert_eq!(report.status, seen, "{}", r.text());
 }
 
 #[test]

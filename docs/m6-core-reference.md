@@ -712,10 +712,7 @@ a silent log becomes a fault rather than a zero.
 `reopen_log_file() -> Reopened` reopens the analytics file at the absolute path it was opened with.
 `reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
 `writes_log_file()` says whether this process has a file to reopen.
-`newest_rotated(live)` finds the newest rotated sibling of a log file, plain or gzip.
 `read_tail(path, max_bytes)` reads the end of one file.
-`read_recent(live, max_bytes, since)` reads the live file and, when it adds history, the newest rotated sibling before it.
-`read_recent_counted` does the same and also returns what the read cost.
 
 ### 8.2. `telemetry`
 
@@ -728,6 +725,11 @@ exactly like a quiet hour.
 
 `AnalyticsRecord` and `AnalyticsFields` are that missing definition, `Serialize`
 as well as `Deserialize` so the write side can adopt them.
+`AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)`
+builds the record the analytics line with those values parses to, which is how
+`/traffic` turns its in-memory window back into records.
+`truncated` is the window's own fact that a cap cut the path or user agent, and
+it is not part of the line.
 `parse_analytics(...)` reads a stream. `PeriodicStats::parse(line)` reads the
 `periodic stats` log line, `strip_ansi` first because the journal carries
 colour. `aggregate_windows(...) -> StatsAggregate` sums them.
@@ -784,8 +786,10 @@ Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the
 `reopen` is `None` for a process that writes no log file, and `seconds_since_last_reopen` is `None` until the first reopen.
 Both are `serde(default)`, so a node older than the fields still parses.
 
-`TrafficReport::build(node, ndjson, since, window_minutes)` is the `/traffic`
-endpoint: the node does the analysis and the log stays put. `LoggingHealth::read()`
+`TrafficReport::from_records(node, records, window_minutes)` summarises records
+that are already parsed, which is how `m6-http` answers `/traffic` from its
+in-memory window. `events_dropped` says how many events that window overwrote
+before they left it, so a short window is not read as a quiet hour. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
 `CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.

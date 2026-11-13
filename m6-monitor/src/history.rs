@@ -1958,6 +1958,7 @@ mod tests {
         TrafficReport {
             node: "n".into(),
             window_minutes: window,
+            events_dropped: 0,
             total_requests: 900,
             status: [(200u16, 800u64), (404, 100)].into_iter().collect(),
             notable: vec![],

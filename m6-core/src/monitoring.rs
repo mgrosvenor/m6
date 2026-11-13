@@ -460,8 +460,9 @@ pub enum PerfOutcome {
     ///
     /// Its own path rather than more fields on `/perf`, for the reason that
     /// split `/health` from `/perf`: the cost profiles differ. `/perf` sorts a
-    /// reservoir in memory. This reads the tail of a log that can run to tens
-    /// of megabytes. Putting the expensive one behind a conditional on the
+    /// reservoir in memory. This builds the report from the window of events
+    /// `m6-http` logged itself, which allocates a record per retained event on
+    /// a cache miss. Putting the expensive one behind a conditional on the
     /// cheaper path leaves the expensive branch one misconfigured header away
     /// from being taken on every request, and splitting the paths is what keeps
     /// each answer's cost a property of the path rather than of the caller.
@@ -469,10 +470,6 @@ pub enum PerfOutcome {
     /// carrying it inline made the whole enum that size even when the outcome
     /// was a one-word error.
     Traffic(Box<TrafficReport>),
-    /// The analytics log could not be read. Said out loud rather than reported
-    /// as a quiet hour, which is a mistake this codebase has made: an absent
-    /// file at the expected path looked exactly like a feature switched off.
-    TrafficError(String),
     /// No token configured: the endpoint is switched off and answers 404, so
     /// it does not advertise a door that cannot be opened.
     Disabled,
@@ -598,14 +595,6 @@ impl PerfOutcome {
                 let body = serde_json::to_vec(&report)
                     .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
                 (200, headers, body)
-            }
-            // 503, not 500: the node is serving, but its own view of its
-            // traffic is not available. A monitor shows that as a gap rather
-            // than as a quiet hour.
-            PerfOutcome::TrafficError(why) => {
-                let body = serde_json::to_vec(&serde_json::json!({"error": why}))
-                    .unwrap_or_else(|_| br#"{"error":"unreadable"}"#.to_vec());
-                (503, headers, body)
             }
         }
     }
@@ -1134,7 +1123,20 @@ mod tests {
 pub struct TrafficReport {
     pub node: String,
     /// The window summarised, in minutes.
+    ///
+    /// A node that keeps its window in memory reports the span that window
+    /// really holds, which is shorter than the window when a full ring
+    /// overwrote events still inside it.
     pub window_minutes: u64,
+    /// Events the window overwrote while they were still inside the window
+    /// this report covers, counted by minute.
+    ///
+    /// Non-zero means the summary is missing those events: the totals are for
+    /// `window_minutes`, not for a full hour. Zero for a report built from a
+    /// log. `serde(default)`, so a node older than the field reads as zero
+    /// drops instead of making the whole report unparseable.
+    #[serde(default)]
+    pub events_dropped: u64,
     pub total_requests: u64,
     pub status: std::collections::BTreeMap<u16, u64>,
     /// Clients worth a human's attention. Already graded: see
@@ -1310,14 +1312,19 @@ pub struct CrawlerReport {
 }
 
 impl TrafficReport {
-    /// Summarise an analytics stream.
+    /// Summarise records that are already parsed.
     ///
-    /// `since` is an RFC 3339 prefix; the timestamps are fixed-width UTC so a
-    /// string compare is a time compare.
-    pub fn build(node: &str, ndjson: &str, since: &str, window_minutes: u64) -> Self {
-        let records: Vec<crate::telemetry::AnalyticsRecord> =
-            crate::telemetry::parse_analytics(ndjson, since).collect();
-        let summary = crate::telemetry::TrafficSummary::from_records(&records);
+    /// `/traffic` keeps its records in memory and never reads the log, so the
+    /// report a window produces and the report the same lines would produce
+    /// from the file run through this one body. A caller with records from a
+    /// file leaves [`events_dropped`](Self::events_dropped) at zero, because a
+    /// log keeps every event in its window.
+    pub fn from_records(
+        node: &str,
+        records: &[crate::telemetry::AnalyticsRecord],
+        window_minutes: u64,
+    ) -> Self {
+        let summary = crate::telemetry::TrafficSummary::from_records(records);
 
         let notable: Vec<NotableClient> = summary
             .clients
@@ -1360,6 +1367,7 @@ impl TrafficReport {
         Self {
             node: node.to_string(),
             window_minutes,
+            events_dropped: 0,
             heavy_hitters,
             total_requests: summary.total_requests,
             status: summary.status.clone(),
@@ -1433,7 +1441,9 @@ mod traffic_tests {
                 "curl/8",
             ));
         }
-        let r = TrafficReport::build("origin", &lines.join("\n"), "", 60);
+        let ndjson = lines.join("\n");
+        let records: Vec<_> = crate::telemetry::parse_analytics(&ndjson, "").collect();
+        let r = TrafficReport::from_records("origin", &records, 60);
 
         assert_eq!(r.total_requests, 6);
         assert_eq!(r.crawlers.len(), 1);
