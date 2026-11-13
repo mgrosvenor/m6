@@ -168,7 +168,9 @@ fn make_rustls_config(skip_verify: bool) -> Arc<ClientConfig> {
         )
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for cert in rustls_native_certs::load_native_certs().certs {
+            roots.add(cert).ok();
+        }
         Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(roots)
