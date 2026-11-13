@@ -1402,8 +1402,9 @@ fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
 /// Take a finished upstream out of the loop: free its token, its deadline and
 /// its slot, and tell its owner how the request went.
 ///
-/// A socket member is released or backed off. A URL backend whose reply left
-/// the connection reusable keeps its slot on that backend's idle list, still
+/// A socket member is released, or backed off when it went silent or failed
+/// after taking the whole request. A URL backend whose reply left the
+/// connection reusable keeps its slot on that backend's idle list, still
 /// registered for read, so the backend closing it wakes the loop and the slot
 /// is dropped before any request can be handed the dead connection.
 fn retire_upstream(
@@ -1412,7 +1413,8 @@ fn retire_upstream(
     result: &std::io::Result<forward::HttpResponse>,
     cx: &mut CompletionCtx<'_>,
 ) -> (Option<Waiter>, Option<Box<forward::PendingUrlContext>>) {
-    let (kind, member_idx, waiter, ctx, reusable) = {
+    let timed_out = matches!(result, Err(e) if e.kind() == std::io::ErrorKind::TimedOut);
+    let (kind, member_idx, waiter, ctx, reusable, request_written) = {
         let entry = cx.state.upstreams.get_mut(slot);
         (
             entry.kind,
@@ -1420,6 +1422,7 @@ fn retire_upstream(
             entry.waiter.take(),
             entry.ctx.take(),
             entry.upstream.reusable(),
+            entry.upstream.request_written(),
         )
     };
     let mut kept = false;
@@ -1430,7 +1433,9 @@ fn retire_upstream(
             // Release the member using a borrow of the slot's name, before the
             // slot is freed, so the name buffer survives for the next launch.
             if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
-                if result.is_err() {
+                // A refusal's reply may be waiting unread. A refused connect
+                // was already marked failed at launch.
+                if result.is_err() && (timed_out || request_written) {
                     pool.mark_failed(member_idx);
                 } else {
                     pool.release(member_idx);
