@@ -21,8 +21,8 @@ const DEADLINE: Duration = Duration::from_secs(5);
 
 #[test]
 fn stop_writes_everything_and_restores_blocking() {
-    let before = Stdout::nonblocking();
     let (stdout, read) = Stdout::to_pipe();
+    let before = Stdout::nonblocking();
     m6_log::init(m6_log::Level::Info, None).expect("the logger");
     assert!(
         Stdout::nonblocking(),

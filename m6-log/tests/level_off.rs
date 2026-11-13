@@ -1,6 +1,11 @@
 //! A line below the configured level builds nothing: its arguments are not
 //! formatted.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: a second thread is the only way to prove the cross-thread guard"
+)]
+
 mod common;
 
 use std::fmt;
@@ -25,6 +30,15 @@ fn level_off_builds_nothing() {
 
     m6_log::info!(value = %Boom, "never built");
     m6_log::debug!(value = %Boom, "never built");
+
+    #[cfg(debug_assertions)]
+    {
+        let other = std::thread::spawn(|| m6_log::warn!("from another thread"));
+        assert!(
+            other.join().is_err(),
+            "a log call from another thread did not trip the debug guard"
+        );
+    }
     assert!(
         fs::read(&path).expect("the file").is_empty(),
         "a line below the level was written"

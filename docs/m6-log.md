@@ -28,8 +28,10 @@ Each line reads `SystemTime::now()` once and appends that second's cached text a
 Strings are escaped as JSON requires.
 The quote and the backslash are escaped, and every byte from 0x00 to 0x1f is written as `\u00xx`.
 Non-ASCII UTF-8 passes through unchanged.
-A string field longer than 1024 bytes is cut on a character boundary and ends in `...`, inside the same 1024 bytes.
-A message, a `%display` field and a `?debug` field are formatted straight into the buffer through an escaping adapter, with no `String`.
+Keys and targets use the same escaper as the string fields.
+A string field writes at most 1021 escaped bytes inside its quotes.
+A value that needs more is cut on a character boundary and ends in `...`, so the field keeps at most 1024 bytes, the marker included.
+A message, a `%display` field and a `?debug` field are formatted straight into the buffer through the escaping adapter, with no `String`.
 
 A field with no value is omitted, as tracing omitted it.
 Key order is free for a JSON reader.
@@ -80,8 +82,10 @@ A process with no analytics file does nothing on SIGUSR1 and answers `Ok`.
 
 A write to stdout can return `EAGAIN` when the destination is full.
 The bytes stay in the buffer and the loop waits for writability, which `watch` in m6-core registers under the service's `LOG` token.
-While the destination is full, the buffer is not retried and new lines are dropped and counted.
+While the destination is full, the buffer is not retried before a flush.
+New lines are appended while the buffer has room, and the line that does not fit in the full buffer is dropped and counted.
 When the destination drains, the next flush writes the buffered lines and then one line at `WARN` with `message` `"log lines dropped"` and the `dropped` count.
+If that report line itself cannot be written, the count stays pending and the next flush reports the whole loss again.
 `Sink::dropped()` reports the total for the life of the Sink.
 
 A write error other than `EAGAIN` counts the complete lines it could not send as dropped.
@@ -89,7 +93,7 @@ A regular file never returns `EAGAIN`, so the analytics Sink is never registered
 
 ## The loop's calls
 
-A service's loop makes three calls while it runs and two at its edges.
+A service's loop makes six calls: three while it runs, one on a signal and two at its edges.
 Table 3 lists them.
 
 Table 3: the calls a service makes.

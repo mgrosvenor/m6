@@ -18,6 +18,42 @@ use crate::line::write_dropped_line;
 /// Bytes one Sink's buffer holds before it is written to its destination.
 pub const BUFFER_BYTES: usize = 16 * 1024;
 
+/// The escaped form of one byte of a JSON string's contents, and its length.
+///
+/// This is the one escaper: a match over the byte, with no table. Bytes above
+/// 0x1f that are not `"` or `\` are copied through, so the non-ASCII bytes of
+/// a `str`'s UTF-8 pass unchanged.
+fn escaped_byte(b: u8) -> ([u8; 6], usize) {
+    let mut out = [0u8; 6];
+    let len = match b {
+        b'"' => {
+            out[..2].copy_from_slice(b"\\\"");
+            2
+        }
+        b'\\' => {
+            out[..2].copy_from_slice(b"\\\\");
+            2
+        }
+        0x00..=0x1f => {
+            let hex = b"0123456789abcdef";
+            out.copy_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                hex[(b >> 4) as usize],
+                hex[(b & 0x0f) as usize],
+            ]);
+            6
+        }
+        _ => {
+            out[0] = b;
+            1
+        }
+    };
+    (out, len)
+}
+
 /// One log destination: a fixed buffer, its length and the descriptor it
 /// drains to.
 pub struct Sink {
@@ -40,10 +76,16 @@ pub struct Sink {
     blocked: bool,
     /// Lines lost to a full destination or a write error, ever.
     dropped: u64,
-    /// Dropped lines already reported by a dropped-count line.
+    /// Dropped lines the last drained dropped-count line reported.
     reported: u64,
+    /// Bytes of a dropped-count line still at the front of the buffer.
+    report: usize,
+    /// The `dropped` total that the buffered dropped-count line reports.
+    report_upto: u64,
     /// Lines this sink has accepted.
     lines: u64,
+    /// Bytes this sink has written to its destination.
+    written: u64,
 }
 
 impl Sink {
@@ -77,7 +119,10 @@ impl Sink {
             blocked: false,
             dropped: 0,
             reported: 0,
+            report: 0,
+            report_upto: 0,
             lines: 0,
+            written: 0,
         })
     }
 
@@ -103,7 +148,10 @@ impl Sink {
             blocked: false,
             dropped: 0,
             reported: 0,
+            report: 0,
+            report_upto: 0,
             lines: 0,
+            written: 0,
         })
     }
 
@@ -124,10 +172,11 @@ impl Sink {
     /// last report.
     pub fn flush(&mut self) {
         self.try_write();
-        if self.commit == 0 && self.len == 0 && self.dropped > self.reported {
+        if self.commit == 0 && self.len == 0 && self.report == 0 && self.dropped > self.reported {
             let lost = self.dropped - self.reported;
-            self.reported = self.dropped;
+            self.report_upto = self.dropped;
             write_dropped_line(self, lost);
+            self.report = self.commit;
             self.try_write();
         }
     }
@@ -157,13 +206,12 @@ impl Sink {
             fcntl(std::io::stdout(), FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
         }
         let mut result = self.write_all_blocking();
-        if self.dropped > self.reported {
+        if result.is_ok() && self.dropped > self.reported {
             let lost = self.dropped - self.reported;
-            self.reported = self.dropped;
+            self.report_upto = self.dropped;
             write_dropped_line(self, lost);
-            if result.is_ok() {
-                result = self.write_all_blocking();
-            }
+            self.report = self.commit;
+            result = self.write_all_blocking();
         }
         result
     }
@@ -176,6 +224,11 @@ impl Sink {
     /// Lines this sink has accepted.
     pub fn lines(&self) -> u64 {
         self.lines
+    }
+
+    /// Bytes this sink has written to its destination.
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     /// Append one complete line's bytes, flushing complete lines first when it
@@ -192,46 +245,61 @@ impl Sink {
         true
     }
 
-    pub(crate) fn push_byte(&mut self, b: u8) -> bool {
-        if self.len == self.buf.len() {
-            self.make_room();
-            if self.len == self.buf.len() {
+    /// Append a string, escaping it as a JSON string's contents.
+    ///
+    /// The printable-ASCII fast path stays. Every other byte goes through
+    /// [`escaped_byte`], the one escaper.
+    pub(crate) fn push_escaped(&mut self, s: &str) -> bool {
+        if s.bytes()
+            .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
+        {
+            return self.push(s.as_bytes());
+        }
+        for &b in s.as_bytes() {
+            let (escaped, len) = escaped_byte(b);
+            if !self.push(&escaped[..len]) {
                 return false;
             }
         }
-        self.buf[self.len] = b;
-        self.len += 1;
         true
     }
 
-    /// Append a string, escaping it as a JSON string's contents.
-    ///
-    /// This is the one escaper: a match per byte. Non-ASCII UTF-8 passes
-    /// through, since the input is a `str`.
-    pub(crate) fn push_escaped(&mut self, s: &str) -> bool {
-        for &b in s.as_bytes() {
-            let ok = match b {
-                b'"' => self.push(b"\\\""),
-                b'\\' => self.push(b"\\\\"),
-                0x00..=0x1f => {
-                    let hex = b"0123456789abcdef";
-                    let escape = [
-                        b'\\',
-                        b'u',
-                        b'0',
-                        b'0',
-                        hex[(b >> 4) as usize],
-                        hex[(b & 0x0f) as usize],
-                    ];
-                    self.push(&escape)
-                }
-                _ => self.push_byte(b),
+    /// Append as much of `s` as fits in `left` more escaped bytes, on a
+    /// character boundary. Answers whether the whole value was written and
+    /// reduces `left` by the bytes written. `Err` means the buffer itself is
+    /// full.
+    #[inline]
+    pub(crate) fn push_escaped_limited(&mut self, s: &str, left: &mut usize) -> Result<bool, ()> {
+        if s.len() <= *left
+            && s.bytes()
+                .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
+        {
+            return if self.push(s.as_bytes()) {
+                *left -= s.len();
+                Ok(true)
+            } else {
+                Err(())
             };
-            if !ok {
-                return false;
-            }
         }
-        true
+        for c in s.chars() {
+            let mut utf8 = [0u8; 4];
+            let text = c.encode_utf8(&mut utf8);
+            let mut escaped = [0u8; 6];
+            let mut len = 0;
+            for &b in text.as_bytes() {
+                let (bytes, n) = escaped_byte(b);
+                escaped[len..len + n].copy_from_slice(&bytes[..n]);
+                len += n;
+            }
+            if len > *left {
+                return Ok(false);
+            }
+            if !self.push(&escaped[..len]) {
+                return Err(());
+            }
+            *left -= len;
+        }
+        Ok(true)
     }
 
     pub(crate) fn commit_line(&mut self) {
@@ -285,9 +353,12 @@ impl Sink {
                 }
             }
         }
+        let report = self.report;
         self.move_front(written);
+        self.advance_report(report, written);
         if failed {
             self.discard_complete();
+            self.report = 0;
             self.blocked = false;
         } else if full {
             self.blocked = true;
@@ -296,15 +367,34 @@ impl Sink {
         }
     }
 
+    /// Advance `reported` once the bytes of a dropped-count line have drained.
+    fn advance_report(&mut self, report: usize, written: usize) {
+        if report == 0 {
+            return;
+        }
+        if written >= report {
+            self.reported = self.report_upto;
+            self.report = 0;
+            self.report_upto = 0;
+        } else {
+            self.report = report - written;
+        }
+    }
+
     /// Blocking write of everything buffered, for [`Sink::finish`].
     fn write_all_blocking(&mut self) -> io::Result<()> {
         while self.commit > 0 {
+            let report = self.report;
             match self.write_some(&self.buf[..self.commit]) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                Ok(n) => self.move_front(n),
+                Ok(n) => {
+                    self.move_front(n);
+                    self.advance_report(report, n);
+                }
                 Err(Errno::EINTR) => continue,
                 Err(e) => {
                     self.discard_complete();
+                    self.report = 0;
                     return Err(io::Error::from(e));
                 }
             }
@@ -324,6 +414,7 @@ impl Sink {
         if written == 0 {
             return;
         }
+        self.written += written as u64;
         self.buf.copy_within(written..self.len, 0);
         self.len -= written;
         self.commit -= written;
@@ -332,7 +423,7 @@ impl Sink {
     /// Throw away the complete lines that could not be written, keeping the
     /// line being built, and count them as dropped.
     fn discard_complete(&mut self) {
-        let lost = self.buf[..self.commit]
+        let lost = self.buf[self.report..self.commit]
             .iter()
             .filter(|&&b| b == b'\n')
             .count() as u64;

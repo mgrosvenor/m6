@@ -24,8 +24,10 @@
 //! counting are described in `docs/m6-log.md`.
 //!
 //! The writer sees one thread. The Sinks and the level are thread-local, and a
-//! log call from a thread that did not call [`init`] is a programming error
-//! that the macros assert against in a debug build.
+//! process-wide marker records the thread that called [`init`]. A log call from
+//! another thread is a programming error that the macros assert against in a
+//! debug build. A release build has no assert, and it drops the other thread's
+//! line because only the initialising thread has the Sinks.
 
 #![deny(unsafe_code)]
 
@@ -46,8 +48,11 @@ thread_local! {
     static LEVEL: Cell<Level> = const { Cell::new(Level::Info) };
     static OPERATIONAL: RefCell<Option<Sink>> = const { RefCell::new(None) };
     static ANALYTICS: RefCell<Option<Sink>> = const { RefCell::new(None) };
-    static INIT_THREAD: Cell<Option<std::thread::ThreadId>> = const { Cell::new(None) };
 }
+
+/// The thread that called [`init`], so a debug build can name another thread's
+/// log call. The design has one thread per process.
+static INIT_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
 /// Open the log: set the level and open both Sinks.
 ///
@@ -61,7 +66,7 @@ pub fn init(level: Level, analytics: Option<&Path>) -> io::Result<()> {
         None => None,
     };
     LEVEL.with(|slot| slot.set(level));
-    INIT_THREAD.with(|slot| slot.set(Some(std::thread::current().id())));
+    let _ = INIT_THREAD.set(std::thread::current().id());
     OPERATIONAL.with(|slot| *slot.borrow_mut() = Some(operational));
     ANALYTICS.with(|slot| *slot.borrow_mut() = analytics);
     Ok(())
@@ -144,6 +149,18 @@ pub fn operational_lines() -> u64 {
     OPERATIONAL.with(|slot| slot.borrow().as_ref().map_or(0, Sink::lines))
 }
 
+/// Bytes the operational Sink has written to its destination, for the tests.
+#[doc(hidden)]
+pub fn operational_written() -> u64 {
+    OPERATIONAL.with(|slot| slot.borrow().as_ref().map_or(0, Sink::written))
+}
+
+/// Bytes the analytics Sink has written to its destination, for the tests.
+#[doc(hidden)]
+pub fn analytics_written() -> u64 {
+    ANALYTICS.with(|slot| slot.borrow().as_ref().map_or(0, Sink::written))
+}
+
 /// Whether a line at `level` is written at the configured level.
 #[doc(hidden)]
 pub fn __level_enabled(level: Level) -> bool {
@@ -155,9 +172,9 @@ pub fn __level_enabled(level: Level) -> bool {
 pub fn __with_operational(f: impl FnOnce(&mut Sink)) -> bool {
     #[cfg(debug_assertions)]
     {
-        if let Some(initialised) = INIT_THREAD.with(Cell::get) {
+        if let Some(initialised) = INIT_THREAD.get() {
             assert_eq!(
-                initialised,
+                *initialised,
                 std::thread::current().id(),
                 "m6-log: a log call from a thread that did not call init"
             );

@@ -46,13 +46,14 @@ fn main() {
     m6_log::init(Level::Trace, Some(std::path::Path::new("/dev/null"))).expect("the logger");
 
     let before = COUNT.load(Ordering::Relaxed);
+    let mut analytics_accepted = 0u64;
     for n in 0..LINES {
         m6_log::error!(n = n, "line");
         m6_log::warn!(n = n, "line");
         m6_log::info!(n = n, "line");
         m6_log::debug!(n = n, "line");
         m6_log::trace!(n = n, "line");
-        with_analytics(|sink| {
+        let accepted = with_analytics(|sink| {
             Line::begin(sink, Level::Info, "request")
                 .str("node", "dev")
                 .str("path", "/capabilities")
@@ -65,13 +66,32 @@ fn main() {
                 .u64("latency_ns", 3360)
                 .end();
         });
+        assert!(accepted, "the analytics Sink was not open");
+        analytics_accepted += u64::from(accepted);
     }
     let allocated = COUNT.load(Ordering::Relaxed) - before;
+    let operational_lines = m6_log::operational_lines();
+    let operational_written = m6_log::operational_written();
+    let analytics_written = m6_log::analytics_written();
     m6_log::stop().expect("a clean stop");
     eprintln!(
         "no_allocation: {allocated} allocation(s) in {} lines",
         LINES * 6
     );
+    assert_eq!(
+        operational_lines,
+        LINES * 5,
+        "the macro lines did not reach the operational Sink"
+    );
+    assert_eq!(
+        analytics_accepted, LINES,
+        "the analytics line did not reach its Sink"
+    );
+    assert!(
+        operational_written > 0,
+        "the operational Sink wrote nothing"
+    );
+    assert!(analytics_written > 0, "the analytics Sink wrote nothing");
     if allocated != 0 {
         std::process::exit(1);
     }

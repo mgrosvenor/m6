@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sink::Sink;
 
-/// The most bytes a string field keeps. A longer value is cut on a character
-/// boundary and ends in `...`, all inside the same 1024 bytes.
+/// The most bytes a string field writes inside its quotes, the `...` marker
+/// included. A longer value is cut on a character boundary and ends in `...`,
+/// all inside the same 1024 bytes.
 pub const MAX_FIELD: usize = 1024;
 
 /// The severity of a line.
@@ -253,10 +254,11 @@ impl<'a> Line<'a> {
         if !self.failed {
             self = self.raw(b"}");
             if let Some(target) = self.target {
-                self = self
-                    .raw(b",\"target\":\"")
-                    .raw(target.as_bytes())
-                    .raw(b"\"");
+                self = self.raw(b",\"target\":\"");
+                if !self.failed && !self.sink.push_escaped(target) {
+                    self.failed = true;
+                }
+                self = self.raw(b"\"");
             }
             self = self.raw(b"}\n");
         }
@@ -279,22 +281,30 @@ impl<'a> Line<'a> {
             self = self.raw(b",");
         }
         self.first = false;
-        self.raw(b"\"").raw(key.as_bytes()).raw(b"\":")
+        self = self.raw(b"\"");
+        if !self.failed && !self.sink.push_escaped(key) {
+            self.failed = true;
+        }
+        self.raw(b"\":")
     }
 
     fn quoted(mut self, value: &str) -> Self {
         if self.failed {
             return self;
         }
-        let (value, cut) = cut(value);
         if !self.sink.push(b"\"") {
             self.failed = true;
             return self;
         }
-        if !self.sink.push_escaped(value) {
-            self.failed = true;
-            return self;
-        }
+        let mut left = MAX_FIELD - 3;
+        let cut = match self.sink.push_escaped_limited(value, &mut left) {
+            Ok(true) => false,
+            Ok(false) => true,
+            Err(()) => {
+                self.failed = true;
+                return self;
+            }
+        };
         if cut && !self.sink.push(b"...") {
             self.failed = true;
             return self;
@@ -305,6 +315,8 @@ impl<'a> Line<'a> {
         self
     }
 
+    /// Write a string body in quotes, escaped by the adapter and cut at
+    /// [`MAX_FIELD`] bytes, the marker included.
     fn formatted_body(mut self, args: fmt::Arguments<'_>) -> Self {
         if self.failed {
             return self;
@@ -320,8 +332,8 @@ impl<'a> Line<'a> {
                 cut: false,
                 failed: false,
             };
-            let _ = fmt::write(&mut adapter, args);
-            (adapter.cut, adapter.failed)
+            let result = fmt::write(&mut adapter, args);
+            (adapter.cut, adapter.failed || result.is_err())
         };
         if failed {
             self.failed = true;
@@ -351,21 +363,8 @@ impl<'a> Line<'a> {
     }
 }
 
-/// Cut a value to [`MAX_FIELD`] bytes on a character boundary, marker
-/// included. Returns whether the marker is needed.
-fn cut(value: &str) -> (&str, bool) {
-    if value.len() <= MAX_FIELD {
-        return (value, false);
-    }
-    let mut end = MAX_FIELD - 3;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&value[..end], true)
-}
-
-/// A `fmt::Write` that escapes into the line's buffer and cuts at the field
-/// limit.
+/// A `fmt::Write` that escapes into the line's buffer and cuts on a character
+/// boundary at the escaped field limit.
 struct EscapeAdapter<'a> {
     sink: &'a mut Sink,
     left: usize,
@@ -378,23 +377,21 @@ impl fmt::Write for EscapeAdapter<'_> {
         if self.failed {
             return Err(fmt::Error);
         }
-        if self.left == 0 {
-            self.cut = true;
+        if self.cut {
             return Ok(());
         }
-        let mut end = s.len().min(self.left);
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
+        match self.sink.push_escaped_limited(s, &mut self.left) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.cut = true;
+                self.left = 0;
+                Ok(())
+            }
+            Err(()) => {
+                self.failed = true;
+                Err(fmt::Error)
+            }
         }
-        if end < s.len() {
-            self.cut = true;
-        }
-        self.left -= end;
-        if !self.sink.push_escaped(&s[..end]) {
-            self.failed = true;
-            return Err(fmt::Error);
-        }
-        Ok(())
     }
 }
 
