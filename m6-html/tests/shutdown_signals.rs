@@ -98,13 +98,13 @@ fn http_request(socket: &Path, request: &str) -> Option<String> {
 // Shutdown signal scenarios
 // ---------------------------------------------------------------------------
 
-/// Signal the service while a request is stalled in its pool, and require it
-/// to exit 0 within a few seconds with its socket removed.
+/// Signal the service while a request is held in a partial body, and require
+/// it to exit 0 within a few seconds with its socket removed.
 ///
-/// The pool has one worker and a queue of one, so the held request is either
-/// being read by the worker or queued behind it, never refused. It connects,
-/// and sends its head, before the signal, so the accept loop takes it before
-/// the signal's wake connection: it is accepted work when shutdown starts.
+/// The client connects and sends a head with ten of its hundred body bytes, so
+/// the loop holds one accepted connection that is waiting for the rest. That
+/// connection is accepted work when shutdown starts, and the loop drops it
+/// without waiting: there is no pool and no wake connection.
 fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &str) {
     let (mut server, socket_path) = spawn(id);
 

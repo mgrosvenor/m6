@@ -119,9 +119,9 @@ fn cache_control_for(query: &str) -> &'static str {
 
 /// Serve one static file.
 ///
-/// Registered with `App::handler("files", serve)`; the route that reaches it,
-/// and the directory it serves from, are config. Core routes, validates the
-/// path parameters and applies the route's extra headers; everything from the
+/// Registered in code under the name `files`; the route that reaches it, and
+/// the directory it serves from, are config. Core routes, validates the path
+/// parameters and applies the route's extra headers; everything from the
 /// filesystem down is here.
 ///
 /// **This handler owns its own representation.** It negotiates the content

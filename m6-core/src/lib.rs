@@ -32,6 +32,7 @@ pub mod resolve;
 pub mod response;
 pub mod server;
 pub mod signal;
+pub mod site;
 pub mod telemetry;
 pub mod time_range;
 pub mod tls;
@@ -83,6 +84,7 @@ pub use request::Request;
 pub use response::{Body, Response};
 pub use server::{socket_path_from_config, UnixServer};
 pub use signal::ShutdownHandle;
+pub use site::{CodeRoute, Handled, Site};
 
 /// Everything a service normally wants, in one line.
 ///
@@ -120,6 +122,7 @@ pub mod prelude {
     pub use crate::render::NoTemplates;
     pub use crate::request::Request;
     pub use crate::response::Response;
+    pub use crate::site::{CodeRoute, Handled, Site};
     pub use crate::util::{now_iso8601, slugify, today_iso8601};
     pub use serde_json::{json, Map, Value};
 

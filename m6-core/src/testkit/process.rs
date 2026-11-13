@@ -5,6 +5,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -99,6 +100,18 @@ impl Service {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// The child's process id, while it runs.
+    ///
+    /// Panics once the child has been reaped: there is no id left to name. A
+    /// test that measures the process from outside (its thread count, its
+    /// open files) needs this before it signals anything.
+    pub fn pid(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("service already reaped; its pid is gone")
+            .id()
     }
 
     /// Send `sig` to the child.
@@ -316,6 +329,67 @@ impl Drop for Service {
         // outliving the buffer they write into.
         self.finish_output();
     }
+}
+
+/// Spawn `n` instances of one service, each configured by `cmd` with its
+/// index.
+///
+/// One process runs one loop, so it serves one request at a time. A test that
+/// needs two requests in progress at once starts several instances, and the
+/// caller's closure gives each one its own socket through
+/// `M6_SOCKET_OVERRIDE`. Every instance is a [`Service`], so each drains its
+/// own output and is killed when its guard drops.
+///
+/// ```ignore
+/// let instances = spawn_instances("m6-html", 2, |i| {
+///     let mut c = Command::new(binary("m6-html"));
+///     c.arg(site_dir).arg(config).env(
+///         "M6_SOCKET_OVERRIDE",
+///         dir.path().join(format!("instance-{i}.sock")),
+///     );
+///     c
+/// });
+/// ```
+pub fn spawn_instances(
+    name: &str,
+    n: usize,
+    mut cmd: impl FnMut(usize) -> Command,
+) -> Vec<Service> {
+    (0..n)
+        .map(|i| {
+            let mut command = cmd(i);
+            Service::spawn(name, &mut command)
+        })
+        .collect()
+}
+
+/// `program` in a shell that lowers both open-file limits to `hard` and
+/// `exec`s it.
+///
+/// The client uses this to hold a service to a chosen descriptor budget. The
+/// shell `exec`s the program, so the service keeps the shell's pid and the
+/// testkit's signal and output plumbing still points at one process.
+///
+/// `inherited` descriptors beyond stdio are opened on `/dev/null` before the
+/// exec and stay open, which puts the service at a known distance from its
+/// limit. Zero opens none.
+pub fn lowered_fd_limit_command(
+    hard: u64,
+    inherited: usize,
+    program: impl AsRef<OsStr>,
+) -> Command {
+    let opens: String = (0..inherited)
+        .map(|i| format!("exec {}<>/dev/null; ", 3 + i))
+        .collect();
+    // bash, not sh: dash takes only single-digit descriptor numbers in a
+    // redirection, so on Ubuntu `exec 10<>/dev/null` runs a command named `10`.
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "ulimit -Sn {hard}; ulimit -Hn {hard}; {opens}exec \"$0\" \"$@\""
+        ))
+        .arg(program.as_ref());
+    cmd
 }
 
 fn spawn_drain(

@@ -24,22 +24,84 @@
 //! - the binding sequence of spec §1.2, including the socket `chmod`, which is
 //!   the single most common cause of a backend that starts and is never contacted
 //! - `signal(2)` handling, the shutdown flag, and the unlink on the way out
-//! - accepting connections and a thread per connection
 //! - parsing a request line and header section by hand, and draining exactly
 //!   `Content-Length` bytes
 //! - writing a status line, `Content-Type` and an accurate `Content-Length`
 //! - suppressing the body on HEAD, and on 1xx, 204 and 304
 //!
-//! What is left is the part that is actually this service: four routes and their
+//! Both files write their own event loop. This one's is a little under 200 lines
+//! of `main`: start, the poll loop and the per-connection turn, with
+//! `m6_core::mio` for the reactor and `m6_core::event` for signals, deadlines
+//! and the connection table. That makes the pair's delta core's request path
+//! and start checks, which is the number the pair exists to show, rather than
+//! the cost of a loop core supplied.
+//!
+//! What is left is the part that is actually this service: five routes and their
 //! bodies. That is the shape the architectural rule asks for, and the reason
 //! the rule is phrased as "a service being nearly a no-op on top of core is the
 //! goal, not a smell".
 
+#![deny(unsafe_code)]
+
+use std::io;
+use std::time::{Duration, Instant};
+
+use m6_core::app::RouteMethod;
+use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::h1::{head_slots, Flush, Read, ServerConn};
+use m6_core::mio::unix::SourceFd;
+use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::net::listen_unix;
 use m6_core::prelude::*;
+use m6_core::signal::{Action, Lifecycle};
+use m6_core::CodeRoute;
 
 const LANGUAGE: &str = "Rust (m6-core)";
+const NAME: &str = "m6-example-rust-m6core";
 
-fn main() -> Result<()> {
+const LISTENER: Token = Token(usize::MAX);
+const SIGNALS: Token = Token(usize::MAX - 1);
+/// The accounting tick, and the longest the loop waits when nothing happens.
+const TICK: Duration = Duration::from_secs(1);
+const EVENTS: usize = 256;
+/// Slots and buffers made at start, before any connection exists.
+const INITIAL_CONNECTIONS: usize = 1024;
+const READ_CAP: usize = 16 * 1024;
+const WRITE_CAP: usize = 64 * 1024;
+
+/// The five routes, in the order the service answers them. A code route's
+/// index in this slice is what `Handled::Code` carries.
+const ROUTES: [CodeRoute; 5] = [
+    CodeRoute {
+        pattern: "/",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/status",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/health",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/boom",
+        method: RouteMethod::Get,
+    },
+    // A catch-all wildcard gives the same 404 body as the other five, and it
+    // is registered last so the four specific routes win. `{*any}` captures a
+    // segment and every one after it.
+    CodeRoute {
+        pattern: "/{*any}",
+        method: RouteMethod::Get,
+    },
+];
+
+fn main() -> std::io::Result<()> {
+    // Block the signals before anything else: the mask is inherited only by
+    // threads created after this point, and logging starts one.
+    m6_core::signal::block();
+
     // The payload comes from the one copy in the repository, the same file the
     // other five examples read, so byte-identity across all six is structural
     // rather than asserted. The site directory is where a core service's own
@@ -57,14 +119,248 @@ fn main() -> Result<()> {
         }
     };
 
-    App::new()
-        .route_get("/", |_req| {
-            Ok(Response::html(html_page(
-                &format!("m6 backend example: {LANGUAGE}"),
-                &format!("A minimal m6 backend written in {LANGUAGE}."),
-            )))
-        })
-        .route_get("/status", move |_req| {
+    // ── start: blocking and allocation are fine ──────────────────────────
+    let site = Site::load(NAME, &ROUTES, &[], &NoTemplates);
+    let read_timeout = site.read_timeout();
+    let ceiling =
+        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    if ceiling == 0 {
+        fail("the open file limit", "leaves no connection table");
+    }
+    // A table larger than the descriptors the limit allows could never report
+    // itself full: `Slots::is_full` would stay false past the kernel's limit.
+    let initial = INITIAL_CONNECTIONS.min(ceiling);
+    let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
+    let mut listener = listen_unix(site.socket_path(), site.socket_mode())
+        .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
+    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
+    poll.registry()
+        .register(&mut listener, LISTENER, Interest::READABLE)
+        .unwrap_or_else(|e| fail("registering the listener", e));
+    poll.registry()
+        .register(
+            &mut SourceFd(&signals.raw_fd()),
+            SIGNALS,
+            Interest::READABLE,
+        )
+        .unwrap_or_else(|e| fail("registering the signal descriptor", e));
+
+    let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
+    lifecycle.started();
+
+    // The whole connection table, every buffer in it, the deadlines and the
+    // events: made here, never grown except by `Slots`.
+    let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
+    // A config with `read_timeout_s = 0` keeps the zero duration and never
+    // touches a deadline.
+    let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
+    let mut events = Events::with_capacity(EVENTS);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut accepting = true;
+    let mut last = Instant::now();
+    let mut last_report = last;
+
+    // ── run: nothing blocks ──────────────────────────────────────────────
+    'run: loop {
+        // An interrupted wait is not an error: wait again. mio passes EINTR
+        // up rather than retrying.
+        match poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        let now = Instant::now();
+        trace.waited(now - last);
+        // One sample per iteration, under the kind of its first event, as
+        // m6-http reports the trace.
+        let trigger = match events.iter().next().map(|ev| ev.token()) {
+            Some(LISTENER) => 0,
+            Some(SIGNALS) => 2,
+            Some(_) => 1,
+            None => 3,
+        };
+
+        for ev in &events {
+            match ev.token() {
+                // New connections: take a free slot for each, register it,
+                // start its read deadline.
+                LISTENER => {
+                    while let Some(taken) = conns.take() {
+                        if let Some(new_len) = taken.grew_to {
+                            deadlines.grow(new_len);
+                        }
+                        let mut stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // No connection was pending after all: give
+                                // the slot back rather than leaking it.
+                                conns.free(taken.key);
+                                break;
+                            }
+                            Err(e) => {
+                                // A failure here sheds this accept pass and
+                                // not the service: give the slot back, say so
+                                // once, and wait for the next listener event.
+                                // The budget leaves room for every connection
+                                // and every file it streams, so this is a
+                                // transient error outside the table.
+                                conns.free(taken.key);
+                                eprintln!("m6-example-rust-m6core: accept error: {e}");
+                                break;
+                            }
+                        };
+                        poll.registry().register(
+                            &mut stream,
+                            Token(taken.key),
+                            Interest::READABLE,
+                        )?;
+                        if read_timeout.is_some() {
+                            deadlines.touch(Token(taken.key), now);
+                        }
+                        conns.get_mut(taken.key).attach(stream);
+                    }
+                    if conns.is_full() {
+                        // At the ceiling: stop accepting. New clients wait in
+                        // the kernel's backlog.
+                        poll.registry().deregister(&mut listener)?;
+                        accepting = false;
+                    }
+                }
+                SIGNALS => {
+                    let mut stop = false;
+                    while let Some(signal) = signals.read() {
+                        if lifecycle.on_signal(signal) == Action::Stop {
+                            stop = true;
+                        }
+                    }
+                    if stop {
+                        break 'run;
+                    }
+                }
+                // One connection's turn, then wait for what it still needs,
+                // touch its deadline, or close it.
+                Token(k) => {
+                    let conn = conns.get_mut(k);
+                    let was = conn.interest();
+                    match turn(conn, &site, &status_body) {
+                        Ok(true) => {
+                            // Re-register only when the turn changed what the
+                            // connection waits for: a kept-alive request that
+                            // read and wrote everything leaves READABLE alone.
+                            if conn.interest() != was {
+                                let interest = conn.interest();
+                                let stream = conn
+                                    .stream()
+                                    .expect("every registered token has an attached connection");
+                                poll.registry().reregister(stream, Token(k), interest)?;
+                            }
+                            if read_timeout.is_some() {
+                                deadlines.touch(Token(k), now);
+                            }
+                        }
+                        _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
+                    }
+                }
+            }
+        }
+
+        // Close every connection whose read deadline passed, with no
+        // response: it did not send a request in time.
+        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+            m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+        }
+        // A slot came free while the table was full: accept again.
+        if !accepting && !conns.is_full() {
+            poll.registry()
+                .register(&mut listener, LISTENER, Interest::READABLE)?;
+            accepting = true;
+        }
+
+        // The accounting tick: report and clear the loop's wait and work per
+        // trigger. These services serve no metrics page, so the report is the
+        // tick's own accounting rather than a served number.
+        let end = Instant::now();
+        trace.worked(trigger, end - now);
+        last = end;
+        if end - last_report >= TICK {
+            let _ = trace.report();
+            last_report = end;
+        }
+    }
+
+    // ── stop: blocking and allocation are fine ───────────────────────────
+    // Connections still open are dropped: a SIGTERM does not wait for a
+    // request in flight. `complete` removes the socket and logs the line.
+    lifecycle.complete();
+    Ok(())
+}
+
+/// One connection's turn: read, answer and write until the socket would
+/// block. Returns whether the connection stays open.
+fn turn(conn: &mut ServerConn, site: &Site, status_body: &[u8]) -> io::Result<bool> {
+    loop {
+        // Write what is owed before reading anything. A streamed body is not
+        // in the output buffer, so a read here would let the next request's
+        // answer replace it mid-body. Once the flush empties the buffer, the
+        // read below serves any request the client pipelined behind it.
+        if conn.interest() == Interest::WRITABLE {
+            match conn.flush()? {
+                Flush::Done => {}
+                Flush::More => return Ok(true),
+                Flush::Close => return Ok(false),
+            }
+        }
+        // Made where it is used: the head borrows the slots, and a mutable
+        // reference to a long-lived array cannot be reborrowed per turn.
+        let mut heads = head_slots();
+        let read = conn.read(&mut heads)?;
+        // The head borrows the slot, so its answer is built here and written
+        // after the match, when the borrow has ended.
+        let (response, idle) = match read {
+            Read::Request(head) => {
+                let response = match site.handle(&head) {
+                    Handled::Done(response) => response,
+                    // This service's five routes, by the index they were given
+                    // to `Site::load` in.
+                    Handled::Code(index, req) => {
+                        let response = route(index, status_body);
+                        site.finish(&req, response)
+                    }
+                    Handled::Named(..) => unreachable!(
+                        "the backend registers no named handlers, so every route is in code"
+                    ),
+                };
+                (Some(response), false)
+            }
+            // Nothing complete yet; a refusal may have been queued for a
+            // malformed request, and is written below.
+            Read::More => (None, true),
+            Read::Closed => return Ok(false),
+        };
+        if let Some(response) = response {
+            conn.respond_response(response);
+        }
+        match conn.flush()? {
+            // The answer is out and the connection keeps alive. A pipelined
+            // request may already be buffered, so read again before waiting.
+            Flush::Done if !idle => {}
+            // Nothing more to read this turn, or the socket would block with
+            // output still queued: the caller re-registers for what is left.
+            Flush::Done | Flush::More => return Ok(true),
+            // Everything is written and this connection closes.
+            Flush::Close => return Ok(false),
+        }
+    }
+}
+
+/// The body of one route, by its index in [`ROUTES`].
+fn route(index: usize, status_body: &[u8]) -> Response {
+    match index {
+        0 => Response::html(html_page(
+            &format!("m6 backend example: {LANGUAGE}"),
+            &format!("A minimal m6 backend written in {LANGUAGE}."),
+        )),
+        1 => {
             // `.verbatim()` rather than letting the pipeline have it, and not
             // `Response::json`, for two separate reasons:
             //
@@ -80,13 +376,13 @@ fn main() -> Result<()> {
             //   the measurement honest: compressing here and not in the pair
             //   would make the delta a story about brotli rather than about
             //   core.
-            Ok(Response::status(200)
-                .body(status_body.clone())
+            Response::status(200)
+                .body(status_body.to_vec())
                 .header("content-type", "application/json; charset=utf-8")
-                .verbatim())
-        })
-        .route_get("/health", |_req| Ok(Response::text("ok")))
-        .route_get("/boom", |_req| {
+                .verbatim()
+        }
+        2 => Response::text("ok"),
+        3 => {
             // Fails on purpose. The proxy counts 5xx as a backend error and may
             // replace it with a styled error page (spec §4).
             // `.verbatim()` here too. Without it core would compress the body,
@@ -95,34 +391,33 @@ fn main() -> Result<()> {
             // bytes (167 when minified). The examples are meant to be
             // readable side by side, so the one that is allowed to differ is
             // /status, and that one differs in nothing at all.
-            Ok(Response::status(500)
+            Response::status(500)
                 .body(html_page(
                     "500 Internal Server Error",
                     "This endpoint fails on purpose.",
                 ))
                 .header("content-type", "text/html; charset=utf-8")
-                .verbatim())
-        })
-        // Core answers an unmatched path with a bare 404 and no body, which
-        // satisfies the protocol but not docs/m6-backend-examples.md §3, where
-        // every example serves "a small not-found page". A catch-all wildcard
-        // gives the same 404 body as the other five. It is registered last so
-        // the four specific routes win; `{*any}` captures a segment and every
-        // one after it.
-        .route_get("/{*any}", |_req| {
-            Ok(Response::status(404)
-                .body(html_page(
-                    "404 Not Found",
-                    &format!("This {LANGUAGE} backend does not serve that path."),
-                ))
-                .header("content-type", "text/html; charset=utf-8")
-                .verbatim())
-        })
-        .run()
+                .verbatim()
+        }
+        4 => Response::status(404)
+            .body(html_page(
+                "404 Not Found",
+                &format!("This {LANGUAGE} backend does not serve that path."),
+            ))
+            .header("content-type", "text/html; charset=utf-8")
+            .verbatim(),
+        _ => unreachable!("the five code routes are indexes 0 to 4"),
+    }
 }
 
 fn html_page(title: &str, detail: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><meta charset=\"utf-8\">\n<title>{title}</title>\n<h1>{title}</h1>\n<p>{detail}</p>\n</html>\n"
     )
+}
+
+/// A failure at start is an error: print it and exit 2.
+fn fail(what: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!("{NAME}: {what}: {error}");
+    std::process::exit(2)
 }

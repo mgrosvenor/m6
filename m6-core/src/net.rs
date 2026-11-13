@@ -96,6 +96,66 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
         .and_then(|s| s.parse::<IpAddr>().ok())
 }
 
+// ── Listeners ───────────────────────────────────────────────────────────────
+
+/// A non-blocking unix listener, ready for `mio`. Start only.
+///
+/// Removes a stale socket file left by a previous process, creates the parent
+/// directory, binds and sets `mode`. Every failure is an `Err` the caller turns
+/// into exit 2: a socket with a mode nobody chose is a socket nobody can reason
+/// about, so the same rule that made [`crate::server::apply_socket_mode`] a
+/// start failure applies here.
+pub fn listen_unix(path: &std::path::Path, mode: u32) -> std::io::Result<mio::net::UnixListener> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    crate::server::apply_socket_mode(path, mode)?;
+    Ok(mio::net::UnixListener::from_std(listener))
+}
+
+/// A non-blocking TCP listener with `SO_REUSEADDR`. Start only.
+///
+/// `SO_REUSEADDR` is what lets a restart rebind a port whose connections are in
+/// `TIME_WAIT`; a live listener on the port is still refused. See
+/// [`crate::server::bind_tcp_reuseaddr`].
+pub fn listen_tcp(addr: SocketAddr) -> std::io::Result<mio::net::TcpListener> {
+    let listener = crate::server::bind_tcp_reuseaddr(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(mio::net::TcpListener::from_std(listener))
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stale socket from a previous process is replaced, the mode is the one
+    /// asked for, and a missing parent directory is created.
+    #[test]
+    fn listen_unix_replaces_a_stale_socket_and_sets_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("m6.sock");
+
+        // The parent does not exist yet: binding must create it.
+        let first = listen_unix(&path, 0o660).expect("first bind");
+
+        // Leave a stale socket file behind the way a killed process does, and
+        // bind again: the file must be replaced rather than refused.
+        drop(first);
+        assert!(path.exists(), "the socket file must be left behind");
+        let listener = listen_unix(&path, 0o660).expect("a stale socket is replaced");
+        drop(listener);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

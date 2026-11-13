@@ -464,17 +464,9 @@ impl Response {
             ..
         } = self;
 
-        let has = |name: &str| crate::headers::contains(&headers[..], name);
-
-        let etag;
-        let mut hdrs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        if !has("content-type") && !body.is_empty() {
-            hdrs.push(("Content-Type", "text/html; charset=utf-8"));
-        }
+        let etag_hash = default_etag(&headers, &body);
+        let mut hdrs: Vec<(&str, &str)> = head_fields(&headers, body.is_empty()).collect();
+        let etag_value;
 
         match body {
             // Written straight through, and deliberately given no default
@@ -493,15 +485,52 @@ impl Response {
                 // against once this response is cached. A `no-store` response
                 // is never cached, so no cache will revalidate it: hashing its
                 // body is wasted work.
-                if !has("etag") && !bytes.is_empty() && !cache_control_no_store(&headers) {
-                    etag = format!("\"{:x}\"", content_hash(&bytes));
-                    hdrs.push(("ETag", etag.as_str()));
+                if let Some(hash) = etag_hash {
+                    etag_value = format!("\"{hash:x}\"");
+                    hdrs.push(("ETag", etag_value.as_str()));
                 }
                 resp.send(status, &hdrs, &bytes)?;
             }
         }
         Ok(())
     }
+}
+
+/// The response head's fields as borrowed pairs, with the `Content-Type` a
+/// handler left out supplied for a body of bytes.
+///
+/// One rule for every sender: `Response::send` and a connection slot both build
+/// their head from this, so the two cannot default differently.
+pub(crate) fn head_fields<'a>(
+    headers: &'a [(String, String)],
+    body_is_empty: bool,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    let fields = headers.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let content_type = if !crate::headers::contains(headers, "content-type") && !body_is_empty {
+        Some(("Content-Type", "text/html; charset=utf-8"))
+    } else {
+        None
+    };
+    fields.chain(content_type)
+}
+
+/// The default `ETag` for a buffered body: a content hash, unless the response
+/// carries its own tag, has no body, or asks caches not to store it.
+///
+/// A `Body::Stream` has no `ETag` by construction: hashing it would mean
+/// reading it, which is the whole thing streaming avoids. One rule for
+/// `Response::send` and a connection slot, so the tag they emit cannot differ.
+pub(crate) fn default_etag(headers: &[(String, String)], body: &Body) -> Option<u64> {
+    let Body::Bytes(bytes) = body else {
+        return None;
+    };
+    if bytes.is_empty()
+        || crate::headers::contains(headers, "etag")
+        || cache_control_no_store(headers)
+    {
+        return None;
+    }
+    Some(content_hash(bytes))
 }
 
 fn content_hash(body: &[u8]) -> u64 {

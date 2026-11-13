@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 use m6_auth::Db;
 use m6_core::http::{RawRequest, RawResponse};
@@ -14,26 +14,23 @@ use crate::jwt::{hash_token, now_secs, AccessClaims, RefreshClaims};
 use crate::keys::KeyMaterial;
 use crate::rate_limit::RateLimiter;
 
-/// The signing keys, token lifetimes and login throttle that every worker
-/// shares.
-///
-/// Each worker thread opens its own database connection instead, so a login
-/// hashing a password never holds a lock another request needs. See
-/// `main::WorkerDb`.
+/// The signing keys, token lifetimes and login throttle the loop owns.
 pub struct AppState {
     pub keys: KeyMaterial,
     pub access_ttl: u64,
     pub refresh_ttl: u64,
     pub issuer: String,
-    pub db_path: std::path::PathBuf,
-    pub rate_limiter: Mutex<RateLimiter>,
+    /// Borrowed only for the length of one call. The loop is one thread, and no
+    /// borrow is held across a call that returns to it, so a borrow cannot fail
+    /// at run time.
+    pub rate_limiter: RefCell<RateLimiter>,
 }
 
-// The four handlers are reached by route now: `App` matches the path and the
-// method, so the dispatcher that did it here is gone. These wrappers exist so
-// the handler functions themselves stay private and unchanged -- they are the
-// security-carrying part of this service, and a migration is the wrong time to
-// touch them.
+// The four handlers are reached by route: `Site` matches the path and the
+// method, and the loop's one `match` calls the wrapper for the route's index.
+// The wrappers exist so the handler functions themselves stay private and
+// unchanged -- they are the security-carrying part of this service, and a
+// migration is the wrong time to touch them.
 
 pub fn dispatch_login(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> RawResponse {
     handle_login(req, state, db, peer_ip)
@@ -64,10 +61,7 @@ fn handle_login(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> R
     // password was actually wrong, so a caller that always succeeds is never
     // throttled. See `rate_limit::RateLimiter` for what counting successes cost.
     {
-        let rl = match state.rate_limiter.lock() {
-            Ok(l) => l,
-            Err(_) => return internal_error(),
-        };
+        let rl = state.rate_limiter.borrow();
         if rl.is_blocked(peer_ip) {
             warn!(ip = %peer_ip, "rate limit exceeded on login");
             if is_json {
@@ -94,25 +88,13 @@ fn handle_login(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> R
 }
 
 /// Count a wrong password against `peer_ip`'s budget.
-///
-/// A poisoned lock is logged and otherwise ignored: refusing the login because
-/// the throttle's mutex is broken would turn a bookkeeping fault into an outage,
-/// and the alternative failure (one uncounted wrong password) is smaller. It is
-/// logged rather than swallowed, because a silently dead throttle is worse than
-/// a loud one.
 fn note_login_failure(state: &AppState, peer_ip: &str) {
-    match state.rate_limiter.lock() {
-        Ok(mut rl) => rl.record_failure(peer_ip),
-        Err(_) => warn!("rate limiter mutex poisoned; login failure not counted"),
-    }
+    state.rate_limiter.borrow_mut().record_failure(peer_ip);
 }
 
 /// Forget `peer_ip`'s failures after a correct password.
 fn note_login_success(state: &AppState, peer_ip: &str) {
-    match state.rate_limiter.lock() {
-        Ok(mut rl) => rl.clear(peer_ip),
-        Err(_) => warn!("rate limiter mutex poisoned; login success not cleared"),
-    }
+    state.rate_limiter.borrow_mut().clear(peer_ip);
 }
 
 fn form_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {

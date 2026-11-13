@@ -31,6 +31,12 @@
 //! | `ThreadPool` | fixed workers over a bounded queue |
 //! | `install_shutdown`, `is_shutdown` | a signal sets the flag the accept loop exits on |
 //!
+//! ## The request path is in `site`
+//!
+//! `Site::load` does the start half and `Site::handle` and `Site::finish` do the request half.
+//! This module keeps the four builders, the thread pool, the accept loop and the lifecycle, and its worker calls `Site` for everything after `accept`.
+//! EL-6d removes the loop and the builders, and the parts a service's own loop needs are already in `site`, `h1` and `net`.
+//!
 //! ## Fixed routes and patterns, and no tie-break
 //!
 //! A route is fixed when every segment is a literal and a pattern when it has a
@@ -114,7 +120,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -129,7 +135,8 @@ use crate::request::{
     parse_auth_claims, parse_cookies, parse_form_body, parse_query_string, validate_path_param,
     validate_wildcard_param, RawRequest, Request,
 };
-use crate::response::{error_to_response, Response};
+use crate::response::Response;
+use crate::site::Invocation;
 
 // ---------------------------------------------------------------------------
 // Per-thread state infrastructure
@@ -292,7 +299,7 @@ impl Methods {
     }
 
     /// Key that tells apart the handlers registered in code on one path.
-    fn handler_key(self) -> &'static str {
+    pub(crate) fn handler_key(self) -> &'static str {
         if self == Self::ANY {
             return "ANY";
         }
@@ -593,7 +600,7 @@ fn config_route_methods(rc: &crate::config::RouteConfig, index: usize) -> anyhow
 }
 
 /// Key that tells apart the handlers registered in code on one path.
-fn route_method_key(m: &RouteMethod) -> &'static str {
+pub(crate) fn route_method_key(m: &RouteMethod) -> &'static str {
     Methods::from(m).handler_key()
 }
 
@@ -757,7 +764,7 @@ pub type BoxHandler = Box<dyn HandlerFn>;
 // Params cache
 // ---------------------------------------------------------------------------
 
-struct ParamsCache {
+pub(crate) struct ParamsCache {
     inner: Mutex<lru::LruCache<String, Arc<Map<String, Value>>>>,
 }
 
@@ -783,20 +790,23 @@ impl ParamsCache {
 // Shared framework state
 // ---------------------------------------------------------------------------
 
-struct FrameworkState {
+pub(crate) struct FrameworkState {
     /// Behind an `Arc` because it is immutable for the life of the process and
     /// every request needs to read it. Owned here instead, the two maps a
     /// request actually wants -- `compression` and `minification` -- have to be
     /// deep-cloned out, per request. An `Arc` clone is a refcount bump and
     /// carries the whole config rather than two fields of it.
-    config: Arc<crate::config::RendererConfig>,
+    pub(crate) config: Arc<crate::config::RendererConfig>,
+
     /// Likewise: one `PathBuf` allocation per request, twice, for a path that
     /// does not change.
-    site_dir: Arc<PathBuf>,
+    pub(crate) site_dir: Arc<PathBuf>,
+
     /// Shared rather than owned, so a request can route without copying the
     /// route it matched. `find_route` returns a borrow, and owning the table
     /// here would mean turning that borrow into an owned `CompiledRoute`.
-    routes: Arc<RouteTable>,
+    pub(crate) routes: Arc<RouteTable>,
+
     /// Test-only. Steps 1 to 3 of the dictionary build are merged once at
     /// start into `route.base_dict`, so no serving path reads either of these.
     /// `dict_cost` measures per-request assembly against that base, which is
@@ -805,14 +815,16 @@ struct FrameworkState {
     global_params_data: Map<String, Value>,
     #[cfg(test)]
     static_params: HashMap<String, Arc<Map<String, Value>>>,
-    params_cache: Arc<ParamsCache>,
-    renderer: Arc<dyn Renderer>,
+    pub(crate) params_cache: Arc<ParamsCache>,
+
+    pub(crate) renderer: Arc<dyn Renderer>,
+
     #[cfg(feature = "flash")]
-    flash_secret: Vec<u8>,
+    pub(crate) flash_secret: Vec<u8>,
 }
 
 impl FrameworkState {
-    fn build(
+    pub(crate) fn build(
         config: crate::config::RendererConfig,
         site_dir: PathBuf,
         // NOTE: takes them by value and wraps them; callers keep passing
@@ -1086,7 +1098,7 @@ impl FrameworkState {
     ///
     /// The ordering the original twelve steps depended on is preserved by the
     /// layering rather than by this loop; see `crate::dict`.
-    fn build_dict(
+    pub(crate) fn build_dict(
         &self,
         raw: &RawRequest,
         route: &CompiledRoute,
@@ -1281,7 +1293,7 @@ impl FrameworkState {
     /// An associated function, not a method: it needs the renderer and nothing
     /// else from the framework state, so a request can render after it has
     /// released the read lock.
-    fn render_response(
+    pub(crate) fn render_response(
         renderer: &dyn Renderer,
         resp: &mut Response,
         dict: &Dict,
@@ -1364,7 +1376,7 @@ fn verify_flash_cookie(cookie_val: &str, secret: &[u8]) -> Option<String> {
 
 /// Generate a fresh CSRF token: 32 random bytes as hex.
 #[cfg(feature = "csrf")]
-fn generate_csrf_token() -> String {
+pub(crate) fn generate_csrf_token() -> String {
     crate::random_hex_token::<32>()
 }
 
@@ -1396,7 +1408,7 @@ fn run_app_global<G: Send + Sync + 'static>(
         site_dir,
         config_path,
         cli_log_level,
-    } = parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
+    } = crate::site::parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1450,6 +1462,7 @@ fn run_app_global<G: Send + Sync + 'static>(
         },
         cli_log_level,
         renderer,
+        Some(config),
     )
 }
 
@@ -1489,7 +1502,7 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         site_dir,
         config_path,
         cli_log_level,
-    } = parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
+    } = crate::site::parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1549,6 +1562,7 @@ fn run_app_thread_state<T: Any + Send + 'static>(
         },
         cli_log_level,
         renderer,
+        Some(config),
     )
 }
 
@@ -1578,7 +1592,7 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         site_dir,
         config_path,
         cli_log_level,
-    } = parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
+    } = crate::site::parse_invocation(&sigs_of(&raw_routes), &names_of(&raw_named));
 
     let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
         eprintln!("Config error: {e}");
@@ -1656,6 +1670,7 @@ fn run_app_state<G: Send + Sync + 'static, T: Any + Send + 'static>(
         },
         cli_log_level,
         renderer,
+        Some(config),
     )
 }
 
@@ -1762,18 +1777,7 @@ impl ThreadPool {
 /// poll timeout it relied on before; and the socket is unlinked on the way out,
 /// which no render app did. Clearing a stale socket at startup before `bind` is
 /// the workaround for missing cleanup rather than the cleanup itself.
-fn install_shutdown(socket_path: &std::path::Path) -> crate::signal::ShutdownHandle {
-    let name = std::env::args()
-        .next()
-        .and_then(|a| {
-            std::path::Path::new(&a)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(str::to_owned)
-        })
-        // Used only when `argv[0]` has no file name, so no binary name is
-        // available to report.
-        .unwrap_or_else(|| "m6-app".to_string());
+fn install_shutdown(name: &str, socket_path: &std::path::Path) -> crate::signal::ShutdownHandle {
     crate::signal::ShutdownHandle::install(crate::signal::Service::new(name).socket(socket_path))
 }
 
@@ -1795,42 +1799,13 @@ fn site_toml_or_exit(
     config: &crate::config::RendererConfig,
     site_dir: &std::path::Path,
 ) -> PathBuf {
-    match check_site_toml(config, site_dir) {
+    match crate::site::check_site_toml(config, site_dir) {
         Ok(path) => path,
         Err(msg) => {
             eprintln!("Config error: {msg}");
             std::process::exit(2);
         }
     }
-}
-
-/// The checking half of [`site_toml_or_exit`].
-///
-/// Every path is read and parsed once here, the default included. A file that
-/// is missing, cannot be read or is not valid TOML is refused, because the
-/// readers of `site.toml` would otherwise fall back to defaults and hide a
-/// disagreement the operator wants to hear about.
-fn check_site_toml(
-    config: &crate::config::RendererConfig,
-    site_dir: &std::path::Path,
-) -> std::result::Result<PathBuf, String> {
-    let site_toml = config.resolve_site_toml(site_dir);
-    let src = if config.site_toml.is_some() {
-        format!("site_toml = {}", site_toml.display())
-    } else {
-        format!("site.toml at {}", site_toml.display())
-    };
-    let text = match std::fs::read_to_string(&site_toml) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("{src} does not exist"));
-        }
-        Err(e) => return Err(format!("{src} cannot be read: {e}")),
-    };
-    if let Err(e) = text.parse::<toml::Table>() {
-        return Err(format!("{src} is not valid TOML: {}", e.message()));
-    }
-    Ok(site_toml)
 }
 
 /// What a service was started with, for building its shared state.
@@ -2428,67 +2403,6 @@ fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Config routes naming a handler that was never registered.
-///
-/// Returned rather than logged so the caller can exit 2 at startup.
-///
-/// This is deliberately fatal rather than a per-route warning. A misplaced
-/// wildcard is narrowed and warned about because the narrower reading is still
-/// a defensible route; a handler name with no code behind it has no reading at
-/// all, and the alternatives are a route that 404s or one that 500s while the
-/// config plainly says it should serve.
-fn unknown_handlers(
-    routes: &[CompiledRoute],
-    named: &HashMap<String, Arc<BoxHandler>>,
-    code_patterns: &[String],
-) -> Vec<(String, String)> {
-    let mut missing = Vec::new();
-    for route in routes {
-        match &route.handler {
-            // A route naming a handler nothing provides.
-            Some(name) if !named.contains_key(name) => {
-                missing.push((route.pattern.clone(), name.clone()));
-            }
-            Some(_) => {}
-            // A config route with no template and no handler can still be
-            // served by a code route registered on the same pattern, which is
-            // how a renderer carries `cache` and `methods` for an endpoint
-            // implemented in Rust. With no such route it can serve
-            // nothing, and the only symptom is a 404 that looks like a missing
-            // page. That is exactly what an out-of-step config and binary
-            // produce, so it is refused here rather than discovered in
-            // production.
-            //
-            // Matched on pattern alone, not pattern and method: a config route
-            // left at the default `Any` legitimately annotates a code route
-            // registered with `route_get`, and comparing methods would call
-            // that dead.
-            None if route.template.is_none() && !code_patterns.contains(&route.pattern) => {
-                missing.push((
-                    route.pattern.clone(),
-                    "<no template, no handler>".to_string(),
-                ));
-            }
-            None => {}
-        }
-    }
-    missing
-}
-
-/// Render `unknown_handlers`' answer as one line an operator can act on.
-fn describe_unknown(missing: &[(String, String)], registered: &[String]) -> String {
-    let named: Vec<String> = missing
-        .iter()
-        .map(|(pattern, handler)| format!("{pattern} -> `{handler}`"))
-        .collect();
-    let known = if registered.is_empty() {
-        "none are registered".to_string()
-    } else {
-        format!("registered: {}", registered.join(", "))
-    };
-    format!("{} ({known})", named.join("; "))
-}
-
 /// Route signatures from any of the builders' raw route lists.
 ///
 /// Generic over the handler type because the three stateful builders each
@@ -2500,257 +2414,6 @@ fn sigs_of<H>(raw: &[(String, RouteMethod, H)]) -> Vec<(String, RouteMethod)> {
 /// Handler names from any of the builders' raw named-handler lists.
 fn names_of<H>(raw: &[(String, H)]) -> Vec<String> {
     raw.iter().map(|(n, _)| n.clone()).collect()
-}
-
-/// What every `App` service is started with.
-///
-/// One parser rather than four. `run_app` and the three stateful runners each
-/// had an identical copy of this, which is how `--dump-config` ended up
-/// existing only in m6-http: there was no one place to add it to.
-pub struct Invocation {
-    pub site_dir: PathBuf,
-    pub config_path: PathBuf,
-    pub cli_log_level: Option<String>,
-}
-
-/// Parse the command line, and handle the flags that do not start a server.
-///
-/// `--dump-config` loads the configuration exactly as the service would, prints
-/// what it resolved to, and exits: **0 if this binary can serve this config, 2
-/// if it cannot.** That is the check a deploy runs against a new binary on each
-/// node before installing it, and it covers every service: they all load their
-/// config through this same function.
-///
-/// It is not a formality. The `App` migrations changed m6-file's config format,
-/// and the old binary against the new config and the new binary against the old
-/// one both fail, in opposite directions and neither loudly. A validation step
-/// that runs before the install is what turns that from an outage into a
-/// refused deploy.
-fn parse_invocation(routes: &[(String, RouteMethod)], handlers: &[String]) -> Invocation {
-    let args: Vec<String> = std::env::args().collect();
-
-    // Before the argument-count check, because `--version` takes no site directory
-    // and no config: a deploy asks a freshly installed binary what it is before
-    // any config is in place.
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        // The program's own name, from argv[0], not `CARGO_PKG_NAME`. That macro
-        // expands where it is written, which is m6-core, so every service would
-        // announce itself as "m6-core" and a deploy log would not say which binary
-        // it had just checked.
-        let name = std::path::Path::new(&args[0])
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("m6");
-        println!("{} {}", name, env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
-    }
-
-    if args.len() < 3 {
-        eprintln!(
-            "Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config] [--version]",
-            args[0]
-        );
-        std::process::exit(2);
-    }
-    let site_dir = PathBuf::from(&args[1]);
-    let config_path = PathBuf::from(&args[2]);
-    let cli_log_level = args
-        .windows(2)
-        .find(|w| w[0] == "--log-level")
-        .map(|w| w[1].clone());
-
-    if args.iter().any(|a| a == "--dump-config") {
-        std::process::exit(dump_config(
-            &site_dir,
-            &config_path,
-            routes,
-            handlers,
-            cli_log_level.as_deref(),
-        ));
-    }
-
-    Invocation {
-        site_dir,
-        config_path,
-        cli_log_level,
-    }
-}
-
-/// The configuration refusals start and `--dump-config` share: a named
-/// `site.toml` that is missing, unreadable or not TOML, then a
-/// `[[backend]] compresses` disagreement. Returns the resolved `site.toml`.
-///
-/// Exit 2 is the configuration error code, detected before anything binds
-/// (backend protocol §8.3). A service that starts having disagreed with the
-/// edge about compression serves either fragmented caches or, worse, brotli
-/// to clients that asked for identity, and neither is visible from the
-/// outside until it bites. `--dump-config` runs the same check so a deploy
-/// that validates a config learns what the start would say.
-fn validate_startup(
-    config: &crate::config::RendererConfig,
-    site_dir: &std::path::Path,
-    config_path: &std::path::Path,
-) -> std::result::Result<PathBuf, String> {
-    let site_toml = check_site_toml(config, site_dir)?;
-    check_compress_declared(config, &site_toml, &backend_name_of(config_path))?;
-    Ok(site_toml)
-}
-
-/// Load the config and report how each route would be served. Returns the
-/// process exit code.
-fn dump_config(
-    site_dir: &std::path::Path,
-    config_path: &std::path::Path,
-    code_routes: &[(String, RouteMethod)],
-    handlers: &[String],
-    cli_log_level: Option<&str>,
-) -> i32 {
-    let config = match crate::config::load(config_path, site_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config error: {e:#}");
-            return 2;
-        }
-    };
-
-    // The same start refusals, so a deploy that validates with --dump-config
-    // learns what the start would say.
-    let site_toml = match validate_startup(&config, site_dir, config_path) {
-        Ok(path) => path,
-        Err(msg) => {
-            eprintln!("Config error: {msg}");
-            return 2;
-        }
-    };
-
-    if let Err(msg) = resolve_log(&site_toml, &config.log, cli_log_level) {
-        eprintln!("Config error: {msg}");
-        return 2;
-    }
-
-    if let Err(e) = check_routes(code_routes, &config.routes) {
-        eprintln!("Config error: {e}");
-        return 2;
-    }
-
-    println!("site_dir    {}", site_dir.display());
-    println!("config      {}", config_path.display());
-    println!("site.toml   {}", site_toml.display());
-    println!(
-        "socket      {}",
-        crate::socket_path_from_config(config_path).display()
-    );
-    println!(
-        "thread_pool size={} queue={}",
-        config.thread_pool.size, config.thread_pool.queue_size
-    );
-    println!(
-        "server      read_timeout={} socket_mode={:04o}",
-        config
-            .server
-            .read_timeout
-            .map_or("none".into(), |d| format!("{}s", d.as_secs())),
-        config.server.socket_mode
-    );
-    for p in &config.global_params {
-        println!("global      {p}");
-    }
-    println!(
-        "handlers    {}",
-        if handlers.is_empty() {
-            "none".to_string()
-        } else {
-            handlers.join(", ")
-        }
-    );
-
-    // Every route, and what would answer it. This is the part worth reading:
-    // a route with no way to be served is the failure the App migrations made
-    // possible, and it is invisible at runtime because it simply 404s.
-    let mut dead = 0;
-    println!("routes ({})", config.routes.len());
-    for rc in &config.routes {
-        let how = if let Some(h) = &rc.handler {
-            if handlers.iter().any(|n| n == h) {
-                format!("handler `{h}`")
-            } else {
-                dead += 1;
-                format!("handler `{h}` NOT REGISTERED")
-            }
-        } else if let Some(t) = &rc.template {
-            format!("template {t}")
-        } else if code_routes.iter().any(|(p, _)| *p == rc.path) {
-            "code route".to_string()
-        } else {
-            dead += 1;
-            "NOTHING CAN SERVE THIS".to_string()
-        };
-        println!("  {:<40} {}", rc.path, how);
-    }
-
-    if dead > 0 {
-        eprintln!(
-            "\n{dead} route(s) this binary cannot serve. Refusing: a config and a \n\
-             binary that disagree is an outage that looks like a 404."
-        );
-        return 2;
-    }
-    println!("\nok: this binary can serve every route in this config");
-    0
-}
-
-/// The name `site.toml` uses for this service's `[[backend]]`: the config
-/// file's stem, falling back to `m6-default`.
-///
-/// The same convention `socket_path_from_config` uses to derive
-/// `/run/m6/<stem>.sock`, so the name in `site.toml` and the name here are the
-/// same string. Used at start and by `--dump-config` so the two cannot look up
-/// different entries.
-fn backend_name_of(config_path: &std::path::Path) -> String {
-    config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("m6-default")
-        .to_string()
-}
-
-/// Whether `site.toml` declares the compression `config` does, for the backend
-/// named `backend_name`. Checked at start and by `--dump-config`.
-///
-/// "Compresses" means at least one MIME type has a non-zero level. The
-/// defaults give text types real levels and images zero, so a service that has
-/// not opted out does compress.
-fn check_compress_declared(
-    config: &crate::config::RendererConfig,
-    site_toml: &std::path::Path,
-    backend_name: &str,
-) -> std::result::Result<(), String> {
-    let compresses = config
-        .compression
-        .values()
-        .any(|c| c.brotli > 0 || c.gzip > 0);
-    crate::compress::check_declared_support(site_toml, backend_name, compresses)
-}
-
-/// The log format and level, in order of precedence: the command line, then
-/// the service's `[log]`, then `site.toml`'s `[log]`.
-///
-/// Read once at start. The resolved level is parsed here, so an unknown level
-/// is a configuration error before anything binds.
-fn resolve_log(
-    site_toml: &std::path::Path,
-    config_log: &crate::config::LogConfig,
-    cli_log_level: Option<&str>,
-) -> std::result::Result<(String, String), String> {
-    let (site_level, site_format) =
-        crate::log::read_site_log_config(site_toml).map_err(|e| e.to_string())?;
-    let format = config_log.format.clone().unwrap_or(site_format);
-    let level = cli_log_level
-        .map(str::to_string)
-        .or_else(|| config_log.level.clone())
-        .unwrap_or(site_level);
-    crate::log::parse_level(&level).map_err(|e| e.to_string())?;
-    Ok((format, level))
 }
 
 pub fn run_app(
@@ -2770,7 +2433,7 @@ pub fn run_app(
         site_dir,
         config_path,
         cli_log_level,
-    } = parse_invocation(
+    } = crate::site::parse_invocation(
         &code_routes
             .iter()
             .map(|(p, m, _)| (p.clone(), m.clone()))
@@ -2787,6 +2450,7 @@ pub fn run_app(
         RunHooks::default(),
         cli_log_level,
         renderer,
+        None,
     )
 }
 
@@ -2797,42 +2461,10 @@ fn run_app_with_shutdown(
     hooks: RunHooks,
     cli_log_level: Option<String>,
     renderer: Arc<dyn RendererFactory>,
+    config: Option<crate::config::RendererConfig>,
 ) -> Result<()> {
     let RunHooks { on_thread_exit } = hooks;
 
-    // Load config.
-    let config = crate::config::load(&config_path, &site_dir).unwrap_or_else(|e| {
-        eprintln!("Config error: {e}");
-        std::process::exit(2);
-    });
-
-    let site_toml = match validate_startup(&config, &site_dir, &config_path) {
-        Ok(path) => path,
-        Err(msg) => {
-            eprintln!("Config error: {msg}");
-            std::process::exit(2);
-        }
-    };
-
-    // Init logging: site.toml base → renderer config [log] → CLI --log-level.
-    let (format, level) = match resolve_log(&site_toml, &config.log, cli_log_level.as_deref()) {
-        Ok(v) => v,
-        Err(msg) => {
-            eprintln!("Config error: {msg}");
-            std::process::exit(2);
-        }
-    };
-    let log_handle = crate::log::init(&format, &level).unwrap_or_else(|e| {
-        eprintln!("logging init error: {e}");
-        std::process::exit(1);
-    });
-    // Held for the life of the process: dropping the handle flushes and stops
-    // the log writer.
-    let _log_handle = log_handle;
-
-    let socket_path = crate::socket_path_from_config(&config_path);
-
-    // Build framework state.
     let Handlers {
         routes: code_routes,
         named,
@@ -2841,108 +2473,64 @@ fn run_app_with_shutdown(
         .iter()
         .map(|(p, m, _)| (p.clone(), m.clone()))
         .collect();
+    let named_names: Vec<String> = named.iter().map(|(n, _)| n.clone()).collect();
 
-    // Handlers registered by name, for config-declared routes to dispatch to.
-    // Built before the state so a route naming a handler nothing provides is
-    // caught at startup rather than by the first request that matches it.
-    let named_handlers: Arc<HashMap<String, Arc<BoxHandler>>> =
-        Arc::new(named.into_iter().collect());
-    let mut registered_names: Vec<String> = named_handlers.keys().cloned().collect();
-    registered_names.sort();
+    // The start half all lives in `Site` now: the config, `site.toml`,
+    // logging, the route table and the checks that name it. The `Arc` is
+    // shared read-only by the worker threads until EL-6d removes `App`.
+    let site = Arc::new(crate::site::Site::start(
+        &crate::site::program_name(),
+        Invocation {
+            site_dir,
+            config_path,
+            cli_log_level,
+        },
+        config,
+        &code_route_signatures,
+        &named_names,
+        &*renderer,
+    ));
+    let (tp_size, tp_queue) = site.thread_pool();
+    // Read once at startup: it is applied to a socket at accept time.
+    let read_timeout = site.read_timeout();
+    let socket_mode = site.socket_mode();
+    let socket_path = site.socket_path().to_path_buf();
 
-    let framework_state =
-        FrameworkState::build(config, site_dir.clone(), &code_route_signatures, &*renderer)
-            .unwrap_or_else(|e| {
-                eprintln!("Startup error: {e:#}");
-                std::process::exit(2);
-            });
-
-    let code_patterns: Vec<String> = code_route_signatures
-        .iter()
-        .map(|(p, _)| p.clone())
-        .collect();
-    let missing = unknown_handlers(
-        framework_state.routes.routes(),
-        &named_handlers,
-        &code_patterns,
-    );
-    if !missing.is_empty() {
-        eprintln!(
-            "Config error: route names an unregistered handler: {}",
-            describe_unknown(&missing, &registered_names)
-        );
-        std::process::exit(2);
-    }
-
-    // Validate flash_secret presence at startup (exit 2 if feature enabled but key absent).
-    #[cfg(feature = "flash")]
-    {
-        if framework_state.flash_secret.is_empty() {
-            eprintln!(
-                "Error: flash feature enabled but `flash_secret` is absent from config \
-                 (generate: openssl rand -base64 32)"
-            );
-            std::process::exit(2);
-        }
-    }
-
-    let tp_size = framework_state.config.thread_pool.size;
-    let tp_queue = framework_state.config.thread_pool.queue_size;
-    // Read once at startup, like the pool dimensions above and for the same
-    // reason: it is applied to a socket at accept time.
-    let read_timeout = framework_state.config.server.read_timeout;
-    let socket_mode = framework_state.config.server.socket_mode;
-
-    // Built once at start and shared read-only across the worker threads.
-    // Nothing writes it after start, so it needs no lock.
-    let fs: Arc<FrameworkState> = Arc::new(framework_state);
-
-    // Build handler lookup map (pattern:METHOD → handler).
-    // Include the method in the key so GET and POST handlers registered on the
-    // same path are stored and looked up independently.
-    let code_handlers: Arc<HashMap<String, Arc<BoxHandler>>> = Arc::new(
-        code_routes
-            .into_iter()
-            .map(|(p, m, h)| (format!("{}:{}", p, route_method_key(&m)), h))
-            .collect(),
-    );
-
-    // Bind socket.
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path).ok();
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
+    // Bind socket: one start helper, so the stale-file, parent-directory and
+    // mode rules are the ones every service has. The listener is non-blocking
+    // for the poll loop; an accepted stream goes back to blocking for the
+    // worker thread that serves it.
+    let listener = crate::net::listen_unix(&socket_path, socket_mode).unwrap_or_else(|e| {
         eprintln!("Failed to bind socket {}: {e}", socket_path.display());
+        std::fs::remove_file(&socket_path).ok();
         std::process::exit(2);
     });
 
-    // Before the shutdown handle below, which self-connects to this socket:
-    // the mode has to be right by the time anything can reach it. A socket
-    // with a mode nobody chose is a start failure, so the process stops.
-    if let Err(e) = crate::server::apply_socket_mode(&socket_path, socket_mode) {
-        eprintln!(
-            "Failed to set mode {socket_mode:04o} on socket {}: {e}",
-            socket_path.display()
-        );
-        std::fs::remove_file(&socket_path).ok();
-        std::process::exit(2);
-    }
-
     // After the bind, not before: the wake connects to this socket, so it has
     // to exist by the time a signal can arrive.
-    let shutdown = install_shutdown(&socket_path);
+    let shutdown = install_shutdown(site.name(), &socket_path);
 
     info!(
-        routes = fs.routes.len(),
+        routes = site.route_count(),
         threads = tp_size,
         socket = %socket_path.display(),
         "routes loaded"
     );
 
     let pool = Arc::new(ThreadPool::new_with_exit(tp_size, tp_queue, on_thread_exit));
+
+    // The handlers a `Handled::Code` or `Handled::Named` index names, in the
+    // order `Site` was given the routes and the names.
+    let code_handlers: Arc<Vec<Arc<BoxHandler>>> = Arc::new(
+        code_routes
+            .into_iter()
+            .map(|(_, _, handler)| handler)
+            .collect(),
+    );
+    // A vector, in the order `Site` was given the names: `Handled::Named(i)`
+    // is an index, so no lookup and no second absent-name branch here.
+    let named_handlers: Arc<Vec<Arc<BoxHandler>>> =
+        Arc::new(named.into_iter().map(|(_, handler)| handler).collect());
 
     use std::os::unix::io::AsRawFd;
     let listener_fd = listener.as_raw_fd();
@@ -2964,16 +2552,23 @@ fn run_app_with_shutdown(
 
         match listener.accept() {
             Ok((stream, _)) => {
+                // The listener is non-blocking; the pool's workers read and
+                // write with blocking calls, so the stream is put back first.
+                let stream: UnixStream = stream.into();
+                if let Err(e) = stream.set_nonblocking(false) {
+                    error!("accept error: {e}");
+                    continue;
+                }
                 // Before the handoff, not inside the worker: a worker that has
                 // already taken the connection is the resource being protected.
                 crate::server::apply_read_timeout(&stream, read_timeout);
 
-                let fs = fs.clone();
+                let site = site.clone();
                 let code_handlers = code_handlers.clone();
                 let named_handlers = named_handlers.clone();
 
                 match pool.try_submit(stream, move |mut s| {
-                    handle_connection(&mut s, &fs, &code_handlers, &named_handlers);
+                    handle_connection(&mut s, &site, &code_handlers, &named_handlers);
                 }) {
                     Ok(_) => {}
                     Err(mut s) => {
@@ -3004,17 +2599,28 @@ fn run_app_with_shutdown(
 /// One accepted connection, served until it ends.
 ///
 /// The loop, the malformed-request answer, the HEAD rule and the keep-alive
-/// decision are core's. This file had its own of each, and answered exactly
-/// one request per connection.
+/// decision are core's. The request path is `Site`'s; this function is the
+/// service's own dispatch: one `match` on the index `Site::handle` returned.
 fn handle_connection(
     stream: &mut UnixStream,
-    fs: &FrameworkState,
-    code_handlers: &HashMap<String, Arc<BoxHandler>>,
-    named_handlers: &HashMap<String, Arc<BoxHandler>>,
+    site: &crate::site::Site,
+    code_handlers: &[Arc<BoxHandler>],
+    named_handlers: &[Arc<BoxHandler>],
 ) {
     let served: std::result::Result<(), std::io::Error> =
         crate::server::serve_connection(stream, |raw, resp| {
-            handle_request(raw, resp, fs, code_handlers, named_handlers);
+            let response = match site.handle_raw(raw) {
+                crate::site::Handled::Done(response) => response,
+                crate::site::Handled::Code(index, req) => match code_handlers[index].call(&req) {
+                    Ok(response) => site.finish(&req, response),
+                    Err(e) => site.finish(&req, crate::response::error_to_response(&e)),
+                },
+                crate::site::Handled::Named(index, req) => match named_handlers[index].call(&req) {
+                    Ok(response) => site.finish(&req, response),
+                    Err(e) => site.finish(&req, crate::response::error_to_response(&e)),
+                },
+            };
+            crate::server::write_response(resp, response).ok();
             Ok(())
         });
     if let Err(e) = served {
@@ -3022,353 +2628,14 @@ fn handle_connection(
     }
 }
 
-/// The body minified for `mime`, or `None` when that type is not minified.
-#[cfg(feature = "minify")]
-fn minified(
-    mime: &str,
-    bytes: &[u8],
-    config: &crate::config::MinificationConfig,
-) -> Option<Vec<u8>> {
-    if !config.is_enabled(mime) {
-        return None;
-    }
-    match mime {
-        "text/html" => Some(crate::minify::minify_html(bytes, config.inline_js)),
-        "text/css" => Some(crate::minify::minify_css(bytes)),
-        "application/json" => Some(crate::minify::minify_json(bytes)),
-        "application/javascript" | "text/javascript" => Some(crate::minify::minify_js(bytes)),
-        _ => None,
-    }
-}
-
-/// Without the `minify` feature the config loader has already refused any
-/// config that turns minification on, so there is nothing to do.
-#[cfg(not(feature = "minify"))]
-fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<Vec<u8>> {
-    None
-}
-
-fn handle_request<W: std::io::Write>(
-    raw: RawRequest,
-    stream: &mut crate::h1::Responder<'_, W>,
-    fs: &FrameworkState,
-    code_handlers: &HashMap<String, Arc<BoxHandler>>,
-    named_handlers: &HashMap<String, Arc<BoxHandler>>,
-) {
-    let start = std::time::Instant::now();
-
-    // The state is built once at start and shared read-only. Under this
-    // borrow: match the route against the shared table and build the
-    // dictionary, which reads a params file on a cache miss.
-    let matched = {
-        let routes = &fs.routes;
-        find_route(raw.path(), raw.method(), routes).map(|(route, path_params)| {
-            let dict = fs.build_dict(&raw, route, &path_params);
-            (route, dict)
-        })
-    };
-    let config = &fs.config;
-    let compression = &config.compression;
-    let minification = &config.minification;
-
-    // Populated from `dict["csrf_token"]` inside the matched-route arm below
-    // (when the csrf feature is on) so the cookie set further down uses the
-    // exact same token the response body was rendered with — see the
-    // comment at that Set-Cookie site for why a second, independently
-    // generated token there was a real bug.
-    #[cfg(feature = "csrf")]
-    let mut csrf_token_for_cookie: Option<String> = None;
-
-    let (mut resp, raw) = match matched {
-        None => {
-            warn!(path = raw.path(), "unmatched path");
-            (Response::not_found(), raw)
-        }
-        Some((route, dict)) => {
-            let dict = match dict {
-                Ok(d) => d,
-                Err(e) => {
-                    let r = error_to_response(&e);
-                    crate::server::write_response(stream, r).ok();
-                    return;
-                }
-            };
-
-            #[cfg(feature = "csrf")]
-            {
-                csrf_token_for_cookie = dict
-                    .get("csrf_token")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-
-            // `raw` is handed over rather than cloned: `serve_connection` has
-            // no use for it after this, and a `Request` owning one used to
-            // cost a full copy of the method, path, query, every header and
-            // the body, per request.
-            let req = Request::new(raw, dict.clone(), Arc::clone(&fs.site_dir))
-                .with_route(route)
-                .with_config(Arc::clone(&fs.config));
-
-            // Dispatch to code handler or template render.
-            // A code handler is only used when the matched route is a code route
-            // (template is None). If the matched route has a template (config route),
-            // use the template even if a code handler exists for the same pattern
-            // — this ensures GET routes handled by config are not shadowed by POST
-            // code handlers registered on the same path.
-            let handler_key = format!("{}:{}", route.pattern, route.methods.handler_key());
-            let mut resp = if let Some(name) = &route.handler {
-                // A config-declared route naming a registered handler. The
-                // lookup cannot miss: `unknown_handlers` refuses a state whose
-                // routes name anything absent at startup, so an absent handler
-                // here means that check was bypassed rather than that config is
-                // wrong. Answer 500 and say so, rather than 404, which would
-                // read as "no such page".
-                match named_handlers.get(name) {
-                    Some(handler) => match handler.call(&req) {
-                        Ok(r) => r,
-                        Err(e) => error_to_response(&e),
-                    },
-                    None => {
-                        error!(
-                            pattern = %route.pattern,
-                            handler = %name,
-                            "route names a handler that is not registered"
-                        );
-                        Response::status(500)
-                    }
-                }
-            } else if route.template.is_none() {
-                if let Some(handler) = code_handlers.get(&handler_key) {
-                    match handler.call(&req) {
-                        Ok(r) => r,
-                        Err(e) => error_to_response(&e),
-                    }
-                } else {
-                    Response::not_found()
-                }
-            } else if let Some(template) = &route.template {
-                match Ok::<_, Error>(Response::render_request_dict(template, route.status)) {
-                    Ok(r) => r,
-                    Err(e) => error_to_response(&e),
-                }
-            } else {
-                Response::not_found()
-            };
-
-            // Render template if needed.
-            if resp.template_name.is_some() {
-                match FrameworkState::render_response(&*fs.renderer, &mut resp, &dict) {
-                    Ok(()) => {}
-                    Err(RenderError::NotFound) => {
-                        warn!(path = req.path(), "template signalled not_found");
-                        resp = Response::not_found();
-                    }
-                    Err(RenderError::Failed(e)) => {
-                        error!("Template render error: {e:#}");
-                        resp = Response::status(500);
-                    }
-                }
-            }
-
-            // Add Cache-Control header. route.cache is a free-form string
-            // (config.rs parses it as-is, defaulting to "public") and is
-            // passed through exactly as configured. Collapsing anything that
-            // is not literally "no-store" down to a bare "public" would
-            // silently discard the max-age and other directives a site
-            // configured, e.g. "public, max-age=60, must-revalidate".
-            // A default, not an override. A handler that decided its own
-            // caching has decided it per request in a way a static route
-            // setting cannot express -- m6-file answers `immutable` for a
-            // `?v=` URL and a short window for everything else -- and
-            // appending a second `Cache-Control` here would put two on the
-            // wire rather than replacing one.
-            if !crate::headers::contains(&resp.headers[..], "cache-control") {
-                resp = resp.header("Cache-Control", &route.cache);
-            }
-
-            // Last-Modified, from the route's own inputs (see CompiledRoute).
-            // Only on a success: attaching a validator to a 404 or a 500 would
-            // invite a client to keep revalidating an error as though it were
-            // content. Skipped when the route has no honest date -- a code
-            // route, or one whose params path is resolved per request.
-            //
-            // m6-http already honours If-Modified-Since against a cached
-            // entry's Last-Modified (cache::is_not_modified); it simply never
-            // had one to compare with for rendered HTML, so every date-based
-            // revalidation returned the whole page. Emitting the header here is
-            // the whole fix.
-            if resp.status < 300 {
-                if let Some(lm) = route.last_modified {
-                    resp = resp.header("Last-Modified", &httpdate::fmt_http_date(lm));
-                }
-            }
-
-            // Add any extra per-route headers (e.g. COOP/COEP for cross-origin isolation).
-            for (k, v) in &route.headers {
-                resp.headers.push((k.clone(), v.clone()));
-            }
-
-            // The raw request comes back for the tail below, which negotiates
-            // the coding, checks the cookies and writes the access log.
-            (resp, req.into_raw())
-        }
-    };
-
-    // ── CSRF: set _csrf cookie if not already present in the request.
-    #[cfg(feature = "csrf")]
-    {
-        let has_csrf = raw
-            .header("cookie")
-            .map(|h| h.contains("_csrf="))
-            .unwrap_or(false);
-        if !has_csrf {
-            // Reuse the exact token build_dict already put in dict["csrf_token"]
-            // (captured above as csrf_token_for_cookie) rather than generating
-            // a second, independent one here. Two unrelated random values is
-            // what that costs: the page's hidden csrf_token field carries
-            // whatever build_dict generated, while the cookie sent to the
-            // browser carries a *different* token generated independently
-            // here — so for any visitor without an existing _csrf cookie
-            // (i.e. every first-time visitor), the submitted field can never
-            // match the cookie and verify_csrf() rejects every legitimate
-            // submission. Falls back to a
-            // fresh token only for routes with no dict (e.g. an unmatched
-            // path's 404), where there's no rendered form to have carried one.
-            let token = csrf_token_for_cookie.unwrap_or_else(generate_csrf_token);
-            // No HttpOnly, deliberately: this is the double-submit token and
-            // the page has to be able to read it back.
-            resp.headers.push(
-                crate::cookie::Cookie::new("_csrf", token)
-                    .path("/")
-                    .same_site(crate::cookie::SameSite::Strict)
-                    .secure()
-                    .to_header(),
-            );
-        }
-    }
-
-    // ── Flash: clear the _flash cookie after reading it.
-    #[cfg(feature = "flash")]
-    {
-        let had_flash = raw
-            .header("cookie")
-            .map(|h| h.contains("_flash="))
-            .unwrap_or(false);
-        if had_flash {
-            // Path and HttpOnly must match the cookie being removed or the
-            // browser treats this as a different cookie and keeps both.
-            resp.headers.push(
-                crate::cookie::Cookie::removal("_flash")
-                    .path("/")
-                    .http_only()
-                    .to_header(),
-            );
-        }
-    }
-
-    // ── Minification: applied BEFORE compression for better ratios.
-    //
-    // Both transforms below are skipped for a `verbatim` response, which is a
-    // handler saying it has already produced the exact representation. m6-file
-    // negotiates the coding itself and builds an ETag naming it, so
-    // re-compressing here would put brotli bytes on the wire under a tag
-    // asserting identity.
-    //
-    // A streamed body needs no such flag: `as_bytes` gives `None` and there is
-    // nothing to transform. That is deliberate rather than incidental -- the
-    // alternative shape, a `Vec<u8>` plus an optional reader, would have left
-    // all four transforms free to run on the empty bytes beside the stream and
-    // produce a correct-looking response with the wrong body.
-    if !resp.verbatim {
-        if let Some(bytes) = resp.body.as_bytes() {
-            if !bytes.is_empty() {
-                let content_type =
-                    crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
-                let mime = content_type.split(';').next().unwrap_or("").trim();
-
-                if let Some(m) = minified(mime, bytes, minification) {
-                    resp.body = crate::response::Body::Bytes(m);
-                }
-            }
-        }
-    }
-
-    // ── Compression: applied AFTER minification.
-    let accept_encoding = raw.header("accept-encoding").unwrap_or("");
-    if !resp.verbatim && !resp.body.is_empty() {
-        let content_type = crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
-        let mime = content_type.split(';').next().unwrap_or("").trim();
-
-        if let Some(level) = compression.get(mime) {
-            // Ask the client what it will actually accept, rather than testing
-            // whether a coding name appears anywhere in the header.
-            //
-            // A raw substring match such as `ae_contains` is wrong three ways
-            // at once, each reproducible with one `curl -H` against a loopback
-            // instance: `gzip, br;q=0` was served **br**, so a client that
-            // had explicitly refused brotli got brotli (RFC 9110 12.4.2 makes
-            // `q=0` "not acceptable", not "least preferred"); `notbr` was
-            // served **br**, matching the substring inside an unrelated token;
-            // and `gzip;q=1.0, br;q=0.1` was served **br**, because candidates
-            // were tested in our order and the first hit won, ignoring the
-            // client's stated preference entirely.
-            //
-            // m6-file had already found and fixed this for static assets and
-            // written the parser. m6-render never got it, which is why the fix
-            // now lives in m6-core and both call it: this is the second time
-            // the same rules diverged between two crates.
-            //
-            // Only codings the config actually permits are offered, so a level
-            // of 0 removes a candidate rather than producing an empty body.
-            let mut candidates: Vec<&str> = Vec::with_capacity(2);
-            if level.brotli > 0 {
-                candidates.push("br");
-            }
-            if level.gzip > 0 {
-                candidates.push("gzip");
-            }
-            // `as_bytes` is `None` for a stream, so a streamed body simply
-            // does not reach either compressor.
-            let plain = resp.body.as_bytes().map(|b| b.to_vec());
-            match (crate::preferred_coding(accept_encoding, &candidates), plain) {
-                (Some("br"), Some(bytes)) => {
-                    if let Ok(compressed) = crate::compress::brotli_compress(&bytes, level.brotli) {
-                        resp.body = crate::response::Body::Bytes(compressed);
-                        resp.headers
-                            .push(("Content-Encoding".to_string(), "br".to_string()));
-                    }
-                }
-                (Some("gzip"), Some(bytes)) => {
-                    if let Ok(compressed) = crate::compress::gzip_compress(&bytes, level.gzip) {
-                        resp.body = crate::response::Body::Bytes(compressed);
-                        resp.headers
-                            .push(("Content-Encoding".to_string(), "gzip".to_string()));
-                    }
-                }
-                // Nothing acceptable: send identity rather than a 406. RFC 9110
-                // 12.5.3 permits that, and an uncompressed body is a better
-                // outcome than refusing to serve the resource.
-                _ => {}
-            }
-        }
-    }
-
-    let latency = start.elapsed().as_micros();
-    tracing::debug!(
-        path = raw.path(),
-        method = raw.method(),
-        status = resp.status,
-        latency_us = latency,
-        "request complete"
-    );
-
-    crate::server::write_response(stream, resp).ok();
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) use crate::site::{
+    check_compress_declared, check_site_toml, describe_unknown, dump_config, unknown_handlers,
+};
 
 #[cfg(test)]
 #[allow(
@@ -4197,16 +3464,6 @@ mod config_route_handler_tests {
         (state, site_dir)
     }
 
-    fn registry(names: &[&str]) -> HashMap<String, Arc<BoxHandler>> {
-        names
-            .iter()
-            .map(|n| {
-                let h: BoxHandler = Box::new(|_req: &Request| Ok(Response::text("ok")));
-                (n.to_string(), Arc::new(h))
-            })
-            .collect()
-    }
-
     /// What a browser sees: a script labelled `text/javascript` comes back
     /// brotli-compressed under the default config.
     #[test]
@@ -4231,10 +3488,22 @@ mod config_route_handler_tests {
             body: vec![],
         };
 
+        let site = crate::site::Site::from_state(state, vec!["script".to_string()]);
+        let response = match site.handle_raw(raw) {
+            crate::site::Handled::Named(0, req) => {
+                let response = named
+                    .get("script")
+                    .expect("registered")
+                    .call(&req)
+                    .expect("the handler answers");
+                site.finish(&req, response)
+            }
+            _ => panic!("the config route names `script`, which is registered"),
+        };
         let mut out = Vec::new();
         {
             let mut resp = crate::h1::Responder::new(&mut out, "GET", false);
-            handle_request(raw, &mut resp, &state, &HashMap::new(), &named);
+            response.send(&mut resp).expect("the response serialises");
         }
         let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
@@ -4265,7 +3534,7 @@ tail = false
     fn a_route_naming_an_unregistered_handler_is_refused() {
         let (state, _d) = state_from(FILES);
 
-        let missing = unknown_handlers(state.routes.routes(), &registry(&["uploads"]), &[]);
+        let missing = unknown_handlers(state.routes.routes(), &["uploads".to_string()], &[]);
         assert_eq!(
             missing,
             vec![("/assets/{*relpath}".to_string(), "files".to_string())]
@@ -4279,7 +3548,7 @@ tail = false
         assert!(described.contains("uploads"), "{described}");
 
         // Registered, and there is nothing to refuse.
-        assert!(unknown_handlers(state.routes.routes(), &registry(&["files"]), &[]).is_empty());
+        assert!(unknown_handlers(state.routes.routes(), &["files".to_string()], &[]).is_empty());
     }
 
     /// A template route is unaffected by any of this: it names no handler and
@@ -4288,7 +3557,7 @@ tail = false
     fn a_template_route_names_no_handler() {
         let (state, _d) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
         assert!(state.routes.routes()[0].handler.is_none());
-        assert!(unknown_handlers(state.routes.routes(), &HashMap::new(), &[]).is_empty());
+        assert!(unknown_handlers(state.routes.routes(), &[], &[]).is_empty());
     }
 
     /// Core does not know what `root` or `tail` mean, and does not need to.

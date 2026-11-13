@@ -445,7 +445,7 @@ The key is absolute because a per-thread initialiser receives no site directory 
 `m6-auth-server` and `m6-auth-cli` take only an absolute `[storage] path`, so the renderer names the same file, and `m6_core::config::secret_path("auth_db", ...)` gives it the same check.
 `m6-app-anatomy.md` section 5.3 gives the two state tiers and what each initialiser receives.
 
-`m6-auth-server` uses the per-worker shape too: `App::with_state` gives each worker thread its own `Db`, opened on the thread's first request.
+`m6-auth-server` opens one `Db` at start and keeps it for the life of the process, and a database that cannot be opened stops it with exit 2.
 
 The processes above share one file, and section 9 gives the rules that keep that safe.
 
