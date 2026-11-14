@@ -37,6 +37,12 @@ const EARLY_BODY: &str = "early answer";
 const EARLY_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
 Content-Length: 12\r\nConnection: close\r\n\r\nearly answer";
 
+/// A complete 413 with a body, written while the request is still being sent.
+/// The URL path forwards a completed 4xx verbatim, so the https test using this
+/// proves the backend's own status and body reached the client.
+const EARLY_413_HEAD: &[u8] = b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\n\
+Content-Length: 7\r\nConnection: close\r\n\r\nrefused";
+
 /// A head that stops in the middle of a header line.
 const PARTIAL_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Len";
 
@@ -46,6 +52,8 @@ const PARTIAL_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Len";
 enum Refusal {
     /// Write a complete reply and close.
     EarlyAnswer,
+    /// Write a complete 413 with a body and close.
+    Early413,
     /// Close without writing anything.
     Silent,
     /// Write half a head and close.
@@ -131,6 +139,9 @@ fn read_head_and_some_body<S: Read + Write>(stream: &mut S, mode: Refusal) {
         Refusal::EarlyAnswer => {
             let _ = stream.write_all(EARLY_HEAD);
         }
+        Refusal::Early413 => {
+            let _ = stream.write_all(EARLY_413_HEAD);
+        }
         Refusal::Silent => {}
         Refusal::PartialHead => {
             let _ = stream.write_all(PARTIAL_HEAD);
@@ -173,10 +184,11 @@ fn spawn_tls_backend(mode: Refusal) -> u16 {
 
 /// One m6-http in front of the site's backend.
 struct Fixture {
-    _dir: tempfile::TempDir,
-    _claim: m6_core::testkit::PortClaim,
-    port: u16,
+    // Field order is drop order: the service stops before its port claim and temp dir are dropped.
     service: Service,
+    _dir: tempfile::TempDir,
+    port: u16,
+    _claim: m6_core::testkit::PortClaim,
 }
 
 impl Fixture {
@@ -215,10 +227,10 @@ impl Fixture {
         );
         service.wait_for_tcp(port, Duration::from_secs(20));
         Fixture {
-            _dir: dir,
-            _claim: claim,
-            port,
             service,
+            _dir: dir,
+            port,
+            _claim: claim,
         }
     }
 
@@ -308,11 +320,12 @@ fn a_socket_backend_that_answers_early_is_forwarded() {
     assert_eq!(body(&resp), EARLY_BODY);
 }
 
-/// An HTTPS URL backend that reads 1 KiB of a large request, answers it in full
-/// and closes: the write's EPIPE/ECONNRESET must not win over the reply.
+/// An HTTPS URL backend that reads 1 KiB of a large request, answers it with a
+/// 413 and a body and closes: the write's EPIPE/ECONNRESET must not win over the
+/// reply, and the backend's own 413 and body must reach the client.
 #[test]
 fn an_https_backend_that_answers_early_is_forwarded() {
-    let port = spawn_tls_backend(Refusal::EarlyAnswer);
+    let port = spawn_tls_backend(Refusal::Early413);
     let fx = Fixture::start(
         &format!(
             "[[backend]]\nname = \"app\"\nurl = \"https://127.0.0.1:{port}\"\n\
@@ -323,12 +336,12 @@ fn an_https_backend_that_answers_early_is_forwarded() {
     let resp = send(fx.port(), "/public/big.txt");
     assert_eq!(
         status(&resp),
-        200,
-        "the backend's early answer was not forwarded: {:?}\n--- m6-http ---\n{}",
+        413,
+        "the backend's early 413 was not forwarded: {:?}\n--- m6-http ---\n{}",
         String::from_utf8_lossy(&resp),
         fx.service.output()
     );
-    assert_eq!(body(&resp), EARLY_BODY);
+    assert_eq!(body(&resp), "refused");
 }
 
 /// A socket backend that closes while the request is still being written, with

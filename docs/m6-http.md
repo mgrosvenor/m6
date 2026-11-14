@@ -48,7 +48,7 @@ Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at 
 
 **Load balancing:** least-connections across active pool members.
 
-**URL backends** (`http://`, `https://`) are not pooled — one HTTP/1.1 connection per request, run on a dedicated I/O thread.
+**URL backends** (`http://`, `https://`) are not pooled: one HTTP/1.1 connection per request, driven by the event loop through a `client::Upstream` slot with no dedicated I/O thread.
 
 **H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://origin.example.com:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over a private backbone, where TLS at the application layer is redundant.
 
