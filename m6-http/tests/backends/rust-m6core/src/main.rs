@@ -154,7 +154,7 @@ fn main() -> std::io::Result<()> {
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout", "log"]);
     let mut accepting = true;
     let mut last = m6_core::platform::now();
     let mut last_report = last;
@@ -178,7 +178,7 @@ fn main() -> std::io::Result<()> {
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 2,
-            Some(LOG) => 3,
+            Some(LOG) => 4,
             Some(_) => 1,
             None => 3,
         };
@@ -241,11 +241,6 @@ fn main() -> std::io::Result<()> {
                 SIGNALS => {
                     let mut stop = false;
                     while let Some(signal) = signals.read() {
-                        if signal == Signal::ReopenLogs {
-                            let result = m6_core::log::reopen();
-                            lifecycle.reopened(&result);
-                            continue;
-                        }
                         if lifecycle.on_signal(signal) == Action::Stop {
                             stop = true;
                         }
@@ -284,7 +279,12 @@ fn main() -> std::io::Result<()> {
 
         // A full stdout holds its bytes in the Sink. Watch it for writability
         // only while it does, so the loop never waits on the log.
-        m6_core::log::watch(poll.registry(), LOG)?;
+        //
+        // These logger calls are live: `Site::load` above initialises the
+        // operational Sink, and `lifecycle.started()` has written to it.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
 
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.

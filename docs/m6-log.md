@@ -102,13 +102,15 @@ Table 3: the calls a service makes.
 |---|---|
 | `init(level, analytics)` | at start, before the loop |
 | `tick(now)` | on the one-second accounting tick, with the time the loop already read |
-| `watch(poll.registry(), LOG)?` | after one turn's events, in `m6_core::log` |
+| `watch(poll.registry(), LOG)`, its error logged | after one turn's events, in `m6_core::log` |
 | `flush()` | in the match on the token, for `LOG` |
-| `reopen()?` | when `Signal::ReopenLogs` arrives |
+| `reopen()`, its error logged | when `Signal::ReopenLogs` arrives |
 | `stop()?` | after the loop, where blocking is allowed |
 
 `watch` lives in `m6-core`, over `Sink::fd` and `Sink::wants_write`.
-It registers stdout for writability only while complete lines wait, and removes it when they have drained.
+It registers stdout for writability only while a write has returned `EAGAIN`, and removes it when the Sink has drained.
+A line waiting for the tick is buffered, not watched, so a regular file and a terminal are never registered.
+A registration failure is logged and the loop serves on.
 
 ## What it copies
 

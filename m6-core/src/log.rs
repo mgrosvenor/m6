@@ -243,16 +243,27 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 
 /// What `site.toml`'s `[log]` says about this process: its level.
 ///
-/// A read or parse failure is an error naming the file, and a `level` that is
-/// present and not a string is an error naming the key. An absent key keeps the
-/// default `"info"`.
+/// A read or parse failure is an error naming the file, a `level` that is
+/// present and not a string is an error naming the key, and any key other than
+/// `level` is an error naming the setting. An absent key keeps the default
+/// `"info"`. The refusal matches the service config: every m6 log is a JSON
+/// line, so `format` and a misspelled `level` stop the service at start.
 pub fn read_site_log_config(site_toml: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(site_toml)
         .map_err(|e| anyhow::anyhow!("{} cannot be read: {e}", site_toml.display()))?;
     let val: toml::Value = text.parse::<toml::Value>().map_err(|e| {
         anyhow::anyhow!("{} is not valid TOML: {}", site_toml.display(), e.message())
     })?;
-    match val.get("log").and_then(|l| l.get("level")) {
+    let Some(log) = val.get("log") else {
+        return Ok("info".to_string());
+    };
+    let table = log
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[log] must be a table"))?;
+    if let Some(key) = table.keys().find(|k| k.as_str() != "level") {
+        anyhow::bail!("unknown key [log] {key}: known keys are level");
+    }
+    match table.get("level") {
         Some(v) => Ok(v
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
@@ -308,13 +319,34 @@ mod tests {
     }
 
     #[test]
-    fn a_site_toml_level_is_read_and_other_keys_are_ignored() {
+    fn a_site_toml_level_is_read() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("site.toml");
-        std::fs::write(&f, "[log]\nlevel = \"warn\"\nformat = \"text\"\n").unwrap();
+        std::fs::write(&f, "[log]\nlevel = \"warn\"\n").unwrap();
         assert_eq!(read_site_log_config(&f).unwrap(), "warn");
         std::fs::write(&f, "[site]\nname = \"example\"\n").unwrap();
         assert_eq!(read_site_log_config(&f).unwrap(), "info");
+    }
+
+    #[test]
+    fn a_site_toml_format_key_is_refused_and_named() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "[log]\nlevel = \"warn\"\nformat = \"text\"\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("unknown key [log] format"), "{err}");
+        std::fs::write(&f, "[log]\nlevle = \"warn\"\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("unknown key [log] levle"), "{err}");
+    }
+
+    #[test]
+    fn a_site_toml_log_table_that_is_not_a_table_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "log = 3\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("[log] must be a table"), "{err}");
     }
 
     #[test]

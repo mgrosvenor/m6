@@ -171,8 +171,9 @@ fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
         Some(TOKEN_UDP) => 3,
         Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) => 0,
         Some(TOKEN_SIGNAL) => 4,
-        // A log drain is the loop's own bookkeeping, reported with timeout.
-        Some(TOKEN_LOG) => 5,
+        // A log drain is the loop's own bookkeeping, named so /perf does not
+        // report it as a timeout that did not happen.
+        Some(TOKEN_LOG) => 6,
         Some(Token(k)) => match sources.get(k) {
             Source::TlsConn(_) | Source::H2cConn(_) => 1,
             Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) => 2,
@@ -1731,7 +1732,9 @@ fn event_loop(
     let mut events = Events::with_capacity(256);
     // Wait time against work time, per kind of event that woke the loop. An
     // iteration with events of several kinds is counted under its first event.
-    let mut trace = LoopTrace::new(&["accept", "conn", "upstream", "udp", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&[
+        "accept", "conn", "upstream", "udp", "signal", "timeout", "log",
+    ]);
     let mut last = m6_core::platform::now();
     let mut last_log_tick = last;
     let mut accepting = tcp.is_some() || h2c.is_some();
@@ -1792,11 +1795,6 @@ fn event_loop(
                 TOKEN_SIGNAL => {
                     let mut stop = false;
                     while let Some(sig) = signals.read() {
-                        if sig == m6_core::platform::Signal::ReopenLogs {
-                            let result = m6_core::log::reopen();
-                            lifecycle.reopened(&result);
-                            continue;
-                        }
                         if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
                             stop = true;
                         }
@@ -5276,7 +5274,8 @@ fn run(args: Vec<String>) -> i32 {
     );
     lifecycle.complete();
     if let Err(e) = m6_core::log::stop() {
-        error!(error = %e, "log stop failed");
+        // `stop` took the Sinks, so this line goes to stderr or nowhere.
+        eprintln!("log stop failed: {e}");
         return 1;
     }
     code

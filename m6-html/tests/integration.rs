@@ -188,12 +188,60 @@ fn an_unknown_log_level_exits_2_before_binding() {
     );
 }
 
+/// A `site.toml` key other than `level` is a start error naming the setting:
+/// the documented refusal applies to every core service, not only to m6-http
+/// and to service configs.
+#[test]
+fn a_site_toml_log_format_exits_2_and_names_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir(&site).expect("the site directory");
+    for entry in std::fs::read_dir(fixtures_dir()).expect("the fixtures") {
+        let entry = entry.expect("a fixture");
+        if entry.file_name() == "site.toml" {
+            continue;
+        }
+        std::os::unix::fs::symlink(entry.path(), site.join(entry.file_name()))
+            .expect("a fixture link");
+    }
+    std::fs::write(
+        site.join("site.toml"),
+        "[site]\nname = \"Test Site\"\ndomain = \"localhost\"\n\n[log]\nformat = \"text\"\n",
+    )
+    .expect("the site file");
+    let socket_path = dir.path().join("format.sock");
+
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(&site)
+            .arg(site.join("configs").join("m6-html.conf"))
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .expect("m6-html should exit on a [log] format key");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("unknown key [log] format"),
+        "--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket should never have been bound: {}",
+        socket_path.display()
+    );
+}
+
 /// A line logged after start reaches the process's stdout within one
 /// accounting tick. Only the loop can write it: the Sink holds it until the
 /// tick flushes, and the process is alive and idle.
 ///
 /// Break: remove the `tick` call from m6-html's loop, and the line sits in the
-/// 16 KiB buffer until the process stops.
+/// 16 KiB buffer until the process stops. The Sink does not register stdout
+/// here: a line waiting for the tick is not a full destination.
 #[test]
 fn a_quiet_service_flushes_within_a_tick() {
     let dir = tempfile::tempdir().expect("tempdir");

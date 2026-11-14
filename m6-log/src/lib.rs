@@ -9,16 +9,17 @@
 //! A service's loop makes five short calls, in plain sight:
 //!
 //! ```text
-//! m6_core::log::tick(m6_platform::wall());          // on the accounting tick
-//! m6_core::log::watch(poll.registry(), LOG)?;     // after one turn's events
+//! m6_core::log::tick(m6_platform::wall());        // on the accounting tick
+//! m6_core::log::watch(poll.registry(), LOG);      // after one turn's events, its error logged
 //! LOG => m6_core::log::flush(),                   // in the match on the token
-//! Some(Signal::ReopenLogs) => m6_core::log::reopen()?,  // SIGUSR1
+//! Some(Signal::ReopenLogs) => m6_core::log::reopen(),  // SIGUSR1, its error logged
 //! m6_core::log::stop()?;                          // after the loop
 //! ```
 //!
 //! [`init`] and [`stop`] run at start and stop. `watch` lives in `m6-core`,
 //! over [`Sink::fd`] and [`Sink::wants_write`], because `m6-log` does not
-//! depend on `mio`.
+//! depend on `mio`. A failed `watch` is logged and the loop serves on: logging
+//! never ends a service.
 //!
 //! The line format, buffering, loss on crash, levels, reopen and dropped-line
 //! counting are described in `docs/m6-log.md`.

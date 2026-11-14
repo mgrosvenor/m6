@@ -252,7 +252,7 @@ fn run_service() -> Result<()> {
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "client", "node", "probe", "dns", "tick"]);
+    let mut trace = LoopTrace::new(&["accept", "client", "node", "probe", "dns", "tick", "log"]);
     let mut out = poller.out();
     let mut accepting = true;
     let mut snapshot: Option<Snapshot> = None;
@@ -290,7 +290,7 @@ fn run_service() -> Result<()> {
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 5,
-            Some(LOG) => 5,
+            Some(LOG) => 6,
             Some(Token(t)) if t < poll::CLIENT_BASE => 1,
             Some(Token(t)) => {
                 let slot = t - poll::CLIENT_BASE;
@@ -363,11 +363,6 @@ fn run_service() -> Result<()> {
                 SIGNALS => {
                     let mut stop = false;
                     while let Some(signal) = signals.read() {
-                        if signal == Signal::ReopenLogs {
-                            let result = m6_core::log::reopen();
-                            lifecycle.reopened(&result);
-                            continue;
-                        }
                         if lifecycle.on_signal(signal) == Action::Stop {
                             stop = true;
                         }
@@ -419,7 +414,9 @@ fn run_service() -> Result<()> {
 
         // A full stdout holds its bytes in the Sink. Watch it for writability
         // only while it does, so the loop never waits on the log.
-        m6_core::log::watch(poll.registry(), LOG)?;
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
 
         // Outgoing work whose deadline passed: a timed-out node step, a lost
         // probe or a failed lookup, each recorded and moved on.

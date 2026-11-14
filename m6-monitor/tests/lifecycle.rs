@@ -267,10 +267,10 @@ fn a_trailing_or_doubled_slash_still_answers() {
     svc.terminate(Duration::from_secs(5));
 }
 
-/// The monitor runs one loop thread, plus the log writer until LOG-2 replaces
-/// it. Three counts test that: one node, the same three-node fleet without a
-/// history, and that fleet with one. A poll thread or a history writer adds a
-/// thread to the same fleet, and a thread per node adds two.
+/// The monitor runs one loop thread. Three counts test that: one node, the
+/// same three-node fleet without a history, and that fleet with one. A poll
+/// thread or a history writer adds a thread to the same fleet, and a thread
+/// per node adds two.
 ///
 /// The counts are read once they have settled, through the platform layer.
 /// Reading the host's certificate store (`client::system_roots`, which the

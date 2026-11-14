@@ -146,7 +146,7 @@ required-features = ["testkit"]
 # `block()`, and the libtest harness has already started one by the time a test
 # function runs.
 [[test]]
-name    = "log_reopen"
+name    = "reopen_moves_new_lines"
 harness = false
 
 # The three allocation checks (`Timeouts`, `Slots`, `LoopTrace`), each on the

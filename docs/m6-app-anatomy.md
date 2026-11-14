@@ -165,12 +165,8 @@ fn main() -> anyhow::Result<()> {
                 SIGNALS => {
                     let mut stop = false;
                     while let Some(signal) = signals.read() {
-                        if signal == Signal::ReopenLogs {
-                            if let Err(e) = m6_core::log::reopen() {
-                                m6_core::log::error!(error = %e, "log reopen failed");
-                            }
-                            continue;
-                        }
+                        // One arm answers a reopen: `Lifecycle` calls
+                        // `m6_core::log::reopen()` and logs the outcome.
                         if lifecycle.on_signal(signal) == Action::Stop {
                             stop = true;
                         }
@@ -202,8 +198,11 @@ fn main() -> anyhow::Result<()> {
             }
         }
         // A full stdout holds its bytes in the Sink. Watch it for writability
-        // only while it does, so the loop never waits on the log.
-        m6_core::log::watch(poll.registry(), LOG)?;
+        // only while a write has returned EAGAIN, so the loop never waits on
+        // the log. A failed watch is logged and the service serves on.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
         // The accounting tick: flush the log buffers once a second.
         if m6_core::platform::now() - last_tick >= TICK {
             m6_core::log::tick(m6_core::platform::wall());
@@ -262,7 +261,7 @@ The loop has one `match` on the event's token.
 `SIGNALS` drains the signal descriptor through `Lifecycle`, and a reopen request flushes the analytics file and opens its path again.
 `LOG` writes what a full stdout held.
 Every other token is one connection, and `turn` reads, dispatches and writes until its socket would block.
-`watch` registers stdout only while the log holds bytes, and `tick` flushes both buffers once a second.
+`watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes both buffers once a second.
 `deadlines.expired` closes a peer that sent nothing before its read deadline.
 
 Two details keep the shape correct.

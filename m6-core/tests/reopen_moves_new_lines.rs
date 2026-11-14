@@ -1,9 +1,11 @@
-//! SIGUSR1 reopens the analytics file, and is not a shutdown.
+//! `reopen` moves new lines to the new file after a rotation.
 //!
 //! This binary has its own `main` (`harness = false` in `Cargo.toml`) so the
 //! process runs on one thread from start to finish, as a service does. The
-//! check follows the order a rotation tool uses: rename the file, ask for the
-//! reopen the way a loop does, wait for the path to reappear, then write again.
+//! check follows the order a rotation tool uses: rename the file, call
+//! `log::reopen()` as a loop's `Signal::ReopenLogs` arm does, wait for the
+//! path to reappear, then write again. The signal path itself is proved end to
+//! end against m6-html by `shutdown_signals.rs`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -30,11 +32,11 @@ fn write_line(n: u64) {
 }
 
 fn main() {
-    sigusr1_reopens_the_file_and_is_not_a_shutdown();
-    println!("sigusr1_reopens_the_file_and_is_not_a_shutdown ... ok");
+    reopen_moves_new_lines_to_the_new_file();
+    println!("reopen_moves_new_lines_to_the_new_file ... ok");
 }
 
-fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
+fn reopen_moves_new_lines_to_the_new_file() {
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("a.ndjson");
     log::init(Level::Info, Some(&live)).expect("init");

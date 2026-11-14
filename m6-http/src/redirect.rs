@@ -235,18 +235,19 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                 TOKEN_SIGNAL => {
                     let mut stop = false;
                     while let Some(sig) = signals.read() {
-                        if sig == m6_core::platform::Signal::ReopenLogs {
-                            let result = m6_core::log::reopen();
-                            lifecycle.reopened(&result);
-                            continue;
-                        }
                         if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
                             stop = true;
                         }
                     }
                     if stop {
                         lifecycle.complete();
-                        m6_core::log::stop()?;
+                        // `stop` takes both Sinks before it finishes, so its
+                        // own failure has to be written to stderr here: the
+                        // caller's error line has no destination left.
+                        if let Err(e) = m6_core::log::stop() {
+                            eprintln!("log stop failed: {e}");
+                            return Err(e.into());
+                        }
                         return Ok(());
                     }
                 }
@@ -273,7 +274,9 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
 
         // A full stdout holds its bytes in the Sink. Watch it for writability
         // only while it does, so the loop never waits on the log.
-        m6_core::log::watch(poll.registry(), TOKEN_LOG)?;
+        if let Err(e) = m6_core::log::watch(poll.registry(), TOKEN_LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
 
         // The accounting tick: flush the log buffers once a second.
         if now.duration_since(last_log_tick) >= Duration::from_secs(1) {
