@@ -120,7 +120,8 @@ The browser therefore sends `If-None-Match` on every use, and an unchanged respo
 `public` makes the response storable by a shared cache.
 
 `no-cache` is absent because it would also force the shared cache to revalidate, the round trip `s-maxage` removes (RFC 9111 section 5.2.2.4).
-`stale-while-revalidate` is absent because it would let the browser serve a stale copy while it revalidates.
+m6 does not emit `stale-while-revalidate` in these headers, because it would let the browser serve a stale copy while it revalidates.
+An upstream that sends `stale-while-revalidate` is still honoured: the cache serves stale inside the window the directive names and refreshes behind the request (RFC 9111 section 4.2.4).
 `immutable` appears only on the versioned asset, where changed bytes mean a different URL, and it stops the browser revalidating that URL on reload.
 
 ### Invalidation

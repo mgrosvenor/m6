@@ -1113,6 +1113,18 @@ fn cache_hit_answers_if_none_match_with_304_on_h1() {
             Some(cache_control.as_str()),
             "{label}: the 304 must carry the 200's Cache-Control"
         );
+        assert_eq!(
+            response.header("connection"),
+            Some("keep-alive"),
+            "{label}: RFC 9112 6.3 says a 304 ends at the empty line, so it \
+             must not advertise a close\nheaders:\n{}",
+            response.headers
+        );
+        assert!(
+            response.header("date").is_some(),
+            "{label}: RFC 9110 15.4.5 requires a Date on the 304\nheaders:\n{}",
+            response.headers
+        );
     }
 
     // Same connection. The bodyless 304s must not have consumed bytes from it.
@@ -1279,12 +1291,15 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
         .expect("m6-file must send an ETag");
+    // m6-file's validator is weak (mtime+size), so the strong form a client
+    // would compare with is the same opaque tag without the `W/` prefix.
+    let strong = etag.strip_prefix("W/").unwrap_or(&etag);
 
     // Strong form on the warm key: m6-http answers this one, and always could.
     let warm = https_get(
         &srv,
         "/public/open.txt",
-        &[("If-None-Match", &etag)],
+        &[("If-None-Match", strong)],
         srv.tls(),
     );
     assert_eq!(
@@ -1294,7 +1309,7 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
     );
 
     // Cold key, weak form: this one has to travel to m6-file.
-    let weak = format!("W/{etag}");
+    let weak = format!("W/{strong}");
     let cold = https_get(
         &srv,
         "/public/open.txt?nonce=cold1",
@@ -1317,7 +1332,7 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
     let cold_strong = https_get(
         &srv,
         "/public/open.txt?nonce=cold2",
-        &[("If-None-Match", &etag)],
+        &[("If-None-Match", strong)],
         srv.tls(),
     );
     assert_eq!(

@@ -6,6 +6,20 @@ use tracing::{debug, warn};
 
 use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
 
+/// The entity tag for one file representation.
+///
+/// **Weak on purpose.** The tag is the file's mtime (whole seconds) and size,
+/// two cheap `stat` fields that, unlike a content hash, do not read the body on
+/// every request. It cannot be strong: a same-size edit inside one mtime second,
+/// or an edit that preserves the mtime, leaves both inputs unchanged while the
+/// bytes differ. RFC 9110 8.8.1 requires a strong validator to change whenever
+/// the representation data changes and names clock resolution as a cause of
+/// weakness, so the tag carries `W/`. `Last-Modified` remains, which is what
+/// the date comparison uses.
+fn file_etag(mtime_secs: u64, len: u64, suffix: &str) -> String {
+    format!("W/\"{mtime_secs:x}-{len:x}{suffix}\"")
+}
+
 /// Resolve the file this request addresses, from the route's `root` setting
 /// and the path parameters core captured.
 ///
@@ -213,7 +227,7 @@ pub fn serve(req: &Request) -> Result<Response> {
         Encoding::Brotli => "-br",
         Encoding::Gzip => "-gz",
     };
-    let mut etag = format!("\"{:x}-{:x}{}\"", mtime_secs, metadata.len(), etag_suffix);
+    let mut etag = file_etag(mtime_secs, metadata.len(), etag_suffix);
 
     // Preconditions come from m6-core, which implements all four steps of
     // RFC 9110 13.2.2 in the required order. What was here did steps 3 and 4
@@ -223,7 +237,8 @@ pub fn serve(req: &Request) -> Result<Response> {
         ("ETag".to_string(), etag.clone()),
         ("Last-Modified".to_string(), last_modified.clone()),
     ];
-    let precondition = m6_core::evaluate_preconditions(&validators, req.headers(), req.method());
+    let precondition =
+        m6_core::evaluate_preconditions(200, &validators, req.headers(), req.method());
 
     let cache_control = cache_control_for(req.query());
 
@@ -322,7 +337,7 @@ pub fn serve(req: &Request) -> Result<Response> {
             Ok(compressed) => (compressed, Some("br")),
             Err(e) => {
                 warn!(path = %fs_path.display(), error = %e, "brotli compression failed, serving identity");
-                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                etag = file_etag(mtime_secs, metadata.len(), "");
                 (data, None)
             }
         },
@@ -330,7 +345,7 @@ pub fn serve(req: &Request) -> Result<Response> {
             Ok(compressed) => (compressed, Some("gzip")),
             Err(e) => {
                 warn!(path = %fs_path.display(), error = %e, "gzip compression failed, serving identity");
-                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                etag = file_etag(mtime_secs, metadata.len(), "");
                 (data, None)
             }
         },
@@ -710,6 +725,48 @@ mod tests {
         assert_eq!(
             fetch(dir.path(), Some("br")).0,
             fetch(dir.path(), Some("br")).0
+        );
+    }
+
+    /// RFC 9110 8.8.1: a strong validator has to change whenever the
+    /// representation data changes. mtime-seconds plus size cannot promise
+    /// that, so the tag must be weak or a same-second, same-size edit would
+    /// leave it validating bytes that no longer exist.
+    #[test]
+    fn the_file_etag_is_weak() {
+        let dir = css_dir();
+        let (etag, _, _) = fetch(dir.path(), None);
+        assert!(
+            etag.starts_with("W/\""),
+            "the mtime-and-size ETag must be weak: {etag}"
+        );
+    }
+
+    /// And the weak tag still moves when both of its inputs move: a rewrite
+    /// with a different length and a different whole-second mtime must not
+    /// leave the old validator in place.
+    #[test]
+    fn an_etag_changes_when_the_file_changes() {
+        let dir = css_dir();
+        let path = dir.path().join("assets/style.css");
+        let (before, _, _) = fetch(dir.path(), None);
+
+        let mut changed = compressible_css();
+        changed.extend_from_slice(b"\n.extra { color: red; }\n");
+        std::fs::write(&path, &changed).unwrap();
+        let when =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+
+        let (after, _, _) = fetch(dir.path(), None);
+        assert_ne!(
+            before, after,
+            "the ETag survived a different mtime and length"
         );
     }
 

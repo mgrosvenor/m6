@@ -826,6 +826,10 @@ fn conditional_requests_follow_rfc9110_precedence() {
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
         .expect("m6-file must send an ETag");
+    // The same opaque validator without the `W/` prefix: the form a client
+    // would use when it wants a strong comparison. m6-file's tag is weak, so
+    // these two differ in meaning even though the opaque part is identical.
+    let opaque = etag.strip_prefix("W/").unwrap_or(&etag);
 
     // No preconditions.
     assert!(status(&get("")).contains("200"), "unconditional GET");
@@ -835,9 +839,13 @@ fn conditional_requests_follow_rfc9110_precedence() {
         status(&get("If-Match: \"nope\"\r\n")).contains("412"),
         "If-Match with a non-matching tag must be 412"
     );
+    // mtime+size is a weak validator (RFC 9110 8.8.1), and strong comparison
+    // is false when either side is weak (8.8.3.2), so even the current opaque
+    // value cannot satisfy If-Match. This handler serves GET and HEAD only
+    // (405 above), where If-Match is not how a write is authorised.
     assert!(
-        status(&get(&format!("If-Match: {etag}\r\n"))).contains("200"),
-        "If-Match with the current tag must proceed"
+        status(&get(&format!("If-Match: {etag}\r\n"))).contains("412"),
+        "a weak validator must not satisfy If-Match's strong comparison"
     );
 
     // 2. If-Unmodified-Since, only consulted when If-Match is absent.
@@ -850,12 +858,21 @@ fn conditional_requests_follow_rfc9110_precedence() {
     );
 
     // 3. If-None-Match uses WEAK comparison: W/"x" matches "x".
+    let not_modified = get(&format!("If-None-Match: {opaque}\r\n"));
     assert!(
-        status(&get(&format!("If-None-Match: {etag}\r\n"))).contains("304"),
+        status(&not_modified).contains("304"),
         "strong form of the current tag must be 304"
     );
+    // RFC 9110 8.6: a 304 must not claim the representation is empty. Core's
+    // writer used to add `Content-Length: 0` to every bodyless status.
     assert!(
-        status(&get(&format!("If-None-Match: W/{etag}\r\n"))).contains("304"),
+        !not_modified
+            .to_ascii_lowercase()
+            .contains("content-length:"),
+        "a 304 must carry no Content-Length:\n{not_modified}"
+    );
+    assert!(
+        status(&get(&format!("If-None-Match: W/{opaque}\r\n"))).contains("304"),
         "WEAK form of the current tag must also be 304 (RFC 9110 8.8.3.2) — \
          this is the assertion that was failing"
     );

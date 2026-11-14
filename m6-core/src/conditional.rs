@@ -93,14 +93,33 @@ fn etag_list_contains(list: &str, tag: &str, strong: bool) -> bool {
 /// 4. `If-Modified-Since` -- only when `If-None-Match` is absent, and only for
 ///    GET/HEAD; if the resource is unchanged, 304.
 ///
+/// `stored_status` is the status of the representation these headers came
+/// from. It is required because a validator is only a validator for a current
+/// representation: RFC 9111 4.3.2 confines a cache's conditional evaluation
+/// to a stored 200 or 206, and RFC 9110 13.1.2 step 1 makes `*` false when no
+/// current representation exists. Inferring existence from "some stored
+/// headers" answered 304 to `If-None-Match: *` from a stored 404 or 410.
+///
 /// `If-Range` is not implemented because ranges are not served; a 206 is
 /// refused storage upstream (F057).
 pub fn evaluate_preconditions(
+    stored_status: u16,
     cached_headers: &[(String, String)],
     req_headers: &(impl HeaderSource + ?Sized),
     method: &str,
 ) -> Precondition {
-    let find = |name: &str| crate::headers::get(cached_headers, name);
+    // RFC 9111 4.3.2: only a stored 200 or 206 is a current representation a
+    // cache may evaluate preconditions against. Any other stored status keeps
+    // its headers out of the comparison entirely, so a stored 404 with an
+    // ETag cannot validate a tag list either.
+    let current = stored_status == 200 || stored_status == 206;
+    let find = |name: &str| {
+        if current {
+            crate::headers::get(cached_headers, name)
+        } else {
+            None
+        }
+    };
     let etag = find("etag");
     let last_modified = find("last-modified");
     let is_get_or_head = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
@@ -122,12 +141,10 @@ pub fn evaluate_preconditions(
         })
     };
 
-    // `*` is an existence test, not a tag (RFC 9110 13.1.2 step 1). Every
-    // caller reaches this with a resource it already knows exists: a file
-    // m6-file could stat, or a stored response m6-http just looked up. A
-    // non-empty header set is that evidence. An empty set is the one way to
-    // say "no stored response", and then `*` is false.
-    let resource_exists = !cached_headers.is_empty() || etag.is_some() || last_modified.is_some();
+    // `*` is an existence test, not a tag (RFC 9110 13.1.2 step 1). It is
+    // true only when the stored response is a current representation, so a
+    // stored 404 or 410 answers false and the 404 is served again.
+    let resource_exists = current && !cached_headers.is_empty();
 
     // 1. If-Match — strong comparison.
     if let Some(im) = header(req_headers, "if-match") {
@@ -195,10 +212,12 @@ pub fn evaluate_preconditions(
 /// `If-Unmodified-Since` failures. New code should call
 /// [`evaluate_preconditions`] and handle all three outcomes.
 pub fn is_not_modified(
+    stored_status: u16,
     cached_headers: &[(String, String)],
     req_headers: &(impl HeaderSource + ?Sized),
 ) -> bool {
-    evaluate_preconditions(cached_headers, req_headers, "GET") == Precondition::NotModified
+    evaluate_preconditions(stored_status, cached_headers, req_headers, "GET")
+        == Precondition::NotModified
 }
 
 /// Build the minimal header set for a 304 response derived from a cached
@@ -213,14 +232,19 @@ pub fn not_modified_headers(cached_headers: &[(String, String)]) -> Vec<(String,
     // particular was dropped, which is the damaging one: a client or shared
     // cache updating its stored entry from this 304 would lose the knowledge
     // that the response varies by `Accept-Encoding` and could then reuse a
-    // brotli body for a gzip-only request. `Date` was missing too, so the
-    // recipient had nothing to compute age from.
+    // brotli body for a gzip-only request.
+    //
+    // `Date` is deliberately NOT copied. The stored value is the generation
+    // time of the 200, while RFC 9110 15.4.5 requires the 304 to carry the
+    // `Date` the server would have sent for a 200 generated now. Copying it
+    // made every 304 report the age of the entry instead, so a fresh one is
+    // stamped below.
     //
     // Content-Length is deliberately NOT carried: RFC 9110 8.6 allows it on a
     // 304 only when it equals the 200's length, and getting that wrong is
     // worse than omitting it. The serialisers set framing for a bodyless
     // response themselves.
-    cached_headers
+    let mut out: Vec<(String, String)> = cached_headers
         .iter()
         .filter(|(k, _)| {
             let k = k.to_ascii_lowercase();
@@ -228,12 +252,16 @@ pub fn not_modified_headers(cached_headers: &[(String, String)]) -> Vec<(String,
                 || k == "last-modified"
                 || k == "cache-control"
                 || k == "vary"
-                || k == "date"
                 || k == "expires"
                 || k == "content-location"
         })
         .cloned()
-        .collect()
+        .collect();
+    out.push((
+        "date".to_string(),
+        httpdate::fmt_http_date(crate::platform::wall()),
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -256,7 +284,7 @@ mod precondition_tests {
             .collect()
     }
     fn eval(h: &[(&str, &str)], method: &str) -> Precondition {
-        evaluate_preconditions(&stored(), &req(h)[..], method)
+        evaluate_preconditions(200, &stored(), &req(h)[..], method)
     }
 
     /// F003. `If-None-Match` uses the WEAK comparison function (RFC 9110
@@ -306,14 +334,49 @@ mod precondition_tests {
         let request = |value: &str| vec![("if-none-match".to_string(), value.to_string())];
 
         assert_eq!(
-            evaluate_preconditions(&no_validators, &request("*")[..], "GET"),
+            evaluate_preconditions(200, &no_validators, &request("*")[..], "GET"),
             Precondition::NotModified,
             "* matches because the stored response exists"
         );
         assert_eq!(
-            evaluate_preconditions(&no_validators, &request("\"abc\"")[..], "GET"),
+            evaluate_preconditions(200, &no_validators, &request("\"abc\"")[..], "GET"),
             Precondition::Proceed,
             "no stored ETag means no comparison, so no 304"
+        );
+    }
+
+    /// RFC 9111 4.3.2 confines a cache's conditional evaluation to a stored
+    /// 200 or 206, and RFC 9110 13.1.2 step 1 makes `*` false when there is no
+    /// current representation. A stored 404 or 410 is not one, so neither `*`
+    /// nor a validator that happens to be stored on it may turn the miss into
+    /// a 304.
+    #[test]
+    fn a_stored_404_is_not_a_representation_to_revalidate() {
+        let stored_404 = vec![
+            ("ETag".to_string(), "\"missing\"".to_string()),
+            (
+                "Cache-Control".to_string(),
+                "public, max-age=60".to_string(),
+            ),
+        ];
+        for status in [404u16, 410] {
+            for value in ["*", "\"missing\""] {
+                let request = req(&[("if-none-match", value)]);
+                assert_eq!(
+                    evaluate_preconditions(status, &stored_404, &request[..], "GET"),
+                    Precondition::Proceed,
+                    "a stored {status} with If-None-Match: {value} must not be a 304"
+                );
+            }
+        }
+
+        // The same existence test in step 1: the resource does not exist, so
+        // If-Match is false and the request must not be applied.
+        let if_match = req(&[("if-match", "*")]);
+        assert_eq!(
+            evaluate_preconditions(404, &stored_404, &if_match[..], "PUT"),
+            Precondition::Failed,
+            "If-Match: * is false when the stored response is a 404"
         );
     }
 
@@ -455,6 +518,40 @@ mod precondition_tests {
         assert_eq!(
             eval(&[("accept", "text/html")], "GET"),
             Precondition::Proceed
+        );
+    }
+}
+
+#[cfg(test)]
+mod not_modified_header_tests {
+    use super::not_modified_headers;
+
+    /// RFC 9110 15.4.5: a 304 carries the `Date` a 200 would have carried,
+    /// which is the time the 304 is generated. The stored entry's `Date` is
+    /// when the 200 was generated, so copying it made every 304 report the
+    /// age of the entry.
+    #[test]
+    fn a_stored_date_is_replaced_by_the_generation_time() {
+        let old = "Sat, 05 Sep 2026 12:00:01 GMT";
+        let stored = vec![
+            ("etag".to_string(), "\"x\"".to_string()),
+            ("date".to_string(), old.to_string()),
+        ];
+        let out = not_modified_headers(&stored);
+        let dates: Vec<&str> = out
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("date"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(dates.len(), 1, "the 304 must carry exactly one Date");
+        assert_ne!(dates[0], old, "the 304 copied the stored generation time");
+        let parsed = httpdate::parse_http_date(dates[0]).expect("the Date must parse");
+        let age = crate::platform::wall()
+            .duration_since(parsed)
+            .unwrap_or_default();
+        assert!(
+            age.as_secs() < 5,
+            "the Date is {age:?} old, so it is not the generation time"
         );
     }
 }

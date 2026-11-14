@@ -1183,6 +1183,17 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
     }
 }
 
+/// May a response with this status carry `Content-Length` at all?
+///
+/// RFC 9110 8.6: a 1xx or 204 MUST NOT have one. A 304 MAY have one only when
+/// it equals the length the 200 would have sent, and this writer does not know
+/// that value, so the safe and legal choice is to omit it. Emitting zero is the
+/// harmful choice: the 200 for the resource is not empty, so a client updating
+/// its stored entry from the 304 would conclude the body it holds is wrong.
+fn status_may_have_content_length(status: u16) -> bool {
+    !(status == 204 || status == 304 || (100..200).contains(&status))
+}
+
 /// Write a response head into `w`, with no buffering of its own.
 ///
 /// The one place the status line, the caller's fields, `Content-Length` and the
@@ -1218,17 +1229,19 @@ fn write_head_to<'a, W: std::io::Write>(
     if let Some(hash) = etag {
         write!(w, "ETag: \"{hash:x}\"\r\n")?;
     }
+    if status_may_have_content_length(status) {
+        write!(w, "Content-Length: {length}\r\n")?;
+    }
     write!(
         w,
-        "Content-Length: {}\r\nConnection: {}\r\n\r\n",
-        length,
+        "Connection: {}\r\n\r\n",
         if keep_alive { "keep-alive" } else { "close" }
     )?;
 
     // RFC 9110 9.3.2. A 304 and a 204 have no body either (RFC 9110 15.4.5,
     // 15.3.5), and one sent on those is unframed bytes the peer will read
     // as the start of the next response.
-    Ok(is_head || status == 204 || status == 304 || (100..200).contains(&status))
+    Ok(is_head || !status_may_have_content_length(status))
 }
 
 // ── One connection slot ──────────────────────────────────────────────────────
@@ -2495,6 +2508,26 @@ mod stream_tests {
         );
         let split = s.find("\r\n\r\n").unwrap() + 4;
         assert_eq!(s.len() - split, 200_000);
+    }
+
+    /// RFC 9110 8.6. m6-file's 304 went through this writer and carried
+    /// `Content-Length: 0`, telling a client updating its stored entry that
+    /// the representation is empty. A 304 cannot claim a length this writer
+    /// does not know, so it sends none.
+    #[test]
+    fn a_304_carries_no_content_length() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut resp = Responder::new(&mut out, "GET", true);
+            resp.send(304, &[("ETag", "\"x\"")], b"").expect("304");
+        }
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.to_lowercase().contains("content-length"),
+            "a 304 carried Content-Length:\n{s}"
+        );
+        assert!(s.contains("ETag: \"x\""), "a 304 lost its validator:\n{s}");
+        assert!(s.ends_with("\r\n\r\n"), "a 304 has no body:\n{s}");
     }
 
     /// A reader that ends early must fail, not quietly send a short body.

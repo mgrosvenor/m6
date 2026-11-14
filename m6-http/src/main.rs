@@ -768,7 +768,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         let chan = Channel::new(http_version, iface);
-        let precond = evaluate_preconditions(&cached.headers, headers, method);
+        let precond = evaluate_preconditions(cached.status, &cached.headers, headers, method);
         state.stats.record(
             elapsed_ns,
             true,
@@ -2554,7 +2554,12 @@ fn handle_h3_request(
         let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
-        let precond = evaluate_preconditions(&cached.headers, &H3Headers(&req.headers), method_str);
+        let precond = evaluate_preconditions(
+            cached.status,
+            &cached.headers,
+            &H3Headers(&req.headers),
+            method_str,
+        );
         // See the h1/h2 paths: recorded after preconditions so a 304 is
         // counted as a 304 and not as the cached 200.
         state.stats.record(
