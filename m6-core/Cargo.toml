@@ -23,6 +23,11 @@ default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
 # links it; enable it from a crate's [dev-dependencies] entry.
 testkit = ["dep:rustls-pki-types"]
+# Record a backtrace per allocation, so a test can say where one request's
+# allocations come from. Test instrumentation, off by default: no release build
+# and no ordinary test build compiles the recording code, and only the
+# diagnostic `alloc_sites` target asks for it.
+alloc-trace = []
 
 # Request/response extras, off by default so a binary links only what it uses.
 # `multipart` gates the multipart body parser and the streaming types it needs.
@@ -189,6 +194,15 @@ required-features = ["testkit"]
 name    = "request_allocs"
 harness = false
 required-features = ["testkit"]
+
+# Where one measured request's allocations come from: the same windows
+# `request_allocs` counts, with `alloc_count`'s backtrace recording on. It
+# prints a grouped list for a diff between two trees, and is a diagnostic, not
+# a gate.
+[[test]]
+name    = "alloc_sites"
+harness = false
+required-features = ["testkit", "alloc-trace"]
 
 [[bench]]
 name    = "critical_path"
