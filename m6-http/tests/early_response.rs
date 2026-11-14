@@ -119,15 +119,23 @@ fn serve_socket(mut stream: UnixStream, mode: Refusal) {
 /// (`a_tls_backend_that_answers_early_is_read_while_writing`). A peer that
 /// drops the socket with request bytes unread makes the close a reset on Linux,
 /// and a reset discards a reply the client has not read yet. So the peer
-/// notifies, shuts its write half, waits until the client has the reply, and
-/// only then drains the remainder and closes.
+/// notifies, shuts its write half, and drains the remainder before it closes,
+/// so that the close is not a reset while bytes are still arriving.
+///
+/// The drain is bounded by a 500 ms read timeout and a 5 s cap, so it does not
+/// wait for the client's close: it ends at the first quiet half second. That
+/// narrows the reset window rather than closing it, and it is the reason a
+/// client that resumes writing after the quiet window can still meet a reset.
+/// It is a bound first, because a test that cannot end is worse than one that
+/// tests slightly less.
 trait EarlyClose: Read + Write {
     /// Send the transport's end-of-reply signal, where the transport has one.
     fn notify_end(&mut self);
     /// Shut the write half, so the client sees the complete reply, then EOF.
     fn shutdown_write(&mut self);
-    /// Wait for the client to close and drain what it sent until then. Bounded
-    /// so a failed test cannot hang this thread.
+    /// Drain what the client sends until it is quiet, bounded so a failed test
+    /// cannot hang this thread. Ends at the first 500 ms of quiet or at 5 s,
+    /// whichever comes first, not at the client's close.
     fn drain_until_closed(&mut self);
 }
 
