@@ -1065,9 +1065,14 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
     );
 }
 
-/// A client that closes while its `/slow` is in flight does not leak the pool
-/// member: when the reply arrives for the gone waiter, the member's in-flight
-/// count returns to 0, so the next two concurrent misses spread across both.
+/// A client that closes while its `/slow` is in flight does not wedge the
+/// server: the held reply for the gone waiter is discarded, and two later
+/// `/slow` requests both answer 200.
+///
+/// Round robin spreads those two requests across both members by construction,
+/// so that spread says nothing about a leaked upstream. What this test still
+/// asserts is that a gone waiter's held reply does not stop later requests from
+/// being dispatched and answered.
 #[test]
 fn a_closed_client_does_not_leak_its_upstream() {
     let fx = Fixture::start(2, 30, "leak");
@@ -1094,11 +1099,12 @@ fn a_closed_client_does_not_leak_its_upstream() {
     );
     drop(stream); // the client closes with the request still held by the backend
 
-    // Release member A's held reply; it lands on a gone waiter, so the member
-    // must be released back to the pool.
+    // Release member A's held reply. The loop takes it for a gone waiter and
+    // frees the slot.
     fx.release.store(true, Ordering::SeqCst);
 
-    // Two concurrent /slow must now spread across both members within 2 s.
+    // Under round robin these two concurrent /slow take one member each. Both
+    // must be answered after the gone waiter's held reply.
     let a = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
     let b = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1108,7 +1114,7 @@ fn a_closed_client_does_not_leak_its_upstream() {
         let _ = a.join();
         let _ = b.join();
         panic!(
-            "both members must receive a request after the gone waiter released its member (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
+            "both members must receive a request after the gone waiter's held reply was handled (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
             fx.service.output()
         );
     }

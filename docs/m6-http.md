@@ -455,6 +455,7 @@ Structured JSON to stdout. journald captures via systemd.
 Emitted events: startup, request complete (path, status, backend, latency_us, cache_hit), auth failure (warn), pool change (info), cache eviction (debug).
 
 Periodic stats: `requests`, `rps_avg`, `rps_peak`, `latency_p50_us`, `latency_p99_us`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`.
+`pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
 
 ---
 

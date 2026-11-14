@@ -25,27 +25,16 @@
 //! monitor at `origin.`/`edge-a.`/`edge-b.` and the answer names the node that
 //! produced it.
 //!
-//! # Health means "this node can serve", not "the fleet is fine"
+//! # What `/health` answers for
 //!
-//! The two node roles have genuinely different backend shapes, and conflating
-//! them produces a health check that lies:
+//! `/health` answers for the m6-http process alone. Its socket pools keep no
+//! per-member health state, so a dead member cannot change the answer. A
+//! request that connects to a dead member takes the next member, and that is
+//! where the failure is found.
 //!
-//! - The **origin** has unix-socket pools (m6-html, m6-file, the renderers).
-//!   If every socket in a pool is gone, that pool cannot serve, and the node
-//!   is degraded.
-//! - A **cache node** has one URL backend (the origin over h2c) and *no*
-//!   socket pools at all. `total_active_members()` counts only socket pools,
-//!   so it reads 0 on every cache node permanently.
-//!
-//! A naive "0 members means unhealthy" check would therefore report both edge
-//! nodes as permanently down. Worse, it would be wrong in the other direction
-//! too: a cache node with a warm cache keeps serving correctly while the
-//! origin is unreachable, which is the entire point of having edges. So an
-//! unreachable origin is deliberately *not* this node's health problem.
-//!
-//! What is reported is strictly what this node can answer for: every
-//! configured socket pool has at least one live member. That is checkable
-//! locally, cheaply, and without a network round trip that could itself hang.
+//! A URL backend is outside that answer too. Proving one reachable would put a
+//! network round trip inside the check, and a warm cache keeps serving while
+//! the origin is unreachable.
 //!
 //! # Two endpoints, because they have opposite requirements
 //!
@@ -176,13 +165,12 @@ pub fn metrics_authorised(headers: &[(String, String)], configured_token: Option
         .unwrap_or(false)
 }
 
-/// One socket-backed backend pool's occupancy.
+/// One socket-backed backend pool's size.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoolHealth {
     pub name: String,
-    /// Members currently available (not marked failed).
-    pub active: usize,
-    /// Members known to the pool, including temporarily unavailable ones.
+    /// Members the pool holds. The pool keeps no per-member health state, so
+    /// every member stays in rotation.
     pub total: usize,
 }
 
@@ -203,7 +191,8 @@ pub struct PoolHealth {
 /// `/perf` now, which is token-gated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthReport {
-    /// `"ok"` or `"degraded"`.
+    /// `"ok"`. A node running an older m6-http could still send `"degraded"`,
+    /// which the monitor reads as a fault.
     ///
     /// `String` rather than `&'static str` because an aggregator reads this
     /// back off the wire and cannot produce a `'static` one.
@@ -319,29 +308,22 @@ fn executable_md5() -> String {
 impl HealthReport {
     /// Build a report and the HTTP status that should carry it.
     ///
-    /// Degraded when any configured socket pool has no live member. A node
-    /// with no socket pools at all (every cache node) is not degraded by
-    /// that fact alone.
-    /// `pools` decides the verdict and is not reported. The status code still
-    /// carries the whole answer a monitor acts on, and `/perf` has the detail
-    /// for whoever is allowed to see which pool went quiet.
-    pub fn build(node: &str, pools: &[PoolHealth]) -> (u16, HealthReport) {
-        let degraded = pools.iter().any(|p| p.active == 0);
-        let status = if degraded { "degraded" } else { "ok" }.to_string();
-        // 503 is the honest code: the node is up enough to answer, but not
-        // able to serve. A monitor treating any non-2xx as down is then
-        // correct without needing to parse the body.
-        //
-        // Deliberately never derived from performance. A latency spike is a
-        // signal for a human or a dashboard to act on, not grounds for a node
-        // to declare itself down and be pulled from rotation while it is
-        // still serving every request correctly. That is also why the numbers
-        // live on `/perf` and not here.
-        let code = if degraded { 503 } else { 200 };
+    /// The answer is always 200 `ok`. A socket pool keeps no per-member
+    /// health state, so this process cannot judge one degraded, and `config`
+    /// refuses a pool with no members at start. Backend liveness is not part
+    /// of the answer: a dead member is found when a request connects to it,
+    /// and that request takes the next member.
+    ///
+    /// Deliberately never derived from performance. A latency spike is a
+    /// signal for a human or a dashboard to act on, not grounds for a node
+    /// to declare itself down and be pulled from rotation while it is
+    /// still serving every request correctly. That is also why the numbers
+    /// live on `/perf` and not here.
+    pub fn build(node: &str) -> (u16, HealthReport) {
         (
-            code,
+            200,
             HealthReport {
-                status,
+                status: "ok".to_string(),
                 node: node.to_string(),
             },
         )
@@ -357,7 +339,7 @@ impl HealthReport {
             // A serialisation failure here is not a reason to fail the health
             // check with an unparseable body; fall back to something a
             // monitor can still read.
-            .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
+            .unwrap_or_else(|_| br#"{"status":"ok"}"#.to_vec());
         let headers = vec![
             (
                 "Content-Type".to_string(),
@@ -605,60 +587,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn pool(name: &str, active: usize, total: usize) -> PoolHealth {
-        PoolHealth {
-            name: name.to_string(),
-            active,
-            total,
-        }
-    }
-
     #[test]
-    fn origin_with_live_pools_is_ok() {
-        let (code, report) =
-            HealthReport::build("origin", &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)]);
+    fn health_is_ok_and_names_the_node() {
+        let (code, report) = HealthReport::build("origin");
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
         assert_eq!(report.node, "origin");
     }
 
-    /// The regression this endpoint most needs to not have.
-    ///
-    /// A cache node has no socket pools at all, so `total_active_members()`
-    /// reads 0 on a cache node at all times. Deriving health from that count alone
-    /// reports every cache node as permanently down.
-    #[test]
-    fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
-        let (code, report) = HealthReport::build("edge-a", &[]);
-        assert_eq!(
-            code, 200,
-            "a cache node has no socket pools and is not degraded for it"
-        );
-        assert_eq!(report.status, "ok");
-    }
-
-    #[test]
-    fn an_empty_pool_degrades_the_node() {
-        let (code, report) = HealthReport::build(
-            "origin",
-            &[pool("m6-html", 1, 1), pool("render-contact", 0, 1)],
-        );
-        assert_eq!(code, 503);
-        assert_eq!(report.status, "degraded");
-    }
-
-    /// A member marked failed still counts in `total`, so a pool that has
-    /// members but none available must degrade. Reading `total` instead of
-    /// `active` would call this healthy.
-    #[test]
-    fn members_present_but_all_failed_is_degraded() {
-        let (code, _) = HealthReport::build("origin", &[pool("m6-html", 0, 3)]);
-        assert_eq!(code, 503);
-    }
-
     #[test]
     fn response_is_never_stored_and_never_indexed() {
-        let (code, report) = HealthReport::build("origin", &[]);
+        let (code, report) = HealthReport::build("origin");
         let (code, headers, body) = report.into_response(code);
         assert_eq!(code, 200);
         let get = |k: &str| {
@@ -1039,7 +978,10 @@ mod tests {
             PerfSubject {
                 node: "origin",
                 uptime_s: 11,
-                pools: vec![pool("m6-html", 1, 1)],
+                pools: vec![PoolHealth {
+                    name: "m6-html".to_string(),
+                    total: 1,
+                }],
                 url_backends: vec!["origin".to_string()],
                 host_path: Path::new("/"),
             },
@@ -1082,7 +1024,7 @@ mod tests {
     /// test whose name says why that is a decision and not a formality.
     #[test]
     fn public_payload_is_exactly_status_and_node() {
-        let (code, report) = HealthReport::build("origin", &[pool("m6-html", 1, 1)]);
+        let (code, report) = HealthReport::build("origin");
         let (_, _, body) = report.into_response(code);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let object = parsed.as_object().expect("object");

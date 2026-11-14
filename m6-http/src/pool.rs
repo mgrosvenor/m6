@@ -400,19 +400,16 @@ impl PoolManager {
         self.pools.iter().map(|(_, p)| p.total_count()).sum()
     }
 
-    /// Per-pool member counts for the health endpoint.
+    /// Per-pool member counts for `/perf`.
     ///
-    /// Both numbers are the members the pool holds: the pool carries no
-    /// per-member health state, so every member stays in rotation. A member
-    /// whose backend is down is found when a request connects to it, and that
-    /// request takes the next member.
-    pub fn pool_health(&self) -> Vec<(String, usize, usize)> {
+    /// This is the count alone: the pool carries no per-member health state,
+    /// so every member stays in rotation. A member whose backend is down is
+    /// found when a request connects to it, and that request takes the next
+    /// member.
+    pub fn pool_health(&self) -> Vec<(String, usize)> {
         self.pools
             .iter()
-            .map(|(name, p)| {
-                let count = p.total_count();
-                (name.clone(), count, count)
-            })
+            .map(|(name, p)| (name.clone(), p.total_count()))
             .collect()
     }
 
