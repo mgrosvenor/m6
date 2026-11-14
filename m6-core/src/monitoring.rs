@@ -166,6 +166,11 @@ pub fn metrics_authorised(headers: &[(String, String)], configured_token: Option
 }
 
 /// One socket-backed backend pool's size.
+///
+/// A node built before the pool lost its health state sent an `active` field
+/// beside the count. A monitor of that build cannot read a newer node's report,
+/// because the field it requires is gone, so the monitor is upgraded before the
+/// nodes it watches. A newer monitor reads an older node's report unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoolHealth {
     pub name: String,

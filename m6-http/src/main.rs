@@ -3742,9 +3742,10 @@ fn handle_request_inner(
             return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
         }
         Err(SocketLaunchError::BacklogFull) => {
-            // Every member's listen queue is full: the members are alive and
-            // busy (E2, the kernel is the queue). Release the slot and answer
-            // 503.
+            // Either every member's listen queue was full, or this service ran
+            // out of its own upstream slots or tokens. Both mean the node is
+            // busy rather than a backend being wrong, so the answer is 503 and
+            // the detail says which. The slot was released on the way here.
             return backend_unavailable(
                 req,
                 client_ip,
@@ -3752,7 +3753,7 @@ fn handle_request_inner(
                 registry,
                 &route.path,
                 &backend_name,
-                "backend listen queue full",
+                "no upstream slot, or every backend listen queue full",
             );
         }
         Err(SocketLaunchError::Connect(e)) => {
