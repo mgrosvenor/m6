@@ -94,7 +94,7 @@ static PULSE: LogPulse = LogPulse::new();
 fn process_start() -> std::time::Instant {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    *START.get_or_init(std::time::Instant::now)
+    *START.get_or_init(crate::platform::now)
 }
 
 fn elapsed_ms() -> u64 {

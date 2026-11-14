@@ -265,5 +265,5 @@ pub fn pulse() -> &'static LogPulse {
 
 fn elapsed_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    START.get_or_init(m6_platform::now).elapsed().as_millis() as u64
 }

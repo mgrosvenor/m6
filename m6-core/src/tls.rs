@@ -287,7 +287,8 @@ pub fn unreadable() -> usize {
 
 /// The loaded chain's expiries, measured against the clock now.
 pub fn loaded() -> Vec<TlsCertificate> {
-    loaded_at(chrono::Utc::now().timestamp())
+    let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+    loaded_at(now.timestamp())
 }
 
 #[cfg(test)]
@@ -301,7 +302,10 @@ mod tests {
     fn certificate(days: i64) -> (Vec<u8>, i64) {
         let mut params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
-        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+        let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+        let now = time::OffsetDateTime::from_unix_timestamp(now.timestamp())
+            .expect("a wall clock reading is a valid timestamp");
+        let not_after = now + time::Duration::days(days);
         // Whole seconds, because that is all notAfter can carry and the
         // comparison below has to be exact rather than within a second.
         let not_after = not_after.replace_nanosecond(0).expect("whole second");
@@ -325,7 +329,8 @@ mod tests {
         let (der, expected) = certificate(-5);
         let not_after = not_after_unix(&der).expect("parses");
         assert_eq!(not_after, expected);
-        let now = chrono::Utc::now().timestamp();
+        let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+        let now = now.timestamp();
         assert!(not_after - now < 0, "expected a negative remainder");
     }
 
