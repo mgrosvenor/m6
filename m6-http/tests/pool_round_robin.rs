@@ -289,6 +289,27 @@ fn four_members_each_serve_k_times() {
     each_member_serves_k_times(&["a", "b", "c", "d"], 3);
 }
 
+/// Every member dead is a 502, and that is a different answer from a busy
+/// member, so it needs its own test: the walk that tries each member is the
+/// only thing that turns "all failed" into one status rather than another.
+#[test]
+fn every_member_dead_is_a_502() {
+    let mut fx = Fixture::start(&["a", "b"]);
+    let port = fx.front_end.port;
+
+    // Both members are gone before the request, so every connect in the walk
+    // fails and there is no success to report.
+    for backend in &mut fx.backends {
+        backend.crash();
+    }
+
+    let (status, body) = get(port, "/").expect("the front end answers");
+    assert_eq!(
+        status, 502,
+        "every member failing is a bad gateway, and the body is {body}"
+    );
+}
+
 #[test]
 fn a_dead_member_is_skipped_and_serves_again_in_turn_after_restart() {
     let fx = Fixture::start(&["a", "b", "c"]);
