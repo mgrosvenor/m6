@@ -1184,6 +1184,50 @@ mod directories {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
     }
 
+    /// D3a. Break: a fixed system path preferred to the temp directory the
+    /// process was given, so a sandbox that denies `/var/tmp` fails every
+    /// compiled asset with `PermissionDenied`.
+    #[test]
+    fn the_scratch_directory_is_the_one_tmpdir_names() {
+        let exe = std::env::current_exe().expect("current_exe");
+        // The directory has to be one a program can be *run* from, because
+        // that is what the probe checks: it compiles a script and executes it.
+        // `/var/tmp` is where that works on this platform, and a TMPDIR under a
+        // `noexec` mount is correctly refused by the probe, which would make
+        // this test assert the opposite of the contract.
+        let dir = match tempfile::tempdir_in("/var/tmp") {
+            Ok(dir) => dir,
+            Err(e) => {
+                // A host with no writable /var/tmp cannot run this contract at
+                // all. Say so by name rather than pass or fail on it.
+                println!("D3a needs a writable /var/tmp to prove TMPDIR wins: {e}");
+                return;
+            }
+        };
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "directories::scratch_dir_is_respected_inside",
+            ])
+            .env("TMPDIR", dir.path())
+            .output()
+            .expect("run the inner test");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{text}");
+        assert!(
+            text.contains(&format!("inner: {}", dir.path().display())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by the_scratch_directory_is_the_one_tmpdir_names with TMPDIR set"]
+    fn scratch_dir_is_respected_inside() {
+        println!("inner: {}", platform::scratch_dir().display());
+    }
+
     /// D4. Break: a path that drifts between services.
     #[test]
     fn the_runtime_directory_is_fixed() {

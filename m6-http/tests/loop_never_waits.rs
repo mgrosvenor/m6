@@ -467,14 +467,19 @@ fn h3_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
 // ── The m6-http fixture ───────────────────────────────────────────────────────
 
 struct Fixture {
-    _dir: tempfile::TempDir,
-    _claim: PortClaim,
     port: u16,
     service: Service,
     _backends: Vec<Backend>,
     slow_seens: Vec<mpsc::Receiver<()>>,
     large_seens: Vec<mpsc::Receiver<()>>,
     release: Arc<AtomicBool>,
+    // Field order is drop order. The service and its backends stop before the
+    // port is released and before the directory they served from is removed.
+    // A claim declared first released the port while m6-http still held it, so
+    // `PortClaim::drop` waited its full five seconds for a bind that could not
+    // succeed.
+    _dir: tempfile::TempDir,
+    _claim: PortClaim,
 }
 
 impl Fixture {
@@ -511,14 +516,14 @@ impl Fixture {
         service.wait_for_tcp(port, Duration::from_secs(20));
 
         Fixture {
-            _dir: dir,
-            _claim: claim,
             port,
             service,
             _backends: backends,
             slow_seens,
             large_seens,
             release,
+            _dir: dir,
+            _claim: claim,
         }
     }
 

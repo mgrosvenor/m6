@@ -1533,7 +1533,8 @@ impl FrameworkState {
         dict.insert("cookies".to_string(), Value::Object(cookies_map.clone()));
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
-        let now = chrono::Utc::now();
+        // The reading comes from the layer and chrono only formats it.
+        let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
         dict.insert(
             "request_path".to_string(),
             Value::String(raw.path().to_string()),
@@ -2530,8 +2531,9 @@ mod tests {
         assert!(mtime1.is_some());
 
         // Touch by setting mtime explicitly via filetime.
+        let now: std::time::SystemTime = crate::platform::wall();
         let future =
-            filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() + 1, 0);
+            filetime::FileTime::from_unix_time(filetime::FileTime::from(now).unix_seconds() + 1, 0);
         filetime::set_file_mtime(f.path(), future).unwrap();
 
         let mtime2 = file_mtime(f.path());
@@ -3307,7 +3309,7 @@ mod dict_cost {
         println!(
             "8. now() + both formats   {:>7}",
             median(N, || {
-                let n = chrono::Utc::now();
+                let n: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
                 std::hint::black_box((
                     n.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                     n.format("%Y").to_string(),
