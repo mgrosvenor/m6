@@ -134,7 +134,8 @@ fn serve(mut stream: UnixStream, body: &'static str, served: &AtomicUsize) {
 
 /// A front end on a claimed loopback port, killed when it drops.
 struct FrontEnd {
-    service: Service,
+    // Only a drop guard: dropping it stops the child and reaps it.
+    _service: Service,
     port: u16,
     _claim: PortClaim,
 }
@@ -160,7 +161,7 @@ impl FrontEnd {
         );
         service.wait_for_tcp(port, Duration::from_secs(20));
         FrontEnd {
-            service,
+            _service: service,
             port,
             _claim: claim,
         }
