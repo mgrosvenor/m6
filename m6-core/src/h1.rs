@@ -597,16 +597,32 @@ impl<'a> RequestHead<'a> {
 /// because its refusal is 414 and a long line must not be reported as the 400 a
 /// long head earns.
 pub fn incomplete_head_status(buf: &[u8]) -> Option<HeadError> {
+    let buf_all = buf;
+    let buf = &buf[request_line_start(buf)..];
     match buf.windows(2).position(|w| w == b"\r\n") {
         None => (buf.len() > MAX_HEADER_LINE).then_some(HeadError::RequestLineTooLong),
         Some(line_end) => {
             if line_end > MAX_HEADER_LINE {
                 Some(HeadError::RequestLineTooLong)
-            } else if buf.len() > MAX_REQUEST_HEAD {
+            } else if buf_all.len() > MAX_REQUEST_HEAD {
                 Some(HeadError::HeadTooLarge)
             } else {
                 None
             }
+        }
+    }
+}
+
+/// Offset of the request line: past the empty lines httparse skips before it
+/// (RFC 9112 section 2.2), CRLF or bare LF, so the length checked is the length
+/// parsed.
+fn request_line_start(buf: &[u8]) -> usize {
+    let mut i = 0;
+    loop {
+        match buf[i..] {
+            [b'\r', b'\n', ..] => i += 2,
+            [b'\n', ..] => i += 1,
+            _ => return i,
         }
     }
 }
@@ -670,7 +686,8 @@ fn finish_head<'a>(
     // has its own limit, and a head over it is a 414 rather than the 400 a
     // field or the whole head earns. `body_offset` is the byte after the
     // closing blank line, so it is the head's length.
-    let line_len = buf[..body_offset]
+    let line_start = request_line_start(buf);
+    let line_len = buf[line_start..body_offset]
         .windows(2)
         .position(|w| w == b"\r\n")
         .unwrap_or(body_offset);
@@ -2590,6 +2607,46 @@ mod parse_head_tests {
             parse_head(line_over.as_bytes(), &mut [httparse::EMPTY_HEADER; 64]),
             HeadResult::Error(HeadError::RequestLineTooLong)
         ));
+    }
+
+    /// Empty lines before the request line are skipped by the parser, so they
+    /// are skipped by the length check too.
+    #[test]
+    fn leading_empty_lines_do_not_hide_a_long_request_line() {
+        let target = MAX_HEADER_LINE - "GET ".len() - " HTTP/1.1".len();
+        for lead in ["\r\n", "\r\n\r\n", "\n", "\r\n\n"] {
+            let at = format!(
+                "{lead}GET /{} HTTP/1.1\r\nHost: x\r\n\r\n",
+                "a".repeat(target - 1)
+            );
+            // A bare LF is refused later as malformed, but never as too long.
+            assert!(
+                !matches!(
+                    parse_head(at.as_bytes(), &mut [httparse::EMPTY_HEADER; 64]),
+                    HeadResult::Error(HeadError::RequestLineTooLong)
+                ),
+                "at the limit after {lead:?}"
+            );
+            let over = format!(
+                "{lead}GET /{} HTTP/1.1\r\nHost: x\r\n\r\n",
+                "a".repeat(target)
+            );
+            assert!(
+                matches!(
+                    parse_head(over.as_bytes(), &mut [httparse::EMPTY_HEADER; 64]),
+                    HeadResult::Error(HeadError::RequestLineTooLong)
+                ),
+                "over the limit after {lead:?}"
+            );
+            assert_eq!(
+                incomplete_head_status(&over.as_bytes()[..over.len() - 13]),
+                Some(HeadError::RequestLineTooLong)
+            );
+            assert_eq!(
+                incomplete_head_status(&at.as_bytes()[..at.len() - 13]),
+                None
+            );
+        }
     }
 
     /// A head over `MAX_REQUEST_HEAD` is the head refusal, which answers 400.

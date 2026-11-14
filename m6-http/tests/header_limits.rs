@@ -850,6 +850,28 @@ fn h1_refuses_a_request_line_one_byte_over_the_header_line_limit() {
 }
 
 #[test]
+fn h1_serves_a_request_line_at_the_limit_after_leading_empty_lines() {
+    let s = Stack::start();
+    let head = format!(
+        "\r\n\r\n{}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        request_line("/", HEADER_LINE_LIMIT)
+    );
+    let reply = s.h1(head.as_bytes());
+    assert_eq!(reply.status, 200, "body was {:?}", reply.text());
+}
+
+#[test]
+fn h1_refuses_a_request_line_over_the_limit_after_leading_empty_lines() {
+    let s = Stack::start();
+    let head = format!(
+        "\r\n\r\n{}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        request_line("/never/", HEADER_LINE_LIMIT + 1)
+    );
+    let reply = s.h1(head.as_bytes());
+    s.assert_refused(&reply, 414, URI_TITLE);
+}
+
+#[test]
 fn h1_serves_a_head_at_the_head_limit() {
     let s = Stack::start();
     let head = h1_head_of_size(HEAD_LIMIT, "/ok");
@@ -1151,6 +1173,28 @@ fn a_backend_refuses_a_request_line_over_the_header_line_limit() {
         "a backend request line over the limit must be 414; body was {:?}",
         reply.text()
     );
+}
+
+#[test]
+fn a_backend_refuses_a_request_line_over_the_limit_after_leading_empty_lines() {
+    let backend = FileBackend::start();
+    let request = format!(
+        "\r\n{}\r\nHost: localhost\r\n\r\n",
+        request_line("/public/", HEADER_LINE_LIMIT + 1)
+    );
+    let reply = backend.send(request.as_bytes());
+    assert_eq!(reply.status, 414, "body was {:?}", reply.text());
+}
+
+#[test]
+fn a_backend_serves_a_request_line_at_the_limit_after_leading_empty_lines() {
+    let backend = FileBackend::start();
+    let request = format!(
+        "\r\n{}\r\nHost: localhost\r\n\r\n",
+        request_line("/public/index.html?q=", HEADER_LINE_LIMIT)
+    );
+    let reply = backend.send(request.as_bytes());
+    assert_eq!(reply.status, 200, "body was {:?}", reply.text());
 }
 
 #[test]
