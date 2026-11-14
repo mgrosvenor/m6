@@ -72,7 +72,7 @@ pub use http::{header, is_same_origin_path, HeaderSource, RawRequest, RawRespons
 pub use mime::{mime_from_path, should_compress_default};
 pub use negotiate::{canonical_coding, coding_quality, preferred_coding};
 pub use path::validate_path_param;
-pub use random::random_hex_token;
+pub use random::{random_hex_token, random_hex_token_into};
 pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use request::Request;
 pub use response::{Body, Response};
