@@ -211,7 +211,7 @@ fn clock_path_lines(text: &str) -> Vec<usize> {
 /// one line of legal code, so a matcher that only reads `use` misses it.
 fn clock_type_names(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
-    let mut names = vec!["Instant", "SystemTime"];
+    let mut names = vec!["Instant", "SystemTime", "Utc", "Local"];
     names.extend(type_alias_names(text, &mut Vec::new()));
     names.sort_unstable();
     names.dedup();
@@ -227,7 +227,9 @@ fn clock_type_names(text: &str) -> Vec<&str> {
             i += 1;
         }
         let word = &text[start..i];
-        if (word != "Instant" && word != "SystemTime") || is_comment_line(text, start) {
+        if (word != "Instant" && word != "SystemTime" && word != "Utc" && word != "Local")
+            || is_comment_line(text, start)
+        {
             continue;
         }
         let mut j = skip_space(bytes, i);
@@ -283,7 +285,10 @@ fn type_alias_names<'a>(text: &'a str, seen: &mut Vec<&'a str>) -> Vec<&'a str> 
         let rest_start = j;
         let rest_end = text[j..].find([';', '\n']).map_or(text.len(), |k| j + k);
         let rest = &text[rest_start..rest_end];
-        if (rest.contains("Instant") || rest.contains("SystemTime"))
+        if (rest.contains("Instant")
+            || rest.contains("SystemTime")
+            || rest.contains("Utc")
+            || rest.contains("Local"))
             && !seen.contains(&name)
             && !names.contains(&name)
         {
@@ -367,7 +372,8 @@ fn the_clock_rule_catches_every_path_form_and_no_other() {
         ("type Counter = u64;\nlet t = Counter::now();", 0),
         ("let t = m6_core::platform::now();", 0),
         ("let n = m6_core::testkit::alloc_count::now();", 0),
-        ("let t = chrono::Utc::now();", 0),
+        ("let t = chrono::Utc::now();", 1),
+        ("let t = chrono::Local::now();", 1),
         ("let t = clock.now();", 0),
         ("let t = now();", 0),
         (
