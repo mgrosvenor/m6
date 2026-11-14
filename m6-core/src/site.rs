@@ -503,27 +503,31 @@ impl Site {
                 if level.gzip > 0 {
                     candidates.push("gzip");
                 }
-                let plain = resp.body.as_bytes().map(|b| b.to_vec());
-                match (crate::preferred_coding(accept_encoding, &candidates), plain) {
-                    (Some("br"), Some(bytes)) => {
-                        if let Ok(compressed) =
-                            crate::compress::brotli_compress(&bytes, level.brotli)
-                        {
-                            resp.body = crate::response::Body::Bytes(compressed);
-                            resp.headers
-                                .push(("Content-Encoding".to_string(), "br".to_string()));
-                        }
-                    }
-                    (Some("gzip"), Some(bytes)) => {
-                        if let Ok(compressed) = crate::compress::gzip_compress(&bytes, level.gzip) {
-                            resp.body = crate::response::Body::Bytes(compressed);
-                            resp.headers
-                                .push(("Content-Encoding".to_string(), "gzip".to_string()));
-                        }
-                    }
+                // Compress from the body while it is still borrowed: the
+                // compressed bytes are built before the borrow ends, so a
+                // request that asks for `identity` never copies a body it
+                // sends unchanged.
+                let coded = match crate::preferred_coding(accept_encoding, &candidates) {
+                    Some("br") => resp
+                        .body
+                        .as_bytes()
+                        .and_then(|bytes| {
+                            crate::compress::brotli_compress(bytes, level.brotli).ok()
+                        })
+                        .map(|compressed| ("br", compressed)),
+                    Some("gzip") => resp
+                        .body
+                        .as_bytes()
+                        .and_then(|bytes| crate::compress::gzip_compress(bytes, level.gzip).ok())
+                        .map(|compressed| ("gzip", compressed)),
                     // Nothing acceptable: send identity rather than a 406,
                     // which RFC 9110 12.5.3 permits.
-                    _ => {}
+                    _ => None,
+                };
+                if let Some((coding, compressed)) = coded {
+                    resp.body = crate::response::Body::Bytes(compressed);
+                    resp.headers
+                        .push(("Content-Encoding".to_string(), coding.to_string()));
                 }
             }
         }
