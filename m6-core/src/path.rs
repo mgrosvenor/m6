@@ -14,6 +14,12 @@
 //! Whether slashes are allowed is decided by the **route**, not by the
 //! parameter's name: a `{*name}` wildcard capture spans segments and an
 //! ordinary `{name}` does not.
+//!
+//! The module also answers where a site-relative path points once every
+//! symlink in it is followed, so the request file helpers and `m6-file` cannot
+//! disagree about whether a path leaves the site.
+
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathParamError {
@@ -81,18 +87,80 @@ pub fn validate_path_param(value: &str, allow_slash: bool) -> Result<&str, PathP
     Ok(value)
 }
 
-// `safe_resolve` and `normalize_path` were removed here, deliberately, rather
-// than kept for later.
-//
-// They were a lexical root-confinement check with no callers anywhere in the
-// workspace. Root confinement does belong in core, and the version that should
-// fill that slot is `m6-file`'s, which is symlink-aware: it canonicalises when
-// a symlink is actually present, and a purely lexical check cannot see one
-// pointing out of the root at all. Promoting the weaker one now, on the
-// grounds that it happened to be here, is how a second implementation appears.
-//
-// Recoverable from git if the lexical form is ever wanted for paths that do
-// not exist on disk.
+/// Why [`resolve_within`] refused a path.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ResolvePathError {
+    #[error("path traversal attempt")]
+    Traversal,
+    #[error("path escapes the site directory")]
+    Escape,
+}
+
+/// Resolve `rel` under `root` with every symlink followed, and refuse it
+/// unless the result is inside `root`.
+///
+/// **The single implementation** for the site-relative file helpers and for
+/// `m6-file`. A lexical check cannot see a symlink at all, and checking only
+/// the last component misses a symlinked directory in the middle of the path.
+/// Both defects came from checking the string the request supplied instead of
+/// the path it resolves to.
+///
+/// `root` is canonicalised, so a site deployed through a symlinked directory
+/// still resolves. A path that does not exist yet cannot be canonicalised
+/// whole: its deepest existing ancestor is canonicalised, the components that
+/// do not exist are appended, and the result is checked. An appended name
+/// cannot be a symlink because its parent does not exist. A dangling symlink
+/// counts as existing and is refused rather than treated as a new name, since
+/// a write through it would create the target outside the root.
+///
+/// A symlink that stays inside `root` resolves to a path that still starts
+/// with the canonical root and is accepted. That is how a site that links
+/// `assets` to `static/assets` keeps working.
+///
+/// `..`, a leading `/` and a Windows prefix are refused before any filesystem
+/// call.
+pub fn resolve_within(root: &Path, rel: &Path) -> Result<PathBuf, ResolvePathError> {
+    let root = root.canonicalize().map_err(|_| ResolvePathError::Escape)?;
+
+    let mut joined = root.clone();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(name) => joined.push(name),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ResolvePathError::Traversal);
+            }
+        }
+    }
+
+    // Walk down to the deepest component that exists. `symlink_metadata` does
+    // not follow the final component, so a dangling symlink stops the walk and
+    // is then refused by the canonicalise below.
+    let mut probe = joined.as_path();
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let existing = loop {
+        if probe.symlink_metadata().is_ok() {
+            break probe;
+        }
+        let Some(name) = probe.file_name() else {
+            return Err(ResolvePathError::Escape);
+        };
+        missing.push(name);
+        probe = probe.parent().ok_or(ResolvePathError::Escape)?;
+    };
+
+    let mut resolved = existing
+        .canonicalize()
+        .map_err(|_| ResolvePathError::Escape)?;
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+
+    if !resolved.starts_with(&root) {
+        return Err(ResolvePathError::Escape);
+    }
+    Ok(resolved)
+}
 
 #[cfg(test)]
 mod tests {
