@@ -172,7 +172,7 @@ fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration>
         m6_core::headers::get(headers, name).and_then(|v| httpdate::parse_http_date(v.trim()).ok())
     };
     let expires = get("expires")?;
-    let date = get("date").unwrap_or_else(std::time::SystemTime::now);
+    let date = get("date").unwrap_or_else(m6_core::platform::wall);
     Some(
         expires
             .duration_since(date)
