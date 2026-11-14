@@ -202,7 +202,7 @@ impl ReopenRecord {
 
     fn record_success(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let unix = std::time::SystemTime::now()
+        let unix = crate::platform::wall()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         self.last_ok_ms.store(elapsed_ms(), Relaxed);
@@ -701,7 +701,7 @@ mod reopen_tests {
         assert_eq!(rec.seconds_since_last_failure(), None);
         rec.record_success();
         assert_eq!(rec.seconds_since_last_success(), Some(0));
-        let now = std::time::SystemTime::now()
+        let now = crate::platform::wall()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();

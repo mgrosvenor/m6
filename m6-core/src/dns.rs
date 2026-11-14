@@ -491,7 +491,7 @@ mod tests {
     use std::net::TcpListener;
     use std::net::UdpSocket as StdUdpSocket;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A test may block; the query under test may not.
     const T: Duration = Duration::from_secs(5);
@@ -613,9 +613,9 @@ mod tests {
                 crate::platform::Interest::READABLE,
             )
             .expect("register the query's socket");
-        let deadline = Instant::now() + T;
+        let deadline = crate::platform::now() + T;
         loop {
-            let now = Instant::now();
+            let now = crate::platform::now();
             assert!(
                 now < deadline,
                 "the query did not answer before its deadline"
@@ -637,7 +637,7 @@ mod tests {
         let mut poll = crate::platform::Poll::new().expect("poll");
         let mut events = crate::platform::Events::with_capacity(4);
         let mut registered = -1;
-        let deadline = Instant::now() + T;
+        let deadline = crate::platform::now() + T;
         loop {
             let fd = confirm.fd();
             if fd != registered {
@@ -650,7 +650,7 @@ mod tests {
                     .expect("register the confirmation's socket");
                 registered = fd;
             }
-            let now = Instant::now();
+            let now = crate::platform::now();
             assert!(
                 now < deadline,
                 "the confirmation did not finish before its deadline"
@@ -1019,10 +1019,10 @@ mod tests {
             server
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .expect("read timeout");
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::platform::now() + Duration::from_secs(2);
             loop {
                 assert!(
-                    Instant::now() < deadline,
+                    crate::platform::now() < deadline,
                     "the closed socket never reported as refused"
                 );
                 // Each send to the closed port provokes the ICMP error that

@@ -326,7 +326,7 @@ impl Poller {
             active: false,
             starting: false,
             outstanding: 0,
-            step_started: vec![Instant::now(); n],
+            step_started: vec![m6_core::platform::now(); n],
             probes: (0..n).map(|_| tunnel::Tally::new()).collect(),
             probe_cursor: 0,
             probing: None,
@@ -668,7 +668,7 @@ impl Poller {
                         n.base_path,
                         hc.path,
                         sep,
-                        std::time::SystemTime::now()
+                        m6_core::platform::wall()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos())
                             .unwrap_or(0)
@@ -1162,7 +1162,7 @@ impl Poller {
             Err(tunnel::Handshake::FileStale { age_s, .. }) => Some(*age_s),
             Err(_) => None,
         };
-        let now_unix = std::time::SystemTime::now()
+        let now_unix = m6_core::platform::wall()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
@@ -1249,12 +1249,12 @@ pub fn drive_to_end(
     const TICK: Duration = Duration::from_secs(1);
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(64);
-    let mut progress = poller.start(&poll, out, Instant::now())?;
+    let mut progress = poller.start(&poll, out, m6_core::platform::now())?;
     loop {
         if let Progress::Done(polled) = progress {
             return Ok(polled);
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         if deadline.is_some_and(|d| now >= d) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1271,7 +1271,7 @@ pub fn drive_to_end(
             let Some(slot) = ev.token().0.checked_sub(CLIENT_BASE) else {
                 continue;
             };
-            progress = poller.drive(&poll, out, slot, Instant::now())?;
+            progress = poller.drive(&poll, out, slot, m6_core::platform::now())?;
             if matches!(progress, Progress::Done(_)) {
                 finished = true;
                 break;
@@ -1280,7 +1280,7 @@ pub fn drive_to_end(
         if finished {
             continue;
         }
-        while let Some(next) = poller.expire(&poll, out, Instant::now())? {
+        while let Some(next) = poller.expire(&poll, out, m6_core::platform::now())? {
             progress = next;
             if matches!(progress, Progress::Done(_)) {
                 break;
@@ -1406,7 +1406,7 @@ mod tests {
         let polled = drive_to_end(
             &mut poller,
             &mut out,
-            Some(Instant::now() + Duration::from_secs(20)),
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
         drop(token_file);
@@ -1537,7 +1537,7 @@ mod tests {
         };
         let mut fleet = fleet_of(n);
         fleet.timeout_ms = 100;
-        let started = Instant::now();
+        let started = m6_core::platform::now();
         let polled = run(&fleet, None);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1726,7 +1726,7 @@ mod tests {
         let polled = drive_to_end(
             &mut poller,
             &mut out,
-            Some(Instant::now() + Duration::from_secs(20)),
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
         seen.join().unwrap();
@@ -1738,7 +1738,7 @@ mod tests {
         // The perf step's deadline is still armed in the old code. It fires
         // now, on a finished node, and must find nothing.
         let poll = Poll::new().unwrap();
-        let later = Instant::now() + Duration::from_secs(1);
+        let later = m6_core::platform::now() + Duration::from_secs(1);
         let mut expired = 0;
         while poller.expire(&poll, &mut out, later).unwrap().is_some() {
             expired += 1;
@@ -1785,7 +1785,7 @@ mod tests {
         let polled = drive_to_end(
             &mut poller,
             &mut out,
-            Some(Instant::now() + Duration::from_secs(20)),
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
         seen.join().unwrap();

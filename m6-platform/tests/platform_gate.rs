@@ -2,7 +2,8 @@
 //!
 //! Every `.rs` file and every `Cargo.toml` in the workspace is read, tests and
 //! benches included. Outside `m6-platform/src/`, no file may name a platform in a `cfg`, name one of
-//! the four OS crates, or read the clock directly. The two OS files must
+//! the four OS crates, read the clock directly in shipping code, or read a
+//! service manager's variable. The two OS files must
 //! define the same items, so a run on one OS sees an arm the other lacks.
 //! `OS-1-TESTS.md` section 9 names the four rules.
 
@@ -123,6 +124,55 @@ fn no_platform_crate_outside_the_layer() {
         }));
     }
     assert_none("G2 (OS crates)", found);
+}
+
+/// G3. No direct clock read outside the layer in shipping code: a loop reads
+/// the clock once per wake through `platform::now`, and the wall clock through
+/// `platform::wall`. A test or a bench may time itself. Break: one
+/// `Instant::now()` in a service's `src/`.
+#[test]
+fn no_direct_clock_read_outside_the_layer() {
+    let root = root();
+    let mut found = Vec::new();
+    for rel in rust_files(&root) {
+        let under = |dir: &str| rel.components().any(|c| c.as_os_str() == dir);
+        if in_layer(&rel) || under("tests") || under("benches") || under("examples") {
+            continue;
+        }
+        found.extend(offending_lines(&root, &rel, &|line| {
+            line.contains("Instant::now()") || line.contains("SystemTime::now()")
+        }));
+    }
+    assert_none("G3 (direct clock reads)", found);
+}
+
+/// G5. No read of a systemd-only variable anywhere outside the layer: m6
+/// never talks to a service manager and never relies on one to create
+/// anything, so the same binary runs under launchd. Break: one
+/// `std::env::var("NOTIFY_SOCKET")` in a service.
+#[test]
+fn no_service_manager_variable_outside_the_layer() {
+    const VARIABLES: [&str; 8] = [
+        "CREDENTIALS_DIRECTORY",
+        "STATE_DIRECTORY",
+        "RUNTIME_DIRECTORY",
+        "NOTIFY_SOCKET",
+        "LISTEN_FDS",
+        "WATCHDOG_USEC",
+        "INVOCATION_ID",
+        "JOURNAL_STREAM",
+    ];
+    let root = root();
+    let mut found = Vec::new();
+    for rel in rust_files(&root) {
+        if in_layer(&rel) {
+            continue;
+        }
+        found.extend(offending_lines(&root, &rel, &|line| {
+            VARIABLES.iter().any(|v| line.contains(v))
+        }));
+    }
+    assert_none("G5 (service manager variables)", found);
 }
 
 /// Whether `line` names the crate `c` as a path (`c::`), a `use` or an

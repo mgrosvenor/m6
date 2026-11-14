@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn touch_then_expired_in_deadline_order() {
         let mut t = Timeouts::new(4, Duration::from_secs(10));
-        let now = Instant::now();
+        let now = crate::platform::now();
         t.touch(Token(0), now);
         t.touch(Token(1), now);
         t.touch(Token(2), now);
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn clear_removes_from_the_middle_head_and_tail() {
         let mut t = Timeouts::new(4, Duration::from_secs(10));
-        let now = Instant::now();
+        let now = crate::platform::now();
         let later = now + Duration::from_secs(11);
 
         t.touch(Token(0), now);
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn timeout_is_capped_at_the_tick() {
         let mut t = Timeouts::new(4, Duration::from_secs(100));
-        let now = Instant::now();
+        let now = crate::platform::now();
         t.touch(Token(0), now);
         let tick = Duration::from_secs(1);
         assert_eq!(t.timeout(now, tick), tick);
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn grow_keeps_existing_deadlines() {
         let mut t = Timeouts::new(2, Duration::from_secs(10));
-        let now = Instant::now();
+        let now = crate::platform::now();
         t.touch(Token(0), now);
         t.touch(Token(1), now);
         t.grow(4);

@@ -133,13 +133,13 @@ impl Service {
     pub fn terminate(&mut self, timeout: Duration) -> ExitStatus {
         self.request(crate::platform::Signal::Shutdown);
         let child = self.child.as_mut().expect("service already reaped");
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::platform::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().ok().flatten() {
                 self.finish_output();
                 return status;
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 let pid = child.id();
                 panic!(
                     "{} (pid {pid}) did not exit within {timeout:?} of SIGTERM\n\
@@ -166,7 +166,7 @@ impl Service {
                 self.finish_output();
                 return Some(status);
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -195,7 +195,7 @@ impl Service {
     /// first: waiting ten seconds for a process that died in fifty
     /// milliseconds wastes time and reports the wrong fact.
     pub fn wait_for_tcp(&mut self, port: u16, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::platform::now() + timeout;
         loop {
             if super::wait::for_tcp(port, Duration::from_millis(25)) {
                 return;
@@ -206,7 +206,7 @@ impl Service {
                     self.death_report(&format!("waiting for port {port}"), status)
                 );
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 panic!(
                     "{} never listened on port {port} within {timeout:?}\n--- output ---\n{}",
                     self.name,
@@ -223,7 +223,7 @@ impl Service {
     /// under a full workspace run, where a dozen stacks start at once: the
     /// server came up with an empty backend pool and answered 502.
     pub fn wait_for_path(&mut self, path: &Path, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::platform::now() + timeout;
         loop {
             if path.exists() {
                 return;
@@ -234,7 +234,7 @@ impl Service {
                     self.death_report(&format!("waiting for {}", path.display()), status)
                 );
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 panic!(
                     "{} never created {} within {timeout:?}\n--- output ---\n{}",
                     self.name,
@@ -312,8 +312,8 @@ impl Drop for Service {
                 // runs and a test that wedges it still gets cleaned up by the
                 // SIGKILL.
                 let _ = crate::platform::send(child.id(), crate::platform::Signal::Shutdown);
-                let deadline = Instant::now() + TERM_GRACE;
-                while Instant::now() < deadline {
+                let deadline = crate::platform::now() + TERM_GRACE;
+                while crate::platform::now() < deadline {
                     if child.try_wait().ok().flatten().is_some() {
                         break;
                     }

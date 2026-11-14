@@ -730,7 +730,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
         );
     }
     let enc_str = m6_core::headers::get(headers, "accept-encoding").unwrap_or("");
-    let start = std::time::Instant::now();
+    let start = m6_core::platform::now();
 
     let cacheable =
         !state.route_table.requires_auth(path) && m6_http_lib::cache::method_may_read_cache(method);
@@ -1349,7 +1349,7 @@ fn complete_h2_streams(
                 quic_port,
                 udp,
                 connections,
-                Instant::now(),
+                m6_core::platform::now(),
             );
             complete_waiter(c.result, ctx, waiter, &mut cx);
         }
@@ -1727,7 +1727,7 @@ fn event_loop(
     // Wait time against work time, per kind of event that woke the loop. An
     // iteration with events of several kinds is counted under its first event.
     let mut trace = LoopTrace::new(&["accept", "conn", "upstream", "udp", "signal", "timeout"]);
-    let mut last = std::time::Instant::now();
+    let mut last = m6_core::platform::now();
     let mut accepting = tcp.is_some() || h2c.is_some();
 
     'run: loop {
@@ -1736,7 +1736,7 @@ fn event_loop(
         // quiche's own timeout over the QUIC connections. Nothing else needs a
         // shorter wait: every reply arrives on a descriptor.
         let tick = std::time::Duration::from_secs(1);
-        let now0 = std::time::Instant::now();
+        let now0 = m6_core::platform::now();
         let mut poll_timeout = state.read_timeouts.timeout(now0, tick);
         poll_timeout = poll_timeout.min(state.h2_idle_timeouts.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.upstream_timeouts.timeout(now0, tick));
@@ -1755,8 +1755,7 @@ fn event_loop(
         let mut h2c_full = false;
         if let Some(h) = h2c.as_mut() {
             if h.accept_again() {
-                let (full, again) =
-                    accept_h2c(h, state, poll.registry(), std::time::Instant::now());
+                let (full, again) = accept_h2c(h, state, poll.registry(), m6_core::platform::now());
                 h.set_accept_again(again);
                 if again {
                     poll_timeout = std::time::Duration::ZERO;
@@ -1777,7 +1776,7 @@ fn event_loop(
                 return 1;
             }
         }
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
 
         let first_trigger = events.iter().next().map(|ev| ev.token());
@@ -1900,13 +1899,13 @@ fn event_loop(
 
         // Close connections past their read or h2 idle deadline, and socket
         // upstreams past their backend deadline.
-        while let Some(token) = state.read_timeouts.expired(Instant::now()) {
+        while let Some(token) = state.read_timeouts.expired(m6_core::platform::now()) {
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
-        while let Some(token) = state.h2_idle_timeouts.expired(Instant::now()) {
+        while let Some(token) = state.h2_idle_timeouts.expired(m6_core::platform::now()) {
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
-        while let Some(token) = state.upstream_timeouts.expired(Instant::now()) {
+        while let Some(token) = state.upstream_timeouts.expired(m6_core::platform::now()) {
             let mut cx = CompletionCtx::new(
                 &mut *state,
                 &mut tcp,
@@ -1919,7 +1918,7 @@ fn event_loop(
             );
             expire_upstream(token, &mut cx);
         }
-        let now2 = Instant::now();
+        let now2 = m6_core::platform::now();
         let (dead, completions) = state.h2c_pool.expire(now2, poll.registry());
         for token in dead {
             state.h2c_pool.remove_by_token(token, poll.registry());
@@ -2008,7 +2007,7 @@ fn event_loop(
 
         // The clock read at the end of the work is also the start of the next
         // wait: record the work under the iteration's first trigger, then loop.
-        last = std::time::Instant::now();
+        last = m6_core::platform::now();
         trace.worked(first_index, last - now);
     }
 
@@ -2091,8 +2090,8 @@ fn drain_udp(
                     pending: HashMap::new(),
                     partial_responses: HashMap::new(),
                     client_addr: from,
-                    last_active: Instant::now(),
-                    created: Instant::now(),
+                    last_active: m6_core::platform::now(),
+                    created: m6_core::platform::now(),
                     handshake_recorded: false,
                 },
             );
@@ -2110,7 +2109,7 @@ fn drain_udp(
             Some(c) => c,
             None => continue,
         };
-        qconn.last_active = Instant::now();
+        qconn.last_active = m6_core::platform::now();
 
         let recv_info = quiche::RecvInfo { from, to: local };
         if let Err(e) = qconn.conn.recv(pkt, recv_info) {
@@ -2382,7 +2381,7 @@ fn handle_h3_request(
         return;
     }
 
-    let start = Instant::now();
+    let start = m6_core::platform::now();
 
     // ── Rate limit — before cache lookup, routing, or any backend work ───────
     // HTTP/3 is not a side door: the same per-IP limit applies here as on
@@ -3046,7 +3045,7 @@ fn launch_url_upstream(
     backend_idx: usize,
 ) -> Result<usize, UrlDispatchError> {
     let addr = state.pool_manager.url_backend(backend_idx).addr();
-    let now = Instant::now();
+    let now = m6_core::platform::now();
     let deadline = now + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
     let head = req.method.eq_ignore_ascii_case("HEAD");
 
@@ -3170,7 +3169,7 @@ fn launch_socket_upstream(
         Some(pool) => pool.take_member().map_err(|_| SocketLaunchError::Empty)?,
         None => return Err(SocketLaunchError::UnknownBackend),
     };
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = m6_core::platform::now() + timeout;
     let Some(owner) = state.upstreams.take() else {
         if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
             pool.cancel(member_idx);
@@ -3247,7 +3246,7 @@ fn launch_socket_upstream(
     };
     state
         .upstream_timeouts
-        .touch(token, std::time::Instant::now());
+        .touch(token, m6_core::platform::now());
     *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
     let entry = state.upstreams.get_mut(owner.key);
     entry.kind = UpstreamKind::Member;
@@ -3652,7 +3651,7 @@ fn handle_request_inner(
             route_path: None,
             cacheable,
             is_prefetch,
-            start: std::time::Instant::now(),
+            start: m6_core::platform::now(),
             error_status_override: None,
             extra_headers: Vec::new(),
         };
@@ -3690,7 +3689,7 @@ fn handle_request_inner(
     // (reached from finalize_url_response), which keeps the socket branch's own
     // completion semantics.
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-    let backend_start = std::time::Instant::now();
+    let backend_start = m6_core::platform::now();
 
     let slot = match launch_socket_upstream(state, registry, req, client_ip, &backend_name, timeout)
     {
@@ -3879,7 +3878,7 @@ fn dispatch_custom_error_async(
         .map(|(_, h, b)| (h.clone(), b.clone()));
 
     if let Some((mut headers, body)) = served_locally {
-        let latency_ns = std::time::Instant::now().elapsed().as_nanos() as u64;
+        let latency_ns = m6_core::platform::now().elapsed().as_nanos() as u64;
         analytics::finish_response(
             state.config.analytics.enabled,
             &mut headers,
@@ -3941,7 +3940,7 @@ fn dispatch_custom_error_async(
             route_path: None,
             cacheable: false,
             is_prefetch: false,
-            start: std::time::Instant::now(),
+            start: m6_core::platform::now(),
             error_status_override: Some(status),
             extra_headers: Vec::new(),
         };
@@ -3973,7 +3972,7 @@ fn dispatch_custom_error_async(
         route_path: None,
         cacheable: false,
         is_prefetch: false,
-        start: std::time::Instant::now(),
+        start: m6_core::platform::now(),
         error_status_override: Some(status),
         extra_headers: Vec::new(),
     };
@@ -4233,7 +4232,7 @@ fn set_date(headers: &mut Vec<(String, String)>) {
     }
     headers.push((
         "date".to_string(),
-        httpdate::fmt_http_date(std::time::SystemTime::now()),
+        httpdate::fmt_http_date(m6_core::platform::wall()),
     ));
 }
 
@@ -4389,7 +4388,7 @@ fn complete_socket_response(
                 state.error_pages.insert(
                     original_status,
                     (
-                        std::time::Instant::now(),
+                        m6_core::platform::now(),
                         headers.clone(),
                         http_resp.body.clone(),
                     ),
@@ -4586,7 +4585,7 @@ fn finalize_url_response_inner(
                 state.error_pages.insert(
                     original_status,
                     (
-                        std::time::Instant::now(),
+                        m6_core::platform::now(),
                         headers.clone(),
                         http_resp.body.clone(),
                     ),
@@ -5216,7 +5215,7 @@ fn run(args: Vec<String>) -> i32 {
         h2c_iface,
         rate_limiter: RateLimiter::new(),
         error_pages: HashMap::new(),
-        started: std::time::Instant::now(),
+        started: m6_core::platform::now(),
         traffic: health::TrafficWindow::new(),
         traffic_report: None,
         lookup_key_buf: String::with_capacity(512),
@@ -5745,7 +5744,7 @@ mod error_page_holder_tests {
         let mut pages: HashMap<u16, CachedErrorPage> = HashMap::new();
         pages.insert(
             404,
-            (std::time::Instant::now(), vec![], b"not found".to_vec()),
+            (m6_core::platform::now(), vec![], b"not found".to_vec()),
         );
         for path in [
             "/.env",
@@ -5764,7 +5763,7 @@ mod error_page_holder_tests {
     #[test]
     fn statuses_do_not_share_a_document() {
         let mut pages: HashMap<u16, CachedErrorPage> = HashMap::new();
-        pages.insert(404, (std::time::Instant::now(), vec![], b"gone".to_vec()));
+        pages.insert(404, (m6_core::platform::now(), vec![], b"gone".to_vec()));
         assert!(
             !pages.contains_key(&500),
             "500 must not be answered by the 404 document"
@@ -5775,7 +5774,7 @@ mod error_page_holder_tests {
     /// redeployed error page would never reach the edges.
     #[test]
     fn a_stale_entry_is_not_served() {
-        let stale = std::time::Instant::now()
+        let stale = m6_core::platform::now()
             .checked_sub(ERROR_PAGE_TTL + std::time::Duration::from_secs(1))
             .expect("clock");
         let entry = (stale, Vec::<(String, String)>::new(), b"old".to_vec());

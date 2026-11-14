@@ -38,7 +38,7 @@ use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
 use m6_core::platform::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{info, warn};
 
 const TOKEN_LISTENER: Token = Token(usize::MAX);
@@ -185,7 +185,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let mut events = Events::with_capacity(64);
     let mut accepting = true;
     loop {
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         match poll.poll(
             &mut events,
             Some(read_timeouts.timeout(now, Duration::from_millis(POLL_TIMEOUT_MS))),
@@ -197,7 +197,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                 continue;
             }
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
 
         for ev in &events {
             match ev.token() {
@@ -261,7 +261,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         }
 
         // Close connections idle past the read deadline.
-        while let Some(Token(k)) = read_timeouts.expired(Instant::now()) {
+        while let Some(Token(k)) = read_timeouts.expired(m6_core::platform::now()) {
             listener.close_one(k, poll.registry());
         }
         // A slot came free while the table was full: accept again.

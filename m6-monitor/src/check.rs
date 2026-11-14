@@ -1434,7 +1434,7 @@ mod tests {
             readings.extend(sighted(&ips));
         }
         let mut cache = VerdictCache::new();
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         let first = cache.refresh(&readings, now, &lookup);
         assert_eq!(calls.borrow().len(), MAX_LOOKUPS_PER_POLL);
         assert_eq!(first.len(), MAX_LOOKUPS_PER_POLL);
@@ -1463,7 +1463,7 @@ mod tests {
         }
         let v = VerdictCache::with_cap(MAX_LOOKUPS_PER_CHECK).refresh(
             &readings,
-            std::time::Instant::now(),
+            m6_core::platform::now(),
             &lookup,
         );
         assert_eq!(calls.get(), 12);
@@ -1492,7 +1492,7 @@ mod tests {
             let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
             readings.extend(sighted(&ips));
         }
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
 
         let mut cache = VerdictCache::new();
         let mut due = Vec::new();
@@ -1532,7 +1532,7 @@ mod tests {
         };
         let readings = sighted(&["192.0.2.1"]);
         let mut cache = VerdictCache::new();
-        let t0 = std::time::Instant::now();
+        let t0 = m6_core::platform::now();
         cache.refresh(&readings, t0, &lookup);
         cache.refresh(&readings, t0 + std::time::Duration::from_secs(60), &lookup);
         assert_eq!(n.get(), 1, "a failure is kept for FAILED_TTL");

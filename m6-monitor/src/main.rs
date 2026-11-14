@@ -249,7 +249,7 @@ fn run_service() -> Result<()> {
     let mut accepting = true;
     let mut snapshot: Option<Snapshot> = None;
     let mut poll_reported_late = false;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
     #[cfg(feature = "count-allocations")]
     let mut client_allocs = 0u64;
@@ -257,7 +257,7 @@ fn run_service() -> Result<()> {
     // The first poll starts with the service, so the page and the check have a
     // reading before the first interval passes.
     let first = poller
-        .start(&poll, &mut out, Instant::now())
+        .start(&poll, &mut out, m6_core::platform::now())
         .unwrap_or_else(|e| fail("starting the first poll", e));
     publish(first, &mut snapshot, &thresholds, &mut history);
 
@@ -267,14 +267,14 @@ fn run_service() -> Result<()> {
         // poll starts on a tick, not on its own timer: one interval is 30
         // ticks, and a second of lateness on the first request is the price of
         // not keeping a second clock.
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let wait = deadlines.timeout(now, TICK).min(poller.timeout(now, TICK));
         match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as the
         // other services report the trace.
@@ -384,7 +384,7 @@ fn run_service() -> Result<()> {
                 // crawler lookup.
                 Token(t) => {
                     let slot = t - poll::CLIENT_BASE;
-                    let progress = poller.drive(&poll, &mut out, slot, Instant::now())?;
+                    let progress = poller.drive(&poll, &mut out, slot, m6_core::platform::now())?;
                     publish(progress, &mut snapshot, &thresholds, &mut history);
                 }
             }
@@ -392,11 +392,11 @@ fn run_service() -> Result<()> {
 
         // Outgoing work whose deadline passed: a timed-out node step, a lost
         // probe or a failed lookup, each recorded and moved on.
-        while let Some(progress) = poller.expire(&poll, &mut out, Instant::now())? {
+        while let Some(progress) = poller.expire(&poll, &mut out, m6_core::platform::now())? {
             publish(progress, &mut snapshot, &thresholds, &mut history);
         }
         // Close every client whose read deadline passed, with no response.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
@@ -409,7 +409,7 @@ fn run_service() -> Result<()> {
         // The tick: start a poll when the interval has passed since the last
         // one started and none is running. A poll still running at its next
         // due time is not restarted; the tick says so once and waits.
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let due = poller
             .last_start()
             .is_none_or(|start| now.duration_since(start) >= interval);
@@ -427,7 +427,7 @@ fn run_service() -> Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. The monitor serves no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
@@ -797,7 +797,7 @@ fn run_check(config_path: &Path) -> Result<()> {
 }
 
 fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
+    m6_core::platform::wall()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

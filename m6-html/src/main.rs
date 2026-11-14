@@ -11,7 +11,7 @@
 #![deny(unsafe_code)]
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use m6_core::event::{LoopTrace, Slots, Timeouts};
@@ -71,19 +71,22 @@ fn main() -> Result<()> {
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
     let mut accepting = true;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
 
     // ── run: nothing blocks ──────────────────────────────────────────────
     'run: loop {
         // An interrupted wait is not an error: wait again. mio passes EINTR
         // up rather than retrying.
-        match poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK))) {
+        match poll.poll(
+            &mut events,
+            Some(deadlines.timeout(m6_core::platform::now(), TICK)),
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as
         // m6-http reports the trace.
@@ -180,7 +183,7 @@ fn main() -> Result<()> {
 
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
@@ -193,7 +196,7 @@ fn main() -> Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. These services serve no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {

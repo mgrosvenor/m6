@@ -43,7 +43,7 @@
 use std::io;
 use std::net::{TcpStream, UdpSocket};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use quiche::h3::NameValue as _;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -167,10 +167,10 @@ pub fn tls_handshake(addr: &str, cfg: Arc<ClientConfig>) -> io::Result<Handshake
     let mut conn = rustls::ClientConnection::new(cfg, name)
         .map_err(|e| io::Error::other(format!("ClientConnection::new: {e}")))?;
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     let deadline = t0 + Duration::from_secs(5);
     while conn.is_handshaking() {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "TLS handshake timeout",
@@ -540,7 +540,7 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
     let mut cfg = quic_client_config(zero_rtt_quic_params())?;
     let mut scid = [0u8; 16];
     getrandom_scid(&mut scid);
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     let mut conn = quiche::connect(
         Some(&sni),
         &quiche::ConnectionId::from_ref(&scid),
@@ -558,9 +558,9 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
     // The ticket arrives in a NewSessionTicket AFTER the handshake, so this has to
     // keep pumping past establishment. Making a real request is part of that: it
     // gives the server a reason to finish talking to us.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = m6_core::platform::now() + Duration::from_secs(5);
     let mut session: Option<Vec<u8>> = None;
-    while Instant::now() < deadline {
+    while m6_core::platform::now() < deadline {
         if conn.is_established() && cold.is_none() {
             cold = Some(t0.elapsed());
         }
@@ -636,7 +636,7 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
     let mut cfg2 = quic_client_config(zero_rtt_quic_params())?;
     let mut scid2 = [0u8; 16];
     getrandom_scid(&mut scid2);
-    let t1 = Instant::now();
+    let t1 = m6_core::platform::now();
     let mut c2 = quiche::connect(
         Some(&sni2),
         &quiche::ConnectionId::from_ref(&scid2),
@@ -654,8 +654,8 @@ pub fn zero_rtt_h3(addr: &str, path: &str, method: &str) -> io::Result<ZeroRtt> 
     let mut early_data_used = false;
     let mut status = None;
     let mut warm = None;
-    let deadline2 = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline2 {
+    let deadline2 = m6_core::platform::now() + Duration::from_secs(5);
+    while m6_core::platform::now() < deadline2 {
         // FLUSH FIRST, before looking at whether early data is available.
         //
         // The early-data keys are derived as quiche builds the Initial packet, so
@@ -800,7 +800,7 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     getrandom_scid(&mut scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     let mut conn = quiche::connect(Some(&sni), &scid, local, peer, &mut cfg)
         .map_err(|e| io::Error::other(format!("quiche::connect: {e}")))?;
     let (_, mut client_bytes) = quic_flush_counted(&mut conn, &udp);
@@ -819,7 +819,7 @@ pub fn quic_handshake_shape(addr: &str) -> io::Result<HandshakeShape> {
     let mut server_bytes = 0usize;
     let mut server_arrivals: Vec<Duration> = Vec::new();
     while !conn.is_established() {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "QUIC handshake timeout",
@@ -910,7 +910,7 @@ fn getrandom_scid(buf: &mut [u8; 16]) {
     }
     // Fallback: the clock. Weaker, but a probe that cannot open /dev/urandom
     // should still run rather than refuse.
-    let ns = std::time::SystemTime::now()
+    let ns = m6_core::platform::wall()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);

@@ -1215,7 +1215,7 @@ impl History {
             st.writes += 1;
             st.crawl_windows += w.crawl_windows;
             st.pruned += w.pruned;
-            st.last_write = Some(Instant::now());
+            st.last_write = Some(m6_core::platform::now());
             st.used_bytes = Some(w.used_bytes);
             st.file_bytes = Some(w.file_bytes);
             st.oldest_ms = w.oldest_ms;
@@ -2686,7 +2686,7 @@ mod tests {
         let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let started = Instant::now();
+        let started = m6_core::platform::now();
         h.record(make(T0, &[reading("a")]));
         assert!(
             started.elapsed() < std::time::Duration::from_millis(100),

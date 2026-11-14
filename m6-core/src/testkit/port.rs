@@ -83,14 +83,14 @@ impl Drop for PortClaim {
     /// at one per port in the range, live under `target/`, and go with
     /// `cargo clean`.
     fn drop(&mut self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = crate::platform::now() + Duration::from_secs(5);
         loop {
             match TcpListener::bind(("127.0.0.1", self.port)) {
                 Ok(l) => {
                     drop(l);
                     break;
                 }
-                Err(_) if std::time::Instant::now() < deadline => {
+                Err(_) if crate::platform::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(_) => break,

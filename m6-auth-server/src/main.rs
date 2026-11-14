@@ -193,7 +193,7 @@ fn main() -> Result<()> {
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
     let mut accepting = true;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
 
     // ── run: nothing blocks ──────────────────────────────────────────────
@@ -202,14 +202,14 @@ fn main() -> Result<()> {
         // tick. An interrupted wait is not an error: wait again. mio passes
         // EINTR up rather than retrying.
         let wait = deadlines
-            .timeout(Instant::now(), TICK)
-            .min(busy_timeouts.timeout(Instant::now(), TICK));
+            .timeout(m6_core::platform::now(), TICK)
+            .min(busy_timeouts.timeout(m6_core::platform::now(), TICK));
         match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as
         // m6-http reports the trace.
@@ -318,11 +318,11 @@ fn main() -> Result<()> {
         // A deferred request: try its handler again when the retry deadline
         // passes, and answer 503 once the database has been locked for a
         // second. The retry keeps the request, so it is not read again.
-        while let Some(Token(k)) = busy_timeouts.expired(Instant::now()) {
+        while let Some(Token(k)) = busy_timeouts.expired(m6_core::platform::now()) {
             let Some(mut retry) = retries[k].take() else {
                 continue;
             };
-            let now = Instant::now();
+            let now = m6_core::platform::now();
             let response =
                 match run_route(retry.route, &retry.req, Some(&retry), &site, &state, &db) {
                     Ok(response) => response,
@@ -333,7 +333,7 @@ fn main() -> Result<()> {
                         // polls and serves the other connections before the
                         // next one, even when the attempt itself took longer
                         // than the retry delay.
-                        busy_timeouts.touch(Token(k), Instant::now());
+                        busy_timeouts.touch(Token(k), m6_core::platform::now());
                         continue;
                     }
                     Err(_) => {
@@ -367,7 +367,7 @@ fn main() -> Result<()> {
 
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             close(
                 &poll,
                 &mut conns,
@@ -387,7 +387,7 @@ fn main() -> Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. This service serves no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
@@ -449,7 +449,7 @@ fn turn(
                                     req,
                                     // The one-second limit starts when the
                                     // database first refused the statement.
-                                    first: Instant::now(),
+                                    first: m6_core::platform::now(),
                                     verified: busy.verified,
                                 });
                                 return Ok(true);
@@ -538,7 +538,7 @@ fn after_turn(
 /// connection's request.
 fn touch_retry(busy_timeouts: &mut Timeouts, retries: &[Option<Retry>], k: usize) {
     if retries[k].is_some() {
-        busy_timeouts.touch(Token(k), Instant::now());
+        busy_timeouts.touch(Token(k), m6_core::platform::now());
     }
 }
 

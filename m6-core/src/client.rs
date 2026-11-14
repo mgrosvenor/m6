@@ -271,7 +271,7 @@ impl Upstream {
             in_trailers: false,
             body_len: 0,
             eof: false,
-            deadline: Instant::now(),
+            deadline: crate::platform::now(),
             method_is_head: false,
             reusable: false,
             request_finished: false,
@@ -1547,7 +1547,7 @@ mod socket_tests {
                     registered = interest;
                 }
             }
-            if Instant::now() >= up.deadline() {
+            if crate::platform::now() >= up.deadline() {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "backend timed out"));
             }
         }
@@ -1582,7 +1582,7 @@ mod socket_tests {
             &Addr::Tcp(addr),
             None,
             false,
-            Instant::now() + Duration::from_secs(5),
+            crate::platform::now() + Duration::from_secs(5),
         )
         .expect("an in-progress connect is not an error");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
@@ -1606,7 +1606,7 @@ mod socket_tests {
             &Addr::Tcp(addr),
             None,
             false,
-            Instant::now() + Duration::from_secs(30),
+            crate::platform::now() + Duration::from_secs(30),
         )
         .expect("a non-blocking connect is not an error");
         assert!(
@@ -1643,8 +1643,13 @@ mod socket_tests {
         let mut up = Upstream::new(64 * 1024, 16 * 1024);
         up.request_buf()
             .extend_from_slice(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
-        up.start(&addr, None, false, Instant::now() + Duration::from_secs(5))
-            .expect("start");
+        up.start(
+            &addr,
+            None,
+            false,
+            crate::platform::now() + Duration::from_secs(5),
+        )
+        .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         assert!(
@@ -1654,8 +1659,13 @@ mod socket_tests {
 
         up.request_buf()
             .extend_from_slice(b"GET /two HTTP/1.1\r\nHost: x\r\n\r\n");
-        up.start(&addr, None, false, Instant::now() + Duration::from_secs(5))
-            .expect("second start reuses the socket");
+        up.start(
+            &addr,
+            None,
+            false,
+            crate::platform::now() + Duration::from_secs(5),
+        )
+        .expect("second start reuses the socket");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         peer.join().expect("peer");
@@ -1718,7 +1728,7 @@ mod socket_tests {
             &Addr::Tcp(addr),
             Some(&tls),
             false,
-            Instant::now() + Duration::from_secs(5),
+            crate::platform::now() + Duration::from_secs(5),
         )
         .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
@@ -1749,7 +1759,7 @@ mod socket_tests {
             accept_tx.send(()).expect("report the second accept");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::platform::now() + Duration::from_secs(5);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         let req = up.request_buf();
         req.extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
@@ -1854,7 +1864,7 @@ mod socket_tests {
             name: name_b,
         };
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 16 * 1024);
         // Request 1 with identity A: the server accepts once.
         up.request_buf()
@@ -1949,7 +1959,7 @@ mod socket_tests {
             config: client,
             name,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         up.request_buf().extend_from_slice(
             b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
@@ -2025,7 +2035,7 @@ mod socket_tests {
             config: client,
             name,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         let mut req = Vec::new();
         req.extend_from_slice(
@@ -2080,7 +2090,7 @@ mod socket_tests {
                     reregistered_after_block = true;
                 }
             }
-            if Instant::now() >= up.deadline() {
+            if crate::platform::now() >= up.deadline() {
                 panic!("timed out");
             }
         }

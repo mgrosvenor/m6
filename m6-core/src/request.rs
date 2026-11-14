@@ -88,7 +88,7 @@ impl Request {
             route_pattern: None,
             route_settings: None,
             config: None,
-            started: std::time::Instant::now(),
+            started: crate::platform::now(),
         }
     }
 

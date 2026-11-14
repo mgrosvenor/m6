@@ -233,7 +233,7 @@ impl<T: Transport> H2Client<T> {
             Interest::READABLE | Interest::WRITABLE,
         )?;
         let mut events = m6_core::platform::Events::with_capacity(8);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = m6_core::platform::now() + Duration::from_secs(10);
         loop {
             self.drive();
             if self.is_open() {
@@ -245,7 +245,7 @@ impl<T: Transport> H2Client<T> {
                     format!("{}: connection failed", T::prefix()),
                 ));
             }
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(m6_core::platform::now());
             if left.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -1081,7 +1081,7 @@ impl<T: Transport> Pool<T> {
             Self::register_interest(conn, registry);
             (conn.token(), stream_id)
         };
-        let slot = self.take_deadline_slot(token, stream_id, Instant::now());
+        let slot = self.take_deadline_slot(token, stream_id, m6_core::platform::now());
         if let Some(stream) = self
             .connections
             .get_mut(base_url)

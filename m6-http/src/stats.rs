@@ -434,7 +434,7 @@ impl Default for Stats {
 
 impl Stats {
     pub fn new() -> Self {
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         Stats {
             requests_total: 0,
             cache_hits_total: 0,
@@ -580,7 +580,7 @@ impl Stats {
     /// `EMIT_INTERVAL_SECS`), so the caller copies the loop trace on the same
     /// tick.
     pub fn maybe_emit(&mut self, pool_members: usize) -> bool {
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let elapsed = now.duration_since(self.last_emit);
         if elapsed.as_secs() < EMIT_INTERVAL_SECS {
             return false;
@@ -988,7 +988,7 @@ mod tests {
     #[test]
     fn test_record_overhead() {
         let mut s = Stats::new();
-        let start = Instant::now();
+        let start = m6_core::platform::now();
         for i in 1..=1000u64 {
             s.record(
                 i,
@@ -1281,7 +1281,8 @@ mod perf_reservoir_tests {
             hit(&mut s, ns);
         }
         // Force the window boundary the emitter would hit on a timer.
-        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.last_emit =
+            m6_core::platform::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
         s.maybe_emit(1);
 
         let snap = s.snapshot();
@@ -1314,7 +1315,8 @@ mod perf_reservoir_tests {
         }
         assert_eq!(s.hit_window_added, 3);
 
-        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.last_emit =
+            m6_core::platform::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
         s.maybe_emit(1);
         assert_eq!(
             s.hit_window_added, 0,
@@ -1341,7 +1343,8 @@ mod perf_reservoir_tests {
         for _ in 0..10 {
             hit(&mut s, 1_000);
         }
-        s.last_emit = Instant::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
+        s.last_emit =
+            m6_core::platform::now() - std::time::Duration::from_secs(EMIT_INTERVAL_SECS + 1);
         s.maybe_emit(1);
         // A slow second window.
         for _ in 0..10 {
