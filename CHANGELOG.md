@@ -149,6 +149,12 @@ A symlink that resolves back inside is accepted, which keeps a site that links `
 `..`, a leading `/` and a Windows prefix are still refused.
 Verified with `read_json_refuses_a_symlinked_directory_that_leaves_the_site`, `write_json_refuses_a_symlinked_directory_before_creating_anything` (which asserts the outside directory is still empty), `in_site_symlinked_directory_still_reads_and_writes` and `read_json_still_refuses_dotdot`. The first two return the outside file and `Ok` with the previous lexical check restored.
 
+**m6-file refuses a path whose symlinked directory leaves the site, on plain and tail routes (#339).**
+`escapes_site_dir` called `symlink_metadata` on the last component only, so `GET /assets/linked/secret.css` with `assets/linked` pointing outside the site was served: the final component was a regular file and the check stopped there.
+`serve` now resolves the path through core's `resolve_within`, checks the resolved path against the resolved site root, and reads the file it resolved.
+A directory symlink that stays inside the site still resolves inside and is served.
+Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
+
 ### Fixed
 
 **m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
