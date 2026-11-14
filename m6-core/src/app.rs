@@ -1221,7 +1221,7 @@ impl FrameworkState {
         } else {
             Map::new()
         };
-        dict.insert("cookies".to_string(), Value::Object(cookies_map.clone()));
+        dict.insert("cookies".to_string(), Value::Object(cookies_map));
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
         let (datetime, year) = Self::builtin_dates(chrono::Utc::now());
@@ -1243,9 +1243,17 @@ impl FrameworkState {
         // 10. Error keys (from query params — already merged in step 5, but highlight here).
 
         // 11. Flash message: verify HMAC, add to dict if valid, clear cookie.
+        // Read back through the dictionary: `Dict::get` returns the overlay
+        // first, and the map inserted in step 7 is in it. The verified message
+        // is owned, so the borrow of `dict` ends before the insert.
         #[cfg(feature = "flash")]
-        if let Some(flash_cookie) = cookies_map.get("_flash").and_then(|v| v.as_str()) {
-            if let Some(msg) = verify_flash_cookie(flash_cookie, &self.flash_secret) {
+        {
+            let message = dict
+                .get("cookies")
+                .and_then(|cookies| cookies.get("_flash"))
+                .and_then(|v| v.as_str())
+                .and_then(|flash_cookie| verify_flash_cookie(flash_cookie, &self.flash_secret));
+            if let Some(msg) = message {
                 dict.insert("flash".to_string(), Value::String(msg));
             }
         }
