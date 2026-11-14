@@ -92,9 +92,6 @@ fn main() -> io::Result<()> {
     let mut idle_timeouts = Timeouts::new(initial, idle);
     let mut events = Events::with_capacity(EVENTS);
     let mut accepting = true;
-    // Set when an accept failed for want of a descriptor: the free-slot count
-    // then, so the listener is armed again only once a connection has closed.
-    let mut starved_at: Option<usize> = None;
     let mut turns: u64 = 0;
     let mut open = 0usize;
     let mut drain_until: Option<Instant> = None;
@@ -145,16 +142,11 @@ fn main() -> io::Result<()> {
                                     slots.free(taken.key);
                                     continue;
                                 }
-                                // Out of descriptors: give the slot back and
-                                // stop accepting until a connection closes,
-                                // when the listener is armed again and the
-                                // queued clients accepted. Re-arming at once
-                                // would spin while nothing frees.
-                                net::Accept::Retry => {
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                net::Accept::Stop => {
                                     slots.free(taken.key);
-                                    poll.registry().deregister(&mut listener)?;
-                                    accepting = false;
-                                    starved_at = Some(slots.free_slots());
+                                    eprintln!("echo: accept error: {e}");
                                     break;
                                 }
                             },
@@ -228,15 +220,10 @@ fn main() -> io::Result<()> {
                 break 'run;
             }
         }
-        if !accepting
-            && drain_until.is_none()
-            && !slots.is_full()
-            && starved_at.is_none_or(|n| slots.free_slots() > n)
-        {
+        if !accepting && drain_until.is_none() && !slots.is_full() {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
-            starved_at = None;
         }
     }
 

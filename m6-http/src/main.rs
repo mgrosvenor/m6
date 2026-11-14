@@ -1729,9 +1729,6 @@ fn event_loop(
     let mut trace = LoopTrace::new(&["accept", "conn", "upstream", "udp", "signal", "timeout"]);
     let mut last = m6_core::platform::now();
     let mut accepting = tcp.is_some() || h2c.is_some();
-    // The free-slot count when an accept ran out of descriptors, so the
-    // listeners are armed again only once a connection has closed.
-    let mut starved_at: Option<usize> = None;
 
     'run: loop {
         // The wait is the earliest of three bounds: the 1 s accounting tick,
@@ -1817,13 +1814,6 @@ fn event_loop(
                         if full && accepting {
                             deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
                             accepting = false;
-                        } else if t.take_starved() && accepting {
-                            // Out of descriptors with clients queued: stop
-                            // accepting until a connection closes, when the
-                            // listeners are armed again and the queue drains.
-                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
-                            accepting = false;
-                            starved_at = Some(state.sources.free_slots());
                         }
                     }
                 }
@@ -1834,10 +1824,6 @@ fn event_loop(
                         if full && accepting {
                             deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
                             accepting = false;
-                        } else if h.take_starved() && accepting {
-                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
-                            accepting = false;
-                            starved_at = Some(state.sources.free_slots());
                         }
                     }
                 }
@@ -1966,15 +1952,10 @@ fn event_loop(
             &mut connections,
         );
 
-        // A slot came free while the token table was full, or a connection
-        // closed after an accept ran out of descriptors: accept again.
-        if !accepting
-            && !state.sources.is_full()
-            && starved_at.is_none_or(|n| state.sources.free_slots() > n)
-        {
+        // A slot came free while the token table was full: accept again.
+        if !accepting && !state.sources.is_full() {
             register_listeners(&poll, tcp.as_ref(), h2c.as_ref());
             accepting = true;
-            starved_at = None;
         }
 
         // Drive connection timeouts and flush pending sends.

@@ -247,9 +247,6 @@ fn run_service() -> Result<()> {
     let mut trace = LoopTrace::new(&["accept", "client", "node", "probe", "dns", "tick"]);
     let mut out = poller.out();
     let mut accepting = true;
-    // Set when an accept failed for want of a descriptor: the free-slot count
-    // then, so the listener is armed again only once a connection has closed.
-    let mut starved_at: Option<usize> = None;
     let mut snapshot: Option<Snapshot> = None;
     let mut poll_reported_late = false;
     let mut last = m6_core::platform::now();
@@ -321,18 +318,11 @@ fn run_service() -> Result<()> {
                                     conns.free(taken.key);
                                     continue;
                                 }
-                                // Out of descriptors, or a failure: say so,
-                                // give the slot back and stop accepting until
-                                // a connection closes, when the listener is
-                                // armed again and the queued clients accepted.
-                                // Re-arming at once would spin while nothing
-                                // frees.
-                                m6_core::platform::net::Accept::Retry => {
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                m6_core::platform::net::Accept::Stop => {
                                     conns.free(taken.key);
                                     eprintln!("m6-monitor: accept error: {e}");
-                                    poll.registry().deregister(&mut listener)?;
-                                    accepting = false;
-                                    starved_at = Some(conns.free_slots());
                                     break;
                                 }
                             },
@@ -415,11 +405,10 @@ fn run_service() -> Result<()> {
             close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
-        if !accepting && !conns.is_full() && starved_at.is_none_or(|n| conns.free_slots() > n) {
+        if !accepting && !conns.is_full() {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
-            starved_at = None;
         }
 
         // The tick: start a poll when the interval has passed since the last
