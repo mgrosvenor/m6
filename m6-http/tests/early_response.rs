@@ -51,9 +51,7 @@ const PARTIAL_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Len";
 #[derive(Clone, Copy)]
 enum Refusal {
     /// Write a complete reply and close.
-    EarlyAnswer,
-    /// Write a complete 413 with a body and close.
-    Early413,
+    Answer(&'static [u8]),
     /// Close without writing anything.
     Silent,
     /// Write half a head and close.
@@ -136,11 +134,8 @@ fn read_head_and_some_body<S: Read + Write>(stream: &mut S, mode: Refusal) {
         }
     }
     match mode {
-        Refusal::EarlyAnswer => {
-            let _ = stream.write_all(EARLY_HEAD);
-        }
-        Refusal::Early413 => {
-            let _ = stream.write_all(EARLY_413_HEAD);
+        Refusal::Answer(head) => {
+            let _ = stream.write_all(head);
         }
         Refusal::Silent => {}
         Refusal::PartialHead => {
@@ -304,7 +299,7 @@ fn a_socket_backend_that_answers_early_is_forwarded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("m6-file-1.sock");
     let glob = dir.path().join("m6-file-*.sock").display().to_string();
-    let _backend = SocketBackend::start(sock, Refusal::EarlyAnswer);
+    let _backend = SocketBackend::start(sock, Refusal::Answer(EARLY_HEAD));
     let fx = Fixture::start(
         &format!("[[backend]]\nname = \"app\"\nsockets = \"{glob}\""),
         "m6-http-early-socket",
@@ -325,7 +320,7 @@ fn a_socket_backend_that_answers_early_is_forwarded() {
 /// reply, and the backend's own 413 and body must reach the client.
 #[test]
 fn an_https_backend_that_answers_early_is_forwarded() {
-    let port = spawn_tls_backend(Refusal::Early413);
+    let port = spawn_tls_backend(Refusal::Answer(EARLY_413_HEAD));
     let fx = Fixture::start(
         &format!(
             "[[backend]]\nname = \"app\"\nurl = \"https://127.0.0.1:{port}\"\n\

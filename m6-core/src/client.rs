@@ -444,7 +444,7 @@ impl Upstream {
         }
     }
 
-    /// Whether request bytes or TLS ciphertext are still owed to the socket.
+    /// Whether request bytes or TLS ciphertext should be written to the socket.
     fn wants_write(&self) -> bool {
         !self.write_failed
             && (self.write_offset < self.request.len()
@@ -521,7 +521,7 @@ impl Upstream {
     /// when the reply is complete.
     fn transfer(&mut self) -> io::Result<bool> {
         if self.wants_write() {
-            let _ = self.write_request()?;
+            self.write_request()?;
         }
         self.read_available()?;
         self.parse_progress()
@@ -530,7 +530,7 @@ impl Upstream {
     /// Write what is left of the request. A backend may answer before it has
     /// read the whole request (RFC 9110 6.1), so a write the peer refuses keeps
     /// the read side going: the response may already be waiting on the socket.
-    fn write_request(&mut self) -> io::Result<bool> {
+    fn write_request(&mut self) -> io::Result<()> {
         loop {
             let written = match (&mut self.tls, &mut self.stream) {
                 (Some(tls), Some(_)) => {
@@ -539,41 +539,41 @@ impl Upstream {
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
                         Err(e) if write_refused(&e) => {
                             self.write_failed = true;
-                            return Ok(true);
+                            return Ok(());
                         }
                         Err(e) => return Err(e),
                     }
                 }
                 (None, Some(stream)) => match stream.write(&self.request[self.write_offset..]) {
                     Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                     Err(e) if write_refused(&e) => {
                         self.write_failed = true;
-                        return Ok(true);
+                        return Ok(());
                     }
                     Err(e) => return Err(e),
                 },
-                (None, None) => return Ok(true),
-                (Some(_), None) => return Ok(true),
+                (None, None) => return Ok(()),
+                (Some(_), None) => return Ok(()),
             };
             self.write_offset += written;
             if self.write_offset >= self.request.len() {
                 // Flush any TLS ciphertext that is still buffered. If it would
                 // block, report it so a later drive retries the flush.
                 if !self.flush_request()? || self.write_failed {
-                    return Ok(self.write_failed);
+                    return Ok(());
                 }
                 self.request_finished = true;
-                return Ok(true);
+                return Ok(());
             }
             if self.tls.is_some() {
                 // Flush the ciphertext so the plaintext buffer drains, then loop.
                 if !self.flush_request()? || self.write_failed {
-                    return Ok(self.write_failed);
+                    return Ok(());
                 }
                 if written == 0 {
                     // The plaintext buffer is full and nothing was flushed.
-                    return Ok(false);
+                    return Ok(());
                 }
             }
         }
