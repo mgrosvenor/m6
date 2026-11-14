@@ -66,6 +66,8 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **m6-monitor's history file gains the index `health_ok_node_at` at start**, with no action needed. `[monitor] health_last_ok_max_age_s` is optional; its default is three poll intervals.
 
+**One request-header limit, as nginx sets it.** A header field over 8 KiB or a head over 32 KiB now gets 400 ("Request Header Or Cookie Too Large") from m6-http, and a request line over 8 KiB gets 414, on HTTP/1.1, HTTP/2 and HTTP/3, before any backend is contacted. The limits are `m6_core::headers::MAX_HEADER_LINE` and `MAX_REQUEST_HEAD`, and m6-core backends answer the same codes. HTTP/1.1 heads up to 20 MiB and HTTP/2 heads up to 64 KiB used to be forwarded and then refused by an m6 backend, which the client saw as 502. Each connection slot's head buffer is 32 KiB. On HTTP/3, quiche refuses a field section over 32 KiB by closing the connection instead of answering 400.
+
 ### Added
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
