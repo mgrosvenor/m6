@@ -266,7 +266,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
 | `[node]` name | System config | Names this node |
 | `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, max_requests_per_connection | System config | Differs per node |
-| `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
+| `[server]` backend_timeout_secs, allowed_methods, stats_interval_secs | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
 | `[health]` metrics_token_file | System config | A credential path, absolute |
@@ -338,6 +338,7 @@ Take from it that the bind, the certificate and the key are required, and every 
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
 | `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 | `max_requests_per_connection` | integer | no | Default `100`, and `0` is a config error. The most requests one HTTP/1.1 connection serves before m6-http closes it, so a client that makes more than this many HTTP/1.1 requests reconnects, with a new TLS handshake. System config only, read at start |
+| `stats_interval_secs` | integer | no | Default `10`, and `0` is a config error. Seconds between periodic stats lines, and how often `/perf` refreshes its event-loop trace. `site.toml` only, read at start |
 
 **Table 3: the `[server]` keys.**
 The bind addresses and the internal lists choose where the process listens and whom it trusts, and the certificate and key choose what it presents.

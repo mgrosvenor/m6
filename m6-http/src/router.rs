@@ -290,6 +290,7 @@ mod tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
+                stats_interval_secs: 10,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

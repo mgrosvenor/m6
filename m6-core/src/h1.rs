@@ -790,10 +790,20 @@ fn finish_head<'a>(
     }
 
     let body_len: usize = match first_cl {
-        Some(v) => match v.parse() {
-            Ok(n) => n,
-            Err(_) => return HeadResult::Error(HeadError::Malformed),
-        },
+        Some(v) => {
+            // RFC 9110 8.6: `Content-Length = 1*DIGIT`. Rust's integer parser
+            // also accepts a leading `+`, so `+5` was read as 5 and the server
+            // then waited for a body the peer never sent: a ten-second stall
+            // here, and a framing disagreement anywhere that trims or rewrites
+            // the field. Refuse anything that is not digits.
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return HeadResult::Error(HeadError::Malformed);
+            }
+            match v.parse() {
+                Ok(n) => n,
+                Err(_) => return HeadResult::Error(HeadError::Malformed),
+            }
+        }
         None if saw_cl => return HeadResult::Error(HeadError::Malformed),
         None => 0,
     };

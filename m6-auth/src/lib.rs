@@ -123,7 +123,30 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 ";
 
+/// The cost production hashes at.
 const BCRYPT_COST: u32 = 12;
+
+/// The cost a unit test hashes at.
+///
+/// The round count is a production property, and no unit test here asserts it.
+/// Cost 12 in a debug build costs about a second per hash, and twenty-odd tests
+/// create and verify users, so the whole unit-test binary paid tens of seconds
+/// for a number none of them read. Integration tests spawn the real binary and
+/// still run at `BCRYPT_COST`.
+#[cfg(test)]
+const BCRYPT_TEST_COST: u32 = 4;
+
+/// The cost to hash at: the production one, or the cheap one under `cfg(test)`.
+fn bcrypt_cost() -> u32 {
+    #[cfg(test)]
+    {
+        BCRYPT_TEST_COST
+    }
+    #[cfg(not(test))]
+    {
+        BCRYPT_COST
+    }
+}
 
 /// A fixed cost-12 bcrypt hash, verified on the missing-user path so a login
 /// for a username that does not exist does the same work as one for a user
@@ -236,7 +259,7 @@ impl Db {
         }
 
         let id = Uuid::new_v4().to_string();
-        let hash = bcrypt::hash(password, BCRYPT_COST)?;
+        let hash = bcrypt::hash(password, bcrypt_cost())?;
         let roles_json = serde_json::to_string(&roles).expect("serialising roles cannot fail");
         let created_at = crate::jwt::now_secs();
 
@@ -333,7 +356,7 @@ impl Db {
     }
 
     pub fn user_set_password(&self, username: &str, password: &str) -> Result<()> {
-        let hash = bcrypt::hash(password, BCRYPT_COST)?;
+        let hash = bcrypt::hash(password, bcrypt_cost())?;
         let n = self.0.execute(
             "UPDATE users SET password = ?1 WHERE username = ?2",
             params![hash, username],
@@ -700,6 +723,37 @@ mod tests {
         let f = NamedTempFile::new().expect("tempfile");
         let db = Db::open(f.path()).expect("open db");
         (db, f)
+    }
+
+    // ── The hash cost ────────────────────────────────────────────────────────
+
+    /// Production hashes at cost 12 even though these tests hash at 4.
+    ///
+    /// Lowering `BCRYPT_COST` would weaken every stored password in the field,
+    /// and it is the kind of change that ships silently because nothing reads
+    /// the number. This reads it.
+    #[test]
+    fn production_hashes_at_cost_twelve() {
+        // Read through functions, because an assertion about a constant
+        // expression is rejected by clippy and the number is exactly what this
+        // test exists to read.
+        fn production_cost() -> u32 {
+            BCRYPT_COST
+        }
+        fn test_cost() -> u32 {
+            BCRYPT_TEST_COST
+        }
+        assert_eq!(
+            production_cost(),
+            12,
+            "the production bcrypt cost was lowered, which weakens every stored password"
+        );
+        assert!(
+            test_cost() < production_cost(),
+            "the test cost {} is not cheaper than production's {}",
+            test_cost(),
+            production_cost()
+        );
     }
 
     // ── WAL mode ─────────────────────────────────────────────────────────────

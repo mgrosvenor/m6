@@ -41,7 +41,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::process::Command;
 use std::sync::Arc;
@@ -93,6 +93,11 @@ struct Server {
     _port: PortClaim,
 }
 
+/// How long a malformed request gets to conclude before the test treats it as
+/// unanswered. The test's subject is that every case concludes, so the bound is
+/// short and stated once rather than inherited from a socket default.
+const CONCLUDE: Duration = Duration::from_secs(1);
+
 impl Server {
     /// Open a TLS connection with ALPN pinned to HTTP/1.1 — these tests are
     /// about the h1 parser, and without pinning, rustls may offer h2 and the
@@ -127,12 +132,11 @@ impl Server {
                 return None;
             }
         };
-        if sock
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .is_err()
-            || sock
-                .set_write_timeout(Some(Duration::from_secs(10)))
-                .is_err()
+        // The conclusion this file requires is "answered or closed", and one
+        // second is the bound. Ten was the socket's default read timeout, so a
+        // request the server waits on cost ten seconds per case.
+        if sock.set_read_timeout(Some(CONCLUDE)).is_err()
+            || sock.set_write_timeout(Some(CONCLUDE)).is_err()
         {
             return None;
         }
@@ -155,21 +159,19 @@ impl Server {
             return Vec::new();
         }
         let _ = s.flush();
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    out.extend_from_slice(&buf[..n]);
-                    if out.len() > 4 * 1024 * 1024 {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        out
+        // ONE response, not read-to-EOF. The server keeps a connection alive
+        // (RFC 9112 9.3), so waiting for a close waited out this socket's 10 s
+        // read timeout with the response already in hand, which was most of
+        // this file's time on the build host. `read_one` stops at the end of
+        // the response it was sent; a peer that closes without one returns
+        // what arrived, which the callers already treat as the legitimate
+        // "refused to answer" outcome.
+        let method = bytes.split(|b| *b == b' ').next().unwrap_or(b"GET");
+        let method = String::from_utf8_lossy(method);
+        // A peer that closed without a TLS close_notify, or that did not
+        // answer within the bound. Both are the "refused to answer" outcome
+        // `assert_concluded` already treats as legitimate for garbage.
+        m6_core::testkit::read_one(&mut s, &method).unwrap_or_default()
     }
 
     /// Wait until a request actually reaches the backend.
@@ -657,7 +659,9 @@ fn malformed_request_lines_are_handled_and_do_not_crash() {
         b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost\r\n\r\n",
     ];
     for req in cases {
+        eprintln!("PROBE request: {:?}", String::from_utf8_lossy(req));
         let resp = s.raw(req);
+        eprintln!("PROBE done: {} bytes", resp.len());
         assert_concluded(&resp, "malformed request line");
         assert_no_injected_header(&resp, "evil.example.com");
         s.assert_still_healthy("malformed request line");

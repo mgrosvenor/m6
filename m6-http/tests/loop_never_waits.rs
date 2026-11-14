@@ -548,7 +548,7 @@ fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> Str
 fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
     site_with(
         "info",
-        &format!("backend_timeout_secs = {backend_timeout_secs}"),
+        &format!("backend_timeout_secs = {backend_timeout_secs}\nstats_interval_secs = 2"),
         &format!("[[backend]]\nname = \"app\"\nsockets = \"{glob}\""),
         "[[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
@@ -2011,9 +2011,10 @@ fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
 
 /// An idle m6-http wakes about once a second, not a hundred times.
 ///
-/// The report covers the 10 s accounting interval, so the plan's mark of two
-/// wake-ups a second is 20 over a report; the removed 10 ms cap gave about 100
-/// a second, 1000 over the same report.
+/// The report covers the 2 s accounting interval this fixture sets, so the
+/// plan's mark of two wake-ups a second is four over a report, and half a
+/// second is one. The removed 10 ms cap gave about 100 a second, 200 over the
+/// same report.
 #[test]
 fn an_idle_m6_http_wakes_about_once_a_second() {
     let fx = Fixture::start(1, 30, "idle");
@@ -2026,14 +2027,17 @@ fn an_idle_m6_http_wakes_about_once_a_second() {
     wait_for_periodic(&fx, lines);
     let loops = perf_event_loop(&mut conn);
     let timeouts = trigger_count(&loops, "timeout");
+    // The report covers `stats_interval_secs = 2`, so two a second is four and
+    // half a second is one. The bounds are the same rate the ten-second report
+    // was asserting: at most two wakes a second, at least one per window.
     assert!(
-        timeouts <= 20,
-        "an idle m6-http woke {timeouts} times on its timeout trigger over one 10 s report; expected at most 20, two a second (the 10 ms cap gave about 1000)\n{loops:?}\n--- m6-http ---\n{}",
+        timeouts <= 4,
+        "an idle m6-http woke {timeouts} times on its timeout trigger over one 2 s report; expected at most 4, two a second (the 10 ms cap gave about 200)\n{loops:?}\n--- m6-http ---\n{}",
         fx.service.output()
     );
     assert!(
-        timeouts >= 5,
-        "an idle m6-http woke {timeouts} times on its timeout trigger over one 10 s report; the loop must wake on its 1 s accounting tick\n{loops:?}\n--- m6-http ---\n{}",
+        timeouts >= 1,
+        "an idle m6-http woke {timeouts} times on its timeout trigger over one 2 s report; the loop must wake on its 1 s accounting tick\n{loops:?}\n--- m6-http ---\n{}",
         fx.service.output()
     );
 }

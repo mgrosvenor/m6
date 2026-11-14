@@ -5225,6 +5225,7 @@ fn run(args: Vec<String>) -> i32 {
             format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
         ))
     };
+    let stats_interval_secs = config.server.stats_interval_secs;
     let mut state = ServerState {
         config,
         route_table,
@@ -5232,7 +5233,7 @@ fn run(args: Vec<String>) -> i32 {
         cache: Cache::new(),
         public_key,
         error_mode,
-        stats: Stats::new(),
+        stats: Stats::with_interval(std::time::Duration::from_secs(stats_interval_secs)),
         sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
         generations: vec![0; INITIAL_CONNECTIONS],
         prefetch_queue: std::collections::VecDeque::new(),
@@ -5306,6 +5307,7 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
+                stats_interval_secs: 10,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
