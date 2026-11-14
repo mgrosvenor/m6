@@ -665,9 +665,11 @@ mod spawn {
             .expect("the harness names its server");
         assert!(process::is_alive(server));
         // SIGINT to the harness's process group, which is what a terminal's
-        // interrupt does. `kill` with a negative pid names a group.
-        let status = Command::new("kill")
-            .args(["-INT", &format!("-{}", harness.id())])
+        // interrupt does. A negative pid names a group, and bash's builtin
+        // `kill` takes it the same way on every target (the `kill` binaries
+        // differ in how they read it).
+        let status = Command::new("bash")
+            .args(["-c", "kill -INT -- -$1", "kill", &harness.id().to_string()])
             .status()
             .expect("kill runs");
         assert!(status.success(), "{status}");
