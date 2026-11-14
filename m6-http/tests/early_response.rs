@@ -114,9 +114,68 @@ fn serve_socket(mut stream: UnixStream, mode: Refusal) {
     read_head_and_some_body(&mut stream, mode);
 }
 
+/// What a test peer that answers early owes the reply before it closes: the
+/// same shape as the fixed peer in `m6-core/src/client.rs`
+/// (`a_tls_backend_that_answers_early_is_read_while_writing`). A peer that
+/// drops the socket with request bytes unread makes the close a reset on Linux,
+/// and a reset discards a reply the client has not read yet. So the peer
+/// notifies, shuts its write half, waits until the client has the reply, and
+/// only then drains the remainder and closes.
+trait EarlyClose: Read + Write {
+    /// Send the transport's end-of-reply signal, where the transport has one.
+    fn notify_end(&mut self);
+    /// Shut the write half, so the client sees the complete reply, then EOF.
+    fn shutdown_write(&mut self);
+    /// Wait for the client to close and drain what it sent until then. Bounded
+    /// so a failed test cannot hang this thread.
+    fn drain_until_closed(&mut self);
+}
+
+impl EarlyClose for UnixStream {
+    fn notify_end(&mut self) {}
+    fn shutdown_write(&mut self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+    fn drain_until_closed(&mut self) {
+        let _ = self.set_read_timeout(Some(Duration::from_millis(500)));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        while std::time::Instant::now() < until {
+            match self.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+impl EarlyClose for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn notify_end(&mut self) {
+        self.conn.send_close_notify();
+        let _ = self.flush();
+    }
+    fn shutdown_write(&mut self) {
+        let _ = self.get_ref().shutdown(std::net::Shutdown::Write);
+    }
+    fn drain_until_closed(&mut self) {
+        // Once the reply is written the plaintext does not matter: the unread
+        // request bytes are in the TCP receive queue, so drain that.
+        let mut tcp = self.get_ref();
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(500)));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        while std::time::Instant::now() < until {
+            match tcp.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
 /// Read the head, then up to 1 KiB of the body, then act. A real backend's
 /// parser stops there when it refuses the request, leaving the rest unread.
-fn read_head_and_some_body<S: Read + Write>(stream: &mut S, mode: Refusal) {
+fn read_head_and_some_body<S: EarlyClose>(stream: &mut S, mode: Refusal) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -136,13 +195,29 @@ fn read_head_and_some_body<S: Read + Write>(stream: &mut S, mode: Refusal) {
     match mode {
         Refusal::Answer(head) => {
             let _ = stream.write_all(head);
+            let _ = stream.flush();
+            // Deliberately the same shape as the fixed m6-core peer: notify,
+            // shut the write half, wait for the client to take the reply, then
+            // drain the remainder before the socket is dropped. The wait is the
+            // drain below: it ends at the client's close, which happens after
+            // it has the reply. A separate release channel is not needed
+            // because this peer is driven by the service, not by hand.
+            stream.notify_end();
+            stream.shutdown_write();
+            stream.drain_until_closed();
         }
-        Refusal::Silent => {}
+        Refusal::Silent => {
+            // No reply is written, so there is nothing for a reset to discard:
+            // the test's point is the abrupt close itself.
+            let _ = stream.flush();
+        }
         Refusal::PartialHead => {
+            // Only half a head is written, so no complete reply can be lost.
+            // The client must still see the partial head and answer 502.
             let _ = stream.write_all(PARTIAL_HEAD);
+            let _ = stream.flush();
         }
     }
-    let _ = stream.flush();
 }
 
 /// An HTTPS backend for a URL backend: the same refusal modes over TLS.
