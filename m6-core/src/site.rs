@@ -1619,10 +1619,14 @@ impl FrameworkState {
     /// four-digit year. No format string is parsed on the request path.
     fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
         use chrono::Datelike as _;
-        (
-            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            now.year().to_string(),
-        )
+        use std::fmt::Write as _;
+        // `{:04}` is what `%Y` does for the years a site can see: four digits,
+        // zero padded, so 0999 is "0999" and not "999". Negative and
+        // five-digit years arrive with a sign or a fifth digit, which `%Y`
+        // also prints, and neither can come from `Utc::now()`.
+        let mut year = String::new();
+        write!(year, "{:04}", now.year()).expect("writing to a String cannot fail");
+        (now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), year)
     }
 
     /// Render a template response.
@@ -1684,6 +1688,12 @@ mod builtin_dates_tests {
         let (datetime, year) = FrameworkState::builtin_dates(last);
         assert_eq!(datetime, "9999-12-31T23:59:59Z");
         assert_eq!(year, "9999");
+
+        // The year `%Y` zero-pads and `to_string` did not, which is the only
+        // place the two forms ever differed.
+        let early = chrono::Utc.with_ymd_and_hms(999, 6, 1, 0, 0, 0).unwrap();
+        let (_, year) = FrameworkState::builtin_dates(early);
+        assert_eq!(year, "0999");
     }
 }
 
@@ -2181,6 +2191,90 @@ fn test_renderer() -> &'static dyn RendererFactory {
 mod tests {
     use super::*;
     use crate::h1::parse_head;
+
+    /// Step 11's read-back: a `_flash` cookie whose signature verifies reaches
+    /// the template dictionary, and one that does not leaves nothing there.
+    ///
+    /// These lived in `src/app.rs` after EL-6d moved `build_dict` here, and
+    /// `app.rs` has had no `mod` since, so they never compiled.
+    #[cfg(feature = "flash")]
+    fn flash_dict(cookie: &str, secret: &[u8]) -> Dict {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("templates")).unwrap();
+        let config_path = dir.path().join("m6-site.toml");
+        std::fs::write(
+            &config_path,
+            "[[route]]\npath = \"/\"\nhandler = \"page\"\n",
+        )
+        .unwrap();
+        let config = crate::config::load(&config_path, dir.path()).unwrap();
+        let mut state =
+            FrameworkState::build(config, dir.path().to_path_buf(), &[], test_renderer()).unwrap();
+        state.flash_secret = secret.to_vec();
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            headers: vec![("Cookie".to_string(), format!("_flash={cookie}"))],
+            body: vec![],
+        };
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+        state.build_dict(&raw, route, &params).unwrap()
+    }
+
+    #[cfg(feature = "flash")]
+    fn flash_cookie(message: &str, secret: &[u8]) -> String {
+        Response::text("ok")
+            .flash(message, secret)
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Set-Cookie")
+            .map(|(_, v)| v.as_str())
+            .expect("Set-Cookie header")
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("_flash=")
+            .to_string()
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn a_valid_flash_cookie_reaches_the_dictionary() {
+        let secret = b"test-secret-key-32-bytes-xxxxxxx";
+        let message = "Login successful!";
+        let dict = flash_dict(&flash_cookie(message, secret), secret);
+
+        assert_eq!(
+            dict.get("flash").and_then(|v| v.as_str()),
+            Some(message),
+            "a verified flash message must reach the page"
+        );
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn a_tampered_flash_cookie_leaves_no_message_in_the_dictionary() {
+        let secret = b"test-secret-key-32-bytes-xxxxxxx";
+        let (message, signature) = flash_cookie("Login successful!", secret)
+            .split_once('.')
+            .map(|(m, s)| (m.to_string(), s.to_string()))
+            .expect("a flash cookie is message.signature");
+        let mut first = signature.chars();
+        let swapped = match first.next() {
+            Some('A') => 'B',
+            Some(_) => 'A',
+            None => panic!("a signature is not empty"),
+        };
+        let tampered = format!("{message}.{}{}", swapped, first.as_str());
+
+        let dict = flash_dict(&tampered, secret);
+        assert!(
+            dict.get("flash").is_none(),
+            "a tampered flash cookie must not reach the page"
+        );
+    }
 
     /// The `/login` template. The two-space runs and the blank line are what a
     /// minifier removes, so `minify_tests` looks for them in a finished body as
