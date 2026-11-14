@@ -98,6 +98,15 @@ pub fn close_inherited_on_exec() -> io::Result<()> {
     Ok(())
 }
 
+/// The effective user's numeric id.
+///
+/// The test kit names its shared port-claim directory with this, because a
+/// port belongs to the host and the marker files have to be writable by
+/// whoever claims them.
+pub fn uid() -> u32 {
+    nix::unistd::Uid::effective().as_raw()
+}
+
 /// Whether this process runs as root.
 pub fn is_root() -> bool {
     nix::unistd::Uid::effective().is_root()
