@@ -55,6 +55,11 @@ http-client = ["dep:ureq"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+# The platform layer: the one crate that knows the operating system, re-exported
+# as `m6_core::platform` so a service names nothing below m6-core.
+m6-platform = { path = "../m6-platform" }
+# `server::bind_tcp_reuseaddr` and the TCP listener options.
+socket2    = "0.6"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml       = "0.8"
@@ -63,15 +68,9 @@ thiserror  = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 tracing-appender   = "0.2"
-nix        = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net"] }
-# `client::Upstream`'s connect, and the Linux-only backlog test's listener,
-# which needs backlog 0 that `std` cannot ask for. Already a normal dependency,
-# so the test links nothing new.
-socket2    = "0.6"
 httparse   = "1"
 httpdate   = "1"
 rand       = "0.8"
-libc       = "0.2"
 brotli      = "6"
 flate2      = "1"
 base64      = "0.22"
@@ -87,9 +86,6 @@ slug        = "0.1"
 # binary, it identifies one. Same RustCrypto family as sha2, so it shares
 # `digest` and adds one crate.
 md-5        = "0.10"
-# The reactor: poll, tokens, interests, events and non-blocking sockets.
-# Re-exported as `m6_core::mio`, so a service links only m6-core.
-mio         = { version = "1", features = ["os-poll", "os-ext", "net"] }
 # DNS messages for the monitor's crawler check. Only the message codec is
 # wanted: the socket and the loop are m6's, and `std` is the whole feature set
 # this crate needs.
@@ -151,12 +147,6 @@ required-features = ["testkit"]
 # function runs.
 [[test]]
 name    = "log_reopen"
-harness = false
-
-# Signals as a descriptor, proved against a real `mio` poll. Its own `main` so
-# `block()` runs before any thread, as `log_reopen` does.
-[[test]]
-name    = "event_signals"
 harness = false
 
 # The three allocation checks (`Timeouts`, `Slots`, `LoopTrace`), each on the

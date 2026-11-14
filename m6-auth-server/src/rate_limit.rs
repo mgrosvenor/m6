@@ -75,7 +75,7 @@ impl RateLimiter {
 
     /// Count one failed login against `ip`.
     pub fn record_failure(&mut self, ip: &str) {
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let window = self.window_secs;
         let entry = self.map.entry(ip.to_string()).or_insert((0, now));
         if entry.1.elapsed().as_secs() >= window {
@@ -174,7 +174,7 @@ mod tests {
             .map
             .get_mut("192.0.2.1")
             .expect("the failure is recorded");
-        *started = Instant::now() - Duration::from_secs(61);
+        *started = m6_core::platform::now() - Duration::from_secs(61);
 
         assert!(
             !rl.is_blocked("192.0.2.1"),

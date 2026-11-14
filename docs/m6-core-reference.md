@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
 `docs/m6-app-anatomy.md` §2 has that loop in full.
 
 The prelude is deliberately small.
-It exports `Site`, `Handled`, `CodeRoute` and `RouteMethod`, `Dict`, `Error` and `Result`, `Request` and `Response`, `ServerConn`, `Read`, `Flush` and `head_slots`, the event module's `Signals`, `Signal`, `Timeouts`, `Slots` and `LoopTrace`, `mio` and its `Poll`, `Events`, `Interest` and `Token`, `listen_unix`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
+It exports `Site`, `Handled`, `CodeRoute` and `RouteMethod`, `Dict`, `Error` and `Result`, `Request` and `Response`, `ServerConn`, `Read`, `Flush` and `head_slots`, the event module's `Timeouts`, `Slots` and `LoopTrace`, the platform layer's `Signals`, `Signal`, `Poll`, `Events`, `Interest` and `Token`, `listen_unix`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
 Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, lettre's `Message`, `SmtpTransport` and `Transport`, `ureq`, and `rusqlite`.
 
 A service that renders no templates says so, and takes core with `default-features = false` to stop linking Tera.
@@ -117,7 +117,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Building a service** | `site` | `Site`, `CodeRoute`, `Handled` and `RouteMethod`, the route table, the request dictionary and the site-wide finish. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `socket_path_from_config` and the blocking request and response adapters the benchmarks use. |
-| | `signal` | `block()`, `Lifecycle`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
+| | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
@@ -142,7 +142,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
-| | `host` | What the machine is doing. Load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
+| | `platform` | The platform layer, the one crate that knows the operating system: readiness, the clock, signals, a child's exit, sockets, limits, directories, host and process facts. `docs/m6-platform.md`. Its `host` module is what the machine is doing: load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
 | | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded` and `TlsCertificate`. |
 | | `firewall` | `FirewallState` from nftables' own JSON. |
 | | `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
@@ -170,8 +170,8 @@ Table 4 names them, and `docs/m6-app-anatomy.md` §2 is the loop in full.
 
 | part | module | what it supplies |
 |---|---|---|
-| the reactor | `mio`, re-exported | `Poll`, `Events`, `Token`, `Interest` and the non-blocking sockets |
-| the signal descriptor | `event::Signals` | signals as a readable descriptor, and `Signal` values |
+| the reactor | `platform::Poll` | `Poll`, `Events`, `Token`, `Interest` and the non-blocking sockets in `platform::net` |
+| the signal descriptor | `platform::Signals` | a shutdown or reload request as a readable descriptor, and `Signal` values |
 | the deadlines | `event::Timeouts` | wake me at a time for a token, and the timeout to pass to the poll |
 | the connection table | `event::Slots` | slots made at start, their growth to a ceiling, and the free list |
 | the accounting | `event::LoopTrace` | the wait against the work, per trigger |
@@ -241,13 +241,13 @@ A service's loop uses `h1::ServerConn` instead.
 
 **`signal::block()` must be the first statement of every `main`, before logging.**
 Blocking a signal is per-thread and threads inherit the mask at creation, and `tracing_appender::non_blocking` spawns a writer thread, so a `main` that initialises logging first has already created a thread with SIGTERM unblocked.
-The kernel delivers process-directed SIGTERM there, the default disposition kills the process, and the `sigwait` thread never receives a signal in its life.
+The kernel delivers process-directed SIGTERM there, and the default disposition kills the process.
 A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
 
-`ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up the handler, and it asserts that the mask is set and refuses to start otherwise.
-`complete()`, `is_shutdown()` and `wait()` are the lifecycle.
+`Signals::new()` asserts that the mask is set and refuses to start otherwise.
+`Lifecycle::on_signal` decides what each signal means and `complete()` ends the lifecycle.
 
-`REOPEN_SIGNAL` is SIGUSR1.
+The reload signal is SIGUSR1 (`platform::Signal::ReopenLogs`).
 `block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.
 The thread calls `log::reopen_log_file()` and logs what happened.
 The reopen opens the new file while holding the lock the log writer takes for every line, so once the path exists again no further line can reach the renamed file.
@@ -821,7 +821,7 @@ The rule lives in [`crate::dns`]. `Confirm::start(ip, ns)` asks the PTR question
 
 This module re-exports `Ptr`, because callers name `resolve::Ptr` and this section states the rule. The one caller is `m6-monitor`'s fleet poll, which drives `Confirm` on its own loop and keeps the answers.
 
-### 8.5. `host`
+### 8.5. `platform::host`
 
 Parsing is separated from reading. The `parse_*` functions are pure over the
 text these files contain and are tested on any platform; the readers are thin

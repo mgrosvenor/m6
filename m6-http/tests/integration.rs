@@ -3,6 +3,14 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::{Events, Interest, Poll, Token};
+use m6_http_lib::forward::HttpRequest;
+use m6_http_lib::http11::{
+    make_tls_server_config, HitHeaders, Http11Listener, RequestHead, RequestOutcome,
+    DEFAULT_MAX_REQUESTS_PER_CONN, INITIAL_CONNECTIONS,
+};
+use quiche::h3::NameValue as _;
 /// Functional integration tests for m6-http protocol handling.
 ///
 /// HTTP/1.1: spins up Http11Listener in-process with a self-signed cert (rcgen),
@@ -18,16 +26,6 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-
-use m6_core::event::raise_open_file_limit;
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
-use m6_http_lib::forward::HttpRequest;
-use m6_http_lib::http11::{
-    make_tls_server_config, HitHeaders, Http11Listener, RequestHead, RequestOutcome,
-    DEFAULT_MAX_REQUESTS_PER_CONN, INITIAL_CONNECTIONS,
-};
-use quiche::h3::NameValue as _;
 
 const TOKEN_TCP: Token = Token(usize::MAX);
 
@@ -102,7 +100,7 @@ where
         .install_default()
         .ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
-    let ceiling = raise_open_file_limit().unwrap_or(4096);
+    let ceiling = raise_fd_limit().unwrap_or(4096);
     let mut listener = Http11Listener::bind(
         "127.0.0.1:0",
         tls_cfg,
@@ -118,11 +116,7 @@ where
     thread::spawn(move || {
         let mut poll = Poll::new().expect("poll");
         poll.registry()
-            .register(
-                &mut SourceFd(&listener.raw_fd()),
-                TOKEN_TCP,
-                Interest::READABLE,
-            )
+            .register_fd(listener.raw_fd(), TOKEN_TCP, Interest::READABLE)
             .expect("register listener");
         let mut events = Events::with_capacity(64);
         let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
@@ -160,11 +154,7 @@ where
                             conn.set_interest(Interest::READABLE);
                             if poll
                                 .registry()
-                                .register(
-                                    &mut SourceFd(&conn.raw_fd()),
-                                    Token(key),
-                                    Interest::READABLE,
-                                )
+                                .register_fd(conn.raw_fd(), Token(key), Interest::READABLE)
                                 .is_err()
                             {
                                 listener.free_slot(key);

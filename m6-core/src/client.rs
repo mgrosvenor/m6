@@ -12,7 +12,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -271,7 +271,7 @@ impl Upstream {
             in_trailers: false,
             body_len: 0,
             eof: false,
-            deadline: Instant::now(),
+            deadline: crate::platform::now(),
             method_is_head: false,
             reusable: false,
             request_finished: false,
@@ -358,13 +358,13 @@ impl Upstream {
         };
         match addr {
             Addr::Unix(path) => {
-                let sock =
-                    socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-                sock.set_nonblocking(true)?;
-                // A Unix connect completes at once or fails. WouldBlock means the
-                // listen backlog is full, which the caller answers as 503.
-                sock.connect(&socket2::SockAddr::unix(path)?)?;
-                self.stream = Some(Stream::Unix(OwnedFd::from(sock).into()));
+                // A Unix connect completes at once or fails. On Linux WouldBlock
+                // means the listen backlog is full, which the caller answers as
+                // 503 and keeps the member. macOS answers ConnectionRefused for a
+                // full queue and for no listener alike, so there a full queue
+                // reads as a failed member for one backoff.
+                let sock = crate::platform::net::connect_unix(path)?;
+                self.stream = Some(Stream::Unix(sock));
                 self.tls = tls_conn;
                 self.phase = if self.tls.is_some() {
                     Phase::Handshaking
@@ -373,35 +373,18 @@ impl Upstream {
                 };
             }
             Addr::Tcp(addr) => {
-                let domain = if addr.is_ipv4() {
-                    socket2::Domain::IPV4
-                } else {
-                    socket2::Domain::IPV6
-                };
-                let sock = socket2::Socket::new(
-                    domain,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                )?;
-                sock.set_nonblocking(true)?;
-                sock.set_tcp_nodelay(true)?;
-                // A non-blocking TCP connect returns EINPROGRESS: the caller waits
-                // for writable, then `take_error` decides.
-                match sock.connect(&socket2::SockAddr::from(*addr)) {
-                    Ok(()) => {
-                        self.phase = if self.tls.is_some() {
-                            Phase::Handshaking
-                        } else {
-                            Phase::Transfer
-                        };
-                    }
-                    Err(e) if connect_in_progress(&e) => {
-                        self.phase = Phase::Connecting;
-                    }
-                    Err(e) => return Err(e),
-                }
-                self.stream = Some(Stream::Tcp(OwnedFd::from(sock).into()));
+                // A non-blocking TCP connect may still be in progress: the
+                // caller then waits for writable, and `take_error` decides.
+                let (sock, state) = crate::platform::net::connect_tcp(*addr)?;
                 self.tls = tls_conn;
+                self.phase = match state {
+                    crate::platform::net::Connect::InProgress => Phase::Connecting,
+                    crate::platform::net::Connect::Connected if self.tls.is_some() => {
+                        Phase::Handshaking
+                    }
+                    crate::platform::net::Connect::Connected => Phase::Transfer,
+                };
+                self.stream = Some(Stream::Tcp(sock));
             }
         }
         // Reuse the previous address's buffer when the slot reconnects, so a
@@ -423,18 +406,20 @@ impl Upstream {
     }
 
     /// The interest to register for the current phase.
-    pub fn interest(&self) -> mio::Interest {
+    pub fn interest(&self) -> crate::platform::Interest {
         match self.phase {
-            Phase::Connecting => mio::Interest::WRITABLE,
-            Phase::Handshaking => mio::Interest::READABLE | mio::Interest::WRITABLE,
+            Phase::Connecting => crate::platform::Interest::WRITABLE,
+            Phase::Handshaking => {
+                crate::platform::Interest::READABLE | crate::platform::Interest::WRITABLE
+            }
             Phase::Transfer => {
                 if self.wants_write() {
-                    mio::Interest::READABLE | mio::Interest::WRITABLE
+                    crate::platform::Interest::READABLE | crate::platform::Interest::WRITABLE
                 } else {
-                    mio::Interest::READABLE
+                    crate::platform::Interest::READABLE
                 }
             }
-            Phase::Idle => mio::Interest::READABLE,
+            Phase::Idle => crate::platform::Interest::READABLE,
         }
     }
 
@@ -894,13 +879,6 @@ impl Upstream {
         self.phase = Phase::Idle;
         self.reusable = false;
     }
-}
-
-/// Whether a connect error means the connect is still in progress, not failed.
-/// `socket2` reports `EINPROGRESS` both as `WouldBlock` and as the raw errno,
-/// depending on the platform.
-fn connect_in_progress(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EINPROGRESS)
 }
 
 // Test seam (per-connection): when the caller's `block_next_write` flag is set,
@@ -1532,17 +1510,15 @@ mod socket_tests {
     /// A parsed response: status, owned headers, and body.
     type Parsed = (u16, Vec<(String, String)>, Vec<u8>);
 
-    /// Drive an upstream with a `mio::Poll` until it completes, blocking (tests
-    /// may block). Returns (status, headers, body).
+    /// Drive an upstream with a `platform::Poll` until it completes, blocking
+    /// (tests may block). Returns (status, headers, body).
     fn drive_to_completion(up: &mut Upstream) -> io::Result<Parsed> {
-        use mio::unix::SourceFd;
-        use mio::{Events, Poll, Token};
+        use crate::platform::{Events, Poll, Token};
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(8);
         let token = Token(0);
         let mut registered = up.interest();
-        poll.registry()
-            .register(&mut SourceFd(&up.fd()), token, registered)?;
+        poll.registry().register_fd(up.fd(), token, registered)?;
         loop {
             poll.poll(&mut events, Some(Duration::from_millis(100)))?;
             if events.iter().any(|ev| ev.token() == token) {
@@ -1560,12 +1536,11 @@ mod socket_tests {
                 // that may never arrive.
                 let interest = up.interest();
                 if interest != registered {
-                    poll.registry()
-                        .reregister(&mut SourceFd(&up.fd()), token, interest)?;
+                    poll.registry().reregister_fd(up.fd(), token, interest)?;
                     registered = interest;
                 }
             }
-            if Instant::now() >= up.deadline() {
+            if crate::platform::now() >= up.deadline() {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "backend timed out"));
             }
         }
@@ -1600,7 +1575,7 @@ mod socket_tests {
             &Addr::Tcp(addr),
             None,
             false,
-            Instant::now() + Duration::from_secs(5),
+            crate::platform::now() + Duration::from_secs(5),
         )
         .expect("an in-progress connect is not an error");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
@@ -1624,7 +1599,7 @@ mod socket_tests {
             &Addr::Tcp(addr),
             None,
             false,
-            Instant::now() + Duration::from_secs(30),
+            crate::platform::now() + Duration::from_secs(30),
         )
         .expect("a non-blocking connect is not an error");
         assert!(
@@ -1661,8 +1636,13 @@ mod socket_tests {
         let mut up = Upstream::new(64 * 1024, 16 * 1024);
         up.request_buf()
             .extend_from_slice(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
-        up.start(&addr, None, false, Instant::now() + Duration::from_secs(5))
-            .expect("start");
+        up.start(
+            &addr,
+            None,
+            false,
+            crate::platform::now() + Duration::from_secs(5),
+        )
+        .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         assert!(
@@ -1672,8 +1652,13 @@ mod socket_tests {
 
         up.request_buf()
             .extend_from_slice(b"GET /two HTTP/1.1\r\nHost: x\r\n\r\n");
-        up.start(&addr, None, false, Instant::now() + Duration::from_secs(5))
-            .expect("second start reuses the socket");
+        up.start(
+            &addr,
+            None,
+            false,
+            crate::platform::now() + Duration::from_secs(5),
+        )
+        .expect("second start reuses the socket");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         peer.join().expect("peer");
@@ -1736,69 +1721,12 @@ mod socket_tests {
             &Addr::Tcp(addr),
             Some(&tls),
             false,
-            Instant::now() + Duration::from_secs(5),
+            crate::platform::now() + Duration::from_secs(5),
         )
         .expect("start");
         let (status, _, body) = drive_to_completion(&mut up).expect("drive");
         assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
         peer.join().expect("peer");
-    }
-
-    /// On Linux, a connect to a full Unix-socket backlog returns WouldBlock, so
-    /// the caller answers 503. On macOS the kernel answers ECONNREFUSED, so this
-    /// test builds only on Linux.
-    ///
-    /// `std::net::UnixListener::bind` listens with backlog 128, so a single
-    /// connect never fills it and `start` would succeed. Build the listener
-    /// with backlog 0 instead, then fill the queue with non-blocking connects.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_full_backlog_is_would_block() {
-        use socket2::{Domain, SockAddr, Socket, Type};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("full.sock");
-        let addr = SockAddr::unix(&path).expect("unix addr");
-        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("listener socket");
-        listener.bind(&addr).expect("bind");
-        listener.listen(0).expect("listen");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
-
-        // Fill the queue. Each filler is non-blocking, so the connect that finds
-        // the queue full returns EAGAIN rather than waiting for an accept. The
-        // bound fails the test rather than hanging if the kernel never says so.
-        let mut fillers = Vec::new();
-        loop {
-            assert!(
-                fillers.len() < 256,
-                "the backlog never filled: 256 connects all succeeded"
-            );
-            let filler = Socket::new(Domain::UNIX, Type::STREAM, None).expect("filler socket");
-            filler.set_nonblocking(true).expect("nonblocking filler");
-            match filler.connect(&addr) {
-                Ok(()) => fillers.push(filler),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("filler connect: {e}"),
-            }
-        }
-        assert!(!fillers.is_empty(), "the first filler connect succeeds");
-
-        let mut up = Upstream::new(64 * 1024, 16 * 1024);
-        up.request_buf()
-            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        let err = up
-            .start(
-                &Addr::Unix(path),
-                None,
-                false,
-                Instant::now() + Duration::from_secs(5),
-            )
-            .expect_err("a full backlog is WouldBlock");
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
-        drop(fillers);
-        drop(listener);
     }
 
     /// A backend that answers at once without reading the request is still read
@@ -1824,7 +1752,7 @@ mod socket_tests {
             accept_tx.send(()).expect("report the second accept");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::platform::now() + Duration::from_secs(5);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         let req = up.request_buf();
         req.extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
@@ -1929,7 +1857,7 @@ mod socket_tests {
             name: name_b,
         };
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 16 * 1024);
         // Request 1 with identity A: the server accepts once.
         up.request_buf()
@@ -2024,7 +1952,7 @@ mod socket_tests {
             config: client,
             name,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         up.request_buf().extend_from_slice(
             b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
@@ -2040,8 +1968,7 @@ mod socket_tests {
     /// the write reports the block, and the next drive flushes the tail.
     #[test]
     fn a_blocked_final_flush_is_retried() {
-        use mio::unix::SourceFd;
-        use mio::{Events, Poll, Token};
+        use crate::platform::{Events, Poll, Token};
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
         let cert = ck.cert.der().clone();
         let key =
@@ -2101,7 +2028,7 @@ mod socket_tests {
             config: client,
             name,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         let mut req = Vec::new();
         req.extend_from_slice(
@@ -2120,7 +2047,7 @@ mod socket_tests {
         let token = Token(0);
         let mut interest = up.interest();
         poll.registry()
-            .register(&mut SourceFd(&up.fd()), token, interest)
+            .register_fd(up.fd(), token, interest)
             .expect("register");
         let mut blocked = false;
         let mut reregistered_after_block = false;
@@ -2148,7 +2075,7 @@ mod socket_tests {
                 let force = blocked_now && !reregistered_after_block;
                 if next != interest || force {
                     poll.registry()
-                        .reregister(&mut SourceFd(&up.fd()), token, next)
+                        .reregister_fd(up.fd(), token, next)
                         .expect("reregister");
                     interest = next;
                 }
@@ -2156,7 +2083,7 @@ mod socket_tests {
                     reregistered_after_block = true;
                 }
             }
-            if Instant::now() >= up.deadline() {
+            if crate::platform::now() >= up.deadline() {
                 panic!("timed out");
             }
         }

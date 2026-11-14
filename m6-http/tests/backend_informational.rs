@@ -41,15 +41,14 @@ fn backend(sock: &Path, informational: usize) -> std::thread::JoinHandle<()> {
 }
 
 /// Drive one request over a Unix socket until it completes, blocking with a
-/// `mio::Poll` (tests may block).
+/// `platform::Poll` (tests may block).
 fn drive_upstream(
     sock: &Path,
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
 ) -> std::io::Result<forward::HttpResponse> {
-    use m6_core::mio::unix::SourceFd;
-    use m6_core::mio::{Events, Poll, Token};
+    use m6_core::platform::{Events, Poll, Token};
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
     forward::encode_request(up.request_buf(), req, client_ip, original_host)?;
@@ -65,8 +64,7 @@ fn drive_upstream(
     let mut events = Events::with_capacity(8);
     let token = Token(0);
     let mut registered = up.interest();
-    poll.registry()
-        .register(&mut SourceFd(&up.fd()), token, registered)?;
+    poll.registry().register_fd(up.fd(), token, registered)?;
     loop {
         poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))?;
         if events.iter().any(|ev| ev.token() == token) {
@@ -81,8 +79,7 @@ fn drive_upstream(
             // before the drive waits for an edge that never comes.
             let interest = up.interest();
             if interest != registered {
-                poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, interest)?;
+                poll.registry().reregister_fd(up.fd(), token, interest)?;
                 registered = interest;
             }
         }

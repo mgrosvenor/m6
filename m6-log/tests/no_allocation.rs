@@ -42,7 +42,7 @@ fn main() {
         .write(true)
         .open("/dev/null")
         .expect("/dev/null");
-    nix::unistd::dup2_stdout(&devnull).expect("stdout is /dev/null");
+    m6_platform::fd::dup2_stdout(&devnull).expect("stdout is /dev/null");
     m6_log::init(Level::Trace, Some(std::path::Path::new("/dev/null"))).expect("the logger");
 
     let before = COUNT.load(Ordering::Relaxed);

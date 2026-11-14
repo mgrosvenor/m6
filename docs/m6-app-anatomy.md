@@ -125,11 +125,8 @@ fn main() -> anyhow::Result<()> {
     let mut signals = Signals::new()?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
-    poll.registry().register(
-        &mut mio::unix::SourceFd(&signals.raw_fd()),
-        SIGNALS,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)?;
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
     lifecycle.started();
     let mut conns = Slots::new(1024, 1024, || ServerConn::new(READ_CAP, WRITE_CAP));
@@ -596,7 +593,7 @@ This section lists it, because services have re-implemented parts of it before.
 - HTTP/1.1 parsing and framing at 32/32 on h1spec, measured on `m6-html`, `m6-file`, `m6-auth-server` and the redirect listener, including HEAD with no body and correct `Connection` handling.
 - Persistent connections to 100 requests, and a read deadline.
 - `ServerConn` and `head_slots`, which read, parse and write through buffers made at start, so serving a request allocates only where the page path does.
-- `Poll`, `Token`, `Interest` and `Events` over epoll, kqueue and poll, re-exported as `m6_core::mio`.
+- `Poll`, `Token`, `Interest` and `Events` over epoll and kqueue, from `m6_core::platform`, the one crate that knows the operating system (`docs/m6-platform.md`). `m6-core/examples/echo.rs` is the reference loop every service follows, held by `m6-core/tests/echo_example.rs` on every supported target.
 - `Signals`, `Signal`, `Timeouts`, `Slots` and `LoopTrace`: the signal descriptor, the deadline set, the connection table with its growth and free list, and the wait against work accounting.
 - `listen_unix`, which binds a non-blocking socket with the mode set.
 - Content-coding negotiation with real q-values, so `br;q=0` is honoured, `*` supplies the quality for anything unnamed, and an explicitly named coding beats `*` in either direction.

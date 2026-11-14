@@ -287,7 +287,7 @@ impl Site {
     /// `handle` for a caller that already owns a [`RawRequest`]: the one
     /// dispatch, shared by the borrowed path and by a caller holding one.
     pub(crate) fn handle_raw(&self, raw: RawRequest) -> Handled {
-        let started = std::time::Instant::now();
+        let started = crate::platform::now();
         let matched = find_route(raw.path(), raw.method(), &self.state.routes)
             .map(|(route, params)| (route, self.state.build_dict(&raw, route, &params)));
 
@@ -2347,7 +2347,7 @@ mod tests {
     fn named_site_toml_that_is_unreadable_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         // root reads any file, so the test would prove nothing.
-        if unsafe { libc::geteuid() } == 0 {
+        if crate::platform::process::is_root() {
             return;
         }
         let d = tempfile::tempdir().unwrap();
@@ -2686,7 +2686,7 @@ mod tests {
 #[cfg(test)]
 mod last_modified_tests {
     use super::newest_mtime_under;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     #[test]
     fn newest_mtime_is_none_for_a_missing_directory() {
@@ -2708,8 +2708,8 @@ mod last_modified_tests {
         std::fs::write(d.path().join("old.html"), b"a").unwrap();
         std::fs::write(d.path().join("new.html"), b"b").unwrap();
 
-        let past = SystemTime::now() - Duration::from_secs(3600);
-        let recent = SystemTime::now() - Duration::from_secs(60);
+        let past = crate::platform::wall() - Duration::from_secs(3600);
+        let recent = crate::platform::wall() - Duration::from_secs(60);
         filetime::set_file_mtime(d.path().join("old.html"), filetime::FileTime::from(past))
             .unwrap();
         filetime::set_file_mtime(d.path().join("new.html"), filetime::FileTime::from(recent))
@@ -2732,8 +2732,8 @@ mod last_modified_tests {
         std::fs::create_dir(d.path().join("partials")).unwrap();
         std::fs::write(d.path().join("partials/_head.html"), b"b").unwrap();
 
-        let past = SystemTime::now() - Duration::from_secs(7200);
-        let recent = SystemTime::now() - Duration::from_secs(30);
+        let past = crate::platform::wall() - Duration::from_secs(7200);
+        let recent = crate::platform::wall() - Duration::from_secs(30);
         filetime::set_file_mtime(d.path().join("page.html"), filetime::FileTime::from(past))
             .unwrap();
         filetime::set_file_mtime(
@@ -3192,7 +3192,7 @@ mod dict_cost {
         }
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            let t = std::time::Instant::now();
+            let t = crate::platform::now();
             f();
             v.push(t.elapsed().as_nanos() as u64);
         }
@@ -3431,7 +3431,7 @@ mod copy_audit {
         }
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            let t = std::time::Instant::now();
+            let t = crate::platform::now();
             f();
             v.push(t.elapsed().as_nanos() as u64);
         }

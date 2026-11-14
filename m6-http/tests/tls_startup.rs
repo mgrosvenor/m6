@@ -249,15 +249,16 @@ fn start(configured: &Cert, alternate: &Cert) -> Server {
 
 /// Run m6-http to its exit, which must come within ten seconds.
 fn run_until_exit(site: &Path, config: &Path) -> (Option<i32>, String) {
-    let mut child: Child = Command::new(binary("m6-http"))
-        .arg(site)
-        .arg(config)
-        .env("RUST_LOG", "info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn m6-http");
+    let mut child: Child = m6_core::platform::process::spawn(
+        Command::new(binary("m6-http"))
+            .arg(site)
+            .arg(config)
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn m6-http");
     let exited = testkit::wait::until(Duration::from_secs(10), || {
         child.try_wait().expect("try_wait").is_some()
     });

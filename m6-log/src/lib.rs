@@ -9,7 +9,7 @@
 //! A service's loop makes five short calls, in plain sight:
 //!
 //! ```text
-//! m6_core::log::tick(SystemTime::now());          // on the accounting tick
+//! m6_core::log::tick(m6_platform::wall());          // on the accounting tick
 //! m6_core::log::watch(poll.registry(), LOG)?;     // after one turn's events
 //! LOG => m6_core::log::flush(),                   // in the match on the token
 //! Some(Signal::ReopenLogs) => m6_core::log::reopen()?,  // SIGUSR1

@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use common::Stdout;
-use nix::unistd::{dup, dup2_stdout};
+use m6_platform::fd::{dup, dup2_stdout};
 
 /// These tests replace process stdout, so they take turns even when the
 /// harness runs them on several threads.
@@ -34,7 +34,7 @@ fn a_full_destination_never_blocks_and_drops_are_counted() {
     let _stdout = STDOUT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let saved_stdout = dup(std::io::stdout()).expect("a saved stdout");
+    let saved_stdout = dup(&std::io::stdout()).expect("a saved stdout");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let (stdout, read) = Stdout::to_pipe();
