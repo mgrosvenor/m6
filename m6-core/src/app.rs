@@ -1286,11 +1286,12 @@ impl FrameworkState {
     }
 
     /// The two built-in date values: RFC 3339 in UTC to the second, and the
-    /// four-digit year.
+    /// four-digit year. No format string is parsed on the request path.
     fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+        use chrono::Datelike as _;
         (
-            now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            now.format("%Y").to_string(),
+            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            now.year().to_string(),
         )
     }
 
