@@ -50,11 +50,13 @@ Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at 
 
 **Load balancing:** least-connections across active pool members.
 
-**URL backends** (`http://`, `https://`) are not pooled — one HTTP/1.1 connection per request, run on a dedicated I/O thread.
+**URL backends** (`http://`, `https://`) are not a member pool: each request takes one HTTP/1.1 connection, kept open for later requests in a per-backend idle set of up to eight, driven by the event loop through a `client::Upstream` slot with no dedicated I/O thread.
 
 **H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://origin.example.com:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over a private backbone, where TLS at the application layer is redundant.
 
 **H2S backends** use the `h2s://` scheme (e.g. `url = "h2s://api.example.com:443"`). Like H2C but over TLS — ALPN negotiates `h2` during the handshake; startup fails if the server does not support it. The connection is maintained persistently by an event-loop-driven `H2sTlsClientPool`. Intended for HTTP/2 forwarding to external TLS-terminating upstreams.
+
+A backend that answers before it has read the whole request and then refuses the write has that answer forwarded to the client, and its connection is never reused. A request that was written in full and answered early is a different case: the connection can still carry another request if the reply's framing says it can, so it rejoins the idle set like any other.
 
 ---
 

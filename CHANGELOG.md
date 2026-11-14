@@ -150,6 +150,11 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**A backend's early response is forwarded instead of a 502.**
+When a backend answered before it had read the whole request body (a 413 for an oversized upload, for example) and then closed, m6 treated the failed write as the result and answered 502, and on Linux the reply was lost.
+The client now reads a reply the backend has already sent before it reports a write error, over plain and TLS connections, and the backend's own status reaches the client.
+Verified: the socket and m6-http early-response tests on Linux and macOS (on Linux, 0 of 10 passed before the fix and 10 of 10 after).
+
 **The test kit's scratch directory and port claims work on any host, so the suite has no list of known failures.**
 `m6_core::testkit` chose `/var/tmp` for scratch files whether or not the process could write there, and kept port claims per build, so two builds on one host could claim the same port and one test reached the other's server.
 Scratch files now go to the first of `TMPDIR`, `/var/tmp` and the system temp directory that can create, write and run a file, and port claims live in one directory per user that every build shares.
