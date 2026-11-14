@@ -159,6 +159,12 @@ impl<T> Slots<T> {
         })
     }
 
+    /// How many slots are free: a loop that stopped accepting for want of a
+    /// descriptor accepts again once this has risen, which a close does.
+    pub fn free_slots(&self) -> usize {
+        self.free.len()
+    }
+
     pub fn free(&mut self, key: usize) {
         self.free.push(key);
     }

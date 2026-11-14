@@ -83,6 +83,10 @@ fn main() -> io::Result<()> {
     let mut idle_timeouts = Timeouts::new(initial, idle);
     let mut events = Events::with_capacity(EVENTS);
     let mut accepting = true;
+    // Set when an accept failed for want of a descriptor: the free-slot count
+    // then, so the listener is armed again only once a connection has closed.
+    let mut starved_at: Option<usize> = None;
+    let mut turns: u64 = 0;
     let mut open = 0usize;
     // Set by a shutdown request: the time to give up on open connections.
     let mut drain_until: Option<Instant> = None;
@@ -110,6 +114,7 @@ fn main() -> io::Result<()> {
         }
         // The turn's one time: every deadline below sees the same clock.
         now = platform::now();
+        turns += 1;
         for ev in &events {
             match ev.token() {
                 // NEW CONNECTIONS: take a free slot for each, register it,
@@ -138,15 +143,15 @@ fn main() -> io::Result<()> {
                                     continue;
                                 }
                                 // Out of descriptors: give the slot back and
-                                // re-arm the listener, so the clients still
-                                // queued are accepted once one frees.
+                                // stop accepting until a connection closes,
+                                // when the listener is armed again and the
+                                // queued clients accepted. Re-arming at once
+                                // would spin while nothing frees.
                                 net::Accept::Retry => {
                                     slots.free(taken.key);
-                                    poll.registry().reregister(
-                                        &mut listener,
-                                        LISTENER,
-                                        Interest::READABLE,
-                                    )?;
+                                    poll.registry().deregister(&mut listener)?;
+                                    accepting = false;
+                                    starved_at = Some(slots.free_slots());
                                     break;
                                 }
                             },
@@ -231,10 +236,15 @@ fn main() -> io::Result<()> {
             }
         }
         // A slot came free while the table was full: accept again.
-        if !accepting && drain_until.is_none() && !slots.is_full() {
+        if !accepting
+            && drain_until.is_none()
+            && !slots.is_full()
+            && starved_at.is_none_or(|n| slots.free_slots() > n)
+        {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
+            starved_at = None;
         }
     }
 
@@ -242,7 +252,7 @@ fn main() -> io::Result<()> {
     let outside_growth =
         m6_core::testkit::alloc_count::now() - allocated_at_start - growth_allocations;
     eprintln!(
-        "stopping, {open} connection(s) open, {} slots, {outside_growth} allocation(s) during the run outside table growth",
+        "stopping, {open} connection(s) open, {} slots, {turns} turn(s), {outside_growth} allocation(s) during the run outside table growth",
         slots.len()
     );
     Ok(())

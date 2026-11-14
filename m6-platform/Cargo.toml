@@ -36,10 +36,13 @@ rustix = { version = "1", default-features = false, features = ["std", "process"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Host readings (memory, load, uptime, interface counters) where there is no
-# /proc. Default features off: `multithread` would start a rayon pool.
+# /proc: Linux reads /proc and /sys directly, today's code, and links none of
+# this. Default features off: `multithread` would start a rayon pool.
 sysinfo = { version = "0.31", default-features = false, features = ["system", "network"] }
-# `proc_pidinfo` and `sysctlbyname`, which no safe crate wraps.
-libc    = "0.2"
+# A process's threads and open descriptors (`proc_pidinfo`), safely.
+libproc = "0.14"
+# `kern.maxfilesperproc`, safely.
+sysctl  = "0.6"
 
 [dev-dependencies]
 serde_json = "1"

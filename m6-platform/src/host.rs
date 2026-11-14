@@ -508,29 +508,6 @@ impl FileDescriptors {
     }
 }
 
-/// Parse the `Max open files` row of `/proc/self/limits`.
-pub fn parse_fd_limits(s: &str) -> Option<(u64, u64)> {
-    for line in s.lines() {
-        if !line.starts_with("Max open files") {
-            continue;
-        }
-        let rest = line.trim_start_matches("Max open files").trim();
-        let f: Vec<&str> = rest.split_whitespace().collect();
-        let parse = |v: &str| -> u64 {
-            if v == "unlimited" {
-                u64::MAX
-            } else {
-                v.parse().unwrap_or(0)
-            }
-        };
-        return Some((
-            parse(f.first().copied().unwrap_or("0")),
-            parse(f.get(1).copied().unwrap_or("0")),
-        ));
-    }
-    None
-}
-
 // ── Readers ──────────────────────────────────────────────────────────────────
 
 /// A snapshot of the host, with every field optional because every field can
@@ -614,9 +591,16 @@ pub fn tcp_health() -> Option<TcpHealth> {
     os::tcp_health()
 }
 
-/// This process's open descriptors against its limits.
+/// This process's open descriptors against its limits, through
+/// [`super::process`]: the same on every target.
 pub fn file_descriptors() -> Option<FileDescriptors> {
-    os::file_descriptors()
+    let open = super::process::open_descriptors(std::process::id()).ok()? as u64;
+    let (soft, hard) = super::process::fd_limits().ok()?;
+    Some(FileDescriptors {
+        open,
+        soft_limit: soft,
+        hard_limit: hard,
+    })
 }
 
 /// The kernel's load averages. On Linux from `/proc/loadavg`, with the
@@ -874,38 +858,6 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         assert_eq!(t.sockets_used, 229);
         assert_eq!(t.tcp_inuse, 9);
         assert_eq!(t.tcp_time_wait, 0);
-    }
-
-    /// A limits row with a 1024 soft limit against a 524288 hard one. The soft
-    /// limit is what `accept` fails against.
-    #[test]
-    fn parses_fd_limits_and_keeps_soft_and_hard_apart() {
-        let s = "Limit                     Soft Limit           Hard Limit           Units\n\
-                 Max open files            1024                 524288               files\n";
-        let (soft, hard) = parse_fd_limits(s).unwrap();
-        assert_eq!(soft, 1024);
-        assert_eq!(hard, 524288);
-
-        let f = FileDescriptors {
-            open: 512,
-            soft_limit: soft,
-            hard_limit: hard,
-        };
-        assert!(
-            (f.used_fraction() - 0.5).abs() < 1e-9,
-            "headroom is against the SOFT limit"
-        );
-    }
-
-    #[test]
-    fn unlimited_fds_do_not_parse_as_zero() {
-        let s = "Max open files            unlimited            unlimited            files\n";
-        let (soft, _) = parse_fd_limits(s).unwrap();
-        assert_eq!(soft, u64::MAX);
-        assert_eq!(
-            parse_fd_limits("Max locked memory 8388608 8388608 bytes\n"),
-            None
-        );
     }
 
     /// Everything is optional and a snapshot on a machine missing any of it

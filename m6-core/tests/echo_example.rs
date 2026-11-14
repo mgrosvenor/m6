@@ -69,6 +69,10 @@ impl Server {
         conns: u64,
         max_conns: Option<u64>,
     ) -> Server {
+        static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWEPT.get_or_init(|| {
+            let _ = platform::process::close_inherited_on_exec();
+        });
         cmd.args(args);
         cmd.env("ECHO_IDLE_MS", idle_ms.to_string());
         cmd.env("ECHO_CONNS", conns.to_string());
@@ -596,13 +600,21 @@ fn queued_clients_are_served_once_descriptors_free() {
         waiting.len() + reset > 0,
         "the descriptor limit left no client waiting or reset"
     );
+    // Nothing frees for half a second: a loop that re-armed the listener at
+    // once would spin through thousands of turns here, which the turn count
+    // in the stopping line shows.
+    std::thread::sleep(Duration::from_millis(500));
     // Closing the served ones frees descriptors: the queue drains, and what
     // the kernel reset is counted rather than served.
     drop(served);
     let mut served_late = 0;
     for mut c in waiting {
-        c.set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
+        // A socket the kernel reset meanwhile refuses the option (macOS
+        // answers EINVAL): that is a reset, counted as one.
+        if c.set_read_timeout(Some(Duration::from_secs(10))).is_err() {
+            reset += 1;
+            continue;
+        }
         let mut b = [0u8; 1];
         match c.read(&mut b) {
             Ok(1) if b[0] == b'q' => served_late += 1,
@@ -611,12 +623,22 @@ fn queued_clients_are_served_once_descriptors_free() {
         }
     }
     println!("served late: {served_late}, reset by the kernel: {reset}");
-    // The listener is still armed: a new client is accepted and echoed.
+    // The listener is armed again: a new client is accepted and echoed.
     let mut fresh = TcpStream::connect(srv.addr).expect("connect");
     fresh.write_all(b"new\n").expect("send");
     assert_eq!(recv_exact(&mut fresh, 4, Duration::from_secs(10)), b"new\n");
     drop(fresh);
     let tail = srv.tail();
+    let turns: u64 = tail
+        .lines()
+        .find(|l| l.contains(" turn(s), "))
+        .and_then(|l| l.split(", ").find_map(|f| f.strip_suffix(" turn(s)")))
+        .and_then(|n| n.parse().ok())
+        .expect("the stopping line counts the turns");
+    assert!(
+        turns < 500,
+        "the loop spun while nothing freed: {turns} turns\n{tail}"
+    );
     assert_zero_allocations(&tail);
 }
 

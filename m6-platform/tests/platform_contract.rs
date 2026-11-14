@@ -606,15 +606,18 @@ mod spawn {
     use super::*;
     use std::process::{Command, Stdio};
 
-    /// C9. Break: `process::spawn` without the close-on-exec pass. A lock this
-    /// process holds would then be held by the child too, and the second
-    /// `try_lock` below would fail.
+    /// C9. Break: `close_inherited_on_exec` not run (or run after the lock
+    /// was taken). A lock this process holds would then be held by the child
+    /// too, and the second `try_lock` below would fail.
     #[test]
     fn a_spawned_child_inherits_no_descriptor_above_stderr() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("lock");
         let held = std::fs::File::create(&path).expect("create");
         held.try_lock().expect("this process takes the lock");
+        // The harness's start-time sweep, here after the lock so it is the
+        // sweep and not Rust's own close-on-exec that the test holds.
+        process::close_inherited_on_exec().expect("sweep");
         let mut child = process::spawn(
             Command::new("sleep")
                 .arg("30")
@@ -852,6 +855,36 @@ mod sockets {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o660);
+    }
+
+    /// U10. Break: `bind_unix` unlinking whatever is at the path, so a second
+    /// instance steals a live listener's socket.
+    #[test]
+    fn a_live_listeners_socket_is_refused_not_replaced() {
+        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let path = dir.path().join("live.sock");
+        let first = net::bind_unix(&path, 0o600).expect("first bind");
+        let err = net::bind_unix(&path, 0o600).expect_err("a live listener is refused");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        assert!(path.exists(), "the live socket file is left alone");
+        drop(first);
+    }
+
+    /// U11. Break: a regular file at the path removed as if it were a stale
+    /// socket.
+    #[test]
+    fn a_non_socket_at_the_path_is_an_error_naming_it() {
+        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"data").expect("write");
+        let err = net::bind_unix(&path, 0o600).expect_err("a file is not replaced");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(err.to_string().contains("not a socket"), "{err}");
+        assert!(path.exists(), "the file is left alone");
     }
 
     /// U9. Break: `EINPROGRESS` returned as an error.

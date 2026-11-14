@@ -50,15 +50,14 @@ pub fn fd_limits() -> io::Result<(u64, u64)> {
 ///
 /// A child also inherits every descriptor of this process that is not marked
 /// close-on-exec, and a test's lock file or a listener held that way outlives
-/// the test in a server it started. So every descriptor above stderr this
-/// process holds is marked close-on-exec first (through `/dev/fd`, which both
-/// targets have), and the child starts with its three standard streams and
-/// whatever `cmd` set up for it. The child stays in this process's group, so
-/// an interrupt from a terminal reaches it as well.
+/// the test in a server it started. [`close_inherited_on_exec`], run once at
+/// start by `block()` (and by a test harness before its first spawn), marks
+/// them, so the child starts with its three standard streams and whatever
+/// `cmd` set up for it. The child stays in this process's group, so an
+/// interrupt from a terminal reaches it as well.
 pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
     use nix::sys::signal::{signal, SigHandler, SigSet};
     use std::os::unix::process::CommandExt;
-    close_inherited_on_exec()?;
     // SAFETY: the closure runs in the child between fork and exec and calls
     // only `pthread_sigmask` and `sigaction`, both async-signal-safe. It
     // installs `SIG_DFL`, which is no handler code, allocates nothing and
@@ -76,7 +75,10 @@ pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
 }
 
 /// Mark every descriptor above stderr close-on-exec, so no child inherits it.
-fn close_inherited_on_exec() -> io::Result<()> {
+/// Once, at start, while the process is one thread: `block()` does it for a
+/// service, and a test harness does it before its first spawn. A descriptor
+/// opened later by Rust is close-on-exec already.
+pub fn close_inherited_on_exec() -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     use std::os::fd::BorrowedFd;
     for entry in std::fs::read_dir("/dev/fd")? {

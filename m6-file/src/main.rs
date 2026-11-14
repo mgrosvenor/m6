@@ -93,6 +93,9 @@ fn main() -> Result<()> {
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
     let mut accepting = true;
+    // Set when an accept failed for want of a descriptor: the free-slot count
+    // then, so the listener is armed again only once a connection has closed.
+    let mut starved_at: Option<usize> = None;
     let mut last = m6_core::platform::now();
     let mut last_report = last;
 
@@ -142,17 +145,17 @@ fn main() -> Result<()> {
                                     continue;
                                 }
                                 // Out of descriptors, or a failure: say so,
-                                // give the slot back and re-arm the listener,
-                                // so the clients still queued are accepted
-                                // once a descriptor frees.
+                                // give the slot back and stop accepting until
+                                // a connection closes, when the listener is
+                                // armed again and the queued clients accepted.
+                                // Re-arming at once would spin while nothing
+                                // frees.
                                 m6_core::platform::net::Accept::Retry => {
                                     conns.free(taken.key);
                                     eprintln!("m6-file: accept error: {e}");
-                                    poll.registry().reregister(
-                                        &mut listener,
-                                        LISTENER,
-                                        Interest::READABLE,
-                                    )?;
+                                    poll.registry().deregister(&mut listener)?;
+                                    accepting = false;
+                                    starved_at = Some(conns.free_slots());
                                     break;
                                 }
                             },
@@ -218,10 +221,11 @@ fn main() -> Result<()> {
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
-        if !accepting && !conns.is_full() {
+        if !accepting && !conns.is_full() && starved_at.is_none_or(|n| conns.free_slots() > n) {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
+            starved_at = None;
         }
 
         // The accounting tick: report and clear the loop's wait and work per

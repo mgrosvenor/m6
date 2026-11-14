@@ -50,6 +50,12 @@ impl Service {
     /// The caller configures the command (program, arguments, environment);
     /// this overrides only the standard streams, which it must own.
     pub fn spawn(name: &str, cmd: &mut Command) -> Service {
+        // Once per test process, before its first child: no inherited
+        // descriptor (a test lock, a listener) reaches a service it starts.
+        static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWEPT.get_or_init(|| {
+            let _ = crate::platform::process::close_inherited_on_exec();
+        });
         let mut child = crate::platform::process::spawn(
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())

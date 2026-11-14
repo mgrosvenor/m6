@@ -453,7 +453,7 @@ impl Http11Listener {
     }
 
     /// Whether the last accept pass stopped for want of a descriptor, once:
-    /// the loop then re-registers the listener so queued clients are retried.
+    /// the loop then stops accepting until a connection closes and re-arms.
     pub fn take_starved(&mut self) -> bool {
         std::mem::take(&mut self.starved)
     }
