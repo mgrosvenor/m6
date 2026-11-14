@@ -112,15 +112,25 @@ fn claim_dir() -> PathBuf {
     // every build shares, with the project's other runtime files.
     //
     // Per user, because the marker files must be writable by the claimant and
-    // one build host runs its builds as one user. The id comes from the test
-    // binary's own owner, so the test kit names no OS crate for it.
-    use std::os::unix::fs::MetadataExt;
-    let uid = std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .map(|meta| meta.uid())
-        .expect("the test binary's owner names the shared port-claim directory");
-    let d = PathBuf::from(format!("/tmp/m6-test-ports-{uid}"));
-    let _ = std::fs::create_dir_all(&d);
+    // one build host runs its builds as one user. The id is the process's own
+    // effective uid: the binary's owner is not the claimant, and a copied or
+    // root-owned binary would otherwise name a directory this process cannot
+    // write.
+    let d = PathBuf::from(format!(
+        "/tmp/m6-test-ports-{}",
+        crate::platform::process::uid()
+    ));
+    // Failing to make the directory is a fact about the host, not a busy port.
+    // It stops here with the path, so the next person reads "permission denied
+    // on /tmp/m6-test-ports-N" instead of "no free port available", which is
+    // the wrong diagnosis and was a real one.
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!(
+            "the shared port-claim directory {} cannot be created: {e}. \
+             Every test that binds a fixed port needs it.",
+            d.display()
+        )
+    });
     d
 }
 
@@ -254,7 +264,13 @@ fn try_claim(marker: &std::path::Path, port: u16) -> Option<PortClaim> {
         .create(true)
         .truncate(false)
         .open(marker)
-        .ok()?;
+        .unwrap_or_else(|e| {
+            panic!(
+                "the port-claim marker {} cannot be opened: {e}. A marker that \
+                 cannot be created is a host problem, not a port in use.",
+                marker.display()
+            )
+        });
 
     // Non-blocking exclusive lock. A refusal means another process, or another
     // open file description in this one, holds this port.

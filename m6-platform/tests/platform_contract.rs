@@ -1190,7 +1190,20 @@ mod directories {
     #[test]
     fn the_scratch_directory_is_the_one_tmpdir_names() {
         let exe = std::env::current_exe().expect("current_exe");
-        let dir = tempfile::tempdir().expect("tempdir");
+        // The directory has to be one a program can be *run* from, because
+        // that is what the probe checks: it compiles a script and executes it.
+        // `/var/tmp` is where that works on this platform, and a TMPDIR under a
+        // `noexec` mount is correctly refused by the probe, which would make
+        // this test assert the opposite of the contract.
+        let dir = match tempfile::tempdir_in("/var/tmp") {
+            Ok(dir) => dir,
+            Err(e) => {
+                // A host with no writable /var/tmp cannot run this contract at
+                // all. Say so by name rather than pass or fail on it.
+                println!("D3a needs a writable /var/tmp to prove TMPDIR wins: {e}");
+                return;
+            }
+        };
         let out = std::process::Command::new(exe)
             .args([
                 "--exact",
