@@ -72,6 +72,14 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`[server] reuse_port` lets two or three m6-http processes serve the public 443 port.**
+It defaults to false, so an accidental second instance still fails at bind and an existing config binds exactly as before.
+When set, only the TLS listener and its QUIC UDP socket on `[server].bind` are bound through `m6_platform::net::listen_shared` with `SO_REUSEPORT`, in one call before the TLS configuration is built.
+No other socket is shared: the redirect listener on port 80, the internal h2c listener, the health endpoints and every backend socket are unchanged.
+Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and macOS does not, so the split is not even and no process is guaranteed traffic.
+A UDP datagram goes to one socket, so a QUIC client that changes address may land on another process.
+Verified on the sandbox with three m6-http processes on one port and one unix-socket backend set: every request was answered 200 before and after one process was stopped.
+
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
 
 **Crawler sightings carry a time and a verdict (#205).**
