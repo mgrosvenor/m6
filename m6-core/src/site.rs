@@ -2544,8 +2544,9 @@ mod tests {
         assert!(mtime1.is_some());
 
         // Touch by setting mtime explicitly via filetime.
+        let now: std::time::SystemTime = crate::platform::wall();
         let future =
-            filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() + 1, 0);
+            filetime::FileTime::from_unix_time(filetime::FileTime::from(now).unix_seconds() + 1, 0);
         filetime::set_file_mtime(f.path(), future).unwrap();
 
         let mtime2 = file_mtime(f.path());

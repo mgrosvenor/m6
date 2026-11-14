@@ -195,7 +195,9 @@ fn clock_path_lines(text: &str) -> Vec<usize> {
         while i < bytes.len() && ident_byte(bytes[i]) {
             i += 1;
         }
-        if &text[start..i] != "now" || is_comment_line(text, start) {
+        let method = &text[start..i];
+        let clock_method = method == "now" || method == "now_utc" || method == "now_local";
+        if !clock_method || is_comment_line(text, start) {
             continue;
         }
         if segment_before(text, start).is_some_and(|ty| clock_types.contains(&ty)) {
@@ -211,7 +213,14 @@ fn clock_path_lines(text: &str) -> Vec<usize> {
 /// one line of legal code, so a matcher that only reads `use` misses it.
 fn clock_type_names(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
-    let mut names = vec!["Instant", "SystemTime", "Utc", "Local"];
+    let mut names = vec![
+        "Instant",
+        "SystemTime",
+        "Utc",
+        "Local",
+        "OffsetDateTime",
+        "FileTime",
+    ];
     names.extend(type_alias_names(text, &mut Vec::new()));
     names.sort_unstable();
     names.dedup();
@@ -227,7 +236,12 @@ fn clock_type_names(text: &str) -> Vec<&str> {
             i += 1;
         }
         let word = &text[start..i];
-        if (word != "Instant" && word != "SystemTime" && word != "Utc" && word != "Local")
+        if (word != "Instant"
+            && word != "SystemTime"
+            && word != "Utc"
+            && word != "Local"
+            && word != "OffsetDateTime"
+            && word != "FileTime")
             || is_comment_line(text, start)
         {
             continue;
@@ -285,13 +299,27 @@ fn type_alias_names<'a>(text: &'a str, seen: &mut Vec<&'a str>) -> Vec<&'a str> 
         let rest_start = j;
         let rest_end = text[j..].find([';', '\n']).map_or(text.len(), |k| j + k);
         let rest = &text[rest_start..rest_end];
-        if (rest.contains("Instant")
-            || rest.contains("SystemTime")
-            || rest.contains("Utc")
-            || rest.contains("Local"))
-            && !seen.contains(&name)
-            && !names.contains(&name)
-        {
+        // The right side must *end* in a clock type, so `type CachedErrorPage =
+        // (std::time::Instant, ...)` does not make `CachedErrorPage::now()` a
+        // clock read: naming a type that holds an Instant is not naming the
+        // clock.
+        let rhs = rest.split('=').nth(1).unwrap_or("");
+        let last = rhs
+            .trim()
+            .trim_end_matches('>')
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .trim();
+        let clock_types = [
+            "Instant",
+            "SystemTime",
+            "Utc",
+            "Local",
+            "OffsetDateTime",
+            "FileTime",
+        ];
+        if clock_types.contains(&last) && !seen.contains(&name) && !names.contains(&name) {
             seen.push(name);
             names.push(name);
         }
