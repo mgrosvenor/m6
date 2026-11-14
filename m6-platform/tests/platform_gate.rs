@@ -205,11 +205,16 @@ fn clock_path_lines(text: &str) -> Vec<usize> {
     found
 }
 
-/// The names that mean a clock type in `text`: `Instant`, `SystemTime`, and
-/// every name a `use ... as <name>` binds to one of them.
+/// The names that mean a clock type in `text`: `Instant`, `SystemTime`, every
+/// name a `use ... as <name>` binds to one of them, and every name a
+/// `type <name> = ... Instant` or `= ... SystemTime` declares. A type alias is
+/// one line of legal code, so a matcher that only reads `use` misses it.
 fn clock_type_names(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut names = vec!["Instant", "SystemTime"];
+    names.extend(type_alias_names(text, &mut Vec::new()));
+    names.sort_unstable();
+    names.dedup();
     let mut i = 0usize;
     while i < bytes.len() {
         if !ident_byte(bytes[i]) {
@@ -241,6 +246,49 @@ fn clock_type_names(text: &str) -> Vec<&str> {
         let alias = &text[alias_start..j];
         if !alias.is_empty() && alias != "_" && !names.contains(&alias) {
             names.push(alias);
+        }
+    }
+    names
+}
+
+/// The names a `type <name> = ...` declaration binds when the right side
+/// names `Instant` or `SystemTime`, so `type Clock = std::time::Instant;`
+/// makes `Clock::now()` a path G3 sees rather than a way around it.
+fn type_alias_names<'a>(text: &'a str, seen: &mut Vec<&'a str>) -> Vec<&'a str> {
+    let bytes = text.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !ident_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && ident_byte(bytes[i]) {
+            i += 1;
+        }
+        if &text[start..i] != "type" || is_comment_line(text, start) {
+            continue;
+        }
+        let mut j = skip_space(bytes, i);
+        let name_start = j;
+        while j < bytes.len() && ident_byte(bytes[j]) {
+            j += 1;
+        }
+        let name = &text[name_start..j];
+        if name.is_empty() {
+            continue;
+        }
+        let rest_start = j;
+        let rest_end = text[j..].find([';', '\n']).map_or(text.len(), |k| j + k);
+        let rest = &text[rest_start..rest_end];
+        if (rest.contains("Instant") || rest.contains("SystemTime"))
+            && !seen.contains(&name)
+            && !names.contains(&name)
+        {
+            seen.push(name);
+            names.push(name);
         }
     }
     names
@@ -314,6 +362,9 @@ fn the_clock_rule_catches_every_path_form_and_no_other() {
             4,
         ),
         ("use std::time::Instant::now;\nlet t = now();", 1),
+        ("type Clock = std::time::Instant;\nlet t = Clock::now();", 2),
+        ("type Wall = SystemTime;\nlet t = Wall::now();", 2),
+        ("type Counter = u64;\nlet t = Counter::now();", 0),
         ("let t = m6_core::platform::now();", 0),
         ("let n = m6_core::testkit::alloc_count::now();", 0),
         ("let t = chrono::Utc::now();", 0),
