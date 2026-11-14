@@ -13,6 +13,47 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// A child that is killed and reaped when its owner is dropped.
+///
+/// A test that spawns a service, asserts something that panics, and never
+/// reaches its own `kill` leaves the service running with a parent of one.
+/// Owning the child in a value that kills on drop makes that impossible: the
+/// unwinding drops the guard whether the test returned or panicked.
+pub struct Running {
+    child: Option<Child>,
+}
+
+impl Running {
+    /// Spawn `cmd` under the same rules `Service::spawn` uses, and own the
+    /// child so a panic cannot leave it behind.
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<Running> {
+        let child = crate::platform::process::spawn(cmd.stdin(Stdio::null()))?;
+        Ok(Running { child: Some(child) })
+    }
+
+    /// The child, for waiting on it.
+    pub fn child(&mut self) -> &mut Child {
+        self.child.as_mut().expect("the guard holds the child")
+    }
+
+    /// Give the child up to the caller, which then owns it. `Drop` no longer
+    /// kills it, so the caller must reap it.
+    pub fn take(&mut self) -> Child {
+        self.child.take().expect("the guard holds the child")
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
 /// How much of a child's output to keep. The tail is what matters when
 /// diagnosing a death, so once the buffer is full the oldest bytes go.
 const OUTPUT_CAP: usize = 256 * 1024;
