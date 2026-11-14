@@ -513,8 +513,12 @@ impl Upstream {
     }
 
     /// Write what is left of the request. A backend may answer before it has
-    /// read the whole request (RFC 9110 6.1), so a write the peer refuses keeps
-    /// the read side going: the response may already be waiting on the socket.
+    /// read the whole request: RFC 9112 section 9.3 is the rule for a server
+    /// that responds early, it must read the remainder and discard it or close
+    /// the connection, and this client does the same thing from the other side,
+    /// keeping the read half open so the answer is not lost. RFC 9110 section
+    /// 6.1 is about what makes a message complete, which is what decides
+    /// whether the request can be reused, not whether it may be answered.
     fn write_request(&mut self) -> io::Result<()> {
         loop {
             let written = match (&mut self.tls, &mut self.stream) {
@@ -894,6 +898,15 @@ impl Upstream {
     /// that follows is a refusal and says nothing about the member's health.
     pub fn request_written(&self) -> bool {
         self.request_finished
+    }
+
+    /// Whether a write was refused, which is the client's early answer.
+    ///
+    /// Not the same as "the request was not written": a would-block also
+    /// leaves it unfinished, while this is the peer having answered and closed
+    /// its side, so the connection cannot carry another request.
+    pub fn write_was_refused(&self) -> bool {
+        self.write_failed
     }
 
     /// Drop the connection (closes the socket). The buffers stay, including the
@@ -1887,6 +1900,11 @@ mod socket_tests {
             .expect("the early reply is forwarded, not the write error");
         assert_eq!((status, body.as_slice()), (413, &b"refused"[..]));
         assert!(!up.reusable(), "an early reply must not be reused");
+        assert!(
+            up.write_was_refused(),
+            "the write was refused: without this a would-block would pass too, \
+             and removing the early-response path would not fail the test"
+        );
         assert!(
             !up.request_written(),
             "the whole request never reached the backend"

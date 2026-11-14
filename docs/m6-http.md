@@ -54,7 +54,7 @@ Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at 
 
 **H2S backends** use the `h2s://` scheme (e.g. `url = "h2s://api.example.com:443"`). Like H2C but over TLS — ALPN negotiates `h2` during the handshake; startup fails if the server does not support it. The connection is maintained persistently by an event-loop-driven `H2sTlsClientPool`. Intended for HTTP/2 forwarding to external TLS-terminating upstreams.
 
-A backend that answers before it has read the whole request and then closes has that answer forwarded to the client, and its connection is never reused whatever the headers say.
+A backend that answers before it has read the whole request and then refuses the write has that answer forwarded to the client, and its connection is never reused. A request that was written in full and answered early is a different case: the connection can still carry another request if the reply's framing says it can, so it rejoins the idle set like any other.
 
 ---
 

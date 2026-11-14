@@ -146,7 +146,30 @@ fn read_head_and_some_body<S: Read + Write>(stream: &mut S, mode: Refusal) {
 }
 
 /// An HTTPS backend for a URL backend: the same refusal modes over TLS.
-fn spawn_tls_backend(mode: Refusal) -> u16 {
+/// A TLS backend on a loopback port that stops when the test ends.
+///
+/// Its accept loop is a thread, so it needs a way to be told to stop: a flag
+/// plus one connection to wake the blocking `incoming()`, then a join. A test
+/// that leaves a thread accepting on a port leaks it past the test and, in a
+/// full run, past every test after it.
+struct TlsBackend {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    accept: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TlsBackend {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wakes the blocking accept, which then sees the flag and returns.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+    }
+}
+
+fn spawn_tls_backend(mode: Refusal) -> TlsBackend {
     probe::install_crypto();
     let ck =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -162,8 +185,13 @@ fn spawn_tls_backend(mode: Refusal) -> u16 {
     );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let port = listener.local_addr().expect("addr").port();
-    std::thread::spawn(move || {
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let accept = std::thread::spawn(move || {
         for tcp in listener.incoming().flatten() {
+            if loop_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             let server = Arc::clone(&server);
             std::thread::spawn(move || {
                 let Ok(conn) = rustls::ServerConnection::new(server) else {
@@ -174,7 +202,11 @@ fn spawn_tls_backend(mode: Refusal) -> u16 {
             });
         }
     });
-    port
+    TlsBackend {
+        port,
+        stop,
+        accept: Some(accept),
+    }
 }
 
 /// One m6-http in front of the site's backend.
@@ -320,7 +352,8 @@ fn a_socket_backend_that_answers_early_is_forwarded() {
 /// reply, and the backend's own 413 and body must reach the client.
 #[test]
 fn an_https_backend_that_answers_early_is_forwarded() {
-    let port = spawn_tls_backend(Refusal::Answer(EARLY_413_HEAD));
+    let backend = spawn_tls_backend(Refusal::Answer(EARLY_413_HEAD));
+    let port = backend.port;
     let fx = Fixture::start(
         &format!(
             "[[backend]]\nname = \"app\"\nurl = \"https://127.0.0.1:{port}\"\n\
@@ -364,7 +397,8 @@ fn a_socket_backend_that_closes_without_a_reply_is_a_502() {
 /// An HTTPS URL backend that closes after half a response head is a 502.
 #[test]
 fn an_https_backend_that_closes_mid_head_is_a_502() {
-    let port = spawn_tls_backend(Refusal::PartialHead);
+    let backend = spawn_tls_backend(Refusal::PartialHead);
+    let port = backend.port;
     let fx = Fixture::start(
         &format!(
             "[[backend]]\nname = \"app\"\nurl = \"https://127.0.0.1:{port}\"\n\
