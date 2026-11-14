@@ -346,18 +346,13 @@ fn no_tcp_listener_is_opened() {
         "history_file = {:?}",
         hist.path().join("h.sqlite3")
     ));
-    let mut child = s
-        .command()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn");
+    // A testkit `Service`: spawned through the layer, stopped when it drops,
+    // on a pass and on a panic alike.
+    let svc = m6_core::testkit::Service::spawn("m6-monitor", &mut s.command());
     assert!(wait::for_path(&s.sock, Duration::from_secs(10)));
     history_with_rows(&s.sock);
-    let listening = m6_core::platform::process::listens_on_tcp(child.id());
-    let _ = child.kill();
-    let _ = child.wait();
+    let listening = m6_core::platform::process::listens_on_tcp(svc.pid());
+    drop(svc);
     assert_eq!(
         listening.ok(),
         Some(false),

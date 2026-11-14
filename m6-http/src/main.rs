@@ -1814,6 +1814,15 @@ fn event_loop(
                         if full && accepting {
                             deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
                             accepting = false;
+                        } else if t.take_starved() && accepting {
+                            // Out of descriptors with clients queued: re-arm,
+                            // so the kernel reports the listener again and
+                            // the queue is drained once a descriptor frees.
+                            let _ = poll.registry().reregister_fd(
+                                t.raw_fd(),
+                                TOKEN_TLS_LISTENER,
+                                Interest::READABLE,
+                            );
                         }
                     }
                 }
@@ -1824,6 +1833,12 @@ fn event_loop(
                         if full && accepting {
                             deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
                             accepting = false;
+                        } else if h.take_starved() && accepting {
+                            let _ = poll.registry().reregister_fd(
+                                h.raw_fd(),
+                                TOKEN_H2C_LISTENER,
+                                Interest::READABLE,
+                            );
                         }
                     }
                 }

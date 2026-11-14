@@ -283,6 +283,9 @@ pub struct Http11Listener {
     /// Reused buffer a drive reports its pending dispatches through, so a turn
     /// that parks a request allocates nothing.
     pending: Vec<PendingDispatch>,
+    /// An accept failed for want of a descriptor (or another failure) with
+    /// clients possibly still queued: the loop re-arms the listener.
+    starved: bool,
 }
 
 /// The connection table's starting size, shared by every owner in the process.
@@ -341,6 +344,7 @@ impl Http11Listener {
             conns: Slots::new(initial, ceiling, Conn::empty),
             max_requests,
             pending: Vec::with_capacity(8),
+            starved: false,
         })
     }
 
@@ -435,13 +439,23 @@ impl Http11Listener {
                         registered_interest: Interest::READABLE,
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
-                Err(e) => {
-                    warn!("tcp accept: {e}");
-                    return None;
-                }
+                Err(e) => match m6_core::platform::net::accept_error(&e) {
+                    m6_core::platform::net::Accept::Drained => return None,
+                    m6_core::platform::net::Accept::SkipOne => continue,
+                    m6_core::platform::net::Accept::Retry => {
+                        warn!("tcp accept: {e}");
+                        self.starved = true;
+                        return None;
+                    }
+                },
             }
         }
+    }
+
+    /// Whether the last accept pass stopped for want of a descriptor, once:
+    /// the loop then re-registers the listener so queued clients are retried.
+    pub fn take_starved(&mut self) -> bool {
+        std::mem::take(&mut self.starved)
     }
 
     /// Drive one connection. Returns what happened, so the loop can manage the
@@ -698,6 +712,8 @@ pub struct H2cListener {
     /// edge-triggered, so the listener will not be reported again for them:
     /// the loop reads this and drains before its next wait.
     accept_again: bool,
+    /// As [`Http11Listener::starved`].
+    starved: bool,
     /// Reused buffer a drive reports its pending dispatches through, so a turn
     /// that parks a request allocates nothing.
     pending: Vec<PendingDispatch>,
@@ -902,6 +918,7 @@ impl H2cListener {
             peers: internal_peers,
             refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
             accept_again: false,
+            starved: false,
             pending: Vec::with_capacity(8),
         })
     }
@@ -982,12 +999,22 @@ impl H2cListener {
                     registered_interest: Interest::READABLE,
                 })
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => H2cAccept::WouldBlock,
-            Err(e) => {
-                warn!("h2c accept: {e}");
-                H2cAccept::WouldBlock
-            }
+            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                m6_core::platform::net::Accept::Drained => H2cAccept::WouldBlock,
+                // Gone before it was accepted: counted and passed over.
+                m6_core::platform::net::Accept::SkipOne => H2cAccept::Refused,
+                m6_core::platform::net::Accept::Retry => {
+                    warn!("h2c accept: {e}");
+                    self.starved = true;
+                    H2cAccept::WouldBlock
+                }
+            },
         }
+    }
+
+    /// As [`Http11Listener::take_starved`].
+    pub fn take_starved(&mut self) -> bool {
+        std::mem::take(&mut self.starved)
     }
 
     /// Accept and admit up to `max` connections, refused ones included. Each

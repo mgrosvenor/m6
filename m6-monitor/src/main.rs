@@ -307,20 +307,32 @@ fn run_service() -> Result<()> {
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // No connection was pending after all: give
-                                // the slot back rather than leaking it.
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                // A failure here sheds this accept pass and
-                                // not the service: give the slot back, say so
-                                // once, and wait for the next listener event.
-                                conns.free(taken.key);
-                                eprintln!("m6-monitor: accept error: {e}");
-                                break;
-                            }
+                            // No connection was pending after all: give
+                            // the slot back rather than leaking it.
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Out of descriptors, or a failure: say so,
+                                // give the slot back and re-arm the listener,
+                                // so the clients still queued are accepted
+                                // once a descriptor frees.
+                                m6_core::platform::net::Accept::Retry => {
+                                    conns.free(taken.key);
+                                    eprintln!("m6-monitor: accept error: {e}");
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
+                                    break;
+                                }
+                            },
                         };
                         poll.registry().register(
                             &mut stream,

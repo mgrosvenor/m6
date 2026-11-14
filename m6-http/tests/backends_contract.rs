@@ -420,11 +420,9 @@ impl Backend {
             }
         };
 
-        let child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("cannot spawn {} example: {e}", lang.dir()));
+        let child =
+            m6_core::platform::process::spawn(cmd.stdout(Stdio::null()).stderr(Stdio::piped()))
+                .unwrap_or_else(|e| panic!("cannot spawn {} example: {e}", lang.dir()));
 
         let b = Backend {
             lang,

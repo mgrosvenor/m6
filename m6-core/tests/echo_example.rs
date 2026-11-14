@@ -57,7 +57,18 @@ impl Server {
         conns: u64,
         max_conns: Option<u64>,
     ) -> Server {
-        let mut cmd = Command::new(bin);
+        Server::start_cmd(Command::new(bin), args, idle_ms, conns, max_conns)
+    }
+
+    /// As `start`, from a command already built (a shell that lowers the
+    /// descriptor limit and execs the program).
+    fn start_cmd(
+        mut cmd: Command,
+        args: &[&str],
+        idle_ms: u64,
+        conns: u64,
+        max_conns: Option<u64>,
+    ) -> Server {
         cmd.args(args);
         cmd.env("ECHO_IDLE_MS", idle_ms.to_string());
         cmd.env("ECHO_CONNS", conns.to_string());
@@ -69,7 +80,7 @@ impl Server {
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
-        let mut child = cmd.spawn().expect("spawn echo");
+        let mut child = platform::process::spawn(&mut cmd).expect("spawn echo");
         let mut stderr = child.stderr.take().expect("stderr");
 
         // The first line carries the bound address.
@@ -529,6 +540,82 @@ fn the_loop_never_waits() {
         "slowest round trip {slowest:?}"
     );
     drop((held, fast));
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
+/// E10. Out of descriptors while clients queue. The shell lowers the limit to
+/// 40 descriptors and the table is told it may hold 64, so accept fails with
+/// EMFILE once about 30 connections are open while more wait in the kernel's
+/// queue. The server neither exits nor stops accepting: once the first
+/// clients close, every client still queued is answered or has been reset by
+/// the kernel, and a new client is echoed. Linux leaves a connection queued
+/// when accept fails for want of a descriptor, so it is served later. macOS
+/// dequeues it before allocating the descriptor and resets it when that
+/// fails, so a waiting client there may read a reset instead: that half of
+/// the claim is the kernel's and not shared.
+/// Break: an accept loop that breaks on EMFILE with the listener left armed
+/// (nothing reports it again, so the new client is never accepted), or an
+/// echo that returns the error and exits.
+#[test]
+fn queued_clients_are_served_once_descriptors_free() {
+    let cmd = m6_core::testkit::lowered_fd_limit_command(40, 0, bin("echo"));
+    let srv = Server::start_cmd(cmd, &["127.0.0.1:0"], 10_000, 64, Some(64));
+    let mut clients: Vec<TcpStream> = (0..48)
+        .map(|i| {
+            let mut c = TcpStream::connect(srv.addr).expect("connect");
+            c.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap_or_else(|e| panic!("client {i}: read timeout: {e}"));
+            c.write_all(b"q").expect("send");
+            c
+        })
+        .collect();
+    // The first ones are served, the rest wait or were reset: a short read
+    // sorts them.
+    let mut served = Vec::new();
+    let mut waiting = Vec::new();
+    let mut reset = 0;
+    for mut c in clients.drain(..) {
+        let mut b = [0u8; 1];
+        match c.read(&mut b) {
+            Ok(1) if b[0] == b'q' => served.push(c),
+            Ok(n) => panic!("unexpected read of {n}"),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                waiting.push(c)
+            }
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => reset += 1,
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+    assert!(
+        served.len() >= 8,
+        "some clients were served: {}",
+        served.len()
+    );
+    assert!(
+        waiting.len() + reset > 0,
+        "the descriptor limit left no client waiting or reset"
+    );
+    // Closing the served ones frees descriptors: the queue drains, and what
+    // the kernel reset is counted rather than served.
+    drop(served);
+    let mut served_late = 0;
+    for mut c in waiting {
+        c.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut b = [0u8; 1];
+        match c.read(&mut b) {
+            Ok(1) if b[0] == b'q' => served_late += 1,
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => reset += 1,
+            other => panic!("a waiting client: {other:?}"),
+        }
+    }
+    println!("served late: {served_late}, reset by the kernel: {reset}");
+    // The listener is still armed: a new client is accepted and echoed.
+    let mut fresh = TcpStream::connect(srv.addr).expect("connect");
+    fresh.write_all(b"new\n").expect("send");
+    assert_eq!(recv_exact(&mut fresh, 4, Duration::from_secs(10)), b"new\n");
+    drop(fresh);
     let tail = srv.tail();
     assert_zero_allocations(&tail);
 }

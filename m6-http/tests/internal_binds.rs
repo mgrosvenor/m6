@@ -71,15 +71,16 @@ fn write_system(
 /// Fails the test, after killing the process, if it is still running after
 /// ten seconds: a refusal must be immediate.
 fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i32>, String) {
-    let mut child: Child = Command::new(testkit::binary("m6-http"))
-        .arg(site)
-        .arg(config)
-        .env("RUST_LOG", "info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn m6-http");
+    let mut child: Child = m6_core::platform::process::spawn(
+        Command::new(testkit::binary("m6-http"))
+            .arg(site)
+            .arg(config)
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn m6-http");
     let exited = testkit::wait::until(Duration::from_secs(10), || {
         child.try_wait().expect("try_wait").is_some()
     });

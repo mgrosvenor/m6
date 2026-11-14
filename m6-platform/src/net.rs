@@ -126,6 +126,37 @@ fn connect_in_progress(e: &io::Error) -> bool {
         || e.raw_os_error() == Some(nix::errno::Errno::EINPROGRESS as i32)
 }
 
+/// What an `accept` error means for an edge-triggered accept loop.
+///
+/// The loop drains the listener to [`Accept::Drained`]. [`Accept::SkipOne`]
+/// is a connection that went away before it was accepted (`ECONNABORTED`) or
+/// an interrupted call: keep draining. [`Accept::Retry`] is a shortage of
+/// descriptors (`EMFILE`, `ENFILE`) or any other failure: stop for this turn,
+/// and re-register the listener so the kernel reports it again while clients
+/// still wait in its queue. Breaking out with the listener left armed strands
+/// them, because an edge-triggered poll reports the listener again only when
+/// a new connection arrives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Accept {
+    /// `WouldBlock`: the queue is empty.
+    Drained,
+    /// The connection is gone or the call was interrupted: accept the next.
+    SkipOne,
+    /// Out of descriptors, or a failure: stop this turn, re-arm the listener.
+    Retry,
+}
+
+/// Classify an `accept` error. The same answer on every target.
+pub fn accept_error(e: &io::Error) -> Accept {
+    use nix::errno::Errno;
+    match e.kind() {
+        io::ErrorKind::WouldBlock => Accept::Drained,
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => Accept::SkipOne,
+        _ if e.raw_os_error() == Some(Errno::ECONNABORTED as i32) => Accept::SkipOne,
+        _ => Accept::Retry,
+    }
+}
+
 /// Set the send and receive buffer sizes, in bytes. The kernel may round them
 /// up, so a later read of the size is at least what was asked. For a test that
 /// depends on a buffer size, because the platform defaults differ.

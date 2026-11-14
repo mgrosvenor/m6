@@ -33,7 +33,8 @@ Table 1 lists them.
 | `Poll` | an event for every new readiness edge on a registered interest, one event per token per wait, `reregister` always reaches the kernel so a ready source is reported again, a peer close is readable then EOF, edge-triggered so a turn reads and writes until `WouldBlock` | epoll, edge-triggered, through `mio` | kqueue with `EV_CLEAR`, through `mio` |
 | `now`, `wall` | thin wrappers over the monotonic and wall clocks, read once per loop wake and passed down the turn | `CLOCK_MONOTONIC`, `CLOCK_REALTIME` | `CLOCK_UPTIME_RAW`, `gettimeofday` |
 | `Signals` | SIGTERM and SIGINT are one `Shutdown` request, SIGUSR1 is `ReopenLogs`, each read once, a burst coalesces and none is lost, the signals stay blocked for the life of the process | `signalfd`, whose read dequeues the signal | kqueue `EVFILT_SIGNAL`, which reports and does not dequeue, so the three are also `SIG_IGN` and discarded once reported |
-| `process::spawn` | a child starts with no signal blocked or ignored | `pre_exec` clears the mask and restores the three dispositions | the same |
+| `process::spawn` | a child starts with no signal blocked or ignored and inherits no descriptor above stderr, and stays in the parent's process group so a terminal's interrupt reaches it | `pre_exec` clears the mask and restores the three dispositions, every descriptor above stderr is marked close-on-exec first | the same |
+| `net::accept_error` | an accept loop drains to `Drained`, passes over `SkipOne` (a connection gone before it was accepted, an interrupted call) and on `Retry` (out of descriptors, or a failure) stops for the turn and re-registers the listener, so queued clients are accepted once a descriptor frees | `EAGAIN`, `ECONNABORTED` and `EINTR`, `EMFILE` and `ENFILE` | the same |
 | `ChildExit` | a readable descriptor when the child exits, at once when it already has, `reap` never blocks | `pidfd_open` | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
 | `net::connect_unix` | a refused connect is a dead listener (the pool marks the member failed), a missing file is `NotFound`, and a full queue never connects and never hangs | `EAGAIN` for a full queue: busy, answer 503 and keep the member | `ECONNREFUSED` for a full queue too, so it reads as a failed member for one backoff |
 | `net::connect_tcp` | `Connected` or `InProgress`, never `EINPROGRESS` as an error | `WouldBlock` | the raw errno |
@@ -50,6 +51,7 @@ Three things are stated and not normalised.
 A writable report may repeat on macOS after the peer acknowledges data, because kqueue re-arms the filter and epoll does not. A loop that writes until `WouldBlock` pays one failed write for it.
 On macOS a stale socket file and a full queue are the same `ECONNREFUSED`, and the kernel's answer is passed through, so a full queue there reads as a failed member for one backoff.
 Both monotonic clocks stop while the machine sleeps, so a deadline set before a laptop sleeps fires after it wakes, late by the sleep's length.
+A connection queued while `accept` fails for want of a descriptor is served later on Linux and reset by the kernel on macOS, which dequeues it before it can allocate the descriptor. The loop's part is the same on both: stop for the turn, re-arm the listener, and accept again once a descriptor frees.
 Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
 m6 sets `SO_REUSEPORT` on no listener, because Linux balances connections across sockets that share a port and macOS does not.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
@@ -98,10 +100,10 @@ Table 3 maps them.
 
 | suite | file | holds |
 |---|---|---|
-| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), sockets (9), clock (2), limits (2), host and process facts (13), directories (5) |
+| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), what a spawned child inherits and an interrupted harness (2), sockets (9), clock (2), limits (2), host and process facts (13), directories (5) |
 | signals | `m6-platform/tests/platform_signals.rs` | the 8 signal cases, in its own `main` so the mask is set before any thread |
 | the gate | `m6-platform/tests/platform_gate.rs` | the rule in section 1 |
-| the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with 16 behavioural checks including zero allocations and a shutdown that drains |
+| the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with 17 behavioural checks including zero allocations, a shutdown that drains and queued clients served once descriptors free |
 
 Table 3: where each contract is held.
 

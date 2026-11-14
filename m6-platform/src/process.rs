@@ -39,7 +39,7 @@ pub fn fd_limits() -> io::Result<(u64, u64)> {
 }
 
 /// Spawn `cmd` as every m6 process must: with no signal blocked or ignored in
-/// the child.
+/// the child, and no descriptor of this process above stderr.
 ///
 /// A service blocks SIGTERM, SIGINT and SIGUSR1 for its own loop
 /// ([`super::Signals`]), and on macOS ignores them as well. A child inherits
@@ -47,9 +47,18 @@ pub fn fd_limits() -> io::Result<(u64, u64)> {
 /// `Command::spawn` alone would ignore the SIGTERM that stops it. This clears
 /// the mask and restores the three default dispositions between fork and
 /// exec, which is the one thing `pre_exec` is for here.
+///
+/// A child also inherits every descriptor of this process that is not marked
+/// close-on-exec, and a test's lock file or a listener held that way outlives
+/// the test in a server it started. So every descriptor above stderr this
+/// process holds is marked close-on-exec first (through `/dev/fd`, which both
+/// targets have), and the child starts with its three standard streams and
+/// whatever `cmd` set up for it. The child stays in this process's group, so
+/// an interrupt from a terminal reaches it as well.
 pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
     use nix::sys::signal::{signal, SigHandler, SigSet};
     use std::os::unix::process::CommandExt;
+    close_inherited_on_exec()?;
     // SAFETY: the closure runs in the child between fork and exec and calls
     // only `pthread_sigmask` and `sigaction`, both async-signal-safe. It
     // installs `SIG_DFL`, which is no handler code, allocates nothing and
@@ -64,6 +73,27 @@ pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
         });
     }
     cmd.spawn()
+}
+
+/// Mark every descriptor above stderr close-on-exec, so no child inherits it.
+fn close_inherited_on_exec() -> io::Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    use std::os::fd::BorrowedFd;
+    for entry in std::fs::read_dir("/dev/fd")? {
+        let Ok(fd) = entry?.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if fd <= 2 {
+            continue;
+        }
+        // SAFETY: the number was read from this process's own descriptor table
+        // a moment ago, and the flag is set without the borrow outliving the
+        // call. A descriptor closed in between fails the fcntl, which is
+        // ignored: it is not inherited either way.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let _ = fcntl(borrowed, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
+    }
+    Ok(())
 }
 
 /// Whether this process runs as root.

@@ -451,11 +451,12 @@ backend = "example"
         // this moment, so a failure in the edge path below still reaps it.
         let mut backend = BackendGuard {
             child: Some(
-                backend_command(lang, base, &sock)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
+                m6_core::platform::process::spawn(
+                    backend_command(lang, base, &sock)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped()),
+                )
+                .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
             ),
         };
         *backend_pid = backend.child.as_ref().map(|c| c.id());

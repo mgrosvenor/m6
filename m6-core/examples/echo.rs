@@ -28,7 +28,7 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use m6_core::event::{Slots, Timeouts};
-use m6_core::platform::net::{listen_tcp, TcpStream};
+use m6_core::platform::net::{self, listen_tcp, TcpStream};
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::{self, Event, Events, Interest, Poll, Signal, Signals, Token};
 
@@ -126,13 +126,30 @@ fn main() -> io::Result<()> {
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // No connection was pending after all: give the
-                                // slot back rather than leaking it.
-                                slots.free(taken.key);
-                                break;
-                            }
-                            Err(e) => return Err(e),
+                            // No connection was pending after all: give the
+                            // slot back rather than leaking it.
+                            Err(e) => match net::accept_error(&e) {
+                                net::Accept::Drained => {
+                                    slots.free(taken.key);
+                                    break;
+                                }
+                                net::Accept::SkipOne => {
+                                    slots.free(taken.key);
+                                    continue;
+                                }
+                                // Out of descriptors: give the slot back and
+                                // re-arm the listener, so the clients still
+                                // queued are accepted once one frees.
+                                net::Accept::Retry => {
+                                    slots.free(taken.key);
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
+                                    break;
+                                }
+                            },
                         };
                         stream.set_nodelay(true)?; // no Nagle delay on 1-byte replies
                         poll.registry().register(

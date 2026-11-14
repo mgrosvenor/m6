@@ -600,6 +600,100 @@ mod child_exit {
     }
 }
 
+// ── 3b. The harness: what a spawned child inherits ───────────────────────────
+
+mod spawn {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    /// C9. Break: `process::spawn` without the close-on-exec pass. A lock this
+    /// process holds would then be held by the child too, and the second
+    /// `try_lock` below would fail.
+    #[test]
+    fn a_spawned_child_inherits_no_descriptor_above_stderr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock");
+        let held = std::fs::File::create(&path).expect("create");
+        held.try_lock().expect("this process takes the lock");
+        let mut child = process::spawn(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null()),
+        )
+        .expect("spawn");
+        drop(held);
+        let again = std::fs::File::open(&path).expect("open");
+        let free = again.try_lock().is_ok();
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert!(
+            free,
+            "the child held the lock it should never have inherited"
+        );
+    }
+
+    /// C10. Break: a harness that puts its servers in another process group,
+    /// or a server that ignores SIGINT: an interrupt from the terminal reaches
+    /// the harness and not them, and they outlive it. The harness here is this
+    /// binary running `an_interrupted_harness_leaves_no_server_inside`, in a
+    /// group of its own so the interrupt reaches nothing else.
+    #[test]
+    fn an_interrupted_harness_leaves_no_server() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut harness = Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "spawn::an_interrupted_harness_leaves_no_server_inside",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start the harness");
+        let mut lines = std::io::BufReader::new(harness.stdout.take().expect("stdout")).lines();
+        let server: u32 = lines
+            .by_ref()
+            .find_map(|l| {
+                l.ok()?
+                    .strip_prefix("server ")
+                    .map(|p| p.parse().expect("a pid"))
+            })
+            .expect("the harness names its server");
+        assert!(process::is_alive(server));
+        // SIGINT to the harness's process group, which is what a terminal's
+        // interrupt does. `kill` with a negative pid names a group.
+        let status = Command::new("kill")
+            .args(["-INT", &format!("-{}", harness.id())])
+            .status()
+            .expect("kill runs");
+        assert!(status.success(), "{status}");
+        let deadline = Instant::now() + SOON;
+        while process::is_alive(server) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = harness.wait();
+        assert!(
+            !process::is_alive(server),
+            "the server outlived the interrupted harness"
+        );
+    }
+
+    /// The harness half of C10: start a server through the layer, name it,
+    /// then wait to be interrupted.
+    #[test]
+    #[ignore = "run by an_interrupted_harness_leaves_no_server in its own process group"]
+    fn an_interrupted_harness_leaves_no_server_inside() {
+        let mut server = process::spawn(Command::new("sleep").arg("30").stdin(Stdio::null()))
+            .expect("start the server");
+        println!("server {}", server.id());
+        let _ = server.wait();
+    }
+}
+
 // ── 4. Unix and TCP sockets ──────────────────────────────────────────────────
 
 mod sockets {

@@ -250,13 +250,13 @@ impl Fixture {
 
     /// Run m6-http to its exit, which must come within ten seconds.
     fn run_until_exit(&self) -> (Option<i32>, String) {
-        let mut child: Child = self
-            .command()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn m6-http");
+        let mut child: Child = m6_core::platform::process::spawn(
+            self.command()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("spawn m6-http");
         let exited = testkit::wait::until(Duration::from_secs(10), || {
             child.try_wait().expect("try_wait").is_some()
         });
