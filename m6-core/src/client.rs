@@ -1873,7 +1873,7 @@ mod socket_tests {
             config: client,
             name,
         };
-        let deadline = m6_core::platform::now() + Duration::from_secs(10);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
         let req = up.request_buf();
         req.extend_from_slice(
