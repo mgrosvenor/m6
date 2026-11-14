@@ -26,8 +26,53 @@
 //! joining two `Set-Cookie` lines produces one malformed cookie and silently
 //! loses the other. [`combine`] refuses it rather than trusting the caller to
 //! remember, and [`NEVER_COMBINED`] is the list.
+//!
+//! # Request head limits
+//!
+//! Two numbers bound an incoming request head, and they live here so that one
+//! definition serves the HTTP/1.1 parser, the HTTP/2 and HTTP/3 edges and every
+//! backend. [`MAX_HEADER_LINE`] bounds one field and [`MAX_REQUEST_HEAD`] bounds
+//! the whole head. Both follow the numbers the mainstream servers use: nginx's
+//! `large_client_header_buffers 4 8k`, Varnish's `http_req_hdr_len 8k` and
+//! `http_req_size 32k`, and Apache's `LimitRequestFieldSize 8190`.
+//!
+//! The edge answers a request over either limit itself, before routing or a
+//! backend, with 400 for a field or a head and 414 for a request line
+//! (nginx's two answers for the two cases).
 
 use crate::http::HeaderSource;
+
+/// The largest one request header field, counted as its name plus its value.
+///
+/// The number is the one nginx bounds a field line with (`8k`), the one
+/// Varnish states as `http_req_hdr_len 8k`, and one byte above Apache's
+/// `LimitRequestFieldSize` default of 8190, which excludes Apache's own
+/// framing. m6 counts the name and the value, and nothing else.
+pub const MAX_HEADER_LINE: usize = 8 * 1024;
+
+/// The largest request head: the request line plus every field.
+///
+/// nginx's `large_client_header_buffers 4 8k` keeps 32 KiB of buffers for one
+/// request, and Varnish states the same total as `http_req_size 32k`. HTTP/2
+/// and HTTP/3 count a decoded head as RFC 9113 6.5.2 does for
+/// `SETTINGS_MAX_HEADER_LIST_SIZE`: name plus value plus 32 bytes per field.
+pub const MAX_REQUEST_HEAD: usize = 32 * 1024;
+
+/// The length of a request line, counted with one space between the method and
+/// the target.
+///
+/// HTTP/1.1 adds one space and the version, and measures the line it receives.
+/// HTTP/2 and HTTP/3 have no version on the wire, so their request line is
+/// `:method` plus `:path`.
+pub fn request_line_len(method: &[u8], target: &[u8]) -> usize {
+    method.len() + 1 + target.len()
+}
+
+/// Whether one request field is over [`MAX_HEADER_LINE`], counted as its name
+/// plus its value.
+pub fn field_over_limit(name: &[u8], value: &[u8]) -> bool {
+    name.len() + value.len() > MAX_HEADER_LINE
+}
 
 /// Fields that must never be folded into one comma-separated line.
 ///

@@ -421,6 +421,11 @@ Eight or more sites across the workspace wrote `.find(|(k, _)| k.eq_ignore_ascii
 `NEVER_COMBINED` is the list and `set-cookie` is on it: *RFC* (Request for Comments) 6265 3 is explicit that cookie values may contain commas, so joining two `Set-Cookie` lines produces one malformed cookie and silently loses the other.
 `may_combine(name)` asks in advance.
 
+The module also defines the two request-head limits every protocol and service shares.
+`MAX_HEADER_LINE` is 8 KiB for one field, and `MAX_REQUEST_HEAD` is 32 KiB for the request line plus every field.
+Both are the numbers nginx, Varnish and Apache use, and the module doc names each setting.
+`request_line_len(method, target)` counts a request line, and `field_over_limit(name, value)` answers the field question.
+
 ### 5.5. `cookie`
 
 `Cookie::new(name, value)` then `.max_age()`, `.path()`, `.domain()`, `.secure()`, `.http_only()`, `.same_site(SameSite::...)`, then `to_header_value()` or `to_header()`.
@@ -574,15 +579,17 @@ logic of its own. It takes `Write` as well as `Read` because a client that sent
 `Expect: 100-continue` will not send its body until told to, and answering that
 has to happen before the read that would otherwise deadlock.
 
-Two caps, guarding different things: 8 KB of head, then 16 MB of body. It used
-to read one byte per `read()` call, measured at 377 syscalls for an ordinary
-browser's 377-byte request head, because `server` hands it a raw `UnixStream`
-with nothing buffering.
+Two bounds, guarding different things: `MAX_REQUEST_HEAD` of head through the
+shared parser, then 16 MB of body. It reads in chunks rather than one byte per
+`read()` call, because `server` hands it a raw `UnixStream` with nothing
+buffering.
 
 The benchmarks and `m6-file`'s `query_of` test drive it. A service's loop frames
 requests with `h1::ServerConn`.
 
-`ParseError::status()` and `.reason()` give the response for a parse failure.
+`ParseError::status()` and `.reason()` give the response for a parse failure,
+including 414 for a request line over `MAX_HEADER_LINE` and 400 for a field or
+a head over its limit.
 
 ### 6.3. `conditional`
 

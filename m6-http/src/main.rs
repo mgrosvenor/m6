@@ -2181,7 +2181,7 @@ fn drain_udp(
         // Parsing a request in early data is not the risk; acting on it is.
         if (qconn.conn.is_established() || qconn.conn.is_in_early_data()) && qconn.h3_conn.is_none()
         {
-            let h3_config = match quiche::h3::Config::new() {
+            let mut h3_config = match quiche::h3::Config::new() {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("h3 Config::new error: {}", e);
@@ -2189,6 +2189,10 @@ fn drain_udp(
                     continue;
                 }
             };
+            // RFC 9114 4.2.2: the field section bound is advertised and the
+            // local decoder enforces it. It is the same number every other
+            // protocol uses.
+            h3_config.set_max_field_section_size(m6_core::headers::MAX_REQUEST_HEAD as u64);
             match quiche::h3::Connection::with_transport(&mut qconn.conn, &h3_config) {
                 Ok(h3) => {
                     qconn.h3_conn = Some(h3);
@@ -2338,6 +2342,42 @@ fn handle_h3_request(
         let _ = qconn
             .conn
             .stream_shutdown(stream_id, quiche::Shutdown::Write, H3_MESSAGE_ERROR);
+        return;
+    }
+
+    // ── Request head limits, before routing or any backend ───────────────────
+    // The same two limits h1 and h2 enforce. The field-section total is the
+    // one quiche counts itself, so a section past `MAX_REQUEST_HEAD` never
+    // reaches this code: quiche answers it by closing the connection with
+    // H3_EXCESSIVE_LOAD. The total check stays as the guard for the day that
+    // changes, and the field and request-line checks are the ones that answer
+    // on this stream.
+    let list_size: usize = req
+        .headers
+        .iter()
+        .map(|h| h.name().len() + h.value().len() + m6_http_lib::fields::FIELD_OVERHEAD)
+        .sum();
+    if let Some(status) = m6_http_lib::fields::head_limit_status(
+        req.headers.iter().map(|h| (h.name(), h.value())),
+        list_size,
+    ) {
+        let is_head = req
+            .headers
+            .iter()
+            .any(|h| h.name() == b":method" && h.value().eq_ignore_ascii_case(b"HEAD"));
+        let mut headers: Vec<(String, String)> = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        set_date(&mut headers);
+        send_h3_response(
+            stream_id,
+            qconn,
+            status,
+            &headers,
+            Bytes::from(m6_http_lib::error::refusal_body(status)),
+            is_head,
+        );
         return;
     }
 

@@ -49,6 +49,44 @@ pub(crate) fn validate_request_headers(headers: &[(String, String)]) -> Result<(
     validate_request_header_bytes(headers.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())))
 }
 
+/// The size of one field in the RFC 9113 6.5.2 count: its name, its value and
+/// 32 bytes of overhead.
+pub const FIELD_OVERHEAD: usize = 32;
+
+/// The status an over-limit decoded request head earns, if it is over one.
+///
+/// 414 is the request line: `:method` and `:path` joined by one space, the way
+/// those two fields carry the HTTP/1.1 request line. 400 is a field over
+/// `MAX_HEADER_LINE`, or a field section over `MAX_REQUEST_HEAD`. The section
+/// total arrives from the caller because HTTP/2 counts it while it decodes, and
+/// the last field that crossed the bound is not kept.
+pub fn head_limit_status<'a, I>(headers: I, list_size: usize) -> Option<u16>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    let (mut method, mut target) = (None, None);
+    let mut too_large_field = false;
+    for (name, value) in headers {
+        if m6_core::headers::field_over_limit(name, value) {
+            too_large_field = true;
+        }
+        match name {
+            b":method" => method = Some(value),
+            b":path" => target = Some(value),
+            _ => {}
+        }
+    }
+    if let (Some(method), Some(target)) = (method, target) {
+        if m6_core::headers::request_line_len(method, target) > m6_core::headers::MAX_HEADER_LINE {
+            return Some(414);
+        }
+    }
+    if too_large_field || list_size > m6_core::headers::MAX_REQUEST_HEAD {
+        return Some(400);
+    }
+    None
+}
+
 /// The rules above, over raw bytes, so HTTP/3 can share them.
 ///
 /// RFC 9114 4.3 restates RFC 9113 8.3 almost verbatim: HTTP/3 has the same
