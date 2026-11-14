@@ -244,6 +244,11 @@ pub struct Upstream {
     /// cross the flag between tests.
     #[cfg(test)]
     block_next_write: std::cell::Cell<bool>,
+    /// Test seam: when set, the next request write fails with an error that is
+    /// not a refusal, so the early-reply path can be pinned independently of
+    /// the two error kinds a reset happens to produce.
+    #[cfg(test)]
+    fail_next_write: std::cell::Cell<bool>,
     /// The address of the open connection, for keep-alive reuse.
     connected: Option<Addr>,
     /// The TLS identity of the open connection: the verified server name and the
@@ -282,6 +287,8 @@ impl Upstream {
             write_failed: false,
             #[cfg(test)]
             block_next_write: std::cell::Cell::new(false),
+            #[cfg(test)]
+            fail_next_write: std::cell::Cell::new(false),
             connected: None,
             connected_name: None,
             connected_config: None,
@@ -506,7 +513,18 @@ impl Upstream {
     /// when the reply is complete.
     fn transfer(&mut self) -> io::Result<bool> {
         if self.wants_write() {
-            self.write_request()?;
+            if let Err(write_err) = self.write_request() {
+                // The peer may have answered before it refused the request, so
+                // check what is already waiting before the write error wins:
+                // RFC 9112 section 9.5 makes the early response the answer, and
+                // a complete one is not a failed request. A read error here is
+                // not fatal by itself; `parse_progress` decides.
+                let _ = self.read_available();
+                if let Ok(true) = self.parse_progress() {
+                    return Ok(true);
+                }
+                return Err(write_err);
+            }
         }
         self.read_available()?;
         self.parse_progress()
@@ -520,6 +538,10 @@ impl Upstream {
     /// 6.1 is about what makes a message complete, which is what decides
     /// whether the request can be reused, not whether it may be answered.
     fn write_request(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_write.replace(false) {
+            return Err(io::Error::other("test: the request write failed"));
+        }
         loop {
             let written = match (&mut self.tls, &mut self.stream) {
                 (Some(tls), Some(_)) => {
@@ -1834,6 +1856,22 @@ mod socket_tests {
     /// A TLS backend that answers before reading the whole request closes the
     /// write side. The complete reply it wrote is still read and returned, and
     /// the connection is never reused.
+    ///
+    /// The peer closes the way RFC 9112 section 9.6 asks a server that answers
+    /// early to close: it notifies, shuts its write half, waits for the client
+    /// to stop sending, then drains the rest of the request with a read timeout
+    /// before the socket is dropped. A peer that drops the socket with the
+    /// request unread makes the close a reset on Linux, and a reset can discard
+    /// the reply the client has not read yet; that pins the reset path, not the
+    /// early-response path.
+    ///
+    /// Break: write the whole request before reading (remove the early-response
+    /// switch) and the client reaches the deadline instead of returning 413.
+    /// Break: reuse an early answer (`reusable` without `request_finished`) and
+    /// the second assertion fails. Break: read only after the write is complete
+    /// and the request is written in full, so `!request_written` fails. The
+    /// request is larger than any platform's socket buffer, so that stays true
+    /// without relying on a timing window.
     #[test]
     fn a_tls_backend_that_answers_early_is_read_while_writing() {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
@@ -1861,12 +1899,15 @@ mod socket_tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
+        // The peer does not close until the client has the reply, so the close
+        // cannot reset the connection the reply is still travelling on.
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let peer = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().expect("accept");
             let conn = rustls::ServerConnection::new(server).expect("server conn");
             let mut stream = rustls::StreamOwned::new(conn, tcp);
-            // Read the head and about 1 KiB of the body, then answer and close
-            // with most of the request still unwritten.
+            // Read the head and about 1 KiB of the body, then answer with most
+            // of the request still unwritten.
             let mut got = 0usize;
             let mut buf = [0u8; 4096];
             while got < 1024 {
@@ -1875,10 +1916,29 @@ mod socket_tests {
                     Ok(n) => got += n,
                 }
             }
-            let _ = stream.write_all(
-                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrefused",
-            );
+            // Keep-alive framing on purpose: only the unfinished request may
+            // stop reuse, so removing that rule fails the reuse assertion.
+            let _ = stream
+                .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 7\r\n\r\nrefused");
             let _ = stream.flush();
+            // RFC 9112 section 9.6: notify, shut the write half, and only then
+            // discard the remainder before closing. Dropping the socket while
+            // the kernel still has request bytes unread is a reset on Linux.
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+            let _ = stream.get_ref().shutdown(std::net::Shutdown::Write);
+            // The client has stopped writing once it has the reply; the read
+            // timeout means a failed test cannot hang this thread.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let _ = stream
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(500)));
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
         });
 
         let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
@@ -1888,28 +1948,63 @@ mod socket_tests {
         };
         let deadline = crate::platform::now() + Duration::from_secs(10);
         let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        // 16 MiB: larger than any TcpStream send buffer, so a client that
+        // writes the request out before reading cannot pass this test.
+        const BODY_LEN: usize = 16 * 1024 * 1024;
         let req = up.request_buf();
         req.extend_from_slice(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\
-              Connection: close\r\n\r\n",
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {BODY_LEN}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
         );
-        req.extend(std::iter::repeat_n(b'x', 1_048_576));
+        req.extend(std::iter::repeat_n(b'x', BODY_LEN));
         up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
             .expect("start");
         let (status, _, body) = drive_to_completion(&mut up)
             .expect("the early reply is forwarded, not the write error");
-        assert_eq!((status, body.as_slice()), (413, &b"refused"[..]));
-        assert!(!up.reusable(), "an early reply must not be reused");
-        assert!(
-            up.write_was_refused(),
-            "the write was refused: without this a would-block would pass too, \
-             and removing the early-response path would not fail the test"
+        assert_eq!(
+            (status, body.as_slice()),
+            (413, &b"refused"[..]),
+            "the backend's 413 and body, not a 502 or a timeout"
         );
+        assert!(!up.reusable(), "an early reply must not be reused");
         assert!(
             !up.request_written(),
             "the whole request never reached the backend"
         );
+        up.close();
+        release_tx.send(()).expect("release the peer");
         peer.join().expect("peer");
+    }
+
+    /// A complete reply already waiting outranks a request write that fails
+    /// with an error which is not one of the two reset kinds.
+    ///
+    /// Break: return the write error before looking at buffered data (the old
+    /// `write_request()?` in `transfer`) fails here with that error, not 413.
+    #[test]
+    fn a_complete_reply_outranks_a_write_error() {
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        client
+            .set_nonblocking(true)
+            .expect("the client side is non-blocking, as `connect` leaves it");
+        peer.write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 7\r\n\r\nrefused")
+            .expect("peer writes the reply");
+        let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        up.stream = Some(Stream::Unix(client));
+        up.phase = Phase::Transfer;
+        up.request
+            .extend_from_slice(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n");
+        up.request.extend(std::iter::repeat_n(b'x', 1_048_576));
+        up.fail_next_write.set(true);
+        assert!(up.drive().expect("the reply, not the write error"));
+        let mut slots = reply_slots();
+        let reply = up.reply(&mut slots).expect("reply");
+        assert_eq!((reply.status, reply.body), (413, &b"refused"[..]));
+        assert!(!up.reusable(), "the request was not written, so no reuse");
+        assert!(!up.request_written());
     }
 
     /// A different TLS identity (name) for the same address reconnects instead
