@@ -1,6 +1,6 @@
 # m6-http
 
-Reverse proxy, cache, and router. The only process in an m6 deployment that listens on a public port. Does not manage other processes — that is systemd's job.
+Reverse proxy, cache, and router. The process in an m6 deployment that listens on a public port, and the only one unless `[server] reuse_port` asks several of them to share one. Does not manage other processes — that is systemd's job.
 
 ---
 

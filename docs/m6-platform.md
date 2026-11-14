@@ -55,8 +55,8 @@ Both monotonic clocks stop while the machine sleeps, so a deadline set before a 
 Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives. m6 does not handle descriptor exhaustion.
 Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
 m6 sets `SO_REUSEPORT` only on a listener a service opens through `net::listen_shared`, which m6-http's `[server] reuse_port` asks for.
-Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple, and macOS spreads them differently, so neither is an even spread and nothing may assume one.
-A UDP datagram goes to one socket, so a QUIC client that changes address may land on another process.
+Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and gives every UDP datagram to one socket. macOS spreads neither: the socket bound last to the port receives every connection and every datagram, so there a second process is a takeover rather than a scale-out.
+Nothing may assume an even spread on either target, and on Linux a QUIC client that changes address may land on another process.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 Everything in Table 1 is held by the tests in section 6.
 

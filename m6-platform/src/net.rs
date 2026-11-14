@@ -107,10 +107,12 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
 ///
 /// The option is set on each socket before its `bind`, which is the only point
 /// where it has an effect. Linux spreads a new TCP connection across the
-/// sockets that share a port by a hash of its 4-tuple, and macOS spreads them
-/// differently. Neither is an even spread, so no caller may assume one. A UDP
-/// datagram goes to one socket, so a QUIC client that changes address can land
-/// on another process.
+/// sockets that share a port by a hash of its 4-tuple and gives every UDP
+/// datagram to one socket. macOS spreads neither: the socket bound last to the
+/// port receives every connection and every datagram, so a second process there
+/// is a takeover rather than a scale-out. Nothing may assume an even spread on
+/// either target, and on Linux a QUIC client that changes address can land on
+/// another process.
 ///
 /// The TCP socket also carries `SO_REUSEADDR`, as [`listen_tcp`] does, so a
 /// restart rebinds a port whose connections are in `TIME_WAIT`. The returned
