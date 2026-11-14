@@ -1,0 +1,31 @@
+[package]
+name    = "m6-log"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "m6_log"
+
+[dependencies]
+itoa = "1"
+nix  = { version = "0.31", features = ["fs"] }
+
+[dev-dependencies]
+serde_json         = "1"
+tempfile           = "3"
+criterion          = { version = "0.5", features = ["html_reports"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-appender   = "0.2"
+nix                = { version = "0.31", features = ["fs"] }
+
+[[test]]
+name    = "no_allocation"
+harness = false
+
+[[bench]]
+name    = "line"
+harness = false

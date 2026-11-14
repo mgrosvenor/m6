@@ -19,7 +19,8 @@ export PATH="$PWD/target/release:$PATH"
 ```
 
 Rust 1.89 or newer. Linux is the production target (epoll). macOS works
-for development.
+for development. Example 11's admin dashboard needs Linux because its shipped
+config sets `bench_bin` and the bench child is reaped from a pidfd.
 
 **2. A development certificate.** m6-http is HTTPS only, so there is no way to
 serve anything without one. [mkcert](https://github.com/FiloSottile/mkcert)

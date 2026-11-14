@@ -2020,6 +2020,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "m6-log"
+version = "1.15.0"
+dependencies = [
+ "criterion",
+ "itoa",
+ "nix 0.31.3",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "m6-md"
 version = "1.15.0"
 dependencies = [

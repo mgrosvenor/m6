@@ -103,14 +103,21 @@ impl NodeReading {
         self.unreachable.is_none()
     }
 
-    /// Whether the node says it can serve. A node that cannot be reached is
-    /// not "ok" and is not "degraded" either; it is unknown, and saying so is
-    /// the honest answer.
+    /// Whether the node says it can serve, and the one place that decides it.
+    ///
+    /// A node is "ok" only when `/health` answered 200 and its body says "ok".
+    /// A non-200 code is "degraded" whatever the body says, a 200 carries the
+    /// body's own status, a 200 with no body is "unknown", and no answer is
+    /// "unreachable". The digest, the history row and the HEALTH section all
+    /// read this, so they cannot disagree.
     pub fn status(&self) -> &str {
-        match (&self.unreachable, &self.health) {
-            (Some(_), _) => "unreachable",
-            (None, Some(h)) => h.status.as_str(),
-            (None, None) => "unknown",
+        if self.unreachable.is_some() {
+            return "unreachable";
+        }
+        match (self.health_status, &self.health) {
+            (Some(200), Some(h)) => h.status.as_str(),
+            (Some(200), None) | (None, _) => "unknown",
+            (Some(_), _) => "degraded",
         }
     }
 
@@ -1335,7 +1342,7 @@ mod tests {
                 status: s.to_string(),
                 node: "origin".into(),
             }),
-            health_status: None,
+            health_status: status.map(|_| 200),
             perf: None,
             perf_error: None,
             traffic: None,
@@ -1362,6 +1369,21 @@ mod tests {
         assert_eq!(reading(None, None).status(), "unknown");
     }
 
+    /// "ok" needs the 200 as well as the body. A 503 that says "ok" is a node
+    /// that is not serving, and a 200 with any other status is not healthy.
+    #[test]
+    fn ok_needs_both_the_200_and_the_body() {
+        let mut r = reading(None, Some("ok"));
+        r.health_status = Some(503);
+        assert_eq!(r.status(), "degraded");
+        r.health_status = Some(500);
+        assert_eq!(r.status(), "degraded");
+        r.health_status = Some(200);
+        assert_eq!(r.status(), "ok");
+        let r = reading(None, Some("starting"));
+        assert_eq!(r.status(), "starting");
+    }
+
     // ── The poll engine, driven against loopback listeners ────────────────
 
     /// One shared TLS config for http-only nodes. Nothing in these tests
@@ -1380,12 +1402,14 @@ mod tests {
     fn fleet_of(node: Node) -> crate::fleet::Fleet {
         crate::fleet::Fleet {
             nodes: vec![node],
+            poll_interval_s: crate::DEFAULT_POLL_SECS,
             perf_token_file: None,
             timeout_ms: 5_000,
             header_check: Vec::new(),
             wg_handshakes_file: None,
             tunnel_handshake_max_age_s: 600,
             log_reopen_max_age_s: None,
+            health_last_ok_max_age_s: None,
         }
     }
 

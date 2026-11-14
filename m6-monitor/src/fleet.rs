@@ -123,6 +123,12 @@ fn read_token(path: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fleet {
     pub nodes: Vec<Node>,
+    /// The seconds between polls, read at load from the top level.
+    ///
+    /// Kept here so a default that depends on the cadence is computed from the
+    /// same number the poller uses.
+    #[serde(skip)]
+    pub(crate) poll_interval_s: u64,
     /// Fallback `/perf` bearer token, for nodes that do not name their own.
     ///
     /// Read from a file, never inlined: this config is in git and the token is
@@ -189,6 +195,16 @@ pub struct Fleet {
     /// interval, which is 7200.
     #[serde(default)]
     pub log_reopen_max_age_s: Option<u64>,
+    /// Seconds since a node's `/health` last answered 200 above which the
+    /// check flags it. Optional, default three poll intervals.
+    ///
+    /// The age comes from the history, so the service shows it only when
+    /// `history_file` is set. The check already faults a node that is
+    /// degraded or unreachable, and the age says how long it has been so.
+    /// A deployment that changes `poll_interval_s` keeps this limit in step
+    /// without a second number to maintain.
+    #[serde(default)]
+    pub health_last_ok_max_age_s: Option<u64>,
 }
 
 /// The seconds between polls, read from the top level of the service config.
@@ -260,7 +276,7 @@ impl Fleet {
         let section = value
             .get("monitor")
             .ok_or_else(|| anyhow::anyhow!("no [monitor] section in {}", config_path.display()))?;
-        let fleet: Fleet = section.clone().try_into()?;
+        let mut fleet: Fleet = section.clone().try_into()?;
         if fleet.nodes.is_empty() {
             anyhow::bail!("[monitor] lists no nodes");
         }
@@ -311,12 +327,22 @@ impl Fleet {
                 }
             }
         }
+        fleet.poll_interval_s = poll_interval_s;
         Ok(fleet)
     }
 
     /// The fleet-wide fallback token, if one is configured and readable.
     pub fn perf_token(&self) -> Option<String> {
         read_token(self.perf_token_file.as_ref()?)
+    }
+
+    /// Seconds a node's last `/health` 200 may be old before the check flags
+    /// it: the configured limit, or three poll intervals.
+    pub fn health_last_ok_limit_s(&self) -> u64 {
+        self.health_last_ok_max_age_s.unwrap_or_else(|| {
+            self.poll_interval_s
+                .saturating_mul(crate::digest::HEALTH_LAST_OK_POLLS)
+        })
     }
 }
 
@@ -726,6 +752,24 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         assert_eq!(set.log_reopen_max_age_s, Some(7200));
         let unset = load(node).unwrap();
         assert_eq!(unset.log_reopen_max_age_s, None);
+    }
+
+    /// The health limit is the one setting that has no literal default: it
+    /// follows the poll cadence, so changing `poll_interval_s` keeps it true.
+    #[test]
+    fn the_health_limit_defaults_to_three_poll_intervals() {
+        let node = "[[monitor.nodes]]\nname = \"origin\"\nurl = \"http://origin.example.com\"\n";
+        let set = load(&format!(
+            "poll_interval_s = 60\n[monitor]\nhealth_last_ok_max_age_s = 45\n{node}"
+        ))
+        .unwrap();
+        assert_eq!(set.health_last_ok_max_age_s, Some(45));
+        assert_eq!(set.health_last_ok_limit_s(), 45);
+        let default = load(&format!("poll_interval_s = 60\n{node}")).unwrap();
+        assert_eq!(default.health_last_ok_max_age_s, None);
+        assert_eq!(default.health_last_ok_limit_s(), 180);
+        let stock = load(node).unwrap();
+        assert_eq!(stock.health_last_ok_limit_s(), 90);
     }
 
     #[test]
