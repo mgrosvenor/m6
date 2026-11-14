@@ -1325,7 +1325,7 @@ mod tests {
     fn a_node_up_minutes_reads_minutes_in_the_check() {
         let mut r = reading("origin", None);
         r.perf = Some(crate::digest::tests::perf(
-            m6_core::host::HostSnapshot {
+            m6_core::platform::host::HostSnapshot {
                 cpus: 1,
                 ..Default::default()
             },
@@ -1565,7 +1565,7 @@ mod tests {
             readings.extend(sighted(&ips));
         }
         let mut cache = VerdictCache::new();
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         let first = cache.refresh(&readings, now, &lookup);
         assert_eq!(calls.borrow().len(), MAX_LOOKUPS_PER_POLL);
         assert_eq!(first.len(), MAX_LOOKUPS_PER_POLL);
@@ -1594,7 +1594,7 @@ mod tests {
         }
         let v = VerdictCache::with_cap(MAX_LOOKUPS_PER_CHECK).refresh(
             &readings,
-            std::time::Instant::now(),
+            m6_core::platform::now(),
             &lookup,
         );
         assert_eq!(calls.get(), 12);
@@ -1623,7 +1623,7 @@ mod tests {
             let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
             readings.extend(sighted(&ips));
         }
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
 
         let mut cache = VerdictCache::new();
         let mut due = Vec::new();
@@ -1663,7 +1663,7 @@ mod tests {
         };
         let readings = sighted(&["192.0.2.1"]);
         let mut cache = VerdictCache::new();
-        let t0 = std::time::Instant::now();
+        let t0 = m6_core::platform::now();
         cache.refresh(&readings, t0, &lookup);
         cache.refresh(&readings, t0 + std::time::Duration::from_secs(60), &lookup);
         assert_eq!(n.get(), 1, "a failure is kept for FAILED_TTL");
@@ -1972,8 +1972,8 @@ mod tunnel_tests {
     #[test]
     fn wg_interface_drops_are_shown_when_the_node_reports_them() {
         let mut r = with_tunnel("edge-a", Handshake::At { age_s: 1 });
-        let mut host = m6_core::host::HostSnapshot::default();
-        host.net.push(m6_core::host::NetDevice {
+        let mut host = m6_core::platform::host::HostSnapshot::default();
+        host.net.push(m6_core::platform::host::NetDevice {
             name: "wg0".into(),
             rx_drop: 3,
             tx_drop: 4,
@@ -1997,7 +1997,7 @@ mod tunnel_tests {
         });
         r.health_status = Some(200);
         let mut p: PerfReport = crate::digest::tests::perf(
-            m6_core::host::HostSnapshot {
+            m6_core::platform::host::HostSnapshot {
                 cpus: 1,
                 ..Default::default()
             },

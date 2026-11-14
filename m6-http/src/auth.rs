@@ -424,7 +424,7 @@ pub(crate) mod test_keys {
             exp: i64,
             roles: Vec<String>,
         }
-        let now = std::time::SystemTime::now()
+        let now = m6_core::platform::wall()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;

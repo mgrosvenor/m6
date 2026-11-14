@@ -675,30 +675,10 @@ struct Written {
 
 /// Create the directory (mode 0700 when new) and the empty file (mode 0600)
 /// before SQLite does, and tighten a file left by an earlier start. SQLite
-/// gives its journal the mode of the database file. Mode bits do not exist off
-/// Unix, so there the files take the platform default.
+/// gives its journal the mode of the database file.
 fn make_private(file: &Path) -> anyhow::Result<()> {
-    if let Some(dir) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-        b.create(dir)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
-    }
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(file)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("securing {}: {e}", file.display()))?;
-    }
-    Ok(())
+    m6_core::platform::create_private(file)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))
 }
 
 /// True when the error means the process must not go on: a file from a newer
@@ -1128,7 +1108,7 @@ const LAST_OK_SQL: &str = "SELECT n.name, \
 /// The wall clock in milliseconds. The one clock helper in the crate: the
 /// digest's ages, the poll's stamp and the tests all read it.
 pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now()
+    m6_core::platform::wall()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
@@ -1313,7 +1293,7 @@ impl History {
             st.writes += 1;
             st.crawl_windows += w.crawl_windows;
             st.pruned += w.pruned;
-            st.last_write = Some(Instant::now());
+            st.last_write = Some(m6_core::platform::now());
             st.used_bytes = Some(w.used_bytes);
             st.file_bytes = Some(w.file_bytes);
             st.oldest_ms = w.oldest_ms;
@@ -2019,8 +1999,10 @@ pub fn fill_page<T: Keyed>(
 mod tests {
     use super::*;
     use crate::digest::{self, Thresholds};
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice};
     use m6_core::monitoring::{LoggingHealth, TrafficReport};
+    use m6_core::platform::host::{
+        Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice,
+    };
     use m6_core::telemetry::ChannelSnapshot;
 
     const T0: i64 = 1_800_000_000_000;
@@ -2103,7 +2085,7 @@ mod tests {
                 total_bytes: 2000,
                 available_bytes: 500,
             }),
-            thermal: vec![m6_core::host::ThermalZone {
+            thermal: vec![m6_core::platform::host::ThermalZone {
                 name: "cpu".into(),
                 celsius: 45.5,
             }],
@@ -2810,7 +2792,7 @@ mod tests {
         let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let started = Instant::now();
+        let started = m6_core::platform::now();
         h.record(make(T0, &[reading("a")]));
         assert!(
             started.elapsed() < std::time::Duration::from_millis(100),
@@ -3460,13 +3442,11 @@ mod tests {
         assert_eq!(rows, vec![T0 + 30_000]);
     }
 
-    #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_history_directory_and_file_are_private() {
         let dir = tempfile::tempdir().unwrap();
@@ -3489,7 +3469,6 @@ mod tests {
         assert_eq!(mode(c.file.parent().unwrap()), 0o755);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_journal_beside_the_history_file_is_private() {
         let dir = tempfile::tempdir().unwrap();

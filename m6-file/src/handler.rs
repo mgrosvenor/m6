@@ -828,7 +828,6 @@ mod tests {
 
     /// A symlink pointing outside the site directory is a 404, not a file.
     #[test]
-    #[cfg(unix)]
     fn a_symlink_escaping_the_site_dir_is_404() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();

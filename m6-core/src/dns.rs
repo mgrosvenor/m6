@@ -43,12 +43,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 
-use nix::net::if_::if_nametoindex;
-
+use crate::platform::net::UdpSocket;
 use hickory_proto::op::{Message, MessageType, OpCode, Query as Question, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-use mio::net::UdpSocket;
 
 /// The first `nameserver` in /etc/resolv.conf, port 53. Start only.
 ///
@@ -91,7 +89,7 @@ fn scope_id(scope: Option<&str>) -> io::Result<u32> {
     if let Ok(id) = scope.parse::<u32>() {
         return Ok(id);
     }
-    if_nametoindex(scope).map_err(io::Error::from)
+    crate::platform::net::interface_index(scope)
 }
 
 /// The answer to one [`Query`].
@@ -493,7 +491,7 @@ mod tests {
     use std::net::TcpListener;
     use std::net::UdpSocket as StdUdpSocket;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A test may block; the query under test may not.
     const T: Duration = Duration::from_secs(5);
@@ -606,25 +604,25 @@ mod tests {
 
     /// Drive `query` with a poll until it answers.
     fn driven(query: &mut Query) -> Answer {
-        let mut poll = mio::Poll::new().expect("poll");
-        let mut events = mio::Events::with_capacity(4);
+        let mut poll = crate::platform::Poll::new().expect("poll");
+        let mut events = crate::platform::Events::with_capacity(4);
         poll.registry()
-            .register(
-                &mut mio::unix::SourceFd(&query.fd()),
-                mio::Token(0),
-                mio::Interest::READABLE,
+            .register_fd(
+                query.fd(),
+                crate::platform::Token(0),
+                crate::platform::Interest::READABLE,
             )
             .expect("register the query's socket");
-        let deadline = Instant::now() + T;
+        let deadline = crate::platform::now() + T;
         loop {
-            let now = Instant::now();
+            let now = crate::platform::now();
             assert!(
                 now < deadline,
                 "the query did not answer before its deadline"
             );
             poll.poll(&mut events, Some(deadline - now)).expect("poll");
             for event in events.iter() {
-                if event.token() == mio::Token(0) {
+                if event.token() == crate::platform::Token(0) {
                     if let Some(answer) = query.drive().expect("drive the query") {
                         return answer;
                     }
@@ -636,30 +634,30 @@ mod tests {
     /// Drive `confirm` with a poll until it answers, following the descriptor
     /// from the PTR step to the forward step.
     fn driven_confirm(confirm: &mut Confirm) -> Ptr {
-        let mut poll = mio::Poll::new().expect("poll");
-        let mut events = mio::Events::with_capacity(4);
+        let mut poll = crate::platform::Poll::new().expect("poll");
+        let mut events = crate::platform::Events::with_capacity(4);
         let mut registered = -1;
-        let deadline = Instant::now() + T;
+        let deadline = crate::platform::now() + T;
         loop {
             let fd = confirm.fd();
             if fd != registered {
                 poll.registry()
-                    .register(
-                        &mut mio::unix::SourceFd(&fd),
-                        mio::Token(0),
-                        mio::Interest::READABLE,
+                    .register_fd(
+                        fd,
+                        crate::platform::Token(0),
+                        crate::platform::Interest::READABLE,
                     )
                     .expect("register the confirmation's socket");
                 registered = fd;
             }
-            let now = Instant::now();
+            let now = crate::platform::now();
             assert!(
                 now < deadline,
                 "the confirmation did not finish before its deadline"
             );
             poll.poll(&mut events, Some(deadline - now)).expect("poll");
             for event in events.iter() {
-                if event.token() == mio::Token(0) {
+                if event.token() == crate::platform::Token(0) {
                     if let Some(ptr) = confirm.drive().expect("drive the confirmation") {
                         return ptr;
                     }
@@ -1021,10 +1019,10 @@ mod tests {
             server
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .expect("read timeout");
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::platform::now() + Duration::from_secs(2);
             loop {
                 assert!(
-                    Instant::now() < deadline,
+                    crate::platform::now() < deadline,
                     "the closed socket never reported as refused"
                 );
                 // Each send to the closed port provokes the ICMP error that

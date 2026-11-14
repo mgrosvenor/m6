@@ -110,7 +110,7 @@ pub fn hash_token(token: &str) -> String {
 
 /// Return the current Unix timestamp as i64.
 pub fn now_secs() -> i64 {
-    std::time::SystemTime::now()
+    m6_core::platform::wall()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)

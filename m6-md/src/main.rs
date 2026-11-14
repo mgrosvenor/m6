@@ -92,7 +92,7 @@ fn toml_to_json(v: toml::Value) -> Value {
 fn file_mtime_iso(path: &Path) -> String {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .unwrap_or_else(|_| std::time::SystemTime::now());
+        .unwrap_or_else(|_| m6_core::platform::wall());
     m6_core::util::iso_date_from(mtime)
 }
 

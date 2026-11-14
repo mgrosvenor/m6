@@ -19,8 +19,8 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
 use m6_core::h1::{self, Flush, Read, ServerConn};
-use m6_core::mio;
-use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::site::Site;
 use m6_core::testkit::alloc_count;
 
@@ -108,7 +108,7 @@ fn connection() -> Conn {
         .set_write_timeout(Some(DEADLINE))
         .expect("a write deadline");
     let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
-    conn.attach(mio::net::UnixStream::from_std(server));
+    conn.attach(platform::net::UnixStream::from_std(server));
     let poll = Poll::new().expect("a poll");
     poll.registry()
         .register(conn.stream().expect("attached"), SERVER, Interest::READABLE)

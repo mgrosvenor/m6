@@ -17,7 +17,7 @@
 //!
 //! The monitor's `main` is start, run and stop, the shape every service has
 //! since EL-6b: `m6_core::event` supplies the signals, the deadlines and the
-//! connection table, and `m6::mio` the reactor. The fleet poll is not a thread.
+//! connection table, and `m6_core::platform` the reactor. The fleet poll is not a thread.
 //! It is a table of steps in this loop (`poll.rs`): each node's `/health`,
 //! `/perf` and `/traffic` requests, each tunnel connect and each crawler
 //! lookup is a descriptor the loop waits on, so a node that hangs holds only
@@ -55,11 +55,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{close_conn, head_slots, Flush, Read, RequestHead, ServerConn};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
@@ -217,8 +218,7 @@ fn run_service() -> Result<()> {
         lookup_cap: check::MAX_LOOKUPS_PER_POLL,
     });
 
-    let ceiling =
-        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");
     }
@@ -233,11 +233,7 @@ fn run_service() -> Result<()> {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
     poll.registry()
-        .register(
-            &mut SourceFd(&signals.raw_fd()),
-            SIGNALS,
-            Interest::READABLE,
-        )
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
     lifecycle.started();
@@ -254,7 +250,7 @@ fn run_service() -> Result<()> {
     let mut accepting = true;
     let mut snapshot: Option<Snapshot> = None;
     let mut poll_reported_late = false;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
     #[cfg(feature = "count-allocations")]
     let mut client_allocs = 0u64;
@@ -262,7 +258,7 @@ fn run_service() -> Result<()> {
     // The first poll starts with the service, so the page and the check have a
     // reading before the first interval passes.
     let first = poller
-        .start(&poll, &mut out, Instant::now())
+        .start(&poll, &mut out, m6_core::platform::now())
         .unwrap_or_else(|e| fail("starting the first poll", e));
     publish(first, &mut snapshot, &thresholds, &mut history);
 
@@ -272,14 +268,14 @@ fn run_service() -> Result<()> {
         // poll starts on a tick, not on its own timer: one interval is 30
         // ticks, and a second of lateness on the first request is the price of
         // not keeping a second clock.
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let wait = deadlines.timeout(now, TICK).min(poller.timeout(now, TICK));
         match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as the
         // other services report the trace.
@@ -312,20 +308,25 @@ fn run_service() -> Result<()> {
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                // No connection was pending after all: give
-                                // the slot back rather than leaking it.
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                // A failure here sheds this accept pass and
-                                // not the service: give the slot back, say so
-                                // once, and wait for the next listener event.
-                                conns.free(taken.key);
-                                eprintln!("m6-monitor: accept error: {e}");
-                                break;
-                            }
+                            // No connection was pending after all: give
+                            // the slot back rather than leaking it.
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    eprintln!("m6-monitor: accept error: {e}");
+                                    break;
+                                }
+                            },
                         };
                         poll.registry().register(
                             &mut stream,
@@ -389,7 +390,7 @@ fn run_service() -> Result<()> {
                 // crawler lookup.
                 Token(t) => {
                     let slot = t - poll::CLIENT_BASE;
-                    let progress = poller.drive(&poll, &mut out, slot, Instant::now())?;
+                    let progress = poller.drive(&poll, &mut out, slot, m6_core::platform::now())?;
                     publish(progress, &mut snapshot, &thresholds, &mut history);
                 }
             }
@@ -397,11 +398,11 @@ fn run_service() -> Result<()> {
 
         // Outgoing work whose deadline passed: a timed-out node step, a lost
         // probe or a failed lookup, each recorded and moved on.
-        while let Some(progress) = poller.expire(&poll, &mut out, Instant::now())? {
+        while let Some(progress) = poller.expire(&poll, &mut out, m6_core::platform::now())? {
             publish(progress, &mut snapshot, &thresholds, &mut history);
         }
         // Close every client whose read deadline passed, with no response.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
@@ -414,7 +415,7 @@ fn run_service() -> Result<()> {
         // The tick: start a poll when the interval has passed since the last
         // one started and none is running. A poll still running at its next
         // due time is not restarted; the tick says so once and waits.
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let due = poller
             .last_start()
             .is_none_or(|start| now.duration_since(start) >= interval);
@@ -432,7 +433,7 @@ fn run_service() -> Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. The monitor serves no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {

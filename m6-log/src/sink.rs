@@ -10,9 +10,6 @@ use std::io::{self, IsTerminal};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-
 use crate::line::write_dropped_line;
 
 /// Bytes one Sink's buffer holds before it is written to its destination.
@@ -71,7 +68,7 @@ pub struct Sink {
     path: Option<PathBuf>,
     /// The flags `fd` had before `Sink::stdout` changed them, restored by
     /// [`Sink::finish`].
-    original_flags: Option<OFlag>,
+    original_nonblocking: Option<bool>,
     /// The last write could not take the bytes and the destination is full.
     blocked: bool,
     /// Lines lost to a full destination or a write error, ever.
@@ -99,14 +96,7 @@ impl Sink {
         let original = if terminal {
             None
         } else {
-            let flags = fcntl(std::io::stdout(), FcntlArg::F_GETFL).map_err(io::Error::from)?;
-            let flags = OFlag::from_bits_truncate(flags);
-            fcntl(
-                std::io::stdout(),
-                FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
-            )
-            .map_err(io::Error::from)?;
-            Some(flags)
+            Some(m6_platform::fd::set_nonblocking(&std::io::stdout(), true)?)
         };
         Ok(Sink {
             buf: vec![0; BUFFER_BYTES].into_boxed_slice(),
@@ -115,7 +105,7 @@ impl Sink {
             fd: 1,
             file: None,
             path: None,
-            original_flags: original,
+            original_nonblocking: original,
             blocked: false,
             dropped: 0,
             reported: 0,
@@ -144,7 +134,7 @@ impl Sink {
             fd,
             file: Some(file),
             path: Some(path),
-            original_flags: None,
+            original_nonblocking: None,
             blocked: false,
             dropped: 0,
             reported: 0,
@@ -202,8 +192,8 @@ impl Sink {
     ///
     /// A restored blocking descriptor can wait here, which is what stop may do.
     pub fn finish(&mut self) -> io::Result<()> {
-        if let Some(flags) = self.original_flags.take() {
-            fcntl(std::io::stdout(), FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
+        if let Some(was) = self.original_nonblocking.take() {
+            m6_platform::fd::set_nonblocking(&std::io::stdout(), was)?;
         }
         let mut result = self.write_all_blocking();
         if result.is_ok() && self.dropped > self.reported {
@@ -342,8 +332,8 @@ impl Sink {
                     break;
                 }
                 Ok(n) => written += n,
-                Err(Errno::EINTR) => continue,
-                Err(Errno::EAGAIN) => {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     full = true;
                     break;
                 }
@@ -391,21 +381,21 @@ impl Sink {
                     self.move_front(n);
                     self.advance_report(report, n);
                 }
-                Err(Errno::EINTR) => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     self.discard_complete();
                     self.report = 0;
-                    return Err(io::Error::from(e));
+                    return Err(e);
                 }
             }
         }
         Ok(())
     }
 
-    fn write_some(&self, bytes: &[u8]) -> Result<usize, Errno> {
+    fn write_some(&self, bytes: &[u8]) -> io::Result<usize> {
         match self.file.as_ref() {
-            Some(file) => nix::unistd::write(file, bytes),
-            None => nix::unistd::write(std::io::stdout(), bytes),
+            Some(file) => m6_platform::fd::write(file, bytes),
+            None => m6_platform::fd::write(&std::io::stdout(), bytes),
         }
     }
 

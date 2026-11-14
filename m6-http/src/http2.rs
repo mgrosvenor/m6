@@ -870,7 +870,8 @@ impl Http2Conn {
         if self.recently_reset.len() >= RESET_MEMORY {
             self.recently_reset.pop_front();
         }
-        self.recently_reset.push_back((stream_id, Instant::now()));
+        self.recently_reset
+            .push_back((stream_id, m6_core::platform::now()));
     }
 
     fn was_reset(&self, stream_id: u32) -> bool {
@@ -1283,7 +1284,7 @@ impl Http2Conn {
         // full inline dispatch, while the count it was measured by stayed at
         // zero. Recently-reset streams keep their slot for `RESET_DECAY` so the
         // cap counts streams *started*, not streams still open.
-        if self.active_streams(Instant::now()) >= MAX_CONCURRENT as usize {
+        if self.active_streams(m6_core::platform::now()) >= MAX_CONCURRENT as usize {
             self.push_frame(
                 TYPE_RST_STREAM,
                 0,
@@ -2799,7 +2800,7 @@ mod stream_state_tests {
 
         assert_eq!(c.streams.len(), 0, "every stream really was cancelled");
         assert_eq!(
-            c.active_streams(Instant::now()),
+            c.active_streams(m6_core::platform::now()),
             MAX_CONCURRENT as usize,
             "cancelled streams must still hold their slots"
         );
@@ -2891,7 +2892,7 @@ mod stream_state_tests {
             run(&mut c, &open_and_reset(1 + n * 2)).unwrap();
         }
 
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         assert_eq!(c.active_streams(now), MAX_CONCURRENT as usize);
         assert_eq!(
             c.active_streams(now + RESET_DECAY * 2),
@@ -2944,14 +2945,14 @@ mod stream_state_tests {
             c.note_reset(push_id);
         }
         assert_eq!(
-            c.active_streams(Instant::now()),
+            c.active_streams(m6_core::platform::now()),
             0,
             "declined pushes are not the peer's doing"
         );
 
         // A client-initiated cancellation on the same connection still counts.
         c.note_reset(1);
-        assert_eq!(c.active_streams(Instant::now()), 1);
+        assert_eq!(c.active_streams(m6_core::platform::now()), 1);
     }
 
     /// The budget must not punish a normal client. A page whose requests all
@@ -2975,7 +2976,7 @@ mod stream_state_tests {
             "streams that completed normally must not occupy reset slots"
         );
         assert!(
-            c.active_streams(Instant::now()) < MAX_CONCURRENT as usize,
+            c.active_streams(m6_core::platform::now()) < MAX_CONCURRENT as usize,
             "200 completed requests must not approach the cap"
         );
 

@@ -33,7 +33,7 @@
 //! request handler, and no connect waits: each is a non-blocking socket the
 //! loop waits on, with one budget for the node's whole probe.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use m6_core::wireguard::Handshakes;
 
@@ -157,9 +157,9 @@ fn probe_with(
     mut connect: impl FnMut(Duration) -> std::io::Result<()>,
 ) -> ProbeResult {
     let mut tally = Tally::new();
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = m6_core::platform::now() + timeout;
     for _ in 0..PROBES_PER_POLL {
-        let started = std::time::Instant::now();
+        let started = m6_core::platform::now();
         let remaining = deadline.saturating_duration_since(started);
         if remaining.is_zero() {
             break;
@@ -225,7 +225,7 @@ pub fn load(path: Option<&str>, max_age_s: u64) -> HandshakeSource {
             let file_age_s = std::fs::metadata(path)
                 .and_then(|m| m.modified())
                 .ok()
-                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .and_then(|t| m6_core::platform::wall().duration_since(t).ok())
                 .map(|d| d.as_secs());
             match file_age_s {
                 Some(age_s) if age_s > max_age_s => Err(Handshake::FileStale {
@@ -402,7 +402,7 @@ mod tests {
     fn a_file_older_than_the_limit_is_stale_and_names_its_path() {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), "K\t1\n").unwrap();
-        let old = SystemTime::now() - Duration::from_secs(900);
+        let old = m6_core::platform::wall() - Duration::from_secs(900);
         f.as_file().set_modified(old).unwrap();
         let path = f.path().to_str().unwrap();
         match load(Some(path), 600) {

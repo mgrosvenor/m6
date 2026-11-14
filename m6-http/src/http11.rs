@@ -32,8 +32,7 @@ use crate::cache::CachedResponse;
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
 use crate::http2::{H2Io, Http2Conn};
 use m6_core::event::{Slots, Taken};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Interest, Registry, Token};
+use m6_core::platform::{Interest, Registry, Token};
 
 // ── Request outcome ───────────────────────────────────────────────────────────
 
@@ -170,7 +169,7 @@ impl Conn {
             client_ip: String::new(),
             tls: None,
             kind: ConnKind::Handshake {
-                created: Instant::now(),
+                created: m6_core::platform::now(),
             },
             token: Token(usize::MAX),
             registered_interest: Interest::READABLE,
@@ -412,12 +411,12 @@ impl Http11Listener {
                     let client_ip = peer.ip().to_string();
                     let kind = if tls.is_some() {
                         ConnKind::Handshake {
-                            created: Instant::now(),
+                            created: m6_core::platform::now(),
                         }
                     } else {
                         ConnKind::Http1(H1Conn {
                             state: H1State::Reading { buf: Vec::new() },
-                            created: Instant::now(),
+                            created: m6_core::platform::now(),
                             keep_alive: false,
                             served: 0,
                             max_requests: self.max_requests,
@@ -436,11 +435,14 @@ impl Http11Listener {
                         registered_interest: Interest::READABLE,
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
-                Err(e) => {
-                    warn!("tcp accept: {e}");
-                    return None;
-                }
+                Err(e) => match m6_core::platform::net::accept_error(&e) {
+                    m6_core::platform::net::Accept::Drained => return None,
+                    m6_core::platform::net::Accept::SkipOne => continue,
+                    m6_core::platform::net::Accept::Stop => {
+                        warn!("tcp accept: {e}");
+                        return None;
+                    }
+                },
             }
         }
     }
@@ -490,7 +492,7 @@ impl Http11Listener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -577,7 +579,7 @@ impl Http11Listener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -617,7 +619,7 @@ impl Http11Listener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -630,7 +632,7 @@ impl Http11Listener {
     pub fn close_one(&mut self, key: usize, registry: &Registry) {
         let conn = self.conns.get_mut(key);
         if let Some(stream) = conn.stream.take() {
-            registry.deregister(&mut SourceFd(&stream.as_raw_fd())).ok();
+            registry.deregister_fd(stream.as_raw_fd()).ok();
         }
         *conn = Conn::empty();
         self.conns.free(key);
@@ -942,7 +944,7 @@ impl H2cListener {
         match self.listener.accept() {
             Ok((stream, peer)) => {
                 let Some(trust) = admit(self.peers.as_deref(), peer.ip()) else {
-                    let verdict = self.refusals.record(peer.ip(), Instant::now());
+                    let verdict = self.refusals.record(peer.ip(), m6_core::platform::now());
                     if let Some(s) = verdict.summary {
                         warn!(
                             other_refusals = s.other_refusals,
@@ -983,11 +985,15 @@ impl H2cListener {
                     registered_interest: Interest::READABLE,
                 })
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => H2cAccept::WouldBlock,
-            Err(e) => {
-                warn!("h2c accept: {e}");
-                H2cAccept::WouldBlock
-            }
+            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                m6_core::platform::net::Accept::Drained => H2cAccept::WouldBlock,
+                // Gone before it was accepted: counted and passed over.
+                m6_core::platform::net::Accept::SkipOne => H2cAccept::Refused,
+                m6_core::platform::net::Accept::Stop => {
+                    warn!("h2c accept: {e}");
+                    H2cAccept::WouldBlock
+                }
+            },
         }
     }
 
@@ -1050,7 +1056,7 @@ impl H2cListener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -1096,7 +1102,7 @@ impl H2cListener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -1109,7 +1115,7 @@ impl H2cListener {
     pub fn close_one(&mut self, key: usize, registry: &Registry) {
         let conn = self.conns.get_mut(key);
         if let Some(stream) = conn.stream.take() {
-            registry.deregister(&mut SourceFd(&stream.as_raw_fd())).ok();
+            registry.deregister_fd(stream.as_raw_fd()).ok();
         }
         *conn = H2cPlainConn::empty();
         self.conns.free(key);
@@ -1236,7 +1242,7 @@ fn drive_conn<S, FH, FO>(
     if tls_failed {
         conn.kind = ConnKind::Http1(H1Conn {
             state: H1State::Done,
-            created: Instant::now(),
+            created: m6_core::platform::now(),
             keep_alive: false,
             served: 0,
             max_requests,
@@ -1779,7 +1785,7 @@ fn finish_response(h1: &mut H1Conn) -> bool {
     h1.served = h1.served.saturating_add(1);
     if h1.keep_alive && h1.served < h1.max_requests {
         h1.state = H1State::Reading { buf: Vec::new() };
-        h1.created = Instant::now();
+        h1.created = m6_core::platform::now();
         h1.expect_handled = false;
         true
     } else {
@@ -2827,7 +2833,7 @@ mod expect_tests {
     fn h1_with_head(buf: Vec<u8>) -> H1Conn {
         H1Conn {
             state: H1State::Reading { buf },
-            created: Instant::now(),
+            created: m6_core::platform::now(),
             keep_alive: false,
             served: 0,
             max_requests: 100,
@@ -2944,7 +2950,6 @@ mod h2c_admit_tests {
     };
     use crate::forward::ForwardedTrust;
     use std::net::{IpAddr, TcpStream};
-    use std::time::Instant;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -2989,7 +2994,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn the_first_refusal_of_a_peer_is_logged_and_repeats_are_counted() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, 8);
         let a = ip("10.0.0.3");
         assert_eq!(log.record(a, t0).peer_line, Some(0));
@@ -3001,7 +3006,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn a_line_after_the_interval_carries_the_suppressed_count() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, 8);
         let a = ip("10.0.0.3");
         assert_eq!(log.record(a, t0).peer_line, Some(0));
@@ -3017,7 +3022,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn a_full_table_keeps_its_peers_and_counts_new_addresses() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, 3);
         for n in 1..=3 {
             assert_eq!(log.record(v4(n), t0).peer_line, Some(0));
@@ -3048,7 +3053,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn rotating_addresses_cannot_defeat_the_line_limit() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, REFUSAL_LOG_MAX_PEERS);
         let mut lines = 0;
         let mut summaries = 0;
@@ -3077,7 +3082,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn a_withheld_peer_gets_its_line_in_the_next_window() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, 256);
         for n in 0..40 {
             log.record(v4(n), t0);
@@ -3090,7 +3095,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn a_new_address_is_named_once_stale_entries_free_a_slot() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, 3);
         for n in 1..=3 {
             assert_eq!(log.record(v4(n), t0 + n * SEC).peer_line, Some(0));
@@ -3107,7 +3112,7 @@ mod h2c_admit_tests {
 
     #[test]
     fn with_no_stale_entry_a_new_address_is_counted_and_sampled() {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let mut log = RefusalLog::new(60 * SEC, 3);
         for n in 1..=3 {
             log.record(v4(n), t0);
