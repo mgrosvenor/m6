@@ -5,7 +5,7 @@ It keeps the line format m6's consumers read, and it removes the writer thread, 
 A log call copies one JSON line into a buffer that start made, and the process's own loop writes that buffer when it is nearly full, on the accounting tick and at stop.
 
 The library is `m6-log`.
-m6-core re-exports it as `m6_core::log` and adds `watch`, which is the one piece that needs `mio`.
+m6-core re-exports it as `m6_core::log` and adds `watch`, which is the one piece that needs the reactor.
 The library has no thread, no channel and no lock.
 
 ## The line
@@ -101,14 +101,16 @@ Table 3: the calls a service makes.
 | call | where |
 |---|---|
 | `init(level, analytics)` | at start, before the loop |
-| `tick(SystemTime::now())` | on the one-second accounting tick |
-| `watch(poll.registry(), LOG)?` | after one turn's events, in `m6_core::log` |
+| `tick(now)` | on the one-second accounting tick, with the time the loop already read |
+| `watch(poll.registry(), LOG)`, its error logged | after one turn's events, in `m6_core::log` |
 | `flush()` | in the match on the token, for `LOG` |
-| `reopen()?` | when `Signal::ReopenLogs` arrives |
+| `reopen()`, its error logged | when `Signal::ReopenLogs` arrives |
 | `stop()?` | after the loop, where blocking is allowed |
 
 `watch` lives in `m6-core`, over `Sink::fd` and `Sink::wants_write`.
-It registers stdout for writability only while complete lines wait, and removes it when they have drained.
+It registers stdout for writability only while a write has returned `EAGAIN`, and removes it when the Sink has drained.
+A line waiting for the tick is buffered, not watched, so a regular file and a terminal are never registered.
+A registration failure is logged and the loop serves on.
 
 ## What it copies
 
@@ -130,5 +132,5 @@ m6-log leaves out gzip of log files, conditional logging, syslog, a log format l
 ## Where it fits
 
 m6-log is the writing half of logging.
-m6-core supplies `watch`, the routing of a line to one of the two Sinks, and the re-export every service uses.
+m6-core re-exports it as `m6_core::log` and adds `watch`, the one piece that needs the reactor.
 Each service's own loop supplies the tick, the token and the stop, in plain sight, as every other part of its loop does.

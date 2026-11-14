@@ -581,7 +581,7 @@ pub fn error_to_response(err: &Error) -> Response {
         Error::Forbidden => Response::forbidden(),
         Error::BadRequest(_) => Response::bad_request(),
         Error::Other(_) => {
-            tracing::error!("handler error: {err}");
+            crate::log::error!("handler error: {err}");
             Response::status(500)
         }
     }

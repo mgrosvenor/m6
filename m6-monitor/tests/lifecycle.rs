@@ -37,7 +37,6 @@ role = "origin"
 
 [log]
 level  = "info"
-format = "text"
 "#;
 
 fn setup(config: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -268,10 +267,10 @@ fn a_trailing_or_doubled_slash_still_answers() {
     svc.terminate(Duration::from_secs(5));
 }
 
-/// The monitor runs one loop thread, plus the log writer until LOG-2 replaces
-/// it. Three counts test that: one node, the same three-node fleet without a
-/// history, and that fleet with one. A poll thread or a history writer adds a
-/// thread to the same fleet, and a thread per node adds two.
+/// The monitor runs one loop thread. Three counts test that: one node, the
+/// same three-node fleet without a history, and that fleet with one. A poll
+/// thread or a history writer adds a thread to the same fleet, and a thread
+/// per node adds two.
 ///
 /// The counts are read once they have settled, through the platform layer.
 /// Reading the host's certificate store (`client::system_roots`, which the
@@ -323,18 +322,13 @@ fn the_monitor_runs_one_thread() {
     assert_history_adds_none(plain, with_history, &output);
 }
 
-/// The loop and the log writer, above the platform's own workers, with the
-/// one-thread swing those workers have between processes.
+/// The loop, exactly, above the platform's own workers.
 fn assert_single_loop(what: &str, count: usize, workers: usize) {
-    // The log writer is a thread even when the log goes to stdout, so the loop
-    // and the writer are two. LOG-2 replaces tracing-appender and this becomes
-    // one.
-    let expected = 1 + LOG_WRITER_THREADS + workers;
-    assert!(
-        (expected.saturating_sub(1)..=expected + 1).contains(&count),
-        "{what}: m6-monitor runs {count} threads, not the one loop thread, \
-         tracing-appender's writer until LOG-2 and the platform's {workers} \
-         certificate-store worker(s), give or take the one those swing by"
+    assert_eq!(
+        count,
+        1 + workers,
+        "{what}: m6-monitor runs {count} threads, not the one loop thread \
+         and the platform's {workers} certificate-store worker(s)"
     );
 }
 
@@ -370,10 +364,6 @@ fn assert_history_adds_none(plain: usize, with_history: usize, output: &str) {
         with_history as isize - plain as isize
     );
 }
-
-/// `LOG_WRITER_THREADS` is 1 until LOG-2 replaces tracing-appender; it becomes
-/// 0 then, and the trusted session updates this constant.
-const LOG_WRITER_THREADS: usize = 1;
 
 /// The thread count once it has settled: two readings 100 ms apart agree, or
 /// the deadline passes. The assertion is the signal and the deadline is the

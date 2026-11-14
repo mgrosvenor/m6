@@ -47,7 +47,7 @@ fn write_cert_key(site: &Path) {
 /// `write_cert_key` wrote. Plain `info` logging so warnings are visible.
 fn site_toml() -> String {
     "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-     [log]\nlevel = \"info\"\nformat = \"plain\"\n"
+     [log]\nlevel = \"info\"\n"
         .to_string()
 }
 
@@ -243,7 +243,7 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
     std::fs::write(
         site.join("site.toml"),
         "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"plain\"\n",
+         [log]\nlevel = \"info\"\n",
     )
     .expect("site.toml");
     let system = dir.path().join("system.toml");
@@ -374,7 +374,7 @@ fn a_pool_whose_glob_matches_no_socket_exits_2() {
         site.join("site.toml"),
         format!(
             "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-             [log]\nlevel = \"info\"\nformat = \"plain\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
              [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
              [[route]]\npath = \"/\"\nbackend = \"b\"\n",
             sockets.join("*.sock").display()
@@ -462,7 +462,7 @@ fn url_backend_site(dir: &Path, bind: &str, backend: &str) -> (PathBuf, PathBuf)
         site.join("site.toml"),
         format!(
             "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-             [log]\nlevel = \"info\"\nformat = \"plain\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
              {backend}\n\n\
              [[route]]\npath = \"/\"\nbackend = \"remote\"\n"
         ),

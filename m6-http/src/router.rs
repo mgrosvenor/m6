@@ -146,7 +146,7 @@ impl RouteTable {
             let paths = match glob::glob(&glob_pattern) {
                 Ok(paths) => paths,
                 Err(e) => {
-                    tracing::warn!(pattern = %glob_pattern, error = %e, "route_group glob error");
+                    m6_core::log::warn!(pattern = %glob_pattern, error = %e, "route_group glob error");
                     continue;
                 }
             };
@@ -155,7 +155,7 @@ impl RouteTable {
                 let file_path = match path_result {
                     Ok(p) => p,
                     Err(e) => {
-                        tracing::warn!(error = %e, "route_group glob entry error");
+                        m6_core::log::warn!(error = %e, "route_group glob entry error");
                         continue;
                     }
                 };
@@ -175,7 +175,7 @@ impl RouteTable {
                 }
 
                 if let Err(e) = router.insert(url_path.clone(), entry.clone()) {
-                    tracing::warn!(path = %url_path, error = %e, "route_group insert error");
+                    m6_core::log::warn!(path = %url_path, error = %e, "route_group insert error");
                     continue;
                 }
                 entries.push(entry);

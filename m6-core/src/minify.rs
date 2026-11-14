@@ -40,7 +40,7 @@ pub fn minify_js(data: &[u8]) -> Vec<u8> {
     match minify_js::minify(&session, minify_js::TopLevelMode::Module, data, &mut out) {
         Ok(()) => out,
         Err(e) => {
-            tracing::warn!(error = %e, "minify_js: parse failed, serving unminified source");
+            crate::log::warn!(error = %e, "minify_js: parse failed, serving unminified source");
             data.to_vec()
         }
     }

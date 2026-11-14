@@ -251,7 +251,7 @@ fn get_ok(port: u16, context: &str) -> String {
 fn site_toml(glob: &str) -> String {
     format!(
         "[site]\nname = \"pool-round-robin\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"warn\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"warn\"\n\n\
          [errors]\nmode = \"internal\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\

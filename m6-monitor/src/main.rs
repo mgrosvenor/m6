@@ -71,6 +71,9 @@ static ALLOC: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -124,7 +127,12 @@ fn main() -> Result<()> {
             .skip(1)
             .find(|a| !a.starts_with("--"))
             .ok_or_else(|| anyhow::anyhow!("usage: m6-monitor --check <config-path>"))?;
-        return run_check(Path::new(config));
+        // A one-shot tool: no loop, so the log starts here and stops before
+        // the process exits.
+        m6_core::log::init(m6_core::log::Level::Info, None)?;
+        let result = run_check(Path::new(config));
+        m6_core::log::stop()?;
+        return result;
     }
     run_service()
 }
@@ -245,7 +253,7 @@ fn run_service() -> Result<()> {
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "client", "node", "probe", "dns", "tick"]);
+    let mut trace = LoopTrace::new(&["accept", "client", "node", "probe", "dns", "tick", "log"]);
     let mut out = poller.out();
     let mut accepting = true;
     let mut snapshot: Option<Snapshot> = None;
@@ -283,6 +291,7 @@ fn run_service() -> Result<()> {
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 5,
+            Some(LOG) => 6,
             Some(Token(t)) if t < poll::CLIENT_BASE => 1,
             Some(Token(t)) => {
                 let slot = t - poll::CLIENT_BASE;
@@ -356,6 +365,7 @@ fn run_service() -> Result<()> {
                         break 'run;
                     }
                 }
+                LOG => m6_core::log::flush(),
                 // One connection's turn: answer from the snapshot, or from
                 // the history for the two paged routes.
                 Token(k) if k < poll::CLIENT_BASE => {
@@ -396,6 +406,12 @@ fn run_service() -> Result<()> {
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
         // Outgoing work whose deadline passed: a timed-out node step, a lost
         // probe or a failed lookup, each recorded and moved on.
         while let Some(progress) = poller.expire(&poll, &mut out, m6_core::platform::now())? {
@@ -421,7 +437,7 @@ fn run_service() -> Result<()> {
             .is_none_or(|start| now.duration_since(start) >= interval);
         if due && poller.is_running() {
             if !poll_reported_late {
-                tracing::debug!("a poll is still running at its next due time; waiting");
+                m6_core::log::debug!("a poll is still running at its next due time; waiting");
                 poll_reported_late = true;
             }
         } else if due {
@@ -437,6 +453,7 @@ fn run_service() -> Result<()> {
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
             let _ = trace.report();
             last_report = end;
         }
@@ -451,6 +468,7 @@ fn run_service() -> Result<()> {
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();
+    m6_core::log::stop()?;
     Ok(())
 }
 
@@ -808,6 +826,9 @@ fn run_check(config_path: &Path) -> Result<()> {
     let mut out = poller.out();
     let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
     let d = digest::build(&polled.readings, &thresholds, now_iso8601());
+    // The report goes through `print!`, so stop the log first: it flushes and
+    // puts stdout back to the blocking flag the process started with.
+    m6_core::log::stop()?;
     print!("{}", check::render(&d, &polled.readings, &polled.verdicts));
     if d.level == digest::Level::Fault {
         std::process::exit(1);

@@ -25,8 +25,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Instant;
 
+use m6_core::log::warn;
 use rustls::ServerConnection;
-use tracing::warn;
 
 use crate::cache::CachedResponse;
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};

@@ -56,8 +56,7 @@ name   = "My Blog"
 domain = "example.com"
 
 [log]
-level  = "info"     # "debug" | "info" | "warn" | "error"
-format = "json"     # "json" | "text"
+level = "info"     # "debug" | "info" | "warn" | "error"
 
 [errors]
 mode = "status"     # "status" | "custom" | "internal"
@@ -389,19 +388,18 @@ internal_peers = ["10.0.0.2", "10.0.0.3"]
 
 ### 4.3. `[log]`
 
-Table 4 gives the two `[log]` keys.
-Take from it that both have a default, so an absent section leaves the process on JSON at `info`.
+Table 4 gives the one `[log]` key.
+Take from it that the key has a default, so an absent section leaves the process at `info`.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `level` | string | `"info"` | `"trace"`, `"debug"`, `"info"`, `"warn"` or `"error"` |
-| `format` | string | `"json"` | `"json"` or `"text"` |
 
-**Table 4: the `[log]` keys.**
+**Table 4: the `[log]` key.**
 The level names are case-insensitive.
 
-All processes log to stdout, and `format` applies to every process that reads this config.
-A `format` outside `"json"` writes text.
+All processes log to stdout as JSON lines.
+A `format` key is an unknown key, so the start is refused with exit 2 and the message names it.
 
 ### 4.4. `[errors]`
 

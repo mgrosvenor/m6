@@ -34,7 +34,7 @@ m6-md <input-dir> --output <file> [--log-level <level>]
 |---|---|---|
 | `<input-dir>` | yes | Directory of `*.md` files. m6-md reads one level. |
 | `--output <file>` | yes | Path of the JSON file to write. |
-| `--log-level <level>` | no | Log filter directive, default `info`. A value the filter refuses is a usage error, exit 2. |
+| `--log-level <level>` | no | One level name (`trace`, `debug`, `info`, `warn` or `error`), default `info`. Any other value is a usage error, exit 2. |
 | `--version`, `-V` | no | Print the m6-md version and exit 0. |
 
 **Table 1: every command-line argument and flag, whether it is required, and what it does.** The version flag writes no file.
@@ -171,7 +171,7 @@ Take from it that a usage mistake exits 2 and every failure during a run exits 1
 |---|---|
 | 0 | The run wrote the output, or `--version` printed the version |
 | 1 | A runtime failure: the input directory is missing or is a file, the output path's parent directory is missing, a source file cannot be read, a frontmatter block is malformed, or the output cannot be written |
-| 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, a second positional argument is given, or `--log-level` is a filter directive m6-md cannot parse |
+| 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, a second positional argument is given, or `--log-level` is not one level name |
 
 **Table 4: the three exit codes and the conditions behind each.**
 

@@ -622,13 +622,13 @@ impl Stats {
             self.monitor_window_added,
         );
 
-        tracing::info!(
+        m6_core::log::info!(
             requests = self.requests_total,
             rps_avg = rps_avg,
             rps_peak = self.rps_peak,
             cache_hits = self.window_cache_hits,
             cache_misses = self.window_cache_misses,
-            cache_hit_rate = format_args!("{:.4}", cache_hit_rate),
+            cache_hit_rate = %format_args!("{:.4}", cache_hit_rate),
             backend_errors = self.window_backend_errors,
             pool_members = pool_members,
             // The sample count beside the percentiles, not just the numbers.
@@ -1305,7 +1305,7 @@ mod perf_reservoir_tests {
     /// `snapshot()`'s comment was protecting when it declined to reset.
     ///
     /// Checked through the window counter the log reports rather than by
-    /// capturing tracing output: after an emit the window is empty, and new
+    /// capturing log output: after an emit the window is empty, and new
     /// traffic lands in the next window only.
     #[test]
     fn the_periodic_window_still_only_covers_its_own_window() {

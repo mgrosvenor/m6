@@ -26,7 +26,7 @@ impl BackendPool {
     /// Add a socket path to the pool (if not already present).
     pub fn add_socket(&mut self, path: PathBuf) {
         if !self.members.iter().any(|m| m == &path) {
-            tracing::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
+            m6_core::log::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
             self.members.push(path);
         }
     }
@@ -52,7 +52,7 @@ impl BackendPool {
 
         for p in found {
             if !self.members.iter().any(|m| m == &p) {
-                tracing::info!(pool = %self.name, socket = %p.display(), "pool: socket found");
+                m6_core::log::info!(pool = %self.name, socket = %p.display(), "pool: socket found");
                 self.members.push(p);
             }
         }

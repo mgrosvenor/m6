@@ -151,8 +151,13 @@ impl Sink {
     }
 
     /// Bytes are waiting on a destination that could not take them.
+    ///
+    /// True only after a write returned `EAGAIN`, not merely because complete
+    /// lines are buffered: a line waiting for the tick is not a reason to ask
+    /// the reactor for a writable edge. A regular file and a terminal never
+    /// return `EAGAIN`, so they are never registered.
     pub fn wants_write(&self) -> bool {
-        self.commit > 0
+        self.blocked
     }
 
     /// Write the complete lines, never waiting on a full destination.

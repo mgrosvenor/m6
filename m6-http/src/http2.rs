@@ -452,7 +452,7 @@ impl Http2Conn {
         match self.fill_recv(&mut io) {
             Ok(m) => moved |= m,
             Err(e) => {
-                tracing::trace!("h2 fill_recv: {e}");
+                m6_core::log::trace!("h2 fill_recv: {e}");
                 self.phase = Phase::Done;
                 return moved;
             }
@@ -463,7 +463,7 @@ impl Http2Conn {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    tracing::warn!("http2 error: {e}");
+                    m6_core::log::warn!("http2 error: {e}");
                     // Only if nothing more specific has already been said.
                     // Handlers that detect a connection error send their own
                     // GOAWAY with the code the RFC names -- ENHANCE_YOUR_CALM
@@ -489,7 +489,7 @@ impl Http2Conn {
         self.flush_pending_streams();
 
         if let Err(e) = self.flush_io(&mut io) {
-            tracing::trace!("h2 flush_io: {e}");
+            m6_core::log::trace!("h2 flush_io: {e}");
             self.phase = Phase::Done;
         }
 
@@ -1420,7 +1420,7 @@ impl Http2Conn {
                 // connection-wide, so skipping a block would desynchronise every
                 // later one on a healthy stream.
                 if flags & FLAG_END_STREAM == 0 {
-                    tracing::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
+                    m6_core::log::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
                     self.push_frame(
                         TYPE_RST_STREAM,
                         0,
@@ -1431,7 +1431,7 @@ impl Http2Conn {
                     return Ok(());
                 }
                 if let Some((name, _)) = block.iter().find(|(k, _)| k.starts_with(':')) {
-                    tracing::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
+                    m6_core::log::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
                     self.push_frame(
                         TYPE_RST_STREAM,
                         0,
@@ -1654,7 +1654,7 @@ impl Http2Conn {
             .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         {
             if declared != body.len() {
-                tracing::debug!(
+                m6_core::log::debug!(
                     stream_id,
                     declared,
                     actual = body.len(),
@@ -1672,7 +1672,7 @@ impl Http2Conn {
         }
 
         if let Err(why) = validate_request_headers(&headers) {
-            tracing::debug!(stream_id, reason = why, "h2: malformed request headers");
+            m6_core::log::debug!(stream_id, reason = why, "h2: malformed request headers");
             self.push_frame(
                 TYPE_RST_STREAM,
                 0,
@@ -1856,7 +1856,7 @@ impl Http2Conn {
                         (0usize, true)
                     } else {
                         if self.conn_send_window <= 0 || s.send_window <= 0 {
-                            tracing::trace!(
+                            m6_core::log::trace!(
                                 "h2 stream {} blocked: conn_window={} stream_window={} remaining={}",
                                 stream_id, self.conn_send_window, s.send_window, remaining
                             );
@@ -2030,7 +2030,7 @@ impl Http2Conn {
     /// a complete response to ask the peer to stop sending a request body with
     /// RST_STREAM(NO_ERROR), so that follows when the page is fully buffered.
     fn refuse_head(&mut self, stream_id: u32, status: u16, method: &str) {
-        tracing::debug!(stream_id, status, "h2: request head over a limit");
+        m6_core::log::debug!(stream_id, status, "h2: request head over a limit");
         let headers = vec![(
             "Content-Type".to_string(),
             "text/html; charset=utf-8".to_string(),
@@ -2079,7 +2079,7 @@ impl Http2Conn {
     /// stream from it.
     fn check_hpack_block(&mut self, block: &[u8]) -> Result<(), &'static str> {
         if let Err(why) = validate_hpack_block(block, HPACK_MAX_TABLE_SIZE) {
-            tracing::debug!(reason = why, "h2: HPACK block rejected");
+            m6_core::log::debug!(reason = why, "h2: HPACK block rejected");
             self.send_goaway(ERR_COMPRESSION);
             self.phase = Phase::GoingAway;
             return Err(why);

@@ -284,25 +284,24 @@ pub fn finish_proxied_response(
     finish_response(enabled, resp_headers, request_headers, ev, window);
 }
 
-/// Emit one structured analytics line. Routed by `m6_core::log`'s
-/// `target: "analytics"` filter to its own file, independent of the main
-/// operational log — see `m6-core/src/log.rs::init_with_analytics`.
+/// Emit one structured analytics line into the analytics Sink, which its own
+/// file receives and the operational log never does. See `m6_core::log`.
 fn log_request(ev: &Event<'_>, session_id: &str, session_new: bool, features: &RequestFeatures) {
-    tracing::info!(
-        target: "analytics",
-        node = ev.node,
-        path = ev.path,
-        status = ev.status,
-        cache_state = ev.cache_state,
-        client_ip = ev.client_ip,
-        session_id = session_id,
-        session_new = session_new,
-        referer_host = features.referer_host.as_deref(),
-        referer_path = features.referer_path.as_deref(),
-        user_agent = features.user_agent.as_deref(),
-        latency_ns = ev.latency_ns,
-        "request"
-    );
+    m6_core::log::with_analytics(|sink| {
+        m6_core::log::Line::begin(sink, m6_core::log::Level::Info, "request")
+            .str("node", ev.node)
+            .str("path", ev.path)
+            .field("status", ev.status)
+            .str("cache_state", ev.cache_state)
+            .str("client_ip", ev.client_ip)
+            .str("session_id", session_id)
+            .bool("session_new", session_new)
+            .opt_str("referer_host", features.referer_host.as_deref())
+            .opt_str("referer_path", features.referer_path.as_deref())
+            .opt_str("user_agent", features.user_agent.as_deref())
+            .field("latency_ns", ev.latency_ns)
+            .end();
+    });
 }
 
 /// Record a poll of `/health` or `/perf`.
@@ -339,16 +338,16 @@ pub fn log_monitor(
         return;
     }
     let features = extract_features(request_headers);
-    tracing::info!(
-        target: "analytics",
-        node = node,
-        path = path,
-        status = status,
-        client_ip = client_ip,
-        user_agent = features.user_agent.as_deref(),
-        latency_ns = latency_ns,
-        "monitor"
-    );
+    m6_core::log::with_analytics(|sink| {
+        m6_core::log::Line::begin(sink, m6_core::log::Level::Info, "monitor")
+            .str("node", node)
+            .str("path", path)
+            .field("status", status)
+            .str("client_ip", client_ip)
+            .opt_str("user_agent", features.user_agent.as_deref())
+            .field("latency_ns", latency_ns)
+            .end();
+    });
     window.push(
         unix_micros_now(),
         Kind::Monitor,
@@ -369,18 +368,18 @@ pub fn log_rate_limited(
     user_agent: Option<&str>,
     window: &mut TrafficWindow,
 ) {
-    tracing::info!(
-        target: "analytics",
-        node = node,
-        path = path,
-        status = 429u16,
-        cache_state = "BYPASS",
-        client_ip = client_ip,
-        bot_flag = true,
-        bot_reason = "rate-exceeded",
-        user_agent = user_agent,
-        "request"
-    );
+    m6_core::log::with_analytics(|sink| {
+        m6_core::log::Line::begin(sink, m6_core::log::Level::Info, "request")
+            .str("node", node)
+            .str("path", path)
+            .u64("status", 429)
+            .str("cache_state", "BYPASS")
+            .str("client_ip", client_ip)
+            .bool("bot_flag", true)
+            .str("bot_reason", "rate-exceeded")
+            .opt_str("user_agent", user_agent)
+            .end();
+    });
     window.push(
         unix_micros_now(),
         Kind::RateLimited,

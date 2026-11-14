@@ -11,10 +11,10 @@
 //!
 //! # The write side has no struct
 //!
-//! `m6-http` emits an analytics row with `tracing::info!(target: "analytics",
-//! node = .., path = .., ..)`, and the JSON is produced by the subscriber's
-//! formatter. So there is no type describing the format, on either side, and
-//! every consumer has re-derived it by looking at a sample. That is how the
+//! `m6-http` emits an analytics row through `m6_core::log`, and the JSON is
+//! produced by the logger's line builder. So there is no type describing the
+//! format, on either side, and every consumer has re-derived it by looking at
+//! a sample. That is how the
 //! field set below came to be read as `ts` and `user_agent` rather than
 //! `timestamp` and `fields.user_agent`, which yields an empty result that
 //! looks exactly like a quiet hour rather than like a bug.
@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 
 /// One line of the analytics stream.
 ///
-/// The envelope is the tracing subscriber's: a timestamp and level outside, the
-/// event's own fields nested under `fields`. Reading `user_agent` at the top
-/// level finds nothing.
+/// The envelope is the logger's: a timestamp and level outside, the event's own
+/// fields nested under `fields`. Reading `user_agent` at the top level finds
+/// nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsRecord {
     pub timestamp: String,

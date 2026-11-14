@@ -244,7 +244,6 @@ domain = "localhost"
 
 [log]
 level  = "{level}"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -856,10 +855,10 @@ fn conflicting_host_headers_are_not_both_honoured() {
 /// This is a regression test for a defect the migration to `sigwait`
 /// introduced and this suite caught. Blocking a signal is per-thread, and
 /// threads inherit the mask only at creation, so blocking SIGTERM in `main`
-/// after `tracing_appender` has already spawned its writer thread leaves that
-/// thread unblocked. The kernel then delivers every process-directed SIGTERM
-/// there, the default disposition kills the process, and the `sigwait` thread
-/// never sees a signal in its life.
+/// after a thread has started leaves that thread unblocked. The kernel then
+/// delivers every process-directed SIGTERM there, the default disposition
+/// kills the process, and the `sigwait` thread never sees a signal in its
+/// life.
 ///
 /// What made it worth a test rather than a comment is how quiet the failure
 /// is. systemd counts death by the signal it sent as a clean stop, so

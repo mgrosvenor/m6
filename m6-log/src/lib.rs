@@ -9,16 +9,17 @@
 //! A service's loop makes five short calls, in plain sight:
 //!
 //! ```text
-//! m6_core::log::tick(m6_platform::wall());          // on the accounting tick
-//! m6_core::log::watch(poll.registry(), LOG)?;     // after one turn's events
+//! m6_core::log::tick(m6_platform::wall());        // on the accounting tick
+//! m6_core::log::watch(poll.registry(), LOG);      // after one turn's events, its error logged
 //! LOG => m6_core::log::flush(),                   // in the match on the token
-//! Some(Signal::ReopenLogs) => m6_core::log::reopen()?,  // SIGUSR1
+//! Some(Signal::ReopenLogs) => m6_core::log::reopen(),  // SIGUSR1, its error logged
 //! m6_core::log::stop()?;                          // after the loop
 //! ```
 //!
 //! [`init`] and [`stop`] run at start and stop. `watch` lives in `m6-core`,
 //! over [`Sink::fd`] and [`Sink::wants_write`], because `m6-log` does not
-//! depend on `mio`.
+//! depend on `mio`. A failed `watch` is logged and the loop serves on: logging
+//! never ends a service.
 //!
 //! The line format, buffering, loss on crash, levels, reopen and dropped-line
 //! counting are described in `docs/m6-log.md`.
@@ -37,6 +38,7 @@ mod sink;
 
 use std::cell::{Cell, RefCell};
 use std::io;
+use std::os::fd::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -139,6 +141,24 @@ pub fn with_analytics(f: impl FnOnce(&mut Sink)) -> bool {
         }
         None => false,
     })
+}
+
+/// The operational Sink's descriptor, for a loop that watches it for
+/// writability while [`stdout_wants_write`] is true.
+///
+/// `None` before [`init`] and on a thread that never called it. The descriptor
+/// is stdout itself, which the Sink made non-blocking.
+pub fn stdout_fd() -> Option<RawFd> {
+    OPERATIONAL.with(|slot| slot.borrow().as_ref().map(Sink::fd))
+}
+
+/// Whether the operational Sink is holding bytes that a full destination would
+/// not take.
+///
+/// The loop registers stdout for `WRITABLE` under its `LOG` token while this is
+/// true, and removes it once a flush drains the Sink.
+pub fn stdout_wants_write() -> bool {
+    OPERATIONAL.with(|slot| slot.borrow().as_ref().is_some_and(Sink::wants_write))
 }
 
 /// Lines the operational Sink has dropped, for the tests.
@@ -265,5 +285,5 @@ pub fn pulse() -> &'static LogPulse {
 
 fn elapsed_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    START.get_or_init(m6_platform::now).elapsed().as_millis() as u64
 }
