@@ -144,6 +144,11 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**The test kit's scratch directory and port claims work on any host, so the suite has no list of known failures.**
+`m6_core::testkit` chose `/var/tmp` for scratch files whether or not the process could write there, and kept port claims per build, so two builds on one host could claim the same port and one test reached the other's server.
+Scratch files now go to the first of `TMPDIR`, `/var/tmp` and the system temp directory that can create, write and run a file, and port claims live in one directory per user that every build shares.
+Verified: the full workspace suite on Linux and macOS with no failure.
+
 **m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
 Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed.
 It is now malformed at ingress and its stream is reset, as RFC 9113 8.1.1 and RFC 9114 4.1.2 require.
@@ -230,6 +235,10 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**Every clock read outside `m6-platform` is refused by its gate, including reads through `chrono`, `time` and `filetime`.**
+Five shipping reads that asked the operating system directly now take the time from `m6_core::platform::now()` or `wall()`, and `chrono` only formats a value it is given.
+Verified: the platform gate on Linux and macOS.
 
 **The minimum supported Rust version is 1.89** (was 1.88), the version the updated SQLite binding requires.
 
