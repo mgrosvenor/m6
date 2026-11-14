@@ -344,7 +344,7 @@ impl TrafficWindow {
             slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
             next: 0,
             filled: 0,
-            started: Instant::now(),
+            started: m6_core::platform::now(),
             drops: [DropCell::EMPTY; DROP_CELLS],
         }
     }
@@ -453,7 +453,7 @@ impl TrafficWindow {
 
 /// Unix microseconds, the precision the analytics envelope records.
 pub(crate) fn unix_micros_now() -> u64 {
-    std::time::SystemTime::now()
+    m6_core::platform::wall()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_micros() as u64)
 }
@@ -516,7 +516,7 @@ pub fn traffic_authorised(
         }
     }
     let report = build_report(node, window);
-    *cache = Some((Instant::now(), report.clone()));
+    *cache = Some((m6_core::platform::now(), report.clone()));
     PerfOutcome::Traffic(Box::new(report))
 }
 
@@ -716,7 +716,7 @@ mod traffic_endpoint_tests {
             next: 0,
             filled: 0,
             // An hour since start, so the span is the ring's, not elapsed time.
-            started: Instant::now() - Duration::from_secs(3600),
+            started: m6_core::platform::now() - Duration::from_secs(3600),
             drops: [DropCell::EMPTY; DROP_CELLS],
         };
         // Fill the ring over 50 minutes and 30 seconds, leaving a margin over
@@ -759,7 +759,7 @@ mod traffic_endpoint_tests {
             slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
             next: 0,
             filled: 0,
-            started: Instant::now() - Duration::from_secs(7200),
+            started: m6_core::platform::now() - Duration::from_secs(7200),
             drops: [DropCell::EMPTY; DROP_CELLS],
         };
         // 70 minutes of events, so the ten overwritten below are older than

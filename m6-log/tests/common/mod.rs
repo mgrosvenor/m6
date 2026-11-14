@@ -6,8 +6,7 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::unistd::{dup, dup2_stdout, pipe};
+use m6_platform::fd::{dup, dup2_stdout, is_nonblocking, pipe};
 
 /// A saved standard output, put back when this is dropped.
 pub struct Stdout {
@@ -37,13 +36,12 @@ impl Stdout {
 
     /// Whether stdout carries `O_NONBLOCK` now.
     pub fn nonblocking() -> bool {
-        let flags = fcntl(std::io::stdout(), FcntlArg::F_GETFL).expect("the flags");
-        OFlag::from_bits_truncate(flags).contains(OFlag::O_NONBLOCK)
+        is_nonblocking(&std::io::stdout()).expect("the flags")
     }
 
     fn save() -> Stdout {
         Stdout {
-            saved: dup(std::io::stdout()).expect("a copy of stdout"),
+            saved: dup(&std::io::stdout()).expect("a copy of stdout"),
         }
     }
 }

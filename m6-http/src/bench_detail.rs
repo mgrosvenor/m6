@@ -22,7 +22,7 @@
 /// Warmup samples are excluded from all reported statistics.
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -345,10 +345,10 @@ fn h1_timed_get(
     tls_cfg: Arc<ClientConfig>,
 ) -> anyhow::Result<(Vec<u8>, f64, f64, f64, f64, f64)> {
     // connect
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     let stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
-    let t_connected = Instant::now();
+    let t_connected = m6_core::platform::now();
 
     // TLS handshake — drive explicitly without writing request yet
     let server_name: ServerName<'static> = "localhost".try_into().unwrap();
@@ -374,20 +374,16 @@ fn h1_timed_get(
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Blocking poll: wait for socket readable
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, 5000);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        stream.as_fd(),
+                        Duration::from_millis(5000),
+                    );
                 }
                 Err(e) => return Err(e.into()),
             }
         }
     }
-    let t_tls = Instant::now();
+    let t_tls = m6_core::platform::now();
 
     // Write request
     let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -396,7 +392,7 @@ fn h1_timed_get(
         let mut tls_stream = rustls::Stream::new(&mut conn, &mut stream_ref);
         tls_stream.write_all(req.as_bytes())?;
     }
-    let t_request_sent = Instant::now();
+    let t_request_sent = m6_core::platform::now();
 
     // Read first byte
     let mut first_byte = [0u8; 1];
@@ -418,7 +414,7 @@ fn h1_timed_get(
             }
         }
     }
-    let t_first_byte = Instant::now();
+    let t_first_byte = m6_core::platform::now();
 
     // Read rest of response
     {
@@ -430,7 +426,7 @@ fn h1_timed_get(
             Err(e) => return Err(e.into()),
         }
     }
-    let t_done = Instant::now();
+    let t_done = m6_core::platform::now();
 
     let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
     Ok((
@@ -455,7 +451,7 @@ fn bench_h1_phases(
     }
     let mut s = PhaseSamples::new(n);
     for _ in 0..n {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let (_, connect, tls, req_send, ttfb, transfer) =
             h1_timed_get(addr, path, Arc::clone(&tls_cfg))?;
         let total = t0.elapsed().as_secs_f64() * 1_000_000.0;
@@ -557,11 +553,11 @@ struct H2TimedClient {
 impl H2TimedClient {
     fn connect(addr: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Self> {
         // TCP connect
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
         stream.set_nonblocking(true)?;
-        let t_connected = Instant::now();
+        let t_connected = m6_core::platform::now();
 
         let server_name: ServerName<'static> = "localhost".try_into().unwrap();
         let conn = rustls::ClientConnection::new(tls_cfg, server_name)?;
@@ -585,7 +581,7 @@ impl H2TimedClient {
             .write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
 
         // Drive TLS handshake
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
         loop {
             c.flush_write()?;
             if !c.conn.is_handshaking() {
@@ -593,7 +589,7 @@ impl H2TimedClient {
             }
             c.fill_recv_deadline(deadline)?;
         }
-        let t_tls = Instant::now();
+        let t_tls = m6_core::platform::now();
 
         // Drain server data (SETTINGS, tickets, etc.) and send SETTINGS ACK + WINDOW_UPDATE.
         // Expand the connection-level flow-control window to 16 MiB so large responses
@@ -607,7 +603,7 @@ impl H2TimedClient {
             .writer()
             .write_all(&make_h2_frame(0x8, 0x0, 0, &window_increment.to_be_bytes()))?;
         c.flush_write()?;
-        let t_proto = Instant::now();
+        let t_proto = m6_core::platform::now();
 
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
         c.connect_us = us(t0, t_connected);
@@ -651,20 +647,16 @@ impl H2TimedClient {
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(m6_core::platform::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
                     }
                     self.flush_write()?;
                     let ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -713,17 +705,17 @@ impl H2TimedClient {
         let headers = make_h2_get_headers(path);
         let frame = make_h2_frame(0x1, 0x05, sid, &headers);
 
-        let t_req_start = Instant::now();
+        let t_req_start = m6_core::platform::now();
         self.conn.writer().write_all(&frame)?;
         self.flush_write()?;
-        let t_req_sent = Instant::now();
+        let t_req_sent = m6_core::platform::now();
 
         let mut body = Vec::new();
         let mut first_byte_time: Option<Instant> = None;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2 response timeout");
             }
 
@@ -733,7 +725,7 @@ impl H2TimedClient {
 
                 // Record time of first frame on our stream
                 if fsid == sid && first_byte_time.is_none() {
-                    first_byte_time = Some(Instant::now());
+                    first_byte_time = Some(m6_core::platform::now());
                 }
 
                 match ftype {
@@ -752,7 +744,7 @@ impl H2TimedClient {
                         body.extend_from_slice(&payload);
                         if flags & 0x1 != 0 {
                             // END_STREAM
-                            let t_done = Instant::now();
+                            let t_done = m6_core::platform::now();
                             let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                             let t_fb = first_byte_time.unwrap_or(t_done);
                             return Ok((
@@ -768,7 +760,7 @@ impl H2TimedClient {
                         && flags & 0x1 != 0 =>
                     {
                         // END_STREAM (no body)
-                        let t_done = Instant::now();
+                        let t_done = m6_core::platform::now();
                         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                         let t_fb = first_byte_time.unwrap_or(t_done);
                         return Ok((
@@ -856,10 +848,10 @@ struct H2cTimedClient {
 
 impl H2cTimedClient {
     fn connect(addr: &str) -> anyhow::Result<Self> {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        let t_connected = Instant::now();
+        let t_connected = m6_core::platform::now();
 
         // Send client preface + SETTINGS (blocking).
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -869,10 +861,10 @@ impl H2cTimedClient {
         // Read until server SETTINGS (non-ACK).
         let mut recv_buf: Vec<u8> = Vec::with_capacity(16_384);
         let mut tmp = [0u8; 8192];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
         let mut got_settings = false;
         while !got_settings {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2C setup timeout");
             }
             let n = (&stream).read(&mut tmp)?;
@@ -889,7 +881,7 @@ impl H2cTimedClient {
         }
         // Send SETTINGS ACK.
         (&stream).write_all(&make_h2_frame(0x4, 0x1, 0, &[]))?;
-        let t_proto = Instant::now();
+        let t_proto = m6_core::platform::now();
 
         stream.set_nonblocking(true)?;
         stream.set_read_timeout(None)?;
@@ -933,20 +925,16 @@ impl H2cTimedClient {
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(m6_core::platform::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
                     }
                     self.flush_write()?;
                     let ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -963,17 +951,17 @@ impl H2cTimedClient {
         let headers = make_h2c_get_headers(path);
         let frame = make_h2_frame(0x1, 0x05, sid, &headers);
 
-        let t_req_start = Instant::now();
+        let t_req_start = m6_core::platform::now();
         self.send_buf.extend_from_slice(&frame);
         self.flush_write()?;
-        let t_req_sent = Instant::now();
+        let t_req_sent = m6_core::platform::now();
 
         let mut body = Vec::new();
         let mut first_byte_time: Option<Instant> = None;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2C response timeout");
             }
 
@@ -982,7 +970,7 @@ impl H2cTimedClient {
                 self.recv_buf.drain(..total);
 
                 if fsid == sid && first_byte_time.is_none() {
-                    first_byte_time = Some(Instant::now());
+                    first_byte_time = Some(m6_core::platform::now());
                 }
 
                 match ftype {
@@ -1005,7 +993,7 @@ impl H2cTimedClient {
                         }
                         body.extend_from_slice(&payload);
                         if flags & 0x1 != 0 {
-                            let t_done = Instant::now();
+                            let t_done = m6_core::platform::now();
                             let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                             let t_fb = first_byte_time.unwrap_or(t_done);
                             return Ok((
@@ -1017,7 +1005,7 @@ impl H2cTimedClient {
                         }
                     }
                     0x1 if fsid == sid && flags & 0x1 != 0 => {
-                        let t_done = Instant::now();
+                        let t_done = m6_core::platform::now();
                         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                         let t_fb = first_byte_time.unwrap_or(t_done);
                         return Ok((
@@ -1113,14 +1101,14 @@ fn bench_h2c_fullpage(
             client = H2cTimedClient::connect(addr)?;
         }
 
-        let t_start = Instant::now();
+        let t_start = m6_core::platform::now();
         client.get_timed(html_path)?;
-        let t_html = Instant::now();
+        let t_html = m6_core::platform::now();
 
         for asset in &assets {
             client.get_timed(asset)?;
         }
-        let t_done = Instant::now();
+        let t_done = m6_core::platform::now();
 
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
         s.connect.push(0.0); // persistent — no per-sample connection cost
@@ -1173,14 +1161,14 @@ fn h3_connect_timed(
     let peer: std::net::SocketAddr = addr.parse()?;
     let local = udp.local_addr()?;
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     let mut conn = quiche::connect(Some("localhost"), &scid, local, peer, cfg)?;
     quic_flush(&mut conn, &udp);
 
     let mut buf = [0u8; 65535];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = m6_core::platform::now() + Duration::from_secs(5);
     loop {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             anyhow::bail!("QUIC handshake timeout");
         }
         conn.on_timeout();
@@ -1210,11 +1198,11 @@ fn h3_connect_timed(
             anyhow::bail!("QUIC closed during handshake");
         }
     }
-    let t_quic = Instant::now();
+    let t_quic = m6_core::platform::now();
 
     let h3_cfg = quiche::h3::Config::new()?;
     let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_cfg)?;
-    let t_h3 = Instant::now();
+    let t_h3 = m6_core::platform::now();
 
     let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
     Ok((conn, h3, udp, us(t0, t_quic), us(t_quic, t_h3)))
@@ -1234,18 +1222,18 @@ fn h3_timed_get(
         quiche::h3::Header::new(b":authority", b"localhost"),
     ];
 
-    let t_req_start = Instant::now();
+    let t_req_start = m6_core::platform::now();
     let stream_id = h3.send_request(conn, &req, true)?;
     quic_flush(conn, udp);
-    let t_req_sent = Instant::now();
+    let t_req_sent = m6_core::platform::now();
 
     let mut body = Vec::new();
     let mut buf = [0u8; 65535];
     let mut first_event_time: Option<Instant> = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
     loop {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             anyhow::bail!("H3 timeout");
         }
         conn.on_timeout();
@@ -1276,12 +1264,12 @@ fn h3_timed_get(
             match h3.poll(conn) {
                 Ok((sid, quiche::h3::Event::Headers { .. })) if sid == stream_id => {
                     if first_event_time.is_none() {
-                        first_event_time = Some(Instant::now());
+                        first_event_time = Some(m6_core::platform::now());
                     }
                 }
                 Ok((sid, quiche::h3::Event::Data)) => {
                     if first_event_time.is_none() {
-                        first_event_time = Some(Instant::now());
+                        first_event_time = Some(m6_core::platform::now());
                     }
                     while let Ok(read) = h3.recv_body(conn, sid, &mut buf) {
                         if sid == stream_id {
@@ -1290,7 +1278,7 @@ fn h3_timed_get(
                     }
                 }
                 Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
-                    let t_done = Instant::now();
+                    let t_done = m6_core::platform::now();
                     let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
                     let t_fb = first_event_time.unwrap_or(t_done);
                     return Ok((
@@ -1462,15 +1450,15 @@ fn bench_h1_fullpage(
     let mut s = FullPageSamples::new(n);
 
     for _ in 0..n {
-        let t_start = Instant::now();
+        let t_start = m6_core::platform::now();
         let (_, connect, tls, _, _, _) = h1_timed_get(addr, html_path, Arc::clone(&tls_cfg))?;
-        let t_html = Instant::now();
+        let t_html = m6_core::platform::now();
 
         // Fetch each asset sequentially (H1 = one req per connection)
         for asset in &assets {
             h1_timed_get(addr, asset, Arc::clone(&tls_cfg))?;
         }
-        let t_done = Instant::now();
+        let t_done = m6_core::platform::now();
 
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
         s.connect.push(connect);
@@ -1520,14 +1508,14 @@ fn bench_h2_fullpage(
             client = H2TimedClient::connect(addr, Arc::clone(&tls_cfg))?;
         }
 
-        let t_start = Instant::now();
+        let t_start = m6_core::platform::now();
         client.get_timed(html_path)?;
-        let t_html = Instant::now();
+        let t_html = m6_core::platform::now();
 
         for asset in &assets {
             client.get_timed(asset)?;
         }
-        let t_done = Instant::now();
+        let t_done = m6_core::platform::now();
 
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
         s.connect.push(0.0); // persistent — no per-sample connection cost
@@ -1593,16 +1581,16 @@ fn bench_h3_fullpage(
             reqs = 0;
         }
 
-        let t_start = Instant::now();
+        let t_start = m6_core::platform::now();
         h3_timed_get(&mut conn, &mut h3, &udp, html_path.as_bytes())?;
         reqs += 1;
-        let t_html = Instant::now();
+        let t_html = m6_core::platform::now();
 
         for asset in &assets_owned {
             h3_timed_get(&mut conn, &mut h3, &udp, asset.as_bytes())?;
             reqs += 1;
         }
-        let t_done = Instant::now();
+        let t_done = m6_core::platform::now();
 
         let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1_000_000.0;
         s.connect.push(0.0); // persistent — no per-sample connection cost

@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use m6_core::event::{LoopTrace, Slots, Timeouts};
-use m6_core::mio::Token;
+use m6_core::platform::Token;
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]

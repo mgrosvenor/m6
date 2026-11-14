@@ -14,7 +14,7 @@ use rustls::ClientConnection;
 use crate::forward::{HttpRequest, PendingUrlContext, Waiter};
 use crate::h2_client::{H2Client, H2Completion, Pool, Transport};
 use m6_core::client::TlsClient;
-use m6_core::mio::{Registry, Token};
+use m6_core::platform::{Registry, Token};
 
 /// The TLS transport for `h2s://` backends.
 pub struct H2sTransport {

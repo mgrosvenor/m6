@@ -29,7 +29,7 @@ impl PoolMember {
     fn is_available(&self) -> bool {
         match self.retry_at {
             None => true,
-            Some(t) => Instant::now() >= t,
+            Some(t) => m6_core::platform::now() >= t,
         }
     }
 
@@ -48,7 +48,7 @@ impl PoolMember {
 
     fn mark_failed(&mut self) {
         self.failure_count += 1;
-        self.retry_at = Some(Instant::now() + self.backoff_duration());
+        self.retry_at = Some(m6_core::platform::now() + self.backoff_duration());
     }
 
     fn mark_success(&mut self) {
@@ -636,7 +636,7 @@ mod tests {
         pool.add_socket(PathBuf::from("/tmp/app-b.sock"));
 
         pool.mark_failed(0);
-        pool.members[0].retry_at = Some(Instant::now() - Duration::from_secs(1));
+        pool.members[0].retry_at = Some(m6_core::platform::now() - Duration::from_secs(1));
 
         assert_eq!(
             pool.pick_member(),

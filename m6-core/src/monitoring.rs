@@ -451,7 +451,7 @@ pub struct PerfReport {
     /// the latency figures: a p99 that moved is a different conversation
     /// depending on whether load also moved. Every field is optional, and a
     /// field a platform cannot answer is absent rather than zero.
-    pub host: crate::host::HostSnapshot,
+    pub host: crate::platform::host::HostSnapshot,
 }
 
 /// Outcome of a `/perf` request.
@@ -562,7 +562,7 @@ impl PerfReport {
             tls_unreadable: crate::tls::unreadable(),
             logging: Some(LoggingHealth::read()),
             metrics: snapshot(),
-            host: crate::host::snapshot(host_path),
+            host: crate::platform::host::snapshot(host_path),
         }))
     }
 }

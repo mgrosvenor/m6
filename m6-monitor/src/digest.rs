@@ -1194,8 +1194,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
+    use m6_core::platform::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::telemetry::StatsSnapshot;
 
     pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {

@@ -10,7 +10,6 @@ pub mod event;
 pub mod firewall;
 pub mod h1;
 pub mod headers;
-pub mod host;
 pub mod http;
 pub mod log;
 pub mod mime;
@@ -24,6 +23,9 @@ pub mod negotiate;
 pub mod net;
 pub mod parse;
 pub mod path;
+/// The platform layer, the one crate that knows the operating system. See
+/// `docs/m6-platform.md`.
+pub use m6_platform as platform;
 pub mod random;
 pub mod render;
 pub mod request;
@@ -57,11 +59,6 @@ pub mod template;
 #[cfg(feature = "templates")]
 pub use template::{TeraFactory, TeraRenderer};
 
-/// The reactor: `Poll`, `Events`, `Token`, `Interest` and the non-blocking
-/// sockets. Re-exported so a service names `m6_core::mio::...` and links only
-/// m6-core.
-pub use mio;
-
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
 pub use conditional::{
     evaluate_preconditions, is_not_modified, not_modified_headers, Precondition,
@@ -80,7 +77,6 @@ pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use request::Request;
 pub use response::{Body, Response};
 pub use server::socket_path_from_config;
-pub use signal::ShutdownHandle;
 pub use site::{CodeRoute, Handled, Site};
 
 /// Everything a service normally wants, in one line.
@@ -129,11 +125,11 @@ pub use site::{CodeRoute, Handled, Site};
 pub mod prelude {
     pub use crate::dict::Dict;
     pub use crate::error::{Error, Result};
-    pub use crate::event::{LoopTrace, Signal, Signals, Slots, Timeouts};
+    pub use crate::event::{LoopTrace, Slots, Timeouts};
     pub use crate::h1::{head_slots, Flush, Read, ServerConn};
-    pub use crate::mio;
-    pub use crate::mio::{Events, Interest, Poll, Token};
     pub use crate::net::listen_unix;
+    pub use crate::platform::{Events, Interest, Poll, Token};
+    pub use crate::platform::{Signal, Signals};
     pub use crate::render::NoTemplates;
     pub use crate::request::Request;
     pub use crate::response::Response;

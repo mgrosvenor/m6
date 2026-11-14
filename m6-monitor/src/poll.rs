@@ -31,10 +31,9 @@ use std::time::{Duration, Instant};
 use m6_core::client::{reply_slots, Addr, Reply, Upstream};
 use m6_core::dns::{Confirm, Ptr};
 use m6_core::event::Timeouts;
-use m6_core::mio::net::TcpStream as MioTcpStream;
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::monitoring::{HealthReport, PerfReport, TrafficReport};
+use m6_core::platform::net::TcpStream as MioTcpStream;
+use m6_core::platform::{Events, Interest, Poll, Token};
 
 use crate::check::{VerdictCache, Verdicts};
 use crate::fleet::{HeaderCheck, ResolvedNode};
@@ -334,7 +333,7 @@ impl Poller {
             active: false,
             starting: false,
             outstanding: 0,
-            step_started: vec![Instant::now(); n],
+            step_started: vec![m6_core::platform::now(); n],
             probes: (0..n).map(|_| tunnel::Tally::new()).collect(),
             probe_cursor: 0,
             probing: None,
@@ -539,11 +538,8 @@ impl Poller {
                     // so re-arm it, as the other services do after a turn.
                     let interest = up.interest();
                     let fd = up.fd();
-                    poll.registry().reregister(
-                        &mut SourceFd(&fd),
-                        Token(CLIENT_BASE + slot),
-                        interest,
-                    )?;
+                    poll.registry()
+                        .reregister_fd(fd, Token(CLIENT_BASE + slot), interest)?;
                     return Ok(Progress::Working);
                 }
                 Ok(true) => {
@@ -679,7 +675,7 @@ impl Poller {
                         n.base_path,
                         hc.path,
                         sep,
-                        std::time::SystemTime::now()
+                        m6_core::platform::wall()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_nanos())
                             .unwrap_or(0)
@@ -745,9 +741,8 @@ impl Poller {
         up.start(&addr, tls.as_ref(), false, now + self.timeout)?;
         let fd = up.fd();
         let interest = up.interest();
-        let mut source = SourceFd(&fd);
         poll.registry()
-            .register(&mut source, Token(CLIENT_BASE + node), interest)?;
+            .register_fd(fd, Token(CLIENT_BASE + node), interest)?;
         if let Out::Node { fd: slot_fd, .. } = &mut out[node] {
             *slot_fd = Some(fd);
         }
@@ -764,8 +759,7 @@ impl Poller {
             Out::Free => None,
         };
         if let Some(fd) = fd {
-            let mut source = SourceFd(&fd);
-            let _ = poll.registry().deregister(&mut source);
+            let _ = poll.registry().deregister_fd(fd);
         }
         match &mut out[slot] {
             Out::Node { .. } => {}
@@ -908,10 +902,9 @@ impl Poller {
             }
         };
         let fd = sock.as_raw_fd();
-        let mut source = SourceFd(&fd);
         if let Err(e) =
             poll.registry()
-                .register(&mut source, Token(CLIENT_BASE + slot), Interest::WRITABLE)
+                .register_fd(fd, Token(CLIENT_BASE + slot), Interest::WRITABLE)
         {
             self.running.probes[node].failed(&e);
             return Ok(false);
@@ -952,8 +945,7 @@ impl Poller {
                 sock, fd, started, ..
             } => {
                 if let Some(fd) = fd.take() {
-                    let mut source = SourceFd(&fd);
-                    let _ = poll.registry().deregister(&mut source);
+                    let _ = poll.registry().deregister_fd(fd);
                 }
                 let started = *started;
                 sock.take().map(|s| (s, started))
@@ -1039,9 +1031,8 @@ impl Poller {
                 Ok(confirm) => {
                     let slot = self.dns_slot(i);
                     let fd = confirm.fd();
-                    let mut source = SourceFd(&fd);
-                    poll.registry().register(
-                        &mut source,
+                    poll.registry().register_fd(
+                        fd,
                         Token(CLIENT_BASE + slot),
                         Interest::READABLE,
                     )?;
@@ -1083,8 +1074,8 @@ impl Poller {
                 // epoll a re-register is EPOLL_CTL_MOD and fails for a
                 // descriptor the set does not hold.
                 if before != after {
-                    poll.registry().register(
-                        &mut SourceFd(&after),
+                    poll.registry().register_fd(
+                        after,
                         Token(CLIENT_BASE + slot),
                         Interest::READABLE,
                     )?;
@@ -1178,7 +1169,7 @@ impl Poller {
             Err(tunnel::Handshake::FileStale { age_s, .. }) => Some(*age_s),
             Err(_) => None,
         };
-        let now_unix = std::time::SystemTime::now()
+        let now_unix = m6_core::platform::wall()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
@@ -1265,12 +1256,12 @@ pub fn drive_to_end(
     const TICK: Duration = Duration::from_secs(1);
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(64);
-    let mut progress = poller.start(&poll, out, Instant::now())?;
+    let mut progress = poller.start(&poll, out, m6_core::platform::now())?;
     loop {
         if let Progress::Done(polled) = progress {
             return Ok(polled);
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         if deadline.is_some_and(|d| now >= d) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1287,7 +1278,7 @@ pub fn drive_to_end(
             let Some(slot) = ev.token().0.checked_sub(CLIENT_BASE) else {
                 continue;
             };
-            progress = poller.drive(&poll, out, slot, Instant::now())?;
+            progress = poller.drive(&poll, out, slot, m6_core::platform::now())?;
             if matches!(progress, Progress::Done(_)) {
                 finished = true;
                 break;
@@ -1296,7 +1287,7 @@ pub fn drive_to_end(
         if finished {
             continue;
         }
-        while let Some(next) = poller.expire(&poll, out, Instant::now())? {
+        while let Some(next) = poller.expire(&poll, out, m6_core::platform::now())? {
             progress = next;
             if matches!(progress, Progress::Done(_)) {
                 break;
@@ -1439,7 +1430,7 @@ mod tests {
         let polled = drive_to_end(
             &mut poller,
             &mut out,
-            Some(Instant::now() + Duration::from_secs(20)),
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
         drop(token_file);
@@ -1570,7 +1561,7 @@ mod tests {
         };
         let mut fleet = fleet_of(n);
         fleet.timeout_ms = 100;
-        let started = Instant::now();
+        let started = m6_core::platform::now();
         let polled = run(&fleet, None);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1759,7 +1750,7 @@ mod tests {
         let polled = drive_to_end(
             &mut poller,
             &mut out,
-            Some(Instant::now() + Duration::from_secs(20)),
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
         seen.join().unwrap();
@@ -1771,7 +1762,7 @@ mod tests {
         // The perf step's deadline is still armed in the old code. It fires
         // now, on a finished node, and must find nothing.
         let poll = Poll::new().unwrap();
-        let later = Instant::now() + Duration::from_secs(1);
+        let later = m6_core::platform::now() + Duration::from_secs(1);
         let mut expired = 0;
         while poller.expire(&poll, &mut out, later).unwrap().is_some() {
             expired += 1;
@@ -1818,7 +1809,7 @@ mod tests {
         let polled = drive_to_end(
             &mut poller,
             &mut out,
-            Some(Instant::now() + Duration::from_secs(20)),
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
         seen.join().unwrap();

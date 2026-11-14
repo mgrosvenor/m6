@@ -221,6 +221,153 @@ jobs:
             fi
           done
 
+  # The same build and tests on the other two supported targets. Supported
+  # means built and tested here: macOS arm64 and Linux arm64, on GitHub's
+  # free runners for a public repository. The steps are the ones above, in
+  # the same form, so a warning or a failure is reported the same way. Each
+  # job first prints the machine it ran on, so a run's record says which
+  # target it proved. Conformance, the dependency check, the shell check, the
+  # perf tools and the examples stay on Linux x86_64: h2spec and h3spec are
+  # released as x86_64 Linux binaries, cargo-deny checks all three targets'
+  # graphs in one run, and the rest is platform-independent.
+  build-and-test-macos:
+    name: macOS arm64 build and tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Which machine
+        run: uname -m && rustc --print target-libdir
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Release build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' build.log || true)
+          echo "release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
+      - name: Test build, zero warnings
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' testbuild.log || true)
+          echo "test-build warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
+      - name: Test suite
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -80
+            echo "::error::tests failed"
+            exit 1
+          fi
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+      - name: Opt-in core features, zero warnings and tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
+          n=$(grep -c '^warning' featbuild.log || true)
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
+          status=0
+          { cargo test -p m6-core --lib --all-features && cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || status=$?
+          grep -E '^test result:' feat.log || true
+          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
+          [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
+      - name: Core with no features
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo check -p m6-core --no-default-features > nofeat.log 2>&1 || { cat nofeat.log; echo "::error::m6-core does not build with no features"; exit 1; }
+          n=$(grep -c '^warning' nofeat.log || true)
+          [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
+      - name: Clippy, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: ./tools/clippy.sh
+
+  build-and-test-linux-arm64:
+    name: Linux arm64 build and tests
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Which machine
+        run: uname -m && rustc --print target-libdir
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Release build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' build.log || true)
+          echo "release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
+      - name: Test build, zero warnings
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' testbuild.log || true)
+          echo "test-build warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
+      - name: Test suite
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -80
+            echo "::error::tests failed"
+            exit 1
+          fi
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+      - name: Opt-in core features, zero warnings and tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
+          n=$(grep -c '^warning' featbuild.log || true)
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
+          status=0
+          { cargo test -p m6-core --lib --all-features && cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || status=$?
+          grep -E '^test result:' feat.log || true
+          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
+          [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
+      - name: Core with no features
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo check -p m6-core --no-default-features > nofeat.log 2>&1 || { cat nofeat.log; echo "::error::m6-core does not build with no features"; exit 1; }
+          n=$(grep -c '^warning' nofeat.log || true)
+          [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
+      - name: Clippy, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: ./tools/clippy.sh
+
   conformance:
     name: h1, h2, h3 conformance
     runs-on: ubuntu-latest
@@ -382,15 +529,30 @@ jobs:
           n=$(grep -c '^warning' clippy.log || true)
           [ "$n" -eq 0 ] || { echo "::error::$n clippy finding(s) in the examples"; exit 1; }
 
+      # The examples are the platform layer's users too: no example names an
+      # OS in a cfg or links mio, nix, rustix or libc. The same rule the gate
+      # test holds for m6, as a grep here because this job checks out both.
+      - name: Examples name no platform
+        if: ${{ !cancelled() }}
+        working-directory: m6-examples
+        run: |
+          if grep -rnE --include='*.rs' 'target_os|cfg\(unix|cfg\(windows|\b(mio|nix|rustix|libc)::|^\s*use (mio|nix|rustix|libc)\b' examples; then
+            echo "::error::an example names the operating system or an OS crate: that belongs in m6-platform"; exit 1
+          fi
+          if grep -nE '^\s*(mio|nix|rustix|libc)\s*=' examples/*/*/Cargo.toml examples/*/Cargo.toml 2>/dev/null; then
+            echo "::error::an example declares an OS crate"; exit 1
+          fi
+          echo "no example names the operating system"
+
       - name: Examples unit tests
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: m6-examples
         run: |
-          # Example 05's end-to-end test needs the certificate and auth
-          # database that dev.sh creates, and fails without them, so it runs
-          # in the example 05 step below once the stack is up (#277).
+          # Example 05's end-to-end test makes its own certificate, keys and
+          # auth database in a temporary directory, so it runs here with the
+          # rest (it needed dev.sh's state until OS-1).
           status=0
-          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || status=$?
+          cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -60

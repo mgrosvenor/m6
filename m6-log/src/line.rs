@@ -160,7 +160,7 @@ pub struct Line<'a> {
 impl<'a> Line<'a> {
     /// Open a line with its timestamp, level and message.
     pub fn begin(sink: &'a mut Sink, level: Level, message: &str) -> Line<'a> {
-        Line::open(sink, level, SystemTime::now()).message_str(message)
+        Line::open(sink, level, m6_platform::wall()).message_str(message)
     }
 
     /// Open a line with its timestamp and level, for a caller that writes the
@@ -168,7 +168,7 @@ impl<'a> Line<'a> {
     /// before the message. JSON does not care about key order.
     #[doc(hidden)]
     pub fn empty(sink: &'a mut Sink, level: Level) -> Line<'a> {
-        Line::open(sink, level, SystemTime::now())
+        Line::open(sink, level, m6_platform::wall())
     }
 
     fn open(sink: &'a mut Sink, level: Level, now: SystemTime) -> Line<'a> {

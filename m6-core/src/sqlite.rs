@@ -109,7 +109,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use rusqlite;
 pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -216,14 +216,14 @@ impl OpenOptions {
         // the switch until one of them has made it or the busy timeout has
         // passed. Only the switch to WAL retries: a request for another mode
         // fails when the file is in use, as the doc comment above says.
-        let deadline = Instant::now() + self.busy_timeout;
+        let deadline = crate::platform::now() + self.busy_timeout;
         let got: String = loop {
             match conn.pragma_update_and_check(None, "journal_mode", wanted, |r| r.get(0)) {
                 Ok(got) => break got,
                 Err(rusqlite::Error::SqliteFailure(e, _))
                     if self.journal == Journal::Wal
                         && e.code == rusqlite::ErrorCode::DatabaseBusy
-                        && Instant::now() < deadline =>
+                        && crate::platform::now() < deadline =>
                 {
                     #[expect(
                         clippy::disallowed_methods,
@@ -1038,7 +1038,7 @@ mod tests {
             let r = migrate(&mut c, &[M1, M2]);
             (r, c)
         });
-        let start = std::time::Instant::now();
+        let start = crate::platform::now();
         while !WAITING.load(Ordering::SeqCst) {
             assert!(
                 start.elapsed() < Duration::from_secs(10),

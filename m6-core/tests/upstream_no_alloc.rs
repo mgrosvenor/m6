@@ -146,10 +146,10 @@ fn tls_requests_report_their_allocations() {
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut up = Upstream::new(64 * 1024, 16 * 1024);
-    let mut poll = m6_core::mio::Poll::new().expect("poll");
-    let mut events = m6_core::mio::Events::with_capacity(8);
-    let token = m6_core::mio::Token(0);
-    let mut registered: Option<m6_core::mio::Interest> = None;
+    let mut poll = m6_core::platform::Poll::new().expect("poll");
+    let mut events = m6_core::platform::Events::with_capacity(8);
+    let token = m6_core::platform::Token(0);
+    let mut registered: Option<m6_core::platform::Interest> = None;
 
     // One warm-up request, so the connect and handshake are out of count.
     tls_request(
@@ -185,15 +185,14 @@ fn tls_requests_report_their_allocations() {
 #[allow(clippy::too_many_arguments)]
 fn tls_request(
     up: &mut Upstream,
-    poll: &mut m6_core::mio::Poll,
-    events: &mut m6_core::mio::Events,
-    token: m6_core::mio::Token,
-    registered: &mut Option<m6_core::mio::Interest>,
+    poll: &mut m6_core::platform::Poll,
+    events: &mut m6_core::platform::Events,
+    token: m6_core::platform::Token,
+    registered: &mut Option<m6_core::platform::Interest>,
     tls: &m6_core::client::TlsClient,
     addr: std::net::SocketAddr,
     deadline: Instant,
 ) {
-    use m6_core::mio::unix::SourceFd;
     up.request_buf()
         .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     up.start(&Addr::Tcp(addr), Some(tls), false, deadline)
@@ -202,11 +201,11 @@ fn tls_request(
     if *registered != Some(interest) {
         if registered.is_some() {
             poll.registry()
-                .reregister(&mut SourceFd(&up.fd()), token, interest)
+                .reregister_fd(up.fd(), token, interest)
                 .expect("reregister");
         } else {
             poll.registry()
-                .register(&mut SourceFd(&up.fd()), token, interest)
+                .register_fd(up.fd(), token, interest)
                 .expect("register");
         }
         *registered = Some(interest);
@@ -228,7 +227,7 @@ fn tls_request(
             let next = up.interest();
             if next != interest {
                 poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, next)
+                    .reregister_fd(up.fd(), token, next)
                     .expect("reregister");
                 interest = next;
                 *registered = Some(next);

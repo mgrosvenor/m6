@@ -21,7 +21,6 @@ tracing      = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 sha2         = { version = "0.10", features = [] }
 hex          = "0.4"
-nix          = { version = "0.27", features = ["signal"] }
 
 [dev-dependencies]
 m6-core         = { path = "../m6-core", default-features = false, features = ["testkit"] }

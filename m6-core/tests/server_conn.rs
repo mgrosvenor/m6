@@ -20,8 +20,8 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
 use m6_core::h1::{self, Flush, Read, ServerConn};
-use m6_core::mio;
-use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
@@ -103,10 +103,10 @@ fn harness() -> Harness {
     client
         .set_write_timeout(Some(DEADLINE))
         .expect("a write deadline");
-    harness_with((client, mio::net::UnixStream::from_std(server)))
+    harness_with((client, platform::net::UnixStream::from_std(server)))
 }
 
-fn harness_with(pair: (StdUnixStream, mio::net::UnixStream)) -> Harness {
+fn harness_with(pair: (StdUnixStream, platform::net::UnixStream)) -> Harness {
     let (client, server) = pair;
     let poll = Poll::new().expect("a poll");
     let mut conn = ServerConn::new(READ_CAP, WRITE_CAP);
@@ -176,7 +176,7 @@ impl Harness {
     }
 
     /// Swap in the next connection's ends: deregister the old, attach the new.
-    fn next_connection(&mut self, client: StdUnixStream, server: mio::net::UnixStream) {
+    fn next_connection(&mut self, client: StdUnixStream, server: platform::net::UnixStream) {
         if let Some(mut old) = self.conn.detach() {
             self.poll
                 .registry()
@@ -267,7 +267,7 @@ fn a_conn_serves_keep_alive_requests_without_allocating() -> bool {
     // count starts: attaching one allocates nothing.
     const CONNECTIONS: usize = 10;
     const PER_CONNECTION: usize = 100;
-    let mut pairs: Vec<(StdUnixStream, mio::net::UnixStream)> = (0..CONNECTIONS)
+    let mut pairs: Vec<(StdUnixStream, platform::net::UnixStream)> = (0..CONNECTIONS)
         .map(|_| {
             let (client, server) = StdUnixStream::pair().expect("a socket pair");
             server
@@ -279,7 +279,7 @@ fn a_conn_serves_keep_alive_requests_without_allocating() -> bool {
             client
                 .set_write_timeout(Some(DEADLINE))
                 .expect("a write deadline");
-            (client, mio::net::UnixStream::from_std(server))
+            (client, platform::net::UnixStream::from_std(server))
         })
         .collect();
 
