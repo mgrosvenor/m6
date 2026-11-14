@@ -3696,6 +3696,88 @@ tail = false
         assert_eq!(req.route_str("root"), None);
         assert!(req.route_bool("tail", true));
     }
+
+    // ── Flash read-back ───────────────────────────────────────────────────
+    //
+    // Step 11 reads `_flash` back through `dict.get("cookies")`, the map step
+    // 7 inserted. `flash` is not a default feature, so the allocation tests
+    // never compile that block and the round-trip tests above stop at
+    // `verify_flash_cookie`. These two drive the whole way to the dictionary.
+
+    /// The cookie value `Response::flash` produces for `message`.
+    #[cfg(feature = "flash")]
+    fn flash_cookie(message: &str, secret: &[u8]) -> String {
+        Response::text("ok")
+            .flash(message, secret)
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Set-Cookie")
+            .map(|(_, v)| v.as_str())
+            .expect("Set-Cookie header")
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("_flash=")
+            .to_string()
+    }
+
+    /// The dictionary a request carrying one `_flash` cookie builds.
+    ///
+    /// The key is set here, decoded, because `flash_secret` is a framework key
+    /// that `config::load` keeps out of `user_config`. The read-back under test
+    /// is step 11's, not the config plumbing's.
+    #[cfg(feature = "flash")]
+    fn flash_dict(cookie: &str, secret: &[u8]) -> Dict {
+        let (mut state, _dir) = state_from("[[route]]\npath = \"/\"\nhandler = \"page\"\n");
+        state.flash_secret = secret.to_vec();
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            headers: vec![("Cookie".to_string(), format!("_flash={cookie}"))],
+            body: vec![],
+        };
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+        state.build_dict(&raw, route, &params).unwrap()
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn a_valid_flash_cookie_reaches_the_dictionary() {
+        let secret = b"test-secret-key-32-bytes-xxxxxxx";
+        let message = "Login successful!";
+        let dict = flash_dict(&flash_cookie(message, secret), secret);
+
+        assert_eq!(
+            dict.get("flash").and_then(|v| v.as_str()),
+            Some(message),
+            "a verified flash message must reach the page"
+        );
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn a_tampered_flash_cookie_leaves_no_message_in_the_dictionary() {
+        let secret = b"test-secret-key-32-bytes-xxxxxxx";
+        let (message, signature) = flash_cookie("Login successful!", secret)
+            .split_once('.')
+            .map(|(m, s)| (m.to_string(), s.to_string()))
+            .expect("a flash cookie is message.signature");
+        let mut first = signature.chars();
+        let swapped = match first.next() {
+            Some('A') => 'B',
+            Some(_) => 'A',
+            None => panic!("a signature is not empty"),
+        };
+        let tampered = format!("{message}.{}{}", swapped, first.as_str());
+
+        let dict = flash_dict(&tampered, secret);
+        assert!(
+            dict.get("flash").is_none(),
+            "a tampered flash cookie must not reach the page"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3710,23 +3792,23 @@ mod dict_cost {
     //! cargo test --release -p m6-core dict_cost -- --ignored --nocapture
     //! ```
     //!
-    //! Measured on the laptop in release, 2026-09-12. **The whole cost is
-    //! copying immutable state per request**, and it is nothing to do with
-    //! parsing:
+    //! Measured in release on 2026-11-14. **The whole cost is copying
+    //! immutable state per request**, and it is nothing to do with parsing or
+    //! formatting dates:
     //!
     //! | what | ns |
     //! |---|---|
-    //! | `Map::new()` | 41 |
-    //! | query parse + map | 42 |
-    //! | `parse_cookies` | 333 |
-    //! | `chrono::Utc::now()` + two `strftime` | 708 |
-    //! | **cloning 20 config keys** | **2,750** |
+    //! | `Map::new()` | 0 |
+    //! | query parse + map | 41 |
+    //! | `parse_cookies` | 167 |
+    //! | `chrono::Utc::now()` + `builtin_dates` | 83 |
+    //! | **cloning 20 config keys** | **1,458** |
     //!
     //! Against a real content catalogue, tens of kilobytes and thousands of
     //! nodes, the same shape costs far more, because such a file is commonly
     //! loaded as *both* the
     //! global params and the route's params and is then cloned a third time by
-    //! `render_response`:
+    //! `render_response` (the figures below are from 2026-09-12):
     //!
     //! | what | ns |
     //! |---|---|
@@ -3877,13 +3959,9 @@ mod dict_cost {
             })
         );
         println!(
-            "8. now() + both formats   {:>7}",
+            "8. now() + builtin_dates  {:>7}",
             median(N, || {
-                let n = chrono::Utc::now();
-                std::hint::black_box((
-                    n.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                    n.format("%Y").to_string(),
-                ));
+                std::hint::black_box(FrameworkState::builtin_dates(chrono::Utc::now()));
             })
         );
     }
