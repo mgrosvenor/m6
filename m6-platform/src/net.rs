@@ -4,9 +4,8 @@
 //! On macOS every socket made here has `SO_NOSIGPIPE`, so a write to a closed
 //! peer is an error and never a signal. On Linux there is no such option and
 //! none is needed: the Rust runtime ignores `SIGPIPE` in every binary, so the
-//! same write is `BrokenPipe` on both. m6 does not set `SO_REUSEPORT` on any
-//! listener, because Linux balances connections across the sockets that share
-//! a port and macOS does not, so nothing may rely on it.
+//! same write is `BrokenPipe` on both. `SO_REUSEPORT` is set only by
+//! [`listen_shared`], which is what lets several processes serve one port.
 //!
 //! The default socket buffer sizes differ (about 128 KiB on macOS, about
 //! 208 KiB on Linux, both tunable by the host). A test that depends on a size
@@ -101,6 +100,49 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     Ok(TcpListener::from_std(std::net::TcpListener::from(
         OwnedFd::from(sock),
     )))
+}
+
+/// A non-blocking TCP listener and UDP socket bound to one address with
+/// `SO_REUSEPORT`, so several processes serve the same port. Start only.
+///
+/// The option is set on each socket before its `bind`, which is the only point
+/// where it has an effect. Linux spreads a new TCP connection across the
+/// sockets that share a port by a hash of its 4-tuple, and macOS spreads them
+/// differently. Neither is an even spread, so no caller may assume one. A UDP
+/// datagram goes to one socket, so a QUIC client that changes address can land
+/// on another process.
+///
+/// The TCP socket also carries `SO_REUSEADDR`, as [`listen_tcp`] does, so a
+/// restart rebinds a port whose connections are in `TIME_WAIT`. The returned
+/// pair are `std` sockets because the service's loop registers their
+/// descriptors itself.
+pub fn listen_shared(addr: SocketAddr) -> io::Result<(std::net::TcpListener, std::net::UdpSocket)> {
+    let tcp = socket2::Socket::new(
+        domain_of(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    os::prepare_socket(&tcp)?;
+    tcp.set_reuse_address(true)?;
+    tcp.set_reuse_port(true)?;
+    tcp.bind(&addr.into())?;
+    tcp.listen(128)?;
+    tcp.set_nonblocking(true)?;
+
+    let udp = socket2::Socket::new(
+        domain_of(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    os::prepare_socket(&udp)?;
+    udp.set_reuse_port(true)?;
+    udp.bind(&addr.into())?;
+    udp.set_nonblocking(true)?;
+
+    Ok((
+        std::net::TcpListener::from(OwnedFd::from(tcp)),
+        std::net::UdpSocket::from(OwnedFd::from(udp)),
+    ))
 }
 
 /// A non-blocking connect to a unix listener. It completes at once or fails.
