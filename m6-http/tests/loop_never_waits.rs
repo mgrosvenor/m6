@@ -46,9 +46,31 @@ type GetFn = fn(u16, &str, Duration) -> Result<(u16, String), String>;
 
 // ── The fake backend ──────────────────────────────────────────────────────────
 
+/// The hold every backend in a fixture shares. A `/slow` reply is held until
+/// `release` is set, or until the backends have seen `after` `/slow` requests
+/// (zero never triggers). A test that needs two requests in flight together
+/// sets `after`, so the replies go out only once both have arrived.
+#[derive(Clone)]
+struct Hold {
+    release: Arc<AtomicBool>,
+    seen: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+}
+
+impl Hold {
+    fn new() -> Hold {
+        Hold {
+            release: Arc::new(AtomicBool::new(false)),
+            seen: Arc::new(AtomicUsize::new(0)),
+            after: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// One fake socket backend. `GET /fast` answers at once with a cacheable body;
-/// `GET /slow` signals `slow_seen` and holds until `release` (or shutdown). A
-/// resetting backend reads the request then closes without replying.
+/// `GET /slow` signals `slow_seen` and holds until the fixture's `Hold`
+/// releases it (or shutdown). A resetting backend reads the request then closes
+/// without replying.
 struct Backend {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -60,9 +82,25 @@ impl Backend {
         path: PathBuf,
         slow_seen: mpsc::Sender<()>,
         large_seen: mpsc::Sender<()>,
+        hold: Hold,
+    ) -> Backend {
+        Self::spawn(path, slow_seen, large_seen, hold, false)
+    }
+
+    /// A backend whose `/slow` replies are held until `release` is set, for a
+    /// test that owns the flag itself rather than a fixture's `Hold`.
+    fn start_with_release(
+        path: PathBuf,
+        slow_seen: mpsc::Sender<()>,
+        large_seen: mpsc::Sender<()>,
         release: Arc<AtomicBool>,
     ) -> Backend {
-        Self::spawn(path, slow_seen, large_seen, release, false)
+        let hold = Hold {
+            release,
+            seen: Arc::new(AtomicUsize::new(0)),
+            after: Arc::new(AtomicUsize::new(0)),
+        };
+        Self::spawn(path, slow_seen, large_seen, hold, false)
     }
 
     /// A backend that accepts a request and closes without replying, the state a
@@ -70,15 +108,14 @@ impl Backend {
     fn start_resetting(path: PathBuf) -> Backend {
         let (slow_seen, _) = mpsc::channel();
         let (large_seen, _) = mpsc::channel();
-        let release = Arc::new(AtomicBool::new(false));
-        Self::spawn(path, slow_seen, large_seen, release, true)
+        Self::spawn(path, slow_seen, large_seen, Hold::new(), true)
     }
 
     fn spawn(
         path: PathBuf,
         slow_seen: mpsc::Sender<()>,
         large_seen: mpsc::Sender<()>,
-        release: Arc<AtomicBool>,
+        hold: Hold,
         reset: bool,
     ) -> Backend {
         let _ = std::fs::remove_file(&path);
@@ -90,7 +127,7 @@ impl Backend {
         let handle = spawn_accept(
             listener,
             Arc::clone(&stop),
-            Arc::clone(&release),
+            hold,
             slow_seen,
             large_seen,
             reset,
@@ -116,7 +153,7 @@ impl Drop for Backend {
 fn spawn_accept(
     listener: UnixListener,
     stop: Arc<AtomicBool>,
-    release: Arc<AtomicBool>,
+    hold: Hold,
     slow_seen: mpsc::Sender<()>,
     large_seen: mpsc::Sender<()>,
     reset: bool,
@@ -126,11 +163,11 @@ fn spawn_accept(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let stop = Arc::clone(&stop);
-                    let release = Arc::clone(&release);
+                    let hold = hold.clone();
                     let slow_seen = slow_seen.clone();
                     let large_seen = large_seen.clone();
                     std::thread::spawn(move || {
-                        serve(stream, &stop, &release, &slow_seen, &large_seen, reset)
+                        serve(stream, &stop, &hold, &slow_seen, &large_seen, reset)
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -149,7 +186,7 @@ fn spawn_accept(
 fn serve(
     mut stream: UnixStream,
     stop: &AtomicBool,
-    release: &AtomicBool,
+    hold: &Hold,
     slow_seen: &mpsc::Sender<()>,
     large_seen: &mpsc::Sender<()>,
     reset: bool,
@@ -177,11 +214,18 @@ fn serve(
     }
     let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
     if head.starts_with("get /slow") {
+        // Count before the report, so a test that sees the report knows this
+        // request is already in the count.
+        let seen = hold.seen.fetch_add(1, Ordering::SeqCst) + 1;
+        let after = hold.after.load(Ordering::SeqCst);
         let _ = slow_seen.send(());
-        while !release.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        if after != 0 && seen >= after {
+            hold.release.store(true, Ordering::SeqCst);
+        }
+        while !hold.release.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
-        if !release.load(Ordering::SeqCst) {
+        if !hold.release.load(Ordering::SeqCst) {
             return; // shutdown while still held
         }
         respond(&mut stream, 200, SLOW_BODY, false);
@@ -473,6 +517,8 @@ struct Fixture {
     slow_seens: Vec<mpsc::Receiver<()>>,
     large_seens: Vec<mpsc::Receiver<()>>,
     release: Arc<AtomicBool>,
+    /// The `/slow` count at which the backends release every held reply.
+    slow_after: Arc<AtomicUsize>,
     // Field order is drop order. The service and its backends stop before the
     // port is released and before the directory they served from is removed.
     // A claim declared first released the port while m6-http still held it, so
@@ -493,12 +539,14 @@ impl Fixture {
         let mut backends = Vec::new();
         let mut slow_seens = Vec::new();
         let mut large_seens = Vec::new();
-        let release = Arc::new(AtomicBool::new(false));
+        let hold = Hold::new();
+        let release = Arc::clone(&hold.release);
+        let slow_after = Arc::clone(&hold.after);
         for i in 0..n_backends {
             let path = PathBuf::from(format!("/tmp/m6lnw-{pid}-{tag}-{i}.sock"));
             let (tx, rx) = mpsc::channel();
             let (ltx, lrx) = mpsc::channel();
-            backends.push(Backend::start(path, tx, ltx, Arc::clone(&release)));
+            backends.push(Backend::start(path, tx, ltx, hold.clone()));
             slow_seens.push(rx);
             large_seens.push(lrx);
         }
@@ -528,6 +576,7 @@ impl Fixture {
             slow_seens,
             large_seens,
             release,
+            slow_after,
             _dir: dir,
             _claim: claim,
         }
@@ -535,6 +584,13 @@ impl Fixture {
 
     fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Release every held `/slow` reply once the backends have seen `n`
+    /// requests. Set it before the requests it releases, counting the `/slow`
+    /// requests already held.
+    fn release_after(&self, n: usize) {
+        self.slow_after.store(n, Ordering::SeqCst);
     }
 }
 
@@ -596,6 +652,25 @@ fn await_slow_seen(rx: &mpsc::Receiver<()>, deadline: Instant) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// The `/slow` requests each member has reported since the last drain.
+fn slow_hits(fx: &Fixture) -> (usize, usize) {
+    let hits = |rx: &mpsc::Receiver<()>| std::iter::from_fn(|| rx.try_recv().ok()).count();
+    (hits(&fx.slow_seens[0]), hits(&fx.slow_seens[1]))
+}
+
+/// Assert the two members took one `/slow` each. Both replies are out, and the
+/// backends release only after both requests arrived, so both were counted
+/// before either answered and the distribution is complete.
+fn assert_one_slow_each(fx: &Fixture) {
+    let (a_hits, b_hits) = slow_hits(fx);
+    assert_eq!(
+        (a_hits, b_hits),
+        (1, 1),
+        "two concurrent /slow requests must land one on each member\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
 }
 
 /// Wait until `needle` appears in the service's captured log, so a test can
@@ -685,34 +760,21 @@ fn a_held_backend_request_does_not_delay_a_cache_hit_over_h3() {
 fn two_held_requests_land_on_two_members() {
     let fx = Fixture::start(2, 30, "two");
 
-    // Two concurrent /slow requests on two h1 connections.
+    // Two /slow on two h1 connections. The backends release both replies once
+    // the second request has arrived, so both are in flight together.
+    fx.release_after(2);
     let a_port = fx.port();
     let a = std::thread::spawn(move || h1_get(a_port, "/slow", Duration::from_secs(20)));
     let b_port = fx.port();
     let b = std::thread::spawn(move || h1_get(b_port, "/slow", Duration::from_secs(20)));
 
-    // Both backends must report a received request within two seconds, before
-    // either is released.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let a_seen = await_slow_seen(&fx.slow_seens[0], deadline);
-    let b_seen = await_slow_seen(&fx.slow_seens[1], deadline);
-    if !(a_seen && b_seen) {
-        fx.release.store(true, Ordering::SeqCst);
-        let _ = a.join();
-        let _ = b.join();
-        panic!(
-            "both members must receive a request (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
-            fx.service.output()
-        );
-    }
-
-    fx.release.store(true, Ordering::SeqCst);
     let (a_status, a_body) = a.join().expect("a thread").expect("/slow a");
     let (b_status, b_body) = b.join().expect("b thread").expect("/slow b");
     assert_eq!(a_status, 200, "/slow a: {a_body}");
     assert_eq!(a_body, SLOW_BODY);
     assert_eq!(b_status, 200, "/slow b: {b_body}");
     assert_eq!(b_body, SLOW_BODY);
+    assert_one_slow_each(&fx);
 }
 
 #[test]
@@ -969,7 +1031,8 @@ fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
     let (slow_seen, _slow_rx) = mpsc::channel();
     let (large_seen, _large_rx) = mpsc::channel();
     let release = Arc::new(AtomicBool::new(false));
-    let _healthy = Backend::start(healthy_path, slow_seen, large_seen, Arc::clone(&release));
+    let _healthy =
+        Backend::start_with_release(healthy_path, slow_seen, large_seen, Arc::clone(&release));
 
     std::fs::write(site.join("site.toml"), site_toml(&glob, 30)).expect("site.toml");
     std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
@@ -1077,8 +1140,16 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
 }
 
 /// A client that closes while its `/slow` is in flight does not leak the pool
-/// member: when the reply arrives for the gone waiter, the member's in-flight
-/// count returns to 0, so the next two concurrent misses spread across both.
+/// member: when the reply arrives for the gone waiter, the member is released,
+/// and the two requests that follow still land one on each member.
+///
+/// The spread is incidental to the leak. It says both members are in rotation
+/// and reachable after the closed client, which a member taken out of service
+/// fails. A single leaked in-flight count has no external observable here: a
+/// two-member pool still picks that member for one of two overlapping
+/// requests. The two commands do overlap, because the backends release every
+/// held reply only once the second has arrived, so the distribution is the
+/// sequence and no duration is asserted.
 #[test]
 fn a_closed_client_does_not_leak_its_upstream() {
     let fx = Fixture::start(2, 30, "leak");
@@ -1105,28 +1176,20 @@ fn a_closed_client_does_not_leak_its_upstream() {
     );
     drop(stream); // the client closes with the request still held by the backend
 
-    // Release member A's held reply; it lands on a gone waiter, so the member
-    // must be released back to the pool.
-    fx.release.store(true, Ordering::SeqCst);
-
-    // Two concurrent /slow must now spread across both members within 2 s.
+    // Two more /slow on fresh connections. The backends release every held
+    // reply once the third request has arrived, so the closed client's reply
+    // lands on its gone waiter and both new requests are in flight together:
+    // the pool's two picks overlap, whatever their order. Both responses
+    // completing is the signal that the spread happened; no duration is
+    // asserted and no deadline can turn a loaded machine into a failure.
+    fx.release_after(3);
     let a = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
     let b = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let a_seen = await_slow_seen(&fx.slow_seens[0], deadline);
-    let b_seen = await_slow_seen(&fx.slow_seens[1], deadline);
-    if !(a_seen && b_seen) {
-        let _ = a.join();
-        let _ = b.join();
-        panic!(
-            "both members must receive a request after the gone waiter released its member (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
-            fx.service.output()
-        );
-    }
     let (a_status, a_body) = a.join().expect("a thread").expect("/slow a");
     let (b_status, b_body) = b.join().expect("b thread").expect("/slow b");
     assert_eq!(a_status, 200, "/slow a: {a_body}");
     assert_eq!(b_status, 200, "/slow b: {b_body}");
+    assert_one_slow_each(&fx);
 }
 
 /// A custom error page fetched from a socket backend is non-blocking: while the
@@ -1920,7 +1983,7 @@ fn an_unreachable_h2c_upstream_does_not_stall_cache_hits() {
     let (slow_seen, _slow_rx) = mpsc::channel();
     let (large_seen, _large_rx) = mpsc::channel();
     let release = Arc::new(AtomicBool::new(false));
-    let _backend = Backend::start(sock, slow_seen, large_seen, Arc::clone(&release));
+    let _backend = Backend::start_with_release(sock, slow_seen, large_seen, Arc::clone(&release));
     let glob = format!("/tmp/m6lnw-{pid}-h2cdead-*.sock");
     let fx = UrlFixture::start(
         // Debug logging so the test can wait until m6-http has dispatched the
