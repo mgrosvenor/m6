@@ -130,8 +130,8 @@ use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    make_tls_server_config, resolve_bind, ConnDrive, H2cListener, HitHeaders, Http11Listener,
-    ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
+    make_tls_server_config, ConnDrive, H2cListener, HitHeaders, Http11Listener, ParseResult,
+    RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
     MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::{self, PoolManager};
@@ -5094,32 +5094,12 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Bind the QUIC UDP socket. With [server] reuse_port the TLS listener is
-    // bound in the same call, so the two sockets that share one port both carry
-    // SO_REUSEPORT: the option is set before bind, which is the only point it
-    // takes effect, and a second process must be able to bind both halves.
-    let (shared_tcp, udp) = if config.server.reuse_port {
-        let addr = match resolve_bind(&config.server.bind) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("bind error {}: {e}", config.server.bind);
-                return 2;
-            }
-        };
-        match m6_core::platform::net::listen_shared(addr) {
-            Ok((tcp, udp)) => (Some(tcp), udp),
-            Err(e) => {
-                eprintln!("bind error {}: {e}", config.server.bind);
-                return 2;
-            }
-        }
-    } else {
-        match UdpSocket::bind(&config.server.bind) {
-            Ok(s) => (None, s),
-            Err(e) => {
-                eprintln!("bind error {}: {e}", config.server.bind);
-                return 2;
-            }
+    // Bind UDP socket
+    let udp = match UdpSocket::bind(&config.server.bind) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bind error {}: {e}", config.server.bind);
+            return 2;
         }
     };
     if let Err(e) = udp.set_nonblocking(true) {
@@ -5159,48 +5139,36 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
     let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
-        Ok(tls_cfg) => {
-            let bound = match shared_tcp {
-                Some(listener) => Http11Listener::from_shared(
-                    listener,
-                    tls_cfg,
-                    config.server.max_requests_per_connection,
-                    INITIAL_CONNECTIONS,
-                    ceiling,
-                ),
-                None => Http11Listener::bind(
-                    &config.server.bind,
-                    tls_cfg,
-                    config.server.max_requests_per_connection,
-                    INITIAL_CONNECTIONS,
-                    ceiling,
-                ),
-            };
-            match bound {
-                Ok(l) => {
-                    info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
-                    Some(l)
-                }
-                // FATAL, not a warning. `bind` is configured on every node, so a
-                // failure to bind it is a node that cannot serve: systemd sees a
-                // running process, /health answers on whatever else is listening,
-                // and nothing is on 443. That is the shape this project keeps
-                // meeting -- artefact wrong, process healthy, failure deferred and
-                // invisible -- and `Restart=on-failure` already exists to handle
-                // the honest version.
-                //
-                // The distinction §3d asked for is between a listener that is
-                // configured and failed, and one that was never configured. This
-                // arm is the first. `h2c_bind` below is the second: absent on a
-                // cache node, which is not a failure to bind but an absence of a
-                // bind, and is left alone.
-                Err(e) => {
-                    error!(bind = %config.server.bind, error = %e,
-                           "HTTP/1.1 TCP listener bind failed; refusing to run without it");
-                    return 1;
-                }
+        Ok(tls_cfg) => match Http11Listener::bind(
+            &config.server.bind,
+            tls_cfg,
+            config.server.max_requests_per_connection,
+            INITIAL_CONNECTIONS,
+            ceiling,
+        ) {
+            Ok(l) => {
+                info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
+                Some(l)
             }
-        }
+            // FATAL, not a warning. `bind` is configured on every node, so a
+            // failure to bind it is a node that cannot serve: systemd sees a
+            // running process, /health answers on whatever else is listening,
+            // and nothing is on 443. That is the shape this project keeps
+            // meeting -- artefact wrong, process healthy, failure deferred and
+            // invisible -- and `Restart=on-failure` already exists to handle
+            // the honest version.
+            //
+            // The distinction §3d asked for is between a listener that is
+            // configured and failed, and one that was never configured. This
+            // arm is the first. `h2c_bind` below is the second: absent on a
+            // cache node, which is not a failure to bind but an absence of a
+            // bind, and is left alone.
+            Err(e) => {
+                error!(bind = %config.server.bind, error = %e,
+                       "HTTP/1.1 TCP listener bind failed; refusing to run without it");
+                return 1;
+            }
+        },
         Err(e) => {
             error!(error = %e, "HTTP/1.1 TLS config failed; refusing to run without it");
             return 2;
@@ -5352,7 +5320,6 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
-                reuse_port: false,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

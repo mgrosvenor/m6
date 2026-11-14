@@ -72,14 +72,6 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
-**`[server] reuse_port` lets two or three m6-http processes serve one port.**
-It defaults to false, so an accidental second instance still fails at bind and an existing config binds exactly as before.
-When set, the TLS listener and the QUIC UDP socket on `[server].bind` are bound through `m6_platform::net::listen_shared` with `SO_REUSEPORT`, in one call before the TLS configuration is built.
-Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and macOS does not, so the split is not even and no process is guaranteed traffic.
-A UDP datagram goes to one socket, so a QUIC client that changes address may land on another process.
-`h2c_bind` is a separate listener and is not shared.
-Verified on the sandbox with three m6-http processes on one port and one unix-socket backend set: every request was answered 200 before and after one process was stopped.
-
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
 
 **Crawler sightings carry a time and a verdict (#205).**
@@ -236,6 +228,8 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**Choosing a backend socket is plain round robin, and a request whose connect fails tries the next member.** The least-connections choice and the 1 to 30 second per-member backoff are gone, with the failure count and the retry deadline they read. Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members, and a client receives 502 only when every member has failed. A backend that stops and restarts on the same path serves again on its next turn. The `/perf` pool counts report every member as in rotation. Verified on the sandbox with a real `m6-http` in front of three and four unix-socket backends, and a member killed and then restarted on the same path.
 
 **The minimum supported Rust version is 1.89** (was 1.88), the version the updated SQLite binding requires.
 

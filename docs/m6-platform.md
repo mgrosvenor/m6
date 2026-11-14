@@ -38,7 +38,6 @@ Table 1 lists them.
 | `ChildExit` | a readable descriptor when the child exits, at once when it already has, `reap` never blocks | `pidfd_open` | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
 | `net::connect_unix` | a refused connect is a listener that is gone, a missing file is `NotFound`, and a full queue never connects and never hangs, so the caller tries the next member and answers 503 only when every attempt was a full queue | `EAGAIN` for a full queue: busy, the next member for this request | `ECONNREFUSED` for a full queue too, so a full queue reads the same as a listener that is gone and the caller tries the next member |
 | `net::connect_tcp` | `Connected` or `InProgress`, never `EINPROGRESS` as an error | `WouldBlock` | the raw errno |
-| `net::listen_shared` | a TCP listener and a UDP socket bound to one address with `SO_REUSEPORT`, so several processes serve one port, every connection is answered, and stopping one leaves the port served | `SO_REUSEPORT` set before bind, and a hash of the 4-tuple chooses the socket | `SO_REUSEPORT` set before bind, and a UDP datagram goes to one socket |
 | sockets | every socket the layer makes gives `BrokenPipe` on a write to a closed peer, never a signal | the runtime ignores `SIGPIPE` | the same, and `SO_NOSIGPIPE` on every socket |
 | `MAX_SOCKET_PATH` | a path too long to bind fails at start naming the path and the limit | 108 | 104 |
 | `process::raise_fd_limit` | the soft limit becomes the highest the kernel accepts, the number returned is what connections may use, a second call returns the same | the hard limit | `kern.maxfilesperproc`, because the hard limit reads as unlimited |
@@ -54,9 +53,6 @@ On macOS a stale socket file and a full queue are the same `ECONNREFUSED`, and t
 Both monotonic clocks stop while the machine sleeps, so a deadline set before a laptop sleeps fires after it wakes, late by the sleep's length.
 Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives. m6 does not handle descriptor exhaustion.
 Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
-m6 sets `SO_REUSEPORT` only on a listener a service opens through `net::listen_shared`, which m6-http's `[server] reuse_port` asks for.
-Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and gives every UDP datagram to one socket. macOS spreads neither: the socket bound last to the port receives every connection and every datagram, so there a second process is a takeover rather than a scale-out.
-Nothing may assume an even spread on either target, and on Linux a QUIC client that changes address may land on another process.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 Everything in Table 1 is held by the tests in section 6.
 
@@ -103,7 +99,7 @@ Table 3 maps them.
 
 | suite | file | holds |
 |---|---|---|
-| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), what a spawned child inherits and an interrupted harness (2), sockets (13), clock (2), limits (2), host and process facts (13), directories (5) |
+| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), what a spawned child inherits and an interrupted harness (2), sockets (9), clock (2), limits (2), host and process facts (13), directories (5) |
 | signals | `m6-platform/tests/platform_signals.rs` | the 8 signal cases, in its own `main` so the mask is set before any thread |
 | the gate | `m6-platform/tests/platform_gate.rs` | the rule in section 1 |
 | the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with 17 behavioural checks including zero allocations, a shutdown that drains and queued clients served once descriptors free |
