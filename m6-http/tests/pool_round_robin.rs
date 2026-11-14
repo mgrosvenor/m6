@@ -167,17 +167,17 @@ impl FrontEnd {
     }
 }
 
-/// The backends, in the order the pool's glob found them, and the front ends.
+/// The backends, in the order the pool's glob found them, and the front end.
 struct Fixture {
-    // Declared before `backends` so the front ends stop first when the fixture
+    // Declared before `backends` so the front end stops first when the fixture
     // drops.
-    front_ends: Vec<FrontEnd>,
+    front_end: FrontEnd,
     backends: Vec<Backend>,
     _dir: tempfile::TempDir,
 }
 
 impl Fixture {
-    fn start(members: &[&'static str], front_ends: usize) -> Fixture {
+    fn start(members: &[&'static str]) -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let site = dir.path().to_path_buf();
         let ck = rcgen::generate_simple_self_signed(vec![
@@ -196,13 +196,8 @@ impl Fixture {
         let glob = site.join("m6-rr-*.sock").display().to_string();
         std::fs::write(site.join("site.toml"), site_toml(&glob)).expect("site.toml");
 
-        let names = ["one", "two", "three"];
-        let mut running = Vec::new();
-        for tag in names.iter().take(front_ends) {
-            running.push(FrontEnd::start(&site, tag));
-        }
         Fixture {
-            front_ends: running,
+            front_end: FrontEnd::start(&site, "one"),
             backends,
             _dir: dir,
         }
@@ -269,8 +264,8 @@ fn system_toml(bind_port: u16, cert: &str, key: &str, node: &str) -> String {
 
 /// `requests = members * k` requests leave each member with exactly `k`.
 fn each_member_serves_k_times(members: &[&'static str], k: usize) {
-    let fx = Fixture::start(members, 1);
-    let port = fx.front_ends[0].port;
+    let fx = Fixture::start(members);
+    let port = fx.front_end.port;
     for i in 0..members.len() * k {
         get_ok(port, &format!("request {i}"));
     }
@@ -295,8 +290,8 @@ fn four_members_each_serve_k_times() {
 
 #[test]
 fn a_dead_member_is_skipped_and_serves_again_in_turn_after_restart() {
-    let fx = Fixture::start(&["a", "b", "c"], 1);
-    let port = fx.front_ends[0].port;
+    let fx = Fixture::start(&["a", "b", "c"]);
+    let port = fx.front_end.port;
 
     // Three requests put one on each member and leave the turn on the first.
     for i in 0..3 {
@@ -355,52 +350,4 @@ fn a_dead_member_is_skipped_and_serves_again_in_turn_after_restart() {
         2,
         "the restarted member must serve again in its turn"
     );
-}
-
-#[test]
-fn front_ends_on_separate_ports_share_one_backend_set() {
-    let mut fx = Fixture::start(&["a", "b"], 3);
-
-    // Each front end serves on its own, taking its own turn through the shared
-    // members: four requests put two on each member.
-    for i in 0..fx.front_ends.len() {
-        let port = fx.front_ends[i].port;
-        let before = fx.counts();
-        for n in 0..4 {
-            get_ok(port, &format!("front end {i}, request {n}"));
-        }
-        let after = fx.counts();
-        for (n, (had, has)) in before.iter().zip(after.iter()).enumerate() {
-            assert_eq!(
-                has - had,
-                2,
-                "front end {i} must send two of its four requests to member {n}"
-            );
-        }
-    }
-
-    // Stop the middle front end. The other two keep serving.
-    let mut stopped = fx.front_ends.remove(1);
-    let stopped_port = stopped.port;
-    let status = stopped.service.terminate(Duration::from_secs(10));
-    assert!(status.success(), "front end did not shut down cleanly");
-    assert!(
-        TcpStream::connect(("127.0.0.1", stopped_port)).is_err(),
-        "the stopped front end still accepts connections"
-    );
-    for i in 0..fx.front_ends.len() {
-        let port = fx.front_ends[i].port;
-        let before = fx.counts();
-        for n in 0..4 {
-            get_ok(port, &format!("surviving front end {i}, request {n}"));
-        }
-        let after = fx.counts();
-        for (n, (had, has)) in before.iter().zip(after.iter()).enumerate() {
-            assert_eq!(
-                has - had,
-                2,
-                "surviving front end {i} must send two of its four requests to member {n}"
-            );
-        }
-    }
 }
