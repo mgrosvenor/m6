@@ -187,6 +187,15 @@ name    = "site_allocs"
 harness = false
 required-features = ["testkit"]
 
+# The page path's per-request allocation counts, so one that comes back is
+# seen: an identity response is not copied for a compression that never
+# happens, and a handler request stays within its budget. Its own `main`, as
+# `site_allocs`'s.
+[[test]]
+name    = "request_allocs"
+harness = false
+required-features = ["testkit"]
+
 [[bench]]
 name    = "critical_path"
 harness = false

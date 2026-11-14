@@ -1224,19 +1224,13 @@ impl FrameworkState {
         dict.insert("cookies".to_string(), Value::Object(cookies_map.clone()));
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
-        let now = chrono::Utc::now();
+        let (datetime, year) = Self::builtin_dates(chrono::Utc::now());
         dict.insert(
             "request_path".to_string(),
             Value::String(raw.path().to_string()),
         );
-        dict.insert(
-            "datetime".to_string(),
-            Value::String(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        );
-        dict.insert(
-            "year".to_string(),
-            Value::String(now.format("%Y").to_string()),
-        );
+        dict.insert("datetime".to_string(), Value::String(datetime));
+        dict.insert("year".to_string(), Value::String(year));
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -1283,6 +1277,15 @@ impl FrameworkState {
         Ok(dict)
     }
 
+    /// The two built-in date values: RFC 3339 in UTC to the second, and the
+    /// four-digit year.
+    fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+        (
+            now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            now.format("%Y").to_string(),
+        )
+    }
+
     /// Render a template response.
     ///
     /// Builds the context as a plain `Map` rather than an engine type: the
@@ -1318,6 +1321,31 @@ impl FrameworkState {
             resp.template_dict = None;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod builtin_dates_tests {
+    use super::FrameworkState;
+
+    /// The built-in dates keep the shape templates already read:
+    /// `%Y-%m-%dT%H:%M:%SZ` and `%Y`. Pinned here so a change to how they are
+    /// formatted cannot drift from what a template sees.
+    #[test]
+    fn builtin_dates_keep_their_format() {
+        use chrono::TimeZone as _;
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let (datetime, year) = FrameworkState::builtin_dates(now);
+        assert_eq!(datetime, "2026-01-02T03:04:05Z");
+        assert_eq!(year, "2026");
+
+        let last = chrono::Utc
+            .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+            .unwrap();
+        let (datetime, year) = FrameworkState::builtin_dates(last);
+        assert_eq!(datetime, "9999-12-31T23:59:59Z");
+        assert_eq!(year, "9999");
     }
 }
 
