@@ -251,7 +251,6 @@ struct UpstreamEntry {
     /// The token this slot's descriptor is registered under. An idle URL slot
     /// keeps its token while it waits, so a close can wake the loop.
     token: Token,
-    member_idx: usize,
     backend_name: String,
     waiter: Option<Waiter>,
     ctx: Option<Box<forward::PendingUrlContext>>,
@@ -265,7 +264,6 @@ impl UpstreamEntry {
             addr: m6_core::client::Addr::Unix(std::path::PathBuf::new()),
             kind: UpstreamKind::Member,
             token: Token(usize::MAX),
-            member_idx: 0,
             backend_name: String::new(),
             waiter: None,
             ctx: None,
@@ -1417,45 +1415,31 @@ fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
 /// Take a finished upstream out of the loop: free its token, its deadline and
 /// its slot, and tell its owner how the request went.
 ///
-/// A socket member is released, or backed off when it went silent or failed
-/// after taking the whole request. A URL backend whose reply left the
-/// connection reusable keeps its slot on that backend's idle list, still
-/// registered for read, so the backend closing it wakes the loop and the slot
-/// is dropped before any request can be handed the dead connection.
+/// A socket member needs no state updated: the pool carries no per-member
+/// health, and the next request takes the next member in turn. A URL backend
+/// whose reply left the connection reusable keeps its slot on that backend's
+/// idle list, still registered for read, so the backend closing it wakes the
+/// loop and the slot is dropped before any request can be handed the dead
+/// connection.
 fn retire_upstream(
     token: Token,
     slot: usize,
     result: &std::io::Result<forward::HttpResponse>,
     cx: &mut CompletionCtx<'_>,
 ) -> (Option<Waiter>, Option<Box<forward::PendingUrlContext>>) {
-    let timed_out = matches!(result, Err(e) if e.kind() == std::io::ErrorKind::TimedOut);
-    let (kind, member_idx, waiter, ctx, reusable, request_written) = {
+    let (kind, waiter, ctx, reusable) = {
         let entry = cx.state.upstreams.get_mut(slot);
         (
             entry.kind,
-            entry.member_idx,
             entry.waiter.take(),
             entry.ctx.take(),
             entry.upstream.reusable(),
-            entry.upstream.request_written(),
         )
     };
     let mut kept = false;
     match kind {
         UpstreamKind::Member => {
-            let entry = cx.state.upstreams.get_mut(slot);
-            entry.upstream.close();
-            // Release the member using a borrow of the slot's name, before the
-            // slot is freed, so the name buffer survives for the next launch.
-            if let Some(pool) = cx.state.pool_manager.get_pool_mut(&entry.backend_name) {
-                // A refusal's reply may be waiting unread. A refused connect
-                // was already marked failed at launch.
-                if result.is_err() && (timed_out || request_written) {
-                    pool.mark_failed(member_idx);
-                } else {
-                    pool.release(member_idx);
-                }
-            }
+            cx.state.upstreams.get_mut(slot).upstream.close();
             cx.state.upstreams.free(slot);
         }
         UpstreamKind::Url(idx) => {
@@ -1982,10 +1966,7 @@ fn event_loop(
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
         // On the emit, copy the loop trace into the snapshot so `/perf` serves it.
-        if state
-            .stats
-            .maybe_emit(state.pool_manager.total_active_members())
-        {
+        if state.stats.maybe_emit(state.pool_manager.total_members()) {
             state.stats.set_event_loop(trace.report());
         }
 
@@ -3195,7 +3176,6 @@ fn launch_url_upstream(
     entry.token = token;
     entry.addr = m6_core::client::Addr::Tcp(addr);
     entry.kind = UpstreamKind::Url(backend_idx);
-    entry.member_idx = 0;
     entry.backend_name.clear();
     entry.waiter = None;
     entry.ctx = None;
@@ -3214,9 +3194,14 @@ enum SocketLaunchError {
     Register(std::io::Error),
 }
 
-/// Encode the request into the slot's buffer, take the member, start the
-/// non-blocking upstream, register it, and park it in `upstreams`.
+/// Encode the request into the slot's buffer, take the next pool member, start
+/// the non-blocking upstream, register it, and park it in `upstreams`.
 /// Returns the upstream's slot key, so the caller can store its waiter there.
+///
+/// A member whose connect fails is skipped for this request only: the next
+/// member is tried, so the request answers 502 only when every member has
+/// failed. The pool keeps every member in rotation, so a backend that comes
+/// back serves on its next turn.
 fn launch_socket_upstream(
     state: &mut ServerState,
     registry: &m6_core::mio::Registry,
@@ -3225,68 +3210,88 @@ fn launch_socket_upstream(
     backend_name: &str,
     timeout: std::time::Duration,
 ) -> Result<usize, SocketLaunchError> {
-    let (socket_path, member_idx) = match state.pool_manager.get_pool_mut(backend_name) {
-        Some(pool) => pool.take_member().map_err(|_| SocketLaunchError::Empty)?,
+    let member_count = match state.pool_manager.get_pool(backend_name) {
+        Some(pool) => pool.total_count(),
         None => return Err(SocketLaunchError::UnknownBackend),
     };
     let deadline = std::time::Instant::now() + timeout;
     let Some(owner) = state.upstreams.take() else {
-        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-            pool.cancel(member_idx);
-        }
         return Err(SocketLaunchError::BacklogFull);
     };
-    // Update the slot's address in place while the member's path is still
-    // borrowed, then the borrow ends and the token table can be taken.
-    {
-        let entry = state.upstreams.get_mut(owner.key);
-        match &mut entry.addr {
-            m6_core::client::Addr::Unix(existing) => {
-                existing.clear();
-                existing.push(socket_path);
-            }
-            m6_core::client::Addr::Tcp(_) => {
-                entry.addr = m6_core::client::Addr::Unix(socket_path.to_path_buf());
-            }
-        }
-    }
     let Some(token) = take_token(state) else {
         state.upstreams.free(owner.key);
-        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-            pool.cancel(member_idx);
-        }
         return Err(SocketLaunchError::BacklogFull);
     };
-
-    let started = {
+    // Encode once: every attempt sends the same request, and the slot's buffer
+    // keeps its capacity.
+    let encoded = {
         let entry = state.upstreams.get_mut(owner.key);
         let original_host = origin_host(req, &state.config);
-        let buf = entry.upstream.request_buf();
-        if let Err(e) = forward::encode_request(buf, req, client_ip, original_host) {
-            Err(e)
-        } else {
-            entry.upstream.start(
-                &entry.addr,
-                None,
-                req.method.eq_ignore_ascii_case("HEAD"),
-                deadline,
-            )
-        }
+        forward::encode_request(entry.upstream.request_buf(), req, client_ip, original_host)
     };
-    if let Err(e) = started {
+    if let Err(e) = encoded {
         state.upstreams.free(owner.key);
         *state.sources.get_mut(token.0) = Source::Vacant;
         state.sources.free(token.0);
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-                pool.cancel(member_idx);
-            }
-            return Err(SocketLaunchError::BacklogFull);
-        }
-        if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-            pool.mark_failed(member_idx);
-        }
         return Err(SocketLaunchError::Connect(e));
+    }
+
+    // Each attempt moves the next member's path into the slot's address, so
+    // the pool borrow ends before the slot is used and the path buffer is
+    // reused. The last attempt's error is the one reported.
+    let mut failed = 0;
+    let mut outcome = None;
+    while outcome.is_none() {
+        let taken = match state.pool_manager.get_pool_mut(backend_name) {
+            Some(pool) => match pool.take_member() {
+                Some(path) => {
+                    let entry = state.upstreams.get_mut(owner.key);
+                    match &mut entry.addr {
+                        m6_core::client::Addr::Unix(existing) => {
+                            existing.clear();
+                            existing.push(path);
+                        }
+                        m6_core::client::Addr::Tcp(_) => {
+                            entry.addr = m6_core::client::Addr::Unix(path.to_path_buf());
+                        }
+                    }
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if !taken {
+            outcome = Some(SocketLaunchError::Empty);
+            break;
+        }
+        let started = {
+            let entry = state.upstreams.get_mut(owner.key);
+            let method_is_head = req.method.eq_ignore_ascii_case("HEAD");
+            entry
+                .upstream
+                .start(&entry.addr, None, method_is_head, deadline)
+        };
+        match started {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // The member is alive and its listen queue is full (E2, the
+                // kernel is the queue): answer 503 rather than blame it.
+                outcome = Some(SocketLaunchError::BacklogFull);
+            }
+            Err(e) => {
+                failed += 1;
+                if failed == member_count {
+                    outcome = Some(SocketLaunchError::Connect(e));
+                }
+            }
+        }
+    }
+    if let Some(e) = outcome {
+        state.upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(e);
     }
 
     let interest = {
@@ -3297,9 +3302,6 @@ fn launch_socket_upstream(
             state.upstreams.free(owner.key);
             *state.sources.get_mut(token.0) = Source::Vacant;
             state.sources.free(token.0);
-            if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-                pool.mark_failed(member_idx);
-            }
             return Err(SocketLaunchError::Register(e));
         }
         interest
@@ -3311,7 +3313,6 @@ fn launch_socket_upstream(
     let entry = state.upstreams.get_mut(owner.key);
     entry.kind = UpstreamKind::Member;
     entry.token = token;
-    entry.member_idx = member_idx;
     entry.backend_name.clear();
     entry.backend_name.push_str(backend_name);
     entry.waiter = None;

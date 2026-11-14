@@ -340,12 +340,12 @@ The proxy turns every backend failure into a status the client can act on.
 This section gives the proxy's response to each failure, because a backend author needs to know which failures are survivable.
 
 Table 5 gives the conditions.
-Take from it that every transport-level failure reaches the client as a `502`, whatever its cause.
+Take from it that a transport-level failure the proxy cannot route to another member reaches the client as a `502`, whatever its cause.
 
 | Condition | Proxy behaviour |
 |---|---|
-| Socket does not exist | The member is absent from the pool. Another member serves the request, or the client receives `502` |
-| `connect` refused | `502`, and the member is backed off for 1 to 30 seconds |
+| Socket does not exist | The connect fails, and the next member serves the request. If every member fails, the client receives `502` |
+| `connect` refused | The next member serves the request. If every member fails, the client receives `502` |
 | No response within `backend_timeout_secs` (default **30**) | The connection is dropped and the client receives `502` |
 | Malformed status line or headers | `502` |
 | Framing violation (§3.2) | `502` |
@@ -355,7 +355,8 @@ Take from it that every transport-level failure reaches the client as a `502`, w
 **Table 5: backend conditions and the response the proxy sends.**
 A slow backend and a refused connection produce the same `502`, so a client cannot tell them apart.
 
-The proxy does not retry a request against another member.
+The proxy retries the connect against the next member.
+A request a member accepted is not retried, so a reset in the middle of a response answers `502`.
 A backend SHOULD fail fast, because a prompt `500` reaches the client sooner than a connection held for 30 seconds.
 
 Those are the failures a backend can survive and the ones that end the request.
@@ -426,7 +427,8 @@ On `SIGTERM` or `SIGINT`, the backend MUST take these steps in order:
 - **Exit with status `0`.**
 
 A second `SIGTERM` or `SIGINT` MUST exit immediately.
-Removing the socket withdraws the member from the pool, and a backend that exits leaving the file behind causes the proxy to keep selecting a member that refuses every connection.
+Removing the socket file does not take the member out of the pool before the proxy restarts.
+A backend that exits leaving the file behind leaves a member whose connect is refused, and each request that lands on it tries the next member.
 
 ### 8.3. Exit codes
 

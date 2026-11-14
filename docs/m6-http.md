@@ -43,10 +43,10 @@ Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at 
 **Pool management:**
 - Members are the sockets the glob matches when m6-http starts
 - A pool whose glob matches no socket at start exits 2
-- Failed connection → member backed off, retried after 1s, 2s, 4s, max 30s
-- A backend that restarts on the same socket path serves again after its backoff
+- A request that fails to connect tries the next member, and the client receives 502 only when every member has failed
+- A backend that stops and restarts on the same socket path serves again on its next turn
 
-**Load balancing:** least-connections across active pool members.
+**Load balancing:** plain round robin. Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members.
 
 **URL backends** (`http://`, `https://`) are not pooled — one HTTP/1.1 connection per request, run on a dedicated I/O thread.
 

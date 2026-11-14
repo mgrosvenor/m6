@@ -282,8 +282,9 @@ And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 A pool is declared as a socket glob, and membership comes from expanding that glob once at start, so backends must start before m6-http (systemd `After=` on the backend units), and a new instance joins its pool when m6-http restarts.
 An explicit list would mean a config edit to add capacity, which is ceremony in the path of the one operation an operator performs under pressure.
 
-A member whose backend stops is retried into its backoff, and a backend that restarts on the same path serves again on its next connect.
-Requests go to the member holding the fewest connections, which is the only load signal available locally, and a failed member is retried after 1, 2, 4, 8, 16 and then 30 seconds so a restarting backend is not hammered.
+Requests go to the members in turn, so each member takes the same share of the load however long the others take to answer.
+A request whose connect fails tries the next member, so a stopped backend costs one refused connect and does not fail the request.
+A backend that restarts on the same path serves again on its next turn.
 
 ---
 

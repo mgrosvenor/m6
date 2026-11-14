@@ -886,15 +886,6 @@ impl Upstream {
         self.reusable && self.request_finished
     }
 
-    /// Whether the whole request was written to the socket.
-    ///
-    /// False when the peer stopped accepting bytes. A backend that rejects an
-    /// oversized request closes with most of it still unread, so the failure
-    /// that follows is a refusal and says nothing about the member's health.
-    pub fn request_written(&self) -> bool {
-        self.request_finished
-    }
-
     /// Drop the connection (closes the socket). The buffers stay, including the
     /// last address, so the next connect reuses its allocation.
     pub fn close(&mut self) {
