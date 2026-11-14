@@ -1310,7 +1310,7 @@ impl FrameworkState {
         resp: &mut Response,
         dict: &Dict,
     ) -> std::result::Result<(), RenderError> {
-        if let Some(template_name) = resp.template_name.clone() {
+        if let Some(template_name) = resp.template_name.take() {
             // No copy on the common path. A response that supplied its own
             // context is rendered against that; one that did not is rendered
             // against the request's dictionary, which is this argument. Cloning
@@ -1326,7 +1326,6 @@ impl FrameworkState {
                 "Content-Type".to_string(),
                 "text/html; charset=utf-8".to_string(),
             ));
-            resp.template_name = None;
             resp.template_dict = None;
         }
         Ok(())
