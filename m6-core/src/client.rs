@@ -235,6 +235,10 @@ pub struct Upstream {
     /// can arrive before the write finishes; reuse then truncates the request
     /// and desynchronises the backend, so reuse requires this.
     request_finished: bool,
+    /// The peer stopped accepting request bytes (EPIPE or ECONNRESET) before
+    /// the request was written. Its reply may still be waiting, so only the
+    /// read side continues and the connection is never reusable.
+    write_failed: bool,
     /// Test seam: when set, the next `write_tls` on this connection reports a
     /// WouldBlock once. Per-connection, so the parallel test runner cannot
     /// cross the flag between tests.
@@ -275,6 +279,7 @@ impl Upstream {
             method_is_head: false,
             reusable: false,
             request_finished: false,
+            write_failed: false,
             #[cfg(test)]
             block_next_write: std::cell::Cell::new(false),
             connected: None,
@@ -323,6 +328,7 @@ impl Upstream {
         self.method_is_head = method_is_head;
         self.reusable = false;
         self.request_finished = false;
+        self.write_failed = false;
 
         if can_reuse {
             self.phase = Phase::Transfer;
@@ -440,7 +446,9 @@ impl Upstream {
 
     /// Whether request bytes or TLS ciphertext are still owed to the socket.
     fn wants_write(&self) -> bool {
-        self.write_offset < self.request.len() || self.tls.as_ref().is_some_and(|t| t.wants_write())
+        !self.write_failed
+            && (self.write_offset < self.request.len()
+                || self.tls.as_ref().is_some_and(|t| t.wants_write()))
     }
 
     /// Do what can be done without blocking. Returns `Ok(true)` when the reply
@@ -520,8 +528,8 @@ impl Upstream {
     }
 
     /// Write what is left of the request. A backend may answer before it has
-    /// read the whole request (RFC 9110 6.1), so an EPIPE or ECONNRESET keeps
-    /// reading: the response is already waiting on the socket.
+    /// read the whole request (RFC 9110 6.1), so a write the peer refuses keeps
+    /// the read side going: the response may already be waiting on the socket.
     fn write_request(&mut self) -> io::Result<bool> {
         loop {
             let written = match (&mut self.tls, &mut self.stream) {
@@ -529,17 +537,18 @@ impl Upstream {
                     match tls.writer().write(&self.request[self.write_offset..]) {
                         Ok(n) => n,
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+                        Err(e) if write_refused(&e) => {
+                            self.write_failed = true;
+                            return Ok(true);
+                        }
                         Err(e) => return Err(e),
                     }
                 }
                 (None, Some(stream)) => match stream.write(&self.request[self.write_offset..]) {
                     Ok(n) => n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-                    Err(e)
-                        if e.kind() == io::ErrorKind::BrokenPipe
-                            || e.kind() == io::ErrorKind::ConnectionReset =>
-                    {
-                        self.write_offset = self.request.len();
+                    Err(e) if write_refused(&e) => {
+                        self.write_failed = true;
                         return Ok(true);
                     }
                     Err(e) => return Err(e),
@@ -551,37 +560,44 @@ impl Upstream {
             if self.write_offset >= self.request.len() {
                 // Flush any TLS ciphertext that is still buffered. If it would
                 // block, report it so a later drive retries the flush.
-                if let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) {
-                    #[cfg(test)]
-                    if !flush_tls(tls, stream, &self.block_next_write)? {
-                        return Ok(false);
-                    }
-                    #[cfg(not(test))]
-                    if !flush_tls(tls, stream)? {
-                        return Ok(false);
-                    }
+                if !self.flush_request()? || self.write_failed {
+                    return Ok(self.write_failed);
                 }
                 self.request_finished = true;
                 return Ok(true);
             }
             if self.tls.is_some() {
                 // Flush the ciphertext so the plaintext buffer drains, then loop.
-                let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) else {
-                    return Ok(true);
-                };
-                #[cfg(test)]
-                if !flush_tls(tls, stream, &self.block_next_write)? {
-                    return Ok(false);
-                }
-                #[cfg(not(test))]
-                if !flush_tls(tls, stream)? {
-                    return Ok(false);
+                if !self.flush_request()? || self.write_failed {
+                    return Ok(self.write_failed);
                 }
                 if written == 0 {
                     // The plaintext buffer is full and nothing was flushed.
                     return Ok(false);
                 }
             }
+        }
+    }
+
+    /// Flush pending TLS ciphertext to the socket. Returns `Ok(false)` when the
+    /// socket would block, and `Ok(true)` once it is flushed or the peer has
+    /// refused the write. A refusal sets `write_failed`, so the request is
+    /// abandoned and only the reply is read from there on.
+    fn flush_request(&mut self) -> io::Result<bool> {
+        let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) else {
+            return Ok(true);
+        };
+        #[cfg(test)]
+        let flushed = flush_tls(tls, stream, &self.block_next_write);
+        #[cfg(not(test))]
+        let flushed = flush_tls(tls, stream);
+        match flushed {
+            Ok(flushed) => Ok(flushed),
+            Err(e) if write_refused(&e) => {
+                self.write_failed = true;
+                Ok(true)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -910,6 +926,16 @@ impl Upstream {
 /// depending on the platform.
 fn connect_in_progress(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EINPROGRESS)
+}
+
+/// Whether a write error means the peer stopped accepting request bytes. A
+/// backend that answers early closes without reading the rest of the request,
+/// and its reply is still readable, so the error only ends the write side.
+fn write_refused(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
 }
 
 // Test seam (per-connection): when the caller's `block_next_write` flag is set,
@@ -1860,6 +1886,82 @@ mod socket_tests {
         assert!(
             accept_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "the second start must reconnect, not reuse"
+        );
+        peer.join().expect("peer");
+    }
+
+    /// A TLS backend that answers before reading the whole request closes the
+    /// write side. The complete reply it wrote is still read and returned, and
+    /// the connection is never reused.
+    #[test]
+    fn a_tls_backend_that_answers_early_is_read_while_writing() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(server).expect("server conn");
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            // Read the head and about 1 KiB of the body, then answer and close
+            // with most of the request still unwritten.
+            let mut got = 0usize;
+            let mut buf = [0u8; 4096];
+            while got < 1024 {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got += n,
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrefused",
+            );
+            let _ = stream.flush();
+        });
+
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
+        let tls = TlsClient {
+            config: client,
+            name,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut up = Upstream::new(64 * 1024, 64 * 1024);
+        let req = up.request_buf();
+        req.extend_from_slice(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\
+              Connection: close\r\n\r\n",
+        );
+        req.extend(std::iter::repeat_n(b'x', 1_048_576));
+        up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
+            .expect("start");
+        let (status, _, body) = drive_to_completion(&mut up)
+            .expect("the early reply is forwarded, not the write error");
+        assert_eq!((status, body.as_slice()), (413, &b"refused"[..]));
+        assert!(!up.reusable(), "an early reply must not be reused");
+        assert!(
+            !up.request_written(),
+            "the whole request never reached the backend"
         );
         peer.join().expect("peer");
     }
