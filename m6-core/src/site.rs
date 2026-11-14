@@ -1551,22 +1551,16 @@ impl FrameworkState {
         } else {
             Map::new()
         };
-        dict.insert("cookies".to_string(), Value::Object(cookies_map.clone()));
+        dict.insert("cookies".to_string(), Value::Object(cookies_map));
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
-        let now = chrono::Utc::now();
+        let (datetime, year) = Self::builtin_dates(chrono::Utc::now());
         dict.insert(
             "request_path".to_string(),
             Value::String(raw.path().to_string()),
         );
-        dict.insert(
-            "datetime".to_string(),
-            Value::String(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        );
-        dict.insert(
-            "year".to_string(),
-            Value::String(now.format("%Y").to_string()),
-        );
+        dict.insert("datetime".to_string(), Value::String(datetime));
+        dict.insert("year".to_string(), Value::String(year));
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -1579,9 +1573,17 @@ impl FrameworkState {
         // 10. Error keys (from query params — already merged in step 5, but highlight here).
 
         // 11. Flash message: verify HMAC, add to dict if valid, clear cookie.
+        // Read back through the dictionary: `Dict::get` returns the overlay
+        // first, and the map inserted in step 7 is in it. The verified message
+        // is owned, so the borrow of `dict` ends before the insert.
         #[cfg(feature = "flash")]
-        if let Some(flash_cookie) = cookies_map.get("_flash").and_then(|v| v.as_str()) {
-            if let Some(msg) = verify_flash_cookie(flash_cookie, &self.flash_secret) {
+        {
+            let message = dict
+                .get("cookies")
+                .and_then(|cookies| cookies.get("_flash"))
+                .and_then(|v| v.as_str())
+                .and_then(|flash_cookie| verify_flash_cookie(flash_cookie, &self.flash_secret));
+            if let Some(msg) = message {
                 dict.insert("flash".to_string(), Value::String(msg));
             }
         }
@@ -1613,6 +1615,16 @@ impl FrameworkState {
         Ok(dict)
     }
 
+    /// The two built-in date values: RFC 3339 in UTC to the second, and the
+    /// four-digit year. No format string is parsed on the request path.
+    fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+        use chrono::Datelike as _;
+        (
+            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            now.year().to_string(),
+        )
+    }
+
     /// Render a template response.
     ///
     /// Builds the context as a plain `Map` rather than an engine type: the
@@ -1628,7 +1640,7 @@ impl FrameworkState {
         resp: &mut Response,
         dict: &Dict,
     ) -> std::result::Result<(), RenderError> {
-        if let Some(template_name) = resp.template_name.clone() {
+        if let Some(template_name) = resp.template_name.take() {
             // No copy on the common path. A response that supplied its own
             // context is rendered against that; one that did not is rendered
             // against the request's dictionary, which is this argument. Cloning
@@ -1644,10 +1656,34 @@ impl FrameworkState {
                 "Content-Type".to_string(),
                 "text/html; charset=utf-8".to_string(),
             ));
-            resp.template_name = None;
             resp.template_dict = None;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod builtin_dates_tests {
+    use super::FrameworkState;
+
+    /// The built-in dates keep the shape templates already read:
+    /// `%Y-%m-%dT%H:%M:%SZ` and `%Y`. Pinned here so a change to how they are
+    /// formatted cannot drift from what a template sees.
+    #[test]
+    fn builtin_dates_keep_their_format() {
+        use chrono::TimeZone as _;
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let (datetime, year) = FrameworkState::builtin_dates(now);
+        assert_eq!(datetime, "2026-01-02T03:04:05Z");
+        assert_eq!(year, "2026");
+
+        let last = chrono::Utc
+            .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+            .unwrap();
+        let (datetime, year) = FrameworkState::builtin_dates(last);
+        assert_eq!(datetime, "9999-12-31T23:59:59Z");
+        assert_eq!(year, "9999");
     }
 }
 
