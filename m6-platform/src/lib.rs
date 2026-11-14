@@ -363,17 +363,19 @@ impl ChildExit {
         self.inner.raw_fd()
     }
 
-    /// The child's exit status, collected without blocking. Call once the
-    /// descriptor was reported readable: before the child has exited this
-    /// returns `WouldBlock`.
+    /// The child's exit status. Call only once the descriptor was reported
+    /// readable. The report can come a moment before the kernel makes the
+    /// child waitable (macOS posts `NOTE_EXIT` first, and a child whose
+    /// output has closed may still be exiting when the exit is armed), so
+    /// this waits for that moment, which is bounded by the exit already
+    /// under way. Called before the child exits, it blocks until it does.
     pub fn reap(&mut self) -> io::Result<std::process::ExitStatus> {
-        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        use nix::sys::wait::{waitpid, WaitStatus};
         use std::os::unix::process::ExitStatusExt;
         let pid = nix::unistd::Pid::from_raw(self.pid as i32);
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG))? {
+        match waitpid(pid, None)? {
             WaitStatus::Exited(_, code) => Ok(ExitStatusExt::from_raw(code << 8)),
             WaitStatus::Signaled(_, sig, _) => Ok(ExitStatusExt::from_raw(sig as i32)),
-            WaitStatus::StillAlive => Err(io::ErrorKind::WouldBlock.into()),
             other => Err(io::Error::other(format!(
                 "child {} reported {other:?}, not an exit",
                 self.pid
