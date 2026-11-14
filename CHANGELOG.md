@@ -235,6 +235,8 @@ Comments only.
 
 **A backend reply reaches the client in the same loop turn it arrives.** Replies from socket backends and from the h2c and h2s upstream pools went over a channel that the client's connection checked only on its next wake-up. They are now written straight into the waiting HTTP/1.1, HTTP/2 or HTTP/3 stream, with no channel per request. A custom error page from a socket backend is fetched the same way.
 
+**A request's own code path went from 41 allocations to 29, and a rendered page from 52 to 51, against a target of zero.** Both counts are measured by the counting allocator, not estimated, and they only ever fall: a dependency update that moves one records the new count and the reason in its commit. What remains is rustls's buffer per encrypted record, the response's own buffers and what Tera does when it renders.
+
 **A cached HTTP/1.1 response is served without heap allocation in m6-http's own code.** The request was copied into owned strings, and the cached headers and body were copied and every header line formatted into a new buffer for each hit. The request is now parsed into slices of the connection's buffer, the cached entry is shared rather than copied, and the response head is written straight into the connection's output buffer, which is allocated once per connection slot. TLS, logging and HTTP/2 and HTTP/3 hits still allocate and are handled separately.
 
 **m6-core: `config::secret_path` is the one absolute-path check every crate uses, and m6-auth-server's two path bases are gone (m6 #16). m6-monitor reads its fleet once at start, so a fleet it cannot read stops the start with exit 2.**

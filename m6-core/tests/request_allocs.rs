@@ -29,15 +29,21 @@ const BODY_LEN: usize = 64 * 1024;
 /// Measured on 2292e60 (the branch RS-1 left), before the copy was removed.
 const BASE_IDENTITY_DIFFERENCE: usize = 2;
 
-/// The allocations one `/ok` request makes with every removal in place. The
-/// count is deterministic for a given dependency set: a dependency update that
-/// moves it records the new count, with the reason, in that commit.
+/// The allocations one `/ok` request makes with every removal in place.
+///
+/// The target is zero, and this is today's count against it, so it may only
+/// ever be lowered: a change that raises it is refused rather than priced in.
+/// A dependency update that moves it down records the new number, with the
+/// reason, in that commit.
 const HANDLER_BUDGET: usize = 29;
 
 /// The allocations one `/page` request makes with every removal in place.
+///
 /// `Site::handle` renders a template route itself, through `render_response`,
 /// and finishes the page in the same call, so this is the render path's only
-/// count in the suite. Restoring the template-name `.clone()` costs one more.
+/// count in the suite. The target is zero and this is today's count against
+/// it, so it may only ever be lowered, and ALLOC-3 carries the plan for the
+/// rest. Restoring the template-name `.clone()` costs one more.
 const TEMPLATE_BUDGET: usize = 51;
 
 const BIG: &[u8] = b"GET /big HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
