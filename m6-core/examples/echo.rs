@@ -83,6 +83,7 @@ fn main() -> io::Result<()> {
     let mut idle_timeouts = Timeouts::new(initial, idle);
     let mut events = Events::with_capacity(EVENTS);
     let mut accepting = true;
+    let mut turns: u64 = 0;
     let mut open = 0usize;
     // Set by a shutdown request: the time to give up on open connections.
     let mut drain_until: Option<Instant> = None;
@@ -110,6 +111,7 @@ fn main() -> io::Result<()> {
         }
         // The turn's one time: every deadline below sees the same clock.
         now = platform::now();
+        turns += 1;
         for ev in &events {
             match ev.token() {
                 // NEW CONNECTIONS: take a free slot for each, register it,
@@ -137,16 +139,11 @@ fn main() -> io::Result<()> {
                                     slots.free(taken.key);
                                     continue;
                                 }
-                                // Out of descriptors: give the slot back and
-                                // re-arm the listener, so the clients still
-                                // queued are accepted once one frees.
-                                net::Accept::Retry => {
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                net::Accept::Stop => {
                                     slots.free(taken.key);
-                                    poll.registry().reregister(
-                                        &mut listener,
-                                        LISTENER,
-                                        Interest::READABLE,
-                                    )?;
+                                    eprintln!("echo: accept error: {e}");
                                     break;
                                 }
                             },
@@ -242,7 +239,7 @@ fn main() -> io::Result<()> {
     let outside_growth =
         m6_core::testkit::alloc_count::now() - allocated_at_start - growth_allocations;
     eprintln!(
-        "stopping, {open} connection(s) open, {} slots, {outside_growth} allocation(s) during the run outside table growth",
+        "stopping, {open} connection(s) open, {} slots, {turns} turn(s), {outside_growth} allocation(s) during the run outside table growth",
         slots.len()
     );
     Ok(())

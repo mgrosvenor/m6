@@ -166,9 +166,13 @@ fn the_process_survives_every_signal_it_handles(
 // is the thing that fails, then restored.
 fn signals_new_refuses_an_unblocked_mask() {
     platform::unblock_for_test();
+    // The refusal is expected, so its panic message stays off stderr.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
     let r = std::panic::catch_unwind(|| {
         let _ = Signals::new();
     });
+    std::panic::set_hook(hook);
     m6_platform::block();
     let payload = r.expect_err("S8: Signals::new must refuse an unblocked mask");
     let msg = payload

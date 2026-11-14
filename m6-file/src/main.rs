@@ -145,18 +145,11 @@ fn main() -> Result<()> {
                                     conns.free(taken.key);
                                     continue;
                                 }
-                                // Out of descriptors, or a failure: say so,
-                                // give the slot back and re-arm the listener,
-                                // so the clients still queued are accepted
-                                // once a descriptor frees.
-                                m6_core::platform::net::Accept::Retry => {
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                m6_core::platform::net::Accept::Stop => {
                                     conns.free(taken.key);
                                     eprintln!("m6-file: accept error: {e}");
-                                    poll.registry().reregister(
-                                        &mut listener,
-                                        LISTENER,
-                                        Interest::READABLE,
-                                    )?;
                                     break;
                                 }
                             },

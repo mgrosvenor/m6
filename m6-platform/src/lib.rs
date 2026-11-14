@@ -172,10 +172,20 @@ impl Registry {
 /// readable. For a blocking client, such as the benchmark tools, that waits on
 /// one socket at a time and must not pay a reactor per wait. Never in a loop.
 pub fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
-    let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-    let ms = u16::try_from(timeout.as_millis()).unwrap_or(u16::MAX);
-    let n = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(ms))?;
-    Ok(n > 0)
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // One `poll` takes at most 65535 ms: longer waits go round again.
+        let ms = u16::try_from(left.as_millis()).unwrap_or(u16::MAX);
+        let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
+        match nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(ms)) {
+            Ok(0) if left.as_millis() > u128::from(u16::MAX) => continue,
+            Ok(0) => return Ok(false),
+            Ok(_) => return Ok(true),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 // ── Time ─────────────────────────────────────────────────────────────────────
@@ -232,7 +242,6 @@ pub struct Signals(os::Signals);
 impl Signals {
     pub fn new() -> io::Result<Signals> {
         require_blocked();
-        managed().thread_block()?;
         Ok(Signals(os::Signals::new()?))
     }
 
@@ -284,10 +293,13 @@ fn signal_from_signo(signo: i32) -> Option<Signal> {
     }
 }
 
-/// Block the three signals in the calling thread. The first statement of every
-/// `main`, under the name `m6_core::signal::block`, which delegates here.
+/// Block the three signals in the calling thread, and mark every descriptor
+/// this process inherited close-on-exec. The first statement of every `main`,
+/// under the name `m6_core::signal::block`, which delegates here: both are
+/// facts about the process that are set once, while it is still one thread.
 pub fn block() {
     let _ = managed().thread_block();
+    let _ = process::close_inherited_on_exec();
 }
 
 /// Unblock the three signals in the calling thread, so a test can prove the
@@ -314,26 +326,6 @@ pub fn require_blocked() {
          kernel delivers SIGTERM at the default disposition, and the process \
          dies instead of the loop reading the shutdown request."
     );
-}
-
-/// Block until one of the three signals arrives and say which request it is.
-/// For m6-core's `ShutdownHandle` thread only, which a later job deletes.
-pub fn wait_for_signal() -> io::Result<Signal> {
-    loop {
-        let sig = managed().wait()?;
-        if let Some(s) = signal_from_signo(sig as i32) {
-            return Ok(s);
-        }
-    }
-}
-
-/// Write one byte to `fd`, to wake a reactor parked on the other end of a
-/// pipe. A full pipe is fine: bytes already pending mean the wake is already
-/// going to happen.
-pub fn write_wake_byte(fd: RawFd) {
-    // SAFETY: the caller owns `fd` and keeps it open for the process.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let _ = nix::unistd::write(borrowed, &[1u8]);
 }
 
 // ── A child process's exit ───────────────────────────────────────────────────
@@ -370,17 +362,19 @@ impl ChildExit {
         self.inner.raw_fd()
     }
 
-    /// The child's exit status, collected without blocking. Call once the
-    /// descriptor was reported readable: before the child has exited this
-    /// returns `WouldBlock`.
+    /// The child's exit status. Call only once the descriptor was reported
+    /// readable. The report can come a moment before the kernel makes the
+    /// child waitable (macOS posts `NOTE_EXIT` first, and a child whose
+    /// output has closed may still be exiting when the exit is armed), so
+    /// this waits for that moment, which is bounded by the exit already
+    /// under way. Called before the child exits, it blocks until it does.
     pub fn reap(&mut self) -> io::Result<std::process::ExitStatus> {
-        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        use nix::sys::wait::{waitpid, WaitStatus};
         use std::os::unix::process::ExitStatusExt;
         let pid = nix::unistd::Pid::from_raw(self.pid as i32);
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG))? {
+        match waitpid(pid, None)? {
             WaitStatus::Exited(_, code) => Ok(ExitStatusExt::from_raw(code << 8)),
             WaitStatus::Signaled(_, sig, _) => Ok(ExitStatusExt::from_raw(sig as i32)),
-            WaitStatus::StillAlive => Err(io::ErrorKind::WouldBlock.into()),
             other => Err(io::Error::other(format!(
                 "child {} reported {other:?}, not an exit",
                 self.pid

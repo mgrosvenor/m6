@@ -117,7 +117,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Building a service** | `site` | `Site`, `CodeRoute`, `Handled` and `RouteMethod`, the route table, the request dictionary and the site-wide finish. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `socket_path_from_config` and the blocking request and response adapters the benchmarks use. |
-| | `signal` | `block()`, `Lifecycle`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
+| | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
@@ -242,11 +242,10 @@ A service's loop uses `h1::ServerConn` instead.
 **`signal::block()` must be the first statement of every `main`.**
 Blocking a signal is per-thread and threads inherit the mask at creation, so a `main` that starts a thread before blocking has a thread with SIGTERM unblocked.
 The kernel delivers process-directed SIGTERM there, and the default disposition kills the process instead of the loop reading the shutdown request.
-`platform::Signals::new` refuses to open the descriptor without the mask, and the refusal names the rule.
 A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
 
-`ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up the handler, and it asserts that the mask is set and refuses to start otherwise.
-`complete()`, `is_shutdown()` and `wait()` are the lifecycle.
+`Signals::new()` asserts that the mask is set and refuses to start otherwise.
+`Lifecycle::on_signal` decides what each signal means and `complete()` ends the lifecycle.
 
 The reload signal is SIGUSR1 (`platform::Signal::ReopenLogs`).
 `block()` blocks it with SIGTERM and SIGINT, and a service's loop reads it from the same descriptor.
@@ -422,6 +421,11 @@ Eight or more sites across the workspace wrote `.find(|(k, _)| k.eq_ignore_ascii
 `NEVER_COMBINED` is the list and `set-cookie` is on it: *RFC* (Request for Comments) 6265 3 is explicit that cookie values may contain commas, so joining two `Set-Cookie` lines produces one malformed cookie and silently loses the other.
 `may_combine(name)` asks in advance.
 
+The module also defines the two request-head limits every protocol and service shares.
+`MAX_HEADER_LINE` is 8 KiB for one field, and `MAX_REQUEST_HEAD` is 32 KiB for the request line plus every field.
+Both are the numbers nginx, Varnish and Apache use, and the module doc names each setting.
+`request_line_len(method, target)` counts a request line, and `field_over_limit(name, value)` answers the field question.
+
 ### 5.5. `cookie`
 
 `Cookie::new(name, value)` then `.max_age()`, `.path()`, `.domain()`, `.secure()`, `.http_only()`, `.same_site(SameSite::...)`, then `to_header_value()` or `to_header()`.
@@ -575,15 +579,17 @@ logic of its own. It takes `Write` as well as `Read` because a client that sent
 `Expect: 100-continue` will not send its body until told to, and answering that
 has to happen before the read that would otherwise deadlock.
 
-Two caps, guarding different things: 8 KB of head, then 16 MB of body. It used
-to read one byte per `read()` call, measured at 377 syscalls for an ordinary
-browser's 377-byte request head, because `server` hands it a raw `UnixStream`
-with nothing buffering.
+Two bounds, guarding different things: `MAX_REQUEST_HEAD` of head through the
+shared parser, then 16 MB of body. It reads in chunks rather than one byte per
+`read()` call, because `server` hands it a raw `UnixStream` with nothing
+buffering.
 
 The benchmarks and `m6-file`'s `query_of` test drive it. A service's loop frames
 requests with `h1::ServerConn`.
 
-`ParseError::status()` and `.reason()` give the response for a parse failure.
+`ParseError::status()` and `.reason()` give the response for a parse failure,
+including 414 for a request line over `MAX_HEADER_LINE` and 400 for a field or
+a head over its limit.
 
 ### 6.3. `conditional`
 

@@ -603,15 +603,16 @@ fn keep_alive_and_the_request_cap() -> bool {
 }
 
 fn parse_errors_answer_as_today() -> bool {
-    // Header too large: 413, as `parse.rs` answers a head over its cap.
+    // Header too large: 400, the same answer the edge gives. 413 means the
+    // body, and a head over its limit is not the body.
     {
         let mut h = harness();
-        // A complete head over the cap is accepted today (the cap is on an
-        // unfinished head), so this one never sends the blank line.
+        // An unfinished head over the 32 KiB cap: the refusal arrives before
+        // the blank line does, which is the bound the process needs.
         let mut request = b"GET /x HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        // Over the 8 KiB head cap and under the 64 header slots, so the
+        // Over the 32 KiB head cap and under the 64 header slots, so the
         // refusal is the size cap rather than the header count.
-        for i in 0..12 {
+        for i in 0..45 {
             request.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "a".repeat(800)).as_bytes());
         }
         let mut writer = h.client.try_clone().expect("a client clone");
@@ -638,7 +639,7 @@ fn parse_errors_answer_as_today() -> bool {
         let mut response = [0u8; 4096];
         let n = h.client.read(&mut response).expect("read the refusal");
         let text = String::from_utf8_lossy(&response[..n]).to_string();
-        if flush != Flush::Close || !text.starts_with("HTTP/1.1 413 Payload Too Large\r\n") {
+        if flush != Flush::Close || !text.starts_with("HTTP/1.1 400 Bad Request\r\n") {
             println!("  header too large: {flush:?} {text:?}");
             return false;
         }

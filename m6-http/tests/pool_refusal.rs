@@ -24,13 +24,12 @@ use std::time::Duration;
 use m6_core::testkit::{binary, claim_port, read_one, Service};
 use m6_http_lib::probe;
 
-/// The largest request head the test backend accepts, mirroring the 8 KiB cap
-/// in the blocking parser a backend service runs.
-const HEAD_CAP: usize = 8 * 1024;
+/// The largest request head the test backend reads, as a backend's parser does.
+const HEAD_CAP: usize = m6_core::headers::MAX_REQUEST_HEAD;
 
-/// A backend that reads a request head up to `HEAD_CAP` and closes, without a
-/// reply and without draining the rest of the request, when the head is larger
-/// than that. Every other request is answered.
+/// A backend that reads a request head and closes, without a reply and without
+/// draining the rest of the request, when the target is `/public/refused.txt`.
+/// Every other request is answered.
 struct Backend {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -78,9 +77,9 @@ fn spawn_accept(listener: UnixListener, stop: Arc<AtomicBool>) -> std::thread::J
     })
 }
 
-/// Read the head byte by byte. A head over the cap is a request this backend
-/// refuses: it closes with the rest of the request unread, the state `m6-file`
-/// leaves when it rejects an oversized header.
+/// Read the head byte by byte. The refused target is a request this backend
+/// refuses: it closes with the body unread, the state `m6-file` leaves when it
+/// rejects a request body over its cap.
 fn serve(mut stream: UnixStream) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -92,6 +91,9 @@ fn serve(mut stream: UnixStream) {
             Ok(0) | Err(_) => return,
             Ok(_) => head.push(byte[0]),
         }
+    }
+    if head.starts_with(b"POST /public/refused.txt") {
+        return;
     }
     let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
     let _ = stream.write_all(resp);
@@ -146,9 +148,9 @@ fn system_toml(bind_port: u16, cert: &str, key: &str) -> String {
 /// A backend that refuses a request by closing while the request is still being
 /// written must not back its member off: the next ordinary request is served.
 ///
-/// The order is driven explicitly: the first request's head is larger than the
-/// backend's cap, so the backend reads its cap and closes while `m6-http` still
-/// has request bytes to send. The second request then goes to the same member.
+/// The order is driven explicitly: the first request's body is large and the
+/// backend closes after its head, while `m6-http` still has request bytes to
+/// send. The second request then goes to the same member.
 #[test]
 fn a_backend_that_closes_while_the_request_is_written_does_not_take_the_pool_down() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -197,11 +199,10 @@ fn a_backend_that_closes_while_the_request_is_written_does_not_take_the_pool_dow
         http.output()
     );
 
-    // A head of 1 MiB: m6-http forwards it, the backend reads its 8 KiB cap
-    // and closes with most of the request still unwritten.
-    let mut big = b"GET /public/refused.txt HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
+    // A body of 1 MiB: m6-http forwards it, the backend closes after the head
+    // with most of the request still unwritten.
+    let mut big = b"POST /public/refused.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n".to_vec();
     big.extend(std::iter::repeat_n(b'A', 1024 * 1024));
-    big.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     let first = send(port, &big);
     let first_status = status(&first);
     assert!(

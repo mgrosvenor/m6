@@ -12,13 +12,12 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
 use super::host::{
-    DiskIo, FileDescriptors, LoadAverage, Memory, MemorySource, NetDevice, Pressure, TcpHealth,
-    ThermalZone,
+    DiskIo, LoadAverage, Memory, MemorySource, NetDevice, Pressure, TcpHealth, ThermalZone,
 };
 use super::Signal;
 
 /// A zero timeout, for the drains below.
-const NOW: libc::timespec = libc::timespec {
+const NOW: nix::libc::timespec = nix::libc::timespec {
     tv_sec: 0,
     tv_nsec: 0,
 };
@@ -44,7 +43,7 @@ impl Signals {
         let kq = Kqueue::new()?;
         for sig in super::managed().iter() {
             let ev = KEvent::new(
-                sig as libc::c_int as libc::uintptr_t,
+                sig as usize,
                 EventFilter::EVFILT_SIGNAL,
                 EvFlags::EV_ADD | EvFlags::EV_ENABLE,
                 FilterFlag::empty(),
@@ -109,7 +108,7 @@ impl ChildExit {
     pub(super) fn new(pid: u32) -> io::Result<ChildExit> {
         let kq = Kqueue::new()?;
         let exit = KEvent::new(
-            pid as libc::uintptr_t,
+            pid as usize,
             EventFilter::EVFILT_PROC,
             EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_ONESHOT,
             FilterFlag::NOTE_EXIT,
@@ -120,7 +119,7 @@ impl ChildExit {
             Ok(_) => {}
             Err(nix::errno::Errno::ESRCH) => {
                 let already = KEvent::new(
-                    pid as libc::uintptr_t,
+                    pid as usize,
                     EventFilter::EVFILT_USER,
                     EvFlags::EV_ADD | EvFlags::EV_ENABLE,
                     FilterFlag::NOTE_TRIGGER,
@@ -156,90 +155,57 @@ pub(super) fn prepare_socket(sock: &socket2::Socket) -> io::Result<()> {
     sock.set_nosigpipe(true)
 }
 
-/// The kernel answers `ECONNREFUSED` for a full unix listen queue, the same
-/// answer it gives for a socket file whose listener is gone, and nothing tells
-/// the two apart. A refused connect must stay a refused connect, because a
-/// pool marks that member failed and fails over, so the error passes through
-/// and a full queue on macOS reads as a failed member for one backoff.
-pub(super) fn map_connect_unix_error(e: io::Error) -> io::Error {
-    e
-}
-
 /// The hard limit reads as unlimited and the kernel enforces
 /// `kern.maxfilesperproc`, so that is the cap.
 pub(super) fn max_open_files() -> io::Result<Option<u64>> {
-    let mut value: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
-    let name = c"kern.maxfilesperproc";
-    // SAFETY: `value` is a live `c_int` and `len` is its size, which is what
-    // `sysctlbyname` writes through those two pointers. The name is a NUL
-    // terminated C string that outlives the call.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            std::ptr::addr_of_mut!(value).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    use sysctl::Sysctl;
+    let value = sysctl::Ctl::new("kern.maxfilesperproc")
+        .and_then(|c| c.value())
+        .map_err(|e| io::Error::other(format!("kern.maxfilesperproc: {e}")))?;
+    match value {
+        sysctl::CtlValue::Int(n) => Ok(Some(n.max(0) as u64)),
+        sysctl::CtlValue::Uint(n) => Ok(Some(u64::from(n))),
+        sysctl::CtlValue::Long(n) => Ok(Some(n.max(0) as u64)),
+        sysctl::CtlValue::Ulong(n) => Ok(Some(n)),
+        other => Err(io::Error::other(format!(
+            "kern.maxfilesperproc is not a number: {other:?}"
+        ))),
     }
-    Ok(Some(value.max(0) as u64))
 }
 
-// ── Process facts ────────────────────────────────────────────────────────────
+// ── Process facts, through libproc ───────────────────────────────────────────
 
-/// `PROC_PIDLISTTHREADS` and `PROC_PIDLISTFDS` from `<sys/proc_info.h>`.
-const PROC_PIDLISTTHREADS: libc::c_int = 6;
-const PROC_PIDLISTFDS: libc::c_int = 1;
-/// The size of one `proc_fdinfo` record.
-const PROC_FDINFO_SIZE: usize = 8;
-
-/// `proc_pidinfo(pid, flavor)` into `buf`, returning the bytes written. `Err`
-/// for a pid that is gone, and `Ok(0)` for a buffer the kernel left empty.
-fn proc_pidinfo(pid: u32, flavor: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: `buf` is a live slice of exactly the length passed, and
-    // `proc_pidinfo` writes at most that many bytes into it.
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            flavor,
-            0,
-            buf.as_mut_ptr().cast(),
-            buf.len() as libc::c_int,
-        )
-    };
-    if bytes < 0 || (bytes == 0 && !super::process::is_alive(pid)) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no process with pid {pid}"),
-        ));
-    }
-    Ok(bytes as usize)
+/// The task information of `pid`. `NotFound` for a pid that is gone,
+/// `PermissionDenied` for a process that exists and is not ours to read.
+fn task_info(pid: u32) -> io::Result<libproc::task_info::TaskAllInfo> {
+    libproc::proc_pid::pidinfo::<libproc::task_info::TaskAllInfo>(pid as i32, 0).map_err(|e| {
+        if super::process::is_alive(pid) {
+            io::Error::new(io::ErrorKind::PermissionDenied, format!("pid {pid}: {e}"))
+        } else {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no process with pid {pid}"),
+            )
+        }
+    })
 }
 
 pub(super) fn thread_count(pid: u32) -> io::Result<usize> {
-    let mut ids = [0u8; 8 * 1024];
-    Ok(proc_pidinfo(pid, PROC_PIDLISTTHREADS, &mut ids)? / 8)
+    Ok(task_info(pid)?.ptinfo.pti_threadnum.max(0) as usize)
 }
 
+/// The open descriptors, listed: `pbi_nfiles` is the table's size, so the
+/// list is asked for up to that many and its length is the count.
 pub(super) fn open_descriptors(pid: u32) -> io::Result<usize> {
-    // A buffer the kernel fills to the brim held more entries than it could
-    // report, so it is doubled until it has room to spare.
-    let mut buf = vec![0u8; 512 * PROC_FDINFO_SIZE];
-    loop {
-        let bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, &mut buf)?;
-        if bytes < buf.len() {
-            return Ok(bytes / PROC_FDINFO_SIZE);
-        }
-        buf.resize(buf.len() * 2, 0);
-    }
+    let table = task_info(pid)?.pbsd.pbi_nfiles as usize;
+    let fds = libproc::proc_pid::listpidinfo::<libproc::file_info::ListFDs>(pid as i32, table)
+        .map_err(|e| io::Error::other(format!("pid {pid}: {e}")))?;
+    Ok(fds.len())
 }
 
 /// `lsof`, which every macOS has, listing the pid's listening TCP sockets. A
-/// missing `lsof` is the `Err`.
+/// missing `lsof` is the `Err`. libproc exposes a socket's state inside a C
+/// union, which would need `unsafe` to read, so the one line of `lsof` stays.
 pub(super) fn listens_on_tcp(pid: u32) -> io::Result<bool> {
     let out = std::process::Command::new("lsof")
         .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
@@ -288,16 +254,6 @@ pub(super) fn pressure(_resource: &str) -> Option<Pressure> {
 
 pub(super) fn tcp_health() -> Option<TcpHealth> {
     None
-}
-
-pub(super) fn file_descriptors() -> Option<FileDescriptors> {
-    let open = open_descriptors(std::process::id()).ok()? as u64;
-    let (soft, hard) = super::process::fd_limits().ok()?;
-    Some(FileDescriptors {
-        open,
-        soft_limit: soft,
-        hard_limit: hard,
-    })
 }
 
 pub(super) fn load_average() -> Option<LoadAverage> {

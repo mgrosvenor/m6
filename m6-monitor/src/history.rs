@@ -167,7 +167,7 @@
 //! when a node is down, which is when a history is wanted.
 //!
 //! To start fresh, stop the service, delete the file and start it again.
-//! Migration 1 is permanent: a later release adds columns in migration 2.
+//! Migrations 1 and 2 are permanent: a later release adds columns in migration 3.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -262,10 +262,24 @@ CREATE TABLE crawl_status (
   PRIMARY KEY (window_id, code)) STRICT, WITHOUT ROWID;
 ";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: SCHEMA_V1,
-}];
+/// The index the last-200 read answers from. Migration 2 adds it to a file
+/// made by release 1, and it holds only the rows that count as a 200, so the
+/// read touches one row per node however long the history is.
+const SCHEMA_V2: &str = "
+CREATE INDEX IF NOT EXISTS health_ok_node_at ON health (node_id, at_ms)
+  WHERE reachable = 1 AND status = 'ok';
+";
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        sql: SCHEMA_V2,
+    },
+];
 
 /// Lookup tables that are never pruned. `agent` is not here: a user agent is
 /// text a visitor chooses, so its rows go when no sighting names them.
@@ -742,6 +756,21 @@ impl Store {
         }
     }
 
+    /// When each node last answered `/health` with 200, by node name.
+    ///
+    /// One row per node, read from the partial index `health_ok_node_at`:
+    /// each node's newest row is the first entry of its range, so the cost is
+    /// the number of nodes and not the length of the history. It runs when the
+    /// digest is built, so the age the check prints is the age in the file
+    /// rather than a number kept in memory and able to drift from it.
+    fn last_ok_at(&self) -> rusqlite::Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(LAST_OK_SQL)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect();
+        rows
+    }
+
     /// Write one poll in one transaction, then prune. On error the caller drops
     /// this store, so a rolled-back id is never reused from a cache.
     fn write(&mut self, b: &Batch) -> anyhow::Result<Written> {
@@ -1059,6 +1088,31 @@ struct Status {
     newest_ms: Option<i64>,
 }
 
+/// The age of one node's last `/health` answer of 200, from the history.
+///
+/// A node missing from the list has never answered 200 in the history that is
+/// being kept, which the check reports as an absence rather than as an age.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LastOk {
+    pub node: String,
+    pub age_s: u64,
+}
+
+/// Each node's newest 200 row. The `WHERE` repeats the index's own, which is
+/// what lets the planner use the partial index.
+const LAST_OK_SQL: &str = "SELECT n.name, \
+    (SELECT h.at_ms FROM health h WHERE h.node_id = n.id AND h.reachable = 1 \
+       AND h.status = 'ok' ORDER BY h.at_ms DESC LIMIT 1) AS at_ms \
+    FROM node n WHERE at_ms IS NOT NULL";
+
+/// The wall clock in milliseconds. The one clock helper in the crate: the
+/// digest's ages, the poll's stamp and the tests all read it.
+pub(crate) fn now_ms() -> i64 {
+    m6_core::platform::wall()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// The history as the digest reports it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HistoryDigest {
@@ -1080,6 +1134,10 @@ pub struct HistoryDigest {
     pub dropped: u64,
     pub pruned: u64,
     pub last_error: Option<String>,
+    /// The age of each node's last 200. `None` when history is off or the
+    /// file could not be read, and `Some` with no entries when no node has
+    /// answered 200 in the history yet.
+    pub last_ok: Option<Vec<LastOk>>,
 }
 
 /// The history store, owned by the loop that writes it.
@@ -1143,7 +1201,27 @@ impl History {
                 .or_else(|| s.last_error.clone())
                 .or_else(|| s.prune_error.clone())
                 .or_else(|| s.over_cap.then(|| OVER_CAP.to_string())),
+            last_ok: self.last_ok(),
         }
+    }
+
+    /// The age of each node's last 200, read from the store.
+    ///
+    /// The history is the record of what the nodes answered, so the age comes
+    /// from the rows rather than from a counter the writer keeps: a row that
+    /// was pruned stops being a last 200, and the absence is then reported.
+    fn last_ok(&self) -> Option<Vec<LastOk>> {
+        let at = self.store.as_ref()?.last_ok_at().ok()?;
+        let now = now_ms();
+        let mut out: Vec<LastOk> = at
+            .into_iter()
+            .map(|(node, at_ms)| LastOk {
+                node,
+                age_s: u64::try_from(now.saturating_sub(at_ms)).unwrap_or(0) / 1000,
+            })
+            .collect();
+        out.sort_by(|a, b| a.node.cmp(&b.node));
+        Some(out)
     }
 
     /// Add one poll and write every held batch that will go.
@@ -2044,8 +2122,11 @@ mod tests {
             name: name.into(),
             role: "origin".into(),
             url: "http://x".into(),
-            health: None,
-            health_status: None,
+            health: Some(m6_core::monitoring::HealthReport {
+                status: "ok".into(),
+                node: name.into(),
+            }),
+            health_status: Some(200),
             perf: Some(p),
             perf_error: None,
             header_checks: vec![],
@@ -2087,7 +2168,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open(dir.path());
         assert!(cfg(dir.path(), 1).file.exists());
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 1);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 2);
         let mut stmt = s
             .conn
             .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%'")
@@ -2129,7 +2210,32 @@ mod tests {
         let s = open(dir.path());
         assert_eq!(count(&s, "poll"), 1);
         assert_eq!(count(&s, "health"), 1);
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 1);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 2);
+    }
+
+    /// The last-200 read is answered from the partial index. The plan must name
+    /// it and must not scan the health table, which grows with the history.
+    #[test]
+    fn the_last_ok_read_uses_the_partial_index_and_no_table_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        let mut stmt = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LAST_OK_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("health_ok_node_at"), "{plan}");
+        assert!(
+            !plan
+                .lines()
+                .any(|l| l.contains("SCAN h") || l.contains("SCAN health")),
+            "{plan}"
+        );
     }
 
     #[test]
@@ -2137,7 +2243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(open(dir.path()));
         let c = Connection::open(cfg(dir.path(), 1).file).unwrap();
-        c.pragma_update(None, "user_version", 2).unwrap();
+        c.pragma_update(None, "user_version", 3).unwrap();
         drop(c);
         let err = Store::open(&cfg(dir.path(), 1)).err().expect("refused");
         assert!(is_fatal(&err), "{err:#}");
@@ -2780,6 +2886,60 @@ mod tests {
         h.record(make(T0 + 2, &[reading("a")]));
         let d = h.digest();
         assert_eq!((d.state, d.writes, d.failures), ("ok", 2, 1));
+    }
+
+    /// The age of each node's last 200 is read from the rows, and a restarted
+    /// monitor reads the same answer out of the file.
+    #[test]
+    fn the_age_of_the_last_200_comes_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = history(cfg(dir.path(), 64));
+        let mut r = reading("origin");
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
+        let d = h.digest();
+        let last_ok = d.last_ok.clone().expect("the history was read");
+        assert_eq!(last_ok.len(), 1, "{last_ok:?}");
+        assert_eq!(last_ok[0].node, "origin");
+        assert!(
+            (300..=301).contains(&last_ok[0].age_s),
+            "300 seconds ago reads as {:?}",
+            last_ok[0]
+        );
+        // A new process asks the file the same question.
+        let reopened = start(Some(cfg(dir.path(), 64))).unwrap();
+        let again = reopened.digest().last_ok.expect("the history was read");
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].node, "origin");
+        assert!((300..=301).contains(&again[0].age_s), "{again:?}");
+    }
+
+    /// A degraded poll is not a 200, so the age keeps running from the last
+    /// answer that was.
+    #[test]
+    fn a_degraded_poll_does_not_reset_the_age_of_the_last_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = history(cfg(dir.path(), 64));
+        let mut r = reading("origin");
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
+        r.health = Some(m6_core::monitoring::HealthReport {
+            status: "degraded".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(503);
+        h.record(make(now_ms() - 1000, std::slice::from_ref(&r)));
+        let last_ok = h.digest().last_ok.expect("the history was read");
+        assert_eq!(last_ok.len(), 1, "{last_ok:?}");
+        assert!((300..=301).contains(&last_ok[0].age_s), "{last_ok:?}");
     }
 
     #[test]

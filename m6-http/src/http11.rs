@@ -283,9 +283,6 @@ pub struct Http11Listener {
     /// Reused buffer a drive reports its pending dispatches through, so a turn
     /// that parks a request allocates nothing.
     pending: Vec<PendingDispatch>,
-    /// An accept failed for want of a descriptor (or another failure) with
-    /// clients possibly still queued: the loop re-arms the listener.
-    starved: bool,
 }
 
 /// The connection table's starting size, shared by every owner in the process.
@@ -344,7 +341,6 @@ impl Http11Listener {
             conns: Slots::new(initial, ceiling, Conn::empty),
             max_requests,
             pending: Vec::with_capacity(8),
-            starved: false,
         })
     }
 
@@ -442,20 +438,13 @@ impl Http11Listener {
                 Err(e) => match m6_core::platform::net::accept_error(&e) {
                     m6_core::platform::net::Accept::Drained => return None,
                     m6_core::platform::net::Accept::SkipOne => continue,
-                    m6_core::platform::net::Accept::Retry => {
+                    m6_core::platform::net::Accept::Stop => {
                         warn!("tcp accept: {e}");
-                        self.starved = true;
                         return None;
                     }
                 },
             }
         }
-    }
-
-    /// Whether the last accept pass stopped for want of a descriptor, once:
-    /// the loop then re-registers the listener so queued clients are retried.
-    pub fn take_starved(&mut self) -> bool {
-        std::mem::take(&mut self.starved)
     }
 
     /// Drive one connection. Returns what happened, so the loop can manage the
@@ -712,8 +701,6 @@ pub struct H2cListener {
     /// edge-triggered, so the listener will not be reported again for them:
     /// the loop reads this and drains before its next wait.
     accept_again: bool,
-    /// As [`Http11Listener::starved`].
-    starved: bool,
     /// Reused buffer a drive reports its pending dispatches through, so a turn
     /// that parks a request allocates nothing.
     pending: Vec<PendingDispatch>,
@@ -918,7 +905,6 @@ impl H2cListener {
             peers: internal_peers,
             refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
             accept_again: false,
-            starved: false,
             pending: Vec::with_capacity(8),
         })
     }
@@ -1003,18 +989,12 @@ impl H2cListener {
                 m6_core::platform::net::Accept::Drained => H2cAccept::WouldBlock,
                 // Gone before it was accepted: counted and passed over.
                 m6_core::platform::net::Accept::SkipOne => H2cAccept::Refused,
-                m6_core::platform::net::Accept::Retry => {
+                m6_core::platform::net::Accept::Stop => {
                     warn!("h2c accept: {e}");
-                    self.starved = true;
                     H2cAccept::WouldBlock
                 }
             },
         }
-    }
-
-    /// As [`Http11Listener::take_starved`].
-    pub fn take_starved(&mut self) -> bool {
-        std::mem::take(&mut self.starved)
     }
 
     /// Accept and admit up to `max` connections, refused ones included. Each
@@ -1457,6 +1437,28 @@ fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
     false
 }
 
+/// The response a malformed request keeps: a bare 400 and close.
+const BAD_REQUEST: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// The raw HTTP/1.1 response for a request refused at a head limit.
+///
+/// The body is the service's usual error page, titled as nginx titles these
+/// refusals. No `Server` header is added: the answer is about the request and
+/// the status is the whole message.
+fn head_refusal_response(why: m6_core::h1::HeadError) -> Vec<u8> {
+    let status = why.status();
+    let body = crate::error::refusal_body(status);
+    let reason = m6_core::h1::status_reason(status);
+    let mut out = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&body);
+    out
+}
+
 #[allow(clippy::too_many_arguments)] // transport, connection, state and the two dispatch closures
 fn drive_h1<S, FH, FO>(
     io: &mut H1Io<'_>,
@@ -1538,6 +1540,21 @@ fn drive_h1<S, FH, FO>(
                 };
                 match parsed {
                     HeadResult::Incomplete => {
+                        // A head that has already passed a limit is refused
+                        // without waiting for the blank line that would
+                        // complete it, so a peer cannot make the process buffer
+                        // an unbounded head while it decides.
+                        let refusal = match &h1.state {
+                            H1State::Reading { buf } => m6_core::h1::incomplete_head_status(buf),
+                            _ => None,
+                        };
+                        if let Some(why) = refusal {
+                            h1.state = H1State::Writing {
+                                buf: head_refusal_response(why),
+                                pos: 0,
+                            };
+                            continue;
+                        }
                         // The head may be complete even though the message is
                         // not, and a client that sent `Expect: 100-continue` is
                         // holding its body back until we answer. `handle_expect`
@@ -1552,10 +1569,17 @@ fn drive_h1<S, FH, FO>(
                         }
                         continue;
                     }
-                    HeadResult::Error => {
-                        let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    // A malformed head keeps the answer it has always had.
+                    HeadResult::Error(m6_core::h1::HeadError::Malformed) => {
                         h1.state = H1State::Writing {
-                            buf: resp.to_vec(),
+                            buf: BAD_REQUEST.to_vec(),
+                            pos: 0,
+                        };
+                        continue;
+                    }
+                    HeadResult::Error(why) => {
+                        h1.state = H1State::Writing {
+                            buf: head_refusal_response(why),
                             pos: 0,
                         };
                         continue;
@@ -1581,10 +1605,16 @@ fn drive_h1<S, FH, FO>(
                                     }
                                     continue;
                                 }
-                                ParseResult::Error => {
-                                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                ParseResult::Error(m6_core::h1::HeadError::Malformed) => {
                                     h1.state = H1State::Writing {
-                                        buf: resp.to_vec(),
+                                        buf: BAD_REQUEST.to_vec(),
+                                        pos: 0,
+                                    };
+                                    continue;
+                                }
+                                ParseResult::Error(why) => {
+                                    h1.state = H1State::Writing {
+                                        buf: head_refusal_response(why),
                                         pos: 0,
                                     };
                                     continue;
@@ -1896,7 +1926,7 @@ pub(crate) fn drain_tls_plaintext(
 // h1spec (27/32 against 15, 15 and 14), which is why it is the one that
 // survived -- but it survived by being *moved*, not duplicated, and leaving
 // the original here would have kept two copies free to drift apart again.
-pub use m6_core::h1::{parse_head, parse_request, HeadResult, ParseResult, RequestHead};
+pub use m6_core::h1::{parse_head, parse_request, HeadError, HeadResult, ParseResult, RequestHead};
 
 // ── Response serialiser ───────────────────────────────────────────────────────
 

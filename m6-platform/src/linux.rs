@@ -9,10 +9,9 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use super::host::{
-    parse_cgroup_memory, parse_diskstats, parse_fd_limits, parse_loadavg, parse_meminfo,
-    parse_net_dev, parse_netstat, parse_pressure, parse_sockstat_into, parse_thermal_millidegrees,
-    parse_uptime, DiskIo, FileDescriptors, LoadAverage, Memory, NetDevice, Pressure, TcpHealth,
-    ThermalZone,
+    parse_cgroup_memory, parse_diskstats, parse_loadavg, parse_meminfo, parse_net_dev,
+    parse_netstat, parse_pressure, parse_sockstat_into, parse_thermal_millidegrees, parse_uptime,
+    DiskIo, LoadAverage, Memory, NetDevice, Pressure, TcpHealth, ThermalZone,
 };
 use super::Signal;
 
@@ -89,11 +88,6 @@ pub(super) fn prepare_socket(_sock: &socket2::Socket) -> io::Result<()> {
     Ok(())
 }
 
-/// A full unix listen queue is `EAGAIN`, which is already `WouldBlock`.
-pub(super) fn map_connect_unix_error(e: io::Error) -> io::Error {
-    e
-}
-
 /// The kernel enforces the hard limit as read, so there is no cap below it.
 pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     Ok(None)
@@ -167,16 +161,6 @@ pub(super) fn tcp_health() -> Option<TcpHealth> {
         parse_sockstat_into(&s, &mut t);
     }
     Some(t)
-}
-
-pub(super) fn file_descriptors() -> Option<FileDescriptors> {
-    let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
-    let (soft, hard) = parse_fd_limits(&std::fs::read_to_string("/proc/self/limits").ok()?)?;
-    Some(FileDescriptors {
-        open,
-        soft_limit: soft,
-        hard_limit: hard,
-    })
 }
 
 pub(super) fn load_average() -> Option<LoadAverage> {

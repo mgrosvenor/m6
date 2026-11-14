@@ -23,16 +23,49 @@ use super::os;
 
 /// A non-blocking unix listener. Start only.
 ///
-/// Removes a stale socket file left by a previous process, creates the parent
-/// directory, binds and sets `mode`. A path at or over
-/// [`super::MAX_SOCKET_PATH`] fails before the system call with the path and
-/// the limit in the message. Every failure is an `Err` the caller turns into
-/// exit 2: a socket with a mode nobody chose is a socket nobody can reason
-/// about.
+/// A socket file left by a process that is gone is removed, the parent
+/// directory is created, the socket is bound and `mode` set. A socket file
+/// something still listens on is `AddrInUse` naming the path: a second
+/// instance never unlinks a live listener's socket. A path that holds
+/// something other than a socket is `AlreadyExists` naming what is there. A
+/// path at or over [`super::MAX_SOCKET_PATH`] fails before the system call
+/// with the path and the limit in the message. Every failure is an `Err` the
+/// caller turns into exit 2.
 pub fn bind_unix(path: &Path, mode: u32) -> io::Result<UnixListener> {
+    use std::os::unix::fs::FileTypeExt;
     super::check_socket_path(path)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_socket() {
+            let what = if meta.is_dir() {
+                "a directory"
+            } else {
+                "a file"
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is {what}, not a socket", path.display()),
+            ));
+        }
+        match connect_unix(path) {
+            // Answered, or alive and busy: someone listens there.
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("another process listens on {}", path.display()),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("another process listens on {}", path.display()),
+                ))
+            }
+            // Nobody listens: a stale file from a process that is gone.
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path)?;
+            }
+            Err(e) => return Err(e),
+        }
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -84,8 +117,7 @@ pub fn connect_unix(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
     os::prepare_socket(&sock)?;
     sock.set_nonblocking(true)?;
-    sock.connect(&socket2::SockAddr::unix(path)?)
-        .map_err(os::map_connect_unix_error)?;
+    sock.connect(&socket2::SockAddr::unix(path)?)?;
     Ok(OwnedFd::from(sock).into())
 }
 
@@ -130,20 +162,16 @@ fn connect_in_progress(e: &io::Error) -> bool {
 ///
 /// The loop drains the listener to [`Accept::Drained`]. [`Accept::SkipOne`]
 /// is a connection that went away before it was accepted (`ECONNABORTED`) or
-/// an interrupted call: keep draining. [`Accept::Retry`] is a shortage of
-/// descriptors (`EMFILE`, `ENFILE`) or any other failure: stop for this turn,
-/// and re-register the listener so the kernel reports it again while clients
-/// still wait in its queue. Breaking out with the listener left armed strands
-/// them, because an edge-triggered poll reports the listener again only when
-/// a new connection arrives.
+/// an interrupted call: keep draining. [`Accept::Stop`] is any other failure:
+/// log it once and stop accepting for this turn.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Accept {
     /// `WouldBlock`: the queue is empty.
     Drained,
     /// The connection is gone or the call was interrupted: accept the next.
     SkipOne,
-    /// Out of descriptors, or a failure: stop this turn, re-arm the listener.
-    Retry,
+    /// Any other failure: log it and stop accepting for this turn.
+    Stop,
 }
 
 /// Classify an `accept` error. The same answer on every target.
@@ -153,7 +181,7 @@ pub fn accept_error(e: &io::Error) -> Accept {
         io::ErrorKind::WouldBlock => Accept::Drained,
         io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => Accept::SkipOne,
         _ if e.raw_os_error() == Some(Errno::ECONNABORTED as i32) => Accept::SkipOne,
-        _ => Accept::Retry,
+        _ => Accept::Stop,
     }
 }
 

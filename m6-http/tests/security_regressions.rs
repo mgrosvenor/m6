@@ -388,7 +388,7 @@ fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
         assert!(
             matches!(
                 http11::parse_request(raw.as_bytes()),
-                http11::ParseResult::Error
+                http11::ParseResult::Error(_)
             ),
             "{label}: should be rejected, but parsed"
         );
