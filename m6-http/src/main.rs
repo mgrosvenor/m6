@@ -83,7 +83,7 @@ struct CompletionCtx<'a> {
     state: &'a mut ServerState,
     tcp: &'a mut Option<Http11Listener>,
     h2c: &'a mut Option<H2cListener>,
-    registry: &'a m6_core::mio::Registry,
+    registry: &'a m6_core::platform::Registry,
     quic_port: u16,
     udp: &'a UdpSocket,
     connections: &'a mut HashMap<Vec<u8>, QuicConn>,
@@ -99,7 +99,7 @@ impl<'a> CompletionCtx<'a> {
         state: &'a mut ServerState,
         tcp: &'a mut Option<Http11Listener>,
         h2c: &'a mut Option<H2cListener>,
-        registry: &'a m6_core::mio::Registry,
+        registry: &'a m6_core::platform::Registry,
         quic_port: u16,
         udp: &'a UdpSocket,
         connections: &'a mut HashMap<Vec<u8>, QuicConn>,
@@ -123,10 +123,9 @@ impl<'a> CompletionCtx<'a> {
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 use m6_core::event::{LoopTrace, Slots, Timeouts};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
@@ -875,7 +874,7 @@ fn on_request_impl(
     req: &forward::HttpRequest,
     client_ip: &str,
     quic_port: u16,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     h2c: bool,
 ) -> RequestOutcome {
     match route_request(
@@ -934,7 +933,7 @@ fn on_request_head(
     buf: &[u8],
     client_ip: &str,
     quic_port: u16,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> RequestOutcome {
     match route_request(
         state,
@@ -1020,7 +1019,7 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
 fn accept_tls(
     tcp: &mut Http11Listener,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     now: Instant,
 ) -> bool {
     loop {
@@ -1037,8 +1036,7 @@ fn accept_tls(
         let mut conn = conn;
         conn.set_token(token);
         conn.set_interest(Interest::READABLE);
-        if let Err(e) = registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
-        {
+        if let Err(e) = registry.register_fd(conn.raw_fd(), token, Interest::READABLE) {
             warn!(error = %e, "tcp register");
             tcp.free_slot(owner.key);
             state.sources.free(token.0);
@@ -1055,7 +1053,7 @@ fn accept_tls(
 fn accept_h2c(
     h: &mut H2cListener,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     now: Instant,
 ) -> (bool, bool) {
     let mut full = false;
@@ -1075,8 +1073,7 @@ fn accept_h2c(
         };
         conn.set_token(token);
         conn.set_interest(Interest::READABLE);
-        if let Err(e) = registry.register(&mut SourceFd(&conn.raw_fd()), token, Interest::READABLE)
-        {
+        if let Err(e) = registry.register_fd(conn.raw_fd(), token, Interest::READABLE) {
             warn!(error = %e, "h2c register");
             h.free_slot(owner.key);
             state.sources.free(token.0);
@@ -1104,7 +1101,7 @@ fn drive_conn_token(
     state: &mut ServerState,
     tcp: &mut Option<Http11Listener>,
     h2c: &mut Option<H2cListener>,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     quic_port: u16,
     now: Instant,
 ) -> ConnOutcome {
@@ -1190,7 +1187,7 @@ fn close_conn_token(
     state: &mut ServerState,
     tcp: &mut Option<Http11Listener>,
     h2c: &mut Option<H2cListener>,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) {
     if let Source::TlsConn(slot) = *state.sources.get(token.0) {
         if let Some(t) = tcp.as_mut() {
@@ -1238,7 +1235,7 @@ fn after_conn_drive(
     state: &mut ServerState,
     tcp: &mut Option<Http11Listener>,
     h2c: &mut Option<H2cListener>,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     now: Instant,
 ) {
     if drive.restarted {
@@ -1337,7 +1334,7 @@ fn complete_h2_streams(
     state: &mut ServerState,
     tcp: &mut Option<Http11Listener>,
     h2c: &mut Option<H2cListener>,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     quic_port: u16,
     udp: &UdpSocket,
     connections: &mut HashMap<Vec<u8>, QuicConn>,
@@ -1374,11 +1371,11 @@ fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
                     [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
                 match upstream.reply(&mut slots) {
                     Some(reply) => {
-                        cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                        cx.registry.deregister_fd(upstream.fd()).ok();
                         Some(Ok(forward::HttpResponse::from_reply(&reply)))
                     }
                     None => {
-                        cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                        cx.registry.deregister_fd(upstream.fd()).ok();
                         Some(Err(std::io::Error::other(
                             "upstream reported a reply but none parsed",
                         )))
@@ -1395,14 +1392,14 @@ fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
                 let interest = upstream.interest();
                 if interest != entry.registered_interest {
                     cx.registry
-                        .reregister(&mut SourceFd(&upstream.fd()), token, interest)
+                        .reregister_fd(upstream.fd(), token, interest)
                         .ok();
                     entry.registered_interest = interest;
                 }
                 None
             }
             Err(e) => {
-                cx.registry.deregister(&mut SourceFd(&upstream.fd())).ok();
+                cx.registry.deregister_fd(upstream.fd()).ok();
                 Some(Err(e))
             }
         }
@@ -1469,7 +1466,7 @@ fn retire_upstream(
                 entry.kind = UpstreamKind::IdleUrl(idx);
                 let interest = Interest::READABLE;
                 cx.registry
-                    .register(&mut SourceFd(&entry.upstream.fd()), token, interest)
+                    .register_fd(entry.upstream.fd(), token, interest)
                     .ok();
                 entry.registered_interest = interest;
             } else {
@@ -1500,11 +1497,11 @@ fn drop_idle_url(
     slot: usize,
     backend_idx: usize,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) {
     let token = state.upstreams.get(slot).token;
     registry
-        .deregister(&mut SourceFd(&state.upstreams.get(slot).upstream.fd()))
+        .deregister_fd(state.upstreams.get(slot).upstream.fd())
         .ok();
     state.upstreams.get_mut(slot).upstream.close();
     state.upstreams.free(slot);
@@ -1528,7 +1525,7 @@ fn expire_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
         return;
     };
     cx.registry
-        .deregister(&mut SourceFd(&cx.state.upstreams.get(slot).upstream.fd()))
+        .deregister_fd(cx.state.upstreams.get(slot).upstream.fd())
         .ok();
     let timed_out = Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
@@ -1546,7 +1543,7 @@ fn expire_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
 fn ensure_h2c_conn(
     state: &mut ServerState,
     backend_idx: usize,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> Result<(), UrlDispatchError> {
     let Some(token) = take_token(state) else {
         return Err(UrlDispatchError::NoSlot);
@@ -1580,7 +1577,7 @@ fn ensure_h2c_conn(
         conn.set_token(token);
         let interest = conn.phase_interest();
         conn.set_interest(interest);
-        registry.register(&mut SourceFd(&conn.raw_fd()), token, interest)
+        registry.register_fd(conn.raw_fd(), token, interest)
     };
     if let Err(e) = registered {
         state.h2c_pool.remove_by_token(token, registry);
@@ -1598,7 +1595,7 @@ fn ensure_h2c_conn(
 fn ensure_h2s_conn(
     state: &mut ServerState,
     backend_idx: usize,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> Result<(), UrlDispatchError> {
     let Some(token) = take_token(state) else {
         return Err(UrlDispatchError::NoSlot);
@@ -1635,7 +1632,7 @@ fn ensure_h2s_conn(
         conn.set_token(token);
         let interest = conn.phase_interest();
         conn.set_interest(interest);
-        registry.register(&mut SourceFd(&conn.raw_fd()), token, interest)
+        registry.register_fd(conn.raw_fd(), token, interest)
     };
     if let Err(e) = registered {
         state.h2s_pool.remove_by_token(token, registry);
@@ -1650,10 +1647,10 @@ fn ensure_h2s_conn(
 /// Deregister both listeners so new clients wait in the kernel's backlog.
 fn deregister_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
     if let Some(t) = tcp {
-        poll.registry().deregister(&mut SourceFd(&t.raw_fd())).ok();
+        poll.registry().deregister_fd(t.raw_fd()).ok();
     }
     if let Some(h) = h2c {
-        poll.registry().deregister(&mut SourceFd(&h.raw_fd())).ok();
+        poll.registry().deregister_fd(h.raw_fd()).ok();
     }
 }
 
@@ -1661,20 +1658,12 @@ fn deregister_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&
 fn register_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
     if let Some(t) = tcp {
         poll.registry()
-            .register(
-                &mut SourceFd(&t.raw_fd()),
-                TOKEN_TLS_LISTENER,
-                Interest::READABLE,
-            )
+            .register_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE)
             .ok();
     }
     if let Some(h) = h2c {
         poll.registry()
-            .register(
-                &mut SourceFd(&h.raw_fd()),
-                TOKEN_H2C_LISTENER,
-                Interest::READABLE,
-            )
+            .register_fd(h.raw_fd(), TOKEN_H2C_LISTENER, Interest::READABLE)
             .ok();
     }
 }
@@ -1701,35 +1690,29 @@ fn event_loop(
         }
     };
 
-    if let Err(e) = poll.registry().register(
-        &mut SourceFd(&udp.as_raw_fd()),
-        TOKEN_UDP,
-        Interest::READABLE,
-    ) {
+    if let Err(e) = poll
+        .registry()
+        .register_fd(udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+    {
         eprintln!("poll add UDP failed: {e}");
         return 2;
     }
     if let Some(ref t) = tcp {
-        let _ = poll.registry().register(
-            &mut SourceFd(&t.raw_fd()),
-            TOKEN_TLS_LISTENER,
-            Interest::READABLE,
-        );
+        let _ = poll
+            .registry()
+            .register_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE);
     }
     if let Some(ref h) = h2c {
-        let _ = poll.registry().register(
-            &mut SourceFd(&h.raw_fd()),
-            TOKEN_H2C_LISTENER,
-            Interest::READABLE,
-        );
+        let _ = poll
+            .registry()
+            .register_fd(h.raw_fd(), TOKEN_H2C_LISTENER, Interest::READABLE);
     }
     // Signals arrive on their own descriptor, under the number the wake pipe
     // used to hold.
-    if let Err(e) = poll.registry().register(
-        &mut SourceFd(&signals.raw_fd()),
-        TOKEN_SIGNAL,
-        Interest::READABLE,
-    ) {
+    if let Err(e) = poll
+        .registry()
+        .register_fd(signals.raw_fd(), TOKEN_SIGNAL, Interest::READABLE)
+    {
         error!(error = %e, "registering the signal descriptor");
         return 1;
     }
@@ -2034,7 +2017,7 @@ fn event_loop(
 /// The loop context threaded down the h3 request path: the registry, for
 /// registering socket upstreams, and the QUIC port, for the Alt-Svc header.
 struct H3Loop<'a> {
-    registry: &'a m6_core::mio::Registry,
+    registry: &'a m6_core::platform::Registry,
     quic_port: u16,
 }
 
@@ -2960,7 +2943,7 @@ fn handle_request(
     state: &mut ServerState,
     is_prefetch: bool,
     from_internal: bool,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(
@@ -3013,7 +2996,7 @@ enum UrlDispatchError {
 /// loop-driven `client::Upstream` slot for http and https.
 fn dispatch_url_backend(
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     req: &forward::HttpRequest,
     client_ip: &str,
     backend_idx: usize,
@@ -3057,7 +3040,7 @@ fn dispatch_url_backend(
 /// there.
 fn launch_url_upstream(
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     req: &forward::HttpRequest,
     client_ip: &str,
     backend_idx: usize,
@@ -3120,7 +3103,7 @@ fn launch_url_upstream(
         // Drop the idle registration so a failed start cannot leave a stale
         // one; the slot's descriptor is registered again below.
         registry
-            .deregister(&mut SourceFd(&state.upstreams.get(key).upstream.fd()))
+            .deregister_fd(state.upstreams.get(key).upstream.fd())
             .ok();
     }
     let started = {
@@ -3139,11 +3122,7 @@ fn launch_url_upstream(
         return Err(e);
     }
     let interest = state.upstreams.get_mut(key).upstream.interest();
-    let registered = registry.register(
-        &mut SourceFd(&state.upstreams.get(key).upstream.fd()),
-        token,
-        interest,
-    );
+    let registered = registry.register_fd(state.upstreams.get(key).upstream.fd(), token, interest);
     if let Err(e) = registered {
         state.upstreams.get_mut(key).upstream.close();
         state.upstreams.free(key);
@@ -3181,7 +3160,7 @@ enum SocketLaunchError {
 /// Returns the upstream's slot key, so the caller can store its waiter there.
 fn launch_socket_upstream(
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     req: &forward::HttpRequest,
     client_ip: &str,
     backend_name: &str,
@@ -3254,7 +3233,7 @@ fn launch_socket_upstream(
     let interest = {
         let entry = state.upstreams.get_mut(owner.key);
         let interest = entry.upstream.interest();
-        if let Err(e) = registry.register(&mut SourceFd(&entry.upstream.fd()), token, interest) {
+        if let Err(e) = registry.register_fd(entry.upstream.fd(), token, interest) {
             entry.upstream.close();
             state.upstreams.free(owner.key);
             *state.sources.get_mut(token.0) = Source::Vacant;
@@ -3293,7 +3272,7 @@ fn handle_request_inner(
     // rather than a public client. Granted by the listener, never by a header, so a public
     // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
@@ -3796,7 +3775,7 @@ fn backend_unavailable(
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     route_path: &str,
     backend_name: &str,
     detail: &str,
@@ -3875,7 +3854,7 @@ fn dispatch_custom_error_async(
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
     error_ctx: Option<&error::ErrorContext>,
 ) -> Option<RequestOutcome> {
     let error_path = match &state.error_mode {
@@ -4028,7 +4007,7 @@ fn apply_error_mode(
     client_ip: &str,
     state: &mut ServerState,
     ctx: Option<&error::ErrorContext>,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> ErrorOutcome {
     let verbose = state.config.errors.verbose_fallback;
     match &state.error_mode {
@@ -4102,7 +4081,7 @@ fn request_error(
     client_ip: &str,
     state: &mut ServerState,
     ctx: Option<&error::ErrorContext>,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> RequestOutcome {
     match apply_error_mode(status, req, client_ip, state, ctx, registry) {
         ErrorOutcome::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
@@ -4390,7 +4369,7 @@ fn complete_socket_response(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> Completion {
     let req = &ctx.req;
     let backend_name = &ctx.backend_name;
@@ -4554,7 +4533,7 @@ fn finalize_url_response(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> Completion {
     let describedby = state.config.site.describedby.clone();
     let outcome = if ctx.kind == forward::PendingKind::Socket {
@@ -4580,7 +4559,7 @@ fn finalize_url_response_inner(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-    registry: &m6_core::mio::Registry,
+    registry: &m6_core::platform::Registry,
 ) -> Completion {
     let req = &ctx.req;
     let enc = &ctx.enc;

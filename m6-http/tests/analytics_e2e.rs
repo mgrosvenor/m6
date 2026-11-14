@@ -662,7 +662,9 @@ fn sigusr1_reopens_the_analytics_log_and_loses_no_line() {
 
     let rotated = srv.analytics_log.with_extension("ndjson.1");
     std::fs::rename(&srv.analytics_log, &rotated).unwrap();
-    srv.http.borrow().signal(libc::SIGUSR1);
+    srv.http
+        .borrow()
+        .request(m6_core::platform::Signal::ReopenLogs);
     let back = m6_core::testkit::wait::until(Duration::from_secs(5), || srv.analytics_log.exists());
     assert!(back, "the live path never reappeared");
 
@@ -691,7 +693,9 @@ fn reopen_signals_never_count_toward_a_forced_shutdown() {
     // One at a time: a standard signal sent while the same one is pending is
     // merged into it, so two sent back to back may be one reopen.
     for want in 1..=2u64 {
-        srv.http.borrow().signal(libc::SIGUSR1);
+        srv.http
+            .borrow()
+            .request(m6_core::platform::Signal::ReopenLogs);
         let reopened = m6_core::testkit::wait::until(Duration::from_secs(5), || {
             srv.perf_json()["logging"]["reopen"]["reopens_total"] == want
         });

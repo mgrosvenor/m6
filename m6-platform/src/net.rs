@@ -43,7 +43,9 @@ pub fn bind_unix(path: &Path, mode: u32) -> io::Result<UnixListener> {
     // The same backlog std uses.
     sock.listen(128)?;
     sock.set_nonblocking(true)?;
-    crate::server::apply_socket_mode(path, mode)?;
+    // A socket whose mode cannot be set is a start failure: a mode nobody chose
+    // is a socket nobody can reason about.
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
     Ok(UnixListener::from_std(
         std::os::unix::net::UnixListener::from(OwnedFd::from(sock)),
     ))
@@ -70,12 +72,13 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
 
 /// A non-blocking connect to a unix listener. It completes at once or fails.
 ///
-/// A listener whose queue is full is `Err` of kind `WouldBlock` on every
-/// target: the listener is alive and busy, and the caller answers busy (503)
-/// and keeps the member. On Linux the kernel says `EAGAIN`. On macOS it says
-/// `ECONNREFUSED`, the same answer it gives for a socket file whose listener is
-/// gone, so there a dead member reads as busy until the pool's next rescan. A
-/// path that does not exist is `NotFound` on both.
+/// A refused connect (`ConnectionRefused`) means the socket file has no
+/// listener: the member is dead, and a pool marks it failed. A path that does
+/// not exist is `NotFound`. A listener whose queue is full is `WouldBlock` on
+/// Linux (`EAGAIN`): alive and busy, so the caller answers busy and keeps the
+/// member. On macOS the kernel answers `ECONNREFUSED` for a full queue as
+/// well, and nothing tells the two apart, so there a full queue reads as a
+/// failed member for one backoff. The error is the kernel's on both.
 pub fn connect_unix(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
     super::check_socket_path(path)?;
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;

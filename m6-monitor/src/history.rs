@@ -661,30 +661,10 @@ struct Written {
 
 /// Create the directory (mode 0700 when new) and the empty file (mode 0600)
 /// before SQLite does, and tighten a file left by an earlier start. SQLite
-/// gives its journal the mode of the database file. Mode bits do not exist off
-/// Unix, so there the files take the platform default.
+/// gives its journal the mode of the database file.
 fn make_private(file: &Path) -> anyhow::Result<()> {
-    if let Some(dir) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-        b.create(dir)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
-    }
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(file)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("securing {}: {e}", file.display()))?;
-    }
-    Ok(())
+    m6_core::platform::create_private(file)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))
 }
 
 /// True when the error means the process must not go on: a file from a newer
@@ -3302,13 +3282,11 @@ mod tests {
         assert_eq!(rows, vec![T0 + 30_000]);
     }
 
-    #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_history_directory_and_file_are_private() {
         let dir = tempfile::tempdir().unwrap();
@@ -3331,7 +3309,6 @@ mod tests {
         assert_eq!(mode(c.file.parent().unwrap()), 0o755);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_journal_beside_the_history_file_is_private() {
         let dir = tempfile::tempdir().unwrap();

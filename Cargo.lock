@@ -1876,7 +1876,6 @@ dependencies = [
  "jsonwebtoken",
  "m6-auth",
  "m6-core",
- "nix 0.27.1",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1907,19 +1906,16 @@ dependencies = [
  "httparse",
  "httpdate",
  "lettre",
- "libc",
  "lru",
+ "m6-platform",
  "md-5",
  "minify-html",
  "minify-js",
- "mio",
  "multer",
- "nix 0.31.3",
  "rand 0.8.8",
  "rcgen",
  "resolv-conf",
  "rusqlite",
- "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
@@ -1928,7 +1924,6 @@ dependencies = [
  "sha2",
  "slug",
  "socket2",
- "sysinfo",
  "tempfile",
  "tera",
  "thiserror 1.0.69",
@@ -1976,7 +1971,6 @@ dependencies = [
  "anyhow",
  "brotli 6.0.0",
  "flate2",
- "libc",
  "m6-core",
  "tempfile",
 ]
@@ -1999,7 +1993,6 @@ dependencies = [
  "httpdate",
  "itoa",
  "jsonwebtoken",
- "libc",
  "m6-core",
  "matchit",
  "quiche",
@@ -2027,7 +2020,7 @@ version = "1.15.0"
 dependencies = [
  "criterion",
  "itoa",
- "nix 0.31.3",
+ "m6-platform",
  "serde_json",
  "tempfile",
  "tracing",
@@ -2055,7 +2048,6 @@ name = "m6-monitor"
 version = "1.15.0"
 dependencies = [
  "anyhow",
- "libc",
  "m6-core",
  "rustls",
  "serde",
@@ -2063,6 +2055,21 @@ dependencies = [
  "tempfile",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "m6-platform"
+version = "1.15.0"
+dependencies = [
+ "libc",
+ "mio",
+ "nix",
+ "rustix",
+ "serde",
+ "serde_json",
+ "socket2",
+ "sysinfo",
+ "tempfile",
 ]
 
 [[package]]
@@ -2264,17 +2271,6 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
-]
-
-[[package]]
-name = "nix"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
 ]
 
 [[package]]

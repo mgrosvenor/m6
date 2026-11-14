@@ -42,8 +42,8 @@ fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
 
     let rotated = dir.path().join("a.ndjson.1");
     std::fs::rename(&live, &rotated).unwrap();
-    // SAFETY: `kill` takes a pid and a signal number and touches no memory.
-    unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) };
+    m6_core::platform::send(std::process::id(), m6_core::platform::Signal::ReopenLogs)
+        .expect("send the reload request");
     assert!(
         until(Duration::from_secs(5), || live.exists()),
         "the live path never reappeared"

@@ -18,7 +18,7 @@ use crate::forward::{
 };
 use m6_core::client::TlsClient;
 use m6_core::event::Timeouts;
-use m6_core::mio::{Interest, Registry, Token};
+use m6_core::platform::{Interest, Registry, Token};
 
 // ── Frame constants ───────────────────────────────────────────────────────────
 
@@ -226,13 +226,13 @@ impl<T: Transport> H2Client<T> {
     /// convenience constructors use this so their callers keep the blocking
     /// contract they were written against.
     pub(crate) fn wait_until_open(&mut self) -> io::Result<()> {
-        let mut poll = m6_core::mio::Poll::new()?;
-        poll.registry().register(
-            &mut m6_core::mio::unix::SourceFd(&self.raw_fd()),
+        let mut poll = m6_core::platform::Poll::new()?;
+        poll.registry().register_fd(
+            self.raw_fd(),
             Token(0),
             Interest::READABLE | Interest::WRITABLE,
         )?;
-        let mut events = m6_core::mio::Events::with_capacity(8);
+        let mut events = m6_core::platform::Events::with_capacity(8);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             self.drive();
@@ -1102,11 +1102,7 @@ impl<T: Transport> Pool<T> {
         let interest = conn.phase_interest();
         if interest != conn.registered_interest {
             registry
-                .reregister(
-                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                    conn.token(),
-                    interest,
-                )
+                .reregister_fd(conn.raw_fd(), conn.token(), interest)
                 .ok();
             conn.registered_interest = interest;
         }
@@ -1219,33 +1215,17 @@ impl<T: Transport> Pool<T> {
             .map(|(k, _)| k.clone());
         if let Some(url) = url {
             if let Some(conn) = self.connections.remove(&url) {
-                registry
-                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.raw_fd()))
-                    .ok();
+                registry.deregister_fd(conn.raw_fd()).ok();
             }
         }
     }
 }
 
-/// Start a non-blocking TCP connect. `EINPROGRESS` is success: the caller waits
+/// Start a non-blocking TCP connect. In progress is success: the caller waits
 /// for writability and then checks the socket's error.
 pub(crate) fn nonblocking_tcp_connect(addr: SocketAddr) -> io::Result<TcpStream> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    sock.set_nonblocking(true)?;
-    sock.set_tcp_nodelay(true)?;
-    match sock.connect(&socket2::SockAddr::from(addr)) {
-        Ok(()) => {}
-        Err(e)
-            if e.kind() == io::ErrorKind::WouldBlock
-                || e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(e) => return Err(e),
-    }
-    Ok(TcpStream::from(std::os::fd::OwnedFd::from(sock)))
+    let (stream, _) = m6_core::platform::net::connect_tcp(addr)?;
+    Ok(stream)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

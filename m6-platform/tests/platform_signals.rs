@@ -11,12 +11,12 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use m6_core::platform::{self, process, Events, Interest, Poll, Signal, Signals, Token};
+use m6_platform::{self as platform, process, Events, Interest, Poll, Signal, Signals, Token};
 
 const SIGNALS: Token = Token(7);
 
 fn main() {
-    m6_core::signal::block();
+    m6_platform::block();
     let mut signals = Signals::new().expect("Signals::new");
     let mut poll = Poll::new().expect("Poll::new");
     poll.registry()
@@ -169,7 +169,7 @@ fn signals_new_refuses_an_unblocked_mask() {
     let r = std::panic::catch_unwind(|| {
         let _ = Signals::new();
     });
-    m6_core::signal::block();
+    m6_platform::block();
     let payload = r.expect_err("S8: Signals::new must refuse an unblocked mask");
     let msg = payload
         .downcast_ref::<&str>()

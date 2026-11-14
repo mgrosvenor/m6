@@ -819,10 +819,9 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
         let sock = b.sock.clone();
         assert!(sock.exists(), "{}: socket should exist", lang.dir());
 
-        unsafe {
-            // SIGTERM, the signal systemd sends on stop.
-            libc_kill(b.child.id() as i32, 15);
-        }
+        // A shutdown request: SIGTERM, the signal systemd sends on stop.
+        m6_core::platform::send(b.child.id(), m6_core::platform::Signal::Shutdown)
+            .expect("send the shutdown request");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
@@ -854,11 +853,6 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
             sock.display()
         );
     }
-}
-
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 #[cfg(test)]

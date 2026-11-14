@@ -156,17 +156,12 @@ pub(super) fn prepare_socket(sock: &socket2::Socket) -> io::Result<()> {
     sock.set_nosigpipe(true)
 }
 
-/// The kernel answers `ECONNREFUSED` for a full unix listen queue, which the
-/// layer reports as `WouldBlock` on every target. It gives the same answer for
-/// a socket file whose listener is gone, so that reads as busy too: the pool's
-/// next rescan removes the member.
+/// The kernel answers `ECONNREFUSED` for a full unix listen queue, the same
+/// answer it gives for a socket file whose listener is gone, and nothing tells
+/// the two apart. A refused connect must stay a refused connect, because a
+/// pool marks that member failed and fails over, so the error passes through
+/// and a full queue on macOS reads as a failed member for one backoff.
 pub(super) fn map_connect_unix_error(e: io::Error) -> io::Error {
-    if e.kind() == io::ErrorKind::ConnectionRefused {
-        return io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!("the listener's queue is full, or its socket file is stale: {e}"),
-        );
-    }
     e
 }
 

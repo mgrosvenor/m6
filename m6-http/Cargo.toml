@@ -106,7 +106,6 @@ httparse       = "1"
 # them survives validation and panics.
 hpack          = "0.3"
 ahash          = "0.8"
-libc           = "0.2"
 # tls12 and logging reached release builds only through tokio-rustls's default
 # features while the cold-start benchmark was a [[bin]]. Declare them here so
 # the listener keeps the protocol versions and log records it had when

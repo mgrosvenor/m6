@@ -25,11 +25,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
@@ -175,11 +174,7 @@ fn main() -> Result<()> {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
     poll.registry()
-        .register(
-            &mut SourceFd(&signals.raw_fd()),
-            SIGNALS,
-            Interest::READABLE,
-        )
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
 
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));

@@ -271,22 +271,22 @@ fn a_trailing_or_doubled_slash_still_answers() {
 /// The monitor runs one loop thread, plus the log writer until LOG-2 replaces
 /// it. Three counts test that: one node, the same three-node fleet without a
 /// history, and that fleet with one. A poll thread or a history writer adds a
-/// thread to the same fleet, and a thread per node adds three.
+/// thread to the same fleet, and a thread per node adds two.
 ///
-/// macOS has platform threads of its own: reading the host's certificate store
-/// (`client::system_roots`) goes through the Security framework, whose idle
-/// libdispatch workers come and go, so this sandbox sees three or four of them
-/// at different moments and their count is not stable between starts. The
-/// exact count (`1 + LOG_WRITER_THREADS`) and the same-fleet history
-/// comparison are therefore asserted on Linux, which is the trusted proof. On
-/// macOS the counts are bounded instead, and this test makes no exact claim.
+/// The counts are read once they have settled, through the platform layer.
+/// Reading the host's certificate store (`client::system_roots`, which the
+/// monitor does at start) leaves the platform's own idle workers behind on
+/// some hosts (three on macOS, none on Linux), so the test reads the store
+/// itself and counts them in this process, and the same exact claims then
+/// hold on every target.
 #[test]
 fn the_monitor_runs_one_thread() {
+    let workers = platform_workers();
     let (dir, config, sock) = setup(CONFIG);
     let svc = spawn(dir.path(), &config, &sock);
     let one = settled_threads(svc.pid(), &svc);
     drop(svc);
-    assert_single_loop("one node", one);
+    assert_single_loop("one node", one, workers);
 
     // The same three-node fleet twice, so a history writer shows as the one
     // difference between two otherwise identical runs.
@@ -308,7 +308,7 @@ fn the_monitor_runs_one_thread() {
     let svc2 = spawn(dir2.path(), &config2, &sock2);
     let plain = settled_threads(svc2.pid(), &svc2);
     drop(svc2);
-    assert_single_loop("three nodes with tunnels", plain);
+    assert_single_loop("three nodes with tunnels", plain, workers);
 
     let config_text = config_text.replace(
         "\nwg_handshakes_file",
@@ -322,70 +322,69 @@ fn the_monitor_runs_one_thread() {
     assert_history_adds_none(plain, with_history, &output);
 }
 
-/// The loop and the log writer, exactly, where the certificate store is a
-/// plain file read.
-fn assert_single_loop(what: &str, count: usize) {
+/// The loop and the log writer, exactly, above the platform's own workers.
+fn assert_single_loop(what: &str, count: usize, workers: usize) {
     // The log writer is a thread even when the log goes to stdout, so the loop
     // and the writer are two. LOG-2 replaces tracing-appender and this becomes
     // one.
-    #[cfg(target_os = "linux")]
     assert_eq!(
         count,
-        1 + LOG_WRITER_THREADS,
-        "{what}: m6-monitor runs {count} threads, not the one loop thread and \
-         tracing-appender's writer until LOG-2"
+        1 + LOG_WRITER_THREADS + workers,
+        "{what}: m6-monitor runs {count} threads, not the one loop thread, \
+         tracing-appender's writer until LOG-2 and the platform's {workers} \
+         certificate-store worker(s)"
     );
-    // macOS adds the platform store's idle libdispatch workers, at most four.
-    // A thread per node would take a three-node fleet past this.
-    #[cfg(target_os = "macos")]
-    assert!(
-        count <= 1 + LOG_WRITER_THREADS + 4,
-        "{what}: m6-monitor runs {count} threads, more than the loop, the log \
-         writer and the platform store's four workers"
-    );
-    let _ = what;
 }
 
-/// A history adds no thread. The exact comparison is Linux's; macOS allows the
-/// platform's one-worker swing between two starts, so it makes no exact claim.
+/// How many threads reading the host's certificate store leaves behind in a
+/// process on this host: measured here, in this process, so the count above
+/// is exact on every target rather than assumed per OS.
+fn platform_workers() -> usize {
+    let me = std::process::id();
+    let before = settled_count(me);
+    let _ = m6_core::client::system_roots().expect("the host certificate store");
+    settled_count(me).saturating_sub(before)
+}
+
+/// The thread count of `pid` once two readings 100 ms apart agree.
+fn settled_count(pid: u32) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = thread_count(pid);
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let next = thread_count(pid);
+        if next == last || Instant::now() > deadline {
+            return next;
+        }
+        last = next;
+    }
+}
+
+/// A history adds no thread.
 fn assert_history_adds_none(plain: usize, with_history: usize, output: &str) {
-    #[cfg(target_os = "linux")]
     assert_eq!(
         with_history,
         plain,
         "a history added {} thread(s)\n--- output ---\n{output}",
         with_history as isize - plain as isize
     );
-    #[cfg(target_os = "macos")]
-    {
-        assert!(
-            with_history <= plain + 1,
-            "a history added threads beyond the platform's one-worker swing: \
-             {with_history} with it against {plain} without\n--- output ---\n{output}"
-        );
-        let _ = (with_history, plain, output);
-    }
 }
 
 /// `LOG_WRITER_THREADS` is 1 until LOG-2 replaces tracing-appender; it becomes
 /// 0 then, and the trusted session updates this constant.
 const LOG_WRITER_THREADS: usize = 1;
 
-/// Wait for the count to settle; the assertion is the signal and the deadline
-/// is the bound.
+/// The thread count once it has settled: two readings 100 ms apart agree, or
+/// the deadline passes. The assertion is the signal and the deadline is the
+/// bound.
 fn settled_threads(pid: u32, svc: &Service) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut threads = thread_count(pid);
-    while threads == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-        threads = thread_count(pid);
-    }
+    let count = settled_count(pid);
     assert!(
-        threads > 0,
+        count > 0,
         "could not count the threads of pid {pid}\n--- output ---\n{}",
         svc.output()
     );
-    threads
+    count
 }
 
 /// A node whose host name does not resolve is a start failure, not a node that
@@ -427,42 +426,7 @@ fn an_unresolvable_node_is_a_startup_error() {
     );
 }
 
-#[cfg(target_os = "linux")]
+/// The thread count of a running process, through the platform layer.
 fn thread_count(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map(|entries| entries.count())
-        .unwrap_or(0)
-}
-
-#[cfg(target_os = "macos")]
-fn thread_count(pid: u32) -> usize {
-    /// `PROC_PIDLISTTHREADS` from `<sys/proc_info.h>`.
-    const PROC_PIDLISTTHREADS: libc::c_int = 6;
-
-    let mut ids = [0u64; 256];
-    // SAFETY: `ids` is a live buffer of exactly the length passed, and
-    // `proc_pidinfo` writes at most that many bytes into it.
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDLISTTHREADS,
-            0,
-            ids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&ids) as libc::c_int,
-        )
-    };
-    (bytes.max(0) as usize) / std::mem::size_of::<u64>()
-}
-
-/// The BSDs list a process's threads with `ps -H`, one line each.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn thread_count(pid: u32) -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-H", "-p", &pid.to_string()])
-        .output()
-        .expect("ps must run to count a process's threads");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .count()
-        .saturating_sub(1)
+    m6_core::platform::process::thread_count(pid).unwrap_or(0)
 }

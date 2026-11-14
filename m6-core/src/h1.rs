@@ -1206,7 +1206,7 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 /// #     m6_core::Response::text("handler")
 /// # }
 /// use m6_core::h1::{Flush, Read};
-/// use m6_core::mio::{Interest, Token};
+/// use m6_core::platform::{Interest, Token};
 /// # fn reregister(_: &mut m6_core::h1::ServerConn, _: Interest, _: Token) {}
 ///
 /// loop {
@@ -1264,7 +1264,7 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 /// # }
 /// ```
 pub struct ServerConn {
-    stream: Option<mio::net::UnixStream>,
+    stream: Option<crate::platform::net::UnixStream>,
     /// Input: `in_buf[..in_len]` is valid, `in_buf.len()` is how much room the
     /// slot has. The buffer is filled directly, so no zeroing per read.
     in_buf: Vec<u8>,
@@ -1319,29 +1319,29 @@ impl ServerConn {
     }
 
     /// Attach an accepted stream. Resets what the previous connection left.
-    pub fn attach(&mut self, stream: mio::net::UnixStream) {
+    pub fn attach(&mut self, stream: crate::platform::net::UnixStream) {
         self.reset();
         self.stream = Some(stream);
     }
 
     /// Detach the stream, if any, and reset the slot for its next connection.
-    pub fn detach(&mut self) -> Option<mio::net::UnixStream> {
+    pub fn detach(&mut self) -> Option<crate::platform::net::UnixStream> {
         let stream = self.stream.take();
         self.reset();
         stream
     }
 
-    /// The attached stream, for `mio`'s register and reregister.
-    pub fn stream(&mut self) -> Option<&mut mio::net::UnixStream> {
+    /// The attached stream, for the poll's register and reregister.
+    pub fn stream(&mut self) -> Option<&mut crate::platform::net::UnixStream> {
         self.stream.as_mut()
     }
 
     /// `READABLE`, or `WRITABLE` while an answer is owed.
-    pub fn interest(&self) -> mio::Interest {
+    pub fn interest(&self) -> crate::platform::Interest {
         if self.out_pos < self.out_len || self.body.is_some() {
-            mio::Interest::WRITABLE
+            crate::platform::Interest::WRITABLE
         } else {
-            mio::Interest::READABLE
+            crate::platform::Interest::READABLE
         }
     }
 
@@ -1747,12 +1747,12 @@ impl ServerConn {
 /// is about to be handed out again, then detach, deregister and free. Shared
 /// with the services so the order cannot drift between their loops.
 pub fn close_conn(
-    poll: &mio::Poll,
+    poll: &crate::platform::Poll,
     conns: &mut Slots<ServerConn>,
     deadlines: &mut Timeouts,
     token: usize,
 ) -> io::Result<()> {
-    deadlines.clear(mio::Token(token));
+    deadlines.clear(crate::platform::Token(token));
     if let Some(mut stream) = conns.get_mut(token).detach() {
         poll.registry().deregister(&mut stream)?;
         conns.free(token);
@@ -2011,7 +2011,7 @@ mod framing_overflow_tests {
             .set_nonblocking(true)
             .expect("a non-blocking client end");
         let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
-        conn.attach(mio::net::UnixStream::from_std(server));
+        conn.attach(crate::platform::net::UnixStream::from_std(server));
         client
             .write_all(b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
             .expect("the head");
@@ -2074,7 +2074,7 @@ mod framing_overflow_tests {
                 .set_nonblocking(true)
                 .expect("a non-blocking server end");
             let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
-            conn.attach(mio::net::UnixStream::from_std(server));
+            conn.attach(crate::platform::net::UnixStream::from_std(server));
             client
                 .write_all(b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .expect("the head");

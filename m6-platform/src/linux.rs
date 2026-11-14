@@ -105,8 +105,16 @@ pub(super) fn thread_count(pid: u32) -> io::Result<usize> {
     Ok(std::fs::read_dir(format!("/proc/{pid}/task"))?.count())
 }
 
+/// The entries of `/proc/<pid>/fd`. For this process the listing holds its
+/// own directory handle, which is not one of the process's descriptors once
+/// the count is returned, so it is left out.
 pub(super) fn open_descriptors(pid: u32) -> io::Result<usize> {
-    Ok(std::fs::read_dir(format!("/proc/{pid}/fd"))?.count())
+    let count = std::fs::read_dir(format!("/proc/{pid}/fd"))?.count();
+    Ok(if pid == std::process::id() {
+        count.saturating_sub(1)
+    } else {
+        count
+    })
 }
 
 /// The socket inodes of `/proc/<pid>/fd` against the listening rows (state

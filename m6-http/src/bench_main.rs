@@ -25,7 +25,7 @@
 /// Output: one result line per suite; exits non-zero if any threshold exceeded.
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -554,14 +554,10 @@ impl H2Client {
                     // has our request before we block waiting for its response.
                     self.flush_write()?;
                     let timeout_ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, timeout_ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(timeout_ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -936,14 +932,10 @@ impl H2cClient {
                     }
                     self.flush_write()?;
                     let timeout_ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, timeout_ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(timeout_ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }

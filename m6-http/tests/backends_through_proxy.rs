@@ -711,12 +711,7 @@ fn a_failed_start_leaves_no_backend_process_behind() {
     }));
     assert!(failed.is_err(), "the edge should fail to start");
     let pid = backend_pid.expect("the backend was spawned before the edge failed");
-    let alive = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let alive = m6_core::platform::process::is_alive(pid);
     assert!(
         !alive,
         "the backend process should have been reaped after the failed edge start"

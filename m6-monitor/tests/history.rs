@@ -355,47 +355,12 @@ fn no_tcp_listener_is_opened() {
         .expect("spawn");
     assert!(wait::for_path(&s.sock, Duration::from_secs(10)));
     history_with_rows(&s.sock);
-    let listening = tcp_listeners(child.id());
+    let listening = m6_core::platform::process::listens_on_tcp(child.id());
     let _ = child.kill();
     let _ = child.wait();
-    assert!(listening.is_empty(), "TCP listeners: {listening:?}");
-}
-
-#[cfg(target_os = "linux")]
-fn tcp_listeners(pid: u32) -> Vec<String> {
-    let inodes: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .expect("fd dir")
-        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-        .filter_map(|l| {
-            let l = l.to_string_lossy().into_owned();
-            Some(l.strip_prefix("socket:[")?.strip_suffix(']')?.to_string())
-        })
-        .collect();
-    let mut found = Vec::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        for line in std::fs::read_to_string(table)
-            .unwrap_or_default()
-            .lines()
-            .skip(1)
-        {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            // Field 3 is the state (0A is LISTEN) and field 9 the socket inode.
-            if f.len() > 9 && f[3] == "0A" && inodes.iter().any(|i| i == f[9]) {
-                found.push(line.to_string());
-            }
-        }
-    }
-    found
-}
-
-#[cfg(not(target_os = "linux"))]
-fn tcp_listeners(pid: u32) -> Vec<String> {
-    let out = Command::new("lsof")
-        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"])
-        .output()
-        .expect("lsof");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(String::from)
-        .collect()
+    assert_eq!(
+        listening.ok(),
+        Some(false),
+        "the monitor opened a TCP listener"
+    );
 }

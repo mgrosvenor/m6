@@ -17,7 +17,7 @@
 //!
 //! The monitor's `main` is start, run and stop, the shape every service has
 //! since EL-6b: `m6_core::event` supplies the signals, the deadlines and the
-//! connection table, and `m6::mio` the reactor. The fleet poll is not a thread.
+//! connection table, and `m6_core::platform` the reactor. The fleet poll is not a thread.
 //! It is a table of steps in this loop (`poll.rs`): each node's `/health`,
 //! `/perf` and `/traffic` requests, each tunnel connect and each crawler
 //! lookup is a descriptor the loop waits on, so a node that hangs holds only
@@ -57,11 +57,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{close_conn, head_slots, Flush, Read, RequestHead, ServerConn};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
@@ -233,11 +232,7 @@ fn run_service() -> Result<()> {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
     poll.registry()
-        .register(
-            &mut SourceFd(&signals.raw_fd()),
-            SIGNALS,
-            Interest::READABLE,
-        )
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
     lifecycle.started();

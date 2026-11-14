@@ -82,11 +82,10 @@ fn forward_and_capture(req: &HttpRequest, client_ip: &str) -> String {
 }
 
 /// Drive one request over a Unix socket until it completes, blocking with a
-/// `mio::Poll` (tests may block). The reply is discarded: the caller wants the
+/// `platform::Poll` (tests may block). The reply is discarded: the caller wants the
 /// request bytes the backend captured.
 fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
-    use m6_core::mio::unix::SourceFd;
-    use m6_core::mio::{Events, Poll, Token};
+    use m6_core::platform::{Events, Poll, Token};
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
     forward::encode_request(up.request_buf(), req, client_ip, "example.com").expect("encode");
@@ -104,7 +103,7 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
     let token = Token(0);
     let mut registered = up.interest();
     poll.registry()
-        .register(&mut SourceFd(&up.fd()), token, registered)
+        .register_fd(up.fd(), token, registered)
         .expect("register");
     loop {
         poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))
@@ -118,7 +117,7 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
             let interest = up.interest();
             if interest != registered {
                 poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, interest)
+                    .reregister_fd(up.fd(), token, interest)
                     .expect("reregister");
                 registered = interest;
             }

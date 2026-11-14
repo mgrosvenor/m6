@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "m6-platform",
     "m6-core",
     "m6-log",
     "m6-auth",

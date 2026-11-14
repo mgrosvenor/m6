@@ -22,7 +22,7 @@
 /// Warmup samples are excluded from all reported statistics.
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -374,14 +374,10 @@ fn h1_timed_get(
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Blocking poll: wait for socket readable
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, 5000);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        stream.as_fd(),
+                        Duration::from_millis(5000),
+                    );
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -657,14 +653,10 @@ impl H2TimedClient {
                     }
                     self.flush_write()?;
                     let ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -939,14 +931,10 @@ impl H2cTimedClient {
                     }
                     self.flush_write()?;
                     let ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }

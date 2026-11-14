@@ -2347,7 +2347,7 @@ mod tests {
     fn named_site_toml_that_is_unreadable_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         // root reads any file, so the test would prove nothing.
-        if unsafe { libc::geteuid() } == 0 {
+        if crate::platform::process::is_root() {
             return;
         }
         let d = tempfile::tempdir().unwrap();

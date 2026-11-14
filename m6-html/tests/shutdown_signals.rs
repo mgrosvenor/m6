@@ -105,7 +105,8 @@ fn http_request(socket: &Path, request: &str) -> Option<String> {
 /// the loop holds one accepted connection that is waiting for the rest. That
 /// connection is accepted work when shutdown starts, and the loop drops it
 /// without waiting: there is no pool and no wake connection.
-fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &str) {
+fn exits_promptly_with_a_request_in_flight(id: &str) {
+    let name = "a shutdown request";
     let (mut server, socket_path) = spawn(id);
 
     let mut held = UnixStream::connect(&socket_path).expect("connect the held request");
@@ -115,7 +116,7 @@ fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &st
     )
     .expect("send the head of the held request");
 
-    server.svc.signal(sig);
+    server.svc.request(m6_core::platform::Signal::Shutdown);
     let status = server
         .svc
         .wait_for_exit(Instant::now() + Duration::from_secs(5))
@@ -140,17 +141,11 @@ fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &st
     drop(held);
 }
 
-/// SIGTERM with a request in flight exits at once. The wrong outcome: the
-/// service waits for the request, so a stalled client holds up every deploy.
+/// A shutdown request with a request in flight exits at once. The wrong
+/// outcome: the service waits for the request, so a stalled client holds up
+/// every deploy. SIGINT takes the same path, which the platform layer's own
+/// suite proves (`platform_signals`, S2).
 #[test]
-fn sigterm_exits_zero_and_removes_the_socket_with_a_request_in_flight() {
-    exits_promptly_with_a_request_in_flight("term-inflight", libc::SIGTERM, "SIGTERM");
-}
-
-/// SIGINT takes the same path as SIGTERM. The wrong outcome: SIGINT kills the
-/// process at the default disposition, leaving the socket behind and a
-/// non-zero status.
-#[test]
-fn sigint_exits_zero_and_removes_the_socket_with_a_request_in_flight() {
-    exits_promptly_with_a_request_in_flight("sigint-inflight", libc::SIGINT, "SIGINT");
+fn shutdown_exits_zero_and_removes_the_socket_with_a_request_in_flight() {
+    exits_promptly_with_a_request_in_flight("term-inflight");
 }

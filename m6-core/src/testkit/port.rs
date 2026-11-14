@@ -231,8 +231,6 @@ pub fn claim_port() -> PortClaim {
 /// never lands where the test needs it. The race that was issue #9 lived in
 /// these few lines and nowhere else.
 fn try_claim(marker: &std::path::Path, port: u16) -> Option<PortClaim> {
-    use std::os::unix::io::AsRawFd;
-
     // Ordinary create-or-open. The file's existence means nothing; the lock on
     // it is what matters, so there is no `O_EXCL` and nothing to unlink.
     let file = std::fs::OpenOptions::new()
@@ -242,9 +240,9 @@ fn try_claim(marker: &std::path::Path, port: u16) -> Option<PortClaim> {
         .open(marker)
         .ok()?;
 
-    // Non-blocking exclusive lock. EWOULDBLOCK means another process, or another
+    // Non-blocking exclusive lock. A refusal means another process, or another
     // open file description in this one, holds this port.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if file.try_lock().is_err() {
         return None;
     }
 

@@ -50,12 +50,12 @@ impl Service {
     /// The caller configures the command (program, arguments, environment);
     /// this overrides only the standard streams, which it must own.
     pub fn spawn(name: &str, cmd: &mut Command) -> Service {
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+        let mut child = crate::platform::process::spawn(
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let mut drains = Vec::with_capacity(2);
@@ -114,17 +114,15 @@ impl Service {
             .id()
     }
 
-    /// Send `sig` to the child.
+    /// Send the child a shutdown or reload request, as a supervisor does.
     ///
     /// Panics with the name and pid if the child has already been reaped.
-    pub fn signal(&self, sig: libc::c_int) {
+    pub fn request(&self, what: crate::platform::Signal) {
         let child = self
             .child
             .as_ref()
             .unwrap_or_else(|| panic!("{} was already reaped; cannot signal it", self.name));
-        // SAFETY: `kill` takes a pid and a signal number and touches no
-        // memory of ours.
-        unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+        let _ = crate::platform::send(child.id(), what);
     }
 
     /// Send SIGTERM and wait for the child to exit, returning its status.
@@ -133,7 +131,7 @@ impl Service {
     /// what it did. Panics if the child is still running after `timeout`,
     /// which is itself the failure a graceful-shutdown test is looking for.
     pub fn terminate(&mut self, timeout: Duration) -> ExitStatus {
-        self.signal(libc::SIGTERM);
+        self.request(crate::platform::Signal::Shutdown);
         let child = self.child.as_mut().expect("service already reaped");
         let deadline = Instant::now() + timeout;
         loop {
@@ -310,9 +308,10 @@ impl Drop for Service {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             if child.try_wait().ok().flatten().is_none() {
-                // SIGTERM first, so the service's own shutdown path runs and a
-                // test that wedges it still gets cleaned up by the SIGKILL.
-                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+                // A shutdown request first, so the service's own shutdown path
+                // runs and a test that wedges it still gets cleaned up by the
+                // SIGKILL.
+                let _ = crate::platform::send(child.id(), crate::platform::Signal::Shutdown);
                 let deadline = Instant::now() + TERM_GRACE;
                 while Instant::now() < deadline {
                     if child.try_wait().ok().flatten().is_some() {

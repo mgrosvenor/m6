@@ -23,7 +23,9 @@ pub mod negotiate;
 pub mod net;
 pub mod parse;
 pub mod path;
-pub mod platform;
+/// The platform layer, the one crate that knows the operating system. See
+/// `docs/m6-platform.md`.
+pub use m6_platform as platform;
 pub mod random;
 pub mod render;
 pub mod request;
@@ -56,11 +58,6 @@ pub mod template;
 
 #[cfg(feature = "templates")]
 pub use template::{TeraFactory, TeraRenderer};
-
-/// The reactor: `Poll`, `Events`, `Token`, `Interest` and the non-blocking
-/// sockets. Re-exported so a service names `m6_core::mio::...` and links only
-/// m6-core.
-pub use mio;
 
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
 pub use conditional::{
@@ -131,9 +128,8 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::event::{LoopTrace, Slots, Timeouts};
     pub use crate::h1::{head_slots, Flush, Read, ServerConn};
-    pub use crate::mio;
-    pub use crate::mio::{Events, Interest, Poll, Token};
     pub use crate::net::listen_unix;
+    pub use crate::platform::{Events, Interest, Poll, Token};
     pub use crate::platform::{Signal, Signals};
     pub use crate::render::NoTemplates;
     pub use crate::request::Request;

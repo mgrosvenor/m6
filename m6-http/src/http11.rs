@@ -32,8 +32,7 @@ use crate::cache::CachedResponse;
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
 use crate::http2::{H2Io, Http2Conn};
 use m6_core::event::{Slots, Taken};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Interest, Registry, Token};
+use m6_core::platform::{Interest, Registry, Token};
 
 // ── Request outcome ───────────────────────────────────────────────────────────
 
@@ -490,7 +489,7 @@ impl Http11Listener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -577,7 +576,7 @@ impl Http11Listener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -617,7 +616,7 @@ impl Http11Listener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -630,7 +629,7 @@ impl Http11Listener {
     pub fn close_one(&mut self, key: usize, registry: &Registry) {
         let conn = self.conns.get_mut(key);
         if let Some(stream) = conn.stream.take() {
-            registry.deregister(&mut SourceFd(&stream.as_raw_fd())).ok();
+            registry.deregister_fd(stream.as_raw_fd()).ok();
         }
         *conn = Conn::empty();
         self.conns.free(key);
@@ -1050,7 +1049,7 @@ impl H2cListener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -1096,7 +1095,7 @@ impl H2cListener {
             if interest != conn.registered_interest {
                 if let Some(stream) = conn.stream.as_ref() {
                     registry
-                        .reregister(&mut SourceFd(&stream.as_raw_fd()), conn.token, interest)
+                        .reregister_fd(stream.as_raw_fd(), conn.token, interest)
                         .ok();
                 }
                 conn.registered_interest = interest;
@@ -1109,7 +1108,7 @@ impl H2cListener {
     pub fn close_one(&mut self, key: usize, registry: &Registry) {
         let conn = self.conns.get_mut(key);
         if let Some(stream) = conn.stream.take() {
-            registry.deregister(&mut SourceFd(&stream.as_raw_fd())).ok();
+            registry.deregister_fd(stream.as_raw_fd()).ok();
         }
         *conn = H2cPlainConn::empty();
         self.conns.free(key);

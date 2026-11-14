@@ -1,5 +1,5 @@
-//! The platform layer: the only code in m6 that knows which operating system
-//! it runs on.
+//! The platform layer: the only crate in m6 that knows which operating system
+//! it runs on. m6-core re-exports it as `m6_core::platform`.
 //!
 //! Everything a service needs from the kernel is here, stated in the service's
 //! terms: readiness ([`Poll`]), the clock ([`now`] and [`wall`]),
@@ -9,10 +9,10 @@
 //! unix socket path limit and the directories a service and its tests use.
 //!
 //! One implementation file per OS family holds the code that differs:
-//! `platform/linux.rs` and `platform/macos.rs`. They are selected once, below,
+//! `src/linux.rs` and `src/macos.rs`. They are selected once, below,
 //! by family and never by CPU, so Linux on arm64 and macOS on x86_64 build the
 //! same code. A family with no file fails to build with a message naming the
-//! file a port adds. No other module, test or service names `mio`, `nix`,
+//! file a port adds. No other crate, test or service names `mio`, `nix`,
 //! `rustix`, `libc` or a `cfg(target_os)`: `tests/platform_gate.rs` refuses
 //! them.
 //!
@@ -39,11 +39,12 @@ use macos as os;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
     "the m6 platform layer has no implementation for this OS family. A port is \
-     one file: copy m6-core/src/platform/macos.rs to \
-     m6-core/src/platform/<family>.rs, implement every pub(super) item it \
-     lists, and select it at the top of m6-core/src/platform.rs."
+     one file: copy m6-platform/src/macos.rs to m6-platform/src/<family>.rs, \
+     implement every pub(super) item it lists, and select it at the top of \
+     m6-platform/src/lib.rs."
 );
 
+pub mod fd;
 pub mod host;
 pub mod net;
 pub mod process;
@@ -85,20 +86,23 @@ pub use mio::{Events, Interest, Token};
 /// `EV_CLEAR`. Both through `mio`, which no code outside this layer names.
 pub struct Poll {
     inner: mio::Poll,
+    registry: Registry,
 }
 
 impl Poll {
     pub fn new() -> io::Result<Poll> {
-        Ok(Poll {
-            inner: mio::Poll::new()?,
-        })
+        let inner = mio::Poll::new()?;
+        // The same reactor under a second descriptor, so the handle is a value
+        // this struct owns and `registry()` is a plain borrow. Start only.
+        let registry = Registry(inner.registry().try_clone()?);
+        Ok(Poll { inner, registry })
     }
 
-    /// The handle sources are registered with. `Copy`, so a loop can hand it to
-    /// the functions that drive its connections.
+    /// The handle sources are registered with. A loop hands it to the
+    /// functions that drive its connections.
     #[inline]
-    pub fn registry(&self) -> Registry<'_> {
-        Registry(self.inner.registry())
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Wait for readiness, at most `timeout` (`None` waits until something is
@@ -110,10 +114,9 @@ impl Poll {
 }
 
 /// Where sources are registered. Obtained from [`Poll::registry`].
-#[derive(Clone, Copy)]
-pub struct Registry<'a>(&'a mio::Registry);
+pub struct Registry(mio::Registry);
 
-impl Registry<'_> {
+impl Registry {
     /// Watch `source` for `interest` under `token`.
     #[inline]
     pub fn register(
@@ -282,8 +285,8 @@ fn signal_from_signo(signo: i32) -> Option<Signal> {
 }
 
 /// Block the three signals in the calling thread. The first statement of every
-/// `main`: see [`crate::signal::block`], which is the name services call.
-pub(crate) fn block() {
+/// `main`, under the name `m6_core::signal::block`, which delegates here.
+pub fn block() {
     let _ = managed().thread_block();
 }
 
@@ -294,7 +297,7 @@ pub fn unblock_for_test() {
 }
 
 /// Whether the calling thread blocks the three signals.
-pub(crate) fn blocked_here() -> bool {
+fn blocked_here() -> bool {
     match nix::sys::signal::SigSet::thread_get_mask() {
         Ok(m) => managed().iter().all(|s| m.contains(s)),
         Err(_) => false,
@@ -303,7 +306,7 @@ pub(crate) fn blocked_here() -> bool {
 
 /// Assert the calling thread blocks the signals, with the one reason every
 /// refusal shares.
-pub(crate) fn require_blocked() {
+pub fn require_blocked() {
     assert!(
         blocked_here(),
         "m6_core::signal::block() must be the first statement of main, before \
@@ -315,8 +318,8 @@ pub(crate) fn require_blocked() {
 }
 
 /// Block until one of the three signals arrives and say which request it is.
-/// For [`crate::signal::ShutdownHandle`]'s thread only.
-pub(crate) fn wait_for_signal() -> io::Result<Signal> {
+/// For m6-core's `ShutdownHandle` thread only, which a later job deletes.
+pub fn wait_for_signal() -> io::Result<Signal> {
     loop {
         let sig = managed().wait()?;
         if let Some(s) = signal_from_signo(sig as i32) {
@@ -328,7 +331,7 @@ pub(crate) fn wait_for_signal() -> io::Result<Signal> {
 /// Write one byte to `fd`, to wake a reactor parked on the other end of a
 /// pipe. A full pipe is fine: bytes already pending mean the wake is already
 /// going to happen.
-pub(crate) fn write_wake_byte(fd: RawFd) {
+pub fn write_wake_byte(fd: RawFd) {
     // SAFETY: the caller owns `fd` and keeps it open for the process.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let _ = nix::unistd::write(borrowed, &[1u8]);
@@ -339,8 +342,11 @@ pub(crate) fn write_wake_byte(fd: RawFd) {
 /// A child's exit as a readable descriptor, so a loop never calls `wait(2)`.
 ///
 /// The descriptor becomes readable when the child exits, at once when it
-/// already has. [`ChildExit::reap`] then collects the status without blocking.
-/// Dropping it closes the descriptor and does not reap.
+/// already has. A loop deregisters it on that report and then calls
+/// [`ChildExit::reap`], which collects the status without blocking. The order
+/// matters: on Linux reaping changes the descriptor's state and epoll reports
+/// it once more, so a descriptor left registered is reported for a child
+/// that is gone. Dropping it closes the descriptor and does not reap.
 ///
 /// On Linux it is a `pidfd`. On macOS it is a kqueue registered for
 /// `EVFILT_PROC` with `NOTE_EXIT`, or, when the child has already exited and
@@ -417,7 +423,7 @@ pub fn check_socket_path(path: &Path) -> io::Result<()> {
 }
 
 /// Where a service's unix sockets live in production: `/run/m6`. A test sets
-/// `M6_SOCKET_OVERRIDE` instead, which [`crate::server::socket_path_from_config`]
+/// `M6_SOCKET_OVERRIDE` instead, which `m6_core::server::socket_path_from_config`
 /// honours.
 pub fn runtime_dir() -> PathBuf {
     PathBuf::from("/run/m6")
