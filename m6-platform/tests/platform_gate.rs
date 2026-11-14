@@ -128,8 +128,11 @@ fn no_platform_crate_outside_the_layer() {
 
 /// G3. No direct clock read outside the layer in shipping code: a loop reads
 /// the clock once per wake through `platform::now`, and the wall clock through
-/// `platform::wall`. A test or a bench may time itself. Break: one
-/// `Instant::now()` in a service's `src/`.
+/// `platform::wall`. A test or a bench may time itself. Every path form counts,
+/// not the literal `Instant::now()`: a qualified or imported `Instant::now`, a
+/// clock type renamed by a `use ... as`, `SystemTime::now` passed as
+/// a function value, and a path broken across lines before `::now`. Break: one
+/// `std::time::Instant::now` in a service's `src/`.
 #[test]
 fn no_direct_clock_read_outside_the_layer() {
     let root = root();
@@ -139,11 +142,198 @@ fn no_direct_clock_read_outside_the_layer() {
         if in_layer(&rel) || under("tests") || under("benches") || under("examples") {
             continue;
         }
-        found.extend(offending_lines(&root, &rel, &|line| {
-            line.contains("Instant::now()") || line.contains("SystemTime::now()")
-        }));
+        found.extend(clock_reads(&root, &rel));
     }
     assert_none("G3 (direct clock reads)", found);
+}
+
+/// Lines of `rel` that read a clock directly, as "path:line: text".
+fn clock_reads(root: &Path, rel: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(root.join(rel)).expect("read the file");
+    let lines: Vec<&str> = text.lines().collect();
+    clock_path_lines(&text)
+        .into_iter()
+        .map(|line| {
+            let source = lines.get(line - 1).copied().unwrap_or("");
+            format!("{}:{}: {}", rel.display(), line, source.trim())
+        })
+        .collect()
+}
+
+/// The 1-based lines in `text` that read a clock directly. A direct read is a
+/// `::`-joined path ending in `now` whose segment before `now` is a type named
+/// `Instant` or `SystemTime`, so every qualification matches:
+///
+/// - `Instant::now()`, `std::time::Instant::now()`, `time::Instant::now()`
+/// - `SystemTime::now` as a function value, with no parentheses
+/// - `use std::time::Instant as Clock;` then `Clock::now()`
+/// - a path broken before `::now`, which rustfmt does when the line is long
+///
+/// A `now` method on any other type does not match, which keeps a domain type
+/// out of the rule. A line that is wholly a `//` comment is not code, so a doc
+/// comment that quotes the path does not match either. A `use` of the clock
+/// function itself (`use std::time::Instant::now`) is named on its `use` line,
+/// where the bypass starts.
+fn clock_path_lines(text: &str) -> Vec<usize> {
+    let clock_types = clock_type_names(text);
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut line = 1usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if !ident_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && ident_byte(bytes[i]) {
+            i += 1;
+        }
+        if &text[start..i] != "now" || is_comment_line(text, start) {
+            continue;
+        }
+        if segment_before(text, start).is_some_and(|ty| clock_types.contains(&ty)) {
+            found.push(line);
+        }
+    }
+    found
+}
+
+/// The names that mean a clock type in `text`: `Instant`, `SystemTime`, and
+/// every name a `use ... as <name>` binds to one of them.
+fn clock_type_names(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut names = vec!["Instant", "SystemTime"];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !ident_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && ident_byte(bytes[i]) {
+            i += 1;
+        }
+        let word = &text[start..i];
+        if (word != "Instant" && word != "SystemTime") || is_comment_line(text, start) {
+            continue;
+        }
+        let mut j = skip_space(bytes, i);
+        let as_start = j;
+        while j < bytes.len() && ident_byte(bytes[j]) {
+            j += 1;
+        }
+        if &text[as_start..j] != "as" {
+            continue;
+        }
+        j = skip_space(bytes, j);
+        let alias_start = j;
+        while j < bytes.len() && ident_byte(bytes[j]) {
+            j += 1;
+        }
+        let alias = &text[alias_start..j];
+        if !alias.is_empty() && alias != "_" && !names.contains(&alias) {
+            names.push(alias);
+        }
+    }
+    names
+}
+
+/// The identifier immediately before the `::` that precedes `at`, if `at` is
+/// a path segment. Whitespace, including a newline, is skipped, so
+/// `Instant\n    ::now` names `Instant` too.
+fn segment_before(text: &str, at: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut j = at;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    if j < 2 || bytes[j - 1] != b':' || bytes[j - 2] != b':' {
+        return None;
+    }
+    j = skip_space_back(bytes, j - 2);
+    let end = j;
+    while j > 0 && ident_byte(bytes[j - 1]) {
+        j -= 1;
+    }
+    if j < end {
+        Some(&text[j..end])
+    } else {
+        None
+    }
+}
+
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn skip_space(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_space_back(bytes: &[u8], mut i: usize) -> usize {
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// Whether the line holding byte `at` is wholly a `//` comment.
+fn is_comment_line(text: &str, at: usize) -> bool {
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    text[start..at].trim_start().starts_with("//")
+}
+
+/// The forms G3 must catch, and the lookalikes it must not. This file is
+/// excluded from G3, so the paths can be spelled here.
+#[test]
+fn the_clock_rule_catches_every_path_form_and_no_other() {
+    let caught = [
+        ("let t = std::time::Instant::now();", 1),
+        ("let t = std::time::SystemTime::now();", 1),
+        ("let t = time::Instant::now();", 1),
+        ("let t = Instant::now();", 1),
+        ("let t = SystemTime::now;", 1),
+        ("let t = Instant::now\n    ();", 1),
+        ("let t = std::time::Instant\n    ::now();", 2),
+        ("let t = std::time::Instant::\n    now();", 2),
+        ("use std::time::Instant as Clock;\nlet t = Clock::now();", 2),
+        ("use std::time::SystemTime as Wall;\nlet t = Wall::now;", 2),
+        (
+            "use std::time::{\n    Instant as Clock,\n};\nlet t = Clock::now();",
+            4,
+        ),
+        ("use std::time::Instant::now;\nlet t = now();", 1),
+        ("let t = m6_core::platform::now();", 0),
+        ("let n = m6_core::testkit::alloc_count::now();", 0),
+        ("let t = chrono::Utc::now();", 0),
+        ("let t = clock.now();", 0),
+        ("let t = now();", 0),
+        (
+            "fn now() -> std::time::Instant { std::time::Instant::UNIX_EPOCH }",
+            0,
+        ),
+        ("// Instant::now() belongs in m6-platform/src", 0),
+        ("let t = MyDomainClock::now();", 0),
+    ];
+    for (text, line) in caught {
+        let expected: Vec<usize> = if line == 0 { Vec::new() } else { vec![line] };
+        assert_eq!(
+            clock_path_lines(text),
+            expected,
+            "line numbers for {text:?}"
+        );
+    }
 }
 
 /// G5. No read of a systemd-only variable anywhere outside the layer: m6
