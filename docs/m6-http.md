@@ -99,13 +99,29 @@ The HTTP/1.1 head limit is separate from the 20 MiB cap on a whole request, and 
 
 ## Caching
 
-| Backend returns | Behaviour |
-|---|---|
-| `Cache-Control: public` | Cached under `(path, content-encoding)` key |
-| `Cache-Control: no-store` | Not cached |
-| `Cache-Control: private` | Not cached |
+m6-http caches a backend response when that response says a shared cache may store it.
+`Cache-Control: public` is stored under the `(path, query, content-encoding)` key, while `no-store` and `private` are not stored.
+Each encoding variant is cached independently on demand, with no eager pre-fetching.
 
-Cache key: `(path, content-encoding)`. Query strings stripped before lookup. Each encoding variant cached independently on demand — no eager pre-fetching.
+### The browser-caching pattern
+
+A page and an unversioned file are read through two caches with different lifetimes, so one `Cache-Control` field names both.
+This is the split web.dev's HTTP caching guide and MDN's `Cache-Control` reference document: the browser revalidates, the shared cache keeps its copy.
+A versioned asset is one exact version, so it is pinned instead.
+These are the three headers m6 emits, and the directives that decide each behaviour.
+
+- A page, from m6-core: `Cache-Control: public, max-age=0, must-revalidate, s-maxage=86400`, with an `ETag`.
+- An unversioned file, from m6-file: the same header, with an `ETag`.
+- A versioned asset, `?v=<hash>`: `Cache-Control: public, max-age=31536000, immutable`, with an `ETag`.
+
+`max-age=0` and `must-revalidate` make the browser's copy stale at once and forbid serving it without validation (RFC 9111 sections 5.2.2.1 and 5.2.2.2).
+The browser therefore sends `If-None-Match` on every use, and an unchanged response costs one 304.
+`s-maxage=86400` is honoured by shared caches only and overrides `max-age` for them (RFC 9111 section 5.2.2.10), so m6-http keeps the response for a day and answers that conditional request itself (RFC 9111 section 4.3.2) without contacting the backend.
+`public` makes the response storable by a shared cache.
+
+`no-cache` is absent because it would also force the shared cache to revalidate, the round trip `s-maxage` removes (RFC 9111 section 5.2.2.4).
+`stale-while-revalidate` is absent because it would let the browser serve a stale copy while it revalidates.
+`immutable` appears only on the versioned asset, where changed bytes mean a different URL, and it stops the browser revalidating that URL on reload.
 
 ### Invalidation
 

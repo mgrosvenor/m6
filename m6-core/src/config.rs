@@ -21,6 +21,26 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde_json::{Map, Value};
 
+/// The `Cache-Control` a page gets unless its route says otherwise.
+///
+/// This is the browser-caching pattern: the browser revalidates on every
+/// request, the shared cache keeps the response for a day.
+///
+/// - `max-age=0` makes the browser's copy stale immediately, and
+///   `must-revalidate` forbids serving it once stale (RFC 9111 5.2.2.1 and
+///   5.2.2.2), so a deploy is visible on the next request and an unchanged
+///   page costs one conditional request and a 304.
+/// - `s-maxage=86400` is honoured ONLY by shared caches and overrides
+///   `max-age` for them (RFC 9111 5.2.2.10), so the edge keeps the page for a
+///   day and answers `If-None-Match` itself.
+/// - `public` makes the response storable by a shared cache.
+///
+/// `no-cache` is absent on purpose: it has the same browser behaviour but also
+/// forces the edge to revalidate (RFC 9111 5.2.2.4), which is the round trip
+/// `s-maxage` removes. `stale-while-revalidate` is absent because it would let
+/// the browser serve stale while revalidating.
+pub const PAGE_CACHE_CONTROL: &str = "public, max-age=0, must-revalidate, s-maxage=86400";
+
 /// A single route entry from `[[route]]` in the config file.
 #[derive(Debug, Clone)]
 pub struct RouteConfig {
@@ -28,7 +48,7 @@ pub struct RouteConfig {
     pub template: Option<String>,
     pub params: Vec<String>,
     pub status: u16,
-    /// "public" | "no-store"
+    /// A `Cache-Control` value, or empty when the route sets none.
     pub cache: String,
     pub methods: Option<Vec<String>>,
     /// Extra response headers as `[[key, value]]` pairs.
@@ -613,16 +633,20 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             .map(|s| s.to_string());
 
         // A handler route defaults to `no-store`, a template route to
-        // `public`, and an explicit `cache` wins over both.
+        // `PAGE_CACHE_CONTROL`, and an explicit `cache` wins over both.
         //
-        // The default has to depend on the kind of route because the two are
-        // not the same kind of thing: a template renders a document from files
-        // on disk, a handler computes an answer. Letting a handler route
-        // inherit `public` would put dynamic output in a shared cache by
-        // omission, which is the shape of defect that is found by someone else
-        // seeing another user's page. A code route defaults to `no-store` for
-        // the same reason; this is that rule reaching the config-declared
-        // form.
+        // The default depends on the kind of route because the two are not the
+        // same kind of thing: a template renders a document from files on disk,
+        // a handler computes an answer. Letting a handler route inherit the
+        // page default would put dynamic output in a shared cache by omission,
+        // which is the shape of defect that is found by someone else seeing
+        // another user's page. A code route defaults to `no-store` for the same
+        // reason; this is that rule reaching the config-declared form.
+        //
+        // A page is still cacheable, and the header says how: the browser
+        // revalidates every time, and the shared cache keeps it for a day. The
+        // ETag that makes the 304 possible is added by the finish path from
+        // the final body bytes.
         let cache = item
             .get("cache")
             .and_then(|v| v.as_str())
@@ -631,7 +655,7 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
                 if handler.is_some() {
                     "no-store".to_string()
                 } else {
-                    "public".to_string()
+                    PAGE_CACHE_CONTROL.to_string()
                 }
             });
 

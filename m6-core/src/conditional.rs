@@ -122,11 +122,18 @@ pub fn evaluate_preconditions(
         })
     };
 
+    // `*` is an existence test, not a tag (RFC 9110 13.1.2 step 1). Every
+    // caller reaches this with a resource it already knows exists: a file
+    // m6-file could stat, or a stored response m6-http just looked up. A
+    // non-empty header set is that evidence. An empty set is the one way to
+    // say "no stored response", and then `*` is false.
+    let resource_exists = !cached_headers.is_empty() || etag.is_some() || last_modified.is_some();
+
     // 1. If-Match — strong comparison.
     if let Some(im) = header(req_headers, "if-match") {
         let im = im.trim();
         let ok = if im == "*" {
-            etag.is_some() || last_modified.is_some() // the resource exists
+            resource_exists
         } else {
             etag.is_some_and(|e| etag_list_contains(im, e, true))
         };
@@ -148,7 +155,7 @@ pub fn evaluate_preconditions(
     if let Some(inm) = header(req_headers, "if-none-match") {
         let inm = inm.trim();
         let matched = if inm == "*" {
-            etag.is_some() || last_modified.is_some()
+            resource_exists
         } else {
             etag.is_some_and(|e| etag_list_contains(inm, e, false))
         };
@@ -280,6 +287,33 @@ mod precondition_tests {
         assert_eq!(
             eval(&[("if-none-match", "\"nope\"")], "GET"),
             Precondition::Proceed
+        );
+    }
+
+    /// The two edge cases a cache has to keep apart.
+    ///
+    /// A stored response with no `ETag` has nothing to compare a tag list
+    /// against, so it must not answer 304: the reply is the stored 200.
+    /// `If-None-Match: *` is not a tag at all. RFC 9110 13.1.2 step 1 makes it
+    /// an existence test, and the cache holds a representation, so it matches
+    /// even when that representation carries no validator.
+    #[test]
+    fn if_none_match_star_is_existence_and_a_missing_etag_is_not_a_match() {
+        let no_validators = vec![(
+            "Cache-Control".to_string(),
+            "public, max-age=60".to_string(),
+        )];
+        let request = |value: &str| vec![("if-none-match".to_string(), value.to_string())];
+
+        assert_eq!(
+            evaluate_preconditions(&no_validators, &request("*")[..], "GET"),
+            Precondition::NotModified,
+            "* matches because the stored response exists"
+        );
+        assert_eq!(
+            evaluate_preconditions(&no_validators, &request("\"abc\"")[..], "GET"),
+            Precondition::Proceed,
+            "no stored ETag means no comparison, so no 304"
         );
     }
 

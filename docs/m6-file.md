@@ -130,22 +130,25 @@ Two consequences follow:
 
 m6-file sets `Cache-Control` itself, from the query string alone.
 
-Table 3 gives the header for each case. Take from it that a versioned request is pinned for a year and everything else is not.
+Table 3 gives the header for each case. Take from it that a versioned request is pinned for a year and everything else revalidates on every browser request.
 
 | request | header |
 |---|---|
 | `?v=<hash>` present | `public, max-age=31536000, immutable` |
-| anything else | `public, max-age=60, s-maxage=86400, stale-while-revalidate=60` |
+| anything else | `public, max-age=0, must-revalidate, s-maxage=86400` |
 
-**Table 3: `Cache-Control` by request, decided from the query string alone.** A versioned request is pinned for a year. Everything else is held for 60 seconds by browsers and 86400 seconds by shared caches.
+**Table 3: `Cache-Control` by request, decided from the query string alone.** A versioned request is pinned for a year. Everything else is stale in the browser at once and held for 86400 seconds by shared caches.
 
 A `?v=` URL addresses one exact version, because changed bytes mean a changed hash and so a different URL.
 That is what makes a year and `immutable` safe, and it also stops a browser revalidating on reload.
 
 For everything else the two audiences are split deliberately:
 
-- `max-age` and `stale-while-revalidate` are honoured by browsers, and no invalidation can reach a browser cache, so they stay short and a deploy is visible promptly.
-- `s-maxage` is honoured only by shared caches, per *RFC* (Request for Comments) 9110 section 5.2.2.10, so it lengthens just the edge copy, which an invalidation can evict.
+- `max-age=0` with `must-revalidate` is honoured by browsers and makes the browser validate on every use (RFC 9111 sections 5.2.2.1 and 5.2.2.2). An unchanged file costs one 304, and a deploy is visible on the next request.
+- `s-maxage=86400` is honoured only by shared caches and overrides `max-age` for them (RFC 9111 section 5.2.2.10), so it lengthens just the edge copy, which an invalidation can evict.
+
+The handler sends an `ETag` on every file, so that browser validation is a 304 with no body.
+The edge also answers the conditional request from its own copy (RFC 9111 section 4.3.2), without reading the file or contacting m6-file.
 
 No route can currently override this, and three things that look like they would do not work:
 

@@ -372,8 +372,14 @@ fn l4_cache_control_public() {
 
     assert!(resp.contains("200 OK"), "expected 200");
     assert!(
-        resp.to_lowercase().contains("cache-control: public"),
-        "expected Cache-Control: public header, headers:\n{}",
+        resp.to_lowercase()
+            .contains("cache-control: public, max-age=0, must-revalidate, s-maxage=86400"),
+        "expected the browser-caching pattern, headers:\n{}",
+        &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
+    );
+    assert!(
+        resp.to_lowercase().contains("etag:"),
+        "an unversioned file needs an ETag to revalidate against, headers:\n{}",
         &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
     );
 }

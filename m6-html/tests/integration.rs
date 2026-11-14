@@ -628,9 +628,9 @@ fn l6_no_store_cache_control() {
     );
 }
 
-/// Default route → Cache-Control: public.
+/// Default route -> the browser-caching pattern, with an ETag.
 #[test]
-fn l6_default_cache_control_public() {
+fn l6_default_cache_control_is_the_browser_caching_pattern() {
     let (_guard, socket_path) = spawn_server("l6-public");
 
     let resp = http_request(
@@ -639,8 +639,14 @@ fn l6_default_cache_control_public() {
     );
     assert!(resp.contains("200 OK"), "expected 200");
     assert!(
-        resp.to_lowercase().contains("cache-control: public"),
-        "expected Cache-Control: public, got headers:\n{}",
+        resp.to_lowercase()
+            .contains("cache-control: public, max-age=0, must-revalidate, s-maxage=86400"),
+        "expected the page default, got headers:\n{}",
+        &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
+    );
+    assert!(
+        resp.to_lowercase().contains("etag:"),
+        "a page must carry an ETag so it can be revalidated, got headers:\n{}",
         &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
     );
 }

@@ -101,19 +101,30 @@ fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
 /// hash and therefore a different URL — so it can be pinned for a year and
 /// marked `immutable`, which also stops a browser revalidating it on reload.
 ///
-/// Everything else splits the two audiences deliberately:
-/// - `max-age=60` / `stale-while-revalidate=60` are honoured by BROWSERS, and
-///   no invalidation can reach a browser cache. They stay short so a deploy is
-///   visible promptly. Raising either one strands visitors on the old file.
-/// - `s-maxage=86400` is honoured ONLY by shared caches (RFC 9111 5.2.2.10).
-///   A browser ignores it. It lengthens just the edge's copy, which a cache
-///   invalidation at deploy time empties.
+/// Everything else uses the browser-caching pattern: the browser revalidates
+/// on every request, the shared cache keeps the response for a day.
+///
+/// - `max-age=0` makes the browser's copy stale immediately, and
+///   `must-revalidate` forbids serving it once stale (RFC 9111 5.2.2.1 and
+///   5.2.2.2). A deploy is therefore visible on the next request, and an
+///   unchanged file costs one conditional request and a 304.
+/// - `s-maxage=86400` is honoured ONLY by shared caches, and it overrides
+///   `max-age` for them (RFC 9111 5.2.2.10). The edge keeps its copy for a day
+///   and answers the browser's `If-None-Match` itself, without the backend.
+/// - `public` is what makes the response storable by a shared cache.
+///
+/// `no-cache` is deliberately absent. It has the same browser behaviour as
+/// `max-age=0, must-revalidate`, but it also forces the shared cache to
+/// revalidate, which is the latency `s-maxage` exists to remove (RFC 9111
+/// 5.2.2.4). `stale-while-revalidate` is deliberately absent too: it would let
+/// the browser serve the stale copy while revalidating, which is what the
+/// pattern forbids.
 fn cache_control_for(query: &str) -> &'static str {
     let versioned = query.split('&').any(|p| p.starts_with("v=") && p.len() > 2);
     if versioned {
         "public, max-age=31536000, immutable"
     } else {
-        "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+        "public, max-age=0, must-revalidate, s-maxage=86400"
     }
 }
 
@@ -886,12 +897,12 @@ mod cache_control_tests {
         }
     }
 
-    /// Everything else keeps the short window. The webfont matters most here:
-    /// it is requested unversioned from @font-face inside style.css, and
+    /// Everything else takes the revalidating branch. The webfont matters most
+    /// here: it is requested unversioned from @font-face inside style.css, and
     /// pinning it for a year would strand clients on an old file that no
     /// server-side invalidation can reach.
     #[test]
-    fn unversioned_and_malformed_urls_keep_the_short_window() {
+    fn unversioned_and_malformed_urls_are_not_versioned() {
         for url in [
             "/assets/fonts/montserrat-normal.woff2",
             "/assets/css/style.css",
@@ -917,30 +928,46 @@ mod cache_control_tests {
         );
         assert_eq!(
             cache_control_for(&query_of("/assets/fonts/montserrat-normal.woff2")),
-            "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+            "public, max-age=0, must-revalidate, s-maxage=86400"
         );
     }
 
     /// The property that holds the unversioned directive together, stated as
     /// its own test so the reason survives.
     ///
-    /// An edge cache can be emptied on deploy, and a browser cache cannot be
-    /// reached at all. So the long window may only ever appear on `s-maxage`,
-    /// which browsers ignore. Raising `max-age` or `stale-while-revalidate` to
-    /// buy the same hit rate would strand every visitor on the previous file
-    /// for a day.
+    /// A browser cache cannot be reached at all, so its copy must be stale
+    /// immediately and unusable without a successful validation. An edge cache
+    /// can be emptied on deploy, so it may keep the same response for a day.
+    /// The long window may therefore appear only on `s-maxage`, the one
+    /// directive browsers ignore.
     #[test]
     fn unversioned_lengthens_only_the_edge_never_the_browser() {
         let cc = cache_control_for(&query_of("/assets/css/style.css"));
 
+        // The edge keeps it, and keeps it for a day.
         assert!(
             cc.contains("s-maxage=86400"),
             "edge must hold it long: {cc}"
         );
-        assert!(cc.contains("max-age=60"), "browser must stay short: {cc}");
+
+        // The browser revalidates on every use: zero freshness plus an
+        // obligation to validate once stale.
         assert!(
-            cc.contains("stale-while-revalidate=60"),
-            "browser-visible stale window must stay short: {cc}"
+            cc.contains("max-age=0"),
+            "the browser's copy must be stale at once: {cc}"
+        );
+        assert!(
+            cc.contains("must-revalidate"),
+            "the browser must not serve a stale copy without validating: {cc}"
+        );
+
+        // `no-cache` would make the edge revalidate too, and
+        // `stale-while-revalidate` would let the browser serve stale while it
+        // revalidates asynchronously. Neither belongs in the pattern.
+        assert!(!cc.contains("no-cache"), "no-cache reaches the edge: {cc}");
+        assert!(
+            !cc.contains("stale-while-revalidate"),
+            "the browser may not serve stale while revalidating: {cc}"
         );
 
         // The directive browsers obey must never carry the long value. Checked
