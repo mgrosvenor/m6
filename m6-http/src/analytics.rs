@@ -117,7 +117,9 @@ fn get_or_create_session(headers: &(impl HeaderSource + ?Sized)) -> Session<'_> 
     // `auth::combined_cookie_header`'s doc comment), and a single-field
     // lookup would miss `_m6sid` whenever it isn't in whichever field
     // happens to come first. Scanning the fields in turn is why this no
-    // longer joins them into a new `String` first.
+    // longer joins them into a new `String` first. When two fields both carry
+    // `_m6sid`, the first one with a value wins, which is the order the old
+    // join produced, and `a_cookie_split_across_fields_is_still_read` pins it.
     headers
         .find_all("cookie")
         .find_map(session_from_cookie_header)
@@ -141,7 +143,11 @@ fn get_or_create_session(headers: &(impl HeaderSource + ?Sized)) -> Session<'_> 
 /// Called only where a response's headers are written and only for a new
 /// session, so the one `String` it makes is a new visit's `Set-Cookie` and not
 /// a per-request cost.
-pub fn session_cookie_header_value(id: &str) -> String {
+///
+/// Takes the minted [`SessionId`] rather than a string so that a value which
+/// came from the request cannot reach a response header by accident.
+pub fn session_cookie_header_value(id: SessionId) -> String {
+    let id = id.as_str();
     format!("{SESSION_COOKIE}={id}; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax")
 }
 
@@ -285,10 +291,7 @@ pub fn finish_response(
     let html = is_html_response(resp_headers);
     if let Some(id) = record(enabled, request_headers, ev, window) {
         if html {
-            resp_headers.push((
-                "Set-Cookie".to_string(),
-                session_cookie_header_value(id.as_str()),
-            ));
+            resp_headers.push(("Set-Cookie".to_string(), session_cookie_header_value(id)));
         }
     }
 }
@@ -568,8 +571,8 @@ mod tests {
 
     #[test]
     fn test_session_cookie_header_value_shape() {
-        let v = session_cookie_header_value("abc");
-        assert!(v.starts_with("_m6sid=abc;"));
+        let v = session_cookie_header_value(SessionId([b'a'; 32]));
+        assert!(v.starts_with(&format!("_m6sid={};", "a".repeat(32))));
         assert!(v.contains("HttpOnly"));
         assert!(v.contains("Secure"));
         assert!(v.contains("SameSite=Lax"));

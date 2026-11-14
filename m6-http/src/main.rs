@@ -858,7 +858,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             &mut state.traffic,
         )
         .filter(|_| analytics::is_html_response(&cached.headers))
-        .map(|id| analytics::session_cookie_header_value(id.as_str()));
+        .map(|id| analytics::session_cookie_header_value(id));
         return Routed::Cached {
             status: cached.status,
             entry: cached,
@@ -2624,7 +2624,7 @@ fn handle_h3_request(
             if let (Some(id), true) = (set_cookie, html) {
                 headers.push((
                     "Set-Cookie".to_string(),
-                    analytics::session_cookie_header_value(id.as_str()),
+                    analytics::session_cookie_header_value(id),
                 ));
             }
             debug!(
@@ -2682,7 +2682,7 @@ fn handle_h3_request(
         if let (Some(id), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
             headers_with_links.push((
                 "Set-Cookie".to_string(),
-                analytics::session_cookie_header_value(id.as_str()),
+                analytics::session_cookie_header_value(id),
             ));
         }
         let resp_headers: &[(String, String)] = &headers_with_links;

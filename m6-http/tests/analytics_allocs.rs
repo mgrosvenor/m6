@@ -1,4 +1,11 @@
-//! The per-request analytics line allocates nothing.
+//! The per-request analytics line allocates nothing in `record`.
+//!
+//! What this measures is the line path: the borrowed features, the referer
+//! slices, the session scan and the Sink write. A new session's `Set-Cookie`
+//! value is built later, where the response headers are written, and is not in
+//! this count: it is one `String` per new session, once per visitor rather than
+//! once per request, and it is the only allocation this work left in the
+//! analytics path.
 //!
 //! `harness = false` means no libtest thread shares this binary, so the
 //! counting allocator reads only what `record` allocated. The analytics Sink is
@@ -70,13 +77,18 @@ fn main() {
 
     let start = alloc_count::now();
     for _ in 0..REQUESTS {
-        let _: Option<SessionId> = analytics::record(true, &with_cookie, &ev, &mut window);
+        let id = analytics::record(true, &with_cookie, &ev, &mut window);
+        assert!(id.is_none(), "a request carrying the cookie adopts it");
     }
     let returning = alloc_count::now() - start;
 
     let start = alloc_count::now();
     for _ in 0..REQUESTS {
-        let _: Option<SessionId> = analytics::record(true, &no_cookie, &ev, &mut window);
+        let id = analytics::record(true, &no_cookie, &ev, &mut window);
+        assert!(
+            id.is_some(),
+            "a request with no cookie gets a new session id"
+        );
     }
     let new_session = alloc_count::now() - start;
 

@@ -59,7 +59,18 @@ pub fn random_hex_token_into(out: &mut [u8]) -> &str {
 /// reseeded. That property is the reason this function exists in one place: a
 /// token generator is a security primitive and should not be re-derived from
 /// memory.
+///
+/// # Panics
+///
+/// `N` must be at most [`MAX_TOKEN_BYTES`], because the scratch buffer holds
+/// exactly that many random bytes. A larger `N` slices the buffer out of
+/// bounds and panics, so a caller with a const-generic size it does not
+/// control checks the bound rather than passing one through.
 pub fn random_hex_token<const N: usize>() -> String {
+    assert!(
+        N <= MAX_TOKEN_BYTES,
+        "a token is at most {MAX_TOKEN_BYTES} random bytes"
+    );
     let mut out = [0u8; 2 * MAX_TOKEN_BYTES];
     random_hex_token_into(&mut out[..2 * N]).to_owned()
 }
