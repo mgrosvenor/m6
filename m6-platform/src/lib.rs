@@ -432,17 +432,63 @@ pub fn temp_dir() -> PathBuf {
 
 /// A directory a test can compile into and then execute from.
 ///
+/// The candidates, in order: `TMPDIR` when the environment names one (the
+/// temporary directory the process was given), `/var/tmp`, and [`temp_dir`]'s
+/// own answer. The first one a directory can be created in and executed
+/// from wins.
+///
+/// `TMPDIR` comes first because it is the directory the caller was given, and
+/// because a sandbox can leave `/var/tmp` existing while refusing every write
+/// to it. The earlier test was `is_dir()` alone, so such a host got `/var/tmp`
+/// back and every caller's `tempfile::tempdir_in` failed with
+/// `PermissionDenied`.
+///
+/// `/var/tmp` remains the fallback for the case the helper was introduced for:
 /// `/tmp` is not guaranteed to permit exec, and a hardened host mounts it
-/// `noexec`. `/var/tmp` is disk-backed and not among the mounts hardening
-/// restricts, so it is used when it exists, and the temporary directory
-/// otherwise. Not for sockets: a path under here is longer than one under
-/// [`temp_dir`].
+/// `noexec`, while `/var/tmp` is disk-backed and not among the mounts
+/// hardening restricts. It is chosen only when it is writable, because
+/// existing is not the same as usable. Not for sockets: a path under here can
+/// be longer than one under [`temp_dir`], and a socket needs the short one.
 pub fn scratch_dir() -> PathBuf {
-    let var_tmp = PathBuf::from("/var/tmp");
-    if var_tmp.is_dir() {
-        return var_tmp;
+    let mut candidates = Vec::new();
+    if let Some(tmp) = std::env::var_os("TMPDIR").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(tmp));
     }
-    temp_dir()
+    candidates.push(PathBuf::from("/var/tmp"));
+    candidates.push(temp_dir());
+    scratch_candidate(candidates).unwrap_or_else(temp_dir)
+}
+
+/// The first candidate a directory can be created in.
+///
+/// The probe is the two operations the callers perform: it makes a private
+/// directory in the candidate, writes a small script into it and runs it. A
+/// directory that exists but is read-only, denied by a sandbox, on a `noexec`
+/// mount, or not a directory at all is skipped rather than returned. The probe
+/// directory is removed before the next candidate is tried.
+fn scratch_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    static PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    candidates.into_iter().find(|dir| {
+        let probe = dir.join(format!(
+            ".m6-scratch-probe-{}-{}",
+            std::process::id(),
+            PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if std::fs::create_dir(&probe).is_err() {
+            return false;
+        }
+        let script = probe.join("run.sh");
+        let ran = std::fs::write(&script, "#!/bin/sh\nexit 0\n")
+            .and_then(|()| {
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            })
+            .and_then(|()| std::process::Command::new(&script).output())
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&probe);
+        ran
+    })
 }
 
 /// Create `file` as a private file: its parent with mode 0700 when the parent
@@ -464,4 +510,31 @@ pub fn create_private(file: &Path) -> io::Result<()> {
         .mode(0o600)
         .open(file)?;
     std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A candidate that exists but cannot be used is skipped.
+    ///
+    /// The first candidate is a regular file, so the probe's `create_dir`
+    /// fails the way a sandbox's refusal of `/var/tmp` does. The second does
+    /// not exist. The third is a writable, executable directory, and it is the
+    /// one returned.
+    #[test]
+    fn a_scratch_candidate_must_be_writable_not_merely_present() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let not_a_directory = base.path().join("a-file");
+        std::fs::write(&not_a_directory, b"").expect("write the file");
+        let usable = base.path().join("usable");
+        std::fs::create_dir(&usable).expect("create the usable directory");
+
+        let chosen = scratch_candidate(vec![
+            not_a_directory,
+            base.path().join("missing"),
+            usable.clone(),
+        ]);
+        assert_eq!(chosen, Some(usable));
+    }
 }

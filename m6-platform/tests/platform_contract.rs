@@ -1184,6 +1184,37 @@ mod directories {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
     }
 
+    /// D3a. Break: a fixed system path preferred to the temp directory the
+    /// process was given, so a sandbox that denies `/var/tmp` fails every
+    /// compiled asset with `PermissionDenied`.
+    #[test]
+    fn the_scratch_directory_is_the_one_tmpdir_names() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "directories::scratch_dir_is_respected_inside",
+            ])
+            .env("TMPDIR", dir.path())
+            .output()
+            .expect("run the inner test");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{text}");
+        assert!(
+            text.contains(&format!("inner: {}", dir.path().display())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by the_scratch_directory_is_the_one_tmpdir_names with TMPDIR set"]
+    fn scratch_dir_is_respected_inside() {
+        println!("inner: {}", platform::scratch_dir().display());
+    }
+
     /// D4. Break: a path that drifts between services.
     #[test]
     fn the_runtime_directory_is_fixed() {
