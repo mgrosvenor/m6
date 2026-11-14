@@ -34,15 +34,18 @@
 use crate::forward::HttpRequest;
 use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
 use m6_core::event::Timeouts;
+use m6_core::log::{info, warn};
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
 use m6_core::platform::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
 use std::time::Duration;
-use tracing::{info, warn};
 
 const TOKEN_LISTENER: Token = Token(usize::MAX);
 const TOKEN_SIGNAL: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const TOKEN_LOG: Token = Token(usize::MAX - 2);
 const POLL_TIMEOUT_MS: u64 = 1_000;
 
 /// Percent-safe: the request target is echoed back into `Location` verbatim,
@@ -184,6 +187,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
 
     let mut events = Events::with_capacity(64);
     let mut accepting = true;
+    let mut last_log_tick = m6_core::platform::now();
     loop {
         let now = m6_core::platform::now();
         match poll.poll(
@@ -231,15 +235,22 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                 TOKEN_SIGNAL => {
                     let mut stop = false;
                     while let Some(sig) = signals.read() {
+                        if sig == m6_core::platform::Signal::ReopenLogs {
+                            let result = m6_core::log::reopen();
+                            lifecycle.reopened(&result);
+                            continue;
+                        }
                         if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
                             stop = true;
                         }
                     }
                     if stop {
                         lifecycle.complete();
+                        m6_core::log::stop()?;
                         return Ok(());
                     }
                 }
+                TOKEN_LOG => m6_core::log::flush(),
                 Token(k) => {
                     let drive = listener.drive_one(
                         k,
@@ -258,6 +269,16 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        m6_core::log::watch(poll.registry(), TOKEN_LOG)?;
+
+        // The accounting tick: flush the log buffers once a second.
+        if now.duration_since(last_log_tick) >= Duration::from_secs(1) {
+            m6_core::log::tick(m6_core::platform::wall());
+            last_log_tick = now;
         }
 
         // Close connections idle past the read deadline.

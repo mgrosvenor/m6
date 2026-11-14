@@ -1,25 +1,25 @@
 //! Shutting down on purpose.
 //!
 //! **`block()` must be the first statement of `main`.** The signal mask is
-//! inherited only by threads created after it, and a service's logging writer
-//! is a thread; if it starts first it takes SIGTERM at the default disposition
-//! and the process dies instead of shutting down. `install_with_hooks` asserts the
-//! mask is set, and that assertion has since caught a real case: a set of
-//! service runners started logging first, so SIGTERM handling was quietly
-//! wrong for every service built on them.
+//! inherited only by threads created after it, and the platform's signal
+//! descriptor refuses to open without it. A thread started first takes SIGTERM
+//! at the default disposition, and the process dies instead of shutting down.
+//!
+//! [`Lifecycle`] is the per-service surface. A service's loop reads the
+//! platform's signal descriptor and asks it what each signal means. SIGUSR1
+//! reopens the log file and never counts toward shutdown.
 //!
 //! **Log before setting the flag, not after.** The flag is what releases the
 //! main thread, which logs "shutdown complete" and returns from `main`, and
-//! process exit discards whatever is still queued in the writer. A line logged
-//! after the store is racing the exit, and on a loaded machine it loses.
+//! process exit discards whatever is still buffered. A line logged after the
+//! store is racing the exit, and on a loaded machine it loses.
 //!
-//! A `ShutdownHandle` also self-connects to wake a parked `accept`, and
-//! unlinks the socket on the way out so m6-http does not keep a dead member in
-//! its backend pool.
-//!
-//! SIGUSR1 reopens the log file and never counts toward shutdown.
+//! [`ShutdownHandle`] is the older thread-backed form. A test installs it and
+//! no service does.
 
 use std::os::unix::io::RawFd;
+
+use crate::log::{error, info};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -48,25 +48,6 @@ pub fn block() {
 /// refusal messages cannot drift.
 pub(crate) fn require_blocked() {
     crate::platform::require_blocked();
-}
-
-/// Reopen the log file for [`crate::platform::Signal::ReopenLogs`] and say what happened.
-fn reopen_on_signal(name: &str) {
-    match crate::log::reopen_log_file() {
-        crate::log::Reopened::NoFile => {
-            tracing::info!("{name} log reopen requested; this process writes no log file");
-        }
-        crate::log::Reopened::Done(p) => {
-            tracing::info!(path = %p.display(), "{name} log file reopened");
-        }
-        crate::log::Reopened::Failed(p, e) => {
-            tracing::error!(
-                path = %p.display(),
-                error = %e,
-                "{name} log reopen failed; still writing to the previous file"
-            );
-        }
-    }
 }
 
 /// What one m6 service needs in order to shut down.
@@ -163,15 +144,15 @@ fn finish(svc_name: &str, socket: Option<&Path>, how: &str) {
     if let Some(path) = socket {
         let _ = std::fs::remove_file(path);
     }
-    tracing::info!("{svc_name} shutdown {how}");
+    info!("{svc_name} shutdown {how}");
 }
 
 /// The `"<name> started"` line, with the socket when there is one, shared by
 /// [`ShutdownHandle::install`] and [`Lifecycle::started`].
 fn log_started_line(name: &str, socket: Option<&Path>) {
     match socket {
-        Some(path) => tracing::info!(socket = %path.display(), "{} started", name),
-        None => tracing::info!("{} started", name),
+        Some(path) => info!(socket = %path.display(), "{} started", name),
+        None => info!("{} started", name),
     }
 }
 
@@ -190,7 +171,7 @@ fn handle_terminate(name: &str, socket: Option<&Path>, count: u32) -> Action {
         finish(name, socket, "forced");
         std::process::exit(0);
     }
-    tracing::info!("{name} shutdown signal received");
+    info!("{name} shutdown signal received");
     Action::Stop
 }
 
@@ -204,6 +185,26 @@ pub struct Lifecycle {
     name: String,
     socket: Option<PathBuf>,
     terminations: u32,
+}
+
+/// The lines a log reopen logs, shared by a service's loop and the signal
+/// thread, so their messages cannot drift.
+fn log_reopen(name: &str, result: &std::io::Result<()>) {
+    if !crate::log::writes_log_file() {
+        info!("{name} log reopen requested; this process writes no log file");
+        crate::log::flush();
+        return;
+    }
+    match result {
+        Ok(()) => info!("{name} log file reopened"),
+        Err(e) => error!(
+            error = %e,
+            "{name} log reopen failed; still writing to the previous file"
+        ),
+    }
+    // The operator asked for this reopen, so its line is written now rather
+    // than on the loop's next tick.
+    crate::log::flush();
 }
 
 impl Lifecycle {
@@ -220,11 +221,17 @@ impl Lifecycle {
         log_started_line(&self.name, self.socket.as_deref());
     }
 
+    /// The lines a log reopen logs, with the service's name, so a loop that
+    /// performs the reopen itself says what happened.
+    pub fn reopened(&self, result: &std::io::Result<()>) {
+        log_reopen(&self.name, result);
+    }
+
     /// What to do after one signal. [`Action::Stop`] means the loop breaks.
     pub fn on_signal(&mut self, s: crate::platform::Signal) -> Action {
         match s {
             crate::platform::Signal::ReopenLogs => {
-                reopen_on_signal(&self.name);
+                self.reopened(&crate::log::reopen());
                 Action::Continue
             }
             crate::platform::Signal::Shutdown => {
@@ -290,38 +297,14 @@ impl ShutdownHandle {
                     // Before the terminate count, so a reopen is never a step
                     // toward a forced exit.
                     if sig == crate::platform::Signal::ReopenLogs {
-                        reopen_on_signal(name);
+                        let result = crate::log::reopen();
+                        log_reopen(name, &result);
                         continue;
                     }
                     let count = SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-                    // `handle_terminate` logs "shutdown signal received" BEFORE
-                    // this stores the flag, not after.
-                    //
-                    // The flag is what releases the main thread: it
-                    // sees `is_shutdown()`, logs "shutdown
-                    // complete" and returns from `main`, and process
-                    // exit discards whatever is still queued in
-                    // `tracing_appender`'s non-blocking writer. With
-                    // the store first, this line was racing the
-                    // exit, so a fast service could exit with
-                    // "shutdown complete" written and "shutdown signal
-                    // received" lost.
-                    //
-                    // That is the whole of
-                    // `redirect_lifecycle::sigterm_shuts_down_rather_than_being_ignored`,
-                    // which failed intermittently for weeks and never
-                    // reproduced in isolation: the redirect listener
-                    // gets from start to complete in about 20ms, so
-                    // under load the appender thread is simply
-                    // scheduled too late. Captured 2026-09-12 with the
-                    // journal showing `started`, the listener line, and
-                    // `shutdown complete` -- and nothing in between.
-                    //
-                    // Ordering the other way does not make the log
-                    // durable, it makes it *ordered*: the main thread
-                    // cannot observe the flag until this call has
-                    // returned, so the line is queued ahead of the
-                    // completion line rather than concurrently with it.
+                    // The line is logged before the flag is stored, so the
+                    // main thread cannot observe the shutdown request until
+                    // it is buffered ahead of the completion line.
                     if handle_terminate(name, sock, count as u32) == Action::Stop {
                         SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
                         wake(sock, wake_fd);

@@ -102,8 +102,7 @@ mode             = "internal"
 verbose_fallback = true
 
 [log]
-level  = "info"
-format = "text"
+level = "info"
 
 [[backend]]
 name    = "m6-html"
@@ -1393,8 +1392,7 @@ journalctl -u m6-http -p err
 journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 ```
 
-The `-o cat | jq .` form only parses when `site.toml` sets `format = "json"`.
-Example 05 sets `format = "text"`, so change it to `json` for structured log processing.
+Every m6 log line is JSON, so `journalctl -u m6-http -o cat | jq .` parses every one.
 
 ### 7.8. Rotating the analytics log
 
@@ -1604,8 +1602,7 @@ mode             = "internal"
 verbose_fallback = true
 
 [log]
-level  = "info"
-format = "text"
+level = "info"
 
 [[backend]]
 name    = "m6-html"
@@ -1812,7 +1809,7 @@ Example 08 adds a log viewer that tails the JSON logs in the browser.
 
 Example 08 adds a real-time log viewer to the site.
 m6-http writes JSON logs, m6-file serves them from a byte offset, and a browser page polls and renders the new lines.
-The example demonstrates `format = "json"` logging and m6-file's tail mode.
+The example demonstrates JSON logging and m6-file's tail mode.
 
 ```bash
 cd examples/08-logviewer
@@ -1823,7 +1820,7 @@ cd examples/08-logviewer
 The stack is three processes: m6-http, m6-html and m6-file.
 `dev.sh` redirects each process's output to its own file under `logs/`, so the viewer has one file per process.
 
-`site.toml` sets `format = "json"` and `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
+`site.toml` sets `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
 The route is direct, so m6-http forwards the request without requiring the log files to exist at startup.
 The example leaves the tail route unauthenticated, and `level = "debug"` logs can carry request detail.
 A production deployment protects the route with `require = "role:..."`, the way section 7.9 protects the monitor history.

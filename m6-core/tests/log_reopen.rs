@@ -1,17 +1,15 @@
 //! SIGUSR1 reopens the analytics file, and is not a shutdown.
 //!
-//! This binary has its own `main` (`harness = false` in `Cargo.toml`) for two
-//! reasons. `tracing`'s subscriber is installed once per process, and
-//! `signal::block()` must run before any other thread exists, which the libtest
-//! harness does not allow. The check follows the order a
-//! rotation tool uses: rename the file, send the signal, wait for the path to
-//! reappear, then write again.
+//! This binary has its own `main` (`harness = false` in `Cargo.toml`) so the
+//! process runs on one thread from start to finish, as a service does. The
+//! check follows the order a rotation tool uses: rename the file, ask for the
+//! reopen the way a loop does, wait for the path to reappear, then write again.
 
 use std::path::Path;
 use std::time::Duration;
 
+use m6_core::log::{self, Level, Line};
 use m6_core::monitoring::LoggingHealth;
-use m6_core::signal::{self, Service, ShutdownHandle};
 use m6_core::testkit::wait::until;
 
 fn lines(path: &Path) -> Vec<String> {
@@ -22,19 +20,26 @@ fn lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+fn write_line(n: u64) {
+    let wrote = log::with_analytics(|sink| {
+        Line::begin(sink, Level::Info, "reopen").u64("n", n).end();
+    });
+    assert!(wrote, "the analytics Sink is not open");
+    // The loop's one-second tick is what writes the buffer out.
+    log::tick(m6_core::platform::wall());
+}
+
 fn main() {
     sigusr1_reopens_the_file_and_is_not_a_shutdown();
     println!("sigusr1_reopens_the_file_and_is_not_a_shutdown ... ok");
 }
 
 fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
-    signal::block();
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("a.ndjson");
-    let _log = m6_core::log::init_with_analytics("json", "info", Some(&live)).expect("init");
-    let _handle = ShutdownHandle::install(Service::new("test"));
+    log::init(Level::Info, Some(&live)).expect("init");
 
-    tracing::info!(target: "analytics", n = 1u64);
+    write_line(1);
     assert!(
         until(Duration::from_secs(5), || lines(&live).len() == 1),
         "the first line never reached the file"
@@ -42,14 +47,13 @@ fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
 
     let rotated = dir.path().join("a.ndjson.1");
     std::fs::rename(&live, &rotated).unwrap();
-    m6_core::platform::send(std::process::id(), m6_core::platform::Signal::ReopenLogs)
-        .expect("send the reload request");
+    log::reopen().expect("reopen the analytics file");
     assert!(
         until(Duration::from_secs(5), || live.exists()),
         "the live path never reappeared"
     );
 
-    tracing::info!(target: "analytics", n = 2u64);
+    write_line(2);
     assert!(
         until(Duration::from_secs(5), || lines(&live).len() == 1),
         "the second line never reached the new file"
@@ -59,10 +63,10 @@ fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
     assert_eq!(old.len(), 1);
     assert!(old[0].contains(r#""n":1"#), "{old:?}");
     assert!(lines(&live)[0].contains(r#""n":2"#));
-    assert!(!signal::is_shutdown());
-    assert_eq!(m6_core::log::reopens().successes(), 1);
+    assert_eq!(log::reopens().successes(), 1);
     let reopen = LoggingHealth::read()
         .reopen
         .expect("this process writes a file");
     assert!(reopen.seconds_since_last_reopen.unwrap() <= 1);
+    log::stop().expect("stop the log");
 }

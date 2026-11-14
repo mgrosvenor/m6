@@ -221,7 +221,7 @@ fn system_toml(bind_port: u16, cert: &str, key: &str) -> String {
 fn site_toml(glob: &str) -> String {
     format!(
         "[site]\nname = \"pool-failover\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"info\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
          [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\

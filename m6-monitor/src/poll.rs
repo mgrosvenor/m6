@@ -1182,7 +1182,7 @@ impl Poller {
         if let Some(start) = self.last_start {
             // The one number an operator watches on a monitor: how long the
             // fleet took to answer. Debug, because a poll is once per interval.
-            tracing::debug!(
+            m6_core::log::debug!(
                 poll_ms = now.duration_since(start).as_millis() as u64,
                 "fleet poll completed"
             );
@@ -1191,7 +1191,7 @@ impl Poller {
         // building the digest, the page and the history batch. Counted under
         // the test feature, so the number is measured rather than assumed.
         #[cfg(feature = "count-allocations")]
-        tracing::debug!(
+        m6_core::log::debug!(
             poll_allocs = m6_core::testkit::alloc_count::now() - self.running.alloc_start,
             "fleet poll allocations"
         );

@@ -37,6 +37,7 @@ mod sink;
 
 use std::cell::{Cell, RefCell};
 use std::io;
+use std::os::fd::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -139,6 +140,24 @@ pub fn with_analytics(f: impl FnOnce(&mut Sink)) -> bool {
         }
         None => false,
     })
+}
+
+/// The operational Sink's descriptor, for a loop that watches it for
+/// writability while [`stdout_wants_write`] is true.
+///
+/// `None` before [`init`] and on a thread that never called it. The descriptor
+/// is stdout itself, which the Sink made non-blocking.
+pub fn stdout_fd() -> Option<RawFd> {
+    OPERATIONAL.with(|slot| slot.borrow().as_ref().map(Sink::fd))
+}
+
+/// Whether the operational Sink is holding bytes that a full destination would
+/// not take.
+///
+/// The loop registers stdout for `WRITABLE` under its `LOG` token while this is
+/// true, and removes it once a flush drains the Sink.
+pub fn stdout_wants_write() -> bool {
+    OPERATIONAL.with(|slot| slot.borrow().as_ref().is_some_and(Sink::wants_write))
 }
 
 /// Lines the operational Sink has dropped, for the tests.
@@ -265,5 +284,5 @@ pub fn pulse() -> &'static LogPulse {
 
 fn elapsed_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    START.get_or_init(m6_platform::now).elapsed().as_millis() as u64
 }

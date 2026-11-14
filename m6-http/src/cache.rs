@@ -848,7 +848,7 @@ impl Cache {
             .saturating_sub(freed);
         self.bytes
             .store(now_held, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(
+        m6_core::log::info!(
             dropped = before - map.len(),
             bytes_held = now_held,
             max_bytes = self.max_bytes,
@@ -885,7 +885,7 @@ impl Cache {
                 if let (Some(kpath), Some(query), Some(enc)) =
                     (parts.next(), parts.next(), parts.next())
                 {
-                    tracing::debug!(
+                    m6_core::log::debug!(
                         path = %kpath, query = %query, encoding = %enc,
                         "cache: evicted"
                     );

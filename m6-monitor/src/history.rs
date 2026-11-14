@@ -1166,7 +1166,7 @@ impl History {
     pub fn flush(&mut self) {
         self.write_held();
         if !self.queue.is_empty() {
-            tracing::warn!(
+            m6_core::log::warn!(
                 held = self.queue.len(),
                 "history batches were still held when the monitor stopped"
             );
@@ -1185,7 +1185,7 @@ impl History {
                     Ok(s) => {
                         self.store = Some(s);
                         if self.status.open_error.take().is_some() {
-                            tracing::info!(file = %cfg.file.display(), "history file opened");
+                            m6_core::log::info!(file = %cfg.file.display(), "history file opened");
                         }
                     }
                     Err(e) => {
@@ -1210,7 +1210,7 @@ impl History {
             self.queue.pop_front();
             let st = &mut self.status;
             if st.last_error.take().is_some() {
-                tracing::info!("history writes recovered");
+                m6_core::log::info!("history writes recovered");
             }
             st.writes += 1;
             st.crawl_windows += w.crawl_windows;
@@ -1221,10 +1221,10 @@ impl History {
             st.oldest_ms = w.oldest_ms;
             st.newest_ms = w.newest_ms;
             if w.prune_error.is_some() && w.prune_error != st.prune_error {
-                tracing::error!(error = ?w.prune_error, "history could not prune");
+                m6_core::log::error!(error = ?w.prune_error, "history could not prune");
             }
             if w.cap_unmet && !st.over_cap {
-                tracing::error!("{OVER_CAP}");
+                m6_core::log::error!("{OVER_CAP}");
             }
             st.prune_error = w.prune_error;
             st.over_cap = w.cap_unmet;
@@ -1240,7 +1240,7 @@ impl History {
             &mut st.last_error
         };
         if slot.as_deref() != Some(msg.as_str()) {
-            tracing::error!(error = %msg, "history is not being written");
+            m6_core::log::error!(error = %msg, "history is not being written");
         }
         *slot = Some(msg);
     }
@@ -1323,7 +1323,7 @@ pub fn start(cfg: Option<Config>) -> anyhow::Result<History> {
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            tracing::error!(error = %msg, "history is not being written");
+            m6_core::log::error!(error = %msg, "history is not being written");
             history.status.open_error = Some(msg);
         }
     }

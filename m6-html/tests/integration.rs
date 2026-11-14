@@ -188,6 +188,48 @@ fn an_unknown_log_level_exits_2_before_binding() {
     );
 }
 
+/// A line logged after start reaches the process's stdout within one
+/// accounting tick. Only the loop can write it: the Sink holds it until the
+/// tick flushes, and the process is alive and idle.
+///
+/// Break: remove the `tick` call from m6-html's loop, and the line sits in the
+/// 16 KiB buffer until the process stops.
+#[test]
+fn a_quiet_service_flushes_within_a_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("tick.sock");
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .arg("--log-level")
+            .arg("debug")
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    let response = http_request(
+        &socket_path,
+        "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.contains("200 OK"),
+        "the request was not served: {response}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if svc.output().contains("\"message\":\"request complete\"") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "no request line in the captured stdout within 3 s\n--- output ---\n{}",
+        svc.output()
+    );
+}
+
 /// secrets_file pointing at a non-existent path is silently ignored.
 #[test]
 fn l1_secrets_file_absent_still_starts() {
@@ -244,10 +286,6 @@ fn l1_sigterm_exits_zero() {
 // L1b — One loop thread
 // ---------------------------------------------------------------------------
 
-/// The writer `tracing-appender` starts for the log: one thread per process
-/// until LOG-2 logs in process. LOG-2 changes this constant to 0.
-const LOG_WRITER_THREADS: usize = 1;
-
 /// An answered request was served on the thread that accepted it, not on a
 /// worker of its own. Nine connections are answered and left open while the
 /// count is taken: a thread per connection would still be blocked in its next
@@ -278,20 +316,19 @@ fn a_request_is_served_on_the_accepting_thread() {
     }
     let pid = server.svc.pid();
 
-    // The writer is started by logging before the socket exists, so it is
-    // already there. The wait is for the count to settle, never a fixed sleep:
-    // the assertion below is the signal and the deadline is the bound.
+    // The wait is for the count to settle, never a fixed sleep: the assertion
+    // below is the signal and the deadline is the bound.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut threads = thread_count(pid);
-    while threads != 1 + LOG_WRITER_THREADS && Instant::now() < deadline {
+    while threads != 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
         threads = thread_count(pid);
     }
     assert_eq!(
         threads,
-        1 + LOG_WRITER_THREADS,
+        1,
         "m6-html (pid {pid}) runs {threads} threads with {} keep-alive connections open: \
-         one loop thread and tracing-appender's writer until LOG-2\n--- output ---\n{}",
+         one loop thread and no logging thread\n--- output ---\n{}",
         clients.len(),
         server.svc.output()
     );

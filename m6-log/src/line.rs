@@ -199,7 +199,7 @@ impl<'a> Line<'a> {
         self.field_head(key).quoted(value)
     }
 
-    /// Add a string field only when it has a value, as tracing omits a `None`.
+    /// Add a string field only when it has a value. An absent value is left out.
     pub fn opt_str(self, key: &str, value: Option<&str>) -> Self {
         match value {
             Some(value) => self.str(key, value),

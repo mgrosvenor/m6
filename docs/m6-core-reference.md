@@ -138,7 +138,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `minify` | The four minifiers: markup, JavaScript, stylesheets and JSON. Feature `minify`. |
 | | `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago` and `html_escape`. |
 | | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
-| **Observability** | `log` | `init`, `init_with_analytics`, `LogHandle` and `LogPulse`. Tracing setup and the liveness pulse. |
+| **Observability** | `log` | `init`, `tick`, `watch`, `flush`, `reopen`, `stop`, `Line`, the five macros and `LogPulse`. The buffered JSONL logger every service loop drives, re-exported from `m6-log`. |
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
@@ -199,7 +199,7 @@ pub struct RendererConfig {
     pub server:        ServerConfig,         // read_timeout, socket_mode
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled, inline_js
-    pub log:           LogConfig,            // level, format
+    pub log:           LogConfig,            // level
     pub site_toml:     Option<PathBuf>,      // the reserved key site_toml
 }
 ```
@@ -239,19 +239,20 @@ A service's loop uses `h1::ServerConn` instead.
 
 ### 4.4. `signal`
 
-**`signal::block()` must be the first statement of every `main`, before logging.**
-Blocking a signal is per-thread and threads inherit the mask at creation, and `tracing_appender::non_blocking` spawns a writer thread, so a `main` that initialises logging first has already created a thread with SIGTERM unblocked.
-The kernel delivers process-directed SIGTERM there, the default disposition kills the process, and the `sigwait` thread never receives a signal in its life.
+**`signal::block()` must be the first statement of every `main`.**
+Blocking a signal is per-thread and threads inherit the mask at creation, so a `main` that starts a thread before blocking has a thread with SIGTERM unblocked.
+The kernel delivers process-directed SIGTERM there, and the default disposition kills the process instead of the loop reading the shutdown request.
+`platform::Signals::new` refuses to open the descriptor without the mask, and the refusal names the rule.
 A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
 
 `ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up the handler, and it asserts that the mask is set and refuses to start otherwise.
 `complete()`, `is_shutdown()` and `wait()` are the lifecycle.
 
 The reload signal is SIGUSR1 (`platform::Signal::ReopenLogs`).
-`block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.
-The thread calls `log::reopen_log_file()` and logs what happened.
-The reopen opens the new file while holding the lock the log writer takes for every line, so once the path exists again no further line can reach the renamed file.
-If the open fails, the old handle stays in place, the process keeps writing to the previous file and an error is logged.
+`block()` blocks it with SIGTERM and SIGINT, and a service's loop reads it from the same descriptor.
+The loop calls `log::reopen()` and logs what happened. The call flushes the buffered lines first, then opens the path again, so once the path exists every new line reaches the new file and none reaches the renamed one.
+If the open fails, the previous file stays in place, the process keeps writing to it and an error is logged.
+A reopen never counts toward a forced exit.
 SIGHUP is not handled.
 
 ### 4.5. `render` and `template`
@@ -701,25 +702,34 @@ must not be append-only.
 
 ### 8.1. `log`
 
-`init(format, level)` and `init_with_analytics(format, level, analytics_path)`
-return a `LogHandle`, which holds the log writers for the life of the process.
-`read_site_log_config(site_toml)` and `parse_level(s)` are the config side. `read_site_log_config` takes the path of the file, which `RendererConfig::resolve_site_toml` gives.
+`m6_core::log` re-exports the `m6-log` crate and adds `watch`.
+`init(level, analytics)` sets the level and opens the two Sinks at start: the operational Sink on stdout and, when `analytics` is given, the analytics Sink on that path.
+It returns nothing to hold. The Sinks and the level are thread-local, and a process has one loop thread.
+`read_site_log_config(site_toml)` reads `[log] level` from `site.toml`, and `parse_level(s)` turns a level name into a `Level`.
+`Site` applies the precedence: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
 
-`pulse() -> &'static LogPulse` is the liveness signal: `events()` counts, and
+A service's loop calls the logger in plain sight.
+`tick(now)` flushes both Sinks on the one-second accounting tick.
+`watch(registry, token)` registers stdout for writability while the operational Sink holds bytes a full destination would not take, and removes it when they drain.
+The `LOG` arm calls `flush()`.
+A `Signal::ReopenLogs` calls `reopen()`.
+`stop()` runs after the loop: it restores stdout's flags, writes everything buffered, then the dropped-count line.
+`Line` and the `error!`, `warn!`, `info!`, `debug!` and `trace!` macros build one line into a Sink without allocating.
+
+`pulse() -> &'static LogPulse` is the liveness signal: `events()` counts the lines the level let through, and
 `seconds_since_last()` answers "has anything been logged recently", which is how
 a silent log becomes a fault rather than a zero.
 
-`reopen_log_file() -> Reopened` reopens the analytics file at the absolute path it was opened with.
+`reopen()` flushes the analytics file and opens its path afresh.
 `reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
 `writes_log_file()` says whether this process has a file to reopen.
 `read_tail(path, max_bytes)` reads the end of one file.
 
 ### 8.2. `telemetry`
 
-The write side had no struct: `m6-http` emits analytics with
-`tracing::info!(target: "analytics", ...)` and the JSON comes out of the
-subscriber's formatter, so every consumer re-derived the format by looking at a
-sample. That is how it came to be read as `ts` and `user_agent` rather than
+The write side had no struct: `m6-http` emits analytics through
+`m6_core::log`'s `Line` and the JSON comes out of the line builder, so every
+consumer re-derived the format by looking at a sample. That is how it came to be read as `ts` and `user_agent` rather than
 `timestamp` and `fields.user_agent`, which yields an empty result that looks
 exactly like a quiet hour.
 

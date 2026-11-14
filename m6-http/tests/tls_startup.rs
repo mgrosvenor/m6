@@ -196,7 +196,7 @@ fn write_site_toml(site: &Path) {
     std::fs::write(
         site.join("site.toml"),
         "[site]\nname = \"tls-startup\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"info\"\n\n\
          [analytics]\nenabled = false\n",
     )
     .expect("site.toml");

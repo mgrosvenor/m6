@@ -37,7 +37,6 @@ role = "origin"
 
 [log]
 level  = "debug"
-format = "text"
 "#;
 
 #[test]

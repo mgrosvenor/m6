@@ -310,10 +310,9 @@ pub fn require_blocked() {
     assert!(
         blocked_here(),
         "m6_core::signal::block() must be the first statement of main, before \
-         anything spawns a thread. Without it the signal mask is not inherited \
-         by threads that already exist (the tracing-appender writer, for one), \
-         the kernel delivers SIGTERM to one of them, and the process dies at \
-         the default disposition instead of shutting down."
+         anything else runs. Without it the signal mask is not inherited, the \
+         kernel delivers SIGTERM at the default disposition, and the process \
+         dies instead of the loop reading the shutdown request."
     );
 }
 

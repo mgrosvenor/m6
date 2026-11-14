@@ -37,7 +37,6 @@ role = "origin"
 
 [log]
 level  = "info"
-format = "text"
 "#;
 
 fn setup(config: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -322,17 +321,13 @@ fn the_monitor_runs_one_thread() {
     assert_history_adds_none(plain, with_history, &output);
 }
 
-/// The loop and the log writer, exactly, above the platform's own workers.
+/// The loop, exactly, above the platform's own workers.
 fn assert_single_loop(what: &str, count: usize, workers: usize) {
-    // The log writer is a thread even when the log goes to stdout, so the loop
-    // and the writer are two. LOG-2 replaces tracing-appender and this becomes
-    // one.
     assert_eq!(
         count,
-        1 + LOG_WRITER_THREADS + workers,
-        "{what}: m6-monitor runs {count} threads, not the one loop thread, \
-         tracing-appender's writer until LOG-2 and the platform's {workers} \
-         certificate-store worker(s)"
+        1 + workers,
+        "{what}: m6-monitor runs {count} threads, not the one loop thread \
+         and the platform's {workers} certificate-store worker(s)"
     );
 }
 
@@ -369,10 +364,6 @@ fn assert_history_adds_none(plain: usize, with_history: usize, output: &str) {
         with_history as isize - plain as isize
     );
 }
-
-/// `LOG_WRITER_THREADS` is 1 until LOG-2 replaces tracing-appender; it becomes
-/// 0 then, and the trusted session updates this constant.
-const LOG_WRITER_THREADS: usize = 1;
 
 /// The thread count once it has settled: two readings 100 ms apart agree, or
 /// the deadline passes. The assertion is the signal and the deadline is the

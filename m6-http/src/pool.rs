@@ -76,7 +76,7 @@ impl BackendPool {
     /// Add a socket path to the pool (if not already present).
     pub fn add_socket(&mut self, path: PathBuf) {
         if !self.members.iter().any(|m| m.path == path) {
-            tracing::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
+            m6_core::log::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
             self.members.push(PoolMember::new(path));
         }
     }
@@ -108,7 +108,7 @@ impl BackendPool {
     /// Mark a connection attempt as failed (for async callers).
     pub fn mark_failed(&mut self, idx: usize) {
         if let Some(m) = self.members.get_mut(idx) {
-            tracing::warn!(
+            m6_core::log::warn!(
                 pool = %self.name,
                 socket = %m.path.display(),
                 "pool: connection failed, backing off"
@@ -149,7 +149,7 @@ impl BackendPool {
 
         for p in found {
             if !self.members.iter().any(|m| m.path == p) {
-                tracing::info!(pool = %self.name, socket = %p.display(), "pool: socket found");
+                m6_core::log::info!(pool = %self.name, socket = %p.display(), "pool: socket found");
                 self.members.push(PoolMember::new(p));
             }
         }
