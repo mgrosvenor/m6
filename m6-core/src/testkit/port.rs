@@ -79,9 +79,9 @@ impl Drop for PortClaim {
     /// would be worse than useless: another process may already have it open and
     /// locked, and a fresh `create` by a third would make a *new inode* whose
     /// lock is unrelated to theirs, so two claimants would each hold a valid
-    /// lock on a different inode for the same port. The files are empty, capped
-    /// at one per port in the range, live under `target/`, and go with
-    /// `cargo clean`.
+    /// lock on a different inode for the same port. The files are empty, one
+    /// per port in the range, and live in the one directory under `/tmp` that
+    /// every build run by this user on the machine shares.
     fn drop(&mut self) {
         let deadline = crate::platform::now() + Duration::from_secs(5);
         loop {
@@ -101,10 +101,36 @@ impl Drop for PortClaim {
 }
 
 fn claim_dir() -> PathBuf {
-    // Beside the build output, so `cargo clean` disposes of it and it is never
-    // shared between checkouts.
-    let d = super::paths::target_dir().join("test-ports");
-    let _ = std::fs::create_dir_all(&d);
+    // One directory for the machine, not one per build directory. The lock
+    // protects a TCP port, and a port belongs to the host, not to a checkout.
+    // A directory under `target/` gives every build on this machine its own
+    // lock file for the same port, so two builds both claim it and one of them
+    // fails to bind with `Address already in use`.
+    //
+    // Not `std::env::temp_dir()`: a machine running several builds gives each a
+    // different `TMPDIR`, which would split the locks again. `/tmp` is the place
+    // every build shares, with the project's other runtime files.
+    //
+    // Per user, because the marker files must be writable by the claimant and
+    // one build host runs its builds as one user. The id is the process's own
+    // effective uid: the binary's owner is not the claimant, and a copied or
+    // root-owned binary would otherwise name a directory this process cannot
+    // write.
+    let d = PathBuf::from(format!(
+        "/tmp/m6-test-ports-{}",
+        crate::platform::process::uid()
+    ));
+    // Failing to make the directory is a fact about the host, not a busy port.
+    // It stops here with the path, so the next person reads "permission denied
+    // on /tmp/m6-test-ports-N" instead of "no free port available", which is
+    // the wrong diagnosis and was a real one.
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+        panic!(
+            "the shared port-claim directory {} cannot be created: {e}. \
+             Every test that binds a fixed port needs it.",
+            d.display()
+        )
+    });
     d
 }
 
@@ -132,13 +158,16 @@ fn claim_dir() -> PathBuf {
 /// symptoms with one cause. Retrying made it look intermittent rather than
 /// wrong.
 ///
-/// **What this does instead.** A candidate port is claimed by atomically
-/// creating a marker file for it (`create_new`, meaning `O_EXCL`), which is a
-/// real mutex across processes and not just across threads. Only after the
-/// claim succeeds is the port probed to confirm nothing already holds it. The
-/// claim outlives this call deliberately: it must still be held while the
-/// caller spawns its server, which is precisely the window the old code left
-/// open. It is released when the returned [`PortClaim`] drops.
+/// **What this does instead.** A candidate port is claimed by locking a marker
+/// file with `flock(2)`, which is a real mutex across processes and not just
+/// across threads, and the locks live in one directory that every build run by
+/// this user on the machine shares: a port belongs to the host, not to a
+/// checkout, so a directory beside a build's own output would give each build
+/// its own lock file for the same port. Only after the lock is held is the port
+/// probed with a bind to confirm nothing already holds it. The claim outlives
+/// this call deliberately: it must still be held while the caller spawns its
+/// server, which is precisely the window the old code left open. It is released
+/// when the returned [`PortClaim`] drops.
 ///
 /// **Ownership is an `flock(2)`, not a file's existence.** That is the fix for
 /// issue #9, and the previous design is worth stating because it looked airtight.
@@ -238,7 +267,13 @@ fn try_claim(marker: &std::path::Path, port: u16) -> Option<PortClaim> {
         .create(true)
         .truncate(false)
         .open(marker)
-        .ok()?;
+        .unwrap_or_else(|e| {
+            panic!(
+                "the port-claim marker {} cannot be opened: {e}. A marker that \
+                 cannot be created is a host problem, not a port in use.",
+                marker.display()
+            )
+        });
 
     // Non-blocking exclusive lock. A refusal means another process, or another
     // open file description in this one, holds this port.
@@ -271,6 +306,24 @@ mod tests {
         let la = TcpListener::bind(("127.0.0.1", a.port())).expect("bind a");
         let lb = TcpListener::bind(("127.0.0.1", b.port())).expect("bind b");
         drop((la, lb));
+    }
+
+    /// A claimed port belongs to the host, so its lock has to as well.
+    ///
+    /// A claim directory inside the build's `target/` gives every build on this
+    /// machine its own lock file for the same port. Both claims then succeed,
+    /// and one of the two fails to bind with `Address already in use`, or the
+    /// test that binds second talks to the other build's service. A port is not
+    /// a checkout's, so neither is the lock.
+    #[test]
+    fn the_claim_directory_is_shared_by_every_build_of_this_user() {
+        let dir = claim_dir();
+        assert!(
+            !dir.starts_with(crate::testkit::paths::target_dir()),
+            "the claim directory {dir:?} is inside this build's target directory, so \
+             a second build on this machine locks a different file and can claim the \
+             same port"
+        );
     }
 
     /// A released port can be claimed again.
