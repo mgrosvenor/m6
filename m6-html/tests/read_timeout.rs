@@ -8,8 +8,7 @@
 //! request sent on it.
 //!
 //! These tests are written against the fixture config `m6-html-timeout.conf`,
-//! which sets a three second deadline. Its `[thread_pool]` table is inert: the
-//! service reads no pool, and EL-6d refuses the key.
+//! which sets a three second deadline.
 
 #![allow(
     clippy::disallowed_methods,

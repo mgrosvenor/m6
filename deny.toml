@@ -9,6 +9,10 @@
 
 [graph]
 all-features = false
+# The three supported targets, so the licences and advisories of the crates
+# only one of them links (sysinfo and libc on macOS, rustix on Linux) are
+# checked by this one Linux run.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [advisories]
 # A known vulnerability in anything we ship fails the build. There is no

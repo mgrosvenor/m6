@@ -9,17 +9,31 @@ repository.workspace   = true
 [[bin]]
 name = "m6-monitor"
 
+[features]
+# Builds the counting allocator in, as ALLOC-0 does for m6-http: the client
+# path's no-allocation proof needs a binary that counts. Off by default, so a
+# release build links no test harness.
+count-allocations = ["m6-core/testkit"]
+
+[[test]]
+name = "client_allocs"
+required-features = ["count-allocations"]
+
 [dependencies]
 # One crate. That is the point of it.
-m6-core    = { path = "../m6-core", default-features = false, features = ["http-client", "sqlite"] }
+m6-core    = { path = "../m6-core", default-features = false, features = ["sqlite"] }
 anyhow     = "1"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing    = "0.1"
 
 toml       = "0.8"
-ureq       = { version = "2", features = ["json"] }
+# The monitor's own outgoing TLS client: it builds one ClientConfig at start
+# from `client::system_roots`. Same declaration as m6-core and m6-http, so the
+# workspace builds one rustls.
+rustls     = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]
 m6-core  = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile = "3"
+# The macOS thread count reads libproc; m6-html's tests do the same.

@@ -292,19 +292,21 @@ pub struct HealthConfig {
     ///
     /// A third path rather than more fields on `/perf`, for the reason that
     /// split `/health` from `/perf` in the first place: the cost profiles
-    /// differ. `/perf` sorts a reservoir in memory; this reads the tail of a
-    /// 47MB file. Putting the expensive one behind a conditional on a cheaper
-    /// path leaves the expensive branch one misconfigured header away from
-    /// being taken on every request, so each answer's cost stays a property of
-    /// its path.
+    /// differ. `/perf` sorts a reservoir in memory; this builds the report
+    /// from the window this process keeps of its own logging, which allocates
+    /// a record per retained event on a cache miss. Putting the expensive one
+    /// behind a conditional on a cheaper path leaves the expensive branch one
+    /// misconfigured header away from being taken on every request, so each
+    /// answer's cost stays a property of its path. `docs/m6-http.md` describes
+    /// the window.
     #[serde(default = "default_traffic_path")]
     pub traffic_path: String,
-    /// How long a traffic summary is reused before the analytics log is read
-    /// again.
+    /// How long a traffic summary is reused before it is rebuilt from the
+    /// window.
     ///
     /// Without this a monitor polling every 30 seconds makes every node
-    /// re-read its analytics tail every 30 seconds, forever, to produce an
-    /// answer that changes slowly. The check that consumes this runs hourly.
+    /// rebuild its report every 30 seconds, forever, to produce an answer
+    /// that changes slowly. The check that consumes this runs hourly.
     #[serde(default = "default_traffic_cache_s")]
     pub traffic_cache_s: u64,
     /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need

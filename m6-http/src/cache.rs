@@ -616,7 +616,7 @@ impl Cache {
         let Some(expires_at) = entry.expires_at else {
             return Some(std::time::Duration::from_secs(u32::MAX as u64));
         };
-        expires_at.checked_duration_since(std::time::Instant::now())
+        expires_at.checked_duration_since(m6_core::platform::now())
     }
 
     /// How long an entry has been stale, or `None` if absent or still fresh.
@@ -628,7 +628,7 @@ impl Cache {
         let map = self.map.read().ok()?;
         let entry = map.get(key)?;
         let expires_at = entry.expires_at?;
-        std::time::Instant::now().checked_duration_since(expires_at)
+        m6_core::platform::now().checked_duration_since(expires_at)
     }
 
     /// Look up an entry, distinguishing fresh from servable-but-stale.
@@ -657,7 +657,7 @@ impl Cache {
             READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         // Current age: how long we have held it, plus whatever age it already
         // had on arrival. Resetting to zero at each hop is what makes a chain
         // of caches report content as fresher than it is.
@@ -682,7 +682,7 @@ impl Cache {
     /// having to know about it.
     pub fn insert(&self, key: CacheKey, response: CachedResponse) {
         let d = directives(&response.headers);
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         // Any `Age` the upstream already declared. A response that reached us
         // one hop old must not have its age reset to zero here, or each hop
         // would silently make the content look fresher than it is.
@@ -708,7 +708,7 @@ impl Cache {
             .unwrap_or_default();
         let apparent_age = m6_core::headers::get(&response.headers[..], "date")
             .and_then(|v| httpdate::parse_http_date(v).ok())
-            .and_then(|d| std::time::SystemTime::now().duration_since(d).ok())
+            .and_then(|d| m6_core::platform::wall().duration_since(d).ok())
             .unwrap_or_default();
         let upstream_age = age_value.max(apparent_age);
         //
@@ -2126,7 +2126,7 @@ mod heuristic_freshness_tests {
         let ttl = e
             .expires_at
             .unwrap()
-            .saturating_duration_since(std::time::Instant::now());
+            .saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() <= 60,
             "explicit max-age was overridden: {ttl:?}"
@@ -2141,13 +2141,13 @@ mod heuristic_freshness_tests {
 #[cfg(test)]
 mod expires_tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     fn at(offset_secs: i64) -> String {
         let t = if offset_secs >= 0 {
-            SystemTime::now() + Duration::from_secs(offset_secs as u64)
+            m6_core::platform::wall() + Duration::from_secs(offset_secs as u64)
         } else {
-            SystemTime::now() - Duration::from_secs((-offset_secs) as u64)
+            m6_core::platform::wall() - Duration::from_secs((-offset_secs) as u64)
         };
         httpdate::fmt_http_date(t)
     }
@@ -2177,7 +2177,7 @@ mod expires_tests {
             ("expires".into(), at(120)),
         ])
         .expect("stored with a deadline");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() > 60 && ttl.as_secs() <= 120,
             "ttl was {ttl:?}, expected ~120s"
@@ -2196,7 +2196,7 @@ mod expires_tests {
             ("expires".into(), at(3660)),
         ])
         .expect("stored");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() <= 60,
             "skew leaked into the lifetime: {ttl:?}"
@@ -2212,7 +2212,7 @@ mod expires_tests {
             ("expires".into(), at(86400)),
         ])
         .expect("stored");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(ttl.as_secs() <= 30, "Expires overrode max-age: {ttl:?}");
     }
 
@@ -2226,7 +2226,7 @@ mod expires_tests {
         ])
         .expect("stored");
         assert!(
-            e <= std::time::Instant::now() + Duration::from_secs(1),
+            e <= m6_core::platform::now() + Duration::from_secs(1),
             "a past Expires should not produce a live deadline"
         );
     }
@@ -2239,7 +2239,7 @@ mod expires_tests {
             ("expires".into(), "not-a-date".into()),
         ])
         .expect("stored");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() > 3600,
             "should have fallen back to the heuristic, got {ttl:?}"
@@ -2470,7 +2470,7 @@ mod corrected_age_tests {
         }
     }
     fn http_date_ago(secs: u64) -> String {
-        httpdate::fmt_http_date(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        httpdate::fmt_http_date(m6_core::platform::wall() - std::time::Duration::from_secs(secs))
     }
     fn age_of(headers: &[(&str, &str)]) -> u64 {
         let cache = Cache::new();
@@ -2532,7 +2532,7 @@ mod corrected_age_tests {
     #[test]
     fn future_date_does_not_wrap_or_go_negative() {
         let future = httpdate::fmt_http_date(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            m6_core::platform::wall() + std::time::Duration::from_secs(3600),
         );
         let age = age_of(&[
             ("cache-control", "public, max-age=86400"),

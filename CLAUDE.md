@@ -255,7 +255,12 @@ service being nearly a no-op on top of core is the result we want, not a smell:
 
 ```rust
 use m6_core::prelude::*;
-fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
+fn main() -> anyhow::Result<()> {
+    let site = Site::load("my-service", &[], &[], &NoTemplates);
+    // The service's own loop follows, as docs/m6-app-anatomy.md section 2 writes it.
+    let _ = site;
+    Ok(())
+}
 ```
 
 ---

@@ -16,7 +16,7 @@
 //! | # | setting | value | reason |
 //! |---|---|---|---|
 //! | 1 | `journal_mode` | `DELETE` (rollback journal) | The journal file is removed at every commit, so at rest the database is exactly one file. Copying that file copies everything. WAL keeps `-wal` and `-shm` files beside it, and a copy of the main file alone can miss committed work. [`Journal::Wal`] is available for services that want it |
-//! | 2 | `busy_timeout` | 5 s ([`BUSY_TIMEOUT`]) | A second connection waits for a lock instead of failing at once with `SQLITE_BUSY` |
+//! | 2 | `busy_timeout` | 5 s ([`BUSY_TIMEOUT`]) | A second connection waits for a lock instead of failing at once with `SQLITE_BUSY`. A service in an event loop sets it to zero after its start-time open and defers the statement on `SQLITE_BUSY`, because a wait in the loop holds every request behind it |
 //! | 3 | `foreign_keys` | on | SQLite has them off in every new connection, so `ON DELETE CASCADE` does nothing without it. The value is read back after it is set |
 //! | 4 | `recursive_triggers` | on | SQLite fires DELETE triggers for rows removed by `INSERT OR REPLACE` only with this on. Without it the append-only rule can be bypassed |
 //!
@@ -103,13 +103,13 @@
 //! # }
 //! ```
 //!
-//! A service keeps the connection in one `Arc<Mutex<Connection>>`, or opens one
-//! per worker through `App::with_thread_state`. Both are safe with the busy
-//! timeout and the migration rules above.
+//! A service opens its one connection at start and keeps it in its `main`.
+//! One thread owns it, so it needs no lock, and the busy timeout and the
+//! migration rules above make it safe.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use rusqlite;
 pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -117,6 +117,12 @@ pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use rusqlite::{TransactionBehavior, MAIN_DB};
 
 /// The busy timeout [`open`] sets: 5 seconds.
+///
+/// A service in an event loop sets its connection's busy timeout to zero after
+/// the start-time open and defers a statement that returns `SQLITE_BUSY`. A wait
+/// in the one loop holds every connection in the process, so the error is the
+/// part the loop can retry. A one-shot tool keeps the five seconds, because
+/// nothing else waits on it.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The journal mode of a database file.
@@ -210,14 +216,14 @@ impl OpenOptions {
         // the switch until one of them has made it or the busy timeout has
         // passed. Only the switch to WAL retries: a request for another mode
         // fails when the file is in use, as the doc comment above says.
-        let deadline = Instant::now() + self.busy_timeout;
+        let deadline = crate::platform::now() + self.busy_timeout;
         let got: String = loop {
             match conn.pragma_update_and_check(None, "journal_mode", wanted, |r| r.get(0)) {
                 Ok(got) => break got,
                 Err(rusqlite::Error::SqliteFailure(e, _))
                     if self.journal == Journal::Wal
                         && e.code == rusqlite::ErrorCode::DatabaseBusy
-                        && Instant::now() < deadline =>
+                        && crate::platform::now() < deadline =>
                 {
                     #[expect(
                         clippy::disallowed_methods,
@@ -1032,7 +1038,7 @@ mod tests {
             let r = migrate(&mut c, &[M1, M2]);
             (r, c)
         });
-        let start = std::time::Instant::now();
+        let start = crate::platform::now();
         while !WAITING.load(Ordering::SeqCst) {
             assert!(
                 start.elapsed() < Duration::from_secs(10),

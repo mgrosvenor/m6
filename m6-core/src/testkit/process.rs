@@ -50,12 +50,18 @@ impl Service {
     /// The caller configures the command (program, arguments, environment);
     /// this overrides only the standard streams, which it must own.
     pub fn spawn(name: &str, cmd: &mut Command) -> Service {
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+        // Once per test process, before its first child: no inherited
+        // descriptor (a test lock, a listener) reaches a service it starts.
+        static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWEPT.get_or_init(|| {
+            let _ = crate::platform::process::close_inherited_on_exec();
+        });
+        let mut child = crate::platform::process::spawn(
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let mut drains = Vec::with_capacity(2);
@@ -114,17 +120,15 @@ impl Service {
             .id()
     }
 
-    /// Send `sig` to the child.
+    /// Send the child a shutdown or reload request, as a supervisor does.
     ///
     /// Panics with the name and pid if the child has already been reaped.
-    pub fn signal(&self, sig: libc::c_int) {
+    pub fn request(&self, what: crate::platform::Signal) {
         let child = self
             .child
             .as_ref()
             .unwrap_or_else(|| panic!("{} was already reaped; cannot signal it", self.name));
-        // SAFETY: `kill` takes a pid and a signal number and touches no
-        // memory of ours.
-        unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+        let _ = crate::platform::send(child.id(), what);
     }
 
     /// Send SIGTERM and wait for the child to exit, returning its status.
@@ -133,15 +137,15 @@ impl Service {
     /// what it did. Panics if the child is still running after `timeout`,
     /// which is itself the failure a graceful-shutdown test is looking for.
     pub fn terminate(&mut self, timeout: Duration) -> ExitStatus {
-        self.signal(libc::SIGTERM);
+        self.request(crate::platform::Signal::Shutdown);
         let child = self.child.as_mut().expect("service already reaped");
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::platform::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().ok().flatten() {
                 self.finish_output();
                 return status;
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 let pid = child.id();
                 panic!(
                     "{} (pid {pid}) did not exit within {timeout:?} of SIGTERM\n\
@@ -168,7 +172,7 @@ impl Service {
                 self.finish_output();
                 return Some(status);
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -197,7 +201,7 @@ impl Service {
     /// first: waiting ten seconds for a process that died in fifty
     /// milliseconds wastes time and reports the wrong fact.
     pub fn wait_for_tcp(&mut self, port: u16, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::platform::now() + timeout;
         loop {
             if super::wait::for_tcp(port, Duration::from_millis(25)) {
                 return;
@@ -208,7 +212,7 @@ impl Service {
                     self.death_report(&format!("waiting for port {port}"), status)
                 );
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 panic!(
                     "{} never listened on port {port} within {timeout:?}\n--- output ---\n{}",
                     self.name,
@@ -225,7 +229,7 @@ impl Service {
     /// under a full workspace run, where a dozen stacks start at once: the
     /// server came up with an empty backend pool and answered 502.
     pub fn wait_for_path(&mut self, path: &Path, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::platform::now() + timeout;
         loop {
             if path.exists() {
                 return;
@@ -236,7 +240,7 @@ impl Service {
                     self.death_report(&format!("waiting for {}", path.display()), status)
                 );
             }
-            if Instant::now() >= deadline {
+            if crate::platform::now() >= deadline {
                 panic!(
                     "{} never created {} within {timeout:?}\n--- output ---\n{}",
                     self.name,
@@ -310,11 +314,12 @@ impl Drop for Service {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             if child.try_wait().ok().flatten().is_none() {
-                // SIGTERM first, so the service's own shutdown path runs and a
-                // test that wedges it still gets cleaned up by the SIGKILL.
-                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-                let deadline = Instant::now() + TERM_GRACE;
-                while Instant::now() < deadline {
+                // A shutdown request first, so the service's own shutdown path
+                // runs and a test that wedges it still gets cleaned up by the
+                // SIGKILL.
+                let _ = crate::platform::send(child.id(), crate::platform::Signal::Shutdown);
+                let deadline = crate::platform::now() + TERM_GRACE;
+                while crate::platform::now() < deadline {
                     if child.try_wait().ok().flatten().is_some() {
                         break;
                     }
@@ -458,7 +463,7 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
     }
 }
 
-/// The whole lifecycle contract of an `App` service, asserted in one call.
+/// The whole lifecycle contract of a service, asserted in one call.
 ///
 /// Spawn, wait for the socket, SIGTERM, then check the three things that make
 /// a shutdown clean rather than merely quiet:
@@ -474,7 +479,7 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
 /// # Why this is here and not written out per service
 ///
 /// It was written out per service, five times, and the sixth never got written:
-/// `m6-monitor` had no `tests/` directory at all. Every `App` service takes the
+/// `m6-monitor` had no `tests/` directory at all. Every service takes the
 /// same argv (`site_dir`, `config_path`) and honours the same
 /// `M6_SOCKET_OVERRIDE`, so there was never anything service-specific in those
 /// five copies except the name. A contract that each service opts into by hand

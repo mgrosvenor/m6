@@ -209,7 +209,7 @@ Take from it that every subject here has one owner.
 |---|---|
 | `m6-md/src/main.rs` | m6-md's command line, input and output |
 | `Cargo.toml`, `m6-md/Cargo.toml` | the workspace members list, and the crate's dependencies |
-| `m6-core/src/app.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.1 | the renderer's static params, read at start |
+| `m6-core/src/site.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.6 | the renderer's static params, read at start |
 | [`m6-user-guide.md`](m6-user-guide.md) | Example 02, the blog that serves this output, with both templates |
 | [`m6-site-toml.md`](m6-site-toml.md) | `[[route]]`, `[[route_group]]` and the renderer `params` key |
 | [`m6-http.md`](m6-http.md) | the cache, and when a change clears it |

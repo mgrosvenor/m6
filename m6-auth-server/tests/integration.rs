@@ -76,10 +76,6 @@ access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "test.example.com"
 
-[thread_pool]
-size = 4
-queue_size = 32
-
 [keys]
 private_key = "{}"
 public_key  = "{}"
@@ -176,18 +172,53 @@ fn seed_user(site_dir: &Path, username: &str, password: &str) {
         .expect("create user");
 }
 
+/// Hold the database's write lock until the connection is dropped or the
+/// transaction is committed. `BEGIN IMMEDIATE` takes the lock at the begin, so
+/// a caller that has returned from here holds it.
+fn hold_write_lock(db_path: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(db_path).expect("open the lock connection");
+    conn.busy_timeout(Duration::from_secs(1))
+        .expect("set the lock connection's timeout");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("take the database's write lock");
+    conn
+}
+
 /// Send a raw HTTP request over a Unix socket and return the full response bytes.
 fn http_request(socket_path: &Path, request: &str) -> String {
+    http_request_within(socket_path, request, Duration::from_secs(10))
+}
+
+/// `http_request` with a read deadline, for a response that must arrive while
+/// the service is holding another request.
+fn http_request_within(socket_path: &Path, request: &str, read_timeout: Duration) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    stream.set_read_timeout(Some(read_timeout)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3).
     let method = request.split(' ').next().unwrap_or("");
-    let resp = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let resp = m6_core::testkit::read_one(&mut stream, method)
+        .unwrap_or_else(|e| panic!("no response within {read_timeout:?}: {e}"));
     String::from_utf8_lossy(&resp).into_owned()
+}
+
+/// The bytes of a request with a body, for a test that sends it on a
+/// connection it keeps.
+fn request_with_body(method: &str, path: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        method,
+        path,
+        content_type,
+        body.len(),
+        body
+    )
+}
+
+/// The JSON login request the locked-database tests send.
+fn login_json_request(body: &str) -> String {
+    request_with_body("POST", "/auth/login", "application/json", body)
 }
 
 fn http_request_with_body(
@@ -197,15 +228,10 @@ fn http_request_with_body(
     content_type: &str,
     body: &str,
 ) -> String {
-    let req = format!(
-        "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
-        method,
-        path,
-        content_type,
-        body.len(),
-        body
-    );
-    http_request(socket_path, &req)
+    http_request(
+        socket_path,
+        &request_with_body(method, path, content_type, body),
+    )
 }
 
 fn parse_status(resp: &str) -> u16 {
@@ -1053,4 +1079,113 @@ fn a_storage_directory_that_cannot_be_created_names_the_path() {
         output.contains(&data_dir.display().to_string()),
         "the error must name the database directory\n--- output ---\n{output}"
     );
+}
+
+// ─── A locked database ───────────────────────────────────────────────────────
+
+/// A login whose refresh-token write meets another process's write lock is
+/// deferred, and the loop answers another connection while it waits. With the
+/// five-second busy timeout in the loop the login holds the whole process and
+/// the public-key request misses its one-second deadline.
+#[test]
+fn a_locked_database_defers_and_the_service_keeps_serving() {
+    let env = setup_test_env("db-busy-defers");
+    seed_user(&env.site_dir, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+    let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
+
+    // One connection throughout, and a request before the locked one: the
+    // service has answered on this connection, so the login's bytes reach a
+    // loop that is already waiting for them.
+    let mut login = UnixStream::connect(&env.socket_path).expect("connect the login");
+    login
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set the login's read timeout");
+    login
+        .write_all(b"GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the public-key request");
+    let warm = m6_core::testkit::read_one(&mut login, "GET").expect("the public key");
+    assert_eq!(
+        parse_status(&String::from_utf8_lossy(&warm)),
+        200,
+        "the warm-up request must be answered"
+    );
+
+    let body = r#"{"username":"alice","password":"correct_pass"}"#;
+    login
+        .write_all(login_json_request(body).as_bytes())
+        .expect("send the login");
+
+    // The login's refresh-token store meets the lock. While it is deferred,
+    // another connection must be answered: a read deadline of one second
+    // fails the old five-second busy wait in the loop.
+    let public_key = http_request_within(
+        &env.socket_path,
+        "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        parse_status(&public_key),
+        200,
+        "the public key must answer while the login is deferred\n{public_key}"
+    );
+
+    lock.execute_batch("COMMIT").expect("release the lock");
+
+    // The retry happens when the deferred request's five-millisecond deadline
+    // passes, and the answer must arrive within two seconds of the release.
+    login
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set the login's deadline");
+    let answer = m6_core::testkit::read_one(&mut login, "POST").expect("the login's answer");
+    let answer = String::from_utf8_lossy(&answer);
+    assert_eq!(
+        parse_status(&answer),
+        200,
+        "the deferred login must answer once the lock is released\n{answer}"
+    );
+    let body_start = answer
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(answer.len());
+    let json: serde_json::Value =
+        serde_json::from_str(&answer[body_start..]).expect("the login's JSON body");
+    assert!(
+        json["access_token"].is_string(),
+        "the answer has no access token\n{answer}"
+    );
+    assert!(
+        json["refresh_token"].is_string(),
+        "the answer has no refresh token\n{answer}"
+    );
+}
+
+/// A login that meets the lock for over a second is answered with 503 and a
+/// one-second `Retry-After`. The test releases the lock only after it has the
+/// 503, so the service must give up on its own rather than wait forever.
+#[test]
+fn a_database_locked_past_a_second_answers_503() {
+    let env = setup_test_env("db-busy-503");
+    seed_user(&env.site_dir, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+    let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
+
+    let body = r#"{"username":"alice","password":"correct_pass"}"#;
+    let answer = http_request_within(
+        &env.socket_path,
+        &login_json_request(body),
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        parse_status(&answer),
+        503,
+        "a lock held past a second must answer 503\n{answer}"
+    );
+    assert_eq!(
+        get_header(&answer, "Retry-After"),
+        Some("1"),
+        "the 503 must carry a one-second Retry-After\n{answer}"
+    );
+
+    lock.execute_batch("COMMIT").expect("release the lock");
 }

@@ -187,8 +187,8 @@ Table 5 gives what the single-threaded, single-process-cache model surrenders.
 
 | given up | why it follows from the design |
 |---|---|
-| multi-core use within one process | one thread cannot occupy several cores. m6 scales by running more instances, or more backend workers, which is why §3.4 makes pool membership automatic |
-| HTTP/1.1 throughput against a mature server | a new connection per request pays a TLS handshake each time, and the h1 path makes a blocking backend call on a miss, which stalls the loop |
+| multi-core use within one process | one thread cannot occupy several cores. m6 scales by running more instances, which is why §3.4 makes pool membership automatic |
+| HTTP/1.1 throughput against a mature server | a new connection per request pays a TLS handshake each time, and one slow answer holds its own process until it finishes |
 | zero-copy file serving | content is copied through userspace buffers, so a server using `sendfile()` pulls ahead as responses grow past a few kilobytes |
 | kernel TLS | pushing encryption into the kernel is a Linux feature not yet in the TLS stack m6 uses, and it is the largest remaining piece of the gap in §1.2 |
 
@@ -419,7 +419,7 @@ Breadth is the intent and singularity is the rule, and this section says why tho
 
 **A service should be able to build what it needs from one dependency**, which is §1.6 applied to the code rather than to the request path.
 So core holds templating, compression, minification, cookies, multipart bodies, an SMTP client, an outbound HTTP client, host metrics and firewall reporting beside the HTTP layers, and a component a website might want belongs in it.
-The test of whether that is working is that a new service is small: `m6-html` is six lines and renders every HTML page a site serves.
+The test of whether that is working is that a new service is small: `m6-html` is one `main` and a route table, and renders every HTML page a site serves.
 
 Breadth is paid for by feature gates.
 A service names what it wants, so the weight of core is what a binary uses rather than what core contains, which keeps a command line tool such as `m6-md` from acquiring a QUIC stack or a TLS library by depending on it.
@@ -430,7 +430,7 @@ Table 9 gives the sorts of component core holds, in brief.
 |---|---|
 | HTTP semantics | the version-independent rules: conditional requests, content negotiation, repeated header fields, content types with charset |
 | HTTP/1.1 | the one request parser and response writer, and the blocking read adapter over it |
-| Service scaffolding | the socket server, the accept loop, routing, the thread pool, the shutdown sequence |
+| Service scaffolding | the reactor, the signal descriptor, the deadlines, the connection table, routing, the socket helper and the shutdown sequence |
 | Configuration | parsing and validation, and secrets merging |
 | Request and response | what a handler receives and returns, the layered request dictionary, cookie construction, multipart bodies |
 | Content | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam with its template implementation behind it |
@@ -504,21 +504,33 @@ That trade was declined for two tests about how politely a hostile peer is refus
 
 ## 7. Why every service has one shape
 
-Every m6 service except the edge is an `App`: a Unix socket server with a fixed thread pool, a bounded queue, and routes from configuration.
-One shape means one bounded queue, one state model and one shutdown sequence serve all of them.
+Every m6 service except the edge is a `main` with its own event loop, and the loop is the same shape in each.
+One shape means one loop, one state model and one shutdown sequence serve all of them.
 
-### 7.1 Why a fixed pool with a bounded queue
+### 7.1 Why each service writes its own loop
 
-**A bounded queue refuses work in a way the edge can act on.**
-The pool defaults to the CPU count and the queue to eight times the pool, and a full queue answers 503 immediately.
-An unbounded queue would accept work it cannot finish, turning overload into growing latency and eventually memory exhaustion, and a 503 under overload is correct behaviour: it is how backpressure reaches the proxy, which can answer from cache or shed.
+**m6-core supplies parts, and the service writes the loop.**
+The service's `main` owns the poll, the token `match` and every descriptor, so the loop is visible where it runs and a service can be read top to bottom.
+`docs/m6-app-anatomy.md` is that shape in full.
 
-Scaling is by starting another instance rather than growing one pool, which is why §3.4 made membership automatic.
+**One thread per process means scale is more processes.**
+A second thread would need its own state and a hand-off, and a hand-off costs a context switch and a cold cache.
+More cores means more instances, which is why §3.4 makes pool membership automatic.
+The `[thread_pool]` key is refused at start, so an operator cannot ask for more threads by accident.
 
-**State comes in two tiers so that sharing costs as little as possible.**
-A value shared across workers sits behind one reference count, so a request pays one atomic increment and no copy.
-A value per worker is owned by its thread and needs no synchronisation, which lets a database connection per worker run in parallel with no lock.
-A service declares which it needs once and the builder's type carries it, so a handler receives its state with the real type rather than casting.
+**The kernel's listen backlog is the queue.**
+The listener accepts until the kernel has no more, and connections beyond the table wait in the backlog.
+A user-space queue would accept work the process cannot finish, which turns overload into growing latency, and the edge's own deadline is the backpressure.
+
+**Start and stop may block, and the loop never does.**
+Configuration, keys, certificates, templates and host names are read at start, and a change means a restart.
+A request that must wait on another service registers that socket under a token and resumes when the reactor reports it ready.
+Shutdown stops accepting, removes the socket and exits without waiting for a request in progress.
+
+**A timer that checks for something a descriptor could signal has no place in the loop.**
+The one timer is the accounting tick.
+A silent peer is the one wait no descriptor reports, and its read deadline is a `Timeouts` entry that the loop checks each turn.
+Failures at start are errors with exit 2, and a failure the design cannot meet at all is a reason to stop and ask the owner.
 
 ### 7.2 Why the request dictionary is layered
 
@@ -535,7 +547,7 @@ A content file that could redefine the request path could make a page lie about 
 **A service stops on SIGTERM by refusing new connections, removing its socket and exiting.**
 It does not wait for requests in progress: the supervisor restarts it on a deploy, and a request cut off by a restart is acceptable.
 So the first signal exits 0, the second exits immediately, and the sequence is core's.
-What a service supplies is data: the name in its lifecycle lines, the socket to unlink on every exit path, and a descriptor to wake a parked loop.
+What a service supplies is data: the name in its lifecycle lines and the socket to unlink on every exit path.
 
 **One sequence exists because several diverged.**
 With three ways to install a handler, one service of five unlinked its socket, two logged that they had stopped, and three logged a name that was not their own, and none of that was required by anything the services do.
@@ -610,9 +622,9 @@ Table 11 gives them by area.
 | caching | invalidation is derived from the site's own declarations at startup | the site already says which files a route reads, and a backend that has to announce a change is a backend that can forget to |
 | caching | a rendered page carries a validator derived from its inputs | without one every conditional request returned the whole page, and a rendered page has no file of its own to date |
 | processes | a socket path is derived from the config filename | one convention, so a unit file and a pool glob cannot disagree about where a service listens |
-| processes | two positional arguments, and one environment variable, `M6_SOCKET_OVERRIDE` | the two positional arguments carry the service's configuration, and the named exception relocates only the listening socket and is never set in a deployment (`m6-app-anatomy.md` §4.1). |
+| processes | two positional arguments, and one environment variable, `M6_SOCKET_OVERRIDE` | the two positional arguments carry the service's configuration, and the named exception relocates only the listening socket, is set by a template unit that runs several instances, and is absent otherwise (`m6-app-anatomy.md` §4.1). |
 | processes | a connection serves at most 100 requests before closing | persistent connections are the default, and an unbounded one lets one peer hold a slot indefinitely by pipelining |
-| processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds a pool worker until it disconnects, and a handful of those is the whole pool while the service looks healthy |
+| processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds its connection slot until it disconnects, and enough of those fill the table while the service looks healthy |
 | processes | exit 0 clean, 1 runtime error, 2 configuration or usage error before binding | a supervisor can tell a bad config from a crash, which is what lets a deploy validate a new binary and refuse to install |
 | content | minification runs before compression, a `no-store` response is not minified, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, a response no cache keeps would pay the cost on every request for a few saved bytes, and a minifier that does not understand a file should pass it through rather than corrupt it |
 | content | inline script minification is off by default | the engine parses scripts as modules, which has different scoping, and it can silently rewrite a valid classic script into a broken one |

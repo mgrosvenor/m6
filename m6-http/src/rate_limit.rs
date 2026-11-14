@@ -28,7 +28,7 @@ impl RateLimiter {
     /// Keeps counting past the limit (doesn't stop at the threshold) so the
     /// dashboard can show how far over a given IP actually is.
     pub fn check_and_increment(&mut self, ip: &str, limit_per_min: u32) -> bool {
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let window = Duration::from_secs(WINDOW_SECS);
 
         if self.map.len() > MAX_TRACKED_IPS {

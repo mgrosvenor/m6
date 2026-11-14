@@ -77,6 +77,26 @@ Complete request forwarded — method, path, query string, all headers, body.
 
 ---
 
+## Request Header Limits
+
+A request head is bounded before routing, the cache lookup and every backend, so an over-limit request is answered by the edge and no backend sees it.
+Two limits apply, and both follow the numbers the mainstream servers use: nginx's `large_client_header_buffers 4 8k`, Varnish's `http_req_hdr_len 8k` and `http_req_size 32k`, and Apache's `LimitRequestFieldSize 8190`.
+`MAX_HEADER_LINE` is 8 KiB for one field, counted as its name plus its value.
+`MAX_REQUEST_HEAD` is 32 KiB for the request line plus every field.
+HTTP/2 and HTTP/3 count a decoded head as RFC 9113 6.5.2 defines it for `SETTINGS_MAX_HEADER_LIST_SIZE`: name plus value plus 32 bytes per field.
+
+A field over `MAX_HEADER_LINE`, or a head over `MAX_REQUEST_HEAD`, is answered 400 with the error page titled "Request Header Or Cookie Too Large", which is nginx's own text for this refusal.
+A request line over `MAX_HEADER_LINE` is answered 414 Request-URI Too Large, counting the method, target and version on HTTP/1.1 and `:method` plus `:path` on HTTP/2 and HTTP/3.
+Both limits are defined once in m6-core as `m6_core::headers::MAX_HEADER_LINE` and `m6_core::headers::MAX_REQUEST_HEAD`, and the HTTP/1.1 parser, both backends and the edge read those definitions.
+
+HTTP/2 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_HEADER_LIST_SIZE` and enforces it while decoding.
+The 256 KiB `MAX_HEADER_BLOCK` bound on the compressed header block stays, because it is the defence against HPACK expansion.
+HTTP/3 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the pinned quiche enforces it by closing the connection with H3_EXCESSIVE_LOAD.
+A single field over `MAX_HEADER_LINE` and a request line over it are answered on the HTTP/3 stream, as they are on the other two protocols.
+The HTTP/1.1 head limit is separate from the 20 MiB cap on a whole request, and that cap stays.
+
+---
+
 ## Caching
 
 | Backend returns | Behaviour |
@@ -194,7 +214,16 @@ Rotate the analytics file by renaming it and sending `SIGUSR1`.
 The process creates the file at its path again, and the path reappearing means the renamed file is finished.
 If the reopen fails, the process keeps writing to the previous file and logs an error.
 `/perf` reports the last reopen under `logging.reopen`.
-`/traffic` also reads the newest rotated file next to the log (`<name>-YYYYmmddHH`, plain or `.gz`), so its window spans a rotation.
+`/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
+The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
+It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
+When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
+A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the analytics log keeps them whole.
+The notable-client sample is then cut at 160 characters, marked the same way.
+In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
+Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
+The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
+The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
 ---
 
@@ -259,6 +288,9 @@ name = "api-dev"
 url              = "h2s://dev.example.com:443"
 tls_skip_verify  = true   # dev/test only
 ```
+
+An `https://` or `h2s://` backend is verified against the host's certificate authorities.
+A host with none stops m6-http at start with exit 2, naming the backend.
 
 m6-http performs TLS negotiation with ALPN `h2` at startup of the first request. If the server does not accept `h2` in ALPN, the connection attempt fails with a 502. The connection is maintained persistently by `H2sTlsClientPool`, event-loop driven — identical to `H2cClientPool` but with a TLS record layer. Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
 

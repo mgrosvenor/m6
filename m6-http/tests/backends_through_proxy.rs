@@ -451,11 +451,12 @@ backend = "example"
         // this moment, so a failure in the edge path below still reaps it.
         let mut backend = BackendGuard {
             child: Some(
-                backend_command(lang, base, &sock)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
+                m6_core::platform::process::spawn(
+                    backend_command(lang, base, &sock)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped()),
+                )
+                .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
             ),
         };
         *backend_pid = backend.child.as_ref().map(|c| c.id());
@@ -711,12 +712,7 @@ fn a_failed_start_leaves_no_backend_process_behind() {
     }));
     assert!(failed.is_err(), "the edge should fail to start");
     let pid = backend_pid.expect("the backend was spawned before the edge failed");
-    let alive = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let alive = m6_core::platform::process::is_alive(pid);
     assert!(
         !alive,
         "the backend process should have been reaped after the failed edge start"

@@ -27,12 +27,13 @@
 //! reach its origin already shows it as backend errors on that node's `/perf`,
 //! and the existing backend-error finding reports them.
 //!
-//! All of this runs on the background poller, after the HTTPS polls, so the
-//! monitor's own TLS work does not distort the round trip. `--check` runs the
-//! same probe once, in its own process. Nothing runs in a request handler.
+//! The probes run after the poll's requests, one node at a time, so the
+//! monitor's own TLS work is not in flight beside the connect it times.
+//! `--check` runs the same probe once, in its own process. Nothing runs in a
+//! request handler, and no connect waits: each is a non-blocking socket the
+//! loop waits on, with one budget for the node's whole probe.
 
-use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use m6_core::wireguard::Handshakes;
 
@@ -61,55 +62,112 @@ pub struct ProbeResult {
     pub outcome: Probe,
 }
 
+/// How a probe sequence is doing: the samples, and the outcomes so far.
+///
+/// The decision rule lives in [`Tally::outcome`] and both drivers use it: the
+/// loop-driven probe in `poll.rs`, and [`probe_with`]'s scripted tests. One
+/// home for the rule, so a change cannot make the real probe and its tests
+/// disagree.
+pub struct Tally {
+    samples: Vec<Duration>,
+    connected: usize,
+    refused: usize,
+    timed_out: bool,
+    other_error: Option<String>,
+}
+
+impl Tally {
+    /// A tally with room for one probe's samples.
+    pub fn new() -> Tally {
+        Tally {
+            samples: Vec::with_capacity(PROBES_PER_POLL),
+            connected: 0,
+            refused: 0,
+            timed_out: false,
+            other_error: None,
+        }
+    }
+
+    /// Empty it for the next poll, keeping the samples' allocation.
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.connected = 0;
+        self.refused = 0;
+        self.timed_out = false;
+        self.other_error = None;
+    }
+
+    pub fn connected(&mut self, rtt: Duration) {
+        self.samples.push(rtt);
+        self.connected += 1;
+    }
+
+    pub fn refused(&mut self, rtt: Duration) {
+        self.samples.push(rtt);
+        self.refused += 1;
+    }
+
+    /// The connect did not answer inside the budget it was given.
+    pub fn lost(&mut self) {
+        self.timed_out = true;
+    }
+
+    pub fn failed(&mut self, e: &std::io::Error) {
+        self.other_error = Some(e.to_string());
+    }
+
+    /// One connect that gets through means the tunnel answered, so the outcome
+    /// is `Connected` and the samples are the connects that got through. Only
+    /// a sequence with no successful connect is `NoAnswer` or `Failed`.
+    fn outcome(&self, timeout: Duration) -> Probe {
+        if self.connected > 0 {
+            Probe::Connected
+        } else if self.refused > 0 {
+            Probe::Refused
+        } else if self.timed_out {
+            Probe::NoAnswer(format!("no answer in {}ms", timeout.as_millis()))
+        } else {
+            Probe::Failed(
+                self.other_error
+                    .clone()
+                    .unwrap_or_else(|| "no connect attempted".to_string()),
+            )
+        }
+    }
+
+    /// The reading this sequence gives.
+    pub fn result(&self, timeout: Duration) -> ProbeResult {
+        ProbeResult {
+            samples: self.samples.clone(),
+            outcome: self.outcome(timeout),
+        }
+    }
+}
+
 /// Time up to `PROBES_PER_POLL` connects, one after another, inside one
 /// deadline of `timeout` for the whole probe.
 ///
 /// Each connect is given what is left of the budget. A connect that times out
 /// has waited out everything it was given, so nothing is left and the probe
-/// ends. A dead tunnel therefore costs one `timeout`. A poll runs the HTTPS
-/// requests first and this probe after them, all on the same timeout, so a
-/// node that is down can cost up to four timeouts in one poll. A reading goes
-/// stale when one poll takes longer than twice the poll interval, so the
-/// timeout must stay under half of the poll interval.
-///
-/// One connect that gets through means the tunnel answered, so the outcome is
-/// `Connected` and the samples are the connects that got through. The sample
-/// count shows a partial loss. Only a poll with no successful connect is
-/// `NoAnswer` or `Failed`. The stream is dropped at once and nothing is sent.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "monitor threads; removed by EL-9"
-)]
-pub fn probe(addr: SocketAddr, timeout: Duration) -> ProbeResult {
-    probe_with(timeout, |remaining| {
-        TcpStream::connect_timeout(&addr, remaining).map(drop)
-    })
-}
-
+/// ends. The loop's probe drives the same rule through [`Tally`] with real
+/// sockets; this scripted form is how the rule's cases are tested.
+#[cfg(test)]
 fn probe_with(
     timeout: Duration,
     mut connect: impl FnMut(Duration) -> std::io::Result<()>,
 ) -> ProbeResult {
-    let mut samples = Vec::with_capacity(PROBES_PER_POLL);
-    let mut connected = 0;
-    let mut refused = 0;
-    let mut timed_out = false;
-    let mut other_error = None;
-    let deadline = Instant::now() + timeout;
+    let mut tally = Tally::new();
+    let deadline = m6_core::platform::now() + timeout;
     for _ in 0..PROBES_PER_POLL {
-        let started = Instant::now();
+        let started = m6_core::platform::now();
         let remaining = deadline.saturating_duration_since(started);
         if remaining.is_zero() {
             break;
         }
         match connect(remaining) {
-            Ok(()) => {
-                samples.push(started.elapsed());
-                connected += 1;
-            }
+            Ok(()) => tally.connected(started.elapsed()),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                samples.push(started.elapsed());
-                refused += 1;
+                tally.refused(started.elapsed())
             }
             Err(e)
                 if matches!(
@@ -117,23 +175,14 @@ fn probe_with(
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                timed_out = true;
+                tally.lost();
                 // It waited out the whole budget it was given.
                 break;
             }
-            Err(e) => other_error = Some(e.to_string()),
+            Err(e) => tally.failed(&e),
         }
     }
-    let outcome = if connected > 0 {
-        Probe::Connected
-    } else if refused > 0 {
-        Probe::Refused
-    } else if timed_out {
-        Probe::NoAnswer(format!("no answer in {}ms", timeout.as_millis()))
-    } else {
-        Probe::Failed(other_error.unwrap_or_else(|| "no connect attempted".to_string()))
-    };
-    ProbeResult { samples, outcome }
+    tally.result(timeout)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,8 +191,6 @@ pub enum Handshake {
     NoPublicKey,
     /// Tunnels are configured but `wg_handshakes_file` is not set.
     NoHandshakesFile,
-    /// The handshake could not be read for a reason already reported elsewhere.
-    Unknown(&'static str),
     FileMissing(String),
     FileError(String),
     /// The file is older than `tunnel_handshake_max_age_s`, so its collector
@@ -178,7 +225,7 @@ pub fn load(path: Option<&str>, max_age_s: u64) -> HandshakeSource {
             let file_age_s = std::fs::metadata(path)
                 .and_then(|m| m.modified())
                 .ok()
-                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .and_then(|t| m6_core::platform::wall().duration_since(t).ok())
                 .map(|d| d.as_secs());
             match file_age_s {
                 Some(age_s) if age_s > max_age_s => Err(Handshake::FileStale {
@@ -222,88 +269,9 @@ pub struct TunnelReading {
     pub file_age_s: Option<u64>,
 }
 
-impl TunnelReading {
-    /// The reading for a tunnel whose probe thread panicked.
-    fn panicked(address: String) -> Self {
-        Self {
-            address,
-            key_prefix: None,
-            probe: ProbeResult {
-                samples: Vec::new(),
-                outcome: Probe::Failed("probe thread panicked".to_string()),
-            },
-            handshake: Handshake::Unknown("probe thread panicked"),
-            file_age_s: None,
-        }
-    }
-}
-
-fn key_prefix(key: Option<&str>) -> Option<String> {
+/// First 8 characters of the configured peer public key, for messages.
+pub fn key_prefix(key: Option<&str>) -> Option<String> {
     key.map(|k| k.trim().chars().take(8).collect())
-}
-
-/// One entry per node, in order, `None` for a node with no tunnel.
-pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelReading>> {
-    let src = load(
-        f.wg_handshakes_file.as_deref(),
-        f.tunnel_handshake_max_age_s,
-    );
-    let file_age_s = match &src {
-        Ok((_, age)) => *age,
-        Err(Handshake::FileStale { age_s, .. }) => Some(*age_s),
-        Err(_) => None,
-    };
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let src = &src;
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "monitor threads; removed by EL-9"
-    )]
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = f
-            .nodes
-            .iter()
-            .map(|n| {
-                n.tunnel.as_ref().map(|t| {
-                    scope.spawn(move || {
-                        let probe = match t.address.parse::<SocketAddr>() {
-                            Ok(a) => probe(a, timeout),
-                            Err(e) => ProbeResult {
-                                samples: Vec::new(),
-                                outcome: Probe::Failed(format!("bad tunnel address: {e}")),
-                            },
-                        };
-                        TunnelReading {
-                            address: t.address.clone(),
-                            key_prefix: key_prefix(t.public_key.as_deref()),
-                            probe,
-                            handshake: handshake_for(src, t.public_key.as_deref(), now_unix),
-                            file_age_s,
-                        }
-                    })
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .zip(&f.nodes)
-            .map(|(h, n)| {
-                h.map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        TunnelReading::panicked(
-                            n.tunnel
-                                .as_ref()
-                                .map(|t| t.address.clone())
-                                .unwrap_or_default(),
-                        )
-                    })
-                })
-            })
-            .collect()
-    })
 }
 
 #[cfg(test)]
@@ -313,28 +281,8 @@ pub fn fleet(f: &crate::fleet::Fleet, timeout: Duration) -> Vec<Option<TunnelRea
 )]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
     const T: Duration = Duration::from_millis(500);
-
-    #[test]
-    fn a_listening_port_is_measured_as_connected() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let r = probe(l.local_addr().unwrap(), T);
-        assert_eq!(r.outcome, Probe::Connected);
-        assert_eq!(r.samples.len(), PROBES_PER_POLL);
-        assert!(r.samples.iter().all(|s| *s > Duration::ZERO));
-    }
-
-    #[test]
-    fn a_closed_port_is_a_refusal_with_a_round_trip() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        drop(l);
-        let r = probe(addr, T);
-        assert_eq!(r.outcome, Probe::Refused, "{r:?}");
-        assert!(!r.samples.is_empty());
-    }
 
     fn scripted(results: Vec<std::io::Result<()>>) -> ProbeResult {
         let mut it = results.into_iter();
@@ -454,7 +402,7 @@ mod tests {
     fn a_file_older_than_the_limit_is_stale_and_names_its_path() {
         let f = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(f.path(), "K\t1\n").unwrap();
-        let old = SystemTime::now() - Duration::from_secs(900);
+        let old = m6_core::platform::wall() - Duration::from_secs(900);
         f.as_file().set_modified(old).unwrap();
         let path = f.path().to_str().unwrap();
         match load(Some(path), 600) {

@@ -391,49 +391,10 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
     );
 }
 
-/// The thread count of a running process.
-///
-/// Linux lists `/proc/<pid>/task`. macOS has no `/proc`: `libproc` answers the
-/// same question with one 64-bit thread id per thread, which is what `ps -M`
-/// prints, without spawning a tool.
-#[cfg(target_os = "linux")]
+/// The thread count of a running process, through the platform layer, which
+/// answers the same question on every target.
 fn thread_count(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map(|entries| entries.count())
-        .unwrap_or(0)
-}
-
-#[cfg(target_os = "macos")]
-fn thread_count(pid: u32) -> usize {
-    /// `PROC_PIDLISTTHREADS` from `<sys/proc_info.h>`.
-    const PROC_PIDLISTTHREADS: libc::c_int = 6;
-
-    let mut ids = [0u64; 256];
-    // SAFETY: `ids` is a live buffer of exactly the length passed, and
-    // `proc_pidinfo` writes at most that many bytes into it.
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDLISTTHREADS,
-            0,
-            ids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&ids) as libc::c_int,
-        )
-    };
-    (bytes.max(0) as usize) / std::mem::size_of::<u64>()
-}
-
-/// The BSDs list a process's threads with `ps -H`, one line each.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn thread_count(pid: u32) -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-H", "-p", &pid.to_string()])
-        .output()
-        .expect("ps must run to count a process's threads");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .count()
-        .saturating_sub(1)
+    m6_core::platform::process::thread_count(pid).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

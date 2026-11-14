@@ -1,11 +1,12 @@
 //! One DNS question on its own non-blocking UDP socket, for checking a
 //! crawler's claim.
 //!
-//! [`Confirm`] is the reverse-then-forward check that [`crate::resolve`]'s
-//! worker thread makes: resolve the address to a name, then resolve the name
-//! forward and require the address among the results. The monitor's own loop
-//! (EL-9) will wait on descriptors with a deadline, so a lookup driven by that
-//! loop needs no thread. [`Query`] owns one UDP socket connected to one
+//! [`Confirm`] is the reverse-then-forward check: resolve the address to a
+//! name, then resolve the name forward and require the address among the
+//! results. It owns its sockets and never waits, so the caller's own loop
+//! registers [`Confirm::fd`], drives [`Confirm::drive`] when the descriptor is
+//! readable, and drops the confirmation at its deadline. `m6-monitor`'s fleet
+//! poll is that caller. [`Query`] owns one UDP socket connected to one
 //! nameserver. Nothing in this module waits.
 //!
 //! # Three outcomes, and they are not two
@@ -29,9 +30,9 @@
 //! There is no retry and no second nameserver: a question goes to the first
 //! `nameserver` in /etc/resolv.conf and its answer is the answer. The caller
 //! owns the deadline, and a query dropped at its deadline closes its socket,
-//! which is what a timed-out lookup gives the thread version today. A truncated
-//! reply is a failure: an A, AAAA or PTR answer for the names a monitor asks
-//! about fits in UDP, and a TCP fallback would be a second mechanism.
+//! which reads as [`Ptr::Failed`]. A truncated reply is a failure: an A, AAAA
+//! or PTR answer for the names a monitor asks about fits in UDP, and a TCP
+//! fallback would be a second mechanism.
 //!
 //! The messages are built and parsed by `hickory-proto`, which allocates. That
 //! is at most `MAX_LOOKUPS_PER_POLL` lookups per monitor poll, off the request
@@ -42,12 +43,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 
-use nix::net::if_::if_nametoindex;
-
+use crate::platform::net::UdpSocket;
 use hickory_proto::op::{Message, MessageType, OpCode, Query as Question, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-use mio::net::UdpSocket;
 
 /// The first `nameserver` in /etc/resolv.conf, port 53. Start only.
 ///
@@ -90,7 +89,7 @@ fn scope_id(scope: Option<&str>) -> io::Result<u32> {
     if let Ok(id) = scope.parse::<u32>() {
         return Ok(id);
     }
-    if_nametoindex(scope).map_err(io::Error::from)
+    crate::platform::net::interface_index(scope)
 }
 
 /// The answer to one [`Query`].
@@ -340,8 +339,7 @@ fn asks_about(message: &Message, name: &Name, record_type: RecordType) -> bool {
     questions.len() == 1 && questions[0].name() == name && questions[0].query_type() == record_type
 }
 
-/// The PTR-then-forward check that `resolve::confirm` makes today, driven by
-/// readiness.
+/// The PTR-then-forward check, driven by readiness.
 ///
 /// The PTR step runs first. When it answers a name, the query is replaced by
 /// the A and AAAA questions for that name, so [`Confirm::fd`] changes and the
@@ -470,8 +468,8 @@ impl Ptr {
 /// Letters, digits, `-`, `_` and `.`, at most 253 characters once the trailing
 /// dot a resolver may return is removed: the shape of a host name.
 ///
-/// `pub(crate)` because `resolve.rs`'s worker thread applies the same check
-/// until EL-9 removes that path.
+/// `pub(crate)` because `Confirm` applies it to the PTR name before the
+/// forward lookup.
 pub(crate) fn is_host_name(name: &str) -> bool {
     let name = name.strip_suffix('.').unwrap_or(name);
     !name.is_empty()
@@ -493,7 +491,7 @@ mod tests {
     use std::net::TcpListener;
     use std::net::UdpSocket as StdUdpSocket;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A test may block; the query under test may not.
     const T: Duration = Duration::from_secs(5);
@@ -606,25 +604,25 @@ mod tests {
 
     /// Drive `query` with a poll until it answers.
     fn driven(query: &mut Query) -> Answer {
-        let mut poll = mio::Poll::new().expect("poll");
-        let mut events = mio::Events::with_capacity(4);
+        let mut poll = crate::platform::Poll::new().expect("poll");
+        let mut events = crate::platform::Events::with_capacity(4);
         poll.registry()
-            .register(
-                &mut mio::unix::SourceFd(&query.fd()),
-                mio::Token(0),
-                mio::Interest::READABLE,
+            .register_fd(
+                query.fd(),
+                crate::platform::Token(0),
+                crate::platform::Interest::READABLE,
             )
             .expect("register the query's socket");
-        let deadline = Instant::now() + T;
+        let deadline = crate::platform::now() + T;
         loop {
-            let now = Instant::now();
+            let now = crate::platform::now();
             assert!(
                 now < deadline,
                 "the query did not answer before its deadline"
             );
             poll.poll(&mut events, Some(deadline - now)).expect("poll");
             for event in events.iter() {
-                if event.token() == mio::Token(0) {
+                if event.token() == crate::platform::Token(0) {
                     if let Some(answer) = query.drive().expect("drive the query") {
                         return answer;
                     }
@@ -636,30 +634,30 @@ mod tests {
     /// Drive `confirm` with a poll until it answers, following the descriptor
     /// from the PTR step to the forward step.
     fn driven_confirm(confirm: &mut Confirm) -> Ptr {
-        let mut poll = mio::Poll::new().expect("poll");
-        let mut events = mio::Events::with_capacity(4);
+        let mut poll = crate::platform::Poll::new().expect("poll");
+        let mut events = crate::platform::Events::with_capacity(4);
         let mut registered = -1;
-        let deadline = Instant::now() + T;
+        let deadline = crate::platform::now() + T;
         loop {
             let fd = confirm.fd();
             if fd != registered {
                 poll.registry()
-                    .register(
-                        &mut mio::unix::SourceFd(&fd),
-                        mio::Token(0),
-                        mio::Interest::READABLE,
+                    .register_fd(
+                        fd,
+                        crate::platform::Token(0),
+                        crate::platform::Interest::READABLE,
                     )
                     .expect("register the confirmation's socket");
                 registered = fd;
             }
-            let now = Instant::now();
+            let now = crate::platform::now();
             assert!(
                 now < deadline,
                 "the confirmation did not finish before its deadline"
             );
             poll.poll(&mut events, Some(deadline - now)).expect("poll");
             for event in events.iter() {
-                if event.token() == mio::Token(0) {
+                if event.token() == crate::platform::Token(0) {
                     if let Some(ptr) = confirm.drive().expect("drive the confirmation") {
                         return ptr;
                     }
@@ -1021,10 +1019,10 @@ mod tests {
             server
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .expect("read timeout");
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::platform::now() + Duration::from_secs(2);
             loop {
                 assert!(
-                    Instant::now() < deadline,
+                    crate::platform::now() < deadline,
                     "the closed socket never reported as refused"
                 );
                 // Each send to the closed port provokes the ICMP error that

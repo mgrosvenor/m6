@@ -106,7 +106,6 @@ httparse       = "1"
 # them survives validation and panics.
 hpack          = "0.3"
 ahash          = "0.8"
-libc           = "0.2"
 # tls12 and logging reached release builds only through tokio-rustls's default
 # features while the cold-start benchmark was a [[bin]]. Declare them here so
 # the listener keeps the protocol versions and log records it had when
@@ -118,7 +117,6 @@ rustls         = { version = "0.23", default-features = false, features = ["ring
 # naming a dependency the tree already had rather than adding one.
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
-webpki-roots   = "0.26"
 rand           = "0.8"
 httpdate       = "1"
 # Decimal formatting without allocation on the response hot path: the cached
@@ -157,4 +155,10 @@ harness = false
 # reads only the hit path's own allocations.
 [[test]]
 name = "alloc_cached_hit"
+harness = false
+
+# The /traffic window's per-event allocation check, on the main thread for the
+# same reason.
+[[test]]
+name = "traffic_window_alloc"
 harness = false

@@ -4,7 +4,7 @@ use std::io;
 
 pub use m6_core::client::too_many_informational;
 use m6_core::client::{is_skipped_informational, MAX_INFORMATIONAL};
-use m6_core::mio::Token;
+use m6_core::platform::Token;
 
 /// Hop-by-hop headers to remove before forwarding.
 pub const HOP_BY_HOP: &[&str] = &[

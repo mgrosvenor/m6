@@ -2,9 +2,19 @@
 //!
 //! A fleet is configuration, not code. The nodes, their names and roles all come
 //! from the config file, and nothing here knows any particular deployment.
+//!
+//! # Read and resolved once, at start
+//!
+//! The fleet is read once and every node's host name is resolved once, both at
+//! start with blocking calls. An address that changes later needs a restart, and
+//! a name that does not resolve stops the start with exit 2: while serving, the
+//! loop never looks a name up.
 
+use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
+use m6_core::client::TlsClient;
 use serde::{Deserialize, Serialize};
 
 /// One node to poll.
@@ -113,6 +123,12 @@ fn read_token(path: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fleet {
     pub nodes: Vec<Node>,
+    /// The seconds between polls, read at load from the top level.
+    ///
+    /// Kept here so a default that depends on the cadence is computed from the
+    /// same number the poller uses.
+    #[serde(skip)]
+    pub(crate) poll_interval_s: u64,
     /// Fallback `/perf` bearer token, for nodes that do not name their own.
     ///
     /// Read from a file, never inlined: this config is in git and the token is
@@ -179,6 +195,16 @@ pub struct Fleet {
     /// interval, which is 7200.
     #[serde(default)]
     pub log_reopen_max_age_s: Option<u64>,
+    /// Seconds since a node's `/health` last answered 200 above which the
+    /// check flags it. Optional, default three poll intervals.
+    ///
+    /// The age comes from the history, so the service shows it only when
+    /// `history_file` is set. The check already faults a node that is
+    /// degraded or unreachable, and the age says how long it has been so.
+    /// A deployment that changes `poll_interval_s` keeps this limit in step
+    /// without a second number to maintain.
+    #[serde(default)]
+    pub health_last_ok_max_age_s: Option<u64>,
 }
 
 /// The seconds between polls, read from the top level of the service config.
@@ -250,7 +276,7 @@ impl Fleet {
         let section = value
             .get("monitor")
             .ok_or_else(|| anyhow::anyhow!("no [monitor] section in {}", config_path.display()))?;
-        let fleet: Fleet = section.clone().try_into()?;
+        let mut fleet: Fleet = section.clone().try_into()?;
         if fleet.nodes.is_empty() {
             anyhow::bail!("[monitor] lists no nodes");
         }
@@ -301,12 +327,179 @@ impl Fleet {
                 }
             }
         }
+        fleet.poll_interval_s = poll_interval_s;
         Ok(fleet)
     }
 
     /// The fleet-wide fallback token, if one is configured and readable.
     pub fn perf_token(&self) -> Option<String> {
         read_token(self.perf_token_file.as_ref()?)
+    }
+
+    /// Seconds a node's last `/health` 200 may be old before the check flags
+    /// it: the configured limit, or three poll intervals.
+    pub fn health_last_ok_limit_s(&self) -> u64 {
+        self.health_last_ok_max_age_s.unwrap_or_else(|| {
+            self.poll_interval_s
+                .saturating_mul(crate::digest::HEALTH_LAST_OK_POLLS)
+        })
+    }
+}
+
+/// One node as the loop reaches it: its addresses resolved and its TLS client
+/// built, all at start.
+pub struct ResolvedNode {
+    /// Short name for the report, as configured.
+    pub name: String,
+    pub role: String,
+    /// The configured base URL, for error text and the `Host` header.
+    pub url: String,
+    /// Where `/health` and the header checks go: the node's public address.
+    pub addr: SocketAddr,
+    /// The tunnel, when one is configured.
+    pub tunnel: Option<ResolvedTunnel>,
+    /// Whether `/perf` and `/traffic` go over the tunnel.
+    pub metrics_over_tunnel: bool,
+    /// The TLS client for an `https` URL. The name is the URL's host in both
+    /// cases: the tunnel carries TLS for the same certificate.
+    pub tls: Option<TlsClient>,
+    /// The URL's path prefix, empty for an authority-only URL.
+    pub base_path: String,
+    /// The authority as the URL writes it, for the `Host` header.
+    pub authority: String,
+}
+
+impl ResolvedNode {
+    /// Where `/perf` and `/traffic` go: the tunnel when the node asks for it,
+    /// the public address otherwise.
+    pub fn metrics_addr(&self) -> SocketAddr {
+        match (&self.tunnel, self.metrics_over_tunnel) {
+            (Some(t), true) => t.addr,
+            _ => self.addr,
+        }
+    }
+}
+
+/// A node's tunnel address, parsed once at start.
+pub struct ResolvedTunnel {
+    pub addr: SocketAddr,
+    /// As configured, for the report.
+    pub address: String,
+    pub public_key: Option<String>,
+}
+
+/// A node URL, split into what a connection needs.
+#[derive(Debug)]
+struct NodeUrl {
+    https: bool,
+    host: String,
+    port: u16,
+    authority: String,
+    base_path: String,
+}
+
+impl Fleet {
+    /// Resolve every node's host once and build its TLS client, blocking.
+    ///
+    /// `tls` is the one shared client config built at start from the host's
+    /// certificate store. A name that does not resolve is an error naming the
+    /// node and the host, so the service refuses to start rather than report
+    /// the node unreachable at every poll.
+    pub fn resolve(&self, tls: &Arc<rustls::ClientConfig>) -> anyhow::Result<Vec<ResolvedNode>> {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        for n in &self.nodes {
+            let u =
+                parse_node_url(&n.url).map_err(|e| anyhow::anyhow!("node {:?}: {e}", n.name))?;
+            let addr = m6_core::net::resolve(&u.host, u.port).map_err(|e| {
+                anyhow::anyhow!("node {:?}: {} does not resolve: {e}", n.name, u.host)
+            })?;
+            let tunnel = match &n.tunnel {
+                Some(t) => Some(ResolvedTunnel {
+                    addr: t.address.parse::<SocketAddr>().map_err(|e| {
+                        anyhow::anyhow!("node {:?}: tunnel.address {:?}: {e}", n.name, t.address)
+                    })?,
+                    address: t.address.clone(),
+                    public_key: t.public_key.clone(),
+                }),
+                None => None,
+            };
+            let tls_client = if u.https {
+                let name =
+                    rustls::pki_types::ServerName::try_from(u.host.clone()).map_err(|e| {
+                        anyhow::anyhow!("node {:?}: invalid host name {:?}: {e}", n.name, u.host)
+                    })?;
+                Some(TlsClient {
+                    config: Arc::clone(tls),
+                    name,
+                })
+            } else {
+                None
+            };
+            out.push(ResolvedNode {
+                name: n.name.clone(),
+                role: n.role.clone(),
+                url: n.url.clone(),
+                addr,
+                tunnel,
+                metrics_over_tunnel: n.metrics_over_tunnel,
+                tls: tls_client,
+                base_path: u.base_path,
+                authority: u.authority,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Split `http://host[:port][/prefix]` or `https://...` into what a request
+/// needs. A node URL names an authority and an optional path prefix, never a
+/// query or a fragment.
+fn parse_node_url(url: &str) -> anyhow::Result<NodeUrl> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("{url:?} is not an http:// or https:// URL"))?;
+    let https = match scheme {
+        "http" => false,
+        "https" => true,
+        _ => anyhow::bail!("{url:?} is not an http:// or https:// URL"),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() || authority.contains(['@', '?', '#']) {
+        anyhow::bail!("{url:?} has no plain host authority");
+    }
+    let (host, port) = split_host_port(authority, if https { 443 } else { 80 })?;
+    if host.is_empty() {
+        anyhow::bail!("{url:?} has no host");
+    }
+    Ok(NodeUrl {
+        https,
+        host,
+        port,
+        authority: authority.to_string(),
+        base_path: path.trim_end_matches('/').to_string(),
+    })
+}
+
+/// The host and port of an authority, with the bracket form for IPv6.
+fn split_host_port(authority: &str, default_port: u16) -> anyhow::Result<(String, u16)> {
+    let bad_port = |p: &str| anyhow::anyhow!("{authority:?} has an invalid port {p:?}");
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("{authority:?} has an unclosed IPv6 address"))?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().map_err(|_| bad_port(p))?,
+            None if tail.is_empty() => default_port,
+            None => anyhow::bail!("{authority:?} has text after the IPv6 address"),
+        };
+        return Ok((host.to_string(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, p)) => Ok((host.to_string(), p.parse::<u16>().map_err(|_| bad_port(p))?)),
+        None => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -561,6 +754,24 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         assert_eq!(unset.log_reopen_max_age_s, None);
     }
 
+    /// The health limit is the one setting that has no literal default: it
+    /// follows the poll cadence, so changing `poll_interval_s` keeps it true.
+    #[test]
+    fn the_health_limit_defaults_to_three_poll_intervals() {
+        let node = "[[monitor.nodes]]\nname = \"origin\"\nurl = \"http://origin.example.com\"\n";
+        let set = load(&format!(
+            "poll_interval_s = 60\n[monitor]\nhealth_last_ok_max_age_s = 45\n{node}"
+        ))
+        .unwrap();
+        assert_eq!(set.health_last_ok_max_age_s, Some(45));
+        assert_eq!(set.health_last_ok_limit_s(), 45);
+        let default = load(&format!("poll_interval_s = 60\n{node}")).unwrap();
+        assert_eq!(default.health_last_ok_max_age_s, None);
+        assert_eq!(default.health_last_ok_limit_s(), 180);
+        let stock = load(node).unwrap();
+        assert_eq!(stock.health_last_ok_limit_s(), 90);
+    }
+
     #[test]
     fn metrics_over_tunnel_defaults_off() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -603,5 +814,64 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         );
         let err = node.unwrap_err().to_string();
         assert!(err.contains("node \"a\": perf_token_file"), "{err}");
+    }
+
+    #[test]
+    fn a_node_url_splits_into_scheme_host_port_and_prefix() {
+        let u = parse_node_url("https://edge-a.example.com").unwrap();
+        assert!(u.https);
+        assert_eq!((u.host.as_str(), u.port), ("edge-a.example.com", 443));
+        assert_eq!(u.authority, "edge-a.example.com");
+        assert_eq!(u.base_path, "");
+
+        let u = parse_node_url("http://origin.example.com:8080/mon/").unwrap();
+        assert!(!u.https);
+        assert_eq!((u.host.as_str(), u.port), ("origin.example.com", 8080));
+        assert_eq!(u.authority, "origin.example.com:8080");
+        assert_eq!(u.base_path, "/mon");
+
+        let u = parse_node_url("http://[::1]:8081").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("::1", 8081));
+        assert_eq!(u.authority, "[::1]:8081");
+    }
+
+    /// A URL that names nothing a socket can be opened to is a config error,
+    /// and the message says which URL.
+    #[test]
+    fn a_url_that_is_not_http_or_has_no_host_is_refused() {
+        for bad in [
+            "edge-a.example.com",
+            "ftp://edge-a.example.com",
+            "https://",
+            "https://edge-a.example.com:notaport",
+            "https://[::1",
+            "https://user@edge-a.example.com",
+        ] {
+            let e = parse_node_url(bad).unwrap_err().to_string();
+            assert!(!e.is_empty(), "{bad}");
+        }
+    }
+
+    /// Resolution happens at start: an IP literal needs no lookup, so a config
+    /// that names addresses works with no resolver at all.
+    #[test]
+    fn resolving_an_ip_literal_node_needs_no_lookup() {
+        let fleet =
+            load("[[monitor.nodes]]\nname = \"a\"\nurl = \"http://127.0.0.1:9\"\n").unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let resolved = fleet.resolve(&config).unwrap();
+        assert_eq!(resolved.len(), 1);
+        let want: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert_eq!(resolved[0].addr, want);
+        assert!(resolved[0].tls.is_none());
+        assert_eq!(resolved[0].metrics_addr(), want);
+        assert_eq!(resolved[0].name, "a");
     }
 }

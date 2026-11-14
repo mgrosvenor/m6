@@ -1,4 +1,3 @@
-pub mod app;
 pub mod client;
 pub mod compress;
 pub mod conditional;
@@ -11,7 +10,6 @@ pub mod event;
 pub mod firewall;
 pub mod h1;
 pub mod headers;
-pub mod host;
 pub mod http;
 pub mod log;
 pub mod mime;
@@ -25,6 +23,9 @@ pub mod negotiate;
 pub mod net;
 pub mod parse;
 pub mod path;
+/// The platform layer, the one crate that knows the operating system. See
+/// `docs/m6-platform.md`.
+pub use m6_platform as platform;
 pub mod random;
 pub mod render;
 pub mod request;
@@ -58,13 +59,6 @@ pub mod template;
 #[cfg(feature = "templates")]
 pub use template::{TeraFactory, TeraRenderer};
 
-/// The reactor: `Poll`, `Events`, `Token`, `Interest` and the non-blocking
-/// sockets. Re-exported so a service names `m6_core::mio::...` and links only
-/// m6-core.
-pub use mio;
-
-pub use app::App;
-pub use app::AppContext;
 pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decompress};
 pub use conditional::{
     evaluate_preconditions, is_not_modified, not_modified_headers, Precondition,
@@ -82,47 +76,64 @@ pub use random::random_hex_token;
 pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use request::Request;
 pub use response::{Body, Response};
-pub use server::{socket_path_from_config, UnixServer};
-pub use signal::ShutdownHandle;
+pub use server::socket_path_from_config;
 pub use site::{CodeRoute, Handled, Site};
 
 /// Everything a service normally wants, in one line.
 ///
 /// `use m6_core::prelude::*;` is the intended first line of an m6 service.
 /// m6-core is the box of blocks: linking it should be the only thing a new
-/// service has to do to get a server loop, routing, templating, a request
-/// dictionary and the helpers that go with them.
+/// service has to do to get routing, templating, a request dictionary, the
+/// event-loop parts and the helpers that go with them. The loop is the
+/// service's own, written out in its `main`.
 ///
 /// ```rust,no_run
+/// use std::time::Duration;
+///
 /// use m6_core::prelude::*;
 ///
-/// fn main() -> Result<()> {
-///     App::new()
-///         .route("/blog/{stem}", |req| Response::render("templates/post.html", req))
-///         .run()
+/// const ROUTES: &[CodeRoute] = &[CodeRoute {
+///     pattern: "/healthz",
+///     method: RouteMethod::Get,
+/// }];
+/// const LISTENER: Token = Token(usize::MAX);
+///
+/// fn main() -> anyhow::Result<()> {
+///     // Start: blocking and allocation are fine.
+///     let site = Site::load("example", ROUTES, &[], &NoTemplates);
+///     let mut poll = Poll::new()?;
+///     let mut listener = listen_unix(site.socket_path(), site.socket_mode())?;
+///     poll.registry()
+///         .register(&mut listener, LISTENER, Interest::READABLE)?;
+///     let mut conns = Slots::new(1024, 1024, || ServerConn::new(16 * 1024, 64 * 1024));
+///     // `read_timeout_s = 0` means no deadline, which is the zero duration.
+///     let read_timeout = site.read_timeout();
+///     let mut deadlines = Timeouts::new(1024, read_timeout.unwrap_or(Duration::ZERO));
+///     let mut events = Events::with_capacity(256);
+///
+///     // Run: `docs/m6-app-anatomy.md` section 2 owns the loop (the accept,
+///     // the connection turn, the signals and the stop phase). This example
+///     // shows the start only.
+///     drop((poll, listener, conns, deadlines, events, site));
+///     Ok(())
 /// }
 /// ```
 ///
-/// A service that renders nothing links the same crate and says so:
-///
-/// ```rust,no_run
-/// use m6_core::prelude::*;
-///
-/// fn main() -> Result<()> {
-///     App::new()
-///         .renderer(NoTemplates)
-///         .route("/healthz", |_req| Ok(Response::text("ok")))
-///         .run()
-/// }
-/// ```
+/// The loop is one `match` on the event's token and one function per
+/// connection. `docs/m6-app-anatomy.md` §2 shows it in full, with the accept,
+/// the connection turn, the signals and the stop phase.
 pub mod prelude {
-    pub use crate::app::{App, AppContext};
     pub use crate::dict::Dict;
     pub use crate::error::{Error, Result};
+    pub use crate::event::{LoopTrace, Slots, Timeouts};
+    pub use crate::h1::{head_slots, Flush, Read, ServerConn};
+    pub use crate::net::listen_unix;
+    pub use crate::platform::{Events, Interest, Poll, Token};
+    pub use crate::platform::{Signal, Signals};
     pub use crate::render::NoTemplates;
     pub use crate::request::Request;
     pub use crate::response::Response;
-    pub use crate::site::{CodeRoute, Handled, Site};
+    pub use crate::site::{CodeRoute, Handled, RouteMethod, Site};
     pub use crate::util::{now_iso8601, slugify, today_iso8601};
     pub use serde_json::{json, Map, Value};
 

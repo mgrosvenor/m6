@@ -56,9 +56,19 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **A backend host name that does not resolve when m6-http starts now stops it with exit 2.** Host names in `url` and HTTP/2 backends are resolved once at start, so a backend whose address changes needs m6-http restarted.
 
-**m6-html and m6-file no longer read `[thread_pool]`** (it is refused at start from a later release). To use more cores, run more instances: a systemd template unit with `M6_SOCKET_OVERRIDE` per instance and a glob in `site.toml`'s `[[backend]]` sockets.
-
 **A database path m6-auth-server cannot open now stops it at start with exit 2**, instead of answering 500 to each request.
+
+**m6-http verifies an https:// or h2s:// backend against the host's certificate authorities only, and a host with none stops it at start with exit 2.** A backend that relied on the bundled Mozilla list on a host with no CA certificates needs the host's CA package installed.
+
+**A service config that still has `[thread_pool]` is refused at start.** Delete it from every service config. To use more cores, run more instances (a systemd template unit with `M6_SOCKET_OVERRIDE` per instance and a glob in `site.toml`'s `[[backend]]` sockets). Code built on `App`: replace `App::new()` and its `route_*` calls with a main that loads `site::Site`, opens its listener with `net::listen_unix` and runs the loop in docs/m6-app-anatomy.md, with your routes as `CodeRoute` values and one match on `Handled`.
+
+**m6-monitor reads the fleet list and every node's host name at start.** A change to the fleet, or to a node's address, needs a restart. A node whose host name does not resolve at start stops m6-monitor with exit 2, naming the node.
+
+**m6-monitor's history file gains the index `health_ok_node_at` at start**, with no action needed. `[monitor] health_last_ok_max_age_s` is optional; its default is three poll intervals.
+
+**One request-header limit, as nginx sets it.** A header field over 8 KiB or a head over 32 KiB now gets 400 ("Request Header Or Cookie Too Large") from m6-http, and a request line over 8 KiB gets 414, on HTTP/1.1, HTTP/2 and HTTP/3, before any backend is contacted. The limits are `m6_core::headers::MAX_HEADER_LINE` and `MAX_REQUEST_HEAD`, and m6-core backends answer the same codes. HTTP/1.1 heads up to 20 MiB and HTTP/2 heads up to 64 KiB used to be forwarded and then refused by an m6 backend, which the client saw as 502. Each connection slot's head buffer is 32 KiB. On HTTP/3, quiche refuses a field section over 32 KiB by closing the connection instead of answering 400.
+
+`m6_core::mio` is gone: use `m6_core::platform::{Poll, Events, Interest, Token}`, `platform::net`'s sockets and `Registry::register_fd` in place of `SourceFd`. `m6_core::event::{Signals, Signal}` are `m6_core::platform::{Signals, Signal}` and `Signal::Terminate` is `Signal::Shutdown`. `event::raise_open_file_limit` is `platform::process::raise_fd_limit`. `m6_core::host` is `m6_core::platform::host`. `m6_core::signal::ShutdownHandle` and `Service` are removed: use `platform::Signals` in the service's own loop. A service that spawns a child uses `platform::process::spawn`, and an accept loop matches `platform::net::accept_error`. Shipping code reads the clock through `platform::now()` and `platform::wall()`.
 
 ### Added
 
@@ -108,6 +118,10 @@ A client that makes more requests than this on one connection reconnects, with a
 **m6_core::dns, a DNS question on its own non-blocking UDP socket.** dns::Query asks one PTR, or one A and AAAA pair, of the first nameserver in /etc/resolv.conf, and dns::Confirm makes the reverse-then-forward check a crawler claim needs, each driven by the caller's event loop. Messages are built and parsed by hickory-proto. Nothing else in m6 resolves names while serving: host names are resolved once at start.
 
 **m6-core supplies the parts a service's own event loop is built from.** h1::ServerConn serves one HTTP/1.1 connection from buffers made at start, reading and writing until the socket would block, with no allocation per request. net::listen_unix and net::listen_tcp open a non-blocking listener. site::Site loads a site's config, templates and params at start, and handle and finish answer a request with the routing, rendering, minification and compression App used, returning the service's own routes to the service to answer.
+
+**m6-log, a buffered JSONL logger for an event loop.** Lines are written into a 16 KiB buffer allocated at start and flushed when full, every second and at stop, as nginx's buffered access log does. Warnings and errors are written at once. No thread, no lock, no allocation per line. A destination that cannot take more is never waited on: lines are kept, then dropped and counted, as HAProxy does.
+
+**m6-monitor's hourly check reports each node's `/health` and the age of its last 200.** A node is ok only when `/health` answers 200 with status ok, and every other node is a fault on its line and in the verdict.
 
 ### Security
 
@@ -332,6 +346,22 @@ The sync used to delete the file the build host wrote, so the history never ente
 **m6-html and m6-file each run one event loop in one thread.** They accepted on one thread and handed each connection to a worker over a locked queue, about 15 µs per request, and a worker held its connection for its whole keep-alive life. Now each service's main accepts, reads, answers and writes with every socket non-blocking: an idle keep-alive connection costs a buffer, not a thread, and a large file streams as the client reads it. Connections beyond what the process can serve wait in the kernel's listen queue: there is no 503 for a full queue. Run several instances to use several cores.
 
 **m6-auth-server runs one event loop with one database connection.** It handed each connection to a worker thread, and each worker opened its own database connection on its first request, answering 500 when that open failed. Now one loop serves every connection, the database is opened once at start, and a database that cannot be opened stops the service with exit 2. The login rate limit is per process.
+
+**m6-auth-server never waits on a database lock.** It waited up to 5 seconds for SQLite's lock, which in a single-threaded service holds every request. It now sets SQLite's busy timeout to zero once started, retries a request that found the database locked every 5 ms from its event loop while serving others, and answers 503 with Retry-After after one second. A retried login does not verify the password twice. m6-auth-cli keeps its 5-second wait.
+
+**m6-monitor runs one thread with its own event loop.** It ran a background poll thread, one thread per node per poll with blocking HTTP requests, a thread per tunnel probe, a history writer thread and a thread per reverse DNS lookup. Each poll is now a set of non-blocking requests, connects and DNS queries driven by its loop, the page, digest and check are built once per poll and served from memory, and history is written in one short transaction per poll, never waiting on a locked database. The reports are unchanged. The monitor trusts the host's certificate store instead of a bundled one.
+
+**/traffic no longer reads the analytics log.** m6-http read up to 24 MiB of its log file inside its event loop to answer /traffic. It now keeps the last 32,768 events it logs in memory, in space allocated at start, and builds the report from those in the last hour. A report after a restart covers only the time since the restart, and window_minutes says how long that is. A node that wraps the ring inside the hour reports the shorter span it holds and counts the events it dropped. A path is stored up to 512 bytes and a user agent up to 256, and a cut value ends in `...`: the log keeps them whole. A request whose path or user agent was cut counts as probe-shaped, so a marker cannot be hidden past the cut.
+
+**A node answering `/health` with 200 and an unrecognised status, or with no usable answer, is now a fault in m6-monitor's digest.**
+
+**One platform layer.** m6 named the operating system, or an OS crate, in every service loop, three thread counters, a Linux-only test, the host readings and the bench tools. They now live in one crate, `m6-platform`, re-exported as `m6_core::platform` and selected by OS family: readiness over mio, the clock, a shutdown or reload request as a descriptor, a child's exit as a descriptor (pidfd on Linux, kqueue on macOS), sockets with the right options, the open-file and socket-path limits, host and process facts. A gate test refuses platform conditionals, OS crates, direct clock reads and service-manager variables anywhere else. One shared contract suite and the echo reference app run unchanged on macOS arm64, Linux x86_64 and Linux arm64, and CI builds and tests all three. A child a service spawned inherited its blocked signals (and on macOS the ignored disposition) and could not be stopped: fixed. The thread-based `ShutdownHandle` is removed. Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives.
+
+### Removed
+
+m6-http's bundled webpki-roots store, a second store beside the host's.
+
+**App, its builders, AppContext, with_thread_state and `[thread_pool]` are gone: m6-core is not a framework.** Every service writes its own main with its own event loop, and m6-core supplies the parts: h1::ServerConn, site::Site, net::listen_unix, and the event module's Signals, Timeouts, Slots and LoopTrace (see docs/m6-app-anatomy.md). The params cache takes no lock.
 
 ### Verified
 

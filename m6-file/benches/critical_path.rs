@@ -2,12 +2,12 @@
 //!
 //!   1. `serve` with an in-memory writer: route settings → disk read →
 //!      response serialise.
-//!   2. Full Unix socket round-trip through the same `serve_connection` loop
-//!      production runs.
+//!   2. Full Unix socket round-trip through the blocking reference loop
+//!      `m6_core::server::serve_connection`.
 //!
-//! `bench_route_match` was removed when m6-file became an `App` service: the
-//! router it measured was m6-file's own, and there is one router now. Core's
-//! is benchmarked in `m6-core/benches/critical_path.rs`.
+//! `bench_route_match` was removed when m6-file took core's router: the router
+//! it measured was m6-file's own, and there is one router now. Core's is
+//! benchmarked in `m6-core/benches/critical_path.rs`.
 
 #![allow(
     clippy::disallowed_methods,
@@ -130,8 +130,8 @@ fn spawn_server(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
             let site_dir = site_dir.clone();
-            // The same connection loop production runs, so the round trip
-            // measured here is the one that actually happens.
+            // The blocking reference loop, so the round trip measures the
+            // handler the same way the contract describes.
             let _ = m6_core::server::serve_connection(&mut stream, move |raw, resp| {
                 let relpath = raw.path().trim_start_matches("/assets/").to_string();
                 let mut dict = Map::new();

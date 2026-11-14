@@ -23,7 +23,7 @@
 ///   --out-dir DIR       SVG output directory  (default .)
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -168,7 +168,9 @@ fn make_rustls_config(skip_verify: bool) -> Arc<ClientConfig> {
         )
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for cert in rustls_native_certs::load_native_certs().certs {
+            roots.add(cert).ok();
+        }
         Arc::new(
             ClientConfig::builder()
                 .with_root_certificates(roots)
@@ -648,14 +650,12 @@ fn h1_single_get(addr: &str, path: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::
                     conn.process_new_packets()
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => unsafe {
-                    let mut pfd = libc::pollfd {
-                        fd: stream.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    libc::poll(&mut pfd, 1, 5000);
-                },
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let _ = m6_core::platform::wait_readable(
+                        stream.as_fd(),
+                        Duration::from_millis(5000),
+                    );
+                }
                 Err(e) => return Err(e.into()),
             }
         }

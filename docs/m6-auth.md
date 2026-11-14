@@ -73,7 +73,7 @@ Take from it that every flag is optional and the two positional arguments are re
 
 **Table 2: the two positional arguments and the three flags.**
 
-For this binary the dump covers the site directory, the config paths, the socket, the thread pool, the server settings and any routes declared in the config.
+For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
 It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the four routes the service registers.
 It exits 0 before the service validates those sections.
 
@@ -379,7 +379,7 @@ The edge check is local, so the header it sets carries the result to a backend, 
 
 A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
 The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
-The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.1.
+The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.6.
 
 Token verification, the edge check and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.
@@ -393,7 +393,12 @@ A database that cannot be opened stops the service with exit 2, and the error na
 
 `Db::open` sets *WAL* (write-ahead logging), a 5-second busy timeout and foreign keys.
 WAL lets readers and one writer proceed together.
-A second writer waits up to 5 seconds and then fails.
+The service sets the busy timeout to zero after that open, because a wait in the one loop holds every connection behind it.
+A statement that meets another process's lock returns `SQLITE_BUSY` at once.
+The loop defers that request and tries it again every 5 ms while it serves the other connections.
+A request that is still locked after one second is answered with 503 and `Retry-After: 1`.
+A retried login does not verify the password twice, because the retry keeps the user the first attempt verified.
+`m6-auth-cli` keeps the 5-second wait, because it serves one command at a time.
 The one connection is used by the one loop, so a login that is checking a password holds the process for its bcrypt verify and every other connection waits for it.
 
 The database path is the `[storage] path` key, an absolute path.

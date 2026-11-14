@@ -13,10 +13,10 @@
 
 use std::io::{Read, Write};
 
+use crate::h1::HeadError;
+use crate::headers::MAX_REQUEST_HEAD;
 use crate::http::RawRequest;
 
-/// Maximum size for request line + headers combined (8 KB).
-pub(crate) const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// Maximum body size (16 MB).
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -26,10 +26,13 @@ pub enum ParseError {
     ConnectionClosed,
     #[error("invalid request line")]
     InvalidRequestLine,
-    #[error("invalid header")]
-    InvalidHeader,
     #[error("request too large")]
     RequestTooLarge,
+    /// The head was refused by [`crate::h1`]: malformed, or over one of the two
+    /// head limits. The status travels with it so a backend answers 414 for a
+    /// long request line and 400 for everything else.
+    #[error("request head refused")]
+    Refused(HeadError),
     #[error("request timeout")]
     RequestTimeout,
     #[error("expectation failed")]
@@ -47,6 +50,7 @@ impl ParseError {
     pub fn status(&self) -> u16 {
         match self {
             ParseError::RequestTooLarge => 413,
+            ParseError::Refused(why) => why.status(),
             ParseError::ExpectationFailed => 417,
             ParseError::RequestTimeout => 408,
             _ => 400,
@@ -57,6 +61,7 @@ impl ParseError {
     pub fn reason(&self) -> &'static str {
         match self.status() {
             413 => "Payload Too Large",
+            414 => "Request-URI Too Large",
             417 => "Expectation Failed",
             408 => "Request Timeout",
             _ => "Bad Request",
@@ -90,21 +95,21 @@ pub fn parse_request(stream: &mut (impl Read + Write)) -> Result<RawRequest, Par
     loop {
         match crate::h1::parse_request(&buf) {
             crate::h1::ParseResult::Complete(req) => return Ok(req),
-            crate::h1::ParseResult::Error => return Err(ParseError::InvalidHeader),
+            crate::h1::ParseResult::Error(why) => return Err(ParseError::Refused(why)),
             crate::h1::ParseResult::Incomplete => {}
         }
 
-        // Two caps, because they guard different things. Until the blank line
-        // arrives everything read is head, and an unbounded head is how a peer
-        // makes the server buffer forever. After it, the body is bounded
+        // Two bounds, because they guard different things. Until the blank
+        // line arrives everything read is head, and an unbounded head is how a
+        // peer makes the server buffer forever: the shared head refusal is
+        // decided as the bytes arrive. After the blank line the body is bounded
         // separately and much more generously.
         let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
-        let cap = if head_done {
-            MAX_HEADER_BYTES + MAX_BODY_BYTES
-        } else {
-            MAX_HEADER_BYTES
-        };
-        if buf.len() > cap {
+        if !head_done {
+            if let Some(why) = crate::h1::incomplete_head_status(&buf) {
+                return Err(ParseError::Refused(why));
+            }
+        } else if buf.len() > MAX_REQUEST_HEAD + MAX_BODY_BYTES {
             return Err(ParseError::RequestTooLarge);
         }
 
@@ -438,6 +443,67 @@ Connection: keep-alive\r\n\r\n"
             parse_request(&mut r).is_err(),
             "an oversized head must be refused"
         );
+    }
+
+    /// The three refusals this adapter shares with the edge, with the status
+    /// each carries. A field or the head answers 400 and a request line 414,
+    /// and none of them is the body's 413.
+    #[test]
+    fn a_field_over_the_header_line_limit_answers_400() {
+        let mut req = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        req.extend_from_slice(format!("X-Pad: {}\r\n", "a".repeat(8192)).as_bytes());
+        req.extend_from_slice(b"\r\n");
+        let mut r = Chunked::new(&req, 4096);
+        let err = parse_request(&mut r).unwrap_err();
+        assert_eq!(err.status(), 400, "got {err:?}");
+    }
+
+    #[test]
+    fn a_request_line_over_the_header_line_limit_answers_414() {
+        let mut req = format!(
+            "GET /{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "a".repeat(8192)
+        )
+        .into_bytes();
+        let mut r = Chunked::new(&req, 4096);
+        let err = parse_request(&mut r).unwrap_err();
+        assert_eq!(err.status(), 414, "got {err:?}");
+        assert_eq!(err.reason(), "Request-URI Too Large");
+        // One byte fewer is a valid head to this parser.
+        req = format!(
+            "GET /{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "a".repeat(8178)
+        )
+        .into_bytes();
+        let mut r = Chunked::new(&req, 4096);
+        assert!(
+            parse_request(&mut r).is_ok(),
+            "the line is inside the limit"
+        );
+    }
+
+    #[test]
+    fn a_head_over_the_limit_answers_400() {
+        let mut req = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        // Three fields near the line limit, so the head check is reached
+        // rather than the parser's 64 header slots.
+        let mut n = 0usize;
+        while req.len() + 2 <= MAX_REQUEST_HEAD {
+            let mut line = format!("x-pad{n}: ");
+            line.push_str(&"a".repeat(crate::headers::MAX_HEADER_LINE - 1 - line.len()));
+            line.push_str("\r\n");
+            req.extend_from_slice(line.as_bytes());
+            n += 1;
+        }
+        req.extend_from_slice(b"\r\n");
+        assert!(req.len() > MAX_REQUEST_HEAD);
+        let mut r = Chunked::new(&req, 4096);
+        let err = parse_request(&mut r).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Refused(HeadError::HeadTooLarge)),
+            "got {err:?}"
+        );
+        assert_eq!(err.status(), 400);
     }
 }
 

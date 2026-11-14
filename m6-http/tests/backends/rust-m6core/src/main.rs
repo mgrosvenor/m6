@@ -44,16 +44,17 @@
 #![deny(unsafe_code)]
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use m6_core::app::RouteMethod;
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
+use m6_core::site::RouteMethod;
 use m6_core::CodeRoute;
 
 const LANGUAGE: &str = "Rust (m6-core)";
@@ -122,8 +123,7 @@ fn main() -> std::io::Result<()> {
     // ── start: blocking and allocation are fine ──────────────────────────
     let site = Site::load(NAME, &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
-    let ceiling =
-        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");
     }
@@ -138,11 +138,7 @@ fn main() -> std::io::Result<()> {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
     poll.registry()
-        .register(
-            &mut SourceFd(&signals.raw_fd()),
-            SIGNALS,
-            Interest::READABLE,
-        )
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
 
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
@@ -157,19 +153,22 @@ fn main() -> std::io::Result<()> {
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
     let mut accepting = true;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
 
     // ── run: nothing blocks ──────────────────────────────────────────────
     'run: loop {
         // An interrupted wait is not an error: wait again. mio passes EINTR
         // up rather than retrying.
-        match poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK))) {
+        match poll.poll(
+            &mut events,
+            Some(deadlines.timeout(m6_core::platform::now(), TICK)),
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as
         // m6-http reports the trace.
@@ -191,23 +190,25 @@ fn main() -> std::io::Result<()> {
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // No connection was pending after all: give
-                                // the slot back rather than leaking it.
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                // A failure here sheds this accept pass and
-                                // not the service: give the slot back, say so
-                                // once, and wait for the next listener event.
-                                // The budget leaves room for every connection
-                                // and every file it streams, so this is a
-                                // transient error outside the table.
-                                conns.free(taken.key);
-                                eprintln!("m6-example-rust-m6core: accept error: {e}");
-                                break;
-                            }
+                            // No connection was pending after all: give
+                            // the slot back rather than leaking it.
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    eprintln!("m6-example-rust-m6core: accept error: {e}");
+                                    break;
+                                }
+                            },
                         };
                         poll.registry().register(
                             &mut stream,
@@ -266,7 +267,7 @@ fn main() -> std::io::Result<()> {
 
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
@@ -279,7 +280,7 @@ fn main() -> std::io::Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. These services serve no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {

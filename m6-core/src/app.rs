@@ -2727,7 +2727,7 @@ mod tests {
     fn named_site_toml_that_is_unreadable_is_refused() {
         use std::os::unix::fs::PermissionsExt;
         // root reads any file, so the test would prove nothing.
-        if unsafe { libc::geteuid() } == 0 {
+        if m6_platform::process::is_root() {
             return;
         }
         let d = tempfile::tempdir().unwrap();
@@ -3234,8 +3234,8 @@ mod last_modified_tests {
         std::fs::write(d.path().join("old.html"), b"a").unwrap();
         std::fs::write(d.path().join("new.html"), b"b").unwrap();
 
-        let past = SystemTime::now() - Duration::from_secs(3600);
-        let recent = SystemTime::now() - Duration::from_secs(60);
+        let past = m6_platform::wall() - Duration::from_secs(3600);
+        let recent = m6_platform::wall() - Duration::from_secs(60);
         filetime::set_file_mtime(d.path().join("old.html"), filetime::FileTime::from(past))
             .unwrap();
         filetime::set_file_mtime(d.path().join("new.html"), filetime::FileTime::from(recent))
@@ -3258,8 +3258,8 @@ mod last_modified_tests {
         std::fs::create_dir(d.path().join("partials")).unwrap();
         std::fs::write(d.path().join("partials/_head.html"), b"b").unwrap();
 
-        let past = SystemTime::now() - Duration::from_secs(7200);
-        let recent = SystemTime::now() - Duration::from_secs(30);
+        let past = m6_platform::wall() - Duration::from_secs(7200);
+        let recent = m6_platform::wall() - Duration::from_secs(30);
         filetime::set_file_mtime(d.path().join("page.html"), filetime::FileTime::from(past))
             .unwrap();
         filetime::set_file_mtime(
@@ -3829,7 +3829,7 @@ mod dict_cost {
         }
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            let t = std::time::Instant::now();
+            let t = m6_platform::now();
             f();
             v.push(t.elapsed().as_nanos() as u64);
         }
@@ -4068,7 +4068,7 @@ mod copy_audit {
         }
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
-            let t = std::time::Instant::now();
+            let t = m6_platform::now();
             f();
             v.push(t.elapsed().as_nanos() as u64);
         }

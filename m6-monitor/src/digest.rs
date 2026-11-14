@@ -53,10 +53,27 @@ pub struct Thresholds {
     /// default, because analytics logging is on by default and a deployment
     /// that does not rotate would otherwise fault two hours after every start.
     pub log_reopen_age_s: Option<u64>,
+    /// Seconds since a node last answered `/health` with 200 above which the
+    /// check flags it. Read from `[monitor] health_last_ok_max_age_s`, which
+    /// defaults to three poll intervals.
+    ///
+    /// The age itself comes from the history, so a service with no history
+    /// file cannot judge it and shows the absence instead. The digest already
+    /// faults a node that is degraded or unreachable, and the check adds the
+    /// age as its own fault when it passes the limit, so the verdict says how
+    /// long the node has been in that state.
+    pub health_last_ok_age_s: u64,
 }
 
 /// The default for `Thresholds::tunnel_handshake_age_s`, in seconds.
 pub const DEFAULT_TUNNEL_HANDSHAKE_AGE_S: u64 = 600;
+
+/// How many poll intervals a node's last 200 may be old by default.
+///
+/// One number describes the cadence: a deployment that changes
+/// `poll_interval_s` gets a limit that follows it, without a second setting to
+/// keep in step.
+pub const HEALTH_LAST_OK_POLLS: u64 = 3;
 
 impl Default for Thresholds {
     fn default() -> Self {
@@ -68,6 +85,7 @@ impl Default for Thresholds {
             cert_expiry_days: 21,
             tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
             log_reopen_age_s: None,
+            health_last_ok_age_s: crate::DEFAULT_POLL_SECS.saturating_mul(HEALTH_LAST_OK_POLLS),
         }
     }
 }
@@ -85,6 +103,15 @@ pub struct Finding {
     pub node: String,
     pub text: String,
 }
+
+/// Why a node reports itself degraded.
+///
+/// `/health` carries the verdict and the node name, and the detail of which
+/// pool lost its last member is in `/perf`, which the monitor may not be
+/// allowed to read. This is the one reason m6-http gives for the verdict, and
+/// the check prints it beside the code rather than leaving the reader to look
+/// it up.
+pub(crate) const DEGRADED_REASON: &str = "a configured socket pool has no live member";
 
 /// The whole fleet, summarised.
 #[derive(Debug, Clone, Serialize)]
@@ -294,8 +321,6 @@ pub enum HandshakeState {
     NoPublicKey,
     /// Tunnels are configured but `wg_handshakes_file` is not set.
     NoHandshakesFile,
-    /// Not read, for a reason reported by another finding.
-    Unknown,
     FileMissing,
     FileError,
     /// The handshakes file is older than the limit, so no age is judged.
@@ -311,7 +336,6 @@ impl HandshakeState {
             Self::PeerAbsent => "peer_absent",
             Self::NoPublicKey => "no_public_key",
             Self::NoHandshakesFile => "no_handshakes_file",
-            Self::Unknown => "unknown",
             Self::FileMissing => "file_missing",
             Self::FileError => "file_error",
             Self::FileStale => "file_stale",
@@ -347,10 +371,6 @@ impl TunnelDigest {
             HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
             HandshakeState::NoPublicKey => "unknown (no public_key)".to_string(),
             HandshakeState::NoHandshakesFile => "unknown (no wg_handshakes_file)".to_string(),
-            HandshakeState::Unknown => format!(
-                "unknown ({})",
-                self.handshake_detail.as_deref().unwrap_or("-")
-            ),
             HandshakeState::FileMissing => "file missing".to_string(),
             HandshakeState::FileError => "file unreadable".to_string(),
             HandshakeState::FileStale => "unknown (handshakes file is stale)".to_string(),
@@ -375,7 +395,6 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
     let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
         Handshake::NoPublicKey => (HandshakeState::NoPublicKey, None, None),
         Handshake::NoHandshakesFile => (HandshakeState::NoHandshakesFile, None, None),
-        Handshake::Unknown(why) => (HandshakeState::Unknown, None, Some((*why).to_string())),
         Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
         Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
         Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
@@ -628,8 +647,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 HandshakeState::NoHandshakesFile
                 | HandshakeState::FileStale
                 | HandshakeState::FileMissing
-                | HandshakeState::FileError
-                | HandshakeState::Unknown => {}
+                | HandshakeState::FileError => {}
             }
         }
 
@@ -647,12 +665,18 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             continue;
         }
 
-        if r.status() == "degraded" {
-            findings.push(Finding {
+        match r.status() {
+            "ok" => {}
+            "degraded" => findings.push(Finding {
                 level: Level::Fault,
                 node: r.name.clone(),
-                text: "reports degraded: a configured socket pool has no live member".to_string(),
-            });
+                text: format!("reports degraded: {DEGRADED_REASON}"),
+            }),
+            other => findings.push(Finding {
+                level: Level::Fault,
+                node: r.name.clone(),
+                text: format!("reports health status {other}"),
+            }),
         }
 
         if let Some(p) = &r.perf {
@@ -1170,8 +1194,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
+    use m6_core::platform::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::telemetry::StatsSnapshot;
 
     pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
@@ -2489,6 +2513,7 @@ pub(crate) mod tests {
         let t = m6_core::monitoring::TrafficReport {
             node: "origin".into(),
             window_minutes: 60,
+            events_dropped: 0,
             total_requests: 0,
             status: Default::default(),
             notable: vec![],
@@ -2564,6 +2589,7 @@ mod history_tests {
             dropped: 3,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         });
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["history"]["state"], "behind");

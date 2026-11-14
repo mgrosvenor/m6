@@ -20,8 +20,8 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
 use m6_core::h1::{self, Flush, Read, ServerConn};
-use m6_core::mio;
-use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
@@ -103,10 +103,10 @@ fn harness() -> Harness {
     client
         .set_write_timeout(Some(DEADLINE))
         .expect("a write deadline");
-    harness_with((client, mio::net::UnixStream::from_std(server)))
+    harness_with((client, platform::net::UnixStream::from_std(server)))
 }
 
-fn harness_with(pair: (StdUnixStream, mio::net::UnixStream)) -> Harness {
+fn harness_with(pair: (StdUnixStream, platform::net::UnixStream)) -> Harness {
     let (client, server) = pair;
     let poll = Poll::new().expect("a poll");
     let mut conn = ServerConn::new(READ_CAP, WRITE_CAP);
@@ -176,7 +176,7 @@ impl Harness {
     }
 
     /// Swap in the next connection's ends: deregister the old, attach the new.
-    fn next_connection(&mut self, client: StdUnixStream, server: mio::net::UnixStream) {
+    fn next_connection(&mut self, client: StdUnixStream, server: platform::net::UnixStream) {
         if let Some(mut old) = self.conn.detach() {
             self.poll
                 .registry()
@@ -267,7 +267,7 @@ fn a_conn_serves_keep_alive_requests_without_allocating() -> bool {
     // count starts: attaching one allocates nothing.
     const CONNECTIONS: usize = 10;
     const PER_CONNECTION: usize = 100;
-    let mut pairs: Vec<(StdUnixStream, mio::net::UnixStream)> = (0..CONNECTIONS)
+    let mut pairs: Vec<(StdUnixStream, platform::net::UnixStream)> = (0..CONNECTIONS)
         .map(|_| {
             let (client, server) = StdUnixStream::pair().expect("a socket pair");
             server
@@ -279,7 +279,7 @@ fn a_conn_serves_keep_alive_requests_without_allocating() -> bool {
             client
                 .set_write_timeout(Some(DEADLINE))
                 .expect("a write deadline");
-            (client, mio::net::UnixStream::from_std(server))
+            (client, platform::net::UnixStream::from_std(server))
         })
         .collect();
 
@@ -603,15 +603,16 @@ fn keep_alive_and_the_request_cap() -> bool {
 }
 
 fn parse_errors_answer_as_today() -> bool {
-    // Header too large: 413, as `parse.rs` answers a head over its cap.
+    // Header too large: 400, the same answer the edge gives. 413 means the
+    // body, and a head over its limit is not the body.
     {
         let mut h = harness();
-        // A complete head over the cap is accepted today (the cap is on an
-        // unfinished head), so this one never sends the blank line.
+        // An unfinished head over the 32 KiB cap: the refusal arrives before
+        // the blank line does, which is the bound the process needs.
         let mut request = b"GET /x HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        // Over the 8 KiB head cap and under the 64 header slots, so the
+        // Over the 32 KiB head cap and under the 64 header slots, so the
         // refusal is the size cap rather than the header count.
-        for i in 0..12 {
+        for i in 0..45 {
             request.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "a".repeat(800)).as_bytes());
         }
         let mut writer = h.client.try_clone().expect("a client clone");
@@ -638,7 +639,7 @@ fn parse_errors_answer_as_today() -> bool {
         let mut response = [0u8; 4096];
         let n = h.client.read(&mut response).expect("read the refusal");
         let text = String::from_utf8_lossy(&response[..n]).to_string();
-        if flush != Flush::Close || !text.starts_with("HTTP/1.1 413 Payload Too Large\r\n") {
+        if flush != Flush::Close || !text.starts_with("HTTP/1.1 400 Bad Request\r\n") {
             println!("  header too large: {flush:?} {text:?}");
             return false;
         }

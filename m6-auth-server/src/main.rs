@@ -23,17 +23,18 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use m6_core::app::RouteMethod;
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
+use m6_core::site::RouteMethod;
 
 use config::AuthConfig;
-use handlers::AppState;
+use handlers::{AppState, Busy};
 use keys::KeyMaterial;
 use rate_limit::RateLimiter;
 
@@ -46,6 +47,15 @@ const EVENTS: usize = 256;
 const INITIAL_CONNECTIONS: usize = 1024;
 const READ_CAP: usize = 16 * 1024;
 const WRITE_CAP: usize = 64 * 1024;
+/// How soon the loop tries a request whose handler met a database lock. A
+/// retry costs little and the lock usually clears in milliseconds, so the
+/// waiting client barely notices while the loop serves the other connections
+/// between attempts.
+const BUSY_RETRY: Duration = Duration::from_millis(5);
+/// How long a request waits for a lock before the loop answers 503. After a
+/// second the client needs an answer it can act on, and the lock may be held
+/// for a long time.
+const BUSY_GIVE_UP: Duration = Duration::from_secs(1);
 
 /// The four routes, in the order `Handled::Code` indexes them.
 const ROUTES: [CodeRoute; 4] = [
@@ -67,13 +77,26 @@ const ROUTES: [CodeRoute; 4] = [
     },
 ];
 
+/// A request whose handler met a database lock: the route and the request are
+/// kept until the loop tries again.
+struct Retry {
+    /// The index into `ROUTES` the request matched.
+    route: usize,
+    req: Request,
+    /// When the request first met the lock, for the one-second limit.
+    first: Instant,
+    /// The user a login verified before its refresh-token write met the lock,
+    /// so the retry skips bcrypt.
+    verified: Option<m6_auth::User>,
+}
+
 /// Build what the loop owns: the config, the keys, the rate limiter and the
 /// one database connection.
 ///
 /// Returns `Err` for `main` to print and exit 2. The database branches name the
-/// path they failed on: the directory that cannot be created and the database
-/// that cannot be opened. The config and key branches name the setting or key
-/// that failed.
+/// path they failed on: the directory that cannot be created, the database that
+/// cannot be opened and the connection that cannot stop waiting for a lock. The
+/// config and key branches name the setting or key that failed.
 fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
     let cfg =
         AuthConfig::load(site.config_path(), site.site_toml()).context("loading auth config")?;
@@ -91,6 +114,14 @@ fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
     }
     let db = m6_auth::Db::open(&cfg.db_path)
         .map_err(|e| anyhow::anyhow!("opening the database {}: {e}", cfg.db_path.display()))?;
+    // From here the loop owns the connection: a statement that meets another
+    // process's lock must fail at once and be deferred, never wait in the loop.
+    db.no_busy_wait().map_err(|e| {
+        anyhow::anyhow!(
+            "setting the busy timeout to zero on {}: {e}",
+            cfg.db_path.display()
+        )
+    })?;
 
     tracing::info!(issuer = %cfg.issuer, "auth config loaded");
 
@@ -128,8 +159,7 @@ fn main() -> Result<()> {
     let site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let (state, db) = build_state(&site).unwrap_or_else(|e| fail("building the auth state", e));
-    let ceiling =
-        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");
     }
@@ -144,11 +174,7 @@ fn main() -> Result<()> {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
     poll.registry()
-        .register(
-            &mut SourceFd(&signals.raw_fd()),
-            SIGNALS,
-            Interest::READABLE,
-        )
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
 
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
@@ -160,22 +186,30 @@ fn main() -> Result<()> {
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
+    // One retry deadline per slot, for a request whose handler met a database
+    // lock.
+    let mut busy_timeouts = Timeouts::new(initial, BUSY_RETRY);
+    let mut retries: Vec<Option<Retry>> = (0..initial).map(|_| None).collect();
     let mut events = Events::with_capacity(EVENTS);
     let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
     let mut accepting = true;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
 
     // ── run: nothing blocks ──────────────────────────────────────────────
     'run: loop {
-        // An interrupted wait is not an error: wait again. mio passes EINTR
-        // up rather than retrying.
-        match poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK))) {
+        // The nearer of the read deadlines, a deferred request's retry and the
+        // tick. An interrupted wait is not an error: wait again. mio passes
+        // EINTR up rather than retrying.
+        let wait = deadlines
+            .timeout(m6_core::platform::now(), TICK)
+            .min(busy_timeouts.timeout(m6_core::platform::now(), TICK));
+        match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as
         // m6-http reports the trace.
@@ -194,26 +228,30 @@ fn main() -> Result<()> {
                     while let Some(taken) = conns.take() {
                         if let Some(new_len) = taken.grew_to {
                             deadlines.grow(new_len);
+                            busy_timeouts.grow(new_len);
+                            retries.resize_with(new_len, || None);
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // No connection was pending after all: give
-                                // the slot back rather than leaking it.
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                // A failure here sheds this accept pass and
-                                // not the service: give the slot back, say so
-                                // once, and wait for the next listener event.
-                                // The budget leaves room for every connection,
-                                // so this is a transient error outside the
-                                // table.
-                                conns.free(taken.key);
-                                eprintln!("m6-auth-server: accept error: {e}");
-                                break;
-                            }
+                            // No connection was pending after all: give
+                            // the slot back rather than leaking it.
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    eprintln!("m6-auth-server: accept error: {e}");
+                                    break;
+                                }
+                            },
                         };
                         poll.registry().register(
                             &mut stream,
@@ -244,36 +282,102 @@ fn main() -> Result<()> {
                     }
                 }
                 // One connection's turn, then wait for what it still needs,
-                // touch its deadline, or close it.
+                // touch its deadline, or close it. A connection holding a
+                // deferred request is not read: its client is waiting for that
+                // answer.
                 Token(k) => {
+                    if retries[k].is_some() {
+                        continue;
+                    }
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &site, &state, &db) {
+                    match turn(conn, &mut retries[k], &site, &state, &db) {
                         Ok(true) => {
-                            // Re-register only when the turn changed what the
-                            // connection waits for: a kept-alive request that
-                            // read and wrote everything leaves READABLE alone.
-                            if conn.interest() != was {
-                                let interest = conn.interest();
-                                let stream = conn
-                                    .stream()
-                                    .expect("every registered token has an attached connection");
-                                poll.registry().reregister(stream, Token(k), interest)?;
-                            }
-                            if read_timeout.is_some() {
-                                deadlines.touch(Token(k), now);
-                            }
+                            touch_retry(&mut busy_timeouts, &retries, k);
+                            after_turn(
+                                &poll,
+                                &mut conns,
+                                &mut deadlines,
+                                read_timeout,
+                                k,
+                                was,
+                                now,
+                            )?;
                         }
-                        _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
+                        _ => close(
+                            &poll,
+                            &mut conns,
+                            &mut deadlines,
+                            &mut busy_timeouts,
+                            &mut retries,
+                            k,
+                        )?,
                     }
                 }
             }
         }
 
+        // A deferred request: try its handler again when the retry deadline
+        // passes, and answer 503 once the database has been locked for a
+        // second. The retry keeps the request, so it is not read again.
+        while let Some(Token(k)) = busy_timeouts.expired(m6_core::platform::now()) {
+            let Some(mut retry) = retries[k].take() else {
+                continue;
+            };
+            let now = m6_core::platform::now();
+            let response =
+                match run_route(retry.route, &retry.req, Some(&retry), &site, &state, &db) {
+                    Ok(response) => response,
+                    Err(busy) if now.duration_since(retry.first) < BUSY_GIVE_UP => {
+                        retry.verified = retry.verified.or(busy.verified);
+                        retries[k] = Some(retry);
+                        // Armed from the end of this attempt, so the loop
+                        // polls and serves the other connections before the
+                        // next one, even when the attempt itself took longer
+                        // than the retry delay.
+                        busy_timeouts.touch(Token(k), m6_core::platform::now());
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            route = ROUTES[retry.route].pattern,
+                            "database still locked after a second"
+                        );
+                        busy_response()
+                    }
+                };
+            let conn = conns.get_mut(k);
+            // Capture what the connection was registered for before the answer
+            // makes it writable: a partial flush must re-register the interest.
+            let was = conn.interest();
+            conn.respond_response(response);
+            match turn(conn, &mut retries[k], &site, &state, &db) {
+                Ok(true) => {
+                    touch_retry(&mut busy_timeouts, &retries, k);
+                    after_turn(&poll, &mut conns, &mut deadlines, read_timeout, k, was, now)?;
+                }
+                _ => close(
+                    &poll,
+                    &mut conns,
+                    &mut deadlines,
+                    &mut busy_timeouts,
+                    &mut retries,
+                    k,
+                )?,
+            }
+        }
+
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
-            m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
+            close(
+                &poll,
+                &mut conns,
+                &mut deadlines,
+                &mut busy_timeouts,
+                &mut retries,
+                k,
+            )?;
         }
         // A slot came free while the table was full: accept again.
         if !accepting && !conns.is_full() {
@@ -285,7 +389,7 @@ fn main() -> Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. This service serves no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
@@ -303,8 +407,13 @@ fn main() -> Result<()> {
 
 /// One connection's turn: read, answer and write until the socket would
 /// block. Returns whether the connection stays open.
+///
+/// A handler that meets a database lock stores its request in `retry` and
+/// returns `Ok(true)` with no answer written: the loop tries it again when the
+/// retry deadline passes.
 fn turn(
     conn: &mut ServerConn,
+    retry: &mut Option<Retry>,
     site: &Site,
     state: &AppState,
     db: &m6_auth::Db,
@@ -334,17 +443,20 @@ fn turn(
                     // This service's four routes, by the index they were given
                     // to `Site::load` in.
                     Handled::Code(index, req) => {
-                        let response = match index {
-                            0 => handlers::dispatch_login(req.raw(), state, db, &peer_ip(&req)),
-                            1 => handlers::dispatch_refresh(req.raw(), state, db),
-                            2 => handlers::dispatch_logout(req.raw(), state, db),
-                            3 => handlers::dispatch_public_key(state),
-                            _ => unreachable!(
-                                "ROUTES has four routes and Handled::Code carries one of \
-                                 their indexes"
-                            ),
-                        };
-                        site.finish(&req, response.into())
+                        match run_route(index, &req, None, site, state, db) {
+                            Ok(response) => response,
+                            Err(busy) => {
+                                *retry = Some(Retry {
+                                    route: index,
+                                    req,
+                                    // The one-second limit starts when the
+                                    // database first refused the statement.
+                                    first: m6_core::platform::now(),
+                                    verified: busy.verified,
+                                });
+                                return Ok(true);
+                            }
+                        }
                     }
                     Handled::Named(..) => unreachable!(
                         "m6-auth-server registers no named handlers, so every route is in code"
@@ -371,6 +483,88 @@ fn turn(
             Flush::Close => return Ok(false),
         }
     }
+}
+
+/// Run the handler for route `index` and finish its answer, or report the
+/// database busy so the loop can defer the request.
+fn run_route(
+    index: usize,
+    req: &Request,
+    retry: Option<&Retry>,
+    site: &Site,
+    state: &AppState,
+    db: &m6_auth::Db,
+) -> std::result::Result<Response, Busy> {
+    let response = match index {
+        0 => handlers::dispatch_login(
+            req.raw(),
+            state,
+            db,
+            &peer_ip(req),
+            retry.and_then(|r| r.verified.as_ref()),
+        ),
+        1 => handlers::dispatch_refresh(req.raw(), state, db),
+        2 => handlers::dispatch_logout(req.raw(), state, db),
+        3 => Ok(handlers::dispatch_public_key(state)),
+        _ => unreachable!("ROUTES has four routes and Handled::Code carries one of their indexes"),
+    }?;
+    Ok(site.finish(req, response.into()))
+}
+
+/// What a finished turn leaves behind: re-register a connection whose interest
+/// changed, and touch the read deadline of one that stays open.
+fn after_turn(
+    poll: &Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    read_timeout: Option<Duration>,
+    k: usize,
+    was: Interest,
+    now: Instant,
+) -> io::Result<()> {
+    let conn = conns.get_mut(k);
+    if conn.interest() != was {
+        let interest = conn.interest();
+        let stream = conn
+            .stream()
+            .expect("every registered token has an attached connection");
+        poll.registry().reregister(stream, Token(k), interest)?;
+    }
+    if read_timeout.is_some() {
+        deadlines.touch(Token(k), now);
+    }
+    Ok(())
+}
+
+/// Wake the loop at the retry deadline when the turn deferred this
+/// connection's request.
+fn touch_retry(busy_timeouts: &mut Timeouts, retries: &[Option<Retry>], k: usize) {
+    if retries[k].is_some() {
+        busy_timeouts.touch(Token(k), m6_core::platform::now());
+    }
+}
+
+/// Close a connection: forget any deferred request and its retry deadline, then
+/// detach and free the slot.
+fn close(
+    poll: &Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    busy_timeouts: &mut Timeouts,
+    retries: &mut [Option<Retry>],
+    k: usize,
+) -> io::Result<()> {
+    busy_timeouts.clear(Token(k));
+    retries[k] = None;
+    m6_core::h1::close_conn(poll, conns, deadlines, k)
+}
+
+/// The answer once a deferred request has waited a second for the database.
+fn busy_response() -> Response {
+    let retry_after = BUSY_GIVE_UP.as_secs().to_string();
+    Response::status(503)
+        .header("Retry-After", &retry_after)
+        .body("Service Unavailable")
 }
 
 /// A failure at start is an error: print it and exit 2.
