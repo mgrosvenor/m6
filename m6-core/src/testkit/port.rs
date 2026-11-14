@@ -81,7 +81,7 @@ impl Drop for PortClaim {
     /// lock is unrelated to theirs, so two claimants would each hold a valid
     /// lock on a different inode for the same port. The files are empty, one
     /// per port in the range, and live in the one directory under `/tmp` that
-    /// every build of this user shares.
+    /// every build run by this user on the machine shares.
     fn drop(&mut self) {
         let deadline = crate::platform::now() + Duration::from_secs(5);
         loop {
@@ -158,13 +158,16 @@ fn claim_dir() -> PathBuf {
 /// symptoms with one cause. Retrying made it look intermittent rather than
 /// wrong.
 ///
-/// **What this does instead.** A candidate port is claimed by atomically
-/// creating a marker file for it (`create_new`, meaning `O_EXCL`), which is a
-/// real mutex across processes and not just across threads. Only after the
-/// claim succeeds is the port probed to confirm nothing already holds it. The
-/// claim outlives this call deliberately: it must still be held while the
-/// caller spawns its server, which is precisely the window the old code left
-/// open. It is released when the returned [`PortClaim`] drops.
+/// **What this does instead.** A candidate port is claimed by locking a marker
+/// file with `flock(2)`, which is a real mutex across processes and not just
+/// across threads, and the locks live in one directory that every build run by
+/// this user on the machine shares: a port belongs to the host, not to a
+/// checkout, so a directory beside a build's own output would give each build
+/// its own lock file for the same port. Only after the lock is held is the port
+/// probed with a bind to confirm nothing already holds it. The claim outlives
+/// this call deliberately: it must still be held while the caller spawns its
+/// server, which is precisely the window the old code left open. It is released
+/// when the returned [`PortClaim`] drops.
 ///
 /// **Ownership is an `flock(2)`, not a file's existence.** That is the fix for
 /// issue #9, and the previous design is worth stating because it looked airtight.
