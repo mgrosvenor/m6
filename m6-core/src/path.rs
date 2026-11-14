@@ -117,12 +117,11 @@ pub enum ResolvePathError {
 /// with the canonical root and is accepted. That is how a site that links
 /// `assets` to `static/assets` keeps working.
 ///
-/// `..`, a leading `/` and a Windows prefix are refused before any filesystem
-/// call.
+/// `..`, a leading `/` and a Windows prefix are refused before the target is
+/// looked at, so a lexical traversal is `Traversal` even when the root itself
+/// does not exist.
 pub fn resolve_within(root: &Path, rel: &Path) -> Result<PathBuf, ResolvePathError> {
-    let root = root.canonicalize().map_err(|_| ResolvePathError::Escape)?;
-
-    let mut joined = root.clone();
+    let mut joined = PathBuf::new();
     for comp in rel.components() {
         match comp {
             Component::Normal(name) => joined.push(name),
@@ -132,6 +131,9 @@ pub fn resolve_within(root: &Path, rel: &Path) -> Result<PathBuf, ResolvePathErr
             }
         }
     }
+
+    let root = root.canonicalize().map_err(|_| ResolvePathError::Escape)?;
+    let mut joined = root.join(joined);
 
     // Walk down to the deepest component that exists. `symlink_metadata` does
     // not follow the final component, so a dangling symlink stops the walk and
