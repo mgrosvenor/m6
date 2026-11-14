@@ -117,7 +117,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Building a service** | `site` | `Site`, `CodeRoute`, `Handled` and `RouteMethod`, the route table, the request dictionary and the site-wide finish. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `socket_path_from_config` and the blocking request and response adapters the benchmarks use. |
-| | `signal` | `block()`, `Lifecycle`, `Service` and `ShutdownHandle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
+| | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
@@ -241,11 +241,11 @@ A service's loop uses `h1::ServerConn` instead.
 
 **`signal::block()` must be the first statement of every `main`, before logging.**
 Blocking a signal is per-thread and threads inherit the mask at creation, and `tracing_appender::non_blocking` spawns a writer thread, so a `main` that initialises logging first has already created a thread with SIGTERM unblocked.
-The kernel delivers process-directed SIGTERM there, the default disposition kills the process, and the `sigwait` thread never receives a signal in its life.
+The kernel delivers process-directed SIGTERM there, and the default disposition kills the process.
 A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
 
-`ShutdownHandle::install(Service::new("name").socket(path).wake_fd(fd))` sets up the handler, and it asserts that the mask is set and refuses to start otherwise.
-`complete()`, `is_shutdown()` and `wait()` are the lifecycle.
+`Signals::new()` asserts that the mask is set and refuses to start otherwise.
+`Lifecycle::on_signal` decides what each signal means and `complete()` ends the lifecycle.
 
 The reload signal is SIGUSR1 (`platform::Signal::ReopenLogs`).
 `block()` blocks it with SIGTERM and SIGINT, and the signal thread handles it before it counts a shutdown signal, so a reopen is never a step toward a forced exit.

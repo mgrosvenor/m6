@@ -239,17 +239,10 @@ pub enum Signal {
 /// there and are discarded once reported.
 pub struct Signals(os::Signals);
 
-/// Set once a [`Signals`] exists: the process reads its signals through the
-/// descriptor, and [`wait_for_signal`] then refuses to run, because on macOS
-/// the three signals are ignored and a `sigwait` would never return.
-static SIGNALS_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 impl Signals {
     pub fn new() -> io::Result<Signals> {
         require_blocked();
-        let signals = Signals(os::Signals::new()?);
-        SIGNALS_IN_USE.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(signals)
+        Ok(Signals(os::Signals::new()?))
     }
 
     /// The readable descriptor.
@@ -334,35 +327,6 @@ pub fn require_blocked() {
          the kernel delivers SIGTERM to one of them, and the process dies at \
          the default disposition instead of shutting down."
     );
-}
-
-/// Block until one of the three signals arrives and say which request it is.
-/// For m6-core's `ShutdownHandle` thread only, which a later job deletes. A
-/// process reads its signals through [`Signals`] or through this, never both:
-/// once a `Signals` exists this panics, because on macOS the signals are then
-/// ignored and the wait would never return.
-pub fn wait_for_signal() -> io::Result<Signal> {
-    assert!(
-        !SIGNALS_IN_USE.load(std::sync::atomic::Ordering::SeqCst),
-        "a process reads its signals through platform::Signals or through the \
-         shutdown handle's wait_for_signal, never both: once a Signals exists \
-         the signals are read from its descriptor and a sigwait never returns"
-    );
-    loop {
-        let sig = managed().wait()?;
-        if let Some(s) = signal_from_signo(sig as i32) {
-            return Ok(s);
-        }
-    }
-}
-
-/// Write one byte to `fd`, to wake a reactor parked on the other end of a
-/// pipe. A full pipe is fine: bytes already pending mean the wake is already
-/// going to happen.
-pub fn write_wake_byte(fd: RawFd) {
-    // SAFETY: the caller owns `fd` and keeps it open for the process.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let _ = nix::unistd::write(borrowed, &[1u8]);
 }
 
 // ── A child process's exit ───────────────────────────────────────────────────

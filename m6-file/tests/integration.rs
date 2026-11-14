@@ -3,7 +3,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -32,8 +32,7 @@ fn main() {
     a_spawned_child_still_dies_on_sigterm();
     the_process_survives_every_signal_it_handles(&mut poll, &mut events, &mut signals);
     signals_new_refuses_an_unblocked_mask();
-    wait_for_signal_is_refused_beside_signals();
-    println!("platform_signals: 9 checks ... ok");
+    println!("platform_signals: 8 checks ... ok");
 }
 
 /// Everything pending on the descriptor after one wake, with a deadline.
@@ -161,20 +160,6 @@ fn the_process_survives_every_signal_it_handles(
         "S7: the descriptor drains to None"
     );
     println!("S7 the_process_survives_every_signal_it_handles ... ok");
-}
-
-// S9. Break: `wait_for_signal` not refusing once a `Signals` exists. On macOS
-// the signals are then ignored and the `sigwait` would never return, so this
-// test would hang there instead of failing.
-fn wait_for_signal_is_refused_beside_signals() {
-    let r = std::panic::catch_unwind(|| {
-        let _ = platform::wait_for_signal();
-    });
-    assert!(
-        r.is_err(),
-        "S9: wait_for_signal must refuse once a Signals exists"
-    );
-    println!("S9 wait_for_signal_is_refused_beside_signals ... ok");
 }
 
 // S8. Break: the check removed. The mask is unblocked first so the assertion
