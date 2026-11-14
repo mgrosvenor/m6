@@ -422,7 +422,7 @@ pub struct Stats {
     window_start: Instant,
     last_emit: Instant,
     /// How often the periodic line is emitted and `/perf`'s loop trace is
-    /// refreshed. `[server] stats_interval_secs`, default ten seconds.
+    /// refreshed. `EMIT_INTERVAL_SECS` in production.
     emit_interval: std::time::Duration,
     /// The loop trace, copied on the accounting tick and served by `/perf`.
     event_loop: [m6_core::event::TriggerReport; 16],

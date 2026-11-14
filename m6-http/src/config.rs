@@ -96,11 +96,6 @@ pub struct ServerConfig {
     /// connection, such as a benchmark, wants a higher value.
     #[serde(default = "default_max_requests_per_connection")]
     pub max_requests_per_connection: u32,
-    /// Seconds between periodic stats lines, and how often `/perf` refreshes
-    /// its event-loop trace. Default: 10. 0 is rejected by `load`, because it
-    /// would emit a line on every loop iteration. Read at startup.
-    #[serde(default = "default_stats_interval_secs")]
-    pub stats_interval_secs: u64,
     /// Optional H2C (HTTP/2 cleartext) listener address.
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
@@ -193,10 +188,6 @@ fn default_backend_timeout_secs() -> u64 {
 
 fn default_max_requests_per_connection() -> u32 {
     crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN
-}
-
-fn default_stats_interval_secs() -> u64 {
-    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -732,7 +723,6 @@ struct RawServerSection {
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
     max_requests_per_connection: Option<u32>,
-    stats_interval_secs: Option<u64>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
@@ -1009,12 +999,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             "config error: [server].max_requests_per_connection must be at least 1, because 0 would close every connection before it served a request"
         );
     }
-    let stats_interval_secs = site_server.stats_interval_secs.unwrap_or(10);
-    if stats_interval_secs == 0 {
-        anyhow::bail!(
-            "config error: [server].stats_interval_secs must be at least 1, because 0 would emit a stats line on every loop iteration"
-        );
-    }
     let h2c_bind = node_server.h2c_bind;
     // Nothing is inferred from an address: a listener is internal only when
     // this list names it. A redirector binds nothing the list could name, so a
@@ -1077,7 +1061,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         max_requests_per_connection,
-        stats_interval_secs,
         h2c_bind,
         internal_binds,
         internal_peers,
@@ -1297,11 +1280,7 @@ const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "me
 const NODE_SECTIONS: &[&str] = &["auth", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
-const SITE_SERVER_KEYS: &[&str] = &[
-    "backend_timeout_secs",
-    "allowed_methods",
-    "stats_interval_secs",
-];
+const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
 
 /// Name every key that sits in the file it does not belong to.
 ///
@@ -2576,7 +2555,6 @@ domain = "test.example.com"
                 "internal_peers",
                 "max_requests_per_connection",
                 "redirect_bind",
-                "stats_interval_secs",
                 "tls_cert",
                 "tls_key",
                 "warm_on_start",
@@ -2589,7 +2567,7 @@ domain = "test.example.com"
             ["metrics_peers", "metrics_require", "metrics_token_file"]
         );
         assert_eq!(NODE_SECTIONS, ["auth", "node"]);
-        assert_eq!(all.len(), 12 + 3 + 2);
+        assert_eq!(all.len(), 11 + 3 + 2);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),

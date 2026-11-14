@@ -5225,7 +5225,6 @@ fn run(args: Vec<String>) -> i32 {
             format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
         ))
     };
-    let stats_interval_secs = config.server.stats_interval_secs;
     let mut state = ServerState {
         config,
         route_table,
@@ -5233,7 +5232,7 @@ fn run(args: Vec<String>) -> i32 {
         cache: Cache::new(),
         public_key,
         error_mode,
-        stats: Stats::with_interval(std::time::Duration::from_secs(stats_interval_secs)),
+        stats: initial_stats(),
         sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
         generations: vec![0; INITIAL_CONNECTIONS],
         prefetch_queue: std::collections::VecDeque::new(),
@@ -5283,6 +5282,25 @@ fn run(args: Vec<String>) -> i32 {
     code
 }
 
+/// The accounting tick for this process.
+///
+/// `Stats::new()` is the production value: a fixed ten seconds, with no config
+/// key. Two integration suites assert on the tick and spawn this binary, so a
+/// `#[cfg(test)]` default cannot reach them. A debug build may shorten the tick
+/// through `M6_TEST_STATS_INTERVAL_SECS`, the only channel those tests have, and
+/// a release build does not read the variable at all.
+fn initial_stats() -> Stats {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var("M6_TEST_STATS_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    {
+        return Stats::with_interval(std::time::Duration::from_secs(secs));
+    }
+    Stats::new()
+}
+
 #[cfg(test)]
 mod www_redirect_tests {
     use super::*;
@@ -5307,7 +5325,6 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
-                stats_interval_secs: 10,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

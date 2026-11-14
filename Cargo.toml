@@ -111,16 +111,3 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
-
-# bcrypt at cost 12 is 3-4 seconds per hash in an unoptimised build and about a
-# quarter of a second optimised. The dev profile is what `cargo test` runs, so
-# every login test in m6-auth, m6-auth-cli and m6-auth-server paid the
-# unoptimised figure: tens of seconds in the unit tests and most of the
-# auth-server suite's time. The round count is unchanged, so what the tests
-# exercise is unchanged as well.
-[profile.dev.package.bcrypt]
-opt-level = 3
-
-[profile.dev.package.blowfish]
-opt-level = 3
-

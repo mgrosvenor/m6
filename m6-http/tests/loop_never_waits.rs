@@ -510,7 +510,13 @@ impl Fixture {
 
         let service = Service::spawn(
             "m6-http",
-            Command::new(binary("m6-http")).arg(&site).arg(&system),
+            Command::new(binary("m6-http"))
+                .arg(&site)
+                .arg(&system)
+                // The accounting tick is a fixed ten seconds in production. This
+                // suite waits on it, so a debug build shortens it through the
+                // test-only variable.
+                .env("M6_TEST_STATS_INTERVAL_SECS", "2"),
         );
         let mut service = service;
         service.wait_for_tcp(port, Duration::from_secs(20));
@@ -548,7 +554,7 @@ fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> Str
 fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
     site_with(
         "info",
-        &format!("backend_timeout_secs = {backend_timeout_secs}\nstats_interval_secs = 2"),
+        &format!("backend_timeout_secs = {backend_timeout_secs}"),
         &format!("[[backend]]\nname = \"app\"\nsockets = \"{glob}\""),
         "[[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
@@ -2011,10 +2017,10 @@ fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
 
 /// An idle m6-http wakes about once a second, not a hundred times.
 ///
-/// The report covers the 2 s accounting interval this fixture sets, so the
-/// plan's mark of two wake-ups a second is four over a report, and half a
-/// second is one. The removed 10 ms cap gave about 100 a second, 200 over the
-/// same report.
+/// The report covers the 2 s accounting interval this fixture sets through the
+/// test-only variable, so the plan's mark of two wake-ups a second is four over
+/// a report, and half a second is one. The removed 10 ms cap gave about 100 a
+/// second, 200 over the same report.
 #[test]
 fn an_idle_m6_http_wakes_about_once_a_second() {
     let fx = Fixture::start(1, 30, "idle");
@@ -2027,7 +2033,7 @@ fn an_idle_m6_http_wakes_about_once_a_second() {
     wait_for_periodic(&fx, lines);
     let loops = perf_event_loop(&mut conn);
     let timeouts = trigger_count(&loops, "timeout");
-    // The report covers `stats_interval_secs = 2`, so two a second is four and
+    // The report covers a 2 s accounting interval, so two a second is four and
     // half a second is one. The bounds are the same rate the ten-second report
     // was asserting: at most two wakes a second, at least one per window.
     assert!(
