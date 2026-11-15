@@ -2,10 +2,14 @@
 //! the count is the checks' own.
 //!
 //! `harness = false` means no libtest thread runs in this binary, so
-//! [`alloc_count::now`] reads only what these checks allocated.
+//! [`alloc_count::now`] reads only what these checks allocated. A custom
+//! harness must still speak libtest's protocol (`--list --format terse`,
+//! `--exact <name>`), which `libtest-mimic` does; and the checks are forced
+//! onto one thread so each runs in this `main` thread.
 
 use std::time::{Duration, Instant};
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::platform::Token;
 use m6_core::testkit::alloc_count;
@@ -14,27 +18,43 @@ use m6_core::testkit::alloc_count;
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
 
 fn main() {
-    let mut failed = false;
-    failed |= check(
-        "timeouts no_allocation_after_new",
-        timeouts_no_allocation_after_new,
-    );
-    failed |= check(
-        "slots growth_is_the_only_allocation",
-        slots_growth_is_the_only_allocation,
-    );
-    failed |= check(
-        "loop_trace no_allocation_after_new",
-        loop_trace_no_allocation_after_new,
-    );
-    std::process::exit(if failed { 1 } else { 0 });
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs every trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![
+        Trial::test("timeouts::no_allocation_after_new", || {
+            check(
+                "timeouts::no_allocation_after_new",
+                timeouts_no_allocation_after_new,
+            )
+        }),
+        Trial::test("slots::growth_is_the_only_allocation", || {
+            check(
+                "slots::growth_is_the_only_allocation",
+                slots_growth_is_the_only_allocation,
+            )
+        }),
+        Trial::test("loop_trace::no_allocation_after_new", || {
+            check(
+                "loop_trace::no_allocation_after_new",
+                loop_trace_no_allocation_after_new,
+            )
+        }),
+    ];
+    libtest_mimic::run(&args, tests).exit();
 }
 
 /// Run one check, print its line, and report whether it allocated.
-fn check(name: &str, run: impl FnOnce() -> usize) -> bool {
+fn check(name: &str, run: impl FnOnce() -> usize) -> Result<(), Failed> {
     let n = run();
     println!("{name}: {n} allocation(s)");
-    n != 0
+    if n == 0 {
+        Ok(())
+    } else {
+        Err(format!("{name} allocated {n} time(s)").into())
+    }
 }
 
 fn timeouts_no_allocation_after_new() -> usize {

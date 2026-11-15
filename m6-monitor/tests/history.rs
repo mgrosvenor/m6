@@ -35,7 +35,6 @@ role = "origin"
 
 [log]
 level  = "info"
-format = "text"
 "#
     )
 }

@@ -1,8 +1,8 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use m6_core::log::{debug, warn};
 use m6_core::{Request, Response, Result};
-use tracing::{debug, warn};
 
 use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
 

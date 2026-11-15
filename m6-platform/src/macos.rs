@@ -194,6 +194,13 @@ pub(super) fn thread_count(pid: u32) -> io::Result<usize> {
     Ok(task_info(pid)?.ptinfo.pti_threadnum.max(0) as usize)
 }
 
+/// Reading the host's certificate store goes through the Security framework,
+/// whose idle libdispatch workers stay behind in the process: three or four,
+/// swinging between starts.
+pub(super) fn certificate_store_workers() -> (usize, usize) {
+    (3, 4)
+}
+
 /// The open descriptors, listed: `pbi_nfiles` is the table's size, so the
 /// list is asked for up to that many and its length is the count.
 pub(super) fn open_descriptors(pid: u32) -> io::Result<usize> {

@@ -11,13 +11,16 @@
 //! The number itself is printed and reported as the baseline, not asserted on.
 //!
 //! `harness = false` and its own `main`, so the counting allocator is installed
-//! before any thread starts and the count is only this binary's own.
+//! before any thread starts and the count is only this binary's own. The one
+//! check speaks libtest's protocol through `libtest-mimic`, forced onto one
+//! thread so it runs in this `main` thread.
 
 use std::io::Read as _;
 use std::io::Write;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::h1::{self, Flush, Read, ServerConn};
 use m6_core::platform;
 use m6_core::platform::{Events, Interest, Poll, Token};
@@ -32,6 +35,19 @@ const DEADLINE: Duration = Duration::from_secs(10);
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
 fn main() {
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "page_path_allocations_do_not_grow",
+        page_path_allocations_do_not_grow,
+    )];
+    libtest_mimic::run(&args, tests).exit();
+}
+
+fn page_path_allocations_do_not_grow() -> Result<(), Failed> {
     let (mut site, _dir) = site();
     let mut conn = connection();
 
@@ -46,10 +62,10 @@ fn main() {
 
     let first = counted[1];
     if counted[1..].iter().any(|&n| n != first) {
-        println!("FAILED: allocations vary per request: {counted:?}");
-        std::process::exit(1);
+        return Err(format!("allocations vary per request: {counted:?}").into());
     }
     println!("page path allocations per request after the first: {first}");
+    Ok(())
 }
 
 /// A site over a temp directory: one template route and one params file.
@@ -147,6 +163,7 @@ fn serve_one(site: &mut Site, c: &mut Conn) {
                 m6_core::site::Handled::Code(..) | m6_core::site::Handled::Named(..) => {
                     panic!("this site has no service routes")
                 }
+                m6_core::site::Handled::Reload(_) => panic!("this test sends no /genid"),
             },
             Read::More => break,
             Read::Closed => panic!("the client stayed open"),

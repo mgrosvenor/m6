@@ -87,7 +87,6 @@ pub struct CompressionLevel {
 #[derive(Debug, Clone, Default)]
 pub struct LogConfig {
     pub level: Option<String>,
-    pub format: Option<String>,
 }
 
 /// Fully parsed renderer configuration.
@@ -387,7 +386,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     }
     check_keys(&tv, "params_cache", &["size"])?;
     check_keys(&tv, "server", &["read_timeout_s", "socket_mode"])?;
-    check_keys(&tv, "log", &["level", "format"])?;
+    check_keys(&tv, "log", &["level"])?;
     if let Some(toml::Value::Table(tbl)) = tv.get("compression") {
         for (mime, val) in tbl {
             let table = format!("compression.\"{mime}\"");
@@ -498,14 +497,6 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             Some(v) => Some(
                 v.as_str()
                     .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
-                    .to_string(),
-            ),
-            None => None,
-        },
-        format: match tv.get("log").and_then(|l| l.get("format")) {
-            Some(v) => Some(
-                v.as_str()
-                    .ok_or_else(|| anyhow::anyhow!("[log] format must be a string, got {v}"))?
                     .to_string(),
             ),
             None => None,
@@ -1011,6 +1002,7 @@ template = "templates/home.html"
         for (body, table, key) in [
             ("[server]\nread_timeout = 5\n", "server", "read_timeout"),
             ("[log]\nlevle = \"info\"\n", "log", "levle"),
+            ("[log]\nformat = \"text\"\n", "log", "format"),
             (
                 "[compression.\"text/html\"]\nbrottli = 5\n",
                 "compression.\"text/html\"",

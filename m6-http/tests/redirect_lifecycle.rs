@@ -41,7 +41,8 @@ fn start() -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
     std::fs::create_dir_all(&site).expect("site dir");
     std::fs::write(
         site.join("site.toml"),
-        "[site]\nname = \"redirect-lifecycle\"\ndomain = \"localhost\"\n",
+        "[site]\nname = \"redirect-lifecycle\"\ndomain = \"localhost\"\n\n\
+         [analytics]\nenabled = false\n",
     )
     .expect("site.toml");
 

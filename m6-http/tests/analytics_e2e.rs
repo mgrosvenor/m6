@@ -446,8 +446,9 @@ impl Server {
     ///
     /// The probe requests are real, so they are logged. Every test in this file
     /// counts analytics lines and assumes it starts from an empty log, so the
-    /// log is truncated once the server is ready. The settle is for
-    /// tracing-appender, which writes on its own thread.
+    /// probe line is waited for and then the log is truncated. The line is
+    /// already written when it is readable, so nothing is left to arrive after
+    /// the truncation.
     fn wait_until_serving(&self) {
         let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
             self.get("/public/probe.html", &[]).status == 200
@@ -518,7 +519,6 @@ domain = "localhost"
 
 [log]
 level  = "info"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -957,7 +957,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "custom"
@@ -1104,7 +1103,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1245,7 +1243,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1322,7 +1319,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1383,7 +1379,7 @@ backend = "origin"
     );
     // The probes are logged like any other request, and this test counts lines.
     // Wait for each node's own 200 probe line, then truncate: that line is the
-    // last the readiness loop enqueued, so nothing is left to leak in after it.
+    // last the readiness loop wrote, so nothing is left to leak in after it.
     wait_until_probe_logged(&origin_analytics_log, "/public/probe.html");
     wait_until_probe_logged(&edge_analytics_log, "/public/probe.html");
     std::fs::write(&origin_analytics_log, b"").expect("truncate origin log");

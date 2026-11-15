@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,9 @@ struct Fixture {
     private_pem: String,
     /// A signing key the site does not trust.
     other_private_pem: String,
+    /// The accounting tick this test needs, in seconds. Production is a fixed
+    /// ten and has no key; the test-only variable is read by a debug build.
+    stats_interval: Option<u64>,
 }
 
 impl Fixture {
@@ -218,7 +221,15 @@ impl Fixture {
             private_pem,
             other_private_pem,
             dir,
+            stats_interval: None,
         }
+    }
+
+    /// Shorten this fixture's accounting tick. Only a test needs this: the
+    /// production tick is a fixed constant.
+    fn with_stats_interval(mut self, secs: u64) -> Self {
+        self.stats_interval = Some(secs);
+        self
     }
 
     fn command(&self) -> Command {
@@ -227,11 +238,14 @@ impl Fixture {
             .arg(&self.system)
             .env("RUST_LOG", "info")
             .current_dir(self.dir.path());
+        if let Some(secs) = self.stats_interval {
+            cmd.env("M6_TEST_STATS_INTERVAL_SECS", secs.to_string());
+        }
         cmd
     }
 
     /// Start m6-http and wait until `/health` answers. The backend socket is a
-    /// placeholder with no listener, so the answer is 503 (degraded): any
+    /// placeholder with no listener, so a request through it answers 503: any
     /// status proves serving.
     fn start(self) -> Running {
         let mut svc = Service::spawn("m6-http-metrics", &mut self.command());
@@ -250,7 +264,7 @@ impl Fixture {
 
     /// Run m6-http to its exit, which must come within ten seconds.
     fn run_until_exit(&self) -> (Option<i32>, String) {
-        let mut child: Child = m6_core::platform::process::spawn(
+        let mut child = m6_core::testkit::process::Running::spawn(
             self.command()
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -258,14 +272,13 @@ impl Fixture {
         )
         .expect("spawn m6-http");
         let exited = testkit::wait::until(Duration::from_secs(10), || {
-            child.try_wait().expect("try_wait").is_some()
+            child.child().try_wait().expect("try_wait").is_some()
         });
         if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
+            // The guard kills and reaps it while this panic unwinds.
             panic!("m6-http was still running after 10s; it should have refused to start");
         }
-        let out = child.wait_with_output().expect("output");
+        let out = child.take().wait_with_output().expect("output");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -687,7 +700,12 @@ fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
 
 #[test]
 fn perf_reports_the_event_loop() {
-    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
+    // The accounting tick is a fixed ten seconds in production. A debug build
+    // can shorten it for this test through the test-only variable: the trace is
+    // copied on the tick, which is the event this waits for.
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated())
+        .with_stats_interval(1)
+        .start();
     let auth = bearer(&run.token(&["monitor"]));
     // A few requests so the loop has work to report on the accounting tick.
     for _ in 0..3 {
