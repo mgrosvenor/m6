@@ -32,7 +32,6 @@ use m6_http_lib::forward::{self, UpstreamId, Waiter};
 use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
-#[cfg(target_os = "linux")]
 use m6_http_lib::http2::SEND_QUEUE_BYTES;
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
@@ -1052,33 +1051,18 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
 /// enter the kernel; without this option the kernel takes a whole response
 /// body at once and decides what leaves first, so the order would be lost.
 ///
-/// Linux only: TCP_NOTSENT_LOWAT has no equivalent elsewhere, and there the
-/// kernel's own order stays in force.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // one setsockopt on the connection's own descriptor
+/// The option is the platform layer's: Linux sets `TCP_NOTSENT_LOWAT` and macOS
+/// has no equivalent, so there the kernel's own order stays in force. A kernel
+/// that will not set it still sends everything, in its own order, so the
+/// failure is a log line rather than a refused connection.
 fn limit_kernel_send_queue(fd: RawFd) {
-    let lowat = SEND_QUEUE_BYTES as libc::c_int;
-    // SAFETY: `fd` is the accepted connection's live descriptor, and the
-    // option reads exactly the one `c_int` it is given.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
-            std::ptr::from_ref(&lowat).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
+    if let Err(e) = m6_core::platform::net::limit_send_queue(fd, SEND_QUEUE_BYTES) {
         warn!(
-            error = %std::io::Error::last_os_error(),
+            error = %e,
             "TCP_NOTSENT_LOWAT: the send queue is bounded, but this kernel will not wait for it"
         );
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn limit_kernel_send_queue(_fd: RawFd) {}
 
 /// Accept TLS connections until the socket would block or the token table is
 /// full. Returns whether the table is at its ceiling.
