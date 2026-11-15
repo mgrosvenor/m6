@@ -228,6 +228,22 @@ fn build_root_dir() -> std::path::PathBuf {
     m6_core::testkit::exec_scratch_root()
 }
 
+/// The Go build cache, shared by every run on this machine.
+///
+/// A per-run cache meant every run recompiled Go's standard library: tens of
+/// seconds for a hello-world backend. The cache is content-addressed and safe
+/// for concurrent use, so one copy under the scratch root serves every run. The
+/// name does not start with `m6bx-`, so the sweep above leaves it alone.
+fn go_cache() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = build_root_dir().join("m6-go-build-cache");
+        std::fs::create_dir_all(&dir).expect("go build cache directory");
+        dir
+    })
+    .clone()
+}
+
 /// The sweep, over a named directory and threshold so it can be tested.
 ///
 /// Split out because the alternative is a test that writes into the real `/tmp`
@@ -321,8 +337,11 @@ fn built_binary(lang: Lang, src: &Path) -> PathBuf {
             let out = Command::new("go")
                 .args(["build", "-o", bin.to_str().unwrap(), "."])
                 .current_dir(src)
-                // Go wants a writable cache and the environment may have no HOME.
-                .env("GOCACHE", dir.join("gocache"))
+                // Go wants a writable cache and the environment may have no
+                // HOME. Shared by every run on the machine: a per-run cache
+                // recompiles the standard library, which was tens of seconds of
+                // this file's time.
+                .env("GOCACHE", go_cache())
                 .output()
                 .expect("go build");
             assert!(

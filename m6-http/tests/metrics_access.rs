@@ -128,6 +128,9 @@ struct Fixture {
     private_pem: String,
     /// A signing key the site does not trust.
     other_private_pem: String,
+    /// The accounting tick this test needs, in seconds. Production is a fixed
+    /// ten and has no key; the test-only variable is read by a debug build.
+    stats_interval: Option<u64>,
 }
 
 impl Fixture {
@@ -218,7 +221,15 @@ impl Fixture {
             private_pem,
             other_private_pem,
             dir,
+            stats_interval: None,
         }
+    }
+
+    /// Shorten this fixture's accounting tick. Only a test needs this: the
+    /// production tick is a fixed constant.
+    fn with_stats_interval(mut self, secs: u64) -> Self {
+        self.stats_interval = Some(secs);
+        self
     }
 
     fn command(&self) -> Command {
@@ -227,6 +238,9 @@ impl Fixture {
             .arg(&self.system)
             .env("RUST_LOG", "info")
             .current_dir(self.dir.path());
+        if let Some(secs) = self.stats_interval {
+            cmd.env("M6_TEST_STATS_INTERVAL_SECS", secs.to_string());
+        }
         cmd
     }
 
@@ -686,7 +700,12 @@ fn perf_answers_a_listed_peer_with_the_role_over_h1_h2_h3() {
 
 #[test]
 fn perf_reports_the_event_loop() {
-    let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
+    // The accounting tick is a fixed ten seconds in production. A debug build
+    // can shorten it for this test through the test-only variable: the trace is
+    // copied on the tick, which is the event this waits for.
+    let run = Fixture::new(PRIVATE_ROUTE, "", &gated())
+        .with_stats_interval(1)
+        .start();
     let auth = bearer(&run.token(&["monitor"]));
     // A few requests so the loop has work to report on the accounting tick.
     for _ in 0..3 {
