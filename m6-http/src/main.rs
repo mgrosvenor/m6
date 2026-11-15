@@ -857,7 +857,8 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             },
             &mut state.traffic,
         )
-        .filter(|_| analytics::is_html_response(&cached.headers));
+        .filter(|_| analytics::is_html_response(&cached.headers))
+        .map(analytics::session_cookie_header_value);
         return Routed::Cached {
             status: cached.status,
             entry: cached,
@@ -2620,8 +2621,11 @@ fn handle_h3_request(
             set_vary_accept_encoding(&mut headers, true);
             set_age(&mut headers, age);
             set_date(&mut headers);
-            if let (Some(sc), true) = (set_cookie, html) {
-                headers.push(("Set-Cookie".to_string(), sc));
+            if let (Some(id), true) = (set_cookie, html) {
+                headers.push((
+                    "Set-Cookie".to_string(),
+                    analytics::session_cookie_header_value(id),
+                ));
             }
             debug!(
                 path = %path_str,
@@ -2675,8 +2679,11 @@ fn handle_h3_request(
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
         set_alt_svc(&mut headers_with_links, h3.quic_port);
-        if let (Some(sc), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
-            headers_with_links.push(("Set-Cookie".to_string(), sc));
+        if let (Some(id), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
+            headers_with_links.push((
+                "Set-Cookie".to_string(),
+                analytics::session_cookie_header_value(id),
+            ));
         }
         let resp_headers: &[(String, String)] = &headers_with_links;
         send_h3_response(

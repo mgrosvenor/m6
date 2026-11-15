@@ -163,3 +163,10 @@ harness = false
 [[test]]
 name = "traffic_window_alloc"
 harness = false
+
+# The per-request analytics line's allocation check. Its own binary so the
+# counting allocator reads only what `record` allocated, with the analytics Sink
+# opened first.
+[[test]]
+name = "analytics_allocs"
+harness = false
