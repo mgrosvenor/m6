@@ -22,7 +22,12 @@ name = "m6_core"
 default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
 # links it; enable it from a crate's [dev-dependencies] entry.
-testkit = ["dep:rustls-pki-types"]
+testkit = ["alloc-count", "dep:rustls-pki-types"]
+# The counting allocator on its own, without the rest of the harness, so a
+# service binary can install it and count its own loop's allocations. ALLOC-0's
+# m6-http `count-allocations` feature turns this on. Off by default and never in
+# a plain build of a service.
+alloc-count = []
 
 # Request/response extras, off by default so a binary links only what it uses.
 # `multipart` gates the multipart body parser and the streaming types it needs.
@@ -210,3 +215,13 @@ required-features = ["email", "testkit"]
 [[bench]]
 name    = "critical_path"
 harness = false
+
+# ALLOC-0's guard on the counting allocator itself: armed, one
+# `Vec::with_capacity(10)` counts one call and ten bytes, a disarmed thread
+# counts nothing, another thread's allocation is not this thread's, and `now()`
+# still counts every thread's. Its own `main`, so the allocator is installed
+# before any thread and the count is this binary's own.
+[[test]]
+name    = "alloc_count_armed"
+harness = false
+required-features = ["alloc-count"]

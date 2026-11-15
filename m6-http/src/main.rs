@@ -35,6 +35,14 @@ use m6_http_lib::health;
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
 
+/// ALLOC-0's counting allocator, behind a feature that is off by default and
+/// never on in a release build of a service. A plain build installs no
+/// allocator, and the loop's arm and stop lines below are compiled out with it,
+/// so the loop is the code it always was.
+#[cfg(feature = "count-allocations")]
+#[global_allocator]
+static ALLOCATOR: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_count::Counting;
+
 /// RFC 9114 8.1: H3_MESSAGE_ERROR, the stream error a server must raise for a
 /// malformed request. Named here rather than taken from quiche so the wire
 /// value is stated where it is used.
@@ -2267,6 +2275,12 @@ fn event_loop(
     let mut last_log_tick = last;
     let mut accepting = tcp.is_some() || h2c.is_some();
 
+    // ALLOC-0: count this thread's allocations from the first iteration. The
+    // counter is read once at stop, after the loop, where ordinary logging may
+    // allocate and is not part of the run.
+    #[cfg(feature = "count-allocations")]
+    m6_core::testkit::alloc_count::arm();
+
     'run: loop {
         // The wait is the earliest of three bounds: the 1 s accounting tick,
         // every deadline table (connections, upstreams and h2 streams), and
@@ -2585,6 +2599,15 @@ fn event_loop(
         // wait: record the work under the iteration's first trigger, then loop.
         last = m6_core::platform::now();
         trace.worked(first_index, last - now);
+    }
+
+    // ALLOC-0: one operational line, which `tests/allocations.rs` reads from
+    // the child's output. It is written after the count is taken, so logging
+    // the number is not part of it.
+    #[cfg(feature = "count-allocations")]
+    {
+        let (calls, bytes) = m6_core::testkit::alloc_count::count();
+        info!(calls, bytes, "allocations during the run");
     }
 
     0

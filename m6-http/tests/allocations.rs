@@ -1,0 +1,532 @@
+//! ALLOC-0: heap allocations per cached request, measured by source category
+//! and held as a guard.
+//!
+//! Each row starts the `m6-http` binary cargo built for this test, which holds
+//! the counting allocator behind its `count-allocations` feature. The server
+//! arms the counter when its run loop starts and logs the count at stop. A row
+//! runs the server twice, once for 100 requests and once for 1,100, with the
+//! same warm-up and the same start-up, so the difference is the 1,000 requests
+//! and nothing else. Start-up and warm-up cancel.
+//!
+//! The rows are the four paths ALLOC-0 splits: a cache hit over HTTP/1.1 on one
+//! keep-alive connection, the same over HTTP/2, a cache miss that goes to the
+//! backend and is stored, and a cache hit on a new connection with a fresh TLS
+//! handshake.
+//!
+//! ```text
+//! cargo test -p m6-http --test allocations --features count-allocations -- --test-threads=1 --nocapture
+//! ```
+//!
+//! The budgets are the counts this job measured. They are ceilings: each ALLOC
+//! job lowers the row it attacks, and none is ever raised. A budget that a run
+//! exceeds means a counted path started allocating more.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: blocking clients with deadlines drive the service from outside"
+)]
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use rustls::StreamOwned;
+
+use m6_core::testkit::{claim_port, PortClaim, Service};
+use m6_http_lib::forward::HttpRequest;
+use m6_http_lib::h2s_client::H2sTlsClientConn;
+
+// The budgets, in calls per 1,000 requests, measured on macOS on 2026-11-15 by
+// ALLOC-0. The plan is `work-queue/batch-9/ALLOC-0.md`. Each ALLOC job (ALLOC-1
+// rustls, ALLOC-2 the cache, ALLOC-3 rendering) lowers the row it attacks.
+// Never raise one: a count above its budget is the defect the guard exists for.
+//
+// The measured figure is calls per request times 1,000: h1_tls_hit 11,000,
+// h2_tls_hit 91,000, h1_tls_miss_insert 91,004 and h1_tls_new_connection
+// 123,000. Each budget carries 200 calls per 1,000, or 0.2 call per request.
+// That allowance is for the measurement, not for a code change. One TLS
+// handshake per run sits inside each difference, and rustls allocates a
+// variable number of times for its record boundaries, which moved the
+// per-request figure by at most 0.060 across runs. The first request of a run
+// is also a cache miss that opens the backend connection, and that adds its own
+// variation. A path that allocates one more time per request adds 1,000 and
+// fails every row, which is the plan's break.
+const H1_TLS_HIT_CALLS: u64 = 11_200;
+const H2_TLS_HIT_CALLS: u64 = 91_200;
+const H1_TLS_MISS_INSERT_CALLS: u64 = 91_204;
+const H1_TLS_NEW_CONNECTION_CALLS: u64 = 123_200;
+
+/// A cacheable response. `public` is what the cache stores, and the body's
+/// length is the one number the test client must know to read a keep-alive
+/// reply.
+const BACKEND_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+Cache-Control: public, max-age=60\r\nContent-Length: 9\r\nConnection: close\r\n\r\ncacheable";
+
+// ── The fixture ──────────────────────────────────────────────────────────────
+
+/// A site directory, a system config and the claimed port. The backend socket
+/// is created by [`Fixture::start_backend`], before the service starts, because
+/// the pool reads its glob once at start.
+struct Fixture {
+    dir: tempfile::TempDir,
+    site: PathBuf,
+    system: PathBuf,
+    port: PortClaim,
+    cert_der: Vec<u8>,
+}
+
+impl Fixture {
+    fn new() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("rcgen");
+        std::fs::write(d.join("cert.pem"), cert.cert.pem()).expect("write cert");
+        std::fs::write(d.join("key.pem"), cert.key_pair.serialize_pem()).expect("write key");
+
+        let port = claim_port();
+        let site_dir = d.join("site");
+        std::fs::create_dir_all(&site_dir).expect("site directory");
+        std::fs::write(
+            site_dir.join("site.toml"),
+            format!(
+                "[site]\nname = \"allocations\"\ndomain = \"localhost\"\n\n\
+                 [errors]\nmode = \"internal\"\n\n\
+                 [analytics]\nenabled = false\n\n\
+                 [log]\nlevel = \"info\"\n\n\
+                 [rate_limit]\nenabled = false\n\n\
+                 [server]\nbackend_timeout_secs = 5\n\n\
+                 [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
+                 [[route]]\npath = \"/\"\nbackend = \"b\"\n",
+                d.join("b-*.sock").display()
+            ),
+        )
+        .expect("write site.toml");
+        std::fs::write(
+            d.join("system.toml"),
+            format!(
+                "[server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n\
+                 max_requests_per_connection = 1000000\n\n\
+                 [node]\nname = \"allocations\"\n",
+                port.addr(),
+                d.join("cert.pem").display(),
+                d.join("key.pem").display()
+            ),
+        )
+        .expect("write system.toml");
+
+        let system = d.join("system.toml");
+        Fixture {
+            dir,
+            site: site_dir,
+            system,
+            port,
+            cert_der: cert.cert.der().to_vec(),
+        }
+    }
+
+    /// Bind the one backend the test needs, before the service starts. Every
+    /// request is answered from this thread pool, and a reply closes the
+    /// backend connection, which is what an ordinary HTTP/1.1 origin does.
+    fn start_backend(&self) {
+        let sock = self.dir.path().join("b-1.sock");
+        let listener = UnixListener::bind(&sock).expect("bind backend socket");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                        if head.len() > 16 * 1024 {
+                            return;
+                        }
+                    }
+                    let _ = stream.write_all(BACKEND_RESPONSE);
+                });
+            }
+        });
+    }
+
+    fn start(&self) -> Service {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_m6-http"));
+        cmd.arg(&self.site)
+            .arg(&self.system)
+            .env("RUST_LOG", "info")
+            // The periodic stats emit is not per request, and a slow run that
+            // crossed the ten-second tick would add its allocations to one K
+            // and not the other. The interval is the debug build's documented
+            // test channel, and this only pushes the first emit past any run.
+            .env("M6_TEST_STATS_INTERVAL_SECS", "3600")
+            .current_dir(self.dir.path());
+        let mut svc = Service::spawn("m6-http-allocations", &mut cmd);
+        svc.wait_for_tcp(self.port.port(), Duration::from_secs(15));
+        svc
+    }
+
+    fn port(&self) -> u16 {
+        self.port.port()
+    }
+}
+
+// ── The rows ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum Row {
+    H1TlsHit,
+    H2TlsHit,
+    H1TlsMissInsert,
+    H1TlsNewConnection,
+}
+
+impl Row {
+    fn name(self) -> &'static str {
+        match self {
+            Row::H1TlsHit => "h1_tls_hit",
+            Row::H2TlsHit => "h2_tls_hit",
+            Row::H1TlsMissInsert => "h1_tls_miss_insert",
+            Row::H1TlsNewConnection => "h1_tls_new_connection",
+        }
+    }
+
+    /// The path of request `i`. The miss row uses a fresh query each time,
+    /// because the query is part of the cache key, so every request misses,
+    /// reaches the backend and is stored.
+    fn path(self, i: usize) -> String {
+        match self {
+            Row::H1TlsMissInsert => format!("/?n={i}"),
+            _ => "/".to_string(),
+        }
+    }
+
+    fn budget_calls(self) -> u64 {
+        match self {
+            Row::H1TlsHit => H1_TLS_HIT_CALLS,
+            Row::H2TlsHit => H2_TLS_HIT_CALLS,
+            Row::H1TlsMissInsert => H1_TLS_MISS_INSERT_CALLS,
+            Row::H1TlsNewConnection => H1_TLS_NEW_CONNECTION_CALLS,
+        }
+    }
+}
+
+// ── The four tests ───────────────────────────────────────────────────────────
+
+#[test]
+fn h1_tls_hit() {
+    check(Row::H1TlsHit);
+}
+
+#[test]
+fn h2_tls_hit() {
+    check(Row::H2TlsHit);
+}
+
+#[test]
+fn h1_tls_miss_insert() {
+    check(Row::H1TlsMissInsert);
+}
+
+#[test]
+fn h1_tls_new_connection() {
+    check(Row::H1TlsNewConnection);
+}
+
+/// Measure a row at K = 100 and K = 1,100, record the calls and bytes per
+/// request, and hold the calls to the row's budget.
+fn check(row: Row) {
+    let (small_calls, small_bytes) = measure(row, 100);
+    let (large_calls, large_bytes) = measure(row, 1_100);
+
+    assert!(
+        large_calls >= small_calls && large_bytes >= small_bytes,
+        "{}: the 1,100-request run counted fewer allocations than the 100-request one \
+         ({small_calls} calls, {small_bytes} bytes against {large_calls} calls, \
+         {large_bytes} bytes). The count is not comparing the same path.",
+        row.name()
+    );
+    let calls = large_calls - small_calls;
+    let bytes = large_bytes - small_bytes;
+
+    println!(
+        "{}: {}.{:03} calls and {}.{:03} bytes per request \
+         (K=100: {small_calls} calls, {small_bytes} bytes, \
+         K=1,100: {large_calls} calls, {large_bytes} bytes)",
+        row.name(),
+        calls / 1_000,
+        calls % 1_000,
+        bytes / 1_000,
+        bytes % 1_000,
+    );
+
+    assert!(
+        calls <= row.budget_calls(),
+        "{}: {}.{:03} calls per request exceeds its budget of {}.{:03}. \
+         A counted path started allocating more. The plan is ALLOC-0.",
+        row.name(),
+        calls / 1_000,
+        calls % 1_000,
+        row.budget_calls() / 1_000,
+        row.budget_calls() % 1_000,
+    );
+}
+
+/// One server run for `requests` requests, returning the calls and bytes its
+/// stop line reports.
+fn measure(row: Row, requests: usize) -> (u64, u64) {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let mut svc = fixture.start();
+    let port = fixture.port();
+
+    match row {
+        Row::H1TlsHit | Row::H1TlsMissInsert => {
+            let mut conn = h1_ready(&fixture, "/");
+            for i in 0..requests {
+                let status = conn
+                    .get(&row.path(i), port, false)
+                    .unwrap_or_else(|e| panic!("{}: request {i}: {e}", row.name()));
+                assert_eq!(status, 200, "{}: request {i} answered {status}", row.name());
+            }
+        }
+        Row::H1TlsNewConnection => {
+            // The warm-up connection takes the start-up cost out of both runs.
+            drop(h1_ready(&fixture, "/"));
+            for i in 0..requests {
+                let mut conn = H1Conn::connect(port, tls_config(&fixture.cert_der, &[b"http/1.1"]));
+                let status = conn
+                    .get(&row.path(i), port, true)
+                    .unwrap_or_else(|e| panic!("{}: request {i}: {e}", row.name()));
+                assert_eq!(status, 200, "{}: request {i} answered {status}", row.name());
+            }
+        }
+        Row::H2TlsHit => {
+            let mut conn = h2_ready(&fixture);
+            for i in 0..requests {
+                let status = h2_get(&mut conn, &row.path(i), port)
+                    .unwrap_or_else(|e| panic!("{}: request {i}: {e}", row.name()));
+                assert_eq!(status, 200, "{}: request {i} answered {status}", row.name());
+            }
+        }
+    }
+
+    let status = svc.terminate(Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "{}: m6-http exited {status} on SIGTERM\n{}",
+        row.name(),
+        svc.output()
+    );
+    stop_counts(&svc.output(), row.name())
+}
+
+/// The `calls` and `bytes` fields of the stop line ALLOC-0 logs.
+fn stop_counts(output: &str, row: &str) -> (u64, u64) {
+    for line in output.lines().rev() {
+        if !line.contains("allocations during the run") {
+            continue;
+        }
+        let calls = json_field(line, "calls")
+            .unwrap_or_else(|| panic!("{row}: stop line has no calls field: {line}"));
+        let bytes = json_field(line, "bytes")
+            .unwrap_or_else(|| panic!("{row}: stop line has no bytes field: {line}"));
+        return (calls, bytes);
+    }
+    panic!("{row}: no 'allocations during the run' line in m6-http's output\n{output}");
+}
+
+/// One integer field from a JSON line.
+fn json_field(line: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\":");
+    let start = line.find(&needle)? + needle.len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+// ── TLS clients ──────────────────────────────────────────────────────────────
+
+fn tls_config(cert_der: &[u8], alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
+    let mut store = rustls::RootCertStore::empty();
+    store.add(cert).expect("trust the test certificate");
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    // Every connection in `h1_tls_new_connection` is a full handshake, as the
+    // row is defined. The default client session cache would resume some of
+    // them, and a resumed handshake allocates a different number of times, so
+    // the count would depend on which connections happened to resume.
+    cfg.resumption = rustls::client::Resumption::disabled();
+    Arc::new(cfg)
+}
+
+/// An HTTP/1.1-over-TLS client that keeps one connection and reads one reply
+/// at a time, by `Content-Length`. Sequential requests only, which is all the
+/// rows need.
+struct H1Conn {
+    stream: StreamOwned<rustls::ClientConnection, TcpStream>,
+    buffered: Vec<u8>,
+}
+
+impl H1Conn {
+    fn connect(port: u16, config: Arc<rustls::ClientConfig>) -> H1Conn {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect to m6-http");
+        tcp.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("read timeout");
+        tcp.set_write_timeout(Some(Duration::from_secs(20)))
+            .expect("write timeout");
+        tcp.set_nodelay(true).expect("nodelay");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let conn = rustls::ClientConnection::new(config, name).expect("TLS client");
+        H1Conn {
+            stream: StreamOwned::new(conn, tcp),
+            buffered: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, path: &str, port: u16, close: bool) -> std::io::Result<u16> {
+        let connection = if close { "Connection: close\r\n" } else { "" };
+        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\n{connection}\r\n");
+        self.stream.write_all(request.as_bytes())?;
+        self.stream.flush()?;
+        self.read_response()
+    }
+
+    fn read_response(&mut self) -> std::io::Result<u16> {
+        loop {
+            if let Some(end) = self.buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&self.buffered[..end]).into_owned();
+                let status = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|code| code.parse().ok())
+                    .unwrap_or(0);
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let wanted = end + 4 + length;
+                while self.buffered.len() < wanted {
+                    self.fill()?;
+                }
+                self.buffered.drain(..wanted);
+                return Ok(status);
+            }
+            self.fill()?;
+        }
+    }
+
+    fn fill(&mut self) -> std::io::Result<()> {
+        let mut buf = [0u8; 8192];
+        let n = self.stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "m6-http closed before a reply",
+            ));
+        }
+        self.buffered.extend_from_slice(&buf[..n]);
+        Ok(())
+    }
+}
+
+/// A keep-alive connection that has answered its warm-up request, retrying
+/// until the service is serving rather than merely bound.
+fn h1_ready(fixture: &Fixture, warm_path: &str) -> H1Conn {
+    let config = tls_config(&fixture.cert_der, &[b"http/1.1"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut conn = H1Conn::connect(fixture.port(), Arc::clone(&config));
+        match conn.get(warm_path, fixture.port(), false) {
+            Ok(200) => return conn,
+            Ok(status) => panic!("warm-up answered {status}, not 200"),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    panic!("m6-http never answered the warm-up request: {e}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+/// An HTTP/2-over-TLS connection that has answered its warm-up request.
+fn h2_ready(fixture: &Fixture) -> H2sTlsClientConn {
+    let config = tls_config(&fixture.cert_der, &[b"h2"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match H2sTlsClientConn::connect("localhost", fixture.port(), Arc::clone(&config)) {
+            Ok(mut conn) => match h2_get(&mut conn, "/", fixture.port()) {
+                Ok(200) => return conn,
+                Ok(status) => panic!("h2 warm-up answered {status}, not 200"),
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        panic!("m6-http never answered the h2 warm-up request: {e}");
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            },
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    panic!("could not open an h2 connection to m6-http: {e}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+fn h2_get(conn: &mut H2sTlsClientConn, path: &str, port: u16) -> std::io::Result<u16> {
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query: None,
+        version: "HTTP/2".to_string(),
+        headers: vec![("host".to_string(), format!("localhost:{port}"))],
+        body: Vec::new(),
+    };
+    let stream_id = conn.dispatch(&request, "localhost", "127.0.0.1", "localhost")?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        conn.drive();
+        if let Some(done) = conn
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+        {
+            return done.result.map(|response| response.status);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "h2 reply timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
