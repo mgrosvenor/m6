@@ -138,7 +138,7 @@ impl Site {
 fn site_toml(glob: &str) -> String {
     format!(
         "[site]\nname = \"scale-reuse-port\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"info\"\n\n\
          [errors]\nmode = \"internal\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
