@@ -39,7 +39,11 @@ fn file_etag(mtime_secs: u64, len: u64, suffix: &str) -> String {
 ///
 /// A request built without a route (a test, or a caller that never routes)
 /// has no pattern to consult, and reads the dictionary as given.
-fn resolve_fs_path(req: &Request, site_dir: &Path) -> Option<PathBuf> {
+///
+/// Returns the path relative to `site_dir`. The caller resolves it with
+/// core's `resolve_within`, which follows every symlink and applies the same
+/// check `Request`'s file helpers use.
+fn resolve_fs_relpath(req: &Request) -> Option<PathBuf> {
     let pattern = req.route_pattern();
     // `Some(wildcard)` when the route captures `name`, `None` when it does not.
     let capture = |name: &str| -> Option<bool> {
@@ -75,30 +79,9 @@ fn resolve_fs_path(req: &Request, site_dir: &Path) -> Option<PathBuf> {
         None => param("filename")?.unwrap_or(""),
     };
     if rel.is_empty() {
-        Some(site_dir.join(&root))
+        Some(PathBuf::from(&root))
     } else {
-        Some(site_dir.join(&root).join(rel))
-    }
-}
-
-/// True if `fs_path` is a symlink resolving outside `site_dir`.
-///
-/// Only pays the `canonicalize` cost when a symlink is actually present;
-/// regular files return immediately. A path that cannot be resolved at all is
-/// treated as escaping — it will 404 either way.
-fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(fs_path) else {
-        return false; // missing file — the normal 404 path handles it
-    };
-    if !meta.file_type().is_symlink() {
-        return false;
-    }
-    match (
-        std::fs::canonicalize(fs_path),
-        std::fs::canonicalize(site_dir),
-    ) {
-        (Ok(real), Ok(root)) => !real.starts_with(root),
-        _ => true,
+        Some(PathBuf::from(&root).join(rel))
     }
 }
 
@@ -160,19 +143,18 @@ pub fn serve(req: &Request) -> Result<Response> {
     }
 
     let site_dir = req.site_path("");
-    let Some(fs_path) = resolve_fs_path(req, &site_dir) else {
+    let Some(rel) = resolve_fs_relpath(req) else {
         return Ok(Response::not_found());
     };
 
-    // Fast symlink check: if the path is (or contains) a symlink that escapes
-    // site_dir, return 404.  Regular files skip canonicalize entirely.
-    //
-    // Runs before the `tail` dispatch below — tail routes read the same
-    // filesystem through the same resolver, so exempting them just moved the
-    // escape one route type over.
-    if escapes_site_dir(&fs_path, &site_dir) {
+    // Resolve the path with every symlink followed, then check the result
+    // against the resolved site root and use that same resolved path below.
+    // The old check ran only on the name the request supplied, so a symlinked
+    // directory in the middle passed it. Runs before the `tail` dispatch: tail
+    // routes read the same filesystem through the same resolver.
+    let Ok(fs_path) = m6_core::path::resolve_within(&site_dir, &rel) else {
         return Ok(Response::not_found());
-    }
+    };
 
     if req.route_bool("tail", false) {
         return serve_tail(req, &fs_path);
@@ -907,6 +889,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wire(&asset_req(dir.path(), "escape", None, &[])).0, 404);
+    }
+
+    /// The break: `escapes_site_dir` looked only at the last component, so a
+    /// symlinked directory in the middle of the path was followed and the
+    /// outside file was served. Restore that check and this test gets 200 with
+    /// `ESCAPED SECRET` in the body.
+    #[test]
+    fn a_symlinked_directory_inside_the_site_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.css"), b"ESCAPED SECRET").unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("assets")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("assets/linked")).unwrap();
+
+        let (status, _, body) = wire(&asset_req(site.path(), "linked/secret.css", None, &[]));
+        assert_eq!(
+            status, 404,
+            "a symlinked directory leaving the site was served"
+        );
+        assert!(body.is_empty(), "the response carried the outside file");
+    }
+
+    /// A symlink that stays inside the site is a normal deployment and is
+    /// served, so the fix refuses escapes rather than every symlink.
+    #[test]
+    fn a_symlinked_directory_inside_the_site_is_served() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("static/assets")).unwrap();
+        std::fs::write(site.path().join("static/assets/app.css"), b"body{}").unwrap();
+        std::os::unix::fs::symlink(
+            site.path().join("static/assets"),
+            site.path().join("assets"),
+        )
+        .unwrap();
+
+        let (status, _, body) = wire(&asset_req(site.path(), "app.css", None, &[]));
+        assert_eq!(status, 200, "an in-site directory symlink was refused");
+        assert_eq!(body, b"body{}");
     }
 
     /// A `relpath` that climbs out of the root is a 404 even when it reaches

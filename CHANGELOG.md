@@ -186,6 +186,21 @@ Core now leaves a path parameter in place when a query key or form field has its
 m6-file now reads `relpath`, `filename` and each `root` placeholder only when the route's pattern captures that name, and checks each with core's path-parameter rule (a slash only in a `{*name}` capture). A name the pattern does not capture is never taken from the query, so `?relpath=` on a `{filename}` route cannot pick a file in a subdirectory, and a `root` placeholder the pattern does not capture is a 404.
 Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query_relpath_cannot_choose_a_file_on_a_filename_route`, which send those requests over HTTP. The first fails on the previous code with `200 OK` and the service's config in the body. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
 
+**A site-relative file helper follows no symlink out of the site directory, and a refused write creates nothing outside it (#346).**
+`Request::validated_path` rejected `..` in the string and never resolved the path, so `read_json`, `write_json`, `write_json_atomic`, `list_json` and the multipart `write_bytes` reached `data/linked/file.json` through a symlinked directory to a file outside the site.
+`write_json` then called `create_dir_all` on that path, so a refused write created the missing directories outside the site before writing.
+The helpers now call one shared `m6_core::path::resolve_within`, which canonicalises the site root, canonicalises the deepest existing ancestor of the requested path, appends the components that do not exist yet, and refuses the result unless it starts with the resolved root.
+A dangling symlink counts as existing and is refused, so a write cannot create its target outside the site.
+A symlink that resolves back inside is accepted, which keeps a site that links `data` to `storage/data` working.
+`..`, a leading `/` and a Windows prefix are still refused.
+Verified with `read_json_refuses_a_symlinked_directory_that_leaves_the_site`, `write_json_refuses_a_symlinked_directory_before_creating_anything` (which asserts the outside directory is still empty), `in_site_symlinked_directory_still_reads_and_writes` and `read_json_still_refuses_dotdot`. The first two return the outside file and `Ok` with the previous lexical check restored.
+
+**m6-file refuses a path whose symlinked directory leaves the site, on plain and tail routes (#339).**
+`escapes_site_dir` called `symlink_metadata` on the last component only, so `GET /assets/linked/secret.css` with `assets/linked` pointing outside the site was served: the final component was a regular file and the check stopped there.
+`serve` now resolves the path through core's `resolve_within`, checks the resolved path against the resolved site root, and reads the file it resolved.
+A directory symlink that stays inside the site still resolves inside and is served.
+Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
+
 ### Fixed
 
 **The HTTP conformance gate runs again.** `tools/conformance.sh` still wrote `[log] format`, which is now refused, and started the redirect listener with analytics on and no log directory, which is now refused too, so the gate measured nothing for h1's redirect listener, h2 or h3. It now writes neither, and runs the dev-profile build (`target/debug`, or `M6_BIN_DIR`) like every other gate; CI builds `--bins` for it instead of `--release`. `tools/backend-bench.py` no longer writes `[log] format` either. Verified on Linux: h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49 (the recorded floor), resumption and early data as before.
