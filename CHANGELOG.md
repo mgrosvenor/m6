@@ -142,6 +142,11 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**A service writes its access line at the default log level (#179).**
+`Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
+It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.
+Verified with `an_access_line_is_logged_at_the_default_level`, which finds no line on the previous code and an INFO line after it.
+
 **A split body-less HTTP/2 backend response is forwarded instead of a 502 (#315).**
 A backend that put END_STREAM on a HEADERS frame and finished the header block in CONTINUATION frames had its stream completed before the block ended, so the reply was failed as "stream ended without headers" and the edge answered 502.
 The client now completes a stream only when the header block ends and END_STREAM has been seen, as RFC 9113 sections 4.3 and 6.2 require, in the shared h2c and h2s path.

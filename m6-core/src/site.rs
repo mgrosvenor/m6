@@ -511,7 +511,9 @@ impl Site {
             }
         }
 
-        tracing::debug!(
+        // One access line per request at the default level. A line at debug is
+        // below the default and is an access log nobody enables.
+        tracing::info!(
             path = raw.path(),
             method = raw.method(),
             status = resp.status,
