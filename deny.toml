@@ -116,7 +116,6 @@ allow = [
     # BSD Zero Clause, the most permissive of the family: no attribution
     # requirement at all. `quoted_printable`, via lettre, uses it.
     "0BSD",
-    "OpenSSL",
 ]
 
 [bans]
