@@ -51,6 +51,14 @@ path = "src/probe_h3_main.rs"
 name = "m6_http_lib"
 path = "src/lib.rs"
 
+[features]
+# Count every heap allocation the run loop makes, and log the count at stop.
+# Off by default, and a plain build has neither the allocator nor the arm calls:
+# `src/main.rs` gates all three on this feature, and m6-core exposes only its
+# counting file through `alloc-count`. `tests/allocations.rs` reads the stop
+# line of a binary built with this feature.
+count-allocations = ["m6-core/alloc-count"]
+
 [dependencies]
 # quiche, from our own fork, pinned BY REVISION and not by branch: a branch name
 # would let the dependency change under a build that claims to be reproducible.
@@ -192,3 +200,10 @@ harness = false
 [[test]]
 name = "analytics_allocs"
 harness = false
+
+# ALLOC-0: heap allocations per cached request, by row, read from the stop line
+# of a binary built with the counting allocator. Needs the feature, so an
+# ordinary `cargo test --workspace` neither builds nor runs it.
+[[test]]
+name = "allocations"
+required-features = ["count-allocations"]

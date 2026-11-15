@@ -45,8 +45,11 @@ pub mod util;
 pub mod wireguard;
 
 // Behind a feature so it is never compiled into a production binary.
-// Enable it in `dev-dependencies` only. The module's own `//!` doc describes it.
-#[cfg(feature = "testkit")]
+// `testkit` is the whole harness, `alloc-count` only the counting allocator
+// ALLOC-0 needs. Both are off by default. Enable them in `dev-dependencies`
+// only, or in a test binary that declares its own `#[global_allocator]`. The
+// module's own `//!` doc describes it.
+#[cfg(any(feature = "testkit", feature = "alloc-count"))]
 pub mod testkit;
 
 #[cfg(feature = "email")]
