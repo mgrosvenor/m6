@@ -155,10 +155,11 @@ A `POST /genid` runs four steps in the source's loop.
    A 404 or 405 is a backend with nothing to refresh and is logged at debug.
    Any other status, a connect failure or the deadline is logged at error with the member's socket path and the reason.
    A failed member does not stop the sequence, and it is not treated as refreshed.
-3. In one step, rebuild the route table from the config loaded at start, clear the cache, clear the held error pages, advance the ID and write it.
+3. In one step, rebuild the route table from the config loaded at start, swap the cache and the held error pages for empty ones, advance the ID and write it.
+   Each swap is one assignment, so a request sees the old generation or the new one, and a request already holding an entry finishes on the content it took.
    A route-table build error keeps the old table and is logged.
    The route table is built from `site.toml` as loaded at start, so a publish that adds a file a `[[route_group]]` glob matches gains its route, and a `site.toml` edit needs a restart.
-   This tree keeps no data-file-to-path invalidation map, so the cache clear is the whole invalidation.
+   This tree keeps no data-file-to-path invalidation map, so the cache swap is the whole invalidation.
 4. Answer every covered POST with the new ID.
 
 The order matters.
@@ -195,7 +196,8 @@ It asks that upstream for the ID and follows it.
    One heartbeat is in flight at most, on the accounting tick, under the backend's `backend_timeout_secs` deadline.
    The address is the one resolved at start, so an address change needs a restart.
 2. **A new ID is a full flush.**
-   The node rebuilds the route table from the config loaded at start, clears the cache and the held error pages, and logs `genid changed` at info with `from` and `to`.
+   The node rebuilds the route table from the config loaded at start, swaps the cache and the held error pages for empty ones in one assignment each, and logs `genid changed` at info with `from` and `to`.
+   No entry survives into the new generation. One assignment publishes each replacement, so a request sees the old generation or the new one and never a half-emptied cache, and a request already holding an entry finishes on the content it took.
    The cache refills on demand.
    A first answer sets the ID with no flush, because the node held nothing the new ID makes old.
    This is the whole invalidation: there is no reseed and no per-path map, so it is simple and always correct.

@@ -1,4 +1,5 @@
-//! The cache node's store rule and its hit writer cost no allocation.
+//! The cache node's store rule, its hit writer and its generation swap cost no
+//! per-request allocation.
 //!
 //! `harness = false` means no libtest thread runs in this binary, so the
 //! counting allocator reads only what these checks allocated. The first check
@@ -7,20 +8,24 @@
 //! is a borrowed byte slice, and the rule parses it in place, so the count is
 //! zero. The second writes a cached hit with an ID one thousand times into one
 //! reused buffer, which is the path a cache node answers from while its
-//! upstream is down. The harness speaks libtest's protocol through
+//! upstream is down. The third swaps a 4096-entry generation and measures a
+//! constant cost: the replacement is built empty and published, so the swap
+//! does not copy the entries. The harness speaks libtest's protocol through
 //! `libtest-mimic`, forced onto one thread so each check runs in this `main`
 //! thread.
 //!
 //! Breaks: copy the header into a `String` before parsing it, and the first
 //! check reports two thousand allocations. Format the stored ID into a
 //! `String` and push it as a header, and the second reports one per hit.
+//! Build the replacement generation by re-inserting every entry, and the
+//! third reports one allocation or more per entry.
 
 use std::hint::black_box;
 use std::sync::Arc;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::testkit::alloc_count;
-use m6_http_lib::cache::CachedResponse;
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse};
 use m6_http_lib::genid::{Follower, Outcome};
 use m6_http_lib::http11::{write_cached_h1, HitHeaders};
 
@@ -45,6 +50,15 @@ fn main() {
                 a_cache_node_hit_allocates_nothing(),
             )
         }),
+        Trial::test(
+            "a_generation_swap_allocates_a_constant_number_of_times",
+            || {
+                outcome(
+                    "a_generation_swap_allocates_a_constant_number_of_times",
+                    a_generation_swap_allocates_a_constant_number_of_times(),
+                )
+            },
+        ),
     ];
     libtest_mimic::run(&args, tests).exit();
 }
@@ -108,4 +122,37 @@ fn a_cache_node_hit_allocates_nothing() -> bool {
     let n = alloc_count::now() - start;
     println!("a_cache_node_hit_allocates_nothing: {n} allocation(s) in 1000 hits");
     n != 0
+}
+
+/// A generation swap is a publish, not a copy: 4096 entries cost the same two
+/// allocations (the replacement's map handle and its byte counter) as an empty
+/// one. The count starts after the entries are stored.
+///
+/// Break: build the replacement by re-inserting every entry, and the count
+/// grows with the 4096 entries.
+fn a_generation_swap_allocates_a_constant_number_of_times() -> bool {
+    let mut cache = Cache::new();
+    let body = bytes::Bytes::from_static(b"old generation");
+    for i in 0..4096 {
+        cache.insert(
+            CacheKey::new(&format!("/p{i}"), None, "gzip"),
+            CachedResponse {
+                genid: 7,
+                status: 200,
+                headers: Arc::new(vec![]),
+                body: body.clone(),
+            },
+        );
+    }
+    assert_eq!(cache.len(), 4096, "the check starts with a full generation");
+
+    let start = alloc_count::now();
+    let old = cache.swap_generation();
+    let n = alloc_count::now() - start;
+    drop(old);
+
+    println!(
+        "a_generation_swap_allocates_a_constant_number_of_times: {n} allocation(s) for a 4096-entry swap"
+    );
+    n > 2
 }

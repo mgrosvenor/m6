@@ -444,8 +444,9 @@ static READ_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 use std::sync::{Arc, RwLock};
 
-/// Cache backed by `Arc<RwLock<HashMap>>` — swap the whole map atomically.
-/// Clone is cheap, as it only clones the Arc.
+/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap, and
+/// [`Cache::swap_generation`] publishes a whole new generation with one
+/// assignment.
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,
@@ -959,6 +960,36 @@ impl Cache {
             map.clear();
             self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Replace the live generation with an empty cache in one assignment.
+    ///
+    /// The rule for a site generation change is a full flush (`DESIGN-genid`
+    /// point 8): no entry survives into the new generation, and the cache
+    /// refills on demand. This method is that whole rule. It builds the
+    /// replacement beside the live cache and publishes it with
+    /// `std::mem::replace`, which is read-copy-update's answer in one process
+    /// and the same publish rule G1a uses for the `Site`.
+    ///
+    /// Atomicity follows from ownership. `&mut self` means the loop cannot be
+    /// reading the cache while the swap runs, and one assignment means it
+    /// sees either the old generation or the new one, never a map that is
+    /// partly emptied. A request that already took an entry holds the
+    /// `CachedResponse` clone the hit path makes, so it finishes on the
+    /// content it holds. A holder of the old `Cache` (a clone) keeps that
+    /// generation whole, and it is freed when the last holder drops.
+    ///
+    /// `max_bytes` carries over, so a swap cannot change the bound. The
+    /// held-serving flag starts clear: the swap happens when the upstream has
+    /// answered with a new ID, which is the moment held content stops being
+    /// served.
+    ///
+    /// The old cache is returned so a caller that must keep an in-flight
+    /// reader's generation can, and so the drop is visible at the call site.
+    #[must_use = "the old generation is dropped at once unless the caller keeps it"]
+    pub fn swap_generation(&mut self) -> Cache {
+        let fresh = Cache::with_max_bytes(self.max_bytes);
+        std::mem::replace(self, fresh)
     }
 
     /// Sum of the footprints actually in the map.
@@ -2946,6 +2977,144 @@ mod capacity_accounting_tests {
         assert!(
             !matches!(cache.lookup(k), Lookup::Miss),
             "cache unusable after cycles"
+        );
+    }
+}
+
+/// The generation swap: the rule, the atomic publish, and what an in-flight
+/// request keeps.
+#[cfg(test)]
+mod generation_swap_tests {
+    use super::*;
+
+    fn resp(genid: u64, body: &[u8]) -> CachedResponse {
+        CachedResponse {
+            genid,
+            status: 200,
+            headers: std::sync::Arc::new(vec![(
+                "cache-control".to_string(),
+                "public, max-age=86400".to_string(),
+            )]),
+            body: bytes::Bytes::copy_from_slice(body),
+        }
+    }
+
+    /// The plan's rule is a full flush, so the new generation holds nothing
+    /// and its accounting starts at zero.
+    ///
+    /// Break: make `swap_generation` a no-op, and every entry is still there.
+    #[test]
+    fn a_generation_swap_keeps_no_entry() {
+        let mut cache = Cache::with_max_bytes(1024 * 1024);
+        for i in 0..8 {
+            cache.insert(
+                CacheKey::new(&format!("/p{i}"), None, "gzip"),
+                resp(5, b"the old generation"),
+            );
+        }
+        let held_before = cache.bytes_held();
+        assert!(held_before > 0);
+
+        let old = cache.swap_generation();
+
+        assert_eq!(cache.len(), 0, "the new generation holds no entry");
+        assert_eq!(cache.bytes_held(), 0, "the new generation starts at zero");
+        assert_eq!(cache.footprint_sum(), 0);
+        assert_eq!(old.len(), 8, "the previous generation is returned whole");
+        assert_eq!(
+            old.bytes_held(),
+            held_before,
+            "the previous generation keeps its own accounting"
+        );
+        for i in 0..8 {
+            let key = CacheKey::new(&format!("/p{i}"), None, "gzip");
+            assert!(
+                matches!(cache.lookup(&key), Lookup::Miss),
+                "entry {i} survived the swap"
+            );
+            assert!(
+                old.get(&key).is_some(),
+                "the returned generation lost entry {i}"
+            );
+        }
+    }
+
+    /// A request in flight holds the response clone its lookup took, so it
+    /// finishes on the generation it started with. A holder of the old
+    /// `Cache` keeps that generation whole until it drops.
+    ///
+    /// Break: implement the swap as `self.clear()`. The live cache is empty
+    /// either way, but the old generation is then emptied under its holders,
+    /// and the assertions on `in_flight` and `old` fail.
+    #[test]
+    fn a_request_holding_the_old_generation_finishes_on_it() {
+        let mut cache = Cache::with_max_bytes(1024 * 1024);
+        let key = CacheKey::new("/held", None, "gzip");
+        cache.insert(key.clone(), resp(41, b"the old generation"));
+
+        // What a request in flight holds: the response clone from its lookup,
+        // and a clone of the cache it began on.
+        let held = cache.get(&key).expect("the entry is fresh");
+        let in_flight = cache.clone();
+
+        let old = cache.swap_generation();
+
+        assert!(
+            matches!(cache.lookup(&key), Lookup::Miss),
+            "the live cache serves the new generation only"
+        );
+        assert_eq!(held.genid, 41, "the held response keeps its generation");
+        assert_eq!(
+            &held.body[..],
+            b"the old generation",
+            "the held response keeps its body"
+        );
+        let still = in_flight
+            .get(&key)
+            .expect("an in-flight holder keeps the generation it began on");
+        assert_eq!(still.genid, 41);
+        assert_eq!(old.get(&key).map(|r| r.genid), Some(41));
+    }
+
+    /// The new generation keeps the old generation's bound, so a swap cannot
+    /// quietly raise a small cache to the default 128 MiB.
+    ///
+    /// Break: build the fresh cache with `Cache::new()`, and the 100 KB entry
+    /// stays in a 64 KB cache.
+    #[test]
+    fn a_swapped_cache_keeps_its_bound() {
+        let mut cache = Cache::with_max_bytes(64 * 1024);
+        cache.insert(CacheKey::new("/before", None, "gzip"), resp(5, b"x"));
+        let _old = cache.swap_generation();
+
+        cache.insert(
+            CacheKey::new("/big", None, "gzip"),
+            resp(6, &vec![0u8; 100 * 1024]),
+        );
+
+        assert!(
+            cache.bytes_held() <= 64 * 1024,
+            "the swapped cache ignored its bound: {} bytes held",
+            cache.bytes_held()
+        );
+        assert_eq!(cache.len(), 0, "the over-bound entry was evicted");
+    }
+
+    /// A swap is the moment held content stops being served, so the fresh
+    /// generation does not inherit the old one's serve-held policy.
+    ///
+    /// Break: copy `serve_held` into the fresh cache, and this fails.
+    #[test]
+    fn a_swapped_cache_does_not_serve_held() {
+        let mut cache = Cache::new();
+        cache.set_serve_held(true);
+        assert!(cache.serve_held());
+
+        let _old = cache.swap_generation();
+
+        assert!(
+            !cache.serve_held(),
+            "the new generation must not serve the old one's held content"
         );
     }
 }

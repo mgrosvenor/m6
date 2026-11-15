@@ -1594,9 +1594,14 @@ fn launch_genid_member(
 }
 
 /// The change step, run in one turn once every member has answered or failed:
-/// rebuild the route table from the config loaded at start, empty the cache
-/// and the error pages, advance the ID, write it, and answer the covered
-/// POSTs.
+/// rebuild the route table from the config loaded at start, swap the cache and
+/// the held error pages for empty ones in one step each, advance the ID, write
+/// it, and answer the covered POSTs.
+///
+/// The swap is the whole flush: no entry survives into the new generation. One
+/// assignment publishes each replacement, so a request sees the old generation
+/// or the new one and never a half-emptied cache. A request already holding an
+/// entry finishes on the clone it took.
 ///
 /// A route-table build error keeps the old table and is logged. The ID is
 /// written before any POST is answered, so a publisher that sees 200 knows the
@@ -1613,8 +1618,8 @@ fn genid_finish(cx: &mut CompletionCtx<'_>) {
                 "genid: route table rebuild failed; keeping the old table"
             ),
         }
-        cx.state.cache.clear();
-        cx.state.error_pages.clear();
+        drop(cx.state.cache.swap_generation());
+        cx.state.error_pages = HashMap::new();
 
         let Some(finished) = cx.state.genid.source_mut().map(|g| g.finish()) else {
             return;
@@ -1889,8 +1894,13 @@ fn follower_failed(state: &mut ServerState, reason: &'static str, now: Instant) 
 }
 
 /// The change on a cache node: the route table rebuilt from the config loaded
-/// at start, the cache and the held error pages emptied, then the log line an
-/// operator reads a publish as. The cache refills on demand.
+/// at start, the cache and the held error pages swapped for empty ones in one
+/// assignment each, then the log line an operator reads a publish as. The
+/// cache refills on demand.
+///
+/// The swap and the reason for it are in [`Cache::swap_generation`]: no entry
+/// survives the generation, and a request already holding one finishes on its
+/// clone.
 fn follower_change(state: &mut ServerState, from: u64, to: u64) {
     match RouteTable::from_config(&state.config) {
         Ok(table) => state.route_table = table,
@@ -1899,8 +1909,8 @@ fn follower_change(state: &mut ServerState, from: u64, to: u64) {
             "genid: route table rebuild failed; keeping the old table"
         ),
     }
-    state.cache.clear();
-    state.error_pages.clear();
+    drop(state.cache.swap_generation());
+    state.error_pages = HashMap::new();
     info!(from, to, "genid changed");
 }
 

@@ -143,6 +143,13 @@ While the upstream does not answer, it serves every page it holds, at any age, r
 `/perf` reports the node's ID, its upstream's round trip and whether the upstream is down.
 Verified by `genid_cache_node.rs`, which starts a real source and a real cache node and covers the start-time ID, a publish through the node, a wake from a newer reply, serving held content with the source stopped, recovery, the forwarded `/genid` token check and warm fetches waiting for the ID, and by `genid_cache_allocs.rs`, which measures 0 allocations in 2000 store checks.
 
+**A generation change on a cache node swaps the cache in one step.**
+The rule is a full flush: no entry survives into the new generation, and the cache refills on demand.
+Each replacement is one assignment, so a request sees the old generation or the new one and never a half-emptied cache.
+A request already holding an entry finishes on the content it took, and the old generation stays whole for every holder until it drops.
+The swap keeps the cache's byte bound and clears the serve-held policy, because it runs exactly when the upstream has answered with the new ID.
+Verified by the `cache.rs` generation swap tests, which pin the full flush, the held response and the old generation staying whole, the bound and the serve-held reset, and by `genid_cache_allocs.rs`, which measures 2 allocations for a 4096-entry swap and 0 in 2000 store checks and 1000 hits.
+
 ### Security
 
 **rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host; the update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
