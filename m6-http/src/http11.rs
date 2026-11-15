@@ -2044,7 +2044,15 @@ fn write_response(
 ) {
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes());
+    // Every line below is appended from the slice it already is: the borrowed
+    // name, the borrowed value, `itoa`'s formatting buffer. A `format!` here
+    // built a `String` per line, which was fifteen of a miss's ninety-one
+    // allocations and bought nothing the output buffer could not hold.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(itoa::Buffer::new().format(status).as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
     // Any upstream copy of a header this function emits itself is dropped
     // here, or the response goes out carrying both.
     //
@@ -2059,7 +2067,10 @@ fn write_response(
         if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection") {
             continue;
         }
-        out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
     // Applied at serialisation so every response carries them regardless of
     // which path produced it (cache hit, backend, error page, 429).
@@ -2082,7 +2093,9 @@ fn write_response(
         body.len()
     };
     if status_may_have_content_length(status) {
-        out.extend_from_slice(format!("content-length: {}\r\n", cl).as_bytes());
+        out.extend_from_slice(b"content-length: ");
+        out.extend_from_slice(itoa::Buffer::new().format(cl).as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
     // A response the recipient cannot frame must close, whatever either side
     // would prefer: without Content-Length the body ends at end-of-connection,
