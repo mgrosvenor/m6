@@ -980,7 +980,7 @@ fn render(d: &digest::Digest) -> String {
         } else {
             n.pools
                 .iter()
-                .map(|(name, a, t)| format!("{name} {a}/{t}"))
+                .map(|(name, count)| format!("{name} {count}"))
                 .collect::<Vec<_>>()
                 .join(" &middot; ")
         };

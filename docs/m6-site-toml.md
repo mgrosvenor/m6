@@ -521,9 +521,9 @@ A backend uses `sockets` or `url` for its upstream, and a route names the backen
 m6-http expands the glob once at start and adds every matching socket to the backend's pool.
 A glob that matches no socket stops the start with exit 2, before any listener binds.
 A new or removed socket needs a restart of m6-http.
-The pool sends a request to the member with the fewest connections in flight.
-A connection that fails takes that member out of rotation for 1 second, then 2, 4, 8, 16 and 30 seconds as failures repeat, so a restarting backend is not hammered.
-A completed exchange clears the count.
+The pool sends each request to the next member in turn, so `N * k` requests put exactly `k` on each of `N` members.
+A request whose connect fails tries the next member, and a client receives 502 only when every member has failed.
+A backend that stops and restarts on the same path serves again on its next turn.
 
 **URL backend.**
 A URL backend names one remote upstream, so it has no socket pool and no load balancing.

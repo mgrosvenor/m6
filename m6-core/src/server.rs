@@ -297,8 +297,7 @@ mod tests {
 ///
 /// `SO_REUSEADDR` is the right tool and not a blunt one: it permits binding
 /// over `TIME_WAIT`, and still refuses a port that has a **live** listener, so
-/// a genuine "something else is already running here" is still an error. That
-/// is `SO_REUSEPORT`, which this deliberately does not set.
+/// a genuine "something else is already running here" is still an error.
 pub fn bind_tcp_reuseaddr(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let domain = match addr {
         std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
@@ -345,8 +344,7 @@ mod bind_tests {
 
     /// And it is not a blunt instrument. A port with a **live** listener is
     /// still refused, so "something else is already running here" stays an
-    /// error rather than two servers silently sharing a port. That would be
-    /// `SO_REUSEPORT`, which this deliberately does not set.
+    /// error rather than two servers silently sharing a port.
     #[test]
     fn a_live_listener_still_refuses_a_second_bind() {
         let held = bind_tcp_reuseaddr(loopback(0)).expect("first bind");

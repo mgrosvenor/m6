@@ -776,12 +776,11 @@ deployment, which turns a blind probe into a tuning loop. With no token
 configured `/perf` is a 404, not a 401, so forgetting to configure it fails
 closed and does not advertise a door.
 
-`HealthReport::build(node, pools)` returns `(u16, HealthReport)` and
-`into_response(code)`. Health means "this node can serve", not "the fleet is
-fine": a cache node has no socket pools at all, so a naive "0 members means
-unhealthy" check reports both edges as permanently down, and a cache node with
-a warm cache keeps serving correctly while the origin is unreachable, which is
-the entire point of having edges.
+`HealthReport::build(node)` returns `(u16, HealthReport)` and
+`into_response(code)`, always 200 `ok`. The answer covers the m6-http process.
+Backend liveness is outside it: a socket pool keeps no per-member health state,
+so a dead member is found when a request connects to it and that request takes
+the next member.
 
 `PerfReport::build(...)`, `PerfOutcome`, `metrics_authorised(...)`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.

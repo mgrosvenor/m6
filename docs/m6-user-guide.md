@@ -1561,12 +1561,12 @@ To scale back down:
 systemctl disable --now m6-html@2
 ```
 
-The socket disappears and m6-http backs the member off, and it serves again once a listener is bound there.
+The socket disappears and m6-http keeps the member in its rotation. Each request that lands on it tries the next member, and the instance serves again on its next turn once a listener is bound there.
 
 ### 7.12. Crash recovery
 
 systemd restarts a failed unit with `Restart=on-failure` and `RestartSec=2`.
-During the brief restart window, m6-http's pool backoff handles the missing socket and answers the affected routes with a 502 until the socket reappears.
+During the brief restart window, a request that lands on the missing socket tries the next member and is served. If every member of the pool is down, the affected routes answer 502 until one is back.
 
 ```bash
 systemctl kill -s KILL m6-html
@@ -1576,7 +1576,7 @@ journalctl -u m6-html -f
 # ... m6-html started, listening on /run/m6/m6-html.sock
 ```
 
-m6-http serves again once a listener is bound there.
+m6-http serves from the pool again on the next turn once a listener is bound there.
 
 Example 06 shows the same site running as five supervised units.
 Example 07 makes the development and production split explicit, with one `site.toml` and a system config per environment.

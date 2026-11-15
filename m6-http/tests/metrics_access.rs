@@ -245,7 +245,7 @@ impl Fixture {
     }
 
     /// Start m6-http and wait until `/health` answers. The backend socket is a
-    /// placeholder with no listener, so the answer is 503 (degraded): any
+    /// placeholder with no listener, so a request through it answers 503: any
     /// status proves serving.
     fn start(self) -> Running {
         let mut svc = Service::spawn("m6-http-metrics", &mut self.command());

@@ -43,10 +43,10 @@ Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at 
 **Pool management:**
 - Members are the sockets the glob matches when m6-http starts
 - A pool whose glob matches no socket at start exits 2
-- Failed connection → member backed off, retried after 1s, 2s, 4s, max 30s
-- A backend that restarts on the same socket path serves again after its backoff
+- A request that fails to connect tries the next member, and the client receives 502 only when every member has failed
+- A backend that stops and restarts on the same socket path serves again on its next turn
 
-**Load balancing:** least-connections across active pool members.
+**Load balancing:** plain round robin. Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members.
 
 **URL backends** (`http://`, `https://`) are not a member pool: each request takes one HTTP/1.1 connection, kept open for later requests in a per-backend idle set of up to eight, driven by the event loop through a `client::Upstream` slot with no dedicated I/O thread.
 
@@ -457,6 +457,7 @@ Structured JSON to stdout. journald captures via systemd.
 Emitted events: startup, request complete (path, status, backend, latency_us, cache_hit), auth failure (warn), pool change (info), cache eviction (debug).
 
 Periodic stats: `requests`, `rps_avg`, `rps_peak`, `latency_p50_us`, `latency_p99_us`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`.
+`pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
 
 ---
 

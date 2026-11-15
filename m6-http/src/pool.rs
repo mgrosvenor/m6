@@ -1,67 +1,16 @@
-/// Backend pool management: socket discovery, least-connections load balancing.
+//! Backend pool management: socket discovery and round-robin member choice.
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::config::BackendConfig;
-
-/// State of a single backend socket member.
-#[derive(Debug)]
-struct PoolMember {
-    path: PathBuf,
-    /// In-flight connection count.
-    connections: usize,
-    /// If temporarily removed due to failure, when to retry.
-    retry_at: Option<Instant>,
-    /// Number of consecutive failures (for backoff).
-    failure_count: u32,
-}
-
-impl PoolMember {
-    fn new(path: PathBuf) -> Self {
-        PoolMember {
-            path,
-            connections: 0,
-            retry_at: None,
-            failure_count: 0,
-        }
-    }
-
-    fn is_available(&self) -> bool {
-        match self.retry_at {
-            None => true,
-            Some(t) => m6_core::platform::now() >= t,
-        }
-    }
-
-    fn backoff_duration(&self) -> Duration {
-        // After failure_count incremented: 1→1s, 2→2s, 3→4s, ... max 30s
-        let secs = if self.failure_count == 0 {
-            1
-        } else {
-            // The exponent is capped before the shift: 2^5 already passes the
-            // 30 s ceiling, and an uncapped shift overflows at the 65th
-            // failure, which a release build turns into an abort.
-            (1u64 << (self.failure_count - 1).min(5)).min(30)
-        };
-        Duration::from_secs(secs)
-    }
-
-    fn mark_failed(&mut self) {
-        self.failure_count += 1;
-        self.retry_at = Some(m6_core::platform::now() + self.backoff_duration());
-    }
-
-    fn mark_success(&mut self) {
-        self.failure_count = 0;
-        self.retry_at = None;
-    }
-}
 
 /// A pool for a single named backend (socket-based).
 pub struct BackendPool {
     pub name: String,
     pub socket_glob: String,
-    members: Vec<PoolMember>,
+    /// The member sockets, in the order the glob found them.
+    members: Vec<PathBuf>,
+    /// The member the next request takes.
+    next: usize,
 }
 
 impl BackendPool {
@@ -70,74 +19,28 @@ impl BackendPool {
             name,
             socket_glob,
             members: Vec::new(),
+            next: 0,
         }
     }
 
     /// Add a socket path to the pool (if not already present).
     pub fn add_socket(&mut self, path: PathBuf) {
-        if !self.members.iter().any(|m| m.path == path) {
+        if !self.members.iter().any(|m| m == &path) {
             m6_core::log::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
-            self.members.push(PoolMember::new(path));
+            self.members.push(path);
         }
     }
 
-    /// Pick the least-connections available member.
-    /// Returns index into members.
-    fn pick_member(&mut self) -> Option<usize> {
-        let mut best: Option<usize> = None;
-        let mut best_conns = usize::MAX;
-
-        for (i, m) in self.members.iter().enumerate() {
-            if m.is_available() && m.connections < best_conns {
-                best_conns = m.connections;
-                best = Some(i);
-            }
-        }
-        best
-    }
-
-    /// Take the least-connections available member for an async caller,
-    /// returning its borrowed socket path and index without cloning the path.
-    /// The caller must call `release`, `cancel` or `mark_failed` when done.
-    pub fn take_member(&mut self) -> Result<(&Path, usize), PoolError> {
-        let idx = self.pick_member().ok_or(PoolError::Empty)?;
-        self.members[idx].connections += 1;
-        Ok((&self.members[idx].path, idx))
-    }
-
-    /// Mark a connection attempt as failed (for async callers).
-    pub fn mark_failed(&mut self, idx: usize) {
-        if let Some(m) = self.members.get_mut(idx) {
-            m6_core::log::warn!(
-                pool = %self.name,
-                socket = %m.path.display(),
-                "pool: connection failed, backing off"
-            );
-            m.connections = m.connections.saturating_sub(1);
-            m.mark_failed();
-        }
-    }
-
-    /// Release a member and clear its failures. A member is released when the
-    /// exchange completed, whatever the status (a member that answers 503 is
-    /// reachable), or when the peer closed before the whole request was
-    /// written: a request it never took whole says nothing about its health.
-    /// A timeout or a failure after the whole request was written marks it failed.
-    pub fn release(&mut self, idx: usize) {
-        if let Some(m) = self.members.get_mut(idx) {
-            if m.connections > 0 {
-                m.connections -= 1;
-            }
-            m.mark_success();
-        }
-    }
-
-    /// Release a connection that never reached the member, because m6-http
-    /// refused the request itself. Says nothing about the member's health.
-    pub fn cancel(&mut self, idx: usize) {
-        if let Some(m) = self.members.get_mut(idx) {
-            m.connections = m.connections.saturating_sub(1);
-        }
+    /// The next member's socket path, in turn, or `None` when the pool is
+    /// empty.
+    ///
+    /// Each call advances the cursor. A request whose connect fails takes the
+    /// member after the one it just tried, so one dead member costs one failed
+    /// connect and the request is still served by the next member.
+    pub fn take_member(&mut self) -> Option<&Path> {
+        let path = self.members.get(self.next)?;
+        self.next = (self.next + 1) % self.members.len();
+        Some(path)
     }
 
     /// Expand the glob once at start and add every matching socket.
@@ -148,28 +51,17 @@ impl BackendPool {
         };
 
         for p in found {
-            if !self.members.iter().any(|m| m.path == p) {
+            if !self.members.iter().any(|m| m == &p) {
                 m6_core::log::info!(pool = %self.name, socket = %p.display(), "pool: socket found");
-                self.members.push(PoolMember::new(p));
+                self.members.push(p);
             }
         }
     }
 
-    /// Number of active (available) members.
-    pub fn active_count(&self) -> usize {
-        self.members.iter().filter(|m| m.is_available()).count()
-    }
-
-    /// Total member count (including temporarily unavailable).
+    /// Total member count.
     pub fn total_count(&self) -> usize {
         self.members.len()
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PoolError {
-    #[error("pool is empty")]
-    Empty,
 }
 
 /// A URL-based backend (remote HTTP/HTTPS upstream).
@@ -503,22 +395,21 @@ impl PoolManager {
         &mut self.url_backends[idx]
     }
 
-    /// Total active (non-failed) members across all pools — for stats reporting.
-    pub fn total_active_members(&self) -> usize {
-        self.pools.iter().map(|(_, p)| p.active_count()).sum()
+    /// Total members across all socket pools, for stats reporting.
+    pub fn total_members(&self) -> usize {
+        self.pools.iter().map(|(_, p)| p.total_count()).sum()
     }
 
-    /// Per-pool occupancy for the health endpoint.
+    /// Per-pool member counts for `/perf`.
     ///
-    /// Deliberately per-pool rather than the summed `total_active_members()`
-    /// above: a node with a healthy m6-html and a dead render-contact sums to
-    /// a non-zero total and looks fine, when one of its backends cannot serve
-    /// at all. The sum answers "is anything alive"; health needs "is
-    /// everything alive".
-    pub fn pool_health(&self) -> Vec<(String, usize, usize)> {
+    /// This is the count alone: the pool carries no per-member health state,
+    /// so every member stays in rotation. A member whose backend is down is
+    /// found when a request connects to it, and that request takes the next
+    /// member.
+    pub fn pool_health(&self) -> Vec<(String, usize)> {
         self.pools
             .iter()
-            .map(|(name, p)| (name.clone(), p.active_count(), p.total_count()))
+            .map(|(name, p)| (name.clone(), p.total_count()))
             .collect()
     }
 
@@ -543,105 +434,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_long_run_of_failures_backs_off_thirty_seconds_and_never_overflows() {
-        // An uncapped shift overflows at the 65th failure; a release build
-        // aborts on it.
-        let mut m = PoolMember::new(PathBuf::from("/tmp/x.sock"));
-        for _ in 0..1000 {
-            m.mark_failed();
+    fn take_member_returns_each_member_in_turn() {
+        let mut pool = BackendPool::new("app".to_string(), "/tmp/*.sock".to_string());
+        let a = PathBuf::from("/tmp/app-a.sock");
+        let b = PathBuf::from("/tmp/app-b.sock");
+        pool.add_socket(a.clone());
+        pool.add_socket(b.clone());
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            order.push(pool.take_member().map(Path::to_path_buf));
         }
-        assert_eq!(m.backoff_duration(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn a_successful_request_clears_the_member_failures() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sock = dir.path().join("a.sock");
-        let mut pool =
-            BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
-        pool.add_socket(sock);
-        let (_, idx) = pool.take_member().expect("member");
-        pool.mark_failed(idx);
-        assert_eq!(pool.members[idx].failure_count, 1);
-        pool.members[idx].retry_at = None;
-        let (_, idx) = pool.take_member().expect("member again");
-        pool.release(idx);
         assert_eq!(
-            pool.members[idx].failure_count, 0,
-            "a success must reset the count"
+            order,
+            vec![Some(a.clone()), Some(b.clone()), Some(a), Some(b)],
+            "the turn must repeat every member in order"
         );
-        assert!(pool.members[idx].retry_at.is_none());
     }
 
     #[test]
-    fn a_request_refused_before_forwarding_leaves_the_member_alone() {
-        // The wrong outcome: m6-http's own refusal backs the member off, so
-        // one malformed request makes a one-member pool answer 502.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut pool =
-            BackendPool::new("p".into(), dir.path().join("*.sock").display().to_string());
-        pool.add_socket(dir.path().join("a.sock"));
-        let (_, idx) = pool.take_member().expect("member");
-        pool.cancel(idx);
-        assert_eq!(pool.members[idx].connections, 0);
-        assert_eq!(pool.members[idx].failure_count, 0);
-        assert!(pool.members[idx].retry_at.is_none());
-    }
-
-    #[test]
-    fn test_empty_pool_returns_error() {
+    fn an_empty_pool_has_no_member() {
         let mut pool = BackendPool::new("test".to_string(), "/run/m6/*.sock".to_string());
-        assert!(matches!(pool.take_member(), Err(PoolError::Empty)));
+        assert!(pool.take_member().is_none());
     }
 
     #[test]
-    fn test_socket_not_added_twice() {
+    fn a_socket_is_not_added_twice() {
         let path = PathBuf::from("/tmp/test.sock");
         let mut pool = BackendPool::new("test".to_string(), "/tmp/*.sock".to_string());
         pool.add_socket(path.clone());
-        pool.add_socket(path.clone());
+        pool.add_socket(path);
         assert_eq!(pool.total_count(), 1);
-    }
-
-    /// A failed member is skipped while its backoff lasts.
-    ///
-    /// The bug this catches: `pick_member` ignoring the backoff and keeping a
-    /// dead socket in rotation, so a request still lands on the failed member
-    /// and answers 502 instead of shifting to a healthy one.
-    #[test]
-    fn test_pick_member_skips_failed_member_during_backoff() {
-        let mut pool = BackendPool::new("app".to_string(), "/tmp/*.sock".to_string());
-        pool.add_socket(PathBuf::from("/tmp/app-a.sock"));
-        pool.add_socket(PathBuf::from("/tmp/app-b.sock"));
-
-        pool.mark_failed(0);
-
-        assert_eq!(
-            pool.pick_member(),
-            Some(1),
-            "the failed member must be skipped until its backoff ends"
-        );
-    }
-
-    /// A member is picked again once its backoff has ended.
-    ///
-    /// The bug this catches: `pick_member` treating the backoff as permanent,
-    /// so a recovered backend stays out of the pool for good. The backoff is
-    /// rolled forward in place rather than slept through, because a fixed sleep
-    /// is a timing guess.
-    #[test]
-    fn test_pick_member_picks_member_again_after_backoff_ends() {
-        let mut pool = BackendPool::new("app".to_string(), "/tmp/*.sock".to_string());
-        pool.add_socket(PathBuf::from("/tmp/app-a.sock"));
-        pool.add_socket(PathBuf::from("/tmp/app-b.sock"));
-
-        pool.mark_failed(0);
-        pool.members[0].retry_at = Some(m6_core::platform::now() - Duration::from_secs(1));
-
-        assert_eq!(
-            pool.pick_member(),
-            Some(0),
-            "the recovered member must be picked again after its backoff ends"
-        );
     }
 }

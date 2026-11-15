@@ -372,10 +372,11 @@ impl Upstream {
         match addr {
             Addr::Unix(path) => {
                 // A Unix connect completes at once or fails. On Linux WouldBlock
-                // means the listen backlog is full, which the caller answers as
-                // 503 and keeps the member. macOS answers ConnectionRefused for a
-                // full queue and for no listener alike, so there a full queue
-                // reads as a failed member for one backoff.
+                // means the listen backlog is full, which the caller treats as a
+                // failed connect and tries the next member for the same request.
+                // macOS answers ConnectionRefused for a full queue and for no
+                // listener alike, so the same rule applies there without a
+                // separate case.
                 let sock = crate::platform::net::connect_unix(path)?;
                 self.stream = Some(Stream::Unix(sock));
                 self.tls = tls_conn;

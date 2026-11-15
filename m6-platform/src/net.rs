@@ -4,9 +4,7 @@
 //! On macOS every socket made here has `SO_NOSIGPIPE`, so a write to a closed
 //! peer is an error and never a signal. On Linux there is no such option and
 //! none is needed: the Rust runtime ignores `SIGPIPE` in every binary, so the
-//! same write is `BrokenPipe` on both. m6 does not set `SO_REUSEPORT` on any
-//! listener, because Linux balances connections across the sockets that share
-//! a port and macOS does not, so nothing may rely on it.
+//! same write is `BrokenPipe` on both.
 //!
 //! The default socket buffer sizes differ (about 128 KiB on macOS, about
 //! 208 KiB on Linux, both tunable by the host). A test that depends on a size

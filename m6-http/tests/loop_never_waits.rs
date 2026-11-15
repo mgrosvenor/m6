@@ -6,8 +6,8 @@
 //! slow backend held every connection on the node -- cache hits included -- for
 //! up to `backend_timeout_secs`. The fix drives each socket-backend request as
 //! a non-blocking upstream in the loop, so a cache hit is served while a slow
-//! backend is still thinking, and least-connections now sees real in-flight
-//! counts so concurrent misses spread across the members.
+//! backend is still thinking, and the pool's round-robin turn spreads concurrent
+//! misses across the members.
 //!
 //! Each test stands up a real `m6-http` in front of one or two fake socket
 //! backends. Every wait is on a signal (a backend reporting it received a
@@ -813,7 +813,7 @@ fn two_held_requests_land_on_two_members() {
 }
 
 #[test]
-fn a_backend_past_its_timeout_answers_and_frees_the_member() {
+fn a_backend_past_its_timeout_answers_and_the_member_stays_in_turn() {
     // A one-second deadline: /slow is never released, so it must answer 502.
     let fx = Fixture::start(1, 1, "timeout");
 
@@ -824,8 +824,8 @@ fn a_backend_past_its_timeout_answers_and_frees_the_member() {
         "a backend past its timeout must answer 502: {body}"
     );
 
-    // The member was backed off for one second; once it recovers, a /fast miss
-    // on the same member is served. Poll with a deadline rather than sleep.
+    // One member, so the next /fast miss takes the same member again and is
+    // served. Poll with a deadline rather than sleep.
     let recovered = (|| {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -842,7 +842,7 @@ fn a_backend_past_its_timeout_answers_and_frees_the_member() {
     })();
     assert!(
         recovered,
-        "the member never served /fast after its backoff\n--- m6-http ---\n{}",
+        "the member never served /fast again\n--- m6-http ---\n{}",
         fx.service.output()
     );
 }
@@ -1045,7 +1045,7 @@ fn a_request_body_larger_than_the_tls_plaintext_buffer_arrives_whole() {
 }
 
 #[test]
-fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
+fn a_backend_that_resets_mid_response_answers_502_and_the_next_request_is_served() {
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path().to_path_buf();
     let ck =
@@ -1088,18 +1088,18 @@ fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
     let mut service = service;
     service.wait_for_tcp(port, Duration::from_secs(20));
 
-    // The first request hits the resetting member and answers 502, and the
-    // member is backed off. The overcorrected form (release on every error)
-    // keeps it in rotation, so this assertion pins the backoff.
+    // The first request takes the resetting member and answers 502: the
+    // failure comes after the connect, and only a failed connect moves the
+    // request to the next member.
     let (first, _) = h1_get(port, "/fast", Duration::from_secs(5)).expect("first GET");
     assert_eq!(first, 502, "a resetting backend must answer 502");
 
-    // The next request must be served by the healthy member.
+    // The next request takes the next member in turn, the healthy one.
     let (second, body) = h1_get(port, "/fast", Duration::from_secs(5)).expect("second GET");
     assert_eq!(
         second,
         200,
-        "the pool must fail over to the healthy member, got: {body}\n--- m6-http ---\n{}",
+        "the next request must be served by the healthy member, got: {body}\n--- m6-http ---\n{}",
         service.output()
     );
     assert_eq!(body, FAST_BODY);
@@ -1174,16 +1174,16 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
     );
 }
 
-/// A client that closes while its `/slow` is in flight must leave the pool
-/// usable: when the reply arrives for the gone waiter, both members are still
-/// in rotation, and the two requests that follow land one on each.
+/// A client that closes while its `/slow` is in flight does not wedge the
+/// server: the held reply for the gone waiter is discarded, and two later
+/// `/slow` requests both answer 200.
 ///
-/// This proves rotation, not release. A leaked in-flight count that still lets
-/// the member be picked would pass it, because a single leaked count has no
-/// external observable here: a two-member pool still picks that member for one
-/// of two overlapping requests. The two commands do overlap, because the
-/// backends release every held reply only once the second has arrived, so the
-/// distribution is the sequence and no duration is asserted.
+/// Round robin spreads those two requests across both members by construction,
+/// so that spread says nothing about a leaked upstream. What this test still
+/// asserts is that a gone waiter's held reply does not stop later requests from
+/// being dispatched and answered. The backends release every held reply once
+/// the third request has arrived, so the two new requests are in flight
+/// together, the distribution is the sequence, and no duration is asserted.
 #[test]
 fn a_closed_client_does_not_leak_its_upstream() {
     let fx = Fixture::start(2, 30, "leak");

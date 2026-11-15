@@ -364,26 +364,6 @@ pub fn request_target_is_safe(target: &[u8]) -> bool {
     !target.iter().any(|&b| b <= b' ' || b == 0x7f)
 }
 
-/// A request m6-http refuses to send to a backend, as the error inside the
-/// `io::Error` a forward returns. A refusal is about the request, not the
-/// backend, so a caller must not count it as a backend failure; its own type
-/// keeps it apart from an `InvalidInput` the operating system raises.
-#[derive(Debug)]
-pub struct Refused(pub String);
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Refused {}
-
-/// True when a forward's error is m6-http's own refusal (see [`Refused`]).
-pub fn is_refusal(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<Refused>())
-}
-
 /// Everything this proxy is about to write into a request line or header block.
 ///
 /// Checked in one place, and checked for *every* ingress protocol rather than
@@ -503,9 +483,7 @@ fn encode_forwarded(
     if let Err(what) = check_forwardable(req, client_ip, original_host) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            Refused(format!(
-                "refusing to forward: unsafe {what} would inject HTTP/1.1 framing"
-            )),
+            format!("refusing to forward: unsafe {what} would inject HTTP/1.1 framing"),
         ));
     }
 
@@ -934,19 +912,6 @@ mod smuggling_tests {
                 "value {a:?} must be refused"
             );
         }
-    }
-
-    /// Only m6-http's own refusal is a refusal. The wrong outcome: an
-    /// `InvalidInput` the operating system raises (a zero read timeout, a
-    /// socket path too long) passes for one, so a misconfigured backend is
-    /// never backed off.
-    #[test]
-    fn only_a_refusal_is_a_refusal() {
-        let refused = io::Error::new(io::ErrorKind::InvalidInput, Refused("x".into()));
-        assert!(is_refusal(&refused));
-        let os = io::Error::new(io::ErrorKind::InvalidInput, "path too long");
-        assert!(!is_refusal(&os));
-        assert!(!is_refusal(&io::Error::from(io::ErrorKind::InvalidInput)));
     }
 
     /// A header the proxy strips can never reach the backend, so refusing on it
