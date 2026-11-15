@@ -169,16 +169,19 @@ Run the test with the feature, serially:
 cargo test -p m6-http --test allocations --features count-allocations -- --test-threads=1 --nocapture
 ```
 
-`tests/allocations.rs` starts the binary cargo built with the feature, sends one warm-up request and then 100 or 1,100 requests, sends SIGTERM and reads the stop line.
-The per-request figure is the difference between the two runs divided by 1,000, so start-up and warm-up cancel.
+`tests/allocations.rs` starts the binary cargo built with the feature, sends one warm-up request and then 1,000 requests on one connection and 2,000 requests on another, sends SIGTERM and reads each stop line.
+The per-request figure is `(2N count - N count) / N`, so the one handshake and the one backend-connecting first request in each run sit in both counts and cancel.
 The four rows measured on macOS on 2026-11-15:
 
 - `h1_tls_hit`, a cached page on one keep-alive connection over TLS: 11.000 calls per request.
 - `h2_tls_hit`, the same over HTTP/2: 91.000 calls per request.
-- `h1_tls_miss_insert`, a new query string each time so each request reaches the backend and is stored: 91.004 calls per request.
-- `h1_tls_new_connection`, a cached page with a full TLS handshake per request: 123.000 calls per request.
+- `h1_tls_miss_insert`, a new query string each time so each request reaches the backend and is stored: 91.001 calls per request.
+- `h1_tls_new_connection_per_connection`, a cached page with a full TLS handshake per request, measured per connection: 123.000 calls per connection.
 
-Each budget in the test is that row's measured count plus 0.2 call per request, which covers the one handshake and one backend-connecting first request inside each difference.
+The difference did not repeat exactly under load: over the runs h1 read 10.997 to 11.003, h2 90.996 to 91.004 and the miss row 90.998 to 91.004.
+The three request budgets are the top of that observed spread, with nothing added on top: 11,003, 91,004 and 91,004 calls per 1,000 requests.
+The miss row's one call above 91,000 is the single cache-table growth that its 1,000 inserts trigger.
+The new-connection row is a measure, not a budget: a full handshake per connection read 122.859 to 123.849 per connection across the runs, so a per-connection ceiling would flake.
 The budgets only go down. Each ALLOC job lowers the row it attacks, and a row above its budget fails the test.
 
 ---
