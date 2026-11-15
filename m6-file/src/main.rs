@@ -20,6 +20,7 @@
 
 mod compress;
 mod handler;
+mod site_size;
 
 use std::io;
 use std::time::Duration;
@@ -58,6 +59,34 @@ fn main() -> Result<()> {
 
     // ── start: blocking and allocation are fine ──────────────────────────
     let mut site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
+
+    // What the document roots carry is a start question, asked once. A leak
+    // here is a file nobody meant to publish, and a route's root is the only
+    // tree it can reach, so the answer cannot wait for a request.
+    let site_dir = site.site_dir().to_path_buf();
+    let roots = site_size::served_roots(&site_dir, &site.config().routes);
+    let report = match site_size::inspect(&roots) {
+        Ok(report) => report,
+        Err(e) => fail(
+            &format!("reading the document root {}", site_dir.display()),
+            e,
+        ),
+    };
+    if !report.refused.is_empty() {
+        eprintln!("{}", site_size::refusal(&site_dir, &report.refused));
+        std::process::exit(2);
+    }
+    if !report.warned.is_empty() {
+        eprintln!("{}", site_size::warning(&site_dir, &report.warned));
+    }
+    let budget_mb = site
+        .config()
+        .site_size_budget_mb
+        .unwrap_or(site_size::DEFAULT_BUDGET_MB);
+    if report.bytes > site_size::budget_bytes(budget_mb) {
+        eprintln!("{}", site_size::over_budget(&site_dir, &report, budget_mb));
+    }
+
     let read_timeout = site.read_timeout();
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is

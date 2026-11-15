@@ -288,7 +288,7 @@ A service's loop calls `Site::load` once at start, then per request `handle`, it
 **Start.** `Site::load` reads the command line (`--version`, `--dump-config`), the config, `site.toml`, the logging settings, the route table, templates and params.
 It exits 2 on a configuration error and 1 when logging cannot start, and it refuses a route that names a handler nothing provides.
 `name` is the service's name for the lifecycle lines.
-`read_timeout`, `socket_mode` and `socket_path` are what the loop binds and applies, and `user_config`, `site_dir`, `config_path` and `site_toml` are the roots a service resolves its own files against.
+`read_timeout`, `socket_mode` and `socket_path` are what the loop binds and applies, and `user_config`, `config`, `site_dir`, `config_path` and `site_toml` are the roots a service resolves its own files against. `config` is the whole parsed renderer config, for a start check a service runs itself.
 
 ```rust
 pub const GENID_PATH: &str;
@@ -298,6 +298,7 @@ pub fn socket_path(&self) -> &Path;
 pub fn read_timeout(&self) -> Option<Duration>;
 pub fn socket_mode(&self) -> u32;
 pub fn user_config(&self) -> &Map<String, Value>;
+pub fn config(&self) -> &crate::config::RendererConfig;
 pub fn site_dir(&self) -> &Path;
 pub fn config_path(&self) -> &Path;
 pub fn site_toml(&self) -> &Path;
