@@ -663,6 +663,8 @@ pub fn genid_perf_response(
                     "written_last_tick": writer.written_last_tick(),
                     "written_bytes_last_tick": writer.written_bytes_last_tick(),
                     "skipped_full": writer.skipped_full(),
+                    "ticks": writer.ticks(),
+                    "tick_last_ns": writer.tick_last_ns(),
                 }),
             );
         }

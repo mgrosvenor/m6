@@ -31,13 +31,24 @@ use rustls::StreamOwned;
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 use m6_http_lib::disk_cache;
 
-/// The body of the load test's page, in bytes. About 400 of these fit one
-/// 4 MiB tick, because a file is the body plus its metadata.
+/// The body of the load test's page, in bytes. At about 400 us per file in this
+/// debug build, one 1 ms tick writes two or three of them.
 const LOAD_BODY_LEN: usize = 10_000;
 
-/// Entries the load test queues while it holds the tick: more than one tick's
-/// 4 MiB budget, so the first tick after the hold is a full-budget tick.
+/// Entries the load test queues while it holds the tick: far more than one
+/// tick's 1 ms loop-time budget, so the queue drains over the ticks that
+/// follow the hold.
 const LOAD_KEYS: usize = 500;
+
+/// Old-generation files the load test seeds, so the drain also carries the
+/// removal work a generation change leaves behind.
+const LOAD_OLD_FILES: usize = 1_000;
+
+/// The most the median write tick may take. The 1 ms budget plus the one file
+/// that was in progress when it ran out puts the usual tick at 1.0 to 1.6 ms;
+/// this catches a regression to a full queue's half-second tick while leaving
+/// the filesystem's own stalls in the reported tail rather than the gate.
+const TICK_WORK_MEDIAN_MAX_NS: u64 = 2_000_000;
 
 // ── Responses ─────────────────────────────────────────────────────────────────
 
@@ -722,28 +733,33 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
     assert_eq!(&response.body[..], b"first: one");
 }
 
-/// A tick under load: the 4 MiB write budget and the 512-file removal budget,
-/// and the loop's longest iteration while the writer is busy.
+/// A tick under load: the 1 ms loop-time budget bounds one tick's loop work
+/// and the queue drains over the ticks that follow.
 ///
 /// Five hundred entries of 10,000 bytes are queued while the writer's tick is
-/// held, more than the roughly 400 files a tick writes under the 4 MiB budget.
-/// The first tick after the hold therefore reaches the budget. The cache root
-/// starts with 1,000 files under generation `999`, so removal ticks take 512
-/// files each. The report is the loop `work_max_ns` while the writer is busy:
-/// the build host's cache-hit latency A/B runs the same node with the writer
-/// busy and idle.
+/// held, far more than one 1 ms tick writes. The cache root also starts with
+/// 1,000 files under generation `999`, so the drain carries the removal work a
+/// generation change leaves behind. The test releases the hold and reads
+/// `/perf` while the queue drains, recording the writer's tick time and the
+/// loop's `work_max_ns` for every tick. The build host's cache-hit latency A/B
+/// runs the same node with the writer busy and idle.
 ///
-/// Break: remove `disk.tick` from the accounting tick, and `dir_bytes` stays 0.
+/// The report is the number of ticks 500 files take and the distribution of the
+/// loop's longest iteration across them. The same tick held the loop for 0.44
+/// to 0.52 s before the time budget.
+///
+/// Break: drop the time check from `tick`, and the first tick after the hold
+/// writes the whole queue and holds the loop for a third of a second.
 #[test]
 fn a_full_tick_under_load_reports_its_work_max_ns() {
     let mut stack = Stack::new();
     let old = stack.cache_dir.join("999");
     std::fs::create_dir_all(&old).unwrap();
-    for i in 0..1_000 {
+    for i in 0..LOAD_OLD_FILES {
         std::fs::write(old.join(format!("{i:064x}")), b"old generation file").unwrap();
     }
     // Hold the writer's tick while the backlog is queued, so the first tick
-    // after the hold has more than 4 MiB waiting and fills the budget.
+    // after the hold has the whole queue waiting.
     std::fs::write(&stack.hold_tick, b"hold").unwrap();
     stack.start();
     assert!(
@@ -769,56 +785,134 @@ fn a_full_tick_under_load_reports_its_work_max_ns() {
         );
     }
 
+    let before = stack.perf().text();
+    let ticks_before = number_after(&before, "\"ticks\":").unwrap_or(0);
+    let work_before = loop_work_max_ns(&before);
     std::fs::remove_file(&stack.hold_tick).expect("release the tick");
+
     let want_bytes = (LOAD_KEYS * LOAD_BODY_LEN) as u64;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut max_work_ns = 0u64;
-    let mut full_ticks = 0usize;
-    let mut last_written = 0u64;
-    // After a full tick is seen, keep reading until the stats window that
-    // contains it has been emitted (one second) and copied into `/perf`.
-    let mut settle_until: Option<Instant> = None;
-    let mut polls = 0usize;
-    loop {
+    let deadline = Instant::now() + Duration::from_secs(900);
+    // One sample per tick: the files it wrote, the loop time the writer spent,
+    // and the loop trace's longest iteration for the window that contains it.
+    let mut samples: Vec<(usize, u64, u64)> = Vec::new();
+    let mut last_ticks = ticks_before;
+    let mut drained = false;
+    let mut last_body = String::new();
+    while Instant::now() < deadline {
         let body = stack.perf().text();
-        polls += 1;
-        let bytes = number_after(&body, "\"dir_bytes\":").unwrap_or(0);
-        let written = number_after(&body, "\"written_bytes_last_tick\":").unwrap_or(0);
-        max_work_ns = max_work_ns.max(loop_work_max_ns(&body));
-        if written >= 4_000_000 && written != last_written {
-            full_ticks += 1;
-            settle_until = Some(Instant::now() + Duration::from_millis(1_500));
+        let ticks = number_after(&body, "\"ticks\":").unwrap_or(0);
+        if ticks > last_ticks {
+            let written = number_after(&body, "\"written_last_tick\":").unwrap_or(0) as usize;
+            let tick_ns = number_after(&body, "\"tick_last_ns\":").unwrap_or(0);
+            let loop_ns = loop_work_max_ns(&body);
+            for _ in last_ticks..ticks {
+                samples.push((written, tick_ns, loop_ns));
+            }
+            last_ticks = ticks;
         }
-        last_written = written;
+        let bytes = number_after(&body, "\"dir_bytes\":").unwrap_or(0);
         let queued = body.contains("\"queued\":0");
-        let drained = bytes + 4_096 >= want_bytes && queued && !old.exists();
-        let now = Instant::now();
-        if drained && settle_until.is_none_or(|until| now >= until) {
+        if bytes + 4_096 >= want_bytes && queued && !old.exists() {
+            drained = true;
             break;
         }
-        if now >= deadline {
-            panic!(
-                "the writer did not drain {LOAD_KEYS} files: dir_bytes {bytes} of \
-                 {want_bytes}, {full_ticks} full ticks, queue drained {queued}, old \
-                 directory still there {}:\n{body}",
-                old.exists()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
+        last_body = body;
+        std::thread::sleep(Duration::from_millis(333));
     }
+    assert!(
+        drained,
+        "the writer did not drain {LOAD_KEYS} files in {} ticks: {}:\n{last_body}",
+        samples.len(),
+        "dir_bytes, queue or the old directory never reached the target"
+    );
+
     let files = stack.files_for("0");
     assert_eq!(files.len(), LOAD_KEYS, "every queued entry became one file");
+    assert!(!old.exists(), "the old generation directory was removed");
+
+    let mut written_per_tick: Vec<usize> = samples.iter().map(|(w, ..)| *w).collect();
+    written_per_tick.sort_unstable();
+    let write_ticks = written_per_tick.iter().filter(|w| **w > 0).count();
+    let removal_ticks = samples.len() - write_ticks;
+    let mut write_files: Vec<usize> = written_per_tick
+        .iter()
+        .copied()
+        .filter(|w| *w > 0)
+        .collect();
+    write_files.sort_unstable();
+    let max_written = write_files.last().copied().unwrap_or(0);
+    let p = |v: &[u64], q: usize| v[(v.len() - 1) * q / 100];
+    // Write ticks and removal ticks are measured apart: a generation change's
+    // unlinks are a one-off cost and would hide the queue's own figure.
+    let mut write_tick_ns: Vec<u64> = samples
+        .iter()
+        .filter(|(w, ..)| *w > 0)
+        .map(|(_, t, ..)| *t)
+        .collect();
+    write_tick_ns.sort_unstable();
+    let mut write_loop_ns: Vec<u64> = samples
+        .iter()
+        .filter(|(w, ..)| *w > 0)
+        .map(|(_, _, g)| *g)
+        .collect();
+    write_loop_ns.sort_unstable();
+    let mut remove_tick_ns: Vec<u64> = samples
+        .iter()
+        .filter(|(w, ..)| *w == 0)
+        .map(|(_, t, ..)| *t)
+        .collect();
+    remove_tick_ns.sort_unstable();
+    let max = |v: &[u64]| v.last().copied().unwrap_or(0);
     println!(
-        "full tick under load: {full_ticks} ticks of at least 4,000,000 bytes, {} files, \
-         dir_bytes {want_bytes}, loop work_max_ns {max_work_ns}, generation dirs {:?}",
-        files.len(),
+        "time budget under load: {} ticks to drain {LOAD_KEYS} files ({write_ticks} write \
+         ticks, {removal_ticks} removal ticks), files per write tick {}..={max_written}, \
+         write tick_last_ns min {} p50 {} p90 {} p99 {} max {}, \
+         write loop work_max_ns p50 {} p90 {} p99 {} max {}, \
+         removal tick_last_ns p50 {} p90 {} max {}, \
+         loop work_max_ns before release {work_before}, \
+         dir_bytes {want_bytes}, generation dirs {:?}",
+        samples.len(),
+        write_files.first().copied().unwrap_or(0),
+        write_tick_ns.first().copied().unwrap_or(0),
+        p(&write_tick_ns, 50),
+        p(&write_tick_ns, 90),
+        p(&write_tick_ns, 99),
+        max(&write_tick_ns),
+        p(&write_loop_ns, 50),
+        p(&write_loop_ns, 90),
+        p(&write_loop_ns, 99),
+        max(&write_loop_ns),
+        p(&remove_tick_ns, 50),
+        p(&remove_tick_ns, 90),
+        max(&remove_tick_ns),
         stack.generation_dirs()
     );
     assert!(
-        full_ticks > 0,
-        "no single tick wrote a full 4 MiB budget ({polls} polls)"
+        write_ticks > LOAD_KEYS / 8,
+        "500 files took only {write_ticks} write ticks; the time budget must spread them"
     );
-    assert!(max_work_ns > 0, "the loop trace reported no work");
+    assert!(
+        max_written <= 8,
+        "one tick wrote {max_written} files; the time budget must stop it between files"
+    );
+    // The median is the claim: one file's write fits the budget and the tick
+    // stops before starting another. The tail is the sandbox, which has
+    // recorded multi-second filesystem stalls during these runs, so the
+    // measured percentiles and maximum are printed above and only the body of
+    // the distribution is asserted.
+    assert!(
+        p(&write_tick_ns, 50) <= TICK_WORK_MEDIAN_MAX_NS,
+        "the median write tick took {} ns",
+        p(&write_tick_ns, 50)
+    );
+    // The loop's window maximum also carries every request the test makes, so
+    // its median has a floor set by /perf handling. A tenth of a second still
+    // catches a return to the whole-queue tick.
+    assert!(
+        p(&write_loop_ns, 50) <= 100_000_000,
+        "the median write window's longest loop iteration was {} ns",
+        p(&write_loop_ns, 50)
+    );
 }
 
 /// The node stops, and the file it left behind still decodes to the response it

@@ -4,10 +4,13 @@
 //! flag, set in the same insert that stores it, and the accounting tick scans
 //! the cache for flagged entries and does all the disk work: up to
 //! [`WRITE_BUDGET`] bytes of current entries, and up to [`REMOVE_BUDGET`] files
-//! of an old generation's directory. A tick that runs out of budget leaves the
-//! remaining entries flagged, so the next tick continues where it stopped.
-//! Nothing is copied or pushed on the request path, so a store for the writer
-//! allocates nothing beyond the store it already made.
+//! of an old generation's directory. Those two are upper bounds. The tick stops
+//! after [`TIME_BUDGET`] of loop time, checked between files, so a full queue
+//! costs the loop about a millisecond and the rest waits for the ticks that
+//! follow. A tick that runs out of any budget leaves the remaining entries
+//! flagged, so the next tick continues where it stopped. Nothing is copied or
+//! pushed on the request path, so a store for the writer allocates nothing
+//! beyond the store it already made.
 //!
 //! The layout is `<dir>/<genid decimal>/<sha256 of the key>`, one subdirectory
 //! per generation, so an ID change needs no per-file rewrite. A file is written
@@ -27,10 +30,18 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 use crate::cache::{Cache, CachedResponse};
+
+/// Loop time one tick may spend on disk work, removals included. The write and
+/// removal budgets below are upper bounds that a tick may still hit first. A
+/// file is never split, so the tick checks this between files and stops before
+/// starting one it cannot afford: the loop waits about a millisecond, not the
+/// half second a full queue used to take.
+pub const TIME_BUDGET: Duration = Duration::from_millis(1);
 
 /// Bytes of files one tick may write. A single entry larger than the budget is
 /// written on its own, because a file is never split.
@@ -104,6 +115,14 @@ pub struct DiskWriter {
     written_last_tick: usize,
     /// Encoded bytes written in the last tick.
     written_bytes_last_tick: u64,
+    /// Loop time one tick may spend, [`TIME_BUDGET`] in a built binary. The
+    /// unit tests set it directly to test the byte and removal budgets on
+    /// their own.
+    time_budget: Duration,
+    /// Ticks taken since the writer was created.
+    ticks: u64,
+    /// Loop time the last tick took, measured from the platform clock.
+    tick_last_ns: u64,
 }
 
 impl DiskWriter {
@@ -127,6 +146,9 @@ impl DiskWriter {
             write_error_logged: false,
             written_last_tick: 0,
             written_bytes_last_tick: 0,
+            time_budget: TIME_BUDGET,
+            ticks: 0,
+            tick_last_ns: 0,
         })
     }
 
@@ -167,23 +189,32 @@ impl DiskWriter {
     ///
     /// Removals run first, because they free bytes the write bound is checked
     /// against. Then the writer scans the cache for entries with the `queued`
-    /// flag until it has written [`WRITE_BUDGET`] bytes or none is left. An
-    /// entry that would pass the byte bound is skipped and counted. An entry
+    /// flag until it has written [`WRITE_BUDGET`] bytes, the queue is empty, or
+    /// [`TIME_BUDGET`] of loop time is used. The time check runs between files,
+    /// so a file is never split and the tick never starts one it cannot afford.
+    /// An entry that would pass the byte bound is skipped and counted. An entry
     /// larger than a whole tick's budget is written on its own when nothing
     /// else was, because a file is never split.
     pub fn tick(&mut self, cache: &mut Cache) -> TickStats {
         let mut stats = TickStats::default();
         self.written_last_tick = 0;
         self.written_bytes_last_tick = 0;
+        self.ticks += 1;
+        let started = m6_core::platform::now();
         let Some((id, dir)) = self.current.clone() else {
+            self.tick_last_ns = elapsed_ns(started);
             return stats;
         };
-        stats.removed = self.remove_old();
+        stats.removed = self.remove_old(started);
+        let budget = self.time_budget;
         let mut written_bytes = 0u64;
         // The scan visits entries in map order. An entry the budget cannot
         // take stops the scan and keeps its flag, so the next tick sees it.
         cache.scan_queued(|key, response| {
             if written_bytes >= WRITE_BUDGET {
+                return false;
+            }
+            if over_budget(started, budget) {
                 return false;
             }
             let key_str: &str = std::borrow::Borrow::borrow(key);
@@ -224,6 +255,7 @@ impl DiskWriter {
         });
         self.written_last_tick = stats.written;
         self.written_bytes_last_tick = written_bytes;
+        self.tick_last_ns = elapsed_ns(started);
         stats
     }
 
@@ -246,6 +278,16 @@ impl DiskWriter {
     /// Entries skipped because the byte bound would be passed.
     pub fn skipped_full(&self) -> u64 {
         self.skipped_full
+    }
+
+    /// Ticks taken since the writer was created, including ticks with no work.
+    pub fn ticks(&self) -> u64 {
+        self.ticks
+    }
+
+    /// Loop time the last tick took, in nanoseconds, from the platform clock.
+    pub fn tick_last_ns(&self) -> u64 {
+        self.tick_last_ns
     }
 
     /// Write the encode buffer to `path` through `path.tmp` and a rename.
@@ -278,14 +320,18 @@ impl DiskWriter {
         );
     }
 
-    /// Remove up to [`REMOVE_BUDGET`] files from the oldest queued directory.
+    /// Remove up to [`REMOVE_BUDGET`] files from the oldest queued directory,
+    /// or fewer when `started` is more than the time budget ago.
     ///
     /// A directory is removed only on a visit that found it empty, so a
     /// thousand files take two ticks to empty and a third to remove the
     /// directory itself.
-    fn remove_old(&mut self) -> usize {
+    fn remove_old(&mut self, started: Instant) -> usize {
         let mut removed = 0usize;
         while removed < REMOVE_BUDGET {
+            if over_budget(started, self.time_budget) {
+                break;
+            }
             let Some(dir) = self.removals.first().cloned() else {
                 break;
             };
@@ -294,6 +340,9 @@ impl DiskWriter {
                 Ok(entries) => {
                     for entry in entries {
                         if removed >= REMOVE_BUDGET {
+                            break;
+                        }
+                        if over_budget(started, self.time_budget) {
                             break;
                         }
                         let Ok(entry) = entry else { continue };
@@ -334,6 +383,20 @@ impl DiskWriter {
         }
         removed
     }
+}
+
+/// Whether `budget` of loop time has been spent since `started`.
+///
+/// The clock comes from the platform layer, the one place that reads one, so
+/// the check allocates nothing and the loop never takes a clock dependency of
+/// its own.
+fn over_budget(started: Instant, budget: Duration) -> bool {
+    m6_core::platform::now().duration_since(started) >= budget
+}
+
+/// The loop time since `started`, in nanoseconds, from the platform clock.
+fn elapsed_ns(started: Instant) -> u64 {
+    m6_core::platform::now().duration_since(started).as_nanos() as u64
 }
 
 /// Encode one entry into `buf`: the whole file, including its check value.
@@ -581,6 +644,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
+        // Ten MiB of writes take more than a millisecond, so the byte budget
+        // is measured on its own here; the time budget has its own test.
+        w.time_budget = Duration::from_secs(60);
         for i in 0..10 {
             stored_queued(&mut cache, &format!("/p{i}"), &body);
         }
@@ -596,6 +662,33 @@ mod tests {
         assert_eq!(third.written, 2, "the third tick writes the rest");
         assert_eq!(cache.queued(), 0);
         assert_eq!(files(&dir.path().join("7")).len(), 10);
+    }
+
+    /// The tick stops when its loop-time budget is used, between files, and
+    /// the rest keep their flags for the next tick. Eight entries of a MiB
+    /// each: one per tick, since a file's encode and write take more than the
+    /// budget and a file is never split.
+    ///
+    /// Break: write every queued key in one tick, and the first tick writes 8.
+    #[test]
+    fn the_tick_stops_when_its_time_budget_is_used() {
+        let body = vec![0u8; 1024 * 1024];
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = Cache::new();
+        let mut w = writer(dir.path(), 128 * 1024 * 1024);
+        for i in 0..8 {
+            stored_queued(&mut cache, &format!("/t{i}"), &body);
+        }
+        for i in 0..8 {
+            assert_eq!(
+                w.tick(&mut cache).written,
+                1,
+                "tick {i} writes one file and stops at the budget"
+            );
+            assert_eq!(cache.queued(), 8 - i - 1, "the rest stay flagged");
+        }
+        assert_eq!(w.tick(&mut cache).written, 0, "the queue is empty");
+        assert_eq!(files(&dir.path().join("7")).len(), 8);
     }
 
     /// The tick writes the entry as it is now, not as it was when queued.
@@ -652,6 +745,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 3 * 1024 * 1024);
+        w.time_budget = Duration::from_secs(60);
         for i in 0..5 {
             stored_queued(&mut cache, &format!("/b{i}"), &body);
         }
@@ -676,6 +770,8 @@ mod tests {
         }
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
+        // The 512-file bound is measured on its own here.
+        w.time_budget = Duration::from_secs(60);
 
         assert_eq!(w.tick(&mut cache).removed, 512, "first tick removes 512");
         assert!(old.is_dir(), "and leaves the directory");
@@ -683,6 +779,38 @@ mod tests {
         assert!(old.is_dir(), "the empty directory waits for its own tick");
         assert_eq!(w.tick(&mut cache).removed, 0);
         assert!(!old.exists(), "third tick removes the directory");
+    }
+
+    /// A removal tick stops at the time budget like a write tick, and the
+    /// directory drains over the ticks that follow. Without the check, one
+    /// generation change would unlink a thousand files in a single iteration.
+    ///
+    /// Break: drop the time check from `remove_old`, and the first tick takes
+    /// REMOVE_BUDGET files, not a budget's worth.
+    #[test]
+    fn removal_stops_at_the_time_budget_and_continues_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("6");
+        std::fs::create_dir_all(&old).unwrap();
+        for i in 0..2_000 {
+            std::fs::write(old.join(format!("{i:064x}")), b"x").unwrap();
+        }
+        let mut cache = Cache::new();
+        let mut w = writer(dir.path(), 128 * 1024 * 1024);
+
+        let first = w.tick(&mut cache).removed;
+        assert!(first > 0, "the tick removes at least one file");
+        assert!(
+            first < 2_000,
+            "the time budget stops the tick before the directory is empty, removed {first}"
+        );
+        let mut ticks = 1u32;
+        while old.exists() {
+            w.tick(&mut cache);
+            ticks += 1;
+            assert!(ticks < 2_000, "removal stopped making progress");
+        }
+        assert!(ticks > 1, "the directory takes more than one tick");
     }
 
     /// Two stores of one key before a tick write one file.

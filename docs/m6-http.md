@@ -239,9 +239,11 @@ The flag is the dedup, so a second store before the tick adds nothing.
 No key is copied and no queue entry is pushed, so the store allocates nothing for the writer.
 On the tick the writer scans the cache for flagged entries, and an entry the budget cannot reach keeps its flag for the next tick.
 
-On each accounting tick the writer removes up to 512 files from an old generation's directory, then writes current entries until it has written 4 MiB or the queue is empty.
+On each accounting tick the writer removes files from an old generation's directory, then writes current entries.
+A tick stops after 1 ms of loop time, checked between files, so a full queue costs the loop about a millisecond and the rest waits for later ticks.
+The 4 MiB write bound and the 512-file removal bound remain upper bounds, and whichever limit is reached first ends the tick.
 Removals run first, so their bytes are available to the write bound.
-A tick that runs out of budget with more to write leaves the remaining keys on the ring, still queued, and the next tick continues with them.
+A tick that runs out of budget with more to write leaves the remaining keys flagged, and the next tick continues with them.
 A single entry larger than 4 MiB is written on its own, because a file is never split.
 The writer reads each entry again at the tick, so an entry replaced since it was queued is written as it is now, and an entry evicted since is skipped.
 
@@ -257,13 +259,15 @@ A write failure is logged once with the path and the error, and the entry is dro
 A failed write never fails a request, because no request waits for one.
 
 On a generation change the queue and the size map are cleared, the new subdirectory is used from the next write, and every other subdirectory is queued for removal.
-Removal takes up to 512 files per tick, then the empty directory.
+Removal takes up to 512 files per tick, or fewer when the 1 ms time budget runs out first, then the empty directory.
 While the node has no current ID nothing is written, because nothing is stored in memory then either.
 
-An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick` and `skipped_full`.
+An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick`, `skipped_full`, `ticks` and `tick_last_ns`.
 `dir_bytes` counts the files in the current generation's directory.
 `queued` counts the entries whose flag is set.
 `written_bytes_last_tick` is the encoded size of the last tick's writes, including a single entry larger than the 4 MiB budget.
+`ticks` counts the ticks taken since the node started.
+`tick_last_ns` is the loop time the last tick took, measured from the platform clock.
 
 ---
 
