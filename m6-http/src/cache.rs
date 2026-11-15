@@ -452,6 +452,12 @@ pub struct Cache {
     /// Total footprint of everything in `map`, maintained on insert and evict.
     bytes: Arc<std::sync::atomic::AtomicUsize>,
     max_bytes: usize,
+    /// Serve an entry that is past its freshness and stale windows rather than
+    /// asking the backend, while this node's upstream is down.
+    ///
+    /// A plain field, not an `Arc`: the loop owns the `Cache` value in
+    /// `ServerState` and is the only writer, so a hit path reads one `bool`.
+    serve_held: bool,
 }
 
 impl Default for Cache {
@@ -471,7 +477,19 @@ impl Cache {
             map: Arc::new(RwLock::new(CacheMap::new())),
             bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes,
+            serve_held: false,
         }
+    }
+
+    /// Whether an expired entry is served instead of missed. Set by the
+    /// follower while the upstream is down, cleared on its next success.
+    pub fn set_serve_held(&mut self, held: bool) {
+        self.serve_held = held;
+    }
+
+    /// Whether expired entries are being served while the upstream is down.
+    pub fn serve_held(&self) -> bool {
+        self.serve_held
     }
 
     /// Total bytes currently held.
@@ -506,6 +524,7 @@ impl Cache {
             map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))),
             bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes: DEFAULT_MAX_BYTES,
+            serve_held: false,
         }
     }
 
@@ -673,9 +692,31 @@ impl Cache {
             Lookup::Fresh(entry.response.clone(), age)
         } else if entry.serve_stale_until.is_some_and(|until| now < until) {
             Lookup::Stale(entry.response.clone(), age)
+        } else if self.serve_held {
+            // The upstream is down. A working site with old pages beats an
+            // error page, so an entry past every window is served at any age,
+            // flagged stale.
+            Lookup::Stale(entry.response.clone(), age)
         } else {
             Lookup::Miss
         }
+    }
+
+    /// Any entry for `key`, at any age, with its current age.
+    ///
+    /// The last resort after a forward to the upstream failed: the node still
+    /// holds content for this key even though `lookup` may have refused it.
+    /// The clone is the same one the stale branch makes.
+    pub fn lookup_held<Q>(&self, key: &Q) -> Option<(CachedResponse, std::time::Duration)>
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let map = self.map.read().ok()?;
+        let entry = map.get(key)?;
+        let now = m6_core::platform::now();
+        let age = entry.upstream_age + now.saturating_duration_since(entry.stored_at);
+        Some((entry.response.clone(), age))
     }
 
     /// Store a response. Only call if the response should be cached.
@@ -1140,6 +1181,24 @@ pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Headers safe to store in a cache entry, with `Set-Cookie` and `M6-Genid`
+/// removed.
+///
+/// The entry carries its generation in `CachedResponse.genid`, and a hit
+/// writes it once. Keeping the upstream's copy as well would send the header
+/// twice on a cache node, where the upstream is another m6-http and stamps
+/// every reply.
+pub fn strip_uncacheable(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("set-cookie")
+                && !k.eq_ignore_ascii_case(crate::genid::GENID_HEADER)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,6 +1432,74 @@ mod tests {
             cached_with_cc("public, max-age=0"),
         );
         assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
+    }
+
+    /// The held flag is the only thing between an expired entry and a miss.
+    ///
+    /// Break: read `serve_held` on the fresh branch too, and the entry comes
+    /// back `Stale` before its lifetime is up.
+    #[test]
+    fn an_expired_entry_is_a_miss_unless_held() {
+        let mut cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/held", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        assert!(matches!(lookup_path(&cache, "/held"), Lookup::Miss));
+        assert!(!cache.serve_held());
+        cache.set_serve_held(true);
+        assert!(cache.serve_held());
+        match lookup_path(&cache, "/held") {
+            Lookup::Stale(r, _) => assert_eq!(r.body, b"world" as &[u8]),
+            _ => panic!("a held entry past its windows must be served stale"),
+        }
+        // A fresh entry is unchanged by the flag: the hit path stays a hit.
+        cache.insert(
+            CacheKey::new("/fresh", None, ""),
+            cached_with_cc("public, max-age=3600"),
+        );
+        assert!(matches!(lookup_path(&cache, "/fresh"), Lookup::Fresh(..)));
+        cache.set_serve_held(false);
+        assert!(matches!(lookup_path(&cache, "/held"), Lookup::Miss));
+    }
+
+    /// `lookup_held` answers for any entry at any age, including one `lookup`
+    /// refuses, and says nothing when the key was never stored.
+    #[test]
+    fn lookup_held_returns_any_age() {
+        let cache = Cache::new();
+        let mut buf = String::with_capacity(512);
+        assert!(cache
+            .lookup_held(make_lookup_key("/absent", None, "", &mut buf))
+            .is_none());
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        let mut buf = String::with_capacity(512);
+        let (entry, age) = cache
+            .lookup_held(make_lookup_key("/hello", None, "", &mut buf))
+            .expect("a held entry is returned at any age");
+        assert_eq!(entry.body, b"world" as &[u8]);
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
+        assert!(age >= std::time::Duration::ZERO);
+    }
+
+    /// A cache node's upstream is another m6-http and stamps every reply, so
+    /// the stored copy must not carry the header: the entry's own `genid` is
+    /// the one the hit writer emits.
+    #[test]
+    fn stored_headers_keep_neither_set_cookie_nor_the_generation() {
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("Set-Cookie".to_string(), "_m6sid=abc".to_string()),
+            ("M6-Genid".to_string(), "7".to_string()),
+        ];
+        let stripped = strip_uncacheable(&headers);
+        assert_eq!(
+            stripped,
+            vec![("Content-Type".to_string(), "text/html".to_string())]
+        );
     }
 
     /// `no-cache` forbids reuse without revalidation. m6-http has no

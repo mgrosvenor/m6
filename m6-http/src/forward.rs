@@ -712,6 +712,9 @@ pub enum Waiter {
     },
     /// A background fetch has no connection; the reply only fills the cache.
     Background,
+    /// A cache node's `GET /genid` heartbeat. The reply is the ID and a round
+    /// trip, never a client response, so it is intercepted before finalising.
+    Heartbeat,
     /// One member's `POST /genid` during a change sequence, by the member's
     /// index in the sequence. The source logs a failure against that member's
     /// socket path and advances when the last one answers.
@@ -774,6 +777,10 @@ pub struct PendingUrlContext {
     /// the current ID, so a cache cannot refill from a backend that is one
     /// generation behind.
     pub genid: u64,
+    /// This dispatch forwards the caller's `GET`, `HEAD` or `POST /genid` to a
+    /// cache node's upstream. A deadline is answered as gateway timeout, since
+    /// the source may still be completing the publish.
+    pub genid_forward: bool,
 }
 
 impl PendingUrlContext {
@@ -801,6 +808,35 @@ impl PendingUrlContext {
             error_status_override: None,
             extra_headers: Vec::new(),
             genid: 0,
+            genid_forward: false,
+        })
+    }
+
+    /// The context a cache node's heartbeat parks with. No field is read: the
+    /// reply is an ID and a round trip, and `Waiter::Heartbeat` is intercepted
+    /// before any response is finalised.
+    pub fn for_heartbeat() -> Box<PendingUrlContext> {
+        Box::new(PendingUrlContext {
+            req: HttpRequest {
+                method: "GET".to_string(),
+                path: m6_core::site::GENID_PATH.to_string(),
+                query: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            client_ip: String::new(),
+            enc: String::new(),
+            backend_name: "genid".to_string(),
+            kind: PendingKind::Url,
+            route_path: None,
+            cacheable: false,
+            is_prefetch: true,
+            start: m6_core::platform::now(),
+            error_status_override: None,
+            extra_headers: Vec::new(),
+            genid: 0,
+            genid_forward: false,
         })
     }
 }

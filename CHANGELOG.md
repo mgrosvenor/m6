@@ -72,6 +72,8 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 `m6_core::mio` is gone: use `m6_core::platform::{Poll, Events, Interest, Token}`, `platform::net`'s sockets and `Registry::register_fd` in place of `SourceFd`. `m6_core::event::{Signals, Signal}` are `m6_core::platform::{Signals, Signal}` and `Signal::Terminate` is `Signal::Shutdown`. `event::raise_open_file_limit` is `platform::process::raise_fd_limit`. `m6_core::host` is `m6_core::platform::host`. `m6_core::signal::ShutdownHandle` and `Service` are removed: use `platform::Signals` in the service's own loop. A service that spawns a child uses `platform::process::spawn`, and an accept loop matches `platform::net::accept_error`. Shipping code reads the clock through `platform::now()` and `platform::wall()`.
 
+**A cache node needs `[genid] upstream = "<backend>"` and `token_file`, and the source must run this version first.** The token file is an absolute path to a token with the source's read claim, delivered like every other credential. A cache node stores nothing from an upstream that sends no `M6-Genid`, so a source older than this release cannot fill it.
+
 ### Added
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
@@ -124,6 +126,16 @@ A client that makes more requests than this on one connection reconnects, with a
 **m6-log, a buffered JSONL logger for an event loop.** Lines are written into a 16 KiB buffer allocated at start and flushed when full, every second and at stop, as nginx's buffered access log does. Warnings and errors are written at once. No thread, no lock, no allocation per line. A destination that cannot take more is never waited on: lines are kept, then dropped and counted, as HAProxy does.
 
 **m6-monitor's hourly check reports each node's `/health` and the age of its last 200.** A node is ok only when `/health` answers 200 with status ok, and every other node is a fault on its line and in the verdict.
+
+**A cache node follows the site generation ID.**
+A cache node is an m6-http whose `[genid] upstream` names the source.
+It asks the source for the ID at start and every `heartbeat_secs` (default 10).
+A new ID flushes the cache, which then refills on demand.
+It stores a response only when its `M6-Genid` equals the ID it holds.
+While the upstream does not answer, it serves every page it holds, at any age, rather than an error, and `/perf` reports `upstream_down`.
+`/genid` on a cache node is forwarded to the source with the caller's own token.
+`/perf` reports the node's ID, its upstream's round trip and whether the upstream is down.
+Verified by `genid_cache_node.rs`, which starts a real source and a real cache node and covers the start-time ID, a publish through the node, a wake from a newer reply, serving held content with the source stopped, recovery, the forwarded `/genid` token check and warm fetches waiting for the ID, and by `genid_cache_allocs.rs`, which measures 0 allocations in 2000 store checks.
 
 ### Security
 

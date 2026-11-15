@@ -184,6 +184,44 @@ The generation is also reported by an authorised `/perf`, under a `genid` object
 An operator watching a publish sees one `genid advanced` line at info with `genid`, `members`, `failed` and `elapsed_ms`, and one `member refresh failed` line at error naming the socket path of each member that did not refresh.
 The POST still answers 200 when a member failed, and the `failed` count is what says the generation is not uniform.
 
+### A cache node follows the source
+
+A node whose `[genid]` sets `upstream` is a cache node.
+It names a `[[backend]]` with a `url`, holds no state file, and needs no `StateDirectory=`.
+It asks that upstream for the ID and follows it.
+
+1. **Heartbeat.**
+   At start, and then once `heartbeat_secs` (default 10) have passed since the last one finished, the node sends `GET /genid` to the upstream with `Authorization: Bearer <token from token_file>`.
+   One heartbeat is in flight at most, on the accounting tick, under the backend's `backend_timeout_secs` deadline.
+   The address is the one resolved at start, so an address change needs a restart.
+2. **A new ID is a full flush.**
+   The node rebuilds the route table from the config loaded at start, clears the cache and the held error pages, and logs `genid changed` at info with `from` and `to`.
+   The cache refills on demand.
+   A first answer sets the ID with no flush, because the node held nothing the new ID makes old.
+   This is the whole invalidation: there is no reseed and no per-path map, so it is simple and always correct.
+3. **The store rule.**
+   A response from any URL backend enters the cache only when its `M6-Genid` parses and equals the ID the node holds, and the entry carries that ID.
+   A response with no header, no current ID, or another ID is sent to the client unchanged and not stored.
+   Another ID also makes the next heartbeat due at once, so a node that learns of a publish from a response follows it without waiting out the interval.
+   On a cache node the ID reaches a client from the upstream's own header on a miss, and from the cached entry on a hit.
+4. **Serving while the upstream is down.**
+   While the upstream does not answer, an entry past its freshness and stale windows is served as `STALE` with its `Age`, rather than as a miss.
+   A forward that ends in 502, 503 or 504 answers with the held entry for its key when there is one, at any age.
+   The operator sees one `genid: upstream down` line at warn on the transition, and `/perf` reports `upstream_down: true`.
+   The first answer after an outage logs `genid: upstream up` at info and clears the flag.
+   Old pages keep working while the source is unreachable, and that is better than an error page.
+5. **Background fetches wait.**
+   Prefetch, warm-on-start and stale-while-revalidate fetches are not drained while the node has no ID or the upstream is down.
+   The queue keeps its cap of 256 and drains once the upstream answers.
+6. **`/genid` is forwarded.**
+   `GET`, `HEAD` and `POST /genid` reach the upstream backend after the loopback or internal-listener address check, with the request's own headers, bypassing routing and the cache.
+   The cache node checks no token: the source authorises the caller.
+   A forwarded POST waits under `backend_timeout_secs` and is answered 504 if the deadline passes while the source is still completing the publish.
+   `GET /genid` then shows whether the advance happened.
+
+A cache node reports its own `genid` object from an authorised `/perf`: `role` is `cache`, `id` is the ID it holds or `null`, and `upstream`, `upstream_down`, `upstream_rtt_ms` and `last_ok_s` describe the node it follows.
+A source restart keeps its ID, so a cache node sees no change when it comes back.
+
 ---
 
 ## Error Handling

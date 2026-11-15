@@ -17,12 +17,248 @@
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::forward::Waiter;
 
 /// The header that carries a response's generation to a client.
 pub const GENID_HEADER: &str = "M6-Genid";
+
+/// How often a cache node asks its upstream for the ID, unless configured.
+pub const DEFAULT_HEARTBEAT_SECS: u64 = 10;
+
+/// What this node's generation state is: the source that owns the ID, or a
+/// cache node that follows another node's ID.
+///
+/// Held once in `ServerState` for the life of the process, so the source's
+/// larger state costs one bigger field and no allocation. Boxing it would add
+/// an indirection to every `/genid` and store-rule read for no memory saved.
+#[allow(clippy::large_enum_variant)]
+pub enum Role {
+    Source(Genid),
+    Cache(Follower),
+}
+
+impl Role {
+    /// The source's state, when this node is the source.
+    pub fn source(&self) -> Option<&Genid> {
+        match self {
+            Role::Source(g) => Some(g),
+            Role::Cache(_) => None,
+        }
+    }
+
+    pub fn source_mut(&mut self) -> Option<&mut Genid> {
+        match self {
+            Role::Source(g) => Some(g),
+            Role::Cache(_) => None,
+        }
+    }
+
+    /// The cache node's follower state, when this node is a cache node.
+    pub fn cache(&self) -> Option<&Follower> {
+        match self {
+            Role::Cache(f) => Some(f),
+            Role::Source(_) => None,
+        }
+    }
+
+    pub fn cache_mut(&mut self) -> Option<&mut Follower> {
+        match self {
+            Role::Cache(f) => Some(f),
+            Role::Source(_) => None,
+        }
+    }
+
+    /// The ID a response dispatched now is stamped with. A cache node with no
+    /// ID yet answers 0, which no reply can match, so nothing is stored.
+    pub fn dispatched(&self) -> u64 {
+        match self {
+            Role::Source(g) => g.current(),
+            Role::Cache(f) => f.current().unwrap_or(0),
+        }
+    }
+
+    /// The ID a completed response is stored under, or `None` when it must not
+    /// be stored, given the reply's `M6-Genid` already parsed.
+    ///
+    /// The source keeps its dispatch-ID rule. A cache node stores only a reply
+    /// whose `M6-Genid` equals the ID it holds: the ID it serves, not the ID it
+    /// asked for.
+    pub fn may_store_parsed(&self, dispatched: u64, id: Option<u64>) -> Option<u64> {
+        match self {
+            Role::Source(g) => (dispatched == g.current()).then_some(dispatched),
+            Role::Cache(f) => f.may_store_parsed(id),
+        }
+    }
+}
+
+/// Parse a decimal `M6-Genid` value in place: a borrowed `&str`, no copy.
+fn parse_id(header: &[u8]) -> Option<u64> {
+    std::str::from_utf8(header).ok()?.trim().parse().ok()
+}
+
+/// A cache node's view of the source: the ID it last heard, whether the
+/// upstream is down, and when the next heartbeat is due.
+///
+/// No I/O. The loop owns the one heartbeat upstream and calls [`Follower::sent`]
+/// when it starts one and [`Follower::answered`] when it finishes, so every
+/// state change happens on the loop's own thread.
+pub struct Follower {
+    /// The ID this node holds. `None` until the first answer, and a node with
+    /// no ID stores nothing.
+    current: Option<u64>,
+    /// The last heartbeat or forwarded request failed to reach the upstream.
+    down: bool,
+    /// The one heartbeat upstream is in flight, so a tick cannot start a second.
+    in_flight: bool,
+    /// When the next heartbeat may start.
+    due: Instant,
+    /// When the upstream last answered with an ID.
+    last_ok: Option<Instant>,
+    /// The last successful heartbeat's round trip.
+    rtt: Option<Duration>,
+    /// How long between heartbeats.
+    heartbeat: Duration,
+}
+
+/// What one heartbeat or forwarded request changed, so the caller logs the
+/// transition once and runs the flush on a new ID.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The first answer set the ID. No change: there was no old content.
+    First(u64),
+    /// The upstream still holds the ID this node holds.
+    Same,
+    /// The upstream advanced. The caller flushes and refills on demand.
+    Changed { from: u64, to: u64 },
+    /// The upstream stopped answering. The caller serves held content.
+    Down(&'static str),
+    /// It is still down. Nothing to log.
+    StillDown,
+}
+
+impl Follower {
+    /// A follower that holds no ID and owes a heartbeat at `now`.
+    pub fn new(heartbeat: Duration, now: Instant) -> Follower {
+        Follower {
+            current: None,
+            down: false,
+            in_flight: false,
+            due: now,
+            last_ok: None,
+            rtt: None,
+            heartbeat,
+        }
+    }
+
+    /// The ID this node holds, if it has one.
+    pub fn current(&self) -> Option<u64> {
+        self.current
+    }
+
+    pub fn down(&self) -> bool {
+        self.down
+    }
+
+    pub fn rtt(&self) -> Option<Duration> {
+        self.rtt
+    }
+
+    /// Seconds since the last successful answer, for `/perf`.
+    pub fn last_ok_s(&self, now: Instant) -> Option<u64> {
+        self.last_ok
+            .map(|at| now.saturating_duration_since(at).as_secs())
+    }
+
+    /// Whether a heartbeat may start now: at start, then once
+    /// `heartbeat_secs` have passed since the last one finished. One at a time.
+    pub fn heartbeat_due(&self, now: Instant) -> bool {
+        !self.in_flight && now >= self.due
+    }
+
+    /// The heartbeat upstream is started. The next answer clears this.
+    pub fn sent(&mut self) {
+        self.in_flight = true;
+    }
+
+    /// One heartbeat finished: a parsed ID and the round trip, or a static
+    /// reason it did not (`"connect failed"`, `"timed out"`, `"status"`,
+    /// `"no M6-Genid"`). The reason is a static string so a failure allocates
+    /// nothing.
+    pub fn answered(
+        &mut self,
+        result: Result<(u64, Duration), &'static str>,
+        now: Instant,
+    ) -> Outcome {
+        self.in_flight = false;
+        self.due = now + self.heartbeat;
+        match result {
+            Ok((id, rtt)) => {
+                self.rtt = Some(rtt);
+                self.last_ok = Some(now);
+                self.down = false;
+                match self.current {
+                    None => {
+                        self.current = Some(id);
+                        Outcome::First(id)
+                    }
+                    Some(current) if current == id => Outcome::Same,
+                    Some(from) => {
+                        self.current = Some(id);
+                        Outcome::Changed { from, to: id }
+                    }
+                }
+            }
+            Err(reason) => {
+                let was_down = self.down;
+                self.down = true;
+                if was_down {
+                    Outcome::StillDown
+                } else {
+                    Outcome::Down(reason)
+                }
+            }
+        }
+    }
+
+    /// Make the next heartbeat due now. A reply under a different ID is the
+    /// upstream saying the node is behind, and there is no reason to wait out
+    /// the interval to ask.
+    pub fn behind(&mut self, now: Instant) {
+        self.due = now;
+    }
+
+    /// A forwarded client request could not reach the upstream. Mark it down
+    /// and make the next heartbeat due now, which is the cheap way to learn
+    /// whether the whole upstream is gone.
+    ///
+    /// The heartbeat in flight is left alone: its own answer clears that flag,
+    /// and clearing it here would let the next turn start a second one.
+    /// Returns true on the transition, so the caller logs it once.
+    pub fn failed(&mut self, now: Instant) -> bool {
+        let first = !self.down;
+        self.down = true;
+        self.due = now;
+        first
+    }
+
+    /// The ID to store a reply under, or `None` when it must not be stored.
+    ///
+    /// A cache node stores only a response stamped with the ID it holds. A
+    /// missing header, an unparsable one, another ID, or no ID yet all mean the
+    /// response is sent to the client and not kept. The parse reads the header
+    /// as a borrowed `&str`, so the rule allocates nothing.
+    pub fn may_store(&self, header: Option<&[u8]>) -> Option<u64> {
+        self.may_store_parsed(header.and_then(parse_id))
+    }
+
+    /// The same rule over an already parsed ID.
+    pub fn may_store_parsed(&self, id: Option<u64>) -> Option<u64> {
+        let current = self.current?;
+        (id == Some(current)).then_some(current)
+    }
+}
 
 /// The peers a source remembers. Only a loopback or an internal-listener
 /// caller reaches the endpoint at all, so a site's monitoring set fits many
@@ -367,5 +603,142 @@ mod tests {
             peers.windows(2).all(|w| w[0].0 <= w[1].0),
             "the report is sorted by address"
         );
+    }
+
+    // ── The cache node's follower ────────────────────────────────────────────
+
+    fn follower() -> (Follower, Instant) {
+        let t0 = m6_core::platform::now();
+        (Follower::new(Duration::from_secs(10), t0), t0)
+    }
+
+    /// The first heartbeat sets the ID and is not a change: the node held
+    /// nothing the new ID makes old.
+    #[test]
+    fn the_first_answer_sets_the_id_without_a_change() {
+        let (mut f, t0) = follower();
+        assert!(
+            f.heartbeat_due(t0),
+            "a new follower owes a heartbeat at once"
+        );
+        f.sent();
+        assert!(
+            !f.heartbeat_due(t0),
+            "one heartbeat at a time, so a second tick cannot start another"
+        );
+        assert_eq!(
+            f.answered(Ok((7, Duration::from_millis(4))), t0),
+            Outcome::First(7)
+        );
+        assert_eq!(f.current(), Some(7));
+        assert!(!f.down());
+        assert_eq!(f.rtt(), Some(Duration::from_millis(4)));
+        assert_eq!(f.last_ok_s(t0), Some(0));
+        let due = t0 + Duration::from_secs(10);
+        assert!(!f.heartbeat_due(due - Duration::from_millis(1)));
+        assert!(f.heartbeat_due(due));
+    }
+
+    /// A different ID is the change, and the ID is the one just heard.
+    #[test]
+    fn a_new_id_is_a_change() {
+        let (mut f, t0) = follower();
+        assert_eq!(f.answered(Ok((7, Duration::ZERO)), t0), Outcome::First(7));
+        assert_eq!(
+            f.answered(Ok((7, Duration::ZERO)), t0),
+            Outcome::Same,
+            "the same ID is not a change"
+        );
+        assert_eq!(
+            f.answered(Ok((8, Duration::ZERO)), t0),
+            Outcome::Changed { from: 7, to: 8 }
+        );
+        assert_eq!(f.current(), Some(8));
+    }
+
+    /// A failure is logged once on the transition, then says nothing.
+    #[test]
+    fn a_failure_marks_down_once() {
+        let (mut f, t0) = follower();
+        assert_eq!(
+            f.answered(Err("connect failed"), t0),
+            Outcome::Down("connect failed")
+        );
+        assert!(f.down());
+        assert_eq!(f.current(), None, "a failure never sets an ID");
+        assert_eq!(
+            f.answered(Err("timed out"), t0),
+            Outcome::StillDown,
+            "a second failure is the same fact, not a new one"
+        );
+        // A forwarded request failing is the same fact from another source,
+        // and it makes the next heartbeat due without touching the one in
+        // flight.
+        assert!(!f.failed(t0), "already down, so it is not a transition");
+        let mut g = Follower::new(Duration::from_secs(10), t0);
+        g.answered(Ok((7, Duration::ZERO)), t0);
+        g.sent();
+        assert!(g.failed(t0 + Duration::from_secs(1)), "the first failure");
+        assert!(
+            !g.heartbeat_due(t0 + Duration::from_secs(1)),
+            "the heartbeat already in flight still owns the slot"
+        );
+        assert!(g.down());
+    }
+
+    /// The first answer after an outage clears down, and the ID it already held
+    /// is not a change.
+    #[test]
+    fn a_success_after_down_clears_it() {
+        let (mut f, t0) = follower();
+        f.answered(Ok((7, Duration::ZERO)), t0);
+        f.answered(Err("status"), t0);
+        assert!(f.down());
+        assert_eq!(
+            f.answered(Ok((7, Duration::ZERO)), t0),
+            Outcome::Same,
+            "a success after down is not a change when the ID is unchanged"
+        );
+        assert!(!f.down());
+    }
+
+    /// The store rule: the current ID or nothing. No ID yet, no header, another
+    /// ID and an unparsable one all refuse.
+    ///
+    /// Break: accept an absent header, and the absent case comes back `Some`.
+    #[test]
+    fn may_store_needs_the_current_id() {
+        let (mut f, t0) = follower();
+        assert_eq!(
+            f.may_store(Some(b"7")),
+            None,
+            "no current ID stores nothing"
+        );
+        f.answered(Ok((7, Duration::ZERO)), t0);
+        assert_eq!(f.may_store(None), None, "an absent header stores nothing");
+        assert_eq!(f.may_store(Some(b"8")), None, "another ID stores nothing");
+        assert_eq!(
+            f.may_store(Some(b"nope")),
+            None,
+            "a bad header stores nothing"
+        );
+        assert_eq!(f.may_store(Some(b"7")), Some(7));
+        assert_eq!(
+            f.may_store(Some(b" 7 ")),
+            Some(7),
+            "surrounding whitespace is not part of the number"
+        );
+    }
+
+    /// A reply under another ID is the upstream saying the node is behind, so
+    /// the next heartbeat is due now rather than at the end of the interval.
+    #[test]
+    fn behind_makes_the_heartbeat_due_now() {
+        let (mut f, t0) = follower();
+        f.answered(Ok((7, Duration::ZERO)), t0);
+        let later = t0 + Duration::from_secs(1);
+        assert!(!f.heartbeat_due(later));
+        f.behind(later);
+        assert!(f.heartbeat_due(later));
     }
 }
