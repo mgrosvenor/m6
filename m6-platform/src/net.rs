@@ -13,7 +13,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::Path;
 
 pub use mio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
@@ -259,4 +259,16 @@ fn domain_of(addr: SocketAddr) -> socket2::Domain {
         SocketAddr::V4(_) => socket2::Domain::IPV4,
         SocketAddr::V6(_) => socket2::Domain::IPV6,
     }
+}
+
+/// Ask the kernel to report a socket writable only while its send queue holds
+/// fewer than `bytes`, so a whole response body is not handed over at once and
+/// the order m6 frames it in is the order it leaves.
+///
+/// Linux sets `TCP_NOTSENT_LOWAT`. macOS has no equivalent, so its kernel order
+/// stands and this is a no-op. A kernel that will not set the option still
+/// sends everything, in its own order, so the caller logs the error rather than
+/// refusing the connection.
+pub fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
+    super::os::limit_send_queue(fd, bytes)
 }

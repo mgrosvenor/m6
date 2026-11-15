@@ -88,6 +88,28 @@ pub(super) fn prepare_socket(_sock: &socket2::Socket) -> io::Result<()> {
     Ok(())
 }
 
+/// Ask the kernel to report the socket writable only while its send queue holds
+/// fewer than `bytes`, so one response's body is not all handed to the kernel
+/// at once and the order m6 frames it in is the order it leaves.
+pub(super) fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
+    let lowat = bytes as nix::libc::c_int;
+    // SAFETY: `fd` is the caller's live socket, and the option reads exactly
+    // the one `c_int` it is given.
+    let rc = unsafe {
+        nix::libc::setsockopt(
+            fd,
+            nix::libc::IPPROTO_TCP,
+            nix::libc::TCP_NOTSENT_LOWAT,
+            std::ptr::from_ref(&lowat).cast(),
+            std::mem::size_of::<nix::libc::c_int>() as nix::libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The kernel enforces the hard limit as read, so there is no cap below it.
 pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     Ok(None)
