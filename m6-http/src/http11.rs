@@ -512,18 +512,21 @@ impl Http11Listener {
 
     /// Drive one connection. Returns what happened, so the loop can manage the
     /// pending dispatches, the timeouts and the descriptor's interest.
-    pub fn drive_one<S, FH, FO>(
+    #[allow(clippy::too_many_arguments)] // one request's callbacks plus state, hit headers and registry
+    pub fn drive_one<S, FH, FO, FR>(
         &mut self,
         key: usize,
         state: &mut S,
         on_head: &mut FH,
         on_owned: &mut FO,
+        on_head_early: &mut FR,
         hit: &HitHeaders,
         registry: &Registry,
     ) -> ConnDrive
     where
         FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
         FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
+        FR: for<'a> FnMut(&mut S, &RequestHead<'a>, &str) -> Option<RequestOutcome>,
     {
         let mut drive = ConnDrive {
             pending: std::mem::take(&mut self.pending),
@@ -539,6 +542,7 @@ impl Http11Listener {
             state,
             on_head,
             on_owned,
+            on_head_early,
             hit,
             &mut drive,
         );
@@ -619,6 +623,10 @@ impl Http11Listener {
         let mut on_owned = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
         };
+        let mut on_head_early =
+            |_: &mut (), _: &RequestHead<'_>, _: &str| -> Option<RequestOutcome> {
+                unreachable!("a completed h1 connection is not reading a request")
+            };
         if let Some(tls) = conn.tls.as_mut() {
             drive_h1(
                 &mut H1Io::Tls {
@@ -630,6 +638,7 @@ impl Http11Listener {
                 &mut unit,
                 &mut on_head,
                 &mut on_owned,
+                &mut on_head_early,
                 None,
                 &mut drive,
             );
@@ -643,6 +652,7 @@ impl Http11Listener {
                 &mut unit,
                 &mut on_head,
                 &mut on_owned,
+                &mut on_head_early,
                 None,
                 &mut drive,
             );
@@ -1212,17 +1222,20 @@ pub enum H2cAccept {
 
 // ── Per-connection driver ─────────────────────────────────────────────────────
 
-fn drive_conn<S, FH, FO>(
+#[allow(clippy::too_many_arguments)] // the connection, its state and the three dispatch closures
+fn drive_conn<S, FH, FO, FR>(
     conn: &mut Conn,
     max_requests: u32,
     state: &mut S,
     on_head: &mut FH,
     on_owned: &mut FO,
+    on_head_early: &mut FR,
     hit: &HitHeaders,
     drive: &mut ConnDrive,
 ) where
     FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
     FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
+    FR: for<'a> FnMut(&mut S, &RequestHead<'a>, &str) -> Option<RequestOutcome>,
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -1239,6 +1252,7 @@ fn drive_conn<S, FH, FO>(
             state,
             on_head,
             on_owned,
+            on_head_early,
             Some(hit),
             drive,
         );
@@ -1397,6 +1411,7 @@ fn drive_conn<S, FH, FO>(
         state,
         on_head,
         on_owned,
+        on_head_early,
         Some(hit),
         drive,
     );
@@ -1558,19 +1573,21 @@ fn write_head_refusal(h1: &mut H1Conn, why: m6_core::h1::HeadError) {
     h1.state = H1State::Writing { pos: 0 };
 }
 
-#[allow(clippy::too_many_arguments)] // transport, connection, state and the two dispatch closures
-fn drive_h1<S, FH, FO>(
+#[allow(clippy::too_many_arguments)] // transport, connection, state and the three dispatch closures
+fn drive_h1<S, FH, FO, FR>(
     io: &mut H1Io<'_>,
     h1: &mut H1Conn,
     client_ip: &str,
     state: &mut S,
     on_head: &mut FH,
     on_owned: &mut FO,
+    on_head_early: &mut FR,
     hit: Option<&HitHeaders>,
     drive: &mut ConnDrive,
 ) where
     FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
     FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
+    FR: for<'a> FnMut(&mut S, &RequestHead<'a>, &str) -> Option<RequestOutcome>,
 {
     loop {
         match &h1.state {
@@ -1657,6 +1674,31 @@ fn drive_h1<S, FH, FO>(
                     }
                     HeadResult::Complete(head) => {
                         if head.has_body() {
+                            // A request whose method the route does not answer
+                            // is refused from the head, before this connection
+                            // reads one byte of the body. The response says
+                            // `Connection: close`, so the unread body is not
+                            // taken for the next request on this connection.
+                            if let Some(outcome) = on_head_early(state, &head, client_ip) {
+                                let RequestOutcome::Ready(status, headers, body, _, genid) =
+                                    outcome
+                                else {
+                                    unreachable!("a head refusal is ready")
+                                };
+                                h1.keep_alive = false;
+                                h1.out_buf.clear();
+                                write_response(
+                                    &mut h1.out_buf,
+                                    status,
+                                    &headers,
+                                    &body,
+                                    head.method,
+                                    false,
+                                    genid,
+                                );
+                                h1.state = H1State::Writing { pos: 0 };
+                                continue;
+                            }
                             // A body request routes through the owned parser,
                             // which waits for the full body and carries it.
                             let owned = parse_request(&h1.read_buf);

@@ -775,6 +775,14 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             "www-redirect".to_string(),
         );
     }
+    // A method the matched route does not answer is refused here, before the
+    // cache lookup and any backend contact.
+    if let Some(outcome) = route_method_refusal(state, path, method) {
+        let RequestOutcome::Ready(status, headers, body, backend, _) = outcome else {
+            unreachable!("a method refusal is ready")
+        };
+        return Routed::Ready(status, headers, body, backend);
+    }
     let enc_str = m6_core::headers::get(headers, "accept-encoding").unwrap_or("");
     let start = m6_core::platform::now();
 
@@ -1245,6 +1253,12 @@ fn drive_conn_token(
     let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
         on_request_head(state, head, buf, ip, quic_port, registry)
     };
+    // Only a method refusal is decided from a head. Any other body-bearing
+    // request has to be read before it can be routed, as before.
+    let mut on_head_early =
+        |state: &mut ServerState, head: &RequestHead<'_>, _ip: &str| -> Option<RequestOutcome> {
+            route_method_refusal(state, head.path, head.method)
+        };
     let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| match req {
         RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
         RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
@@ -1256,7 +1270,15 @@ fn drive_conn_token(
         }
     } else {
         match tcp.as_mut() {
-            Some(t) => t.drive_one(slot, state, &mut on_head, &mut on_h2, &hit, registry),
+            Some(t) => t.drive_one(
+                slot,
+                state,
+                &mut on_head,
+                &mut on_h2,
+                &mut on_head_early,
+                &hit,
+                registry,
+            ),
             None => return ConnOutcome::Closed,
         }
     };
@@ -3333,11 +3355,31 @@ fn handle_h3_request(
         }
     }
 
+    // A method the route does not answer is refused before the cache lookup,
+    // exactly as on h1 and h2. HTTP/3 has its own cache fast path, so it does
+    // not pass through `route_request`.
+    let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
+    if let Some(outcome) = route_method_refusal(state, path_str, method_str) {
+        let RequestOutcome::Ready(status, headers, body, _, _) = outcome else {
+            unreachable!("a method refusal is ready")
+        };
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            status,
+            &headers,
+            Bytes::from(body),
+            method_str.eq_ignore_ascii_case("HEAD"),
+            None,
+        );
+        return;
+    }
+
     // ── Cache lookup — zero allocation ────────────────────────────────────────
     // Routes with `require` are never served from cache — see the HTTP/1.1
     // path for the reasoning.
     // Same method gate as the h1/h2 lookup sites above.
-    let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
     let cacheable = !state.route_table.requires_auth(path_str)
         && m6_http_lib::cache::method_may_read_cache(method_str);
 
@@ -4317,6 +4359,83 @@ fn launch_socket_upstream(
     Ok(owner.key)
 }
 
+/// The 405 answer for a route that does not answer the request method.
+///
+/// RFC 9110 15.5.6 requires `Allow`, and RFC 9110 10.2.1 says it names the
+/// methods the target resource supports. The body is the same plain refusal
+/// the server-wide method check sends, because rendering the custom error page
+/// here would contact a backend and this answer exists to avoid that.
+fn method_refusal(allowed: m6_core::site::Methods) -> RequestOutcome {
+    method_refusal_value(allowed.allow_value())
+}
+
+/// The same 405 with an `Allow` value already built.
+fn method_refusal_value(allow: String) -> RequestOutcome {
+    let mut headers = vec![
+        (
+            "Content-Type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+        ("Allow".to_string(), allow),
+    ];
+    set_date(&mut headers);
+    RequestOutcome::Ready(
+        405,
+        headers,
+        b"Method Not Allowed".to_vec(),
+        "method-check".to_string(),
+        None,
+    )
+}
+
+/// The route's refusal for this request, if it has one.
+///
+/// `OPTIONS` is decided here rather than falling through. It asks what the
+/// target resource offers (RFC 9110 9.3.7), and m6 offers no options of its
+/// own, so the answer is the same 405 with `Allow` and the request never
+/// reaches a backend even when `[server] allowed_methods` names `OPTIONS`.
+/// `OPTIONS` is removed from that list here and in the header, so `Allow`
+/// never names a method the answer refuses.
+fn route_method_refusal(state: &ServerState, path: &str, method: &str) -> Option<RequestOutcome> {
+    // An invented method is 501, not 405 (RFC 9110 15.6.2). The server-wide
+    // check already draws that line; leaving these to it keeps the two
+    // answers distinct.
+    if !is_registered_method(method) {
+        return None;
+    }
+    if method == "OPTIONS" {
+        let route = state.route_table.at(path)?;
+        return route_refusal(route, method, &state.config);
+    }
+    let expected = state.route_table.refused_method(path, method)?;
+    Some(method_refusal(expected))
+}
+
+/// [`route_method_refusal`] for a route the caller already holds.
+fn route_refusal(
+    route: &m6_http_lib::router::RouteEntry,
+    method: &str,
+    config: &config::Config,
+) -> Option<RequestOutcome> {
+    if method == "OPTIONS" {
+        let allow = if route.methods == m6_core::site::Methods::ANY {
+            config
+                .server
+                .allowed_methods
+                .iter()
+                .filter(|m| !m.eq_ignore_ascii_case("OPTIONS"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            route.methods.allow_value()
+        };
+        return Some(method_refusal_value(allow));
+    }
+    (!route.methods.contains(method)).then(|| method_refusal(route.methods))
+}
+
 fn handle_request_inner(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -4787,6 +4906,13 @@ fn handle_request_inner(
             return request_error(404, req, client_ip, state, None, registry);
         }
     };
+
+    // The same refusal as `route_request`, reached here by a caller that did
+    // not go through it (a background refresh), and by every protocol on the
+    // miss path. The route is already in hand, so this costs one bit test.
+    if let Some(outcome) = route_refusal(&route, &req.method, &state.config) {
+        return outcome;
+    }
 
     // Verified JWT claims — populated during auth check, forwarded to backend.
     let mut verified_claims: Option<auth::Claims> = None;

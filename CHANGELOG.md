@@ -46,6 +46,15 @@ The released versions, newest first:
 
 **`[health] metrics_token_file` is removed, and a config that still names it stops m6-http at start with exit 2.** Switch `/perf` and `/traffic` to `[health] metrics_require = "role:<name>"` or `"group:<name>"` with `[auth] public_key`, and give the monitor a signed API token. A node that used only the legacy bearer file serves neither endpoint until it does. The refusal body on every token-gated route is now `{"error":"unauthorised"}` (401, with `WWW-Authenticate: Bearer`) or `{"error":"forbidden"}` (403); an API client that parsed a route's HTML 401 or 403 page gets JSON. A browser with no credential is still redirected to `/login` or `/auth/refresh`, and a browser with a valid token for the wrong role still gets the site's 403 page; a browser with an invalid or expired token is now redirected to login instead of shown a 401 page.
 
+**An m6-http route can declare the methods it answers, and a request with another method is answered 405 with `Allow` naming the methods it does answer (#174).**
+A `[[route]]` or `[[route_group]]` takes `methods = ["GET", "POST"]` in `site.toml`.
+A route with no `methods` adds no method restriction of its own, so no existing route changes behaviour.
+The refusal is decided at the edge, before the body is read, the cache is looked up or a backend is contacted, and it is 405 with `Allow` (RFC 9110 15.5.6 and 10.2.1).
+`GET` also answers `HEAD`, so a GET-only route names both in `Allow` (RFC 9110 9.3.2).
+`OPTIONS` is answered at the edge with 405 and `Allow` and never forwarded (RFC 9110 9.3.7), and a route cannot name it.
+An unknown or empty `methods` list stops the start with exit 2, and `--dump-config` fails the same way.
+Verified by six end-to-end tests against a real m6-http and backend socket, an RFC 9110 conformance test over HTTP/1.1, HTTP/2 and HTTP/3, a startup test of the exit 2, and unit tests of the fixed method set.
+
 **Each crawler sighting on `/traffic` and in the monitor report now carries the time it was first and last seen, and the monitor checks each address behind a sighting against the method the crawler's operator documents. A reverse DNS name counts only when resolving it forward returns the address (#205).**
 
 The new JSON fields are additive.
@@ -55,6 +64,8 @@ No existing field changes, so no migration is needed.
 ### Migration
 
 **`/perf` reports traffic in three populations, and the traffic counters no longer include the monitor's polls outside the three monitoring endpoints (#107).** `http/<version>/external` and `http/<version>/internal` keep their meaning, and `http/<version>/monitor` is new. A request is monitor when it is answered by `/health`, `/perf` or `/traffic`, or when it arrives on the TLS or QUIC listener from a private network address. It is internal when it arrives on the listener `[server] internal_binds` names, and external otherwise. `monitor_requests_total` now counts every monitor request, including a poll on another path, and the three endpoint polls now appear in the channel table instead of only in that total. A request from a private address, such as an operator on the same private network, is now counted as monitor and is not in `requests_total`. Loopback stays external. No configuration change is required.
+
+**A site whose `[server] allowed_methods` names `OPTIONS` no longer forwards that method.** m6-http answers `OPTIONS` at the edge with 405 and `Allow`, as the default configuration already did, so a client that used `OPTIONS` to discover a backend's methods now reads the edge's list instead of the backend's answer. Remove `OPTIONS` from the list: keeping it changes no answer, and no route can be configured to forward it.
 
 **Pages and unversioned files now make browsers revalidate on every request, and m6 no longer emits `stale-while-revalidate` in those headers (#99).** m6-core page routes default to `Cache-Control: public, max-age=0, must-revalidate, s-maxage=86400`, and m6-file sends the same header on an unversioned file, both with an `ETag`. A browser now sends `If-None-Match` on every page and file load: an unchanged response is a 304, and the edge answers it from its own copy for 86400 seconds. An upstream that sends `stale-while-revalidate` is still honoured inside its window (RFC 9111 section 4.2.4). A deployment that relied on `public` alone, or on the `max-age=60, stale-while-revalidate=60` file header, should expect one conditional request per view. Versioned `?v=<hash>` assets keep `public, max-age=31536000, immutable`. No configuration change is required.
 

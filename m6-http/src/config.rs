@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use m6_core::config::secret_path;
+use m6_core::site::Methods;
 use serde::{Deserialize, Serialize};
 
 /// The one `[log]` type, owned by m6-core. Re-exported so this crate's `Config`
@@ -692,6 +693,15 @@ pub struct RouteConfig {
     pub require: Option<String>,
     /// Present only so a `cache` key is refused by name, not wired to anything.
     pub cache: Option<String>,
+    /// The methods this route answers, or every method when absent.
+    ///
+    /// A route with a list answers exactly those methods: a request with
+    /// another gets 405 with `Allow`, before the cache or a backend is
+    /// touched (RFC 9110 15.5.6). `GET` also answers `HEAD`.
+    ///
+    /// Validated when the route table is built, so an unknown name stops the
+    /// start with exit 2 rather than becoming a request-time 405.
+    pub methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,6 +715,34 @@ pub struct RouteGroupConfig {
     pub require: Option<String>,
     /// See `RouteConfig::cache` — present only to be refused by name.
     pub cache: Option<String>,
+    /// See `RouteConfig::methods`.
+    pub methods: Option<Vec<String>>,
+}
+
+/// The methods a `[[route]]` or `[[route_group]]` answers, or every method
+/// when it lists none.
+///
+/// Names are trimmed and upper-cased once at load, matching
+/// `[server] allowed_methods`, so the request-time comparison is a fixed set
+/// and a config typo is an exit 2 rather than a 405 on every request.
+pub(crate) fn route_methods(names: Option<&[String]>, origin: &str) -> anyhow::Result<Methods> {
+    let Some(names) = names else {
+        return Ok(Methods::ANY);
+    };
+    anyhow::ensure!(
+        !names.is_empty(),
+        "config error: {origin} has an empty methods list; leave `methods` out to answer every method"
+    );
+    let upper: Vec<String> = names
+        .iter()
+        .map(|name| name.trim().to_ascii_uppercase())
+        .collect();
+    Methods::from_names(&upper).map_err(|unknown| {
+        anyhow::anyhow!(
+            "config error: {origin} lists the unknown method \"{unknown}\"; \
+             the supported methods are GET (which also answers HEAD), POST, PUT, PATCH and DELETE"
+        )
+    })
 }
 
 // ── Raw serde types for parsing site.toml ──────────────────────────────────

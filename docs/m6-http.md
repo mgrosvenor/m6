@@ -62,12 +62,20 @@ A backend that answers before it has read the whole request and then refuses the
 
 ## Routing
 
-1. **Cache hit** — serve from memory, no backend contact
-2. **Auth check** — if route has `require`, verify JWT locally; 401 if absent, 403 if insufficient
-3. **Route match** — forward to backend pool
-4. **No match** — 404 per `[errors] mode`
+1. **Method check** — a route that lists `methods` answers only those, and another method gets 405 with `Allow` before the cache or a backend is touched
+2. **Cache hit** — serve from memory, no backend contact
+3. **Auth check** — if route has `require`, verify JWT locally; 401 if absent, 403 if insufficient
+4. **Route match** — forward to backend pool
+5. **No match** — 404 per `[errors] mode`
 
 Route matching: a fixed route (every segment a literal) beats a pattern route (any `{param}` or `{*rest}`). Two fixed routes on one path, and two patterns that can both match some path, are a configuration error at load, and `--dump-config` fails the same way (see `m6-site-toml.md`, Route Matching).
+
+A `[[route]]` or `[[route_group]]` may name the methods it answers in `methods`.
+A request with another method is refused at the edge with 405 and `Allow` naming the ones the route does answer, before the body, the cache or a backend (RFC 9110 15.5.6 and 10.2.1).
+`GET` also answers `HEAD` (RFC 9110 9.3.2).
+`OPTIONS` is answered at the edge the same way and never forwarded (RFC 9110 9.3.7).
+An unknown or empty `methods` list stops the start with exit 2.
+`m6-site-toml.md` §4.8 and §4.9 own the key.
 
 ---
 
