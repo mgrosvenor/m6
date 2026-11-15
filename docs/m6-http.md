@@ -282,12 +282,35 @@ On a generation change the queue and the size map are cleared, the new subdirect
 Removal takes up to 512 files per slice, or fewer when the 1 ms time budget runs out first, then the empty directory.
 While the node has no current ID nothing is written, because nothing is stored in memory then either.
 
-An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick`, `skipped_full`, `ticks` and `tick_last_ns`.
+A restart reads the disk copy at start, before the loop serves, and never on the request path.
+The node lists `<dir>` and reads the subdirectory with the largest decimal name, because the source's IDs only grow.
+That generation's files are decoded one at a time in file-name order.
+Each entry is inserted into a fresh cache bounded like the live one, so a disk copy larger than the memory bound fills the cache with the entries that fit first and leaves the rest on disk under their keys.
+The writer counts the files that were left, so its byte bound covers the whole directory a restart inherits.
+Every other generation's directory is queued for removal over the slices that follow.
+
+A file that is short, fails its check value or carries another generation is deleted and counted, with one log line naming the path and the error.
+A `.tmp` file is an interrupted write and is deleted without being counted.
+A damaged file never stops the start and is never served.
+
+The decoded entries are held aside, not served, until the first heartbeat answers.
+The ID decides, by the same equality the store rule uses.
+A matching ID installs the copy as the live cache, so the node starts warm.
+Another ID drops it, because the site changed while the node was down, and the old directory is removed over the slices that follow.
+No answer installs the copy marked unverified, because a site with pages from before the restart serves visitors better than a site with none.
+The first later success clears the mark, keeps the copy when the ID is unchanged and runs the usual flush when it has moved.
+
+The start cost is one directory listing, one read and one SHA-256 per file, up to `max_bytes`.
+The `disk cache loaded` line reports `elapsed_ms` beside the ID, the entry count and the damaged-file count.
+
+An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick`, `skipped_full`, `ticks`, `tick_last_ns`, `loaded_entries`, `loaded_bad` and `state`.
 `dir_bytes` counts the files in the current generation's directory.
 `queued` counts the entries whose flag is set.
 `written_bytes_last_tick` is the encoded size of the last slice's writes, including a single entry larger than the 4 MiB budget.
 `ticks` counts the slices taken since the node started.
 `tick_last_ns` is the loop time the last slice took, measured from the platform clock.
+`loaded_entries` counts the entries the start-time load inserted and `loaded_bad` the files it deleted.
+`state` is `kept`, `discarded`, `unverified` or `none`, and it is `none` until the first heartbeat answers.
 
 ---
 

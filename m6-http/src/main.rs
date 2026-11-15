@@ -26,7 +26,7 @@ use m6_http_lib::cache::{
     should_cache, strip_uncacheable, Cache, CacheKey, CachedResponse, Precondition,
 };
 use m6_http_lib::config::{self, Config};
-use m6_http_lib::disk_cache::DiskWriter;
+use m6_http_lib::disk_cache::{self, DiskWriter};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
 use m6_http_lib::forward::{self, UpstreamId, Waiter};
@@ -307,6 +307,15 @@ struct ServerState {
     /// The disk copy of the cache on a cache node with `[cache] dir`.
     /// `None` everywhere else, so a hit and a store gain one `Option` test.
     disk: Option<DiskWriter>,
+    /// The disk copy read at start, held aside until the first heartbeat
+    /// answers. `None` once it is kept, discarded or installed unverified.
+    pending_disk: Option<disk_cache::Loaded>,
+    /// How many entries the start-time load inserted, and how many files it
+    /// deleted, for `/perf`.
+    loaded_entries: usize,
+    loaded_bad: usize,
+    /// What the first heartbeat decided about the load, for `/perf`.
+    disk_state: disk_cache::LoadState,
     public_key: Option<PublicKey>,
     error_mode: ErrorMode,
     stats: Stats,
@@ -1964,6 +1973,38 @@ fn follower_answered(
         }
         (outcome, was_down && !f.down())
     };
+    // The first answer settles a disk copy read at start. It is held aside
+    // rather than installed so the node never serves a generation the site
+    // has already left; the same equality the store rule uses decides it.
+    if let Some(loaded) = state.pending_disk.take() {
+        match genid::settle(loaded.id, &outcome) {
+            genid::Settle::Keep => {
+                let id = loaded.id;
+                state.cache = loaded.cache;
+                state.disk_state = disk_cache::LoadState::Kept;
+                info!(genid = id, "disk cache kept");
+            }
+            genid::Settle::Discard => {
+                state.disk_state = disk_cache::LoadState::Discarded;
+                info!("disk cache discarded: the site changed while this node was down");
+            }
+            genid::Settle::Unverified => {
+                let id = loaded.id;
+                state.cache = loaded.cache;
+                state.disk_state = disk_cache::LoadState::Unverified;
+                if let Some(f) = state.genid.cache_mut() {
+                    f.install_unverified(id);
+                }
+                if let Some(disk) = state.disk.as_mut() {
+                    disk.use_id(id);
+                }
+                warn!(
+                    genid = id,
+                    "disk cache served unverified: the upstream did not answer"
+                );
+            }
+        }
+    }
     match outcome {
         genid::Outcome::Down(reason) => {
             state.cache.set_serve_held(true);
@@ -1976,7 +2017,9 @@ fn follower_answered(
         genid::Outcome::First(id) => {
             state.cache.set_serve_held(false);
             // The disk copy starts with the first ID. Nothing was stored
-            // before it, so this only creates the generation's directory.
+            // before it, so this only creates the generation's directory. On
+            // a kept load the directory is the one already read, and this
+            // call leaves it alone.
             if let Some(disk) = state.disk.as_mut() {
                 disk.use_id(id);
             }
@@ -1984,9 +2027,22 @@ fn follower_answered(
         }
         genid::Outcome::Same => {
             state.cache.set_serve_held(false);
+            // A success after an unverified install confirms the disk copy:
+            // the ID is unchanged, so nothing is flushed.
+            if state.disk_state == disk_cache::LoadState::Unverified {
+                state.disk_state = disk_cache::LoadState::Kept;
+            }
         }
         genid::Outcome::Changed { from, to } => {
             state.cache.set_serve_held(false);
+            // The change flushes the cache, so a load that was installed is
+            // no longer the content the node serves.
+            if matches!(
+                state.disk_state,
+                disk_cache::LoadState::Kept | disk_cache::LoadState::Unverified
+            ) {
+                state.disk_state = disk_cache::LoadState::Discarded;
+            }
             follower_change(state, from, to);
         }
     }
@@ -4389,8 +4445,13 @@ fn handle_request_inner(
                             *report,
                             &state.genid,
                             genid_config,
-                            state.disk.as_ref(),
-                            state.cache.queued(),
+                            state.disk.as_ref().map(|writer| health::DiskPerf {
+                                writer,
+                                queued: state.cache.queued(),
+                                loaded_entries: state.loaded_entries,
+                                loaded_bad: state.loaded_bad,
+                                state: state.disk_state,
+                            }),
                         ),
                         None => health::PerfOutcome::Ok(report).into_response(),
                     },
@@ -6551,7 +6612,7 @@ fn run(args: Vec<String>) -> i32 {
     // The disk writer shares the memory cache's bound, so a disk copy cannot
     // outgrow the memory it shadows. Built at start, where a missing or
     // unwritable directory is already an error.
-    let disk = match config.cache_dir.as_ref() {
+    let mut disk = match config.cache_dir.as_ref() {
         Some(dir) => match DiskWriter::new(dir.clone(), cache.max_bytes()) {
             Ok(writer) => Some(writer),
             Err(e) => {
@@ -6561,12 +6622,38 @@ fn run(args: Vec<String>) -> i32 {
         },
         None => None,
     };
+    // The start-time load is the only place the disk is read. The entries are
+    // held aside, not installed: the first heartbeat decides whether the ID
+    // they carry is still the site's. The writer is told the ID now, so the
+    // generation's directory is kept and every other one is queued for
+    // removal over the slices that follow.
+    let (pending_disk, loaded_entries, loaded_bad, disk_state) =
+        match (config.cache_dir.as_deref(), disk.as_mut()) {
+            (Some(dir), Some(writer)) => match disk_cache::load(dir, cache.max_bytes()) {
+                Ok(Some(mut loaded)) => {
+                    let (id, entries, bad) = (loaded.id, loaded.entries, loaded.bad);
+                    writer.use_id(id);
+                    writer.adopt(std::mem::take(&mut loaded.files));
+                    (Some(loaded), entries, bad, disk_cache::LoadState::None)
+                }
+                Ok(None) => (None, 0, 0, disk_cache::LoadState::None),
+                Err(e) => {
+                    eprintln!("config error: [cache].dir {}: {e}", dir.display());
+                    return 2;
+                }
+            },
+            _ => (None, 0, 0, disk_cache::LoadState::None),
+        };
     let mut state = ServerState {
         config,
         route_table,
         pool_manager,
         cache,
         disk,
+        pending_disk,
+        loaded_entries,
+        loaded_bad,
+        disk_state,
         public_key,
         error_mode,
         stats: initial_stats(),

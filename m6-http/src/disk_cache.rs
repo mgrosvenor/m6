@@ -20,6 +20,14 @@
 //! to `<name>.tmp` with one `write_all`, then renamed. No `fsync`: a crash can
 //! leave a short or torn file, and the check value catches it at load.
 //!
+//! A restart reads the newest generation's files with [`load`], before the loop
+//! serves. The decoded entries go into a fresh [`Cache`] bounded like the live
+//! one, and the copy is held until the first heartbeat answers: the same ID
+//! installs it, another ID drops it, and an upstream that does not answer
+//! installs it unverified. A file that is short, fails its check value or
+//! carries another generation is deleted and counted, never served and never a
+//! reason to refuse to start.
+//!
 //! The format, all integers little-endian:
 //!
 //! ```text
@@ -37,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::cache::{Cache, CachedResponse};
+use crate::cache::{Cache, CacheKey, CachedResponse};
 
 /// Loop time one slice may spend on disk work, removals included. The write and
 /// removal budgets below are upper bounds that a slice may still hit first. A
@@ -185,6 +193,20 @@ impl DiskWriter {
                     self.removals.push(entry.path());
                 }
             }
+        }
+    }
+
+    /// Count the files a start-time [`load`] found under the current
+    /// generation, so the byte bound covers a directory this process did not
+    /// write and a rewrite of one of those keys replaces its file.
+    ///
+    /// Called once at start, right after [`DiskWriter::use_id`] and before the
+    /// loop serves. A later ID change resets the map, and the loaded
+    /// directory's files go with it.
+    pub fn adopt(&mut self, files: impl IntoIterator<Item = ([u8; 32], u64)>) {
+        for (hash, len) in files {
+            let old = self.sizes.insert(hash, len).unwrap_or(0);
+            self.bytes_on_disk = self.bytes_on_disk.saturating_sub(old).saturating_add(len);
         }
     }
 
@@ -395,6 +417,242 @@ impl DiskWriter {
             }
         }
         removed
+    }
+}
+
+/// What a start-time load read, held aside until the first heartbeat answers.
+pub struct Loaded {
+    /// The generation every loaded file carried, which is its directory's name.
+    pub id: u64,
+    /// The decoded entries, bounded like the live cache.
+    pub cache: Cache,
+    /// Entries inserted.
+    pub entries: usize,
+    /// Files deleted because they could not be read.
+    pub bad: usize,
+    /// The key hash and file length of every file left in the generation's
+    /// directory, including the ones beyond the memory bound and the ones this
+    /// process did not write. [`DiskWriter::adopt`] counts them, so the byte
+    /// bound covers the directory a restart inherits.
+    pub files: Vec<([u8; 32], u64)>,
+}
+
+/// What happened to the disk copy a node read at start, for `/perf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadState {
+    /// Nothing is installed: there was nothing to read, or the first heartbeat
+    /// has not answered yet.
+    #[default]
+    None,
+    /// The first heartbeat named the ID the files carried, so the load is the
+    /// live cache.
+    Kept,
+    /// The first heartbeat named another ID, so the load was dropped.
+    Discarded,
+    /// The upstream did not answer, so the load serves until it does.
+    Unverified,
+}
+
+impl LoadState {
+    /// The `/perf` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadState::None => "none",
+            LoadState::Kept => "kept",
+            LoadState::Discarded => "discarded",
+            LoadState::Unverified => "unverified",
+        }
+    }
+}
+
+/// Read the newest generation's files under `dir` into a fresh cache.
+///
+/// This is the start-time half of the disk cache: it runs once, before the
+/// loop serves, and never on the request path. The subdirectory with the
+/// largest decimal name is the generation to read, because the source's IDs
+/// only grow. Every other subdirectory is left for the writer to remove when
+/// the first heartbeat names the ID.
+///
+/// A file is read and decoded one at a time. The entries that fit `max_bytes`
+/// are inserted and the rest stay on disk under their keys, so a node whose
+/// disk copy is larger than its memory bound still starts with a cache of the
+/// first entries in file-name order, and the writer's bound covers the files
+/// that were left. A file that is short, fails its check value, carries
+/// another generation or names a key the store could not have written is
+/// deleted and counted in `bad`, with one log line naming the path and the
+/// error. A `.tmp` file is an interrupted write and is deleted without being
+/// counted.
+///
+/// `Ok(None)` means there is nothing to load: an empty `dir`, or no
+/// subdirectory with a decimal name. A directory that cannot be listed is an
+/// error, because a cache node whose `[cache] dir` cannot be read is a
+/// configuration fault the operator must see at start.
+pub fn load(dir: &Path, max_bytes: usize) -> std::io::Result<Option<Loaded>> {
+    let started = m6_core::platform::now();
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(id) = name.parse::<u64>() else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(best, _)| id > *best) {
+            newest = Some((id, entry.path()));
+        }
+    }
+    let Some((id, gen_dir)) = newest else {
+        return Ok(None);
+    };
+
+    let cache = Cache::with_max_bytes(max_bytes);
+    let mut entries = 0usize;
+    let mut bad = 0usize;
+    let mut read_bytes = 0usize;
+    let mut files: Vec<([u8; 32], u64)> = Vec::new();
+    // Name order, so the entries that win the bound and the ones left on disk
+    // are the same on every start.
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&gen_dir)?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let is_tmp = name.as_deref().is_some_and(|n| n.ends_with(".tmp"));
+        let Ok(len) = std::fs::metadata(&path).map(|m| m.len()) else {
+            bad += 1;
+            m6_core::log::warn!(
+                path = %path.display(),
+                error = "the file could not be sized",
+                "disk cache: cannot read a file; deleting it"
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if is_tmp {
+            // An interrupted write, not a value. The next store of the key
+            // writes the file again.
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let hash = name.as_deref().and_then(hash_from_name);
+        if read_bytes.saturating_add(len as usize) > max_bytes {
+            // The rest is left on disk and stays addressable by its key. It
+            // still counts towards the writer's byte bound.
+            if let Some(hash) = hash {
+                files.push((hash, len));
+            }
+            continue;
+        }
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) => {
+                bad += 1;
+                m6_core::log::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "disk cache: cannot read a file; deleting it"
+                );
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        let (file_id, stored_key, response) = match decode(&data) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                bad += 1;
+                m6_core::log::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "disk cache: skipping a file that does not decode"
+                );
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        if file_id != id {
+            bad += 1;
+            m6_core::log::warn!(
+                path = %path.display(),
+                error = "the file carries another generation",
+                file_id,
+                dir_id = id,
+                "disk cache: deleting a file from another generation"
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Some(key) = key_from_stored(&stored_key) else {
+            bad += 1;
+            m6_core::log::warn!(
+                path = %path.display(),
+                error = "the stored key is not a cache key",
+                "disk cache: deleting a file that is not addressable"
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let key_hash = key_hash(&stored_key);
+        cache.insert(key, response);
+        entries += 1;
+        read_bytes += data.len();
+        files.push((key_hash, len));
+    }
+
+    let elapsed_ms = m6_core::platform::now().duration_since(started).as_millis();
+    m6_core::log::info!(id, entries, bad, elapsed_ms, "disk cache loaded");
+    Ok(Some(Loaded {
+        id,
+        cache,
+        entries,
+        bad,
+        files,
+    }))
+}
+
+/// Rebuild the cache key a file stores.
+///
+/// The stored form is `path\x01query\x01encoding`, which is what
+/// [`CacheKey::new`] writes, so splitting on the separator and rebuilding it
+/// gives the same key. A string that does not split into three parts cannot
+/// have been written by the store, so the file is not addressable.
+fn key_from_stored(stored: &str) -> Option<CacheKey> {
+    let (path, rest) = stored.split_once('\u{1}')?;
+    let (query, encoding) = rest.split_once('\u{1}')?;
+    if encoding.contains('\u{1}') {
+        return None;
+    }
+    Some(CacheKey::new(path, Some(query), encoding))
+}
+
+/// The key hash a file name spells, when it is the 64 hex characters the
+/// writer writes.
+fn hash_from_name(name: &str) -> Option<[u8; 32]> {
+    if name.len() != 64 {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    let bytes = name.as_bytes();
+    for (i, byte) in hash.iter_mut().enumerate() {
+        let hi = hex_value(bytes[i * 2])?;
+        let lo = hex_value(bytes[i * 2 + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(hash)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -952,5 +1210,186 @@ mod tests {
         assert_eq!(cache.queued(), 1, "the second key is still waiting");
         assert_eq!(w.tick(&mut cache).written, 1);
         assert_eq!(cache.queued(), 0);
+    }
+
+    // ── The start-time load ──────────────────────────────────────────────────
+
+    /// Write one encoded entry under `<root>/<id>/<hash of key>`.
+    fn write_entry(root: &Path, id: u64, key: &str, body: &[u8]) {
+        let subdir = root.join(id.to_string());
+        std::fs::create_dir_all(&subdir).unwrap();
+        let mut buf = Vec::new();
+        encode_into(&mut buf, id, key, &response(id, body));
+        std::fs::write(subdir.join(hex(&key_hash(key))), buf).unwrap();
+    }
+
+    /// The largest decimal directory name is the generation to read. String
+    /// order would take `9` over `10`, so this proves the comparison is the
+    /// number.
+    ///
+    /// Break: compare the other way, and directory `2` loads instead.
+    #[test]
+    fn load_picks_the_newest_id_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in [2u64, 9, 10] {
+            write_entry(dir.path(), id, "/page\u{1}\u{1}", &[id as u8]);
+        }
+        let loaded = load(dir.path(), 1024 * 1024)
+            .unwrap()
+            .expect("a generation directory");
+        assert_eq!(
+            loaded.id, 10,
+            "the ID grows, so the largest number is newest"
+        );
+        assert_eq!(loaded.entries, 1);
+        assert_eq!(loaded.bad, 0);
+        let entry = loaded
+            .cache
+            .get(&CacheKey::new("/page", None, ""))
+            .expect("the newest generation's entry");
+        assert_eq!(&entry.body[..], &[10], "the body is the newest one's");
+        assert_eq!(entry.genid, 10, "the entry carries the file's ID");
+    }
+
+    /// One good file survives. A flipped byte, a truncated file and a file
+    /// stamped with another ID are deleted and counted, and a `.tmp` from an
+    /// interrupted write is deleted without being counted.
+    ///
+    /// Break: skip a file that does not decode without counting or deleting
+    /// it, and `bad` is 0 and the corrupt file stays on disk.
+    #[test]
+    fn load_deletes_bad_files_and_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let gen = dir.path().join("7");
+        write_entry(dir.path(), 7, "/good\u{1}\u{1}", b"good");
+
+        let mut buf = Vec::new();
+        encode_into(&mut buf, 7, "/flip\u{1}\u{1}", &response(7, b"flipped"));
+        let at = buf.len() - 32 - 1;
+        buf[at] ^= 0x01;
+        std::fs::write(gen.join(hex(&key_hash("/flip\u{1}\u{1}"))), &buf).unwrap();
+
+        let mut buf = Vec::new();
+        encode_into(&mut buf, 7, "/short\u{1}\u{1}", &response(7, b"short"));
+        let cut = buf.len() / 2;
+        std::fs::write(gen.join(hex(&key_hash("/short\u{1}\u{1}"))), &buf[..cut]).unwrap();
+
+        let mut buf = Vec::new();
+        encode_into(&mut buf, 8, "/other\u{1}\u{1}", &response(8, b"other"));
+        std::fs::write(gen.join(hex(&key_hash("/other\u{1}\u{1}"))), &buf).unwrap();
+
+        std::fs::write(gen.join("junk.tmp"), b"partial").unwrap();
+
+        let loaded = load(dir.path(), 1024 * 1024)
+            .unwrap()
+            .expect("a generation directory");
+        assert_eq!(loaded.entries, 1, "only the good file loads");
+        assert_eq!(
+            loaded.bad, 3,
+            "the flipped byte, the short file and the other generation"
+        );
+        assert_eq!(files(&gen).len(), 1, "every bad file and the tmp are gone");
+        assert!(loaded
+            .cache
+            .get(&CacheKey::new("/good", None, ""))
+            .is_some());
+        for key in ["/flip", "/short", "/other"] {
+            assert!(
+                loaded.cache.get(&CacheKey::new(key, None, "")).is_none(),
+                "{key} was not served"
+            );
+        }
+    }
+
+    /// More bytes on disk than `max_bytes`: the entries that fit are inserted
+    /// and the rest stay on disk under their keys. The cache stays inside its
+    /// bound and nothing is deleted for not fitting.
+    ///
+    /// Break: insert every entry regardless of the bound, and `entries` is 40.
+    #[test]
+    fn load_respects_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'x'; 4096];
+        let total = 40usize;
+        for i in 0..total {
+            write_entry(dir.path(), 7, &format!("/p{i}\u{1}\u{1}"), &body);
+        }
+        let bound = 64 * 1024;
+        let loaded = load(dir.path(), bound)
+            .unwrap()
+            .expect("a generation directory");
+        assert!(
+            loaded.cache.bytes_held() <= bound,
+            "the cache holds {} bytes against a {bound} bound",
+            loaded.cache.bytes_held()
+        );
+        assert!(
+            loaded.entries < total,
+            "the load took every file: {} entries",
+            loaded.entries
+        );
+        assert!(loaded.entries > 0, "some entries fit");
+        assert_eq!(loaded.bad, 0, "an entry that does not fit is not corrupt");
+        assert_eq!(
+            files(&dir.path().join("7")).len(),
+            total,
+            "the rest is left on disk and stays addressable"
+        );
+        assert_eq!(
+            loaded.files.len(),
+            total,
+            "every file counts towards the writer's byte bound"
+        );
+    }
+
+    /// An empty root and a root with no decimal subdirectory both mean nothing
+    /// to load, so the node starts exactly as it did before the disk cache.
+    ///
+    /// Break: return a load with ID 0, and the node believes it read
+    /// generation 0 from an empty directory.
+    #[test]
+    fn load_of_nothing_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load(dir.path(), 1024).unwrap().is_none());
+        std::fs::create_dir(dir.path().join("not-a-generation")).unwrap();
+        assert!(load(dir.path(), 1024).unwrap().is_none());
+    }
+
+    /// A full 4 MiB cache of 4 KiB pages is 1,024 files. This is the start
+    /// time an operator waits for: the load runs once, before the loop serves,
+    /// and its `elapsed_ms` is the line the log carries.
+    ///
+    /// Break: drop the bound check, and `entries` is the whole directory.
+    #[test]
+    fn load_a_full_cache_measures_its_start_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'x'; 4096];
+        let total = 1024usize;
+        for i in 0..total {
+            write_entry(dir.path(), 7, &format!("/p{i}\u{1}\u{1}"), &body);
+        }
+        let bound = 4 * 1024 * 1024;
+        let started = m6_core::platform::now();
+        let loaded = load(dir.path(), bound)
+            .unwrap()
+            .expect("a generation directory");
+        let elapsed = started.elapsed();
+        println!(
+            "disk cache load: {total} files of 4 KiB, {} entries, {} bytes held, {} ms",
+            loaded.entries,
+            loaded.cache.bytes_held(),
+            elapsed.as_millis()
+        );
+        assert!(
+            loaded.cache.bytes_held() <= bound,
+            "the cache holds {} bytes against a {bound} bound",
+            loaded.cache.bytes_held()
+        );
+        assert!(loaded.entries > 0);
+        assert!(
+            loaded.entries < total,
+            "the whole directory fit the bound, so the test measures nothing"
+        );
+        assert_eq!(loaded.files.len(), total);
     }
 }
