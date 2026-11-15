@@ -133,7 +133,7 @@ pub fn resolve_within(root: &Path, rel: &Path) -> Result<PathBuf, ResolvePathErr
     }
 
     let root = root.canonicalize().map_err(|_| ResolvePathError::Escape)?;
-    let mut joined = root.join(joined);
+    let joined = root.join(joined);
 
     // Walk down to the deepest component that exists. `symlink_metadata` does
     // not follow the final component, so a dangling symlink stops the walk and
