@@ -80,6 +80,7 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**The conformance gate now runs m6's own RFC tests, including the HTTP behaviour changes in this batch that no external tester can see.** `tools/conformance.sh` gains an `rfc` stage that runs `m6-http`'s `tests/rfc_conformance.rs`, `tests/backend_h2_split_headers.rs` and `tests/early_response.rs`, and the `m6-file` cache-control and `m6-core` conditional unit tests. Every test names its RFC section: `Content-Length` as `1*DIGIT` on h1 and h2 (RFC 9110 8.6, RFC 9113 8.1.1), a split body-less h2 reply (RFC 9113 6.2, 6.10, 8.1), lower-case h2 and h3 field names (RFC 9113 8.2.1, RFC 9114 4.2), `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5), and a backend's early answer forwarded (RFC 9110, RFC 9112 9.6). The stage fails when a test fails, so CI's `h1, h2, h3 conformance` job fails with it. Verified on 2026-11-15 on a macOS sandbox: 9 of 9 `rfc_conformance` tests pass on this tip, and the content-length, lower-case and split-header tests fail when their fix is reverted.
 **`[server] reuse_port` lets two or three m6-http processes serve the public 443 port.**
 It defaults to false, so an accidental second instance still fails at bind and an existing config binds exactly as before.
 When set, only the TLS listener and its QUIC UDP socket on `[server].bind` are bound through `m6_platform::net::listen_shared` with `SO_REUSEPORT`, in one call before the TLS configuration is built.

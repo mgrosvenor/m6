@@ -78,8 +78,8 @@ for arg in "$@"; do
   case "$arg" in
     --update) UPDATE=true ;;
     --allow-missing-tools) ALLOW_MISSING=true ;;
-    h1|h2|h3|resume) ONLY="$arg" ;;
-    *) echo "usage: $0 [h1|h2|h3|resume] [--update] [--allow-missing-tools]"; exit 2 ;;
+    h1|h2|h3|rfc|resume) ONLY="$arg" ;;
+    *) echo "usage: $0 [h1|h2|h3|rfc|resume] [--update] [--allow-missing-tools]"; exit 2 ;;
   esac
 done
 
@@ -729,6 +729,58 @@ run_resume() {
   return "$ok_all"
 }
 
+
+# ── m6-side RFC tests ─────────────────────────────────────────────────────────
+#
+# THE EXTERNAL TESTERS POINT AT m6 AS A SERVER. h2spec and h3spec send a hostile
+# peer at the edge, and h1spec does the same for HTTP/1.1. That leaves four
+# behaviours in this batch where m6 is the client, or where the field m6 writes
+# is the thing under test, and no external tester can see them:
+#
+#   - a backend's HTTP/2 header block split across HEADERS and CONTINUATION,
+#     with END_STREAM in the HEADERS frame (RFC 9113 6.2, 6.10, 8.1);
+#   - the field names m6 writes on h2 and h3 (RFC 9113 8.2.1, RFC 9114 4.2);
+#   - Content-Length is 1*DIGIT on h1 and h2 (RFC 9110 8.6, RFC 9113 8.1.1);
+#   - If-None-Match answered 304 by the edge on h1, h2 and h3 (RFC 9110 13.1.2,
+#     15.4.5);
+#   - a backend that answers early, before it has read the whole request, has
+#     that answer forwarded (RFC 9110, RFC 9112 9.6).
+#
+# Each test names its RFC section in the test name. They are m6's own tests, so
+# they run on the laptop too, where h2spec and h3spec may not be installed.
+rfc_run() {  # rfc_run <label> <cargo test args...>
+  local label="$1"; shift
+  local log="$WORK/rfc-${label//[^a-zA-Z0-9]/_}.log"
+  if cargo test "$@" -- --test-threads=1 > "$log" 2>&1; then
+    pass "rfc:$label  $(grep -a -oE '[0-9]+ passed' "$log" | tail -1)"
+    return 0
+  fi
+  fail "rfc:$label"
+  report_failures "$log"
+  RESULT=1
+  return 1
+}
+
+run_rfc() {
+  info "m6 RFC tests — the behaviours no external tester can see"
+  # rfc_conformance starts a real m6-file, and testkit::binary looks in the dev
+  # profile. The testers above use release binaries, so build the one binary the
+  # RFC tests execute in the profile they run in.
+  if ! cargo build -q -p m6-file --bin m6-file; then
+    fail "rfc: could not build m6-file for the RFC tests"
+    RESULT=1
+    return 1
+  fi
+  rfc_run rfc_conformance  -p m6-http --test rfc_conformance
+  rfc_run h2_split_headers -p m6-http --test backend_h2_split_headers
+  rfc_run early_response   -p m6-http --test early_response
+  # Cache-Control choices and the conditional-request rules are header policy,
+  # not framing, so no external tester reaches them either.
+  rfc_run cache_control    -p m6-file --lib cache_control
+  rfc_run conditional      -p m6-core --lib conditional
+  return 0
+}
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 mkdir -p "$WORK"
@@ -737,9 +789,10 @@ case "$ONLY" in
   h2) run_h2 ;;
   h3) run_h3 ;;
   resume) run_resume ;;
+  rfc) run_rfc ;;
   # Resumption last: it is the only stage that needs no external tester, so a
   # laptop run reaches it after the three skips and still measures something.
-  *)  run_h1; run_h2; run_h3; run_resume ;;
+  *)  run_h1; run_h2; run_h3; run_rfc; run_resume ;;
 esac
 
 if [[ "$UPDATE" == "true" ]]; then
