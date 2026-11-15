@@ -487,7 +487,7 @@ caller whose writer is already a buffer.
 
 **`ServerConn`** is one HTTP/1.1 connection slot for a service's own loop.
 `new(read_cap, write_cap)` makes it at start, `attach` takes an accepted
-`mio::net::UnixStream` and `detach` gives it back, and `stream()` is what the
+`m6_core::platform::net::UnixStream` and `detach` gives it back, and `stream()` is what the
 reactor registers.
 `read` reads until the socket would block and frames what is buffered. A whole
 request is then parsed with `parse_head_uninit` into the caller's fixed header
