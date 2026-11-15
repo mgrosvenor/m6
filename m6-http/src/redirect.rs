@@ -185,6 +185,10 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
             redirect_for(&owned)
         }
     };
+    // The redirect listener has no route table, so it decides nothing from a
+    // head before the body; `redirect_for` answers every method it accepts.
+    let mut on_head_early =
+        |_: &mut (), _: &RequestHead<'_>, _: &str| -> Option<RequestOutcome> { None };
     let hit = HitHeaders {
         alt_svc: std::sync::Arc::from(&[] as &[u8]),
         describedby: None,
@@ -265,6 +269,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                         &mut (),
                         &mut on_head,
                         &mut on_owned,
+                        &mut on_head_early,
                         &hit,
                         poll.registry(),
                     );

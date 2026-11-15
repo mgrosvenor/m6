@@ -549,9 +549,14 @@ Take from it that a route is a path and a backend, with an optional claim.
 | `path` | string | yes | A literal path, or a pattern with `{param}` or `{*rest}` |
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | `"group:<name>"` or `"role:<name>"`. A token must satisfy it |
+| `methods` | array of strings | no | The methods the route answers, such as `["POST"]`. Absent adds no restriction |
 
 **Table 10: the `[[route]]` keys.**
 A `{param}` matches one segment, and a `{*rest}` in the last segment matches the rest of the path.
+A route that lists `methods` answers exactly those: `GET` also answers `HEAD`, and a request with another method gets 405 with `Allow` before the cache or a backend is touched.
+The names m6 accepts are `GET`, `POST`, `PUT`, `PATCH` and `DELETE`.
+A name outside that set, or an empty list, stops the start with exit 2, and `--dump-config` fails the same way.
+`[server] allowed_methods` remains the server-wide ceiling: a route narrows it and does not widen it.
 
 ### 4.9. `[[route_group]]`
 
@@ -565,6 +570,7 @@ Take from it that the glob is a path on disk and `path` is the URL the file is s
 | `path` | string | yes | The URL pattern, with `{stem}`, `{filename}`, `{relpath}` or `{dir}` |
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | As `[[route]]` |
+| `methods` | array of strings | no | As `[[route]]` |
 
 **Table 11: the `[[route_group]]` keys.**
 The glob is expanded once at start, so the routes a group adds are fixed until a restart.
@@ -690,8 +696,11 @@ Two routes conflict when both can match one path.
 The cases are two fixed routes with the same path, and two pattern routes that can both match some path, such as `/blog/{slug}` with `/blog/{name}`, `/blog/{slug}` with `/blog/{*rest}`, or `/{lang}/about` with `/blog/{slug}`.
 The edge applies the same rule and the same test as the services, so a `site.toml` route table and a backend's own route table are refused by one rule.
 
-A `[[route]]` in `site.toml` names no methods, so the route table treats every method alike.
-The method check runs before routing, so a method the site does not serve never reaches a route: a known method gets 405 with `Allow`, and an invented one gets 501.
+A `[[route]]` with no `methods` adds no method restriction of its own; with a list it answers exactly the ones it lists.
+`GET` in the list answers `HEAD` too, so `methods = ["GET"]` answers both and a 405 from that route carries `Allow: GET, HEAD`.
+The method check runs before routing and before the cache lookup, so a method the site or the route does not serve never reaches a backend: a known method gets 405 with `Allow`, and an invented one gets 501.
+`OPTIONS` is decided at the edge and never forwarded: it is answered 405 with the route's `Allow`, because m6 offers no options of its own and a route cannot name it. A site that names `OPTIONS` in `[server] allowed_methods` still gets that refusal, with `OPTIONS` left out of `Allow`.
+The status is 405, which says the method is the problem and the target resource exists (RFC 9110 15.5.6).
 
 A request that reaches the route table therefore matches at most one route, and the method check has already accepted its method.
 Section 6 follows that request to the backend.
@@ -738,6 +747,7 @@ Exit 2 on:
 - A `[[backend]]` `sockets` glob that matches no socket
 - Duplicate `path` values across `[[route]]`
 - `cache` on a `[[route]]` or a `[[route_group]]`
+- A `methods` list naming a method other than `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or an empty list
 - `[errors] mode = "custom"` without `path`
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared with a `backend` that is not declared in `[[backend]]`

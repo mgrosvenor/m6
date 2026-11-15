@@ -78,6 +78,10 @@ pub struct RouteEntry {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
+    /// The methods this route answers, fixed at load. `Methods::ANY` when the
+    /// route lists none, which is the behaviour every route had before the key
+    /// existed.
+    pub methods: Methods,
 }
 
 /// Built route table.
@@ -92,6 +96,12 @@ pub struct RouteTable {
     /// answer without a route lookup, keeping the cache-hit path free of the
     /// extra `matchit` traversal.
     has_protected_routes: bool,
+    /// Whether *any* route lists `methods`.
+    ///
+    /// The method check runs before every cache lookup. When no route is
+    /// restricted — the common case — it answers from this flag with no route
+    /// lookup at all.
+    has_restricted_routes: bool,
 }
 
 impl RouteTable {
@@ -101,8 +111,13 @@ impl RouteTable {
         let mut entries = Vec::new();
 
         // The rule m6-core applies to a service's routes, so the edge and the
-        // services refuse the same configs. An edge route names no methods, so
-        // it answers every method.
+        // services refuse the same configs.
+        //
+        // Every edge route is declared with `Methods::ANY` here on purpose:
+        // the path table holds one route per path, and `matchit` refuses a
+        // second insert on the same path whatever methods it lists. So two
+        // `[[route]]` entries with one path are a config error, which is the
+        // pre-existing behaviour, and the conflict rule keeps saying so.
         let declared: Vec<_> = config
             .routes
             .iter()
@@ -114,11 +129,15 @@ impl RouteTable {
         check_route_conflicts(&declared)?;
 
         // Add explicit routes
-        for route in &config.routes {
+        for (i, route) in config.routes.iter().enumerate() {
             let entry = RouteEntry {
                 path: route.path.clone(),
                 backend: route.backend.clone(),
                 require: route.require.clone(),
+                methods: crate::config::route_methods(
+                    route.methods.as_deref(),
+                    &format!("route \"{}\" ([[route]] number {})", route.path, i + 1),
+                )?,
             };
             // matchit returns error on duplicate; we already validate in config
             if let Err(e) = router.insert(route.path.clone(), entry.clone()) {
@@ -132,7 +151,15 @@ impl RouteTable {
         }
 
         // Expand route_groups
-        for rg in &config.route_groups {
+        for (i, rg) in config.route_groups.iter().enumerate() {
+            let methods = crate::config::route_methods(
+                rg.methods.as_deref(),
+                &format!(
+                    "route_group \"{}\" ([[route_group]] number {})",
+                    rg.path,
+                    i + 1
+                ),
+            )?;
             let glob_pattern = if std::path::Path::new(&rg.glob).is_absolute() {
                 rg.glob.clone()
             } else {
@@ -166,6 +193,7 @@ impl RouteTable {
                     path: url_path.clone(),
                     backend: rg.backend.clone(),
                     require: rg.require.clone(),
+                    methods,
                 };
 
                 // Skip if already added (explicit route takes precedence)
@@ -183,11 +211,30 @@ impl RouteTable {
         }
 
         let has_protected_routes = entries.iter().any(|e| e.require.is_some());
+        let has_restricted_routes = entries.iter().any(|e| e.methods != Methods::ANY);
         Ok(RouteTable {
             router,
             entries,
             has_protected_routes,
+            has_restricted_routes,
         })
+    }
+
+    /// The methods a matched route answers, when it does not answer `method`.
+    ///
+    /// `None` means the route is absent or answers the method. The flag makes
+    /// the common case — no route lists `methods` — one comparison and no
+    /// route lookup, so the cache-hit path keeps its existing traversals.
+    ///
+    /// The refusal is a property of the target resource, so it belongs before
+    /// the cache lookup and any backend contact (RFC 9110 15.5.6). `HEAD`
+    /// belongs to `GET`'s set, per `Methods`.
+    pub fn refused_method(&self, path: &str, method: &str) -> Option<Methods> {
+        if !self.has_restricted_routes {
+            return None;
+        }
+        let route = self.at(path)?;
+        (!route.methods.contains(method)).then_some(route.methods)
     }
 
     /// Match a request path. Returns the matched RouteEntry if found.
@@ -241,6 +288,7 @@ impl RouteTable {
                 path: path.to_string(),
                 backend: "bench".to_string(),
                 require: require.map(str::to_string),
+                methods: Methods::ANY,
             };
             router
                 .insert(path.to_string(), entry.clone())
@@ -252,6 +300,7 @@ impl RouteTable {
             router,
             entries,
             has_protected_routes,
+            has_restricted_routes: false,
         }
     }
 
@@ -333,6 +382,7 @@ mod tests {
             backend: backend.to_string(),
             require: None,
             cache: None,
+            methods: None,
         }
     }
 
@@ -443,5 +493,89 @@ mod tests {
         let path = std::path::Path::new("/site/assets/css/main.css");
         let result = expand_glob_vars("/files/{dir}/{filename}", path, "/site/assets/**/*");
         assert_eq!(result, "/files/css/main.css");
+    }
+
+    fn make_restricted_route(path: &str, backend: &str, methods: &[&str]) -> RouteConfig {
+        RouteConfig {
+            path: path.to_string(),
+            backend: backend.to_string(),
+            require: None,
+            cache: None,
+            methods: Some(methods.iter().map(|m| m.to_string()).collect()),
+        }
+    }
+
+    /// A route that lists POST refuses GET and names POST; GET and HEAD share
+    /// one bit, so HEAD is refused on a POST-only route and allowed on a GET
+    /// one.
+    #[test]
+    fn a_route_refuses_a_method_it_does_not_list() {
+        let config = make_config(
+            vec![make_restricted_route("/submit", "b", &["POST"])],
+            vec![make_backend("b")],
+        );
+        let table = RouteTable::from_config(&config).unwrap();
+        assert_eq!(
+            table
+                .refused_method("/submit", "GET")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("POST")
+        );
+        assert_eq!(
+            table
+                .refused_method("/submit", "HEAD")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("POST")
+        );
+        assert_eq!(
+            table
+                .refused_method("/submit", "OPTIONS")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("POST")
+        );
+        assert_eq!(table.refused_method("/submit", "POST"), None);
+        assert_eq!(table.refused_method("/none", "GET"), None);
+    }
+
+    /// Names are trimmed and upper-cased at load, so a lower-case spelling in
+    /// the config is the same method and the hot path compares fixed strings.
+    #[test]
+    fn route_method_names_are_normalised_at_load() {
+        let config = make_config(
+            vec![make_restricted_route("/x", "b", &[" get ", "Post"])],
+            vec![make_backend("b")],
+        );
+        let table = RouteTable::from_config(&config).unwrap();
+        assert_eq!(table.refused_method("/x", "GET"), None);
+        assert_eq!(table.refused_method("/x", "POST"), None);
+        assert_eq!(
+            table
+                .refused_method("/x", "PUT")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("GET, HEAD, POST")
+        );
+    }
+
+    /// A name outside the fixed set is an error when the table is built, so
+    /// the start exits 2 instead of every request becoming a 405.
+    #[test]
+    fn an_unknown_route_method_is_a_load_error() {
+        let config = make_config(
+            vec![make_restricted_route("/x", "b", &["GET", "BREW"])],
+            vec![make_backend("b")],
+        );
+        let err = match RouteTable::from_config(&config) {
+            Ok(_) => panic!("an unknown method must fail the load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("BREW"),
+            "the error must name the method: {err}"
+        );
+        assert!(err.contains("/x"), "the error must name the route: {err}");
     }
 }

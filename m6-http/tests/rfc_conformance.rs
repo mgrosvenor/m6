@@ -137,7 +137,8 @@ impl Fixture {
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
-                 [[route]]\npath = \"/\"\nbackend = \"b\"\n",
+                 [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
+                 [[route]]\npath = \"/submit\"\nbackend = \"b\"\nmethods = [\"POST\"]\n",
                 d.join("b-*.sock").display()
             ),
         )
@@ -562,6 +563,58 @@ fn h3_serves_the_same_body_as_h1() {
         "HTTP/3 body length must equal HTTP/1.1's ({} vs {})",
         h3.len(),
         h1.len()
+    );
+}
+
+/// One received field by name, for the h2 and h3 field lists.
+fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// RFC 9110 15.5.6: a method the target resource does not support is answered
+/// 405, and RFC 9110 10.2.1 requires `Allow` naming the methods it does
+/// support.
+///
+/// The route `/submit` answers POST only. A GET is refused at the edge on all
+/// three protocols, before the backend is contacted, and the answer says
+/// `Allow: POST` rather than leaving the client to guess. `HEAD` is part of
+/// `GET`'s set (RFC 9110 9.3.2), which is why a GET-only route names both.
+#[test]
+fn rfc9110_15_5_6_405_names_the_route_methods_on_h1_h2_and_h3() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+
+    let raw = format!(
+        "GET /submit HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        fixture.port()
+    );
+    let (status, head, _) = h1_request(fixture.port(), &fixture.cert_der, &raw);
+    assert_eq!(status, 405, "HTTP/1.1 GET on a POST-only route: {head}");
+    assert!(
+        head.lines().any(|l| l.eq_ignore_ascii_case("allow: POST")),
+        "HTTP/1.1 405 must carry Allow: POST (RFC 9110 15.5.6):\n{head}"
+    );
+
+    let (status, fields, _) = h2_get(fixture.port(), &fixture.cert_der, "/submit", &[])
+        .expect("HTTP/2 request for a refused method");
+    assert_eq!(status, 405, "HTTP/2 GET on a POST-only route");
+    assert_eq!(
+        field(&fields, "allow"),
+        Some("POST"),
+        "HTTP/2 405 must carry Allow: POST: {fields:?}"
+    );
+
+    let (status, fields, _) =
+        h3_get(fixture.port(), "/submit", &[]).expect("HTTP/3 request for a refused method");
+    assert_eq!(status, 405, "HTTP/3 GET on a POST-only route");
+    assert_eq!(
+        field(&fields, "allow"),
+        Some("POST"),
+        "HTTP/3 405 must carry Allow: POST: {fields:?}"
     );
 }
 

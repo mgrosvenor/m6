@@ -682,3 +682,56 @@ fn a_present_analytics_log_directory_starts_and_writes_the_file() {
         svc.output()
     );
 }
+
+/// Scenario: a `[[route]] methods` list names a method m6 does not know.
+/// Wrong outcome: the route answers 405 (or 200) at request time, so the typo
+/// is discovered by a visitor instead of by the start.
+#[test]
+fn an_unknown_route_method_name_exits_2_and_names_it() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    // Bind the backend socket the route names, so the unknown method is the
+    // only config error in the file. Without it, the socket-glob check would
+    // stop the start first and this test would not exercise the method list.
+    let _backend =
+        std::os::unix::net::UnixListener::bind(dir.path().join("b-1.sock")).expect("backend");
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
+             [analytics]\nenabled = false\n\n\
+             [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
+             [[route]]\npath = \"/submit\"\nbackend = \"b\"\nmethods = [\"GET\", \"BREW\"]\n",
+            dir.path().join("b-*.sock").display()
+        ),
+    )
+    .expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
+        ),
+    )
+    .expect("system config");
+
+    let out = run(&[site.as_os_str(), system.as_os_str()]);
+    let err = stderr_of(&out);
+    assert_eq!(exit_code(&out), 2, "stderr: {err}");
+    assert!(
+        err.contains("BREW"),
+        "the error must name the unknown method, got: {err}"
+    );
+    assert!(
+        err.contains("/submit") && err.contains("[[route]] number 1"),
+        "the error must name the route, got: {err}"
+    );
+}

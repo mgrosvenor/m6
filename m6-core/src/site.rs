@@ -938,6 +938,28 @@ impl Methods {
             .find(|(_, bit)| self.0 == *bit)
             .map_or("SEVERAL", |(name, _)| name)
     }
+
+    /// The `Allow` field value for this set (RFC 9110 10.2.1).
+    ///
+    /// `HEAD` shares `GET`'s bit because a server that answers `GET` answers
+    /// `HEAD` too (RFC 9110 9.3.2), so it is named whenever `GET` is. Built
+    /// only for a refusal, never on a served request.
+    pub fn allow_value(self) -> String {
+        let mut value = String::new();
+        for (name, bit) in Self::NAMED {
+            if self.0 & bit == 0 {
+                continue;
+            }
+            if !value.is_empty() {
+                value.push_str(", ");
+            }
+            value.push_str(name);
+            if name == "GET" {
+                value.push_str(", HEAD");
+            }
+        }
+        value
+    }
 }
 
 impl From<&RouteMethod> for Methods {
@@ -4250,6 +4272,23 @@ mod route_rule_tests {
         for refused in ["PUT", "PATCH", "DELETE", "OPTIONS"] {
             assert_eq!(answer(&table, refused, "/comments"), None, "{refused}");
         }
+    }
+
+    /// The Allow value names GET with HEAD, because a server that answers GET
+    /// answers HEAD too (RFC 9110 9.3.2), and names only the methods the set
+    /// carries.
+    #[test]
+    fn an_allow_value_names_get_with_head() {
+        let get = Methods::from_names(&["GET".to_string()]).unwrap();
+        assert_eq!(get.allow_value(), "GET, HEAD");
+        let post = Methods::from_names(&["POST".to_string()]).unwrap();
+        assert_eq!(post.allow_value(), "POST");
+        let both = Methods::from_names(&["GET".to_string(), "POST".to_string()]).unwrap();
+        assert_eq!(both.allow_value(), "GET, HEAD, POST");
+        assert_eq!(
+            Methods::ANY.allow_value(),
+            "GET, HEAD, POST, PUT, PATCH, DELETE"
+        );
     }
 
     /// A route with no `methods` answers everything, including a method m6 has

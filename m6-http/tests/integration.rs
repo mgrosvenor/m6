@@ -139,6 +139,8 @@ where
             };
             RequestOutcome::Ready(s, h, b, be, None)
         };
+        let mut on_head_early =
+            |_: &mut (), _: &RequestHead<'_>, _: &str| -> Option<RequestOutcome> { None };
         let hit = HitHeaders {
             alt_svc: std::sync::Arc::from(&[] as &[u8]),
             describedby: None,
@@ -177,6 +179,7 @@ where
                             &mut (),
                             &mut on_head,
                             &mut on_owned,
+                            &mut on_head_early,
                             &hit,
                             poll.registry(),
                         );
