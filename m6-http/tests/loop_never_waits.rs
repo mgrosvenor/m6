@@ -24,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustls::StreamOwned;
@@ -620,19 +620,68 @@ fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
     )
 }
 
+/// The one ES256 signing key the loop tests' `[auth]` uses.
+///
+/// Generated once per process so the `[auth] public_key` every fixture writes
+/// matches the token `/perf` sends. One checker means one credential fixture:
+/// the legacy bearer string is gone, so a token here is a real JWT and the
+/// public key beside it is what `auth::check` verifies.
+fn auth_keys() -> &'static (String, String) {
+    static KEYS: OnceLock<(String, String)> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
+        (kp.serialize_pem(), kp.public_key_pem())
+    })
+}
+
+/// Write the fixture's `[auth]` public key into `dir` and name it.
+fn write_auth_key(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("auth-public.pem");
+    std::fs::write(&path, &auth_keys().1).expect("auth public key");
+    path
+}
+
+/// A `role:monitor` token signed by [`auth_keys`].
+fn monitor_token() -> String {
+    mint(&auth_keys().0, &["monitor"])
+}
+
+fn mint(private_pem: &str, roles: &[&str]) -> String {
+    #[derive(serde::Serialize)]
+    struct Claims {
+        sub: String,
+        exp: u64,
+        roles: Vec<String>,
+    }
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let claims = Claims {
+        sub: "t".to_string(),
+        exp,
+        roles: roles.iter().map(|s| s.to_string()).collect(),
+    };
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
+}
+
 fn system_toml(
     port: u16,
     cert: &std::path::Path,
     key: &std::path::Path,
-    token: &std::path::Path,
+    public_key: &std::path::Path,
 ) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
-         [health]\nmetrics_token_file = \"{}\"\n\n\
+         [auth]\npublic_key = \"{}\"\n\n\
+         [health]\nmetrics_require = \"role:monitor\"\n\n\
          [node]\nname = \"loop-never-waits\"\n",
         cert.display(),
         key.display(),
-        token.display(),
+        public_key.display(),
     )
 }
 
@@ -899,10 +948,8 @@ impl H1KeepAlive {
 /// The `(name, count)` pairs of the event-loop figures `/perf` reports,
 /// read over the already-open keep-alive connection.
 fn perf_event_loop(conn: &mut H1KeepAlive) -> Vec<(String, u64)> {
-    let (status, body) = conn.request(
-        "/perf",
-        &[("Authorization", "Bearer loop-never-waits-token")],
-    );
+    let auth = format!("Bearer {}", monitor_token());
+    let (status, body) = conn.request("/perf", &[("Authorization", auth.as_str())]);
     assert_eq!(status, 200, "/perf answered {status}: {body}");
     let report: m6_core::monitoring::PerfReport =
         serde_json::from_str(&body).expect("a perf report");
@@ -1070,12 +1117,12 @@ fn a_backend_that_resets_mid_response_answers_502_and_the_next_request_is_served
         Backend::start_with_release(healthy_path, slow_seen, large_seen, Arc::clone(&release));
 
     std::fs::write(site.join("site.toml"), site_toml(&glob, 30)).expect("site.toml");
-    std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
+    let public_key = write_auth_key(&site);
     let claim = claim_port();
     let port = claim.port();
     std::fs::write(
         site.join("system.toml"),
-        system_toml(port, &cert, &key, &site.join("metrics.token")),
+        system_toml(port, &cert, &key, &public_key),
     )
     .expect("system.toml");
 
@@ -1332,12 +1379,12 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
         ),
     )
     .expect("site.toml");
-    std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
+    let public_key = write_auth_key(&site);
     let claim = claim_port();
     let port = claim.port();
     std::fs::write(
         site.join("system.toml"),
-        system_toml(port, &cert, &key, &site.join("metrics.token")),
+        system_toml(port, &cert, &key, &public_key),
     )
     .expect("system.toml");
 
@@ -1495,13 +1542,13 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         ),
     )
     .expect("site.toml");
-    std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
+    let public_key = write_auth_key(&site);
     let claim = claim_port();
     let port = claim.port();
     let _claim = claim;
     std::fs::write(
         site.join("system.toml"),
-        system_toml(port, &cert, &key, &site.join("metrics.token")),
+        system_toml(port, &cert, &key, &public_key),
     )
     .expect("system.toml");
 
@@ -1629,8 +1676,9 @@ fn url_site(server: &str, backends: &str, routes: &str) -> String {
     site_with("info", server, backends, routes)
 }
 
-/// Write a site directory with a certificate, a metrics token, `site.toml` and
-/// a `system.toml` bound to `port`. Returns the system config's path.
+/// Write a site directory with a certificate, the `[auth]` public key,
+/// `site.toml` and a `system.toml` bound to `port`. Returns the system config's
+/// path.
 fn write_site(dir: &std::path::Path, site_toml: &str, port: u16) -> PathBuf {
     let ck =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -1640,10 +1688,9 @@ fn write_site(dir: &std::path::Path, site_toml: &str, port: u16) -> PathBuf {
     std::fs::write(&cert, ck.cert.pem()).expect("cert");
     std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
     std::fs::write(dir.join("site.toml"), site_toml).expect("site.toml");
-    let token = dir.join("metrics.token");
-    std::fs::write(&token, "loop-never-waits-token").expect("token");
+    let public_key = write_auth_key(dir);
     let system = dir.join("system.toml");
-    std::fs::write(&system, system_toml(port, &cert, &key, &token)).expect("system.toml");
+    std::fs::write(&system, system_toml(port, &cert, &key, &public_key)).expect("system.toml");
     system
 }
 

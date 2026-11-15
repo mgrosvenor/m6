@@ -51,9 +51,8 @@ pub struct GenidConfig {
     pub upstream: Option<String>,
     /// The bearer token a heartbeat sends, read from `token_file` at load.
     ///
-    /// `serde(skip)` in both directions, as `HealthConfig::metrics_token` is:
-    /// it must never be printed by `--dump-config`, and it must not be settable
-    /// inline from TOML.
+    /// `serde(skip)` in both directions: it must never be printed by
+    /// `--dump-config`, and it must not be settable inline from TOML.
     #[serde(skip)]
     pub token: Option<String>,
     /// How long between heartbeats. Cache node only, default 10 s.
@@ -327,28 +326,6 @@ pub struct HealthConfig {
     /// of being silently shadowed by it.
     #[serde(default = "default_health_path")]
     pub path: String,
-    /// Bearer token gating the metrics block (counters + latency
-    /// percentiles). `None` -- the default -- means metrics are never served,
-    /// so forgetting to configure it fails closed.
-    ///
-    /// Path to a file whose contents are the bearer token.
-    ///
-    /// The *path* is configuration and belongs in git; the *contents* are a
-    /// secret and must not. site.toml is rendered from a committed template
-    /// and shipped byte-identically to every node, so a token written inline
-    /// there would be a secret in the repository. The same split applies to
-    /// every other credential a node needs: the file is mode 0600, owned by
-    /// root, and exists only on the box.
-    #[serde(default)]
-    pub metrics_token_file: Option<String>,
-    /// The resolved token, read from `metrics_token_file` at load.
-    ///
-    /// `serde(skip)` in both directions, deliberately. It must never be
-    /// printed by `--dump-config`, which serialises the whole Config, and it
-    /// must not be settable inline from TOML -- otherwise the file
-    /// indirection above is advisory rather than enforced.
-    #[serde(skip)]
-    pub metrics_token: Option<String>,
     /// Path for the metrics endpoint. Separate from `path` on purpose: the
     /// health check must stay constant-cost, and percentiles are not.
     #[serde(default = "default_perf_path")]
@@ -377,8 +354,7 @@ pub struct HealthConfig {
     /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
     /// an API token that carries this claim, verified with `[auth] public_key`
     /// exactly as a route `require` is: 401 for no or a bad token, 403 for the
-    /// wrong claim. Setting it together with `metrics_token_file` stops the start
-    /// with exit 2.
+    /// wrong claim, both answered by the one token check.
     #[serde(default)]
     pub metrics_require: Option<String>,
     /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
@@ -419,8 +395,6 @@ impl Default for HealthConfig {
         HealthConfig {
             enabled: default_true(),
             path: default_health_path(),
-            metrics_token_file: None,
-            metrics_token: None,
             perf_path: default_perf_path(),
             traffic_path: default_traffic_path(),
             traffic_cache_s: default_traffic_cache_s(),
@@ -846,9 +820,6 @@ struct RawGenid {
 struct RawSystemHealth {
     metrics_require: Option<String>,
     metrics_peers: Option<Vec<String>>,
-    /// A credential path, so it belongs to the node. Absolute only, as
-    /// `[auth].public_key` is in this file.
-    metrics_token_file: Option<String>,
 }
 
 /// Parse a list of peer addresses into canonical form.
@@ -1185,27 +1156,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     if let Some(sys) = node_health {
         health.metrics_require = sys.metrics_require;
         health.metrics_peers = sys.metrics_peers;
-        health.metrics_token_file = sys.metrics_token_file;
-    }
-    // A token file and a token claim are two gates for the same endpoint. Both
-    // set is a mistake, and a token file that cannot be read is a start failure.
-    if health.metrics_token_file.is_some() && health.metrics_require.is_some() {
-        anyhow::bail!(
-            "config error: [health] metrics_require replaces metrics_token_file. Remove metrics_token_file"
-        );
-    }
-    if let Some(path) = &health.metrics_token_file {
-        secret_path("[health] metrics_token_file", path)?;
-    }
-    if let Some(ref path) = health.metrics_token_file {
-        let token = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::anyhow!("config error: [health] metrics_token_file {path} cannot be read: {e}")
-        })?;
-        let token = token.trim().to_string();
-        if token.is_empty() {
-            anyhow::bail!("config error: [health] metrics_token_file {path} is empty");
-        }
-        health.metrics_token = Some(token);
     }
     health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
@@ -1526,7 +1476,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "reuse_port",
 ];
 /// The fields of `RawSystemHealth`; change both together.
-const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
+const NODE_HEALTH_KEYS: &[&str] = &["metrics_require", "metrics_peers"];
 /// Whole sections that are node state. They belong in the system config.
 ///
 /// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
@@ -2527,10 +2477,12 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn a_relative_metrics_token_file_is_refused_and_named() {
+    fn the_removed_metrics_token_file_is_refused_and_named() {
+        // The legacy bearer gate is gone; an operator still carrying it gets a
+        // start failure that names the key rather than a silently ignored row.
         let (_d, r) = load_with("", "\n[health]\nmetrics_token_file = \"token\"\n");
         let e = r.unwrap_err().to_string();
-        assert!(e.contains("[health] metrics_token_file"), "{e}");
+        assert!(e.contains("metrics_token_file"), "{e}");
     }
 
     fn peers_error(entries: &str) -> String {
@@ -2925,7 +2877,7 @@ domain = "test.example.com"
         assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
     }
 
-    // --- misplaced_keys and metrics_token_file placement ---
+    // --- misplaced_keys and the removed legacy metrics key ---
 
     #[test]
     fn metrics_token_file_in_site_toml_is_refused() {
@@ -2942,11 +2894,9 @@ domain = "test.example.com"
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
             .to_string();
-        assert!(
-            e.contains("site.toml sets [health].metrics_token_file"),
-            "{e}"
-        );
-        assert!(e.contains("belongs in the system config"), "{e}");
+        // The key is removed outright: neither file accepts it any more, and
+        // the error names it so an operator can find the line.
+        assert!(e.contains("metrics_token_file"), "{e}");
     }
 
     /// Write `site` and `system` into a fresh directory and name the misplaced keys.
@@ -3004,7 +2954,7 @@ domain = "test.example.com"
     fn misplaced_keys_is_silent_for_a_clean_pair() {
         let m = misplaced(
             "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_token_file = \"/t\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_require = \"role:monitor\"\n",
         );
         assert!(m.is_empty(), "{m:?}");
     }
@@ -3085,12 +3035,9 @@ domain = "test.example.com"
         );
         let mut health = NODE_HEALTH_KEYS.to_vec();
         health.sort_unstable();
-        assert_eq!(
-            health,
-            ["metrics_peers", "metrics_require", "metrics_token_file"]
-        );
+        assert_eq!(health, ["metrics_peers", "metrics_require"]);
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "node"]);
-        assert_eq!(all.len(), 12 + 3 + 4);
+        assert_eq!(all.len(), 12 + 2 + 4);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
@@ -3155,7 +3102,7 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn a_missing_metrics_token_file_is_refused() {
+    fn the_removed_metrics_token_file_is_refused_in_the_system_config_too() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
         let mut sys = minimal_system_toml();
@@ -3164,40 +3111,8 @@ domain = "test.example.com"
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
             .to_string();
+        // Removed, not read: the key is unknown in both files now.
         assert!(e.contains("metrics_token_file"), "{e}");
-        assert!(e.contains("cannot be read"), "{e}");
-    }
-
-    #[test]
-    fn an_empty_metrics_token_file_is_refused() {
-        let dir = make_test_dir();
-        setup_minimal(dir.path());
-        write_file(dir.path(), "empty-token", "");
-        let mut sys = minimal_system_toml();
-        sys.push_str("\n[health]\nmetrics_token_file = \"{DIR}/empty-token\"\n");
-        write_file(dir.path(), "system.toml", &sys);
-        let e = load(dir.path(), &dir.path().join("system.toml"))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("is empty"), "{e}");
-    }
-
-    #[test]
-    fn a_metrics_token_file_with_metrics_require_is_refused() {
-        let dir = make_test_dir();
-        setup_minimal(dir.path());
-        write_file(dir.path(), "auth.pem", "dummy");
-        write_file(dir.path(), "token", "secret\n");
-        let mut sys = minimal_system_toml();
-        sys.push_str("\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_token_file = \"{DIR}/token\"\nmetrics_require = \"role:monitor\"\n");
-        write_file(dir.path(), "system.toml", &sys);
-        let e = load(dir.path(), &dir.path().join("system.toml"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("metrics_require replaces metrics_token_file"),
-            "{e}"
-        );
     }
 
     #[test]

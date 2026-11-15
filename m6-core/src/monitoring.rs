@@ -123,48 +123,6 @@ pub fn is_monitoring_endpoint(backend: &str) -> bool {
     backend == HEALTH_BACKEND || backend == PERF_BACKEND
 }
 
-/// Compare a presented credential against the expected one without leaking
-/// the match position through timing.
-///
-/// A naive `==` on strings returns at the first differing byte, so response
-/// time reveals how many leading bytes were correct and the token can be
-/// recovered one byte at a time. Lengths are compared first and unequal
-/// lengths rejected outright, which does leak length; that is not
-/// recoverable-secret information in the way a prefix is.
-fn credential_matches(presented: &str, expected: &str) -> bool {
-    let (a, b) = (presented.as_bytes(), expected.as_bytes());
-    if a.len() != b.len() || expected.is_empty() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Whether this request may see metrics.
-///
-/// Expects `Authorization: Bearer <token>`. Returns false when no token is
-/// configured, so metrics are off unless deliberately switched on.
-pub fn metrics_authorised(headers: &[(String, String)], configured_token: Option<&str>) -> bool {
-    let Some(expected) = configured_token.filter(|t| !t.is_empty()) else {
-        return false;
-    };
-    crate::headers::get(headers, "authorization")
-        .and_then(|value| {
-            // The scheme is case-insensitive per RFC 9110 11.1.
-            let rest = value.strip_prefix("Bearer ").or_else(|| {
-                value
-                    .get(..7)
-                    .filter(|p| p.eq_ignore_ascii_case("bearer "))
-                    .and_then(|_| value.get(7..))
-            })?;
-            Some(credential_matches(rest.trim(), expected))
-        })
-        .unwrap_or(false)
-}
-
 /// One socket-backed backend pool's size.
 ///
 /// A node built before the pool lost its health state sent an `active` field
@@ -479,47 +437,9 @@ pub struct PerfSubject<'a> {
     pub host_path: &'a std::path::Path,
 }
 
-/// Who is asking, and what would authorise them.
-///
-/// Separate from [`PerfSubject`] because the two are answered at different
-/// times and by different code: access decides whether there is a report at
-/// all, and the subject is only read once it has. Keeping them apart is also
-/// what stopped `build` taking eight positional arguments, six of which were
-/// `&str`-ish and easy to transpose.
-pub struct PerfAccess<'a> {
-    pub headers: &'a [(String, String)],
-    pub configured_token: Option<&'a str>,
-}
-
-impl PerfAccess<'_> {
-    /// Why the legacy bearer gate refuses this caller, or `None` when it
-    /// passes. No token configured is `Disabled`, a wrong or missing one is
-    /// `Unauthorised`.
-    pub fn refusal(&self) -> Option<PerfOutcome> {
-        match self.configured_token.filter(|t| !t.is_empty()) {
-            None => Some(PerfOutcome::Disabled),
-            Some(_) if !metrics_authorised(self.headers, self.configured_token) => {
-                Some(PerfOutcome::Unauthorised)
-            }
-            Some(_) => None,
-        }
-    }
-}
-
 impl PerfReport {
-    pub fn build(
-        subject: PerfSubject<'_>,
-        access: PerfAccess<'_>,
-        snapshot: impl FnOnce() -> StatsSnapshot,
-    ) -> PerfOutcome {
-        match access.refusal() {
-            Some(outcome) => outcome,
-            None => Self::build_authorised(subject, snapshot),
-        }
-    }
-
     /// The report itself, for a caller that has already been authorised by
-    /// some other gate. Nothing here checks access.
+    /// the token check. Nothing here checks access.
     pub fn build_authorised(
         subject: PerfSubject<'_>,
         snapshot: impl FnOnce() -> StatsSnapshot,
@@ -556,32 +476,34 @@ impl PerfReport {
 
 impl PerfOutcome {
     pub fn into_response(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        let mut headers = vec![
-            (
-                "Content-Type".to_string(),
-                "application/json; charset=utf-8".to_string(),
-            ),
-            ("Cache-Control".to_string(), "no-store".to_string()),
-            ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
-        ];
         match self {
-            PerfOutcome::Disabled => (404, headers, br#"{"error":"not found"}"#.to_vec()),
-            PerfOutcome::Unauthorised => {
-                // RFC 9110 11.6.1: a 401 MUST carry WWW-Authenticate naming
-                // the scheme, otherwise a client cannot know how to retry.
-                headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
-                (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
-            }
-            PerfOutcome::Forbidden => (403, headers, br#"{"error":"forbidden"}"#.to_vec()),
-            PerfOutcome::Ok(report) => {
-                let body = serde_json::to_vec(&report)
-                    .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-                (200, headers, body)
-            }
-            PerfOutcome::Traffic(report) => {
-                let body = serde_json::to_vec(&report)
-                    .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-                (200, headers, body)
+            // The token check's refusal is one definition, in `http`: the same
+            // bytes whichever route asked.
+            PerfOutcome::Unauthorised => crate::http::token_refusal(false),
+            PerfOutcome::Forbidden => crate::http::token_refusal(true),
+            other => {
+                let headers = vec![
+                    (
+                        "Content-Type".to_string(),
+                        "application/json; charset=utf-8".to_string(),
+                    ),
+                    ("Cache-Control".to_string(), "no-store".to_string()),
+                    ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+                ];
+                match other {
+                    PerfOutcome::Disabled => (404, headers, br#"{"error":"not found"}"#.to_vec()),
+                    PerfOutcome::Ok(report) => {
+                        let body = serde_json::to_vec(&report)
+                            .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
+                        (200, headers, body)
+                    }
+                    PerfOutcome::Traffic(report) => {
+                        let body = serde_json::to_vec(&report)
+                            .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
+                        (200, headers, body)
+                    }
+                    PerfOutcome::Unauthorised | PerfOutcome::Forbidden => unreachable!(),
+                }
             }
         }
     }
@@ -620,92 +542,18 @@ mod tests {
         assert_eq!(parsed["node"], "origin");
     }
 
-    /// Traffic volume and build identity are not public. If a future change
-    /// adds them to the public payload, this fails.
-    fn auth(value: &str) -> Vec<(String, String)> {
-        vec![("Authorization".to_string(), value.to_string())]
-    }
-
-    #[test]
-    fn no_configured_token_means_metrics_are_never_served() {
-        // The secure default: forgetting to configure it fails closed, and no
-        // presented credential can talk its way past a token that is unset.
-        assert!(!metrics_authorised(&auth("Bearer anything"), None));
-        assert!(!metrics_authorised(&auth("Bearer anything"), Some("")));
-        assert!(!metrics_authorised(&[], None));
-    }
-
-    #[test]
-    fn correct_bearer_token_authorises() {
-        assert!(metrics_authorised(&auth("Bearer s3cret"), Some("s3cret")));
-        // RFC 9110 11.1: the auth scheme is case-insensitive.
-        assert!(metrics_authorised(&auth("bearer s3cret"), Some("s3cret")));
-        assert!(metrics_authorised(&auth("BEARER s3cret"), Some("s3cret")));
-        // Header field names are case-insensitive too.
-        assert!(metrics_authorised(
-            &[("authorization".to_string(), "Bearer s3cret".to_string())],
-            Some("s3cret")
-        ));
-    }
-
-    #[test]
-    fn wrong_or_malformed_credentials_are_refused() {
-        for value in [
-            "Bearer wrong",
-            "Bearer s3cre",     // prefix of the real token
-            "Bearer s3secret1", // longer
-            "Basic s3cret",     // wrong scheme
-            "s3cret",           // no scheme
-            "Bearer",           // no token
-            "",
-        ] {
-            assert!(
-                !metrics_authorised(&auth(value), Some("s3cret")),
-                "must refuse {value:?}"
-            );
-        }
-        assert!(!metrics_authorised(&[], Some("s3cret")));
-    }
-
-    /// A prefix of the real token must not compare equal. This is the
-    /// property that a length check alone would give, but the comparison is
-    /// also constant-time so response latency cannot be used to recover the
-    /// token one byte at a time.
-    #[test]
-    fn credential_comparison_rejects_prefixes_and_empty() {
-        assert!(credential_matches("abc123", "abc123"));
-        assert!(!credential_matches("abc12", "abc123"));
-        assert!(!credential_matches("abc1234", "abc123"));
-        assert!(!credential_matches("", ""));
-        assert!(!credential_matches("", "abc123"));
-    }
-
     /// An empty snapshot. The collector that fills one in lives in m6-http;
-    /// these tests are about the endpoint's shape and authorisation, not about
-    /// how the numbers are gathered.
+    /// these tests are about the endpoint's shape, not about how the numbers
+    /// are gathered.
     fn snap() -> StatsSnapshot {
         StatsSnapshot::default()
     }
 
     #[test]
-    fn perf_is_404_when_no_token_is_configured() {
+    fn a_disabled_endpoint_is_a_404_with_no_door() {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
-        let out = PerfReport::build(
-            PerfSubject {
-                node: "origin",
-                uptime_s: 5,
-                pools: vec![],
-                url_backends: vec![],
-                host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer x"),
-                configured_token: None,
-            },
-            snap,
-        );
-        let (code, _, body) = out.into_response();
+        let (code, _, body) = PerfOutcome::Disabled.into_response();
         assert_eq!(code, 404);
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
     }
@@ -716,17 +564,13 @@ mod tests {
     /// actually is.
     #[test]
     fn perf_reports_the_running_build_identity() {
-        let out = PerfReport::build(
+        let out = PerfReport::build_authorised(
             PerfSubject {
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
                 host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer right"),
-                configured_token: Some("right"),
             },
             snap,
         );
@@ -801,17 +645,13 @@ mod tests {
         // A real payload with the field taken out, rather than a hand-written
         // fixture: a fixture only proves the fixture parses, and the first attempt
         // at one failed on unrelated required fields of StatsSnapshot.
-        let out = PerfReport::build(
+        let out = PerfReport::build_authorised(
             PerfSubject {
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
                 host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer right"),
-                configured_token: Some("right"),
             },
             snap,
         );
@@ -827,17 +667,13 @@ mod tests {
     }
 
     fn authorised_perf_json() -> serde_json::Value {
-        let out = PerfReport::build(
+        let out = PerfReport::build_authorised(
             PerfSubject {
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
                 host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer right"),
-                configured_token: Some("right"),
             },
             snap,
         );
@@ -878,25 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn refusal_matches_the_legacy_gate() {
-        let none = PerfAccess {
-            headers: &auth("Bearer x"),
-            configured_token: None,
-        };
-        assert!(matches!(none.refusal(), Some(PerfOutcome::Disabled)));
-        let wrong = PerfAccess {
-            headers: &auth("Bearer wrong"),
-            configured_token: Some("right"),
-        };
-        assert!(matches!(wrong.refusal(), Some(PerfOutcome::Unauthorised)));
-        let right = PerfAccess {
-            headers: &auth("Bearer right"),
-            configured_token: Some("right"),
-        };
-        assert!(right.refusal().is_none());
-    }
-
-    #[test]
     fn build_authorised_reports_without_a_token() {
         let out = PerfReport::build_authorised(
             PerfSubject {
@@ -929,57 +746,17 @@ mod tests {
 
     #[test]
     fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
-        let out = PerfReport::build(
-            PerfSubject {
-                node: "origin",
-                uptime_s: 5,
-                pools: vec![],
-                url_backends: vec![],
-                host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer wrong"),
-                configured_token: Some("right"),
-            },
-            snap,
-        );
-        let (code, headers, _) = out.into_response();
+        let (code, headers, body) = PerfOutcome::Unauthorised.into_response();
         assert_eq!(code, 401);
+        assert_eq!(body, br#"{"error":"unauthorised"}"#);
         assert!(headers
             .iter()
             .any(|(n, v)| n.eq_ignore_ascii_case("WWW-Authenticate") && v == "Bearer"));
     }
 
-    /// The reservoir sort must never run for an unauthorised caller. If it
-    /// did, an anonymous scrape loop would be a cheap way to make the server
-    /// work.
-    #[test]
-    fn perf_does_not_snapshot_unless_authorised() {
-        let mut taken = false;
-        let counting = || {
-            taken = true;
-            snap()
-        };
-        let _ = PerfReport::build(
-            PerfSubject {
-                node: "origin",
-                uptime_s: 5,
-                pools: vec![],
-                url_backends: vec![],
-                host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &[],
-                configured_token: Some("tok"),
-            },
-            counting,
-        );
-        assert!(!taken, "snapshot must not be taken without authorisation");
-    }
-
     #[test]
     fn perf_returns_metrics_when_authorised() {
-        let out = PerfReport::build(
+        let out = PerfReport::build_authorised(
             PerfSubject {
                 node: "origin",
                 uptime_s: 11,
@@ -989,10 +766,6 @@ mod tests {
                 }],
                 url_backends: vec!["origin".to_string()],
                 host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer tok"),
-                configured_token: Some("tok"),
             },
             snap,
         );

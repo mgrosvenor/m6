@@ -823,14 +823,17 @@ Backend liveness is outside it: a socket pool keeps no per-member health state,
 so a dead member is found when a request connects to it and that request takes
 the next member.
 
-`PerfReport::build(...)`, `PerfOutcome`, `metrics_authorised(...)`,
+`PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.
 
-A caller with its own gate uses two more pieces.
-`PerfAccess::refusal()` returns the legacy bearer gate's verdict: `Some(Disabled)` with no token configured, `Some(Unauthorised)` for a wrong one, `None` to pass.
-`PerfReport::build_authorised(subject, snapshot)` builds the report with no access check, for a caller that has already authorised the request.
-`PerfOutcome::Forbidden` answers 403 `{"error":"forbidden"}` with no `WWW-Authenticate`, for a valid token that lacks the required claim.
-m6-http uses these for `[health] metrics_require` and `metrics_peers`, described in `docs/m6-http.md`.
+`PerfReport::build_authorised` builds the report with no access check, for a
+caller that has already passed the one token check.
+`PerfOutcome::Unauthorised` and `PerfOutcome::Forbidden` answer with
+`m6_core::http::token_refusal`, the one definition of a token check's refusal:
+401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` for no or a bad
+credential, 403 `{"error":"forbidden"}` for the wrong role or group.
+m6-http uses these for `[health] metrics_require` and `metrics_peers`, described
+in `docs/m6-http.md`.
 
 `PerfReport.tls` carries the served certificate chain and how long each
 certificate has left, from `tls::loaded()`. It is `serde(default)`, so a node

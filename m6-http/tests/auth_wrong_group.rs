@@ -4,11 +4,10 @@
 //!
 //! The unit tests assert only the parts: `valid_jwt_wrong_group_gets_403`
 //! checks that `check_require` returns false for a `["users"]` token on a
-//! `group:editors` route, and `authorise_the_wrong_role_is_insufficient`
-//! checks that the `Insufficient` variant exists for a role. Neither sends a
+//! `group:editors` route, and `check_the_wrong_role_is_denied_with_403`
+//! checks that the `Deny` decision exists for a role. Neither sends a
 //! wrong-group token through a protected route and reads the 403 that
-//! `m6-http/src/main.rs` maps `Refusal::Insufficient` to. This file closes
-//! that gap.
+//! `m6-http/src/main.rs` maps `Decision::Deny` to. This file closes that gap.
 //!
 //! These spawn real processes and bind real ports, so run them serially and
 //! against freshly built release binaries (the testkit finds the binary):
