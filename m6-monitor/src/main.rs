@@ -214,6 +214,7 @@ fn run_service() -> Result<()> {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
         log_reopen_age_s: fleet.log_reopen_max_age_s,
         health_last_ok_age_s: fleet.health_last_ok_limit_s(),
+        one_certificate: fleet.one_certificate,
         ..Default::default()
     };
     let mut poller = poll::Poller::new(poll::Setup {
@@ -835,6 +836,7 @@ fn run_check(config_path: &Path) -> Result<()> {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
         log_reopen_age_s: fleet.log_reopen_max_age_s,
         health_last_ok_age_s: fleet.health_last_ok_limit_s(),
+        one_certificate: fleet.one_certificate,
         ..Default::default()
     };
     // One run, one cache, with the wider one-shot cap. `--check` keeps no

@@ -5,6 +5,7 @@
 //! live here, because what counts as too full or too hot is a property of a
 //! deployment rather than of m6.
 
+use m6_core::tls::Fingerprint;
 use serde::Serialize;
 
 use crate::poll::{HeaderCheckResult, NodeReading};
@@ -34,6 +35,30 @@ pub struct Thresholds {
     /// and an ignored warning is the same as no warning. A deployment renewing
     /// on a different schedule sets its own.
     pub cert_expiry_days: i64,
+    /// Whether the deployment declares that the fleet serves one certificate.
+    /// Read from `[monitor] one_certificate`, default false.
+    ///
+    /// Off by default because m6 is a generic web engine and a fleet may
+    /// legitimately run one certificate per node: the user guide documents
+    /// per-node renewal, and an origin and a cache node need not share a
+    /// certificate. With it off, the monitor warns only for the shape a missed
+    /// renewal leaves behind, which is some nodes agreeing and one that does
+    /// not. That inference is silent for a two-node fleet, which is a real
+    /// fleet shape, and for a node that reissued into the same expiry as the
+    /// others, which the fingerprint now catches when the deployment says the
+    /// certificate is shared.
+    ///
+    /// Setting it says the fleet is meant to carry one certificate, so a node
+    /// whose leaf fingerprint differs is a fault and not a question.
+    ///
+    /// Three inferred rules were considered and rejected. A majority calls the
+    /// stale half correct when two nodes agree and the renewed one does not,
+    /// which is the case the check exists for. The first-seen value lets one
+    /// poll's timing decide forever which node is right, so a node that
+    /// answered first after a restart becomes the reference. A quorum has no
+    /// answer for a two-node fleet, which is the fleet where the inference is
+    /// already silent. The deployment knows which it is, so it says.
+    pub one_certificate: bool,
     /// Seconds since a peer's latest WireGuard handshake above which the
     /// tunnel is a fault. Read from `[monitor] tunnel_handshake_max_age_s`.
     ///
@@ -83,6 +108,7 @@ impl Default for Thresholds {
             load_per_cpu: 2.0,
             thermal_celsius: 80.0,
             cert_expiry_days: 21,
+            one_certificate: false,
             tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
             log_reopen_age_s: None,
             health_last_ok_age_s: crate::DEFAULT_POLL_SECS.saturating_mul(HEALTH_LAST_OK_POLLS),
@@ -220,6 +246,19 @@ pub struct NodeDigest {
     /// comparing it ACROSS nodes is exact, and that comparison is the only way
     /// to see a fleet whose nodes have stopped agreeing about what they serve.
     pub cert_not_after_unix: Option<i64>,
+    /// SHA-256 of the leaf certificate this node is serving, from `/perf`.
+    ///
+    /// This is the identity the expiry cannot give. Two certificates can
+    /// expire on the same day, and then `cert_not_after_unix` above cannot
+    /// tell them apart while a client sees two different certificates. The
+    /// fleet comparison groups on this value and not on the expiry.
+    ///
+    /// The leaf only: `depth` 0 is the certificate a client validates and the
+    /// one an *ACME* client renews, and a shared certificate is one leaf.
+    /// `None` when the node reported no fingerprint, which covers a node older
+    /// than the field and a chain with an unreadable member. `None` reads as
+    /// "cannot say" and is never counted as agreeing with the others.
+    pub cert_fingerprint: Option<Fingerprint>,
     pub perf_error: Option<String>,
     /// The WireGuard tunnel from the monitor host to this node, if configured.
     pub tunnel: Option<TunnelDigest>,
@@ -567,6 +606,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             thermal_max_c: None,
             cert_expires_in_seconds: None,
             cert_not_after_unix: None,
+            cert_fingerprint: None,
             perf_error: r.perf_error.clone(),
             tunnel: r.tunnel.as_ref().map(tunnel_digest),
             log_reopen: LogReopenDigest::unknown("no /perf reading"),
@@ -730,6 +770,21 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // certificates.
             d.cert_not_after_unix = if p.tls_unreadable == 0 {
                 p.tls.iter().map(|c| c.not_after_unix).min()
+            } else {
+                None
+            };
+            // The LEAF's identity, under the same guard as the two figures
+            // above. The guard is not about the min this time: it keeps one
+            // rule for the tuple the fleet comparison reads, where a node
+            // either reports its certificate completely or says nothing. An
+            // incomplete chain already warns per node, and a fingerprint
+            // taken from it would let the comparison treat a node whose leaf
+            // is unaccounted for as one that carries a certificate.
+            d.cert_fingerprint = if p.tls_unreadable == 0 {
+                p.tls
+                    .iter()
+                    .find(|c| c.depth == 0)
+                    .and_then(|c| c.fingerprint)
             } else {
                 None
             };
@@ -1056,24 +1111,43 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // about its chain is already a finding of its own above, and counting
         // it again here would report one silence as two faults and name the
         // cause in neither.
-        // Both figures or neither, so there is no half-answer to describe. An
+        // All three or none, so there is no half-answer to describe. An
         // earlier version admitted a node on `cert_not_after_unix.is_some()`
         // and then matched on `cert_expires_in_seconds`, with an `unknown` arm
         // that could not be reached: the two are set together under one
         // `tls_unreadable == 0` guard. A reader had to prove that invariant to
-        // know the arm was dead, so the tuple now requires both and the
-        // impossible case cannot be written.
-        let certified: Vec<(&str, i64, i64)> = reporting
+        // know the arm was dead, so the tuple requires the certificate's
+        // identity and both expiry figures, and the impossible case cannot be
+        // written.
+        //
+        // ── IDENTITY IS THE FINGERPRINT, NOT THE EXPIRY ──────────────────────
+        //
+        // Grouping on `notAfter` was the first version, and issue #275 names
+        // what it misses: two certificates can expire on the same day. A
+        // renewal reissued twelve hours later, or two ACME clients that ran on
+        // one schedule, differ in the DER and agree in the expiry, so the
+        // expiry comparison called them one certificate while a client
+        // validating against them receives two. The fingerprint separates
+        // them, and it is the same value `/perf` carries, so the fleet
+        // comparison reads one fact rather than deriving a second.
+        struct Certified<'a> {
+            name: &'a str,
+            fingerprint: Fingerprint,
+            not_after_unix: i64,
+            expires_in_seconds: i64,
+        }
+        let certified: Vec<Certified<'_>> = reporting
             .iter()
             .filter_map(|n| {
-                Some((
-                    n.name.as_str(),
-                    n.cert_not_after_unix?,
-                    n.cert_expires_in_seconds?,
-                ))
+                Some(Certified {
+                    name: n.name.as_str(),
+                    fingerprint: n.cert_fingerprint?,
+                    not_after_unix: n.cert_not_after_unix?,
+                    expires_in_seconds: n.cert_expires_in_seconds?,
+                })
             })
             .collect();
-        // ── PARTIAL agreement is the signal, not disagreement ────────────────
+        // ── PARTIAL agreement is the signal when nothing was declared ────────
         //
         // The first version of this warned whenever the certified nodes did not
         // all agree, which is wrong for any fleet that does not share one
@@ -1084,10 +1158,9 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // construction, so that version warned on every poll, forever, and a
         // permanent warning in an hourly check is the same as no warning.
         //
-        // The distinguishing shape is not "they differ", it is "some of them
-        // AGREE and one does not". Nodes sharing a `notAfter` are serving one
-        // certificate, which is a fact about the fleet rather than an
-        // assumption about it, and a node outside that group has been left
+        // The distinguishing shape is "some of them AGREE and one does not".
+        // Nodes with one fingerprint are serving one certificate, which is a
+        // fact about the fleet, and a node outside that group has been left
         // behind by the renewal the others got.
         //
         //   every node distinct          per-node certificates. Silent
@@ -1095,62 +1168,128 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         //   two or more equal, one not   one certificate, one node behind. WARN
         //
         // What this cannot see is a TWO-node fleet sharing one certificate
-        // where one node lags: two distinct values, no group of two, so it
-        // stays silent. That is the honest cost of deriving the expectation
-        // from the data instead of being told it, and it fails quiet rather
-        // than crying wolf.
-        let mut by_expiry: std::collections::BTreeMap<i64, Vec<&str>> =
+        // where one node lags: two distinct fingerprints, no group of two, so
+        // it stays silent. It also cannot see a node that reissued into the
+        // same expiry as the others, because the expiry is no longer the
+        // group. `[monitor] one_certificate` answers both: the deployment
+        // states that the fleet is meant to carry one certificate, and any
+        // difference is then a fault rather than a question.
+        let mut by_fingerprint: std::collections::BTreeMap<Fingerprint, Vec<&Certified<'_>>> =
             std::collections::BTreeMap::new();
-        for &(name, at, _) in &certified {
-            by_expiry.entry(at).or_default().push(name);
+        for c in &certified {
+            by_fingerprint.entry(c.fingerprint).or_default().push(c);
         }
-        let largest = by_expiry.values().map(|v| v.len()).max().unwrap_or(0);
-        if by_expiry.len() > 1 && largest > 1 {
-            // ── The NEWEST certificate is the right one, not the commonest ───
-            //
-            // An earlier version named the majority as correct and everything
-            // else as behind, which is backwards for the case this check
-            // exists for. When an origin renews and two cache nodes are not
-            // told, the majority is the STALE pair and the single renewed node
-            // is the one that is right. Naming the renewed node as the problem
-            // would send an operator to fix the only node that did not need
-            // fixing.
-            //
-            // A renewal moves `notAfter` forward and nothing moves it back, so
-            // the latest expiry is the certificate that was installed and
-            // anything earlier has been left behind. Group size decides only
-            // whether to look at all, above.
-            let newest = by_expiry
-                .keys()
-                .next_back()
-                .copied()
-                .expect("by_expiry is not empty");
-            let behind: Vec<String> = certified
+        let largest = by_fingerprint.values().map(Vec::len).max().unwrap_or(0);
+
+        // ── Which of them is the certificate that was installed ──────────────
+        //
+        // The NEWEST is the right one, not the commonest. When an origin renews
+        // and two cache nodes are not told, the majority is the STALE pair and
+        // the single renewed node is the one that is right. Naming the renewed
+        // node as the problem would send an operator to fix the only node that
+        // did not need fixing.
+        //
+        // A renewal moves `notAfter` forward and nothing moves it back, so the
+        // group with the latest expiry holds the certificate that was
+        // installed. Group size breaks an expiry tie and the fingerprint
+        // breaks that tie, so the answer cannot depend on map order.
+        let newest_of = |group: &Vec<&Certified<'_>>| {
+            group
                 .iter()
-                .filter(|&&(_, at, _)| at < newest)
-                .map(|&(name, at, left)| {
-                    // Days, because that is the unit an operator decides in,
-                    // AND `notAfter` itself, because days alone cannot show
-                    // the disagreement this finding reports. Two certificates
-                    // issued twelve hours apart have the same number of whole
-                    // days left, so a line reading "origin 89d, edge-a 89d"
-                    // under a claim they differ tells an operator nothing and
-                    // reads as a defect in the check.
-                    format!("{name} {}d (notAfter {at})", left / 86_400)
-                })
+                .map(|c| c.not_after_unix)
+                .max()
+                .unwrap_or(i64::MIN)
+        };
+        let installed = by_fingerprint
+            .iter()
+            .max_by_key(|(fp, group)| (newest_of(group), group.len(), **fp));
+        let installed_fingerprint = installed.map(|(fp, _)| *fp);
+        let installed_not_after = installed.map(|(_, group)| newest_of(group));
+
+        // Days, because that is the unit an operator decides in, AND
+        // `notAfter` and the fingerprint, because days alone cannot show the
+        // disagreement this finding reports. Two certificates issued twelve
+        // hours apart have the same number of whole days left, and two issued
+        // together have the same expiry and a different DER, which is the
+        // case issue #275 was filed for.
+        let describe = |c: &Certified<'_>| {
+            format!(
+                "{} {}d (notAfter {}, fingerprint {})",
+                c.name,
+                c.expires_in_seconds / 86_400,
+                c.not_after_unix,
+                c.fingerprint.short()
+            )
+        };
+
+        if let (Some(fingerprint), Some(expires_at)) = (installed_fingerprint, installed_not_after)
+        {
+            if by_fingerprint.len() > 1 {
+                let differing: Vec<String> = certified
+                    .iter()
+                    .filter(|c| c.fingerprint != fingerprint)
+                    .map(describe)
+                    .collect();
+                if t.one_certificate {
+                    findings.push(Finding {
+                        level: Level::Fault,
+                        node: "fleet".to_string(),
+                        text: format!(
+                            "{} node(s) do not carry the certificate the fleet is declared to \
+                             share ([monitor] one_certificate): {}. The certificate the \
+                             declaration expects is {fingerprint} and expires at {expires_at}. \
+                             Two certificates can expire on the same day and differ, so this \
+                             compares identities and not expiries. Remove the key from \
+                             [monitor] if this fleet runs one certificate per node.",
+                            differing.len(),
+                            differing.join(", ")
+                        ),
+                    });
+                } else if largest > 1 {
+                    findings.push(Finding {
+                        level: Level::Warn,
+                        node: "fleet".to_string(),
+                        text: format!(
+                            "{} node(s) are behind the newest certificate on the fleet, which \
+                             expires at {expires_at}: {}. A node left behind by a renewal \
+                             serves a valid certificate that a client still trusts, and no \
+                             per-node threshold can see that it is not the one the fleet \
+                             installed. The fingerprint and not the expiry is what separates \
+                             them, so two certificates that expire on one day are still two \
+                             certificates.",
+                            differing.len(),
+                            differing.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+
+        // A node that reports an expiry but no fingerprint cannot be checked
+        // against the declaration, and silence would read as agreement. It is
+        // the state of a node older than the fingerprint field, or of a chain
+        // that did not fully parse, and both are "cannot say" rather than
+        // "the same as the others".
+        if t.one_certificate {
+            let unverifiable: Vec<&str> = reporting
+                .iter()
+                .filter(|n| n.cert_not_after_unix.is_some() && n.cert_fingerprint.is_none())
+                .map(|n| n.name.as_str())
                 .collect();
-            findings.push(Finding {
-                level: Level::Warn,
-                node: "fleet".to_string(),
-                text: format!(
-                    "{} node(s) are behind the newest certificate on the fleet, which \
-                     expires at {newest}: {}. A node left behind by a renewal serves a \
-                     valid certificate that expires sooner than the one that was \
-                     installed, and no per-node threshold can see it.",
-                    behind.len(),
-                    behind.join(", ")
-                ),
-            });
+            if !unverifiable.is_empty() {
+                findings.push(Finding {
+                    level: Level::Warn,
+                    node: "fleet".to_string(),
+                    text: format!(
+                        "{} node(s) report a certificate expiry but no fingerprint, so \
+                         [monitor] one_certificate cannot check them: {}. A node older than \
+                         the fingerprint field, or one whose chain did not fully parse, is not \
+                         evidence that the fleet serves one certificate.",
+                        unverifiable.len(),
+                        unverifiable.join(", ")
+                    ),
+                });
+            }
         }
     }
 
@@ -1220,6 +1359,23 @@ pub(crate) mod tests {
     const CHAIN_BASE_UNIX: i64 = 1_789_000_000;
 
     fn tls_reading(name: &str, days: Option<i64>) -> NodeReading {
+        // The default identity is derived from the expiry, so two nodes that
+        // report the same days are reporting the same DER, which is what a
+        // fleet serving one certificate does. A test that needs two
+        // certificates with one expiry overrides it.
+        let identity = days.map(|d| Fingerprint::of(format!("certificate/{d}").as_bytes()));
+        tls_reading_with(name, days, identity)
+    }
+
+    /// A reading whose leaf fingerprint is given rather than derived.
+    ///
+    /// `Some(days)` with `None` is a node that reports an expiry and no
+    /// fingerprint, which is what a node older than the field sends.
+    fn tls_reading_with(
+        name: &str,
+        days: Option<i64>,
+        identity: Option<Fingerprint>,
+    ) -> NodeReading {
         let mut p = perf(plain_host(), vec![]);
         p.tls = days
             .map(|d| {
@@ -1231,11 +1387,13 @@ pub(crate) mod tests {
                         depth: 0,
                         not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds,
                         expires_in_seconds,
+                        fingerprint: identity,
                     },
                     m6_core::tls::TlsCertificate {
                         depth: 1,
                         not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds + 10_000 * 86_400,
                         expires_in_seconds: expires_in_seconds + 10_000 * 86_400,
+                        fingerprint: None,
                     },
                 ]
             })
@@ -1793,6 +1951,7 @@ pub(crate) mod tests {
             depth: 1,
             not_after_unix: 0,
             expires_in_seconds: 900 * 86_400,
+            fingerprint: None,
         }];
         p.tls_unreadable = 1;
         let mut r = reading("origin", "ok", Some(p));
@@ -1822,6 +1981,7 @@ pub(crate) mod tests {
             depth: 0,
             not_after_unix: 0,
             expires_in_seconds: 3 * 86_400,
+            fingerprint: None,
         }];
         let r = reading("origin", "ok", Some(p)); // url is http://origin.example.com
         let d = build(&[r], &Thresholds::default(), now());
@@ -1957,6 +2117,176 @@ pub(crate) mod tests {
             "a two-node fleet has no majority, so this must stay silent: {:?}",
             d.findings
         );
+    }
+
+    /// **Issue #275, first half.** Two nodes can serve two certificates that
+    /// expire on the same day, and the expiry alone cannot tell them apart.
+    /// Grouping on the leaf's fingerprint can, in the same partial-agreement
+    /// shape a renewal leaves behind.
+    #[test]
+    fn two_certificates_with_one_expiry_are_told_apart() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading_with(
+                    "edge-b",
+                    Some(60),
+                    Some(Fingerprint::of(b"a different certificate, one expiry")),
+                ),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("are behind the newest"))
+            .collect();
+        assert_eq!(
+            drift.len(),
+            1,
+            "one expiry is not one certificate: {:?}",
+            d.findings
+        );
+        assert_eq!(drift[0].level, Level::Warn);
+        assert!(drift[0].text.contains("edge-b"), "{}", drift[0].text);
+        assert!(
+            drift[0].text.contains("fingerprint"),
+            "the finding has to show the identity that differs, not only the day: {}",
+            drift[0].text
+        );
+        assert!(
+            !drift[0].text.contains("origin"),
+            "the two nodes that agree need nothing done to them: {}",
+            drift[0].text
+        );
+    }
+
+    /// **Issue #275, second half.** The inference above cannot read a two-node
+    /// fleet. A deployment that declares the certificate is shared can, and
+    /// then a difference is a fault.
+    #[test]
+    fn a_declared_shared_certificate_makes_a_two_node_difference_a_fault() {
+        let readings = [
+            tls_reading("origin", Some(89)),
+            tls_reading_with(
+                "edge-a",
+                Some(30),
+                Some(Fingerprint::of(b"a different certificate")),
+            ),
+        ];
+        let quiet = build(&readings, &Thresholds::default(), now());
+        assert!(
+            !quiet
+                .findings
+                .iter()
+                .any(|f| f.text.contains("certificate")),
+            "without the declaration the inference stays silent: {:?}",
+            quiet.findings
+        );
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(&readings, &declared, now());
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        let fault: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("declared to share"))
+            .collect();
+        assert_eq!(fault.len(), 1, "{:?}", d.findings);
+        assert_eq!(fault[0].node, "fleet");
+        assert!(fault[0].text.contains("edge-a"), "{}", fault[0].text);
+        assert!(
+            !fault[0].text.contains("origin"),
+            "the newer certificate is the one the declaration expects: {}",
+            fault[0].text
+        );
+    }
+
+    /// The same declaration with two certificates that meet issue #275's
+    /// shape: one expiry, two identities. The group of two is the certificate
+    /// the declaration expects and the odd node is named at a fault.
+    #[test]
+    fn a_declared_shared_certificate_tells_two_identities_with_one_expiry_apart() {
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading_with(
+                    "edge-b",
+                    Some(60),
+                    Some(Fingerprint::of(b"a different certificate, one expiry")),
+                ),
+            ],
+            &declared,
+            now(),
+        );
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        let fault: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("declared to share"))
+            .collect();
+        assert_eq!(fault.len(), 1, "{:?}", d.findings);
+        assert!(fault[0].text.contains("edge-b"), "{}", fault[0].text);
+    }
+
+    /// A declaration that every node honours says nothing, which is the quiet
+    /// half of the signal: an operator who sets the key does not get a finding
+    /// for a correct fleet.
+    #[test]
+    fn a_declared_shared_certificate_is_quiet_when_all_agree() {
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading("edge-b", Some(60)),
+            ],
+            &declared,
+            now(),
+        );
+        assert!(d.findings.is_empty(), "{:?}", d.findings);
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+    }
+
+    /// A node that reports an expiry and no fingerprint cannot be checked
+    /// against the declaration. Reading that silence as agreement would make
+    /// the key say the fleet is uniform when one node never answered the
+    /// question.
+    #[test]
+    fn a_declared_shared_certificate_warns_when_a_node_cannot_say_its_fingerprint() {
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading_with("edge-b", Some(60), None),
+            ],
+            &declared,
+            now(),
+        );
+        assert_eq!(d.level, Level::Warn, "{:?}", d.findings);
+        let gap: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("no fingerprint"))
+            .collect();
+        assert_eq!(gap.len(), 1, "{:?}", d.findings);
+        assert!(gap[0].text.contains("edge-b"), "{}", gap[0].text);
     }
 
     /// A fleet that renewed everywhere says nothing. The countdowns are

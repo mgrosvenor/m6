@@ -47,7 +47,7 @@ templates = ["dep:tera", "dep:comrak"]
 # service that never minifies should not link. Without the feature, a config
 # that enables minification fails to load and names it.
 minify    = ["dep:minify-html", "dep:minify-js"]
-flash     = ["dep:hmac", "dep:sha2"]
+flash     = ["dep:hmac"]
 csrf      = []
 
 # Blocks a service assembles itself from. Off by default because not every
@@ -90,13 +90,13 @@ chrono      = { version = "0.4", features = ["serde"] }
 lru         = "0.18"
 slug        = "0.1"
 # The running binary's identity, reported through /perf. md5 and not sha2,
-# which is already here behind `flash`, because the value has to be the SAME
-# NUMBER a deployment's own tooling compares, and `md5sum` is what that tooling
-# reaches for. A second hash of the same bytes under a different algorithm
-# gives an operator two numbers both called "the binary" and answers none of
-# the questions this is for. Not a security claim: nothing here authenticates a
-# binary, it identifies one. Same RustCrypto family as sha2, so it shares
-# `digest` and adds one crate.
+# which is already here for the certificate fingerprint, because the value has
+# to be the SAME NUMBER a deployment's own tooling compares, and `md5sum` is
+# what that tooling reaches for. A second hash of the same bytes under a
+# different algorithm gives an operator two numbers both called "the binary"
+# and answers none of the questions this is for. Not a security claim: nothing
+# here authenticates a binary, it identifies one. Same RustCrypto family as
+# sha2, so it shares `digest` and adds one crate.
 md-5        = "0.10"
 # DNS messages for the monitor's crawler check. Only the message codec is
 # wanted: the socket and the loop are m6's, and `std` is the whole feature set
@@ -122,7 +122,15 @@ lettre        = { version = "0.11", optional = true, default-features = false, f
 # `client::Endpoint` parses a URL and encodes a form. Behind `http-client`.
 url           = { version = "2",    optional = true }
 hmac          = { version = "0.12", optional = true }
-sha2          = { version = "0.10", optional = true }
+# The certificate fingerprint, reported through /perf, is SHA-256 of the DER a
+# node is serving. Not `md-5` above: that hash is for a binary's identity,
+# where the number has to match `md5sum` on the artefact, and a certificate
+# fingerprint has the same requirement with a different tool -- `openssl x509
+# -fingerprint -sha256` is what an operator compares, so the number has to be
+# SHA-256. It is also the collision-resistant choice for a value the monitor
+# uses to decide two nodes serve the same certificate. Already in m6-http's
+# tree and in the lockfile, so the build gains no package.
+sha2          = "0.10"
 rusqlite      = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
 # `client::Upstream` and the TLS echo program use rustls with exactly the
 # features m6-http names, so the workspace builds one rustls, not two.

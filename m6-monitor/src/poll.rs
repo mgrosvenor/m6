@@ -1396,6 +1396,7 @@ mod tests {
             poll_interval_s: crate::DEFAULT_POLL_SECS,
             perf_token_file: None,
             timeout_ms: 5_000,
+            one_certificate: false,
             header_check: Vec::new(),
             wg_handshakes_file: None,
             tunnel_handshake_max_age_s: 600,

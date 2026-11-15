@@ -142,6 +142,19 @@ pub struct Fleet {
     /// How long to wait for one node before giving up on it.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Whether this fleet is meant to serve one certificate. Default false.
+    ///
+    /// Read from `[monitor] one_certificate`. A fleet that runs one
+    /// certificate per node is a supported shape, so the declaration is off
+    /// unless the deployment makes it. With it on, a node whose leaf
+    /// certificate fingerprint differs from the fleet's is a fault and not a
+    /// judgement call, which is the only way the monitor can read a two-node
+    /// fleet or two certificates that expire on the same day.
+    ///
+    /// `digest::Thresholds::one_certificate` carries the reasoning, including
+    /// what a majority, the first-seen node and a quorum would each get wrong.
+    #[serde(default)]
+    pub one_certificate: bool,
     /// Response headers the fleet config expects on particular paths.
     ///
     /// **Declared by the deployment, not by m6.** A cache policy is a property of

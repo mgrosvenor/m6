@@ -145,7 +145,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
 | | `platform` | The platform layer, the one crate that knows the operating system: readiness, the clock, signals, a child's exit, sockets, limits, directories, host and process facts. `docs/m6-platform.md`. Its `host` module is what the machine is doing: load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
-| | `tls` | How long the loaded certificate has left: `not_after_unix`, `record_loaded`, `loaded` and `TlsCertificate`. |
+| | `tls` | How long the loaded certificate has left and its fingerprint: `not_after_unix`, `Fingerprint`, `record_loaded`, `loaded` and `TlsCertificate`. |
 | | `firewall` | `FirewallState` from nftables' own JSON. |
 | | `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
 | | `ndjson` | Newline-delimited JSON, read and written, tolerant of torn lines, and served as bounded pages with a cursor. |
@@ -832,10 +832,13 @@ A caller with its own gate uses two more pieces.
 `PerfOutcome::Forbidden` answers 403 `{"error":"forbidden"}` with no `WWW-Authenticate`, for a valid token that lacks the required claim.
 m6-http uses these for `[health] metrics_require` and `metrics_peers`, described in `docs/m6-http.md`.
 
-`PerfReport.tls` carries the served certificate chain and how long each
-certificate has left, from `tls::loaded()`. It is `serde(default)`, so a node
-older than the field stays parseable to an aggregator rather than making the
-whole payload unreadable, which is the treatment `build` already gets.
+`PerfReport.tls` carries the served certificate chain, how long each
+certificate has left, and each certificate's SHA-256 fingerprint, from
+`tls::loaded()`. It is `serde(default)`, so a node older than the field stays
+parseable to an aggregator rather than making the whole payload unreadable,
+which is the treatment `build` already gets.
+The fingerprint is what tells two certificates with one expiry apart, and
+`TlsCertificate.fingerprint` is `serde(default)` for the same reason.
 
 `PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
 Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the age of the last reopen, its unix time and the age of the last failure.
@@ -916,8 +919,25 @@ of a DER certificate as seconds since the Unix epoch.
 **`record_loaded(chain)`** stores a loaded chain and returns the certificates it
 could not read, by depth and reason.
 **`loaded()`** and **`loaded_at(now_unix)`** return the stored chain as
-`Vec<TlsCertificate>`, leaf first, each carrying `depth`, `not_after_unix` and
-`expires_in_seconds`.
+`Vec<TlsCertificate>`, leaf first, each carrying `depth`, `not_after_unix`,
+`expires_in_seconds` and `fingerprint`.
+**`Fingerprint::of(der)`** is SHA-256 over a certificate's DER, printed as 64
+lower-case hex characters.
+
+**The fingerprint is the identity an expiry cannot give.**
+Two certificates can expire on the same day, and then `not_after_unix` alone
+cannot tell them apart while a client validating against them sees two.
+The value is SHA-256 over the whole certificate, and not over its
+`SubjectPublicKeyInfo`.
+A renewal that reissues with the same key pair changes the serial number, the
+validity and the signature, and the fingerprint moves with all three.
+Hashing the key would report one identity for two certificates, which is the
+distinction a monitor exists to see.
+The value is the one `openssl x509 -noout -fingerprint -sha256` prints, in
+lower-case hex with no colons, and the DER is public bytes every client
+receives in the handshake.
+`fingerprint` is `None` on a certificate that arrived from a node older than
+the field, and `None` reads as "cannot say" and never as agreement.
 
 This module exists because certificate renewal fails silently.
 Renewal is done by an *ACME* (Automatic Certificate Management Environment)
