@@ -16,7 +16,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -196,7 +196,7 @@ fn write_site_toml(site: &Path) {
     std::fs::write(
         site.join("site.toml"),
         "[site]\nname = \"tls-startup\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"info\"\n\n\
          [analytics]\nenabled = false\n",
     )
     .expect("site.toml");
@@ -249,7 +249,7 @@ fn start(configured: &Cert, alternate: &Cert) -> Server {
 
 /// Run m6-http to its exit, which must come within ten seconds.
 fn run_until_exit(site: &Path, config: &Path) -> (Option<i32>, String) {
-    let mut child: Child = m6_core::platform::process::spawn(
+    let mut child = m6_core::testkit::process::Running::spawn(
         Command::new(binary("m6-http"))
             .arg(site)
             .arg(config)
@@ -260,14 +260,13 @@ fn run_until_exit(site: &Path, config: &Path) -> (Option<i32>, String) {
     )
     .expect("spawn m6-http");
     let exited = testkit::wait::until(Duration::from_secs(10), || {
-        child.try_wait().expect("try_wait").is_some()
+        child.child().try_wait().expect("try_wait").is_some()
     });
     if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+        // The guard kills and reaps it while this panic unwinds.
         panic!("m6-http was still running after 10s; it should have refused to start");
     }
-    let out = child.wait_with_output().expect("output");
+    let out = child.take().wait_with_output().expect("output");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

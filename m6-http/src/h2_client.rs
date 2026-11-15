@@ -98,6 +98,10 @@ struct H2Stream {
     resp_headers: Vec<(String, String)>,
     resp_body: Vec<u8>,
     headers_done: bool,
+    /// END_STREAM has arrived. A header block split across HEADERS and
+    /// CONTINUATION frames is one block (RFC 9113 6.2), so the reply is
+    /// complete only when the block ends too.
+    end_stream: bool,
     /// Informational (1xx) header blocks seen so far on this stream.
     informational: usize,
     /// Who waits for this stream's reply, stored here by the loop's owner once
@@ -428,6 +432,7 @@ impl<T: Transport> H2Client<T> {
                 resp_headers: vec![],
                 resp_body: vec![],
                 headers_done: false,
+                end_stream: false,
                 informational: 0,
                 waiter: None,
                 ctx: None,
@@ -690,15 +695,26 @@ impl<T: Transport> H2Client<T> {
                     }
 
                     if flags & FLAG_END_STREAM != 0 {
-                        self.complete_stream(stream_id);
+                        if flags & FLAG_END_HEADERS != 0 {
+                            self.complete_stream(stream_id);
+                        } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                            // The header block continues in CONTINUATION
+                            // frames, so the reply ends when the block ends.
+                            s.end_stream = true;
+                        }
                     }
                 }
 
                 TYPE_CONTINUATION if stream_id > 0 => {
                     self.header_block_acc.extend_from_slice(payload);
 
-                    if flags & FLAG_END_HEADERS != 0 && !self.finish_header_block(stream_id) {
-                        return;
+                    if flags & FLAG_END_HEADERS != 0 {
+                        if !self.finish_header_block(stream_id) {
+                            return;
+                        }
+                        if self.streams.get(&stream_id).is_some_and(|s| s.end_stream) {
+                            self.complete_stream(stream_id);
+                        }
                     }
                 }
 

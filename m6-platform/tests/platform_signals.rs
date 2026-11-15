@@ -5,18 +5,35 @@
 //!
 //! Its own `main` (`harness = false`), because the signal mask must be set
 //! before any thread exists and the libtest harness starts one first. The
-//! same checks run unchanged on every supported target. `OS-1-TESTS.md`
-//! section 2 names each case and the wrong implementation that must fail it.
+//! harness speaks libtest's protocol through `libtest-mimic`, forced onto one
+//! thread so the checks run in `main`. The same checks run unchanged on every
+//! supported target. `OS-1-TESTS.md` section 2 names each case and the wrong
+//! implementation that must fail it.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_platform::{self as platform, process, Events, Interest, Poll, Signal, Signals, Token};
 
 const SIGNALS: Token = Token(7);
 
 fn main() {
+    // Before anything else, and before any thread: the mask is inherited only
+    // by threads created after this call.
     m6_platform::block();
+
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, and spawns no worker.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test("signal_contract", signal_contract)];
+    libtest_mimic::run(&args, tests).exit();
+}
+
+/// The 8 cases, in order: S7 drains what S1 to S5 left, and S8 is last because
+/// it unblocks and restores the mask.
+fn signal_contract() -> Result<(), Failed> {
     let mut signals = Signals::new().expect("Signals::new");
     let mut poll = Poll::new().expect("Poll::new");
     poll.registry()
@@ -32,7 +49,8 @@ fn main() {
     a_spawned_child_still_dies_on_sigterm();
     the_process_survives_every_signal_it_handles(&mut poll, &mut events, &mut signals);
     signals_new_refuses_an_unblocked_mask();
-    println!("platform_signals: 8 checks ... ok");
+    println!("signal_contract: 8 checks ... ok");
+    Ok(())
 }
 
 /// Everything pending on the descriptor after one wake, with a deadline.

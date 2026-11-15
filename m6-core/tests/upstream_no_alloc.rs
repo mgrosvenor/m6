@@ -6,7 +6,9 @@
 //! request check is a guard: a thousand requests must allocate nothing. The TLS
 //! check is a recorded measurement for ALLOC-1 and runs only when the binary is
 //! started with `--tls` (a rustls server thread allocates in the same process
-//! while it counts, so it asserts nothing).
+//! while it counts, so it asserts nothing). The test speaks libtest's protocol
+//! through `libtest-mimic`; the checks are forced onto one thread so the count
+//! is this `main` thread's own.
 
 #![allow(
     clippy::disallowed_methods,
@@ -18,6 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use libtest_mimic::{Arguments, Trial};
 use m6_core::client::{Addr, Upstream};
 use m6_core::testkit::alloc_count;
 
@@ -27,13 +30,30 @@ static ALLOC: alloc_count::Counting = alloc_count::Counting;
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 fn main() {
+    // The ALLOC-1 measurement, not a test: started by hand, never listed.
     if std::env::args().nth(1).as_deref() == Some("--tls") {
         tls_requests_report_their_allocations();
         return;
     }
-    let allocated = a_thousand_plain_requests_allocate_nothing();
-    println!("a_thousand_plain_requests_allocate_nothing: {allocated} allocation(s)");
-    std::process::exit(if allocated == 0 { 0 } else { 1 });
+
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "a_thousand_plain_requests_allocate_nothing",
+        || {
+            let allocated = a_thousand_plain_requests_allocate_nothing();
+            println!("a_thousand_plain_requests_allocate_nothing: {allocated} allocation(s)");
+            if allocated == 0 {
+                Ok(())
+            } else {
+                Err(format!("{allocated} allocation(s) in 1000 requests").into())
+            }
+        },
+    )];
+    libtest_mimic::run(&args, tests).exit();
 }
 
 fn a_thousand_plain_requests_allocate_nothing() -> usize {

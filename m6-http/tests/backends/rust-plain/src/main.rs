@@ -129,6 +129,13 @@ fn main() -> ExitCode {
             Err(_) => break, // the listener was shut down by the signal handler
         }
     }
+    // The handler closed the listening descriptor to wake `accept`, but
+    // `listener` still believes it owns that number. Dropping it would close
+    // the number a second time, and std detects that as an IO-safety violation
+    // and aborts: "owned file descriptor already closed". A debug build aborts
+    // here, and a release build happens not to. Forget the owner so the
+    // descriptor is closed exactly once, by the handler.
+    std::mem::forget(listener);
     // Finish what is in flight before removing the socket (spec §8.2).
     pool.shutdown();
     // Removing the socket is what withdraws this member from the pool. Left

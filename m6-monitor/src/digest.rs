@@ -104,13 +104,12 @@ pub struct Finding {
     pub text: String,
 }
 
-/// Why a node reports itself degraded.
+/// Why an older m6-http reports itself degraded.
 ///
-/// `/health` carries the verdict and the node name, and the detail of which
-/// pool lost its last member is in `/perf`, which the monitor may not be
-/// allowed to read. This is the one reason m6-http gives for the verdict, and
-/// the check prints it beside the code rather than leaving the reader to look
-/// it up.
+/// `/health` no longer carries a pool verdict, because a socket pool keeps no
+/// per-member health state. The monitor still prints this reason when a node
+/// answers degraded, which a node older than the change can. The check prints
+/// it beside the code rather than leaving the reader to look it up.
 pub(crate) const DEGRADED_REASON: &str = "a configured socket pool has no live member";
 
 /// The whole fleet, summarised.
@@ -191,7 +190,8 @@ pub struct NodeDigest {
     /// exactly like a p50 over a thousand.
     pub hit_samples: Option<usize>,
     pub backend_errors: Option<u64>,
-    pub pools: Vec<(String, usize, usize)>,
+    /// Each socket pool and how many members it holds.
+    pub pools: Vec<(String, usize)>,
     pub load_one: Option<f64>,
     pub cpus: Option<usize>,
     pub memory_used: Option<f64>,
@@ -756,21 +756,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             d.hit_samples = Some(p.metrics.hit_samples);
             d.hit_p50_ns = sampled.then_some(p.metrics.hit_p50_ns);
             d.hit_p99_ns = sampled.then_some(p.metrics.hit_p99_ns);
-            d.pools = p
-                .pools
-                .iter()
-                .map(|x| (x.name.clone(), x.active, x.total))
-                .collect();
+            d.pools = p.pools.iter().map(|x| (x.name.clone(), x.total)).collect();
 
-            for pool in &p.pools {
-                if pool.active == 0 {
-                    findings.push(Finding {
-                        level: Level::Fault,
-                        node: r.name.clone(),
-                        text: format!("pool {} has 0 of {} members live", pool.name, pool.total),
-                    });
-                }
-            }
             if p.metrics.backend_errors_total > 0 {
                 // NAME the backend. "3 backend errors since start" left the
                 // operator to guess which service, and the guess that matters is
@@ -1554,34 +1541,6 @@ pub(crate) mod tests {
         let busy = build(&[reading("b", "ok", Some(perf(mk(1), vec![])))], &t, now());
         assert_eq!(busy.level, Level::Warn);
         assert!(busy.findings[0].text.contains("per cpu"));
-    }
-
-    #[test]
-    fn an_empty_pool_is_a_fault_and_so_is_the_degraded_verdict() {
-        let pools = vec![
-            PoolHealth {
-                name: "m6-html".into(),
-                active: 1,
-                total: 1,
-            },
-            PoolHealth {
-                name: "render-contact".into(),
-                active: 0,
-                total: 2,
-            },
-        ];
-        let d = build(
-            &[reading(
-                "origin",
-                "degraded",
-                Some(perf(HostSnapshot::default(), pools)),
-            )],
-            &Thresholds::default(),
-            now(),
-        );
-        assert_eq!(d.level, Level::Fault);
-        assert_eq!(d.findings.len(), 2);
-        assert!(d.findings.iter().any(|f| f.text.contains("render-contact")));
     }
 
     /// Backend errors name the backend, worst first.

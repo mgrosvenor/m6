@@ -1,10 +1,11 @@
 //! Test harness shared by every m6 crate.
 //!
 //! Integration tests here all do the same four things: find a port nothing
-//! else will take, build and find the release binary, start a service and wait for it to
-//! actually be ready, then talk to it at the byte level. Every crate had
-//! written its own version of all four, and the versions disagreed in ways
-//! that produced intermittent failures rather than honest ones.
+//! else will take, find the binary cargo built for this run, start a service
+//! and wait for it to actually be ready, then talk to it at the byte level.
+//! Every crate had written its own version of all four, and the versions
+//! disagreed in ways that produced intermittent failures rather than honest
+//! ones.
 //!
 //! # What this fixes, beyond removing copies
 //!
@@ -41,19 +42,36 @@
 //! [dev-dependencies]
 //! m6-core = { path = "../m6-core", features = ["testkit"] }
 //! ```
+//!
+//! [`alloc_count`] is also reachable through the `alloc-count` feature on its
+//! own, which exposes that one file and none of the harness. A service built
+//! with it declares its own `#[global_allocator]` and reads its loop's count.
+//! ALLOC-0's `m6-http` is the first caller.
 
+// Ungated: the `alloc-count` feature exposes this one file without the rest of
+// the harness, so a service binary can count its own loop's allocations.
 pub mod alloc_count;
+#[cfg(feature = "testkit")]
 pub mod paths;
+#[cfg(feature = "testkit")]
 pub mod port;
+#[cfg(feature = "testkit")]
 pub mod process;
+#[cfg(feature = "testkit")]
 pub mod response;
+#[cfg(feature = "testkit")]
 pub mod wait;
 
+#[cfg(feature = "testkit")]
 pub use paths::{binary, exec_scratch_root};
+#[cfg(feature = "testkit")]
 pub use port::{claim_port, PortClaim};
+#[cfg(feature = "testkit")]
 pub use process::{
     assert_app_lifecycle, assert_lifecycle_logged, lowered_fd_limit_command, spawn_instances,
     Service,
 };
+#[cfg(feature = "testkit")]
 pub use response::read_one;
+#[cfg(feature = "testkit")]
 pub use wait::{for_path, for_tcp};

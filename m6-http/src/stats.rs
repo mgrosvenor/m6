@@ -421,6 +421,9 @@ pub struct Stats {
     pub rps_peak: u64,
     window_start: Instant,
     last_emit: Instant,
+    /// How often the periodic line is emitted and `/perf`'s loop trace is
+    /// refreshed. `EMIT_INTERVAL_SECS` in production.
+    emit_interval: std::time::Duration,
     /// The loop trace, copied on the accounting tick and served by `/perf`.
     event_loop: [m6_core::event::TriggerReport; 16],
     event_loop_len: usize,
@@ -434,6 +437,11 @@ impl Default for Stats {
 
 impl Stats {
     pub fn new() -> Self {
+        Self::with_interval(std::time::Duration::from_secs(EMIT_INTERVAL_SECS))
+    }
+
+    /// As [`Stats::new`], with a chosen accounting interval.
+    pub fn with_interval(emit_interval: std::time::Duration) -> Self {
         let now = m6_core::platform::now();
         Stats {
             requests_total: 0,
@@ -464,6 +472,7 @@ impl Stats {
             rps_peak: 0,
             window_start: now,
             last_emit: now,
+            emit_interval,
             event_loop: [m6_core::event::TriggerReport::default(); 16],
             event_loop_len: 0,
         }
@@ -582,7 +591,7 @@ impl Stats {
     pub fn maybe_emit(&mut self, pool_members: usize) -> bool {
         let now = m6_core::platform::now();
         let elapsed = now.duration_since(self.last_emit);
-        if elapsed.as_secs() < EMIT_INTERVAL_SECS {
+        if elapsed < self.emit_interval {
             return false;
         }
 
@@ -622,13 +631,13 @@ impl Stats {
             self.monitor_window_added,
         );
 
-        tracing::info!(
+        m6_core::log::info!(
             requests = self.requests_total,
             rps_avg = rps_avg,
             rps_peak = self.rps_peak,
             cache_hits = self.window_cache_hits,
             cache_misses = self.window_cache_misses,
-            cache_hit_rate = format_args!("{:.4}", cache_hit_rate),
+            cache_hit_rate = %format_args!("{:.4}", cache_hit_rate),
             backend_errors = self.window_backend_errors,
             pool_members = pool_members,
             // The sample count beside the percentiles, not just the numbers.
@@ -1305,7 +1314,7 @@ mod perf_reservoir_tests {
     /// `snapshot()`'s comment was protecting when it declined to reset.
     ///
     /// Checked through the window counter the log reports rather than by
-    /// capturing tracing output: after an emit the window is empty, and new
+    /// capturing log output: after an emit the window is empty, and new
     /// traffic lands in the next window only.
     #[test]
     fn the_periodic_window_still_only_covers_its_own_window() {

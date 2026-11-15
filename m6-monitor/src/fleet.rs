@@ -107,14 +107,14 @@ fn read_token(path: &str) -> Option<String> {
         Ok(s) => {
             let t = s.trim().to_string();
             if t.is_empty() {
-                tracing::warn!(path = %path, "perf token file is empty");
+                m6_core::log::warn!(path = %path, "perf token file is empty");
                 None
             } else {
                 Some(t)
             }
         }
         Err(e) => {
-            tracing::warn!(path = %path, error = %e, "perf token file unreadable");
+            m6_core::log::warn!(path = %path, error = %e, "perf token file unreadable");
             None
         }
     }

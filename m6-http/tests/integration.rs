@@ -122,14 +122,16 @@ where
         let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
             let req = match m6_core::h1::materialize(head, buf) {
                 m6_core::h1::ParseResult::Complete(r) => r,
-                _ => return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string()),
+                _ => {
+                    return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string(), None)
+                }
             };
             let (s, h, b, be) = handler(&req, ip);
-            RequestOutcome::Ready(s, h, b, be)
+            RequestOutcome::Ready(s, h, b, be, None)
         };
         let mut on_owned = |_: &mut (), req: &HttpRequest, ip: &str| {
             let (s, h, b, be) = handler(req, ip);
-            RequestOutcome::Ready(s, h, b, be)
+            RequestOutcome::Ready(s, h, b, be, None)
         };
         let hit = HitHeaders {
             alt_svc: std::sync::Arc::from(&[] as &[u8]),
@@ -496,8 +498,38 @@ fn h2_tls_request(port: u16, client_cfg: &Arc<rustls::ClientConfig>) -> Vec<u8> 
         .unwrap();
     tls.flush().ok();
 
+    // Read until the response is COMPLETE, not until the connection closes.
+    // The server is an in-process thread that the caller stops after this
+    // returns, so read-to-EOF could only end on this socket's 5 s read timeout:
+    // three HTTP/2 tests each sat there for the full timeout with the response
+    // already in hand. A frame on stream 1 carrying END_STREAM is the
+    // observable that the answer has arrived.
     let mut raw = Vec::new();
-    let _ = tls.read_to_end(&mut raw);
+    let mut buf = [0u8; 4096];
+    let mut scanned = 0usize;
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                while let Some((ftype, flags, stream_id, _payload, next)) =
+                    next_h2_frame(&raw, scanned)
+                {
+                    scanned = next;
+                    // Frames that end the response: HEADERS or DATA on our
+                    // stream with END_STREAM. The server's SETTINGS and its
+                    // ACK do not carry it.
+                    let response_frame = ftype == 0x0 || ftype == 0x1;
+                    if response_frame && stream_id == 1 && flags & FLAG_END_STREAM != 0 {
+                        return raw;
+                    }
+                }
+            }
+            // A read error is the peer closing without a TLS close_notify, which
+            // is ordinary for this in-process server.
+            Err(_) => break,
+        }
+    }
     raw
 }
 

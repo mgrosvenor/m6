@@ -244,7 +244,6 @@ domain = "localhost"
 
 [log]
 level  = "debug"
-format = "text"
 
 [errors]
 mode = "internal"

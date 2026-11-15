@@ -32,10 +32,13 @@ use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
 use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::signal::{Action, Lifecycle};
-use m6_core::{Handled, NoTemplates, Site};
+use m6_core::{genid_failed, genid_ok, Handled, NoTemplates, Site};
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -54,7 +57,7 @@ fn main() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
+    let mut site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
     let read_timeout = site.read_timeout();
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is
@@ -91,7 +94,7 @@ fn main() -> Result<()> {
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout", "log"]);
     let mut accepting = true;
     let mut last = m6_core::platform::now();
     let mut last_report = last;
@@ -115,6 +118,7 @@ fn main() -> Result<()> {
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 2,
+            Some(LOG) => 4,
             Some(_) => 1,
             None => 3,
         };
@@ -178,12 +182,13 @@ fn main() -> Result<()> {
                         break 'run;
                     }
                 }
+                LOG => m6_core::log::flush(),
                 // One connection's turn, then wait for what it still needs,
                 // touch its deadline, or close it.
                 Token(k) => {
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &site) {
+                    match turn(conn, &mut site) {
                         Ok(true) => {
                             // Re-register only when the turn changed what the
                             // connection waits for: a kept-alive request that
@@ -205,6 +210,12 @@ fn main() -> Result<()> {
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
         while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
@@ -224,6 +235,7 @@ fn main() -> Result<()> {
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
             let _ = trace.report();
             last_report = end;
         }
@@ -233,12 +245,13 @@ fn main() -> Result<()> {
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();
+    m6_core::log::stop()?;
     Ok(())
 }
 
 /// One connection's turn: read, answer and write until the socket would
 /// block. Returns whether the connection stays open.
-fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
+fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
     loop {
         // Write what is owed before reading anything. A streamed body is not
         // in the output buffer, so a read here would let the next request's
@@ -261,6 +274,19 @@ fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
             Read::Request(head) => {
                 let response = match site.handle(&head) {
                     Handled::Done(response) => response,
+                    // The reserved path: run the start path again and assign
+                    // the new Site in the loop's own binding, or keep serving
+                    // the old one and answer the cause.
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&[], &[HANDLER], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        m6_core::site::finish_reload(&reload, response)
+                    }
                     // The one handler this service registers.
                     Handled::Named(_, req) => {
                         let response = handler::serve(&req)

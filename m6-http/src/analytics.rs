@@ -7,6 +7,7 @@
 /// extraction, not a beacon. UA parsing and geo lookup are deliberately left
 /// to a downstream analytics ingester so the hot path here stays
 /// a handful of string operations, not a database/ruleset lookup.
+use m6_core::log::{Level, Line, Sink};
 use quiche::h3::NameValue as _;
 
 use crate::health::{unix_micros_now, Kind, TrafficWindow};
@@ -14,6 +15,46 @@ use crate::health::{unix_micros_now, Kind, TrafficWindow};
 pub use m6_core::http::{header, HeaderSource};
 
 pub const SESSION_COOKIE: &str = "_m6sid";
+
+/// A freshly minted session id: 16 random bytes, 32 lowercase hex characters,
+/// on the stack.
+///
+/// [`record`] returns one instead of a `String`, so minting a session costs no
+/// heap allocation. The 32 bytes are a small local, which the event loop's
+/// primer allows where a larger stack buffer is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionId([u8; 32]);
+
+impl SessionId {
+    /// The id as a `&str`. The buffer is always ASCII hex.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("a hex session id is ASCII")
+    }
+}
+
+/// The session id a request carries, or one minted for it.
+///
+/// The existing arm borrows the request's `cookie` field. Only the new arm
+/// holds anything of its own, and that is 32 bytes on the stack. This lets
+/// `record` log one id in both cases and answer with an id only when it minted
+/// one.
+enum Session<'a> {
+    Existing(&'a str),
+    New(SessionId),
+}
+
+impl Session<'_> {
+    fn id(&self) -> &str {
+        match self {
+            Session::Existing(id) => id,
+            Session::New(id) => id.as_str(),
+        }
+    }
+
+    fn is_new(&self) -> bool {
+        matches!(self, Session::New(_))
+    }
+}
 
 /// `HeaderSource` for quiche's header type.
 ///
@@ -46,37 +87,43 @@ impl HeaderSource for H3Headers<'_> {
 }
 
 /// Extract `_m6sid` from a raw `Cookie` header value (e.g. `"a=1; _m6sid=xyz; b=2"`).
-fn session_from_cookie_header(cookie_header: &str) -> Option<String> {
+///
+/// The id is a slice of `cookie_header`, not a copy: this runs on every
+/// request, and the only reader is the line, which copies it once into the log
+/// buffer.
+fn session_from_cookie_header(cookie_header: &str) -> Option<&str> {
     cookie_header.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        (k == SESSION_COOKIE && !v.is_empty()).then(|| v.to_string())
+        (k == SESSION_COOKIE && !v.is_empty()).then_some(v)
     })
 }
 
-/// A random session id: 16 bytes, hex-encoded. Opaque and not derived from
-/// IP/UA, so it can't be used to re-identify a visitor once cookies are
-/// cleared — it only ties together requests within one browser's lifetime
-/// of the cookie.
-fn generate_session_id() -> String {
-    m6_core::random_hex_token::<16>()
+/// A random session id: 16 bytes, hex-encoded into a `[u8; 32]` on the stack.
+/// Opaque and not derived from IP/UA, so it can't be used to re-identify a
+/// visitor once cookies are cleared — it only ties together requests within one
+/// browser's lifetime of the cookie.
+fn generate_session_id() -> SessionId {
+    let mut id = [0u8; 32];
+    m6_core::random_hex_token_into(&mut id);
+    SessionId(id)
 }
 
-/// Read the session id from the incoming request's `Cookie` header, or mint
-/// a new one. Returns `(id, is_new)` — callers append a `Set-Cookie` only
-/// when `is_new`.
-fn get_or_create_session(headers: &(impl HeaderSource + ?Sized)) -> (String, bool) {
+/// Read the session id from the incoming request's `Cookie` headers, or mint
+/// a new one. The id borrows the request when it already has one, so a
+/// returning visitor's request makes no allocation here.
+fn get_or_create_session(headers: &(impl HeaderSource + ?Sized)) -> Session<'_> {
     // Not `header(headers, "cookie")` — a request can carry cookies split
     // across multiple `cookie` header fields (see
     // `auth::combined_cookie_header`'s doc comment), and a single-field
     // lookup would miss `_m6sid` whenever it isn't in whichever field
-    // happens to come first.
-    match crate::auth::combined_cookie_header(headers)
-        .as_deref()
-        .and_then(session_from_cookie_header)
-    {
-        Some(id) => (id, false),
-        None => (generate_session_id(), true),
-    }
+    // happens to come first. Scanning the fields in turn is why this no
+    // longer joins them into a new `String` first. When two fields both carry
+    // `_m6sid`, the first one with a value wins, which is the order the old
+    // join produced, and `a_cookie_split_across_fields_is_still_read` pins it.
+    headers
+        .find_all("cookie")
+        .find_map(session_from_cookie_header)
+        .map_or_else(|| Session::New(generate_session_id()), Session::Existing)
 }
 
 /// Build the `Set-Cookie` header value for a freshly-minted session id.
@@ -92,25 +139,33 @@ fn get_or_create_session(headers: &(impl HeaderSource + ?Sized)) -> (String, boo
 /// the login → 302 → protected-page flow this cookie needs to survive. Lax
 /// still blocks the cookie on cross-site requests (the actual CSRF threat
 /// model), it just doesn't also block it on top-level same-site redirects.
-fn session_cookie_header_value(id: &str) -> String {
+///
+/// Called only where a response's headers are written and only for a new
+/// session, so the one `String` it makes is a new visit's `Set-Cookie` and not
+/// a per-request cost.
+///
+/// Takes the minted [`SessionId`] rather than a string so that a value which
+/// came from the request cannot reach a response header by accident.
+pub fn session_cookie_header_value(id: SessionId) -> String {
+    let id = id.as_str();
     format!("{SESSION_COOKIE}={id}; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax")
 }
 
 /// Referrer, reduced to host + path only — query strings and fragments
 /// (which can carry search terms, session tokens, tracking params from the
 /// *referring* site) are always dropped before this is logged anywhere.
-pub fn parse_referer(raw: &str) -> (Option<String>, Option<String>) {
+///
+/// Both halves borrow `raw`: the path is the slice from the first `/`, which
+/// already carries its slash, so no `format!` and no `String` is built.
+pub fn parse_referer(raw: &str) -> (Option<&str>, Option<&str>) {
     let without_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
     let end = without_scheme
         .find(['?', '#'])
         .unwrap_or(without_scheme.len());
     let trimmed = &without_scheme[..end];
     match trimmed.split_once('/') {
-        Some((host, path)) if !host.is_empty() => {
-            let path = format!("/{path}");
-            (Some(host.to_string()), Some(path))
-        }
-        _ if !trimmed.is_empty() => (Some(trimmed.to_string()), None),
+        Some((host, _)) if !host.is_empty() => (Some(host), Some(&trimmed[host.len()..])),
+        _ if !trimmed.is_empty() => (Some(trimmed), None),
         _ => (None, None),
     }
 }
@@ -133,17 +188,21 @@ pub struct Event<'a> {
 }
 
 /// Fields extracted from the request headers, ready to log.
-pub struct RequestFeatures {
-    pub referer_host: Option<String>,
-    pub referer_path: Option<String>,
-    pub user_agent: Option<String>,
+///
+/// Borrowed rather than owned: every caller is in the middle of handling the
+/// request these describe and already holds them, so an owned `String` per
+/// field would put three allocations on the path the log exists to make cheap.
+pub struct RequestFeatures<'a> {
+    pub referer_host: Option<&'a str>,
+    pub referer_path: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
 }
 
-fn extract_features(headers: &(impl HeaderSource + ?Sized)) -> RequestFeatures {
+fn extract_features<'a>(headers: &'a (impl HeaderSource + ?Sized)) -> RequestFeatures<'a> {
     let (referer_host, referer_path) = header(headers, "referer")
         .map(parse_referer)
         .unwrap_or((None, None));
-    let user_agent = header(headers, "user-agent").map(|s| s.to_string());
+    let user_agent = header(headers, "user-agent");
     RequestFeatures {
         referer_host,
         referer_path,
@@ -168,28 +227,37 @@ fn push_request(window: &mut TrafficWindow, ev: &Event<'_>, user_agent: Option<&
 
 /// THE single chokepoint for finishing a response's analytics: mint-or-reuse
 /// a session, log exactly one structured analytics line, and return the
-/// Set-Cookie value iff a new session was minted (`None` if disabled or the
-/// session already existed). This must be the only caller of
+/// new session id iff one was minted (`None` if disabled or the session
+/// already existed). This must be the only caller of
 /// `get_or_create_session`/`extract_features`/`log_request` — duplicating
 /// this logic is what caused a real bug (two different Set-Cookie headers on
 /// one response), because `get_or_create_session` is NOT idempotent: it
 /// mints a fresh random id whenever no session cookie is present yet, so two
 /// independent calls for the same still-cookie-less request produce two
 /// different ids.
+///
+/// No heap allocation on either path: an existing id is a slice of the
+/// request's `cookie` field, a new one lives in the returned `SessionId`, and
+/// the line is built straight into the analytics Sink's buffer. The caller
+/// builds the `Set-Cookie` value only where it writes response headers, and
+/// only for a new session.
 pub fn record(
     enabled: bool,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
     window: &mut TrafficWindow,
-) -> Option<String> {
+) -> Option<SessionId> {
     if !enabled {
         return None;
     }
-    let (session_id, session_new) = get_or_create_session(request_headers);
+    let session = get_or_create_session(request_headers);
     let features = extract_features(request_headers);
-    log_request(ev, &session_id, session_new, &features);
-    push_request(window, ev, features.user_agent.as_deref());
-    session_new.then(|| session_cookie_header_value(&session_id))
+    log_request(ev, session.id(), session.is_new(), &features);
+    push_request(window, ev, features.user_agent);
+    match session {
+        Session::New(id) => Some(id),
+        Session::Existing(_) => None,
+    }
 }
 
 /// True if the response's `Content-Type` is HTML. The session cookie has no
@@ -221,9 +289,9 @@ pub fn finish_response(
     window: &mut TrafficWindow,
 ) {
     let html = is_html_response(resp_headers);
-    if let Some(sc) = record(enabled, request_headers, ev, window) {
+    if let Some(id) = record(enabled, request_headers, ev, window) {
         if html {
-            resp_headers.push(("Set-Cookie".to_string(), sc));
+            resp_headers.push(("Set-Cookie".to_string(), session_cookie_header_value(id)));
         }
     }
 }
@@ -233,16 +301,19 @@ pub fn finish_response(
 /// Different shape from a request `Cookie` header: exactly one cookie per
 /// `Set-Cookie` field, name=value first, followed by `; `-separated
 /// attributes — no need to scan multiple cookie pairs within one field.
-fn session_from_set_cookie_header(set_cookie: &str) -> Option<String> {
+///
+/// Borrows the value, so a proxied response that already carries a session
+/// logs against it without copying the id.
+fn session_from_set_cookie_header(set_cookie: &str) -> Option<&str> {
     let first = set_cookie.split(';').next()?;
     let (k, v) = first.trim().split_once('=')?;
-    (k == SESSION_COOKIE && !v.is_empty()).then(|| v.to_string())
+    (k == SESSION_COOKIE && !v.is_empty()).then_some(v)
 }
 
 /// Find a `_m6sid` already set by an upstream hop's response. A response can
 /// carry multiple `Set-Cookie` fields for unrelated reasons, so every
 /// occurrence is checked, not just the first.
-fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<String> {
+fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&str> {
     // `get_all`, not `get`: Set-Cookie is the field the headers module names as
     // the one everybody folds by mistake, and a response may carry several.
     m6_core::headers::get_all(resp_headers, "set-cookie").find_map(session_from_set_cookie_header)
@@ -277,32 +348,50 @@ pub fn finish_proxied_response(
     }
     if let Some(session_id) = session_from_response_headers(resp_headers) {
         let features = extract_features(request_headers);
-        log_request(ev, &session_id, false, &features);
-        push_request(window, ev, features.user_agent.as_deref());
+        log_request(ev, session_id, false, &features);
+        push_request(window, ev, features.user_agent);
         return;
     }
     finish_response(enabled, resp_headers, request_headers, ev, window);
 }
 
-/// Emit one structured analytics line. Routed by `m6_core::log`'s
-/// `target: "analytics"` filter to its own file, independent of the main
-/// operational log — see `m6-core/src/log.rs::init_with_analytics`.
-fn log_request(ev: &Event<'_>, session_id: &str, session_new: bool, features: &RequestFeatures) {
-    tracing::info!(
-        target: "analytics",
-        node = ev.node,
-        path = ev.path,
-        status = ev.status,
-        cache_state = ev.cache_state,
-        client_ip = ev.client_ip,
-        session_id = session_id,
-        session_new = session_new,
-        referer_host = features.referer_host.as_deref(),
-        referer_path = features.referer_path.as_deref(),
-        user_agent = features.user_agent.as_deref(),
-        latency_ns = ev.latency_ns,
-        "request"
-    );
+/// Emit one structured analytics line into the analytics Sink, which its own
+/// file receives and the operational log never does. See `m6_core::log`.
+fn log_request(
+    ev: &Event<'_>,
+    session_id: &str,
+    session_new: bool,
+    features: &RequestFeatures<'_>,
+) {
+    m6_core::log::with_analytics(|sink| {
+        write_request_line(sink, ev, session_id, session_new, features);
+    });
+}
+
+/// Build the `message = "request"` line into `sink`.
+///
+/// Split out from [`log_request`] so the golden-meaning test can write the
+/// line into a file of its own without opening the process's analytics Sink.
+fn write_request_line(
+    sink: &mut Sink,
+    ev: &Event<'_>,
+    session_id: &str,
+    session_new: bool,
+    features: &RequestFeatures<'_>,
+) {
+    Line::begin(sink, Level::Info, "request")
+        .str("node", ev.node)
+        .str("path", ev.path)
+        .field("status", ev.status)
+        .str("cache_state", ev.cache_state)
+        .str("client_ip", ev.client_ip)
+        .str("session_id", session_id)
+        .bool("session_new", session_new)
+        .opt_str("referer_host", features.referer_host)
+        .opt_str("referer_path", features.referer_path)
+        .opt_str("user_agent", features.user_agent)
+        .field("latency_ns", ev.latency_ns)
+        .end();
 }
 
 /// Record a poll of `/health` or `/perf`.
@@ -339,24 +428,45 @@ pub fn log_monitor(
         return;
     }
     let features = extract_features(request_headers);
-    tracing::info!(
-        target: "analytics",
-        node = node,
-        path = path,
-        status = status,
-        client_ip = client_ip,
-        user_agent = features.user_agent.as_deref(),
-        latency_ns = latency_ns,
-        "monitor"
-    );
+    m6_core::log::with_analytics(|sink| {
+        write_monitor_line(
+            sink,
+            node,
+            path,
+            status,
+            client_ip,
+            features.user_agent,
+            latency_ns,
+        );
+    });
     window.push(
         unix_micros_now(),
         Kind::Monitor,
         status,
         path,
         client_ip,
-        features.user_agent.as_deref(),
+        features.user_agent,
     );
+}
+
+/// Build the `message = "monitor"` line into `sink`. See [`write_request_line`].
+fn write_monitor_line(
+    sink: &mut Sink,
+    node: &str,
+    path: &str,
+    status: u16,
+    client_ip: &str,
+    user_agent: Option<&str>,
+    latency_ns: Option<u64>,
+) {
+    Line::begin(sink, Level::Info, "monitor")
+        .str("node", node)
+        .str("path", path)
+        .field("status", status)
+        .str("client_ip", client_ip)
+        .opt_str("user_agent", user_agent)
+        .field("latency_ns", latency_ns)
+        .end();
 }
 
 /// Log a request rejected by the per-IP rate limiter, before it ever reaches
@@ -369,18 +479,9 @@ pub fn log_rate_limited(
     user_agent: Option<&str>,
     window: &mut TrafficWindow,
 ) {
-    tracing::info!(
-        target: "analytics",
-        node = node,
-        path = path,
-        status = 429u16,
-        cache_state = "BYPASS",
-        client_ip = client_ip,
-        bot_flag = true,
-        bot_reason = "rate-exceeded",
-        user_agent = user_agent,
-        "request"
-    );
+    m6_core::log::with_analytics(|sink| {
+        write_rate_limited_line(sink, node, path, client_ip, user_agent);
+    });
     window.push(
         unix_micros_now(),
         Kind::RateLimited,
@@ -391,6 +492,27 @@ pub fn log_rate_limited(
     );
 }
 
+/// Build the rate limiter's `message = "request"` line into `sink`. See
+/// [`write_request_line`].
+fn write_rate_limited_line(
+    sink: &mut Sink,
+    node: &str,
+    path: &str,
+    client_ip: &str,
+    user_agent: Option<&str>,
+) {
+    Line::begin(sink, Level::Info, "request")
+        .str("node", node)
+        .str("path", path)
+        .u64("status", 429)
+        .str("cache_state", "BYPASS")
+        .str("client_ip", client_ip)
+        .bool("bot_flag", true)
+        .str("bot_reason", "rate-exceeded")
+        .opt_str("user_agent", user_agent)
+        .end();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,7 +520,7 @@ mod tests {
     #[test]
     fn test_session_from_cookie_header_present() {
         let v = session_from_cookie_header("a=1; _m6sid=abc123; b=2");
-        assert_eq!(v, Some("abc123".to_string()));
+        assert_eq!(v, Some("abc123"));
     }
 
     #[test]
@@ -414,22 +536,43 @@ mod tests {
     #[test]
     fn test_get_or_create_session_reuses_existing() {
         let headers = vec![("Cookie".to_string(), "_m6sid=existing-id".to_string())];
-        let (id, is_new) = get_or_create_session(&headers);
-        assert_eq!(id, "existing-id");
-        assert!(!is_new);
+        let session = get_or_create_session(&headers);
+        assert_eq!(session.id(), "existing-id");
+        assert!(!session.is_new());
     }
 
     #[test]
     fn test_get_or_create_session_mints_new_when_absent() {
-        let (id, is_new) = get_or_create_session(&Vec::<(String, String)>::new());
-        assert!(is_new);
-        assert_eq!(id.len(), 32); // 16 bytes hex-encoded
+        let headers = Vec::<(String, String)>::new();
+        let session = get_or_create_session(&headers);
+        assert!(session.is_new());
+        assert_eq!(session.id().len(), 32); // 16 bytes hex-encoded
+        assert!(
+            session
+                .id()
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "a session id is lowercase hex"
+        );
+    }
+
+    #[test]
+    fn a_cookie_split_across_fields_is_scanned_in_turn() {
+        // RFC 9113 8.2.3: a client may split Cookie across several fields. The
+        // id must be found in the second field, without joining them first.
+        let headers = vec![
+            ("cookie".to_string(), "a=1".to_string()),
+            ("cookie".to_string(), "_m6sid=split-id; b=2".to_string()),
+        ];
+        let session = get_or_create_session(&headers);
+        assert_eq!(session.id(), "split-id");
+        assert!(!session.is_new());
     }
 
     #[test]
     fn test_session_cookie_header_value_shape() {
-        let v = session_cookie_header_value("abc");
-        assert!(v.starts_with("_m6sid=abc;"));
+        let v = session_cookie_header_value(SessionId([b'a'; 32]));
+        assert!(v.starts_with(&format!("_m6sid={};", "a".repeat(32))));
         assert!(v.contains("HttpOnly"));
         assert!(v.contains("Secure"));
         assert!(v.contains("SameSite=Lax"));
@@ -438,22 +581,22 @@ mod tests {
     #[test]
     fn test_parse_referer_strips_query_and_scheme() {
         let (host, path) = parse_referer("https://www.example.com/search?q=example+search&foo=bar");
-        assert_eq!(host, Some("www.example.com".to_string()));
-        assert_eq!(path, Some("/search".to_string()));
+        assert_eq!(host, Some("www.example.com"));
+        assert_eq!(path, Some("/search"));
     }
 
     #[test]
     fn test_parse_referer_host_only_no_path() {
         let (host, path) = parse_referer("https://news.example.org");
-        assert_eq!(host, Some("news.example.org".to_string()));
+        assert_eq!(host, Some("news.example.org"));
         assert_eq!(path, None);
     }
 
     #[test]
     fn test_parse_referer_drops_fragment() {
         let (host, path) = parse_referer("https://example.com/page#section");
-        assert_eq!(host, Some("example.com".to_string()));
-        assert_eq!(path, Some("/page".to_string()));
+        assert_eq!(host, Some("example.com"));
+        assert_eq!(path, Some("/page"));
     }
 
     #[test]
@@ -466,14 +609,15 @@ mod tests {
             ("User-Agent".to_string(), "Mozilla/5.0 Test".to_string()),
         ];
         let f = extract_features(&headers);
-        assert_eq!(f.referer_host.as_deref(), Some("example.net"));
-        assert_eq!(f.referer_path.as_deref(), Some("/abc"));
-        assert_eq!(f.user_agent.as_deref(), Some("Mozilla/5.0 Test"));
+        assert_eq!(f.referer_host, Some("example.net"));
+        assert_eq!(f.referer_path, Some("/abc"));
+        assert_eq!(f.user_agent, Some("Mozilla/5.0 Test"));
     }
 
     #[test]
     fn test_extract_features_none_present() {
-        let f = extract_features(&Vec::<(String, String)>::new());
+        let headers = Vec::<(String, String)>::new();
+        let f = extract_features(&headers);
         assert!(f.referer_host.is_none());
         assert!(f.user_agent.is_none());
     }
@@ -576,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn record_returns_cookie_only_when_session_new() {
+    fn record_mints_a_session_only_when_the_request_has_none() {
         let headers = Vec::<(String, String)>::new(); // no _m6sid cookie present
         let mut window = TrafficWindow::new();
         let sc = record(
@@ -594,9 +738,9 @@ mod tests {
         );
         assert!(
             sc.is_some(),
-            "a request with no existing session must mint one and return its cookie"
+            "a request with no existing session must mint one and return its id"
         );
-        assert!(sc.unwrap().starts_with("_m6sid="));
+        assert_eq!(sc.unwrap().as_str().len(), 32);
     }
 
     #[test]
@@ -756,7 +900,7 @@ mod tests {
         let v = session_from_set_cookie_header(
             "_m6sid=abc123; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax",
         );
-        assert_eq!(v, Some("abc123".to_string()));
+        assert_eq!(v, Some("abc123"));
     }
 
     #[test]
@@ -775,10 +919,7 @@ mod tests {
                 "_m6sid=upstream-id; Max-Age=1800".to_string(),
             ),
         ];
-        assert_eq!(
-            session_from_response_headers(&headers),
-            Some("upstream-id".to_string())
-        );
+        assert_eq!(session_from_response_headers(&headers), Some("upstream-id"));
     }
 
     #[test]
@@ -873,6 +1014,88 @@ mod tests {
             resp_headers.len(),
             1,
             "disabled analytics must not touch response headers even to dedupe"
+        );
+    }
+
+    // ── The three lines mean what the golden lines mean ─────────────────────
+
+    /// The site's readers filter on `message` and read these fields by name, so
+    /// the analytics lines are a format specification. `m6-log/tests/golden`
+    /// holds one real line of each shape, captured from example 01's running
+    /// stack before m6-log existed.
+    ///
+    /// Each line is written through the same builder the request path uses, into
+    /// a file of its own, and its parsed `level` and `fields` are compared with
+    /// the golden file. A renamed key, a value against the wrong key or a lost
+    /// field fails here. The timestamp differs by design, and is not compared.
+    #[test]
+    fn the_analytics_lines_mean_what_the_golden_lines_mean() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let golden =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../m6-log/tests/golden");
+
+        let request = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&request).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "dev",
+                path: "/missing",
+                status: 404,
+                cache_state: "MISS",
+                client_ip: "192.0.2.1",
+                latency_ns: Some(342_834),
+            },
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            true,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: Some("curl/8.7.1"),
+            },
+        );
+        sink.flush();
+        assert_line_means(&golden, "request", &request);
+
+        let monitor = dir.path().join("monitor.jsonl");
+        let mut sink = Sink::file(&monitor).expect("the line file");
+        write_monitor_line(
+            &mut sink,
+            "dev",
+            "/health",
+            200,
+            "192.0.2.1",
+            Some("curl/8.7.1"),
+            None,
+        );
+        sink.flush();
+        assert_line_means(&golden, "monitor", &monitor);
+
+        let rate_limited = dir.path().join("rate_limited.jsonl");
+        let mut sink = Sink::file(&rate_limited).expect("the line file");
+        write_rate_limited_line(
+            &mut sink,
+            "dev",
+            "/missing",
+            "192.0.2.1",
+            Some("curl/8.7.1"),
+        );
+        sink.flush();
+        assert_line_means(&golden, "rate_limited", &rate_limited);
+    }
+
+    /// Compare one written line's level and fields with its golden file's.
+    fn assert_line_means(golden_dir: &std::path::Path, name: &str, written: &std::path::Path) {
+        let golden_text = std::fs::read_to_string(golden_dir.join(format!("{name}.jsonl")))
+            .expect("the golden file");
+        let golden: serde_json::Value =
+            serde_json::from_str(golden_text.trim()).expect("golden JSON");
+        let text = std::fs::read_to_string(written).expect("the written line");
+        let ours: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert_eq!(ours["level"], golden["level"], "{name}: level");
+        assert_eq!(
+            ours["fields"], golden["fields"],
+            "{name}: the line's fields do not mean what the golden line means"
         );
     }
 }

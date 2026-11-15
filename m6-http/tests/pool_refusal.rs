@@ -1,11 +1,15 @@
-//! A backend that stops reading a request and closes must not take its member
-//! out of rotation.
+//! A backend that stops reading a request and closes must not stop m6-http
+//! serving the next one.
 //!
-//! The bug this catches: `m6-file` rejects an oversized header by answering 413
-//! and closing without draining the rest of the request. `m6-http` is still
-//! writing that request when the peer goes, so the drive fails and the pool
-//! marks its only member failed. Every request inside the one-second backoff
-//! then answers 502, including the next ordinary one.
+//! The scenario is `m6-file` rejecting an oversized request: it answers 413 and
+//! closes without draining the rest of the request, so `m6-http` is still
+//! writing when the peer goes. The pool keeps no per-member health state, so
+//! the next ordinary request is served by the same member.
+//!
+//! QUA-017's rule, that a refusal before the whole request was written is not a
+//! member failure, is obsolete: no request outcome changes a member's place in
+//! the rotation. This test keeps only the property that still applies, that the
+//! next request is served.
 
 #![allow(
     clippy::disallowed_methods,
@@ -129,7 +133,7 @@ fn status(resp: &[u8]) -> u16 {
 fn site_toml(glob: &str) -> String {
     format!(
         "[site]\nname = \"qua017-refusal\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"warn\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"warn\"\n\n\
          [errors]\nmode = \"internal\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
@@ -146,7 +150,7 @@ fn system_toml(bind_port: u16, cert: &str, key: &str) -> String {
 }
 
 /// A backend that refuses a request by closing while the request is still being
-/// written must not back its member off: the next ordinary request is served.
+/// written must not stop the next ordinary request being served.
 ///
 /// The order is driven explicitly: the first request's body is large and the
 /// backend closes after its head, while `m6-http` still has request bytes to
@@ -212,7 +216,8 @@ fn a_backend_that_closes_while_the_request_is_written_does_not_take_the_pool_dow
         String::from_utf8_lossy(&first)
     );
 
-    // The member must still be in rotation for the request after the refusal.
+    // The member stays in rotation for the request after the refusal: the pool
+    // carries no per-member health state.
     let second = send(
         port,
         b"GET /public/open.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
