@@ -28,6 +28,11 @@ testkit = ["alloc-count", "dep:rustls-pki-types"]
 # m6-http `count-allocations` feature turns this on. Off by default and never in
 # a plain build of a service.
 alloc-count = []
+# Record a backtrace per allocation, so a test can say where one request's
+# allocations come from. Test instrumentation, off by default: no release build
+# and no ordinary test build compiles the recording code, and only the
+# diagnostic `alloc_sites` target asks for it.
+alloc-trace = []
 
 # Request/response extras, off by default so a binary links only what it uses.
 # `multipart` gates the multipart body parser and the streaming types it needs.
@@ -195,6 +200,24 @@ required-features = ["testkit"]
 name    = "site_allocs"
 harness = false
 required-features = ["testkit"]
+
+# The page path's per-request allocation counts, so one that comes back is
+# seen: an identity response is not copied for a compression that never
+# happens, and a handler request stays within its budget. Its own `main`, as
+# `site_allocs`'s.
+[[test]]
+name    = "request_allocs"
+harness = false
+required-features = ["testkit"]
+
+# Where one measured request's allocations come from: the same windows
+# `request_allocs` counts, with `alloc_count`'s backtrace recording on. It
+# prints a grouped list for a diff between two trees, and is a diagnostic, not
+# a gate.
+[[test]]
+name    = "alloc_sites"
+harness = false
+required-features = ["testkit", "alloc-trace"]
 
 # The service that sends mail from its own loop: a success, a reported failure
 # and the loop's 504, each against a loopback SMTP stub. Its own `main` so the
