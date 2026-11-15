@@ -82,10 +82,10 @@ impl HeadersGuard {
     /// The configured headers not already present in `existing`.
     pub fn absent_from<'a>(
         &'a self,
-        existing: &'a [(String, String)],
+        existing: &'a (impl m6_core::http::HeaderSource + ?Sized),
     ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
         self.0.pairs.iter().filter_map(move |(name, value)| {
-            let overridden = m6_core::headers::contains(existing, name);
+            let overridden = existing.find(name).is_some();
             (!overridden).then_some((name.as_str(), value.as_str()))
         })
     }

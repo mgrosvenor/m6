@@ -84,6 +84,9 @@ impl HeaderSource for H3Headers<'_> {
             std::str::from_utf8(h.value()).ok()
         })
     }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Extract `_m6sid` from a raw `Cookie` header value (e.g. `"a=1; _m6sid=xyz; b=2"`).

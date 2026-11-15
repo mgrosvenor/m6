@@ -161,6 +161,9 @@ impl m6_core::http::HeaderSource for HeaderBlock {
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
     }
+    fn is_empty(&self) -> bool {
+        HeaderBlock::is_empty(self)
+    }
 }
 
 impl From<Vec<(String, String)>> for HeaderBlock {
@@ -172,6 +175,21 @@ impl From<Vec<(String, String)>> for HeaderBlock {
 impl From<&[(String, String)]> for HeaderBlock {
     fn from(v: &[(String, String)]) -> Self {
         Self::from_pairs(v.to_vec())
+    }
+}
+
+/// Serialise as the sequence of `[name, value]` pairs the disk format stores.
+///
+/// The disk writer encodes straight into its file buffer, so this borrows the
+/// tape rather than building an owned pair list for every entry it writes.
+impl serde::Serialize for HeaderBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        for (name, value) in self.iter() {
+            seq.serialize_element(&(name, value))?;
+        }
+        seq.end()
     }
 }
 
@@ -370,6 +388,9 @@ impl m6_core::http::HeaderSource for HeaderBuilder {
             .iter(false)
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
+    }
+    fn is_empty(&self) -> bool {
+        HeaderBuilder::is_empty(self)
     }
 }
 

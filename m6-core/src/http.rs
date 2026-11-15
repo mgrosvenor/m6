@@ -262,6 +262,12 @@ mod redirect_tests {
 pub trait HeaderSource {
     fn find(&self, name: &str) -> Option<&str>;
     fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str>;
+    /// True when the source holds no header fields.
+    ///
+    /// A cached response's existence is asked through this, since a stored
+    /// 200 with no header fields is not a representation a conditional
+    /// request can match.
+    fn is_empty(&self) -> bool;
 }
 
 impl HeaderSource for [(String, String)] {
@@ -274,6 +280,9 @@ impl HeaderSource for [(String, String)] {
         self.iter()
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 }
 
@@ -288,6 +297,9 @@ impl HeaderSource for Vec<(String, String)> {
     }
     fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
         self.as_slice().find_all(name)
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 }
 
@@ -305,6 +317,9 @@ impl HeaderSource for [httparse::Header<'_>] {
         self.iter()
             .filter(move |h| h.name.eq_ignore_ascii_case(name))
             .filter_map(|h| std::str::from_utf8(h.value).ok())
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 }
 

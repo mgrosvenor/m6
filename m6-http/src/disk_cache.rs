@@ -679,7 +679,7 @@ pub fn encode_into(buf: &mut Vec<u8>, id: u64, key: &str, r: &CachedResponse) {
     struct Meta<'a> {
         key: &'a str,
         status: u16,
-        headers: &'a [(String, String)],
+        headers: &'a crate::cache::HeaderBlock,
     }
 
     buf.clear();
@@ -752,7 +752,7 @@ pub fn decode(bytes: &[u8]) -> Result<(u64, String, CachedResponse), DecodeError
         CachedResponse {
             genid: id,
             status: meta.status,
-            headers: std::sync::Arc::new(meta.headers),
+            headers: crate::cache::HeaderBlock::from_pairs(meta.headers),
             body: bytes::Bytes::from(body),
         },
     ))
@@ -794,9 +794,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
-    use crate::cache::CacheKey;
+    use crate::cache::{CacheKey, HeaderBlock};
 
     use bytes::Bytes;
 
@@ -805,7 +804,7 @@ mod tests {
         CachedResponse {
             genid,
             status: 200,
-            headers: Arc::new(vec![(
+            headers: HeaderBlock::from_pairs(vec![(
                 "content-type".to_string(),
                 "text/html; charset=utf-8".to_string(),
             )]),
@@ -849,7 +848,7 @@ mod tests {
         let r = CachedResponse {
             genid: 7,
             status: 203,
-            headers: Arc::new(vec![
+            headers: HeaderBlock::from_pairs(vec![
                 ("content-type".to_string(), "text/plain".to_string()),
                 (
                     "cache-control".to_string(),
@@ -869,7 +868,7 @@ mod tests {
         assert_eq!(key, "/hello\u{1}a=1\u{1}gzip");
         assert_eq!(decoded.genid, 42);
         assert_eq!(decoded.status, 203);
-        assert_eq!(*decoded.headers, *r.headers);
+        assert_eq!(decoded.headers, r.headers);
         assert_eq!(&decoded.body[..], body);
     }
 
