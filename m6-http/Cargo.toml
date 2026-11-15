@@ -58,6 +58,11 @@ path = "src/lib.rs"
 # counting file through `alloc-count`. `tests/allocations.rs` reads the stop
 # line of a binary built with this feature.
 count-allocations = ["m6-core/alloc-count"]
+# ALLOC-ATTR: dhat as the global allocator, so every allocation is attributed to
+# a source line rather than just counted. It implies `count-allocations` so the
+# binary keeps the same arm and stop lines, and it is off by default. This is
+# measurement instrumentation only: no request path changes.
+alloc-attribution = ["count-allocations", "dep:dhat"]
 
 [dependencies]
 # quiche, from our own fork, pinned BY REVISION and not by branch: a branch name
@@ -94,6 +99,9 @@ jsonwebtoken   = "9"
 glob           = "0.3"
 bytes          = "1"
 base64         = "0.22"
+# ALLOC-ATTR only, behind `alloc-attribution`: the heap profiler that records a
+# backtrace for every allocation and writes dhat-heap.json at exit.
+dhat           = { version = "0.3", optional = true }
 sha2           = "0.10"
 httparse       = "1"
 # Upstream, deliberately, despite RUSTSEC-2023-0084 and -0085.
@@ -197,3 +205,10 @@ harness = false
 [[test]]
 name = "allocations"
 required-features = ["count-allocations"]
+
+# ALLOC-ATTR: the same four rows with dhat as the allocator, at two request
+# counts, writing one dhat-heap.json per server run. It needs both features, so
+# an ordinary test run never builds it.
+[[test]]
+name = "alloc_attribution"
+required-features = ["alloc-attribution"]

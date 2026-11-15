@@ -198,7 +198,7 @@ impl Conn {
                 i
             }
             ConnKind::Http1(h1) => match h1.state {
-                H1State::Reading { .. } => Interest::READABLE,
+                H1State::Reading => Interest::READABLE,
                 H1State::WaitingBackend => Interest::READABLE,
                 H1State::Writing { .. } => Interest::READABLE | Interest::WRITABLE,
                 H1State::Done => Interest::READABLE,
@@ -217,15 +217,12 @@ impl Conn {
 // ── HTTP/1.1 state machine ────────────────────────────────────────────────────
 
 enum H1State {
-    Reading {
-        buf: Vec<u8>,
-    },
+    Reading,
     /// A request was dispatched to a backend; the upstream's completion writes
     /// the response straight into this connection, so no receiver or context is
     /// parked here.
     WaitingBackend,
     Writing {
-        buf: Vec<u8>,
         pos: usize,
     },
     Done,
@@ -233,6 +230,22 @@ enum H1State {
 
 struct H1Conn {
     state: H1State,
+    /// The request bytes for the request being read.
+    ///
+    /// The buffer belongs to the connection, not to the request. It used to be
+    /// part of `H1State::Reading` and `finish_response` replaced it with a fresh
+    /// `Vec`, so every request on a keep-alive connection paid for a read buffer
+    /// that the previous request had already grown. Its capacity is now reused:
+    /// `finish_response` clears it and the next request refills it.
+    read_buf: Vec<u8>,
+    /// The response bytes for the response being written, allocated once per
+    /// connection slot and reused for every response on it.
+    ///
+    /// Both writers append into this buffer, so a cached hit or a backend reply
+    /// writes its head and body by offset and length with no growth after the
+    /// first response. `Vec::clear` keeps the capacity, which is what makes the
+    /// second request on a connection free.
+    out_buf: Vec<u8>,
     /// Reset at the start of each request on a reused connection, so the
     /// timeout below is idle time and not total connection age.
     created: Instant,
@@ -249,6 +262,21 @@ struct H1Conn {
     /// Answering twice would put a second interim response on the wire.
     expect_handled: bool,
 }
+
+/// The request buffer's starting capacity: one read chunk.
+///
+/// The buffer is allocated once when the connection is created rather than
+/// grown by the first request, so what a request pays is the request's own work
+/// and not the allocation of a buffer the connection keeps.
+const READ_BUF_BYTES: usize = 4096;
+
+/// The response buffer's starting capacity: a status line, the headers a
+/// response usually carries and the generation line fit without a growth.
+///
+/// Sized once for the same reason as the read buffer. A body larger than this
+/// grows it once per connection, and every later response on that connection
+/// reuses that capacity.
+const OUT_BUF_BYTES: usize = 512;
 
 /// Idle timeout for an HTTP/1.1 connection, measured from the start of the
 /// current request rather than from when the connection opened.
@@ -418,7 +446,9 @@ impl Http11Listener {
                         }
                     } else {
                         ConnKind::Http1(H1Conn {
-                            state: H1State::Reading { buf: Vec::new() },
+                            state: H1State::Reading,
+                            read_buf: Vec::with_capacity(READ_BUF_BYTES),
+                            out_buf: Vec::with_capacity(OUT_BUF_BYTES),
                             created: m6_core::platform::now(),
                             keep_alive: false,
                             served: 0,
@@ -538,11 +568,20 @@ impl Http11Listener {
             ConnKind::Http1(h1) if matches!(h1.state, H1State::WaitingBackend) => h1.keep_alive,
             _ => return drive,
         };
-        let buf = build_response(status, headers, &body, method, keep_alive, genid);
         let ConnKind::Http1(h1) = &mut conn.kind else {
             return drive;
         };
-        h1.state = H1State::Writing { buf, pos: 0 };
+        h1.out_buf.clear();
+        write_response(
+            &mut h1.out_buf,
+            status,
+            headers,
+            &body,
+            method,
+            keep_alive,
+            genid,
+        );
+        h1.state = H1State::Writing { pos: 0 };
         let mut unit = ();
         let mut on_head = |_: &mut (), _: &RequestHead<'_>, _: &[u8], _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
@@ -1249,6 +1288,8 @@ fn drive_conn<S, FH, FO>(
     if tls_failed {
         conn.kind = ConnKind::Http1(H1Conn {
             state: H1State::Done,
+            read_buf: Vec::new(),
+            out_buf: Vec::new(),
             created: m6_core::platform::now(),
             keep_alive: false,
             served: 0,
@@ -1296,7 +1337,9 @@ fn drive_conn<S, FH, FO>(
             return;
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
-                state: H1State::Reading { buf: Vec::new() },
+                state: H1State::Reading,
+                read_buf: Vec::with_capacity(READ_BUF_BYTES),
+                out_buf: Vec::with_capacity(OUT_BUF_BYTES),
                 created,
                 keep_alive: false,
                 served: 0,
@@ -1418,7 +1461,7 @@ fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
         return false;
     }
     let Some(exp) = (match &h1.state {
-        H1State::Reading { buf } => m6_core::h1::expectation(buf),
+        H1State::Reading => m6_core::h1::expectation(&h1.read_buf),
         _ => None,
     }) else {
         // Head still arriving; nothing to conclude yet.
@@ -1433,11 +1476,10 @@ fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
         }
         m6_core::h1::Expectation::Unsupported => {
             h1.expect_handled = true;
-            let resp = b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            h1.state = H1State::Writing {
-                buf: resp.to_vec(),
-                pos: 0,
-            };
+            start_response(
+                h1,
+                b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
             return true;
         }
     }
@@ -1448,22 +1490,38 @@ fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-/// The raw HTTP/1.1 response for a request refused at a head limit.
+/// Start a response from fixed bytes: reuse the connection's output buffer,
+/// copy them in, and switch to writing.
+///
+/// The buffer is cleared rather than replaced, so an answer the connection has
+/// already sent once costs no allocation to repeat.
+fn start_response(h1: &mut H1Conn, response: &[u8]) {
+    h1.out_buf.clear();
+    h1.out_buf.extend_from_slice(response);
+    h1.state = H1State::Writing { pos: 0 };
+}
+
+/// The raw HTTP/1.1 response for a request refused at a head limit, written
+/// straight into the connection's output buffer.
 ///
 /// The body is the service's usual error page, titled as nginx titles these
 /// refusals. No `Server` header is added: the answer is about the request and
 /// the status is the whole message.
-fn head_refusal_response(why: m6_core::h1::HeadError) -> Vec<u8> {
+fn write_head_refusal(h1: &mut H1Conn, why: m6_core::h1::HeadError) {
     let status = why.status();
     let body = crate::error::refusal_body(status);
     let reason = m6_core::h1::status_reason(status);
-    let mut out = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
+    let out = &mut h1.out_buf;
+    out.clear();
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(itoa::Buffer::new().format(status).as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
+    out.extend_from_slice(itoa::Buffer::new().format(body.len()).as_bytes());
+    out.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
     out.extend_from_slice(&body);
-    out
+    h1.state = H1State::Writing { pos: 0 };
 }
 
 #[allow(clippy::too_many_arguments)] // transport, connection, state and the two dispatch closures
@@ -1482,7 +1540,7 @@ fn drive_h1<S, FH, FO>(
 {
     loop {
         match &h1.state {
-            H1State::Reading { .. } => {
+            H1State::Reading => {
                 let mut tmp = [0u8; 4096];
                 // Read, parse and answer until the socket would block or the
                 // request is dispatched elsewhere. The poll is edge-triggered,
@@ -1490,76 +1548,54 @@ fn drive_h1<S, FH, FO>(
                 // never be reported again: keep reading while the socket yields
                 // data. `dry` says the socket has no more for this turn.
                 let mut dry = false;
-                {
-                    let H1State::Reading { buf } = &mut h1.state else {
-                        break;
-                    };
-                    match io.read_pumped(buf, &mut tmp) {
-                        // Plaintext EOF: a peer that half-closed after sending
-                        // is still owed its response. Parse what is buffered.
-                        Ok(0) => {
-                            if buf.is_empty() {
-                                h1.state = H1State::Done;
-                                return;
-                            }
-                            dry = true;
-                        }
-                        Ok(n) => {
-                            buf.extend_from_slice(&tmp[..n]);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            dry = true;
-                        }
-                        Err(_) => {
+                match io.read_pumped(&mut h1.read_buf, &mut tmp) {
+                    // Plaintext EOF: a peer that half-closed after sending
+                    // is still owed its response. Parse what is buffered.
+                    Ok(0) => {
+                        if h1.read_buf.is_empty() {
                             h1.state = H1State::Done;
                             return;
                         }
+                        dry = true;
+                    }
+                    Ok(n) => {
+                        h1.read_buf.extend_from_slice(&tmp[..n]);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        dry = true;
+                    }
+                    Err(_) => {
+                        h1.state = H1State::Done;
+                        return;
                     }
                 }
-                let H1State::Reading { buf } = &mut h1.state else {
-                    break;
-                };
-                if buf.len() > MAX_REQUEST_BYTES {
-                    let resp = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    h1.state = H1State::Writing {
-                        buf: resp.to_vec(),
-                        pos: 0,
-                    };
+                if h1.read_buf.len() > MAX_REQUEST_BYTES {
+                    start_response(
+                        h1,
+                        b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                     continue;
                 }
-                // Parse under an immutable borrow. `ParseResult` owns all of
-                // its data, so the borrow ends with this statement and
-                // `h1.state` can be reassigned below.
-                //
-                // This used to clone `buf` to release the mutable borrow
-                // above. That copied the whole accumulated request on *every*
-                // read event, so a body arriving in N chunks was copied O(N²)
-                // bytes in total — at the 20 MiB cap, tens of GB of memcpy for
-                // a single upload.
                 // Parse the head under an immutable borrow of the input buffer.
                 // A bodyless request routes on the borrowed head, so a cached
                 // hit never materialises an owned request. A body request, or a
                 // bodyless miss, falls back to the owned parser.
+                //
+                // This used to clone the buffer to release the mutable borrow
+                // above. That copied the whole accumulated request on *every*
+                // read event, so a body arriving in N chunks was copied O(N²)
+                // bytes in total, at the 20 MiB cap tens of GB of memcpy for a
+                // single upload.
                 let mut head_buf = [httparse::EMPTY_HEADER; 64];
-                let parsed = match &h1.state {
-                    H1State::Reading { buf } => parse_head(buf, &mut head_buf),
-                    _ => break,
-                };
+                let parsed = parse_head(&h1.read_buf, &mut head_buf);
                 match parsed {
                     HeadResult::Incomplete => {
                         // A head that has already passed a limit is refused
                         // without waiting for the blank line that would
                         // complete it, so a peer cannot make the process buffer
                         // an unbounded head while it decides.
-                        let refusal = match &h1.state {
-                            H1State::Reading { buf } => m6_core::h1::incomplete_head_status(buf),
-                            _ => None,
-                        };
-                        if let Some(why) = refusal {
-                            h1.state = H1State::Writing {
-                                buf: head_refusal_response(why),
-                                pos: 0,
-                            };
+                        if let Some(why) = m6_core::h1::incomplete_head_status(&h1.read_buf) {
+                            write_head_refusal(h1, why);
                             continue;
                         }
                         // The head may be complete even though the message is
@@ -1578,27 +1614,18 @@ fn drive_h1<S, FH, FO>(
                     }
                     // A malformed head keeps the answer it has always had.
                     HeadResult::Error(m6_core::h1::HeadError::Malformed) => {
-                        h1.state = H1State::Writing {
-                            buf: BAD_REQUEST.to_vec(),
-                            pos: 0,
-                        };
+                        start_response(h1, BAD_REQUEST);
                         continue;
                     }
                     HeadResult::Error(why) => {
-                        h1.state = H1State::Writing {
-                            buf: head_refusal_response(why),
-                            pos: 0,
-                        };
+                        write_head_refusal(h1, why);
                         continue;
                     }
                     HeadResult::Complete(head) => {
                         if head.has_body() {
                             // A body request routes through the owned parser,
                             // which waits for the full body and carries it.
-                            let owned = match &h1.state {
-                                H1State::Reading { buf } => parse_request(buf),
-                                _ => break,
-                            };
+                            let owned = parse_request(&h1.read_buf);
                             match owned {
                                 ParseResult::Incomplete => {
                                     // The head is complete and the body is not:
@@ -1613,17 +1640,11 @@ fn drive_h1<S, FH, FO>(
                                     continue;
                                 }
                                 ParseResult::Error(m6_core::h1::HeadError::Malformed) => {
-                                    h1.state = H1State::Writing {
-                                        buf: BAD_REQUEST.to_vec(),
-                                        pos: 0,
-                                    };
+                                    start_response(h1, BAD_REQUEST);
                                     continue;
                                 }
                                 ParseResult::Error(why) => {
-                                    h1.state = H1State::Writing {
-                                        buf: head_refusal_response(why),
-                                        pos: 0,
-                                    };
+                                    write_head_refusal(h1, why);
                                     continue;
                                 }
                                 ParseResult::Complete(mut req) => {
@@ -1640,16 +1661,17 @@ fn drive_h1<S, FH, FO>(
                                             _,
                                             genid,
                                         ) => {
-                                            let mut out = Vec::new();
-                                            out.extend_from_slice(&build_response(
+                                            h1.out_buf.clear();
+                                            write_response(
+                                                &mut h1.out_buf,
                                                 status,
                                                 &resp_headers,
                                                 &body,
                                                 &req.method,
                                                 h1.keep_alive,
                                                 genid,
-                                            ));
-                                            h1.state = H1State::Writing { buf: out, pos: 0 };
+                                            );
+                                            h1.state = H1State::Writing { pos: 0 };
                                             continue;
                                         }
                                         RequestOutcome::Pending { id, ctx } => {
@@ -1672,11 +1694,7 @@ fn drive_h1<S, FH, FO>(
                             let method = head.method;
                             let keep_alive = wants_keep_alive_head(head.version, head.headers)
                                 && h1.served + 1 < h1.max_requests;
-                            let buf = match &h1.state {
-                                H1State::Reading { buf } => &buf[..],
-                                _ => break,
-                            };
-                            match on_head(state, &head, buf, client_ip) {
+                            match on_head(state, &head, &h1.read_buf, client_ip) {
                                 RequestOutcome::Cached {
                                     entry,
                                     age,
@@ -1684,9 +1702,9 @@ fn drive_h1<S, FH, FO>(
                                     ..
                                 } => {
                                     let hit = hit.expect("cached hit carries hit headers");
-                                    let mut out = Vec::new();
+                                    h1.out_buf.clear();
                                     write_cached_h1(
-                                        &mut out,
+                                        &mut h1.out_buf,
                                         &entry,
                                         age,
                                         hit,
@@ -1695,21 +1713,22 @@ fn drive_h1<S, FH, FO>(
                                         keep_alive,
                                     );
                                     h1.keep_alive = keep_alive;
-                                    h1.state = H1State::Writing { buf: out, pos: 0 };
+                                    h1.state = H1State::Writing { pos: 0 };
                                     continue;
                                 }
                                 RequestOutcome::Ready(status, resp_headers, body, _, genid) => {
-                                    let mut out = Vec::new();
-                                    out.extend_from_slice(&build_response(
+                                    h1.out_buf.clear();
+                                    write_response(
+                                        &mut h1.out_buf,
                                         status,
                                         &resp_headers,
                                         &body,
                                         method,
                                         keep_alive,
                                         genid,
-                                    ));
+                                    );
                                     h1.keep_alive = keep_alive;
-                                    h1.state = H1State::Writing { buf: out, pos: 0 };
+                                    h1.state = H1State::Writing { pos: 0 };
                                     continue;
                                 }
                                 RequestOutcome::Pending { id, ctx } => {
@@ -1732,7 +1751,7 @@ fn drive_h1<S, FH, FO>(
                 // there is nothing to poll here.
                 break;
             }
-            H1State::Writing { buf, pos } => {
+            H1State::Writing { pos } => {
                 // Flush any ciphertext still pending from a previous turn: a
                 // full socket stopped the flush but the response is not done.
                 if io.wants_write() {
@@ -1744,7 +1763,7 @@ fn drive_h1<S, FH, FO>(
                         break; // still flushing; a writable event resumes
                     }
                 }
-                let remaining = &buf[*pos..];
+                let remaining = &h1.out_buf[*pos..];
                 if remaining.is_empty() {
                     if finish_response(h1) {
                         drive.restarted = true;
@@ -1775,10 +1794,10 @@ fn drive_h1<S, FH, FO>(
                 if io.wants_write() {
                     break; // ciphertext still pending; writable resumes
                 }
-                let H1State::Writing { buf, pos } = &h1.state else {
+                let H1State::Writing { pos } = &h1.state else {
                     break;
                 };
-                if *pos >= buf.len() {
+                if *pos >= h1.out_buf.len() {
                     if finish_response(h1) {
                         drive.restarted = true;
                     }
@@ -1799,7 +1818,10 @@ fn drive_h1<S, FH, FO>(
 fn finish_response(h1: &mut H1Conn) -> bool {
     h1.served = h1.served.saturating_add(1);
     if h1.keep_alive && h1.served < h1.max_requests {
-        h1.state = H1State::Reading { buf: Vec::new() };
+        // Cleared, not replaced: the next request on this connection reuses the
+        // capacity this one grew, and the response buffer keeps its own.
+        h1.read_buf.clear();
+        h1.state = H1State::Reading;
         h1.created = m6_core::platform::now();
         h1.expect_handled = false;
         true
@@ -1986,7 +2008,9 @@ pub fn status_may_have_content_length(status: u16) -> bool {
 /// Write a completed HTTP/1.1 response into a new buffer.
 ///
 /// Public so the generation check can count what the miss path allocates with
-/// and without an ID. The writer itself is the production one.
+/// and without an ID. The writer itself is the production one. The production
+/// request path does not call this: it hands [`write_response`] the connection's
+/// own output buffer, which is why a response no longer allocates its bytes.
 pub fn build_response(
     status: u16,
     headers: &[(String, String)],
@@ -1996,12 +2020,39 @@ pub fn build_response(
     genid: Option<u64>,
 ) -> Vec<u8> {
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    let reason = status_reason(status);
     // Room for the generation line, so adding one never grows the buffer a
     // second time: it is written with `itoa` into bytes this response already
     // owns.
     let mut out = Vec::with_capacity(280 + if is_head { 0 } else { body.len() });
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes());
+    write_response(&mut out, status, headers, body, method, keep_alive, genid);
+    out
+}
+
+/// Append one completed HTTP/1.1 response to `out`.
+///
+/// The writer appends instead of returning a buffer, so the connection's output
+/// buffer is reused across responses on it and no response has to be built in a
+/// temporary `Vec` and copied out again.
+fn write_response(
+    out: &mut Vec<u8>,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    method: &str,
+    keep_alive: bool,
+    genid: Option<u64>,
+) {
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let reason = status_reason(status);
+    // Every line below is appended from the slice it already is: the borrowed
+    // name, the borrowed value, `itoa`'s formatting buffer. A `format!` here
+    // built a `String` per line, which was fifteen of a miss's ninety-one
+    // allocations and bought nothing the output buffer could not hold.
+    out.extend_from_slice(b"HTTP/1.1 ");
+    out.extend_from_slice(itoa::Buffer::new().format(status).as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
     // Any upstream copy of a header this function emits itself is dropped
     // here, or the response goes out carrying both.
     //
@@ -2016,14 +2067,17 @@ pub fn build_response(
         if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("connection") {
             continue;
         }
-        out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
     // Applied at serialisation so every response carries them regardless of
     // which path produced it (cache hit, backend, error page, 429).
-    crate::security::write_h1_headers(&mut out, headers);
+    crate::security::write_h1_headers(out, headers);
 
     if let Some(genid) = genid {
-        write_genid_header(&mut out, genid);
+        write_genid_header(out, genid);
     }
 
     // RFC 9110 9.3.2: a HEAD response's Content-Length describes the
@@ -2039,7 +2093,9 @@ pub fn build_response(
         body.len()
     };
     if status_may_have_content_length(status) {
-        out.extend_from_slice(format!("content-length: {}\r\n", cl).as_bytes());
+        out.extend_from_slice(b"content-length: ");
+        out.extend_from_slice(itoa::Buffer::new().format(cl).as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
     // A response the recipient cannot frame must close, whatever either side
     // would prefer: without Content-Length the body ends at end-of-connection,
@@ -2053,7 +2109,6 @@ pub fn build_response(
     if !is_head {
         out.extend_from_slice(body);
     }
-    out
 }
 
 fn status_reason(status: u16) -> &'static str {
@@ -2873,7 +2928,9 @@ mod expect_tests {
 
     fn h1_with_head(buf: Vec<u8>) -> H1Conn {
         H1Conn {
-            state: H1State::Reading { buf },
+            state: H1State::Reading,
+            read_buf: buf,
+            out_buf: Vec::new(),
             created: m6_core::platform::now(),
             keep_alive: false,
             served: 0,
