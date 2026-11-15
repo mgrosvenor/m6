@@ -107,6 +107,18 @@ pub fn uid() -> u32 {
     nix::unistd::Uid::effective().as_raw()
 }
 
+/// The effective user's name.
+///
+/// A start-time error tells the operator who should own a directory the service
+/// will not create, so it names this user. Falls back to the numeric id when
+/// the name cannot be read, the one fact always available.
+pub fn user() -> String {
+    nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .ok()
+        .flatten()
+        .map_or_else(|| uid().to_string(), |user| user.name)
+}
+
 /// Whether this process runs as root.
 pub fn is_root() -> bool {
     nix::unistd::Uid::effective().is_root()

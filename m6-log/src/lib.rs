@@ -65,9 +65,18 @@ static ANY_INIT: AtomicBool = AtomicBool::new(false);
 /// terminal. The analytics Sink writes to `analytics` when it is given, and
 /// regular files never return `EAGAIN`. Called once at start, before the loop.
 pub fn init(level: Level, analytics: Option<&Path>) -> io::Result<()> {
+    init_with_setting(level, analytics.map(|path| ("the log file path", path)))
+}
+
+/// Open the log, naming the setting that named the analytics path.
+///
+/// A missing analytics directory is refused by [`Sink::file_setting`]. The
+/// error then names `setting`, the directory and the remedy in one line, which
+/// is what a service prints before exiting 2.
+pub fn init_with_setting(level: Level, analytics: Option<(&str, &Path)>) -> io::Result<()> {
     let operational = Sink::stdout()?;
     let analytics = match analytics {
-        Some(path) => Some(Sink::file(path)?),
+        Some((setting, path)) => Some(Sink::file_setting(path, setting)?),
         None => None,
     };
     LEVEL.with(|slot| slot.set(level));

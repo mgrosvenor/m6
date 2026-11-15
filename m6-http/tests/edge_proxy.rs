@@ -211,6 +211,9 @@ mode = "internal"
 [log]
 level  = "warn"
 
+[analytics]
+enabled = false
+
 [[backend]]
 name    = "m6-html"
 sockets = "{html_sock}"
@@ -283,6 +286,9 @@ mode = "internal"
 
 [log]
 level  = "warn"
+
+[analytics]
+enabled = false
 
 [[backend]]
 name           = "global"
