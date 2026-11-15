@@ -350,13 +350,13 @@ If a route declares `require`, m6-http enforces before forwarding:
 4. Check claims against `require` declaration (`group:<n>` or `role:<n>`)
 5. Reject with 401 (no token / invalid token) or 403 (insufficient claims)
 
-One function, `auth::authorise`, does steps 1 to 4 for route `require` and for the monitoring endpoints below, so both accept the same tokens and refuse the same ways.
-A 401 from m6-http itself carries `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1).
-A `WWW-Authenticate` header a backend already supplied is kept.
+One function, `auth::check`, does steps 1 to 4 for route `require`, `/perf`, `/traffic` and `/genid`, once per request, so all four accept the same tokens and refuse the same ways.
+It decides `Allow(claims)`, `NoCredential` (401) or `Deny` (403); `m6_core::http::token_refusal` is the one definition of the refusal, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
+A missing `[auth] public_key` fails closed as 401; config validation refuses `require` without `[auth]`, so a running node does not reach that state.
 
 Valid requests are forwarded with the verified token intact. Renderers may perform additional fine-grained checks using the auth claims available in the request dictionary.
 
-**401 handling:** When a browser request (`Accept: text/html`) to a protected route has no token or an expired token, m6-http checks whether a `refresh` cookie is present. If so, it redirects to `POST /auth/refresh` — if the refresh token is still valid, new cookies are set and the browser is redirected back to the original path transparently. If the refresh token is also expired or absent, m6-http redirects to `/login?next=<original-path>`. API clients (non-`text/html` Accept) always receive 401 directly.
+**401 handling:** A browser (`Accept: text/html`) sent to a protected route with no credential, an invalid one or an expired one is redirected: to `/auth/refresh` when a `refresh` cookie is present, otherwise to `/login?next=<original-path>`. A browser whose credential verifies but lacks the role gets the site's own 403 error page, keeping the check's status. API clients (non-`text/html` Accept) receive the JSON refusal directly.
 
 ---
 
@@ -373,17 +373,16 @@ A refusal never reaches routing or the cache, so a catch-all route can never ans
 | `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. An absolute path |
 | `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. A token with the claim is required, from the Authorization header or the session cookie, as route `require` reads it |
 | `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
-| `[health] metrics_token_file` | either file, system config wins | Legacy bearer string. An absolute path. Ignored when `metrics_require` is set |
 
-*Table 1: the keys that decide who reads `/perf` and `/traffic`. With none of them set, only the legacy file gate applies.*
+*Table 1: the keys that decide who reads `/perf` and `/traffic`. With neither set the endpoints do not exist.*
 
 The checks run in this order, as Table 2 shows.
 
 | Step | Check | Refusal |
 |---|---|---|
 | 1 | `metrics_peers` set: not on an internal h2c listener, and the peer address is listed | 404, the body of a disabled endpoint, before any token is read |
-| 2 | `metrics_require` set: the token (Authorization header or session cookie) verifies and holds the claim | 401 for no or a bad token, 403 for the wrong claim |
-| 2 | `metrics_require` unset: the legacy bearer string matches | 404 when no string is configured, 401 when it does not match |
+| 2 | `metrics_require` set: the one token check verifies the token (Authorization header or session cookie) and holds the claim | 401 for no or a bad token, 403 for the wrong claim. Same status, headers and body as every other token-gated route |
+| 2 | `metrics_require` unset: the endpoint does not exist | 404, the body of a disabled endpoint, before any token is read |
 
 *Table 2: the metrics gate, in order. A request reaches the report only when every step that applies passes.*
 

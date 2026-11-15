@@ -40,6 +40,12 @@ The released versions, newest first:
 
 ## Unreleased
 
+**m6-http checks a token in one place, and every route that gates on one answers the same 401 or 403 from one definition.** Route `require`, `/perf`, `/traffic` and `/genid` each call `m6_http_lib::auth::check` exactly once per request; it decides `Allow(claims)`, `NoCredential` (401) or `Deny` (403), and `m6_core::http::token_refusal` is the only definition of the refusal's status, headers and body. The legacy `[health] metrics_token_file` bearer-string gate and its second checker, `m6_core::monitoring::metrics_authorised`, are removed: `/perf` and `/traffic` are gated by `metrics_require`, and without it they answer the 404 of an endpoint that does not exist. A missing `[auth] public_key` now fails closed on a `require` route instead of skipping the check.
+
+### Migration
+
+**`[health] metrics_token_file` is removed, and a config that still names it stops m6-http at start with exit 2.** Switch `/perf` and `/traffic` to `[health] metrics_require = "role:<name>"` or `"group:<name>"` with `[auth] public_key`, and give the monitor a signed API token. A node that used only the legacy bearer file serves neither endpoint until it does. The refusal body on every token-gated route is now `{"error":"unauthorised"}` (401, with `WWW-Authenticate: Bearer`) or `{"error":"forbidden"}` (403); an API client that parsed a route's HTML 401 or 403 page gets JSON. A browser with no credential is still redirected to `/login` or `/auth/refresh`, and a browser with a valid token for the wrong role still gets the site's 403 page; a browser with an invalid or expired token is now redirected to login instead of shown a 401 page.
+
 **Each crawler sighting on `/traffic` and in the monitor report now carries the time it was first and last seen, and the monitor checks each address behind a sighting against the method the crawler's operator documents. A reverse DNS name counts only when resolving it forward returns the address (#205).**
 
 The new JSON fields are additive.
@@ -56,7 +62,7 @@ No existing field changes, so no migration is needed.
 
 **A log or database directory that does not exist now stops the service at start with exit 2, naming the setting and the path, in place of being created.** Create the directory each setting names, owned by the user the service runs as, or point the setting at a directory that exists: the parent of `[analytics] log_path` for m6-http and the parent of `[storage] path` for m6-auth-server. A deployment's converge that creates `<site>/logs` and the config directory, owned by `m6`, already covers m6-http's default analytics path. It must also create m6-auth-server's database directory where auth is enabled. That unit is enabled on no node today, and the shipped `configs/m6-auth.conf` still names the relative `data/auth.db` this release refuses, so an operator who enables it must create the directory and make the path absolute.
 
-**m6-http refuses at start, with exit 2, a config it used to warn about.** That covers a key or section it does not know, a key in the file it does not belong to (docs/m6-site-toml.md §3.3, Table 1), a system config with no `[node]`, a `[health] metrics_token_file` that is missing, empty or set together with `metrics_require`, and a cache key on a `[[route]]` or `[[route_group]]` (set `Cache-Control` on the backend's response instead).
+**m6-http refuses at start, with exit 2, a config it used to warn about.** That covers a key or section it does not know, a key in the file it does not belong to (docs/m6-site-toml.md §3.3, Table 1), a system config with no `[node]`, a removed or misfiled `[health]` key, and a cache key on a `[[route]]` or `[[route_group]]` (set `Cache-Control` on the backend's response instead).
 Before upgrading, run `m6-http <site> <system config> --dump-config` on every node and fix what it names: add `[node] name = "<node>"` to each system config, and move every node key out of `site.toml`.
 Every m6 service refuses an unknown log level (in `site.toml`, its own config or `--log-level`), a `site.toml` that is missing or is not valid TOML (the default path included), an unknown key in one of m6-core's own tables (`[thread_pool]`, `[params_cache]`, `[server]`, `[log]`, `[compression]`), and a socket whose mode it cannot set.
 

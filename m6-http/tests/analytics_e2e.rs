@@ -373,11 +373,41 @@ fn read_analytics_lines(path: &Path) -> Vec<AnalyticsLine> {
 
 // ── Site fixture ──────────────────────────────────────────────────────────────
 
+/// ES256 keypair for the metrics gate's `[auth] public_key`.
+fn jwt_keypair() -> (String, String) {
+    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
+    (kp.serialize_pem(), kp.public_key_pem())
+}
+
+/// A JWT carrying `roles`, valid for one hour.
+fn mint(private_pem: &str, roles: &[&str]) -> String {
+    #[derive(serde::Serialize)]
+    struct Claims {
+        sub: String,
+        exp: u64,
+        roles: Vec<String>,
+    }
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let claims = Claims {
+        sub: "t".to_string(),
+        exp,
+        roles: roles.iter().map(|s| s.to_string()).collect(),
+    };
+    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
+}
+
 struct Server {
     port: u16,
     cert_der: Vec<u8>,
     analytics_log: PathBuf,
-    /// The `[health] metrics_token_file` token, which `/perf` requires.
+    /// The `role:monitor` token, which `/perf` requires. The legacy bearer
+    /// string is gone: `/perf` is behind the one token check now.
     token: String,
     http: std::cell::RefCell<Service>,
     _file: Service,
@@ -505,9 +535,9 @@ fn start_server() -> Server {
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
     let analytics_log = dir.path().join("analytics.ndjson");
-    let token = "analytics-e2e-token".to_string();
-    let token_file = dir.path().join("perf-token");
-    std::fs::write(&token_file, &token).unwrap();
+    let (private_pem, public_pem) = jwt_keypair();
+    std::fs::write(site.join("auth-public.pem"), public_pem).unwrap();
+    let token = mint(&private_pem, &["monitor"]);
 
     std::fs::write(
         site.join("site.toml"),
@@ -568,12 +598,15 @@ tls_key  = "{key}"
 [node]
 name = "test-node"
 
+[auth]
+public_key = "{auth_key}"
+
 [health]
-metrics_token_file = "{token_file}"
+metrics_require = "role:monitor"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
-            token_file = token_file.display(),
+            auth_key = site.join("auth-public.pem").display(),
         ),
     )
     .unwrap();

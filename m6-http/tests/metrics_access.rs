@@ -102,8 +102,6 @@ fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
 // ── The site under test ───────────────────────────────────────────────────────
 
 /// The legacy bearer string every fixture writes to `metrics.token`.
-const LEGACY_TOKEN: &str = "legacy-secret-token-0123456789abcdef";
-
 /// `[auth]` with a verify key only.
 const AUTH: &str = "[auth]\npublic_key = \"{KEY}\"\n";
 
@@ -131,12 +129,15 @@ struct Fixture {
     /// The accounting tick this test needs, in seconds. Production is a fixed
     /// ten and has no key; the test-only variable is read by a debug build.
     stats_interval: Option<u64>,
+    /// `RUST_LOG` for the child. Debug is how the once-per-request count is
+    /// read: the one token check logs one `auth check` line per call.
+    log_level: &'static str,
 }
 
 impl Fixture {
     /// `site` is appended to site.toml and `system` to system.toml (after
     /// `[node]`). `server` adds lines to `[server]`. In all three `{KEY}` is
-    /// the verify key path, `{TOKEN}` the legacy token file, `{H2C}` a claimed
+    /// the verify key path and `{H2C}` a claimed
     /// extra address.
     fn new(site: &str, server: &str, system: &str) -> Fixture {
         Self::build(site, server, system, false)
@@ -161,14 +162,13 @@ impl Fixture {
         let (private_pem, public_pem) = keypair();
         let (other_private_pem, _) = keypair();
         std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
-        std::fs::write(d.join("metrics.token"), LEGACY_TOKEN).unwrap();
         std::fs::write(d.join("analytics.ndjson"), "").unwrap();
+        std::fs::create_dir_all(d.join("state")).unwrap();
 
         let port = claim_port();
         let h2c = claim_port();
         let sub = |s: &str| {
             s.replace("{KEY}", &d.join("auth-public.pem").display().to_string())
-                .replace("{TOKEN}", &d.join("metrics.token").display().to_string())
                 .replace("{H2C}", &h2c.addr())
         };
 
@@ -222,7 +222,20 @@ impl Fixture {
             other_private_pem,
             dir,
             stats_interval: None,
+            log_level: "info",
         }
+    }
+
+    /// Run the child at debug, so the one token check's `auth check` line is
+    /// visible to the test. The level comes from `site.toml`; `RUST_LOG`
+    /// alone is not the switch.
+    fn with_debug(mut self) -> Self {
+        self.log_level = "debug";
+        let p = self.site.join("site.toml");
+        let mut site = std::fs::read_to_string(&p).expect("site.toml");
+        site.push_str("\n[log]\nlevel = \"debug\"\n");
+        std::fs::write(&p, site).expect("site.toml");
+        self
     }
 
     /// Shorten this fixture's accounting tick. Only a test needs this: the
@@ -236,7 +249,11 @@ impl Fixture {
         let mut cmd = Command::new(testkit::binary("m6-http"));
         cmd.arg(&self.site)
             .arg(&self.system)
-            .env("RUST_LOG", "info")
+            .env(
+                m6_core::platform::STATE_DIR_VAR,
+                self.dir.path().join("state"),
+            )
+            .env("RUST_LOG", self.log_level)
             .current_dir(self.dir.path());
         if let Some(secs) = self.stats_interval {
             cmd.env("M6_TEST_STATS_INTERVAL_SECS", secs.to_string());
@@ -353,6 +370,16 @@ impl Running {
     /// A token for `roles` signed by a key the site does not trust.
     fn foreign_token(&self, roles: &[&str]) -> String {
         mint(&self.fx.other_private_pem, roles, 3600)
+    }
+
+    /// Number of `auth check` lines m6-http has logged so far. The one token
+    /// check emits exactly one per call, so this counts checks, not routes.
+    fn auth_check_count(&self) -> usize {
+        self.svc
+            .output()
+            .lines()
+            .filter(|l| l.contains("auth check"))
+            .count()
     }
 
     /// One GET on the internal h2c listener, claiming `client_ip`.
@@ -815,16 +842,15 @@ fn an_expired_token_is_401() {
     assert_eq!(r.status, 401, "{}", r.text());
 }
 
+/// The legacy bearer file is removed, not silently ignored: a node still
+/// carrying the key does not start, and the message names it.
 #[test]
-fn metrics_token_file_with_metrics_require_is_refused() {
-    let system = format!("{AUTH}\n{GATE}metrics_token_file = \"{{TOKEN}}\"\n");
+fn the_removed_legacy_metrics_token_file_is_refused() {
+    let system = format!("{AUTH}\n{GATE}metrics_token_file = \"{{KEY}}\"\n");
     let fx = Fixture::new(PRIVATE_ROUTE, "", &system);
     let (code, output) = fx.run_until_exit();
     assert_eq!(code, Some(2), "output:\n{output}");
-    assert!(
-        output.contains("metrics_require replaces metrics_token_file"),
-        "output:\n{output}"
-    );
+    assert!(output.contains("metrics_token_file"), "output:\n{output}");
 }
 
 #[test]
@@ -914,16 +940,15 @@ fn auth_and_health_keys_are_read_from_the_system_config() {
     assert_eq!(run.h1("/perf", &[]).status, 401);
 }
 
+/// Without `metrics_require` the endpoint does not exist, whatever credential
+/// is presented: there is no second, legacy gate to fall back to.
 #[test]
-fn without_new_keys_perf_behaves_as_before() {
-    let run = Fixture::new("", "", "[health]\nmetrics_token_file = \"{TOKEN}\"\n").start();
-    let right = bearer(LEGACY_TOKEN);
-    assert_report("h1", &run.h1("/perf", &[("Authorization", &right)]));
-    assert_eq!(
-        run.h1("/perf", &[("Authorization", "Bearer wrong")]).status,
-        401
-    );
-    assert_eq!(run.h1("/perf", &[]).status, 401);
+fn without_a_require_perf_is_disabled() {
+    let run = Fixture::new("", "", "").start();
+    let token = bearer(&run.token(&["monitor"]));
+    for headers in [vec![], vec![("Authorization", token.as_str())]] {
+        assert_eq!(run.h1("/perf", &headers).status, 404);
+    }
 }
 
 #[test]
@@ -932,4 +957,134 @@ fn a_public_metrics_peer_refuses_to_start() {
     let (code, output) = Fixture::new(PRIVATE_ROUTE, "", &system).run_until_exit();
     assert_eq!(code, Some(2), "output:\n{output}");
     assert!(output.contains("not in a local range"), "output:\n{output}");
+}
+
+// ── One checker, one refusal ────────────────────────────────────────────────
+//
+// Four routes gate on a token: a `require` route, `/perf`, `/traffic` and
+// `/genid`. Each calls the one token check exactly once, and each answers its
+// refusal from the one definition. These tests are the contract the single
+// checker has to keep:
+//
+// - no credential is 401, with `WWW-Authenticate: Bearer`, on every route;
+// - a credential that verifies but lacks the required role is 403, without
+//   `WWW-Authenticate`, on every route;
+// - a credential that verifies and carries the role passes the check, and
+//   what happens next is the route's own business (a backend call, a report);
+// - the same request runs the check once, not once per layer.
+//
+// The route block legitimately combines the check with two route-level
+// choices, stated here rather than flattened: a browser with no credential is
+// redirected to login, and a browser lacking the role gets the site's 403
+// error page. The check's status and headers are still the same; the body is
+// the site's presentation, which an operator configures.
+
+/// `[health]` and `[genid]` for the gates, both asking for the monitor role.
+const GATES: &str = "[health]\nmetrics_require = \"role:monitor\"\n\n\
+    [genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:monitor\"\n";
+
+fn all_gated() -> String {
+    format!("{AUTH}\n{GATES}")
+}
+
+#[test]
+fn every_token_gated_route_refuses_with_the_same_bytes() {
+    let run = Fixture::new(PRIVATE_ROUTE, "", &all_gated()).start();
+    let good = bearer(&run.token(&["monitor"]));
+    let wrong = bearer(&run.token(&["reader"]));
+
+    for path in ["/private/x", "/perf", "/traffic", "/genid"] {
+        // Without a credential: 401, one body, one scheme hint.
+        //
+        // Break: give any route its own 401 construction and its body stops
+        // matching this one while the status stays right.
+        let r = run.h1(path, &[]);
+        assert_eq!(r.status, 401, "{path}: {}", r.text());
+        assert_eq!(r.text(), r#"{"error":"unauthorised"}"#, "{path}");
+        assert_eq!(r.header("www-authenticate"), Some("Bearer"), "{path}");
+
+        // With a token carrying the role: the check passes. What the route
+        // does next differs by design: `/private/x` reaches a backend with no
+        // listener (503), the other three build their own answer (200).
+        //
+        // Break: make the route block re-check the token and a valid one can
+        // still be refused here.
+        let r = run.h1(path, &[("Authorization", &good)]);
+        assert!(
+            r.status != 401 && r.status != 403,
+            "{path} refused a valid token: {} {}",
+            r.status,
+            r.text()
+        );
+
+        // With a token for the wrong audience: 403, the same body, and no
+        // scheme hint, because the credential did verify.
+        //
+        // Break: answer 401 here and a verified credential is reported as no
+        // credential, which is the second check wearing this one's name.
+        let r = run.h1(path, &[("Authorization", &wrong)]);
+        assert_eq!(r.status, 403, "{path}: {}", r.text());
+        assert_eq!(r.text(), r#"{"error":"forbidden"}"#, "{path}");
+        assert_eq!(r.header("www-authenticate"), None, "{path}");
+    }
+}
+
+/// The browser choices are the route block's, not the check's: same status,
+/// site presentation. This is the "combines the token with something else"
+/// case, kept rather than flattened.
+#[test]
+fn the_route_block_keeps_its_browser_redirect_and_error_page() {
+    let run = Fixture::new(PRIVATE_ROUTE, "", &all_gated()).start();
+    let browser = [("Accept", "text/html")];
+    let r = run.h1("/private/x", &browser);
+    assert_eq!(r.status, 302, "a browser with no session logs in");
+    assert!(r
+        .header("location")
+        .unwrap_or("")
+        .starts_with("/login?next="));
+
+    let wrong = bearer(&run.token(&["reader"]));
+    let r = run.h1(
+        "/private/x",
+        &[("Accept", "text/html"), ("Authorization", &wrong)],
+    );
+    assert_eq!(r.status, 403, "the browser's status is the check's status");
+    assert!(
+        r.text().contains("403 Forbidden"),
+        "the browser gets the site's error page, not the JSON refusal: {}",
+        r.text()
+    );
+}
+
+/// One call per request, counted rather than assumed: the check logs exactly
+/// one `auth check` line, wherever it is called from.
+///
+/// Break: add a second call in the route block after the first, and the count
+/// for `/private/x` becomes two while every other assertion still passes.
+#[test]
+fn one_auth_check_per_protected_request() {
+    let run = Fixture::new(PRIVATE_ROUTE, "", &all_gated())
+        .with_debug()
+        .start();
+    let good = bearer(&run.token(&["monitor"]));
+    for path in ["/private/x", "/perf", "/traffic", "/genid"] {
+        let before = run.auth_check_count();
+        let r = run.h1(path, &[("Authorization", &good)]);
+        assert!(
+            r.status != 401 && r.status != 403,
+            "{path} refused a valid token: {}",
+            r.status
+        );
+        assert!(
+            testkit::wait::until(Duration::from_secs(10), || run.auth_check_count() > before),
+            "{path} logged no `auth check`\n{}",
+            run.svc.output()
+        );
+        assert_eq!(
+            run.auth_check_count() - before,
+            1,
+            "{path} must run the one check once\n{}",
+            run.svc.output()
+        );
+    }
 }

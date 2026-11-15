@@ -196,7 +196,7 @@ m6-http "$SITE" "$SITE/configs/m6-http-dev.toml"
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 ```
 
-The system config accepts `[server]`, `[node]`, `[auth]` and three `[health]` keys, `metrics_require`, `metrics_peers` and `metrics_token_file`.
+The system config accepts `[server]`, `[node]`, `[auth]` and two `[health]` keys, `metrics_require` and `metrics_peers`.
 Everything else comes from `site.toml` unchanged.
 
 Section 2 shows the two files.
@@ -206,12 +206,12 @@ The merge rules, in order:
 
 1. Each key has one file, Table 1 in §3.3.
 2. A key in the other file, an unknown key or section in either file, or a system config with no `[node]` stops m6-http at start with exit 2, and the error names the key and the file it belongs in.
-3. `tls_cert`, `tls_key`, `[auth] public_key` and `metrics_token_file` are absolute paths, and a relative one is a startup error, exit 2.
+3. `tls_cert`, `tls_key` and `[auth] public_key` are absolute paths, and a relative one is a startup error, exit 2.
 4. An absolute path is used as given.
 5. Validation runs after both files are read.
 6. When both arguments name one file, every key is read from it, `[node]` included.
 
-The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file and `metrics_token_file` rules.
+The `[auth]`, `[health]` and `[server]` sections after section 3 state the one-file rules.
 
 ### 3.2. Renderer secrets
 
@@ -268,7 +268,6 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
-| `[health]` metrics_token_file | System config | A credential path, absolute |
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
@@ -470,12 +469,11 @@ Take from it that the endpoint layout is site-wide and the three access keys bel
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | A summary of the last hour this process served, from memory. See [`m6-http.md`](m6-http.md) |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_token_file` | string | none | The legacy gate, a file holding a bearer string. An absolute path. A file that is missing, unreadable or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
-| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`, and it comes from the Authorization header or the session cookie as a route `require` reads it |
+| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`, and it comes from the Authorization header or the session cookie as a route `require` reads it. The one token check decides; without this key the endpoints answer 404 |
 | `metrics_peers` | list of strings | none | The IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
 **Table 8: the `[health]` keys.**
-The three `metrics_*` keys are read from the system config only.
+The two `metrics_*` keys are read from the system config only.
 
 A request to `/perf` or `/traffic` is served only when both rules that are set pass, and the checks run in this order:
 
@@ -484,8 +482,7 @@ A request to `/perf` or `/traffic` is served only when both rules that are set p
 2. `metrics_require`, when set: the request carries a token, from the Authorization header or the session cookie as a route `require` reads it, that `[auth] public_key` verifies and that holds the claim.
    No token or a bad token is 401 with `WWW-Authenticate: Bearer`.
    A valid token without the claim is 403.
-   When `metrics_require` is unset, the legacy `metrics_token_file` gate applies.
-   Without either, the endpoints answer 404.
+   Without `metrics_require` the endpoints answer 404, so there is no second gate and no legacy bearer file.
 
 The peer address is the one a completed TCP or QUIC handshake proved, never a header.
 That is why the endpoints are refused on an internal h2c listener, where the client address is the `X-Forwarded-For` value the listener believes.
@@ -494,10 +491,10 @@ An entry in `metrics_peers` is an IP address in a local range (`m6_core::net::is
 Names are never resolved, ranges are not accepted, and a public or wildcard address is a startup error.
 An IPv4-mapped IPv6 peer matches the IPv4 entry.
 
-`metrics_peers` composes with either gate.
+`metrics_peers` composes with the token check.
 `/health` ignores both keys.
 On a host where a public interface could receive packets with a listed source address, filter them with reverse-path filtering, because a peer address that arrives on the wrong interface is still a completed handshake.
-When `metrics_require` and `metrics_peers` are unset, the legacy `metrics_token_file` gate alone applies.
+When `metrics_require` and `metrics_peers` are unset, the endpoints answer 404.
 
 The example below gates `/perf` and `/traffic` on a role and one peer address.
 
@@ -742,8 +739,7 @@ Exit 2 on:
 - `[auth]` declared but `public_key` file not found
 - `[auth]` declared with a `backend` that is not declared in `[[backend]]`
 - `require` on a route but no `[auth]` declared
-- `tls_cert`, `tls_key`, `[auth] public_key` or `metrics_token_file` given as a relative path
-- `metrics_token_file` missing, unreadable, empty, or set together with `metrics_require`
+- `tls_cert`, `tls_key` or `[auth] public_key` given as a relative path
 - `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
 - `[health] metrics_peers` entry that is not in a local range
 - `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`

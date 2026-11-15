@@ -145,9 +145,51 @@ impl RawResponse {
     }
 }
 
+/// The wire answer of a token check's refusal: status, headers and body.
+pub type TokenRefusal = (u16, Vec<(String, String)>, Vec<u8>);
+
+/// The one answer a token check gives when it refuses, whatever route asked.
+///
+/// `forbidden` is `false` for no credential or a credential that does not
+/// verify (401), and `true` for a credential that verifies but does not carry
+/// the required role or group (403). A 401 carries `WWW-Authenticate` naming
+/// the scheme, which RFC 9110 11.6.1 requires. `m6-http`'s route check,
+/// `/perf`, `/traffic` and `/genid` all answer through here, so the status,
+/// headers and body a caller sees are the same whichever path it asked for.
+pub fn token_refusal(forbidden: bool) -> TokenRefusal {
+    let mut headers = vec![
+        (
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+        ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+    ];
+    if forbidden {
+        (403, headers, br#"{"error":"forbidden"}"#.to_vec())
+    } else {
+        headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
+        (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_refusal_is_one_definition() {
+        let (status, headers, body) = token_refusal(false);
+        assert_eq!(status, 401);
+        assert_eq!(body, br#"{"error":"unauthorised"}"#);
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "WWW-Authenticate" && v == "Bearer"));
+        let (status, headers, body) = token_refusal(true);
+        assert_eq!(status, 403);
+        assert_eq!(body, br#"{"error":"forbidden"}"#);
+        assert!(!headers.iter().any(|(k, _)| k == "WWW-Authenticate"));
+    }
 
     #[test]
     fn test_raw_request_header_lookup_case_insensitive() {

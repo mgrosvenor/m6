@@ -1009,7 +1009,6 @@ Table 1 lists the settings, the file each sits in and the program that reads it.
 | `secrets_file` | any renderer config | m6-core |
 | `[server] tls_cert`, `tls_key` | system config | m6-http |
 | `[auth] public_key` | system config | m6-http |
-| `[health] metrics_token_file` | system config | m6-http, delivered by `LoadCredential` like every other secret |
 | `[storage] path` | m6-auth config | m6-auth-server and m6-auth-cli |
 | `[keys] private_key`, `public_key` | m6-auth config | m6-auth-server and m6-auth-cli |
 | `perf_token_file` | `[monitor]` | m6-monitor |

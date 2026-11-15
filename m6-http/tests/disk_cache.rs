@@ -178,7 +178,6 @@ impl Stack {
         std::fs::write(d.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
         let (private_pem, public_pem) = keypair();
         std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
-        std::fs::write(d.join("metrics-token"), "perf-token\n").unwrap();
         std::fs::write(
             d.join("genid-token"),
             format!("{}\n", mint(&private_pem, &["reader", "writer"])),
@@ -283,7 +282,8 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n\n\
                  [node]\nname = \"disk-cache\"\n\n\
-                 [health]\nmetrics_token_file = \"{}/metrics-token\"\n\n\
+                 [auth]\npublic_key = \"{}/auth-public.pem\"\n\n\
+                 [health]\nmetrics_require = \"role:monitor\"\n\n\
                  [genid]\nupstream = \"origin\"\ntoken_file = \"{}/genid-token\"\nheartbeat_secs = 1\n\n\
                  [cache]\ndir = \"{}\"\n",
                 cache_port.addr(),
@@ -494,7 +494,8 @@ impl Stack {
     }
 
     fn perf(&self) -> Resp {
-        self.get_cache("/perf", &[("Authorization", "Bearer perf-token")])
+        let auth = format!("Bearer {}", mint(&self.private_pem, &["monitor"]));
+        self.get_cache("/perf", &[("Authorization", auth.as_str())])
     }
 
     /// The cache node's `genid` object from `/perf`.

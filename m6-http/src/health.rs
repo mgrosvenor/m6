@@ -12,12 +12,10 @@
 
 use std::net::IpAddr;
 
-use crate::auth::{self, PublicKey, Refusal};
+use crate::auth::{self, Decision, PublicKey};
 use crate::config::{GenidConfig, HealthConfig};
 
-pub use m6_core::monitoring::{
-    metrics_authorised, HealthReport, PerfAccess, PerfOutcome, PerfReport, PerfSubject, PoolHealth,
-};
+pub use m6_core::monitoring::{HealthReport, PerfOutcome, PerfReport, PerfSubject, PoolHealth};
 
 /// Backend name tagged onto a `/health` response.
 pub const HEALTH_BACKEND: &str = "health";
@@ -41,50 +39,6 @@ pub const GENID_BACKEND: &str = "genid";
 /// keeps it moving on its own.
 pub fn is_monitoring_endpoint(backend: &str) -> bool {
     backend == HEALTH_BACKEND || backend == PERF_BACKEND
-}
-
-#[cfg(test)]
-mod token_file_tests {
-    use crate::config::HealthConfig;
-
-    /// `--dump-config` serialises the whole Config. The resolved token must
-    /// never appear in that output, or the secret ends up in any log or
-    /// paste of a config dump.
-    #[test]
-    fn resolved_token_is_never_serialised() {
-        let health = HealthConfig {
-            enabled: true,
-            path: "/health".to_string(),
-            perf_path: "/perf".to_string(),
-            traffic_path: "/traffic".to_string(),
-            traffic_cache_s: 60,
-            metrics_token_file: Some("/etc/m6/perf-token".to_string()),
-            metrics_token: Some("super-secret-value".to_string()),
-            metrics_require: None,
-            metrics_peers: None,
-            metrics_peer_ips: None,
-        };
-        let dumped = serde_json::to_string(&health).expect("serialisable");
-        assert!(
-            !dumped.contains("super-secret-value"),
-            "token leaked into serialised config: {dumped}"
-        );
-        // The path is configuration and should still be visible.
-        assert!(dumped.contains("/etc/m6/perf-token"));
-    }
-
-    /// The file indirection has to be enforced, not advisory: a token written
-    /// inline in site.toml must be refused, because site.toml is committed and
-    /// shipped to every node.
-    #[test]
-    fn inline_token_in_toml_is_refused() {
-        let err = toml::from_str::<HealthConfig>("metrics_token = \"inline-secret\"")
-            .expect_err("an inline token must be refused, not ignored");
-        assert!(
-            err.to_string().contains("metrics_token"),
-            "the error should name the key: {err}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -526,8 +480,23 @@ pub fn traffic_authorised(
 pub enum Gate {
     /// Serve the report.
     Open,
-    /// Answer with this and do nothing else.
-    Refused(PerfOutcome),
+    /// Answer with this exact status, headers and body and do nothing else:
+    /// the 404 a disabled endpoint gives, or the token check's refusal.
+    Refused(u16, Vec<(String, String)>, Vec<u8>),
+}
+
+impl Gate {
+    /// The 404 an endpoint answers when it is not configured.
+    fn disabled() -> Self {
+        let (code, headers, body) = PerfOutcome::Disabled.into_response();
+        Gate::Refused(code, headers, body)
+    }
+
+    /// The one token check's refusal, as the wire answer.
+    fn refusal(decision: Decision) -> Self {
+        let (code, headers, body) = decision.refusal().expect("a refusal, by construction");
+        Gate::Refused(code, headers, body)
+    }
 }
 
 /// Decide whether `/perf` or `/traffic` may be served to this request.
@@ -536,11 +505,11 @@ pub enum Gate {
 ///
 /// 1. `metrics_peers`, when set: the request must not have arrived on an
 ///    internal h2c listener (there the client address is a forwarded claim),
-///    and its peer address must be listed. Otherwise `Disabled`, the 404 an
-///    unconfigured endpoint gives, before any token is looked at.
-/// 2. `metrics_require`, when set: an API token that passes the claim check
-///    (`Unauthorised` for none or a bad one, `Forbidden` for the wrong claim).
-///    When unset, the legacy `metrics_token_file` gate.
+///    and its peer address must be listed. Otherwise the 404 an unconfigured
+///    endpoint gives, before any token is looked at.
+/// 2. `metrics_require`, when set: the one token check decides. It is called
+///    once, here, and its refusal is the answer unchanged. When unset the
+///    endpoint is off, as it is with no token at all.
 ///
 /// The address rule allocates nothing: one parse of the peer address and a
 /// scan of a short slice, and only on these two paths.
@@ -557,31 +526,15 @@ pub fn metrics_gate(
                 .parse::<IpAddr>()
                 .is_ok_and(|ip| peers.contains(&ip.to_canonical()));
         if !listed {
-            return Gate::Refused(PerfOutcome::Disabled);
+            return Gate::disabled();
         }
     }
-    match h.metrics_require.as_deref() {
-        Some(require) => {
-            let Some(key) = key else {
-                return Gate::Refused(PerfOutcome::Unauthorised);
-            };
-            match auth::authorise(key, headers, require) {
-                Ok(_) => Gate::Open,
-                Err(Refusal::Insufficient) => Gate::Refused(PerfOutcome::Forbidden),
-                Err(Refusal::NoToken | Refusal::Invalid(_)) => {
-                    Gate::Refused(PerfOutcome::Unauthorised)
-                }
-            }
-        }
-        None => match (PerfAccess {
-            headers,
-            configured_token: h.metrics_token.as_deref(),
-        })
-        .refusal()
-        {
-            Some(refused) => Gate::Refused(refused),
-            None => Gate::Open,
-        },
+    let Some(require) = h.metrics_require.as_deref() else {
+        return Gate::disabled();
+    };
+    match auth::check(key, headers, require) {
+        Decision::Allow(_) => Gate::Open,
+        refusal => Gate::refusal(refusal),
     }
 }
 
@@ -592,9 +545,9 @@ pub fn metrics_gate(
 /// 1. The peer is loopback, or the request arrived on an internal listener.
 ///    Anyone else gets the 404 an unknown path gives, before a token is read.
 ///    Neither claim set is the same 404: the endpoint does not exist.
-/// 2. The token passes `read_require` for a `GET` or `write_require` for a
-///    `POST` (`Unauthorised` for none or a bad one, `Forbidden` for the wrong
-///    claim).
+/// 2. The one token check decides with `read_require` for a `GET` or
+///    `write_require` for a `POST`. It is called once, here, and its refusal
+///    is the answer unchanged. Unconfigured is the same 404.
 pub fn genid_gate(
     g: &GenidConfig,
     key: Option<&PublicKey>,
@@ -604,7 +557,7 @@ pub fn genid_gate(
     write: bool,
 ) -> Gate {
     if !genid_address_ok(client_ip, from_internal) {
-        return Gate::Refused(PerfOutcome::Disabled);
+        return Gate::disabled();
     }
     let require = if write {
         g.write_require.as_deref()
@@ -612,15 +565,11 @@ pub fn genid_gate(
         g.read_require.as_deref()
     };
     let Some(require) = require else {
-        return Gate::Refused(PerfOutcome::Disabled);
+        return Gate::disabled();
     };
-    let Some(key) = key else {
-        return Gate::Refused(PerfOutcome::Unauthorised);
-    };
-    match auth::authorise(key, headers, require) {
-        Ok(_) => Gate::Open,
-        Err(Refusal::Insufficient) => Gate::Refused(PerfOutcome::Forbidden),
-        Err(Refusal::NoToken | Refusal::Invalid(_)) => Gate::Refused(PerfOutcome::Unauthorised),
+    match auth::check(key, headers, require) {
+        Decision::Allow(_) => Gate::Open,
+        refusal => Gate::refusal(refusal),
     }
 }
 
@@ -736,26 +685,26 @@ mod traffic_endpoint_tests {
     use super::*;
 
     /// No token configured means the endpoint does not exist: a 404, so it
-    /// does not advertise a door. A wrong token is refused by the gate,
-    /// which runs before `traffic_authorised` and so before the report is
-    /// built.
+    /// does not advertise a door. A wrong credential is refused by the one
+    /// token check, which runs before `traffic_authorised` and so before the
+    /// report is built.
     #[test]
-    fn the_legacy_gate_refuses_before_the_report_is_built() {
+    fn a_disabled_endpoint_refuses_before_the_report_is_built() {
         let none = HealthConfig::default();
-        let Gate::Refused(out) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
+        let Gate::Refused(code, _, _) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
             panic!("no token configured must refuse");
         };
-        assert_eq!(out.into_response().0, 404);
+        assert_eq!(code, 404);
 
         let h = HealthConfig {
-            metrics_token: Some("right".to_string()),
+            metrics_require: Some("role:monitor".to_string()),
             ..HealthConfig::default()
         };
         let wrong = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        assert!(matches!(
-            metrics_gate(&h, None, &wrong, "127.0.0.1", false),
-            Gate::Refused(PerfOutcome::Unauthorised)
-        ));
+        let Gate::Refused(code, _, _) = metrics_gate(&h, None, &wrong, "127.0.0.1", false) else {
+            panic!("no key loaded must fail closed");
+        };
+        assert_eq!(code, 401);
     }
 
     #[test]
@@ -1088,27 +1037,30 @@ mod genid_gate_tests {
             write_require: Some("role:writer".to_string()),
             ..GenidConfig::default()
         };
-        let Gate::Refused(out) = genid_gate(&g, None, &[], "192.0.2.10", false, false) else {
+        let Gate::Refused(code, _, _) = genid_gate(&g, None, &[], "192.0.2.10", false, false)
+        else {
             panic!("a public peer must be refused");
         };
-        assert_eq!(out.into_response().0, 404);
-        let Gate::Refused(out) = genid_gate(&g, None, &[], "::ffff:192.0.2.10", false, true) else {
+        assert_eq!(code, 404);
+        let Gate::Refused(code, _, _) = genid_gate(&g, None, &[], "::ffff:192.0.2.10", false, true)
+        else {
             panic!("a canonical public peer must be refused");
         };
-        assert_eq!(out.into_response().0, 404);
+        assert_eq!(code, 404);
         // The same gate opens the address check for a loopback caller, which
         // then has no token, so it is refused as unauthorised rather than as
         // the nonexistent endpoint.
-        let Gate::Refused(out) = genid_gate(&g, None, &[], "127.0.0.1", false, false) else {
+        let Gate::Refused(code, _, _) = genid_gate(&g, None, &[], "127.0.0.1", false, false) else {
             panic!("no token must be refused");
         };
-        assert_eq!(out.into_response().0, 401);
+        assert_eq!(code, 401);
         // Neither claim set is the endpoint not existing, to everyone.
         let none = GenidConfig::default();
-        let Gate::Refused(out) = genid_gate(&none, None, &[], "127.0.0.1", false, false) else {
+        let Gate::Refused(code, _, _) = genid_gate(&none, None, &[], "127.0.0.1", false, false)
+        else {
             panic!("no claims must be refused");
         };
-        assert_eq!(out.into_response().0, 404);
+        assert_eq!(code, 404);
     }
 }
 
@@ -1121,7 +1073,7 @@ mod metrics_gate_tests {
         bearer(&mint(private_pem, roles, 3600))
     }
 
-    fn health(peers: Option<&[&str]>, require: Option<&str>, legacy: Option<&str>) -> HealthConfig {
+    fn health(peers: Option<&[&str]>, require: Option<&str>) -> HealthConfig {
         HealthConfig {
             metrics_require: require.map(str::to_string),
             metrics_peer_ips: peers.map(|p| {
@@ -1129,39 +1081,38 @@ mod metrics_gate_tests {
                     .map(|s| s.parse::<IpAddr>().unwrap().to_canonical())
                     .collect()
             }),
-            metrics_token: legacy.map(str::to_string),
             ..HealthConfig::default()
         }
     }
 
-    fn is_disabled(g: &Gate) -> bool {
-        matches!(g, Gate::Refused(PerfOutcome::Disabled))
+    fn code(g: &Gate) -> u16 {
+        match g {
+            Gate::Open => 200,
+            Gate::Refused(code, _, _) => *code,
+        }
     }
 
     #[test]
     fn an_unlisted_peer_is_404_before_any_token_check() {
         let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
         let good = token(&private, &["monitor"]);
         for ip in ["203.0.113.7", "2001:db8::1", "10.0.0.8"] {
             let g = metrics_gate(&h, Some(&key), &good, ip, false);
-            assert!(is_disabled(&g), "{ip} must get 404 even with a valid token");
+            assert_eq!(code(&g), 404, "{ip} must get 404 even with a valid token");
         }
         // No token and an unlisted peer is still 404, not 401: a stranger
         // learns nothing about the credential.
-        assert!(is_disabled(&metrics_gate(
-            &h,
-            Some(&key),
-            &[],
-            "203.0.113.7",
-            false
-        )));
+        assert_eq!(
+            code(&metrics_gate(&h, Some(&key), &[], "203.0.113.7", false)),
+            404
+        );
     }
 
     #[test]
     fn a_listed_peer_passes_the_address_rule() {
         let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
         let good = token(&private, &["monitor"]);
         assert!(matches!(
             metrics_gate(&h, Some(&key), &good, "10.0.0.9", false),
@@ -1177,11 +1128,12 @@ mod metrics_gate_tests {
     #[test]
     fn an_unparseable_client_address_is_refused() {
         let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
         let good = token(&private, &["monitor"]);
         for ip in ["", "unknown", "10.0.0.9:443", "10.0.0.9, 1.2.3.4"] {
-            assert!(
-                is_disabled(&metrics_gate(&h, Some(&key), &good, ip, false)),
+            assert_eq!(
+                code(&metrics_gate(&h, Some(&key), &good, ip, false)),
+                404,
                 "{ip:?}"
             );
         }
@@ -1190,70 +1142,43 @@ mod metrics_gate_tests {
     #[test]
     fn a_listed_peer_on_an_internal_listener_is_refused() {
         let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
         let good = token(&private, &["monitor"]);
-        assert!(is_disabled(&metrics_gate(
-            &h,
-            Some(&key),
-            &good,
-            "10.0.0.9",
-            true
-        )));
+        assert_eq!(
+            code(&metrics_gate(&h, Some(&key), &good, "10.0.0.9", true)),
+            404
+        );
     }
 
     #[test]
     fn a_listed_peer_with_a_valid_token_but_wrong_role_is_403() {
         let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
+        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
         let reader = token(&private, &["reader"]);
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &reader, "10.0.0.9", false),
-            Gate::Refused(PerfOutcome::Forbidden)
-        ));
+        let Gate::Refused(code, _, body) = metrics_gate(&h, Some(&key), &reader, "10.0.0.9", false)
+        else {
+            panic!("the wrong role must be refused");
+        };
+        assert_eq!(code, 403);
+        assert_eq!(body, br#"{"error":"forbidden"}"#);
     }
 
     #[test]
     fn metrics_require_without_a_loaded_key_fails_closed() {
-        let h = health(None, Some("role:monitor"), None);
-        assert!(matches!(
-            metrics_gate(&h, None, &[], "10.0.0.9", false),
-            Gate::Refused(PerfOutcome::Unauthorised)
-        ));
+        let h = health(None, Some("role:monitor"));
+        let Gate::Refused(code, _, _) = metrics_gate(&h, None, &[], "10.0.0.9", false) else {
+            panic!("a missing key must fail closed");
+        };
+        assert_eq!(code, 401);
     }
 
     #[test]
-    fn metrics_require_refuses_the_legacy_bearer_string() {
-        let (_d, key, _) = keypair();
-        let h = health(None, Some("role:monitor"), Some("legacy-secret"));
-        let legacy = vec![(
-            "authorization".to_string(),
-            "Bearer legacy-secret".to_string(),
-        )];
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &legacy, "10.0.0.9", false),
-            Gate::Refused(PerfOutcome::Unauthorised)
-        ));
-    }
-
-    #[test]
-    fn without_new_keys_the_gate_is_todays() {
-        let h = health(None, None, Some("right"));
-        let ok = vec![("authorization".to_string(), "Bearer right".to_string())];
-        let bad = vec![("authorization".to_string(), "Bearer wrong".to_string())];
-        // Any peer, internal or not: there is no address rule.
+    fn without_a_require_the_endpoint_is_disabled() {
+        let h = health(None, None);
+        let ok = vec![("authorization".to_string(), "Bearer anything".to_string())];
+        // Any peer, internal or not: no require key means no endpoint.
         for (ip, internal) in [("203.0.113.7", false), ("10.0.0.9", true)] {
-            assert!(matches!(
-                metrics_gate(&h, None, &ok, ip, internal),
-                Gate::Open
-            ));
-            assert!(matches!(
-                metrics_gate(&h, None, &bad, ip, internal),
-                Gate::Refused(PerfOutcome::Unauthorised)
-            ));
+            assert_eq!(code(&metrics_gate(&h, None, &ok, ip, internal)), 404);
         }
-        let none = health(None, None, None);
-        assert!(is_disabled(&metrics_gate(
-            &none, None, &ok, "10.0.0.9", false
-        )));
     }
 }
