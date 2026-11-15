@@ -179,6 +179,7 @@ fn count_request(site: &Site, route: &Route) -> usize {
         }
         Handled::Code(..) => panic!("a config route naming a handler comes back Named"),
         Handled::Done(_) => panic!("a config route naming a handler is answered by it"),
+        Handled::Reload(_) => panic!("a config route naming a handler is not the reload route"),
     };
     let response = (route.answer)();
 
@@ -207,7 +208,7 @@ fn count_template_request(site: &Site) -> usize {
 
     let resp = match handled {
         Handled::Done(resp) => resp,
-        Handled::Named(..) | Handled::Code(..) => {
+        Handled::Named(..) | Handled::Code(..) | Handled::Reload(_) => {
             panic!("a template route is rendered and finished by the site")
         }
     };
