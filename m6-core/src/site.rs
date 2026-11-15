@@ -615,27 +615,31 @@ impl Site {
                 if level.gzip > 0 {
                     candidates.push("gzip");
                 }
-                let plain = resp.body.as_bytes().map(|b| b.to_vec());
-                match (crate::preferred_coding(accept_encoding, &candidates), plain) {
-                    (Some("br"), Some(bytes)) => {
-                        if let Ok(compressed) =
-                            crate::compress::brotli_compress(&bytes, level.brotli)
-                        {
-                            resp.body = crate::response::Body::Bytes(compressed);
-                            resp.headers
-                                .push(("Content-Encoding".to_string(), "br".to_string()));
-                        }
-                    }
-                    (Some("gzip"), Some(bytes)) => {
-                        if let Ok(compressed) = crate::compress::gzip_compress(&bytes, level.gzip) {
-                            resp.body = crate::response::Body::Bytes(compressed);
-                            resp.headers
-                                .push(("Content-Encoding".to_string(), "gzip".to_string()));
-                        }
-                    }
+                // Compress from the body while it is still borrowed: the
+                // compressed bytes are built before the borrow ends, so a
+                // request that asks for `identity` never copies a body it
+                // sends unchanged.
+                let coded = match crate::preferred_coding(accept_encoding, &candidates) {
+                    Some("br") => resp
+                        .body
+                        .as_bytes()
+                        .and_then(|bytes| {
+                            crate::compress::brotli_compress(bytes, level.brotli).ok()
+                        })
+                        .map(|compressed| ("br", compressed)),
+                    Some("gzip") => resp
+                        .body
+                        .as_bytes()
+                        .and_then(|bytes| crate::compress::gzip_compress(bytes, level.gzip).ok())
+                        .map(|compressed| ("gzip", compressed)),
                     // Nothing acceptable: send identity rather than a 406,
                     // which RFC 9110 12.5.3 permits.
-                    _ => {}
+                    _ => None,
+                };
+                if let Some((coding, compressed)) = coded {
+                    resp.body = crate::response::Body::Bytes(compressed);
+                    resp.headers
+                        .push(("Content-Encoding".to_string(), coding.to_string()));
                 }
             }
         }
@@ -1724,23 +1728,18 @@ impl FrameworkState {
         } else {
             Map::new()
         };
-        dict.insert("cookies".to_string(), Value::Object(cookies_map.clone()));
+        dict.insert("cookies".to_string(), Value::Object(cookies_map));
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
         // The reading comes from the layer and chrono only formats it.
         let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+        let (datetime, year) = Self::builtin_dates(now);
         dict.insert(
             "request_path".to_string(),
             Value::String(raw.path().to_string()),
         );
-        dict.insert(
-            "datetime".to_string(),
-            Value::String(now.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        );
-        dict.insert(
-            "year".to_string(),
-            Value::String(now.format("%Y").to_string()),
-        );
+        dict.insert("datetime".to_string(), Value::String(datetime));
+        dict.insert("year".to_string(), Value::String(year));
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -1753,9 +1752,17 @@ impl FrameworkState {
         // 10. Error keys (from query params — already merged in step 5, but highlight here).
 
         // 11. Flash message: verify HMAC, add to dict if valid, clear cookie.
+        // Read back through the dictionary: `Dict::get` returns the overlay
+        // first, and the map inserted in step 7 is in it. The verified message
+        // is owned, so the borrow of `dict` ends before the insert.
         #[cfg(feature = "flash")]
-        if let Some(flash_cookie) = cookies_map.get("_flash").and_then(|v| v.as_str()) {
-            if let Some(msg) = verify_flash_cookie(flash_cookie, &self.flash_secret) {
+        {
+            let message = dict
+                .get("cookies")
+                .and_then(|cookies| cookies.get("_flash"))
+                .and_then(|v| v.as_str())
+                .and_then(|flash_cookie| verify_flash_cookie(flash_cookie, &self.flash_secret));
+            if let Some(msg) = message {
                 dict.insert("flash".to_string(), Value::String(msg));
             }
         }
@@ -1787,6 +1794,20 @@ impl FrameworkState {
         Ok(dict)
     }
 
+    /// The two built-in date values: RFC 3339 in UTC to the second, and the
+    /// four-digit year. No format string is parsed on the request path.
+    fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+        use chrono::Datelike as _;
+        use std::fmt::Write as _;
+        // `{:04}` is what `%Y` does for the years a site can see: four digits,
+        // zero padded, so 0999 is "0999" and not "999". Negative and
+        // five-digit years arrive with a sign or a fifth digit, which `%Y`
+        // also prints, and neither can come from `Utc::now()`.
+        let mut year = String::new();
+        write!(year, "{:04}", now.year()).expect("writing to a String cannot fail");
+        (now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), year)
+    }
+
     /// Render a template response.
     ///
     /// Builds the context as a plain `Map` rather than an engine type: the
@@ -1802,7 +1823,7 @@ impl FrameworkState {
         resp: &mut Response,
         dict: &Dict,
     ) -> std::result::Result<(), RenderError> {
-        if let Some(template_name) = resp.template_name.clone() {
+        if let Some(template_name) = resp.template_name.take() {
             // No copy on the common path. A response that supplied its own
             // context is rendered against that; one that did not is rendered
             // against the request's dictionary, which is this argument. Cloning
@@ -1818,10 +1839,40 @@ impl FrameworkState {
                 "Content-Type".to_string(),
                 "text/html; charset=utf-8".to_string(),
             ));
-            resp.template_name = None;
             resp.template_dict = None;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod builtin_dates_tests {
+    use super::FrameworkState;
+
+    /// The built-in dates keep the shape templates already read:
+    /// `%Y-%m-%dT%H:%M:%SZ` and `%Y`. Pinned here so a change to how they are
+    /// formatted cannot drift from what a template sees.
+    #[test]
+    fn builtin_dates_keep_their_format() {
+        use chrono::TimeZone as _;
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let (datetime, year) = FrameworkState::builtin_dates(now);
+        assert_eq!(datetime, "2026-01-02T03:04:05Z");
+        assert_eq!(year, "2026");
+
+        let last = chrono::Utc
+            .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+            .unwrap();
+        let (datetime, year) = FrameworkState::builtin_dates(last);
+        assert_eq!(datetime, "9999-12-31T23:59:59Z");
+        assert_eq!(year, "9999");
+
+        // The year `%Y` zero-pads and `to_string` did not, which is the only
+        // place the two forms ever differed.
+        let early = chrono::Utc.with_ymd_and_hms(999, 6, 1, 0, 0, 0).unwrap();
+        let (_, year) = FrameworkState::builtin_dates(early);
+        assert_eq!(year, "0999");
     }
 }
 
@@ -2316,6 +2367,90 @@ fn test_renderer() -> &'static dyn RendererFactory {
 mod tests {
     use super::*;
     use crate::h1::parse_head;
+
+    /// Step 11's read-back: a `_flash` cookie whose signature verifies reaches
+    /// the template dictionary, and one that does not leaves nothing there.
+    ///
+    /// These lived in `src/app.rs` after EL-6d moved `build_dict` here, and
+    /// `app.rs` has had no `mod` since, so they never compiled.
+    #[cfg(feature = "flash")]
+    fn flash_dict(cookie: &str, secret: &[u8]) -> Dict {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("templates")).unwrap();
+        let config_path = dir.path().join("m6-site.toml");
+        std::fs::write(
+            &config_path,
+            "[[route]]\npath = \"/\"\nhandler = \"page\"\n",
+        )
+        .unwrap();
+        let config = crate::config::load(&config_path, dir.path()).unwrap();
+        let mut state =
+            FrameworkState::build(config, dir.path().to_path_buf(), &[], test_renderer()).unwrap();
+        state.flash_secret = secret.to_vec();
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            headers: vec![("Cookie".to_string(), format!("_flash={cookie}"))],
+            body: vec![],
+        };
+        let (route, params) = find_route(raw.path(), raw.method(), &state.routes).unwrap();
+        state.build_dict(&raw, route, &params).unwrap()
+    }
+
+    #[cfg(feature = "flash")]
+    fn flash_cookie(message: &str, secret: &[u8]) -> String {
+        Response::text("ok")
+            .flash(message, secret)
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Set-Cookie")
+            .map(|(_, v)| v.as_str())
+            .expect("Set-Cookie header")
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("_flash=")
+            .to_string()
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn a_valid_flash_cookie_reaches_the_dictionary() {
+        let secret = b"test-secret-key-32-bytes-xxxxxxx";
+        let message = "Login successful!";
+        let dict = flash_dict(&flash_cookie(message, secret), secret);
+
+        assert_eq!(
+            dict.get("flash").and_then(|v| v.as_str()),
+            Some(message),
+            "a verified flash message must reach the page"
+        );
+    }
+
+    #[cfg(feature = "flash")]
+    #[test]
+    fn a_tampered_flash_cookie_leaves_no_message_in_the_dictionary() {
+        let secret = b"test-secret-key-32-bytes-xxxxxxx";
+        let (message, signature) = flash_cookie("Login successful!", secret)
+            .split_once('.')
+            .map(|(m, s)| (m.to_string(), s.to_string()))
+            .expect("a flash cookie is message.signature");
+        let mut first = signature.chars();
+        let swapped = match first.next() {
+            Some('A') => 'B',
+            Some(_) => 'A',
+            None => panic!("a signature is not empty"),
+        };
+        let tampered = format!("{message}.{}{}", swapped, first.as_str());
+
+        let dict = flash_dict(&tampered, secret);
+        assert!(
+            dict.get("flash").is_none(),
+            "a tampered flash cookie must not reach the page"
+        );
+    }
 
     /// The `/login` template. The two-space runs and the blank line are what a
     /// minifier removes, so `minify_tests` looks for them in a finished body as
