@@ -92,6 +92,7 @@ enum StartMode {
     /// sink and lose what it held), and the same `flash_secret` check.
     Reload,
     /// `Site::load_for_tests`: neither.
+    #[cfg(feature = "testkit")]
     Test,
 }
 
@@ -277,7 +278,7 @@ impl Site {
         // A service that enables flash without a key would sign every cookie
         // with the empty key. Refuse at start rather than serve that.
         #[cfg(feature = "flash")]
-        if mode != StartMode::Test && state.flash_secret.is_empty() {
+        if matches!(mode, StartMode::Service | StartMode::Reload) && state.flash_secret.is_empty() {
             return Err((
                 "Error: flash feature enabled but `flash_secret` is absent from config \
                  (generate: openssl rand -base64 32)"
