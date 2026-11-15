@@ -8,11 +8,10 @@
 //! read just before and after each `start` and `drive` call, so the peer's own
 //! work is outside them.
 //!
-//! Three lettre calls allocate per message and are counted, not hidden:
-//! `Message::formatted()`, `Response::from_str` for each reply, and the
-//! `rustls::ClientConnection` at STARTTLS (not taken on this plain path). The
-//! slot's own buffers, steps and command bytes must allocate nothing. The
-//! check prints both numbers and fails when the slot's count is not zero.
+//! `Message::formatted()`, `Response::from_str` and the owned `Address` clones
+//! that `Mail::new` and `Rcpt::new` take are counted here. The slot's own
+//! buffers, steps and command bytes must allocate nothing. The check prints
+//! each number and fails when the slot's count is not zero.
 
 #![allow(
     clippy::disallowed_methods,
@@ -48,10 +47,10 @@ fn main() {
     let tests = vec![Trial::test(
         "a_plain_delivery_allocates_nothing_but_lettre",
         || {
-            let (slot, formatted, replies, start, drive) =
+            let (slot, formatted, replies, clones, start, drive) =
                 a_plain_delivery_allocates_nothing_but_lettre();
             println!(
-                "allocations: slot {slot}, lettre formatted() {formatted}, lettre reply parses {replies} (start {start}, drive {drive})"
+                "allocations: slot {slot}, lettre formatted() {formatted}, lettre address clones {clones}, lettre reply parses {replies} (start {start}, drive {drive})"
             );
             if slot == 0 {
                 Ok(())
@@ -154,7 +153,7 @@ impl Peer {
     }
 }
 
-fn a_plain_delivery_allocates_nothing_but_lettre() -> (usize, usize, usize, usize, usize) {
+fn a_plain_delivery_allocates_nothing_but_lettre() -> (usize, usize, usize, usize, usize, usize) {
     let mut listener =
         m6_core::net::listen_tcp("127.0.0.1:0".parse().expect("addr")).expect("listen");
     let addr = listener.local_addr().expect("addr");
@@ -191,6 +190,15 @@ fn a_plain_delivery_allocates_nothing_but_lettre() -> (usize, usize, usize, usiz
     let bytes = msg.formatted();
     let formatted = alloc_count::now() - before;
     drop(bytes);
+    // `Mail::new` and `Rcpt::new` take owned addresses. Cloning each addressed
+    // envelope value is the allocation the owner accepted, and the check
+    // measures it here.
+    let before = alloc_count::now();
+    let _ = msg.envelope().from().cloned();
+    for to in msg.envelope().to() {
+        let _ = to.clone();
+    }
+    let clones = alloc_count::now() - before;
     let before = alloc_count::now();
     for reply in [
         "220 test\r\n",
@@ -214,8 +222,8 @@ fn a_plain_delivery_allocates_nothing_but_lettre() -> (usize, usize, usize, usiz
         &mut peer,
         true,
     );
-    let slot = start.saturating_sub(formatted) + drive.saturating_sub(replies);
-    (slot, formatted, replies, start, drive)
+    let slot = start.saturating_sub(formatted + clones) + drive.saturating_sub(replies);
+    (slot, formatted, replies, clones, start, drive)
 }
 
 /// Start the message and drive it to its end. With `count`, the `start` and

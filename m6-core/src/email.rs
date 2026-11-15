@@ -28,17 +28,21 @@
 //! # }
 //! ```
 //!
-//! lettre supplies the message builder, the command types, the reply parser
-//! and the extension and authentication types. Its transport is not used.
+//! lettre builds the message and its envelope, formats the bytes with
+//! `Message::formatted()`, and turns each step into its command: `Mail`,
+//! `Rcpt`, `Data`, `Starttls`, `Auth`, `Ehlo` and `Quit`. It parses the
+//! replies and supplies the extension and authentication types. This loop
+//! owns the socket, the descriptor and the deadline.
 
+use std::fmt::Display;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lettre::transport::smtp::authentication::{Credentials, Mechanism, DEFAULT_MECHANISMS};
-use lettre::transport::smtp::commands::{Auth, Data, Ehlo, Quit, Starttls};
+use lettre::transport::smtp::commands::{Auth, Data, Ehlo, Mail, Quit, Rcpt, Starttls};
 use lettre::transport::smtp::extension::{
     ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo,
 };
@@ -64,7 +68,7 @@ pub struct RelayConfig {
 
 /// The relay, resolved and checked. Start only.
 pub struct Relay {
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     /// The EHLO command bytes, made once so a message writes them unchanged.
     ehlo: Vec<u8>,
     tls: Option<Arc<rustls::ClientConfig>>,
@@ -203,21 +207,22 @@ pub struct Smtp {
     out_buf: Vec<u8>,
     out_pos: usize,
     out_len: usize,
-    /// The message bytes from `formatted()`, kept for the data step.
+    /// The message bytes from `Message::formatted()`, kept for the data step.
     body: Vec<u8>,
     body_pos: usize,
     stuffing: Stuffing,
-    body_end_queued: bool,
+    /// The message's MAIL command: lettre's envelope sender and parameters.
+    mail: Option<Mail>,
+    /// The message's RCPT commands, one per envelope recipient.
+    rcpts: Vec<Rcpt>,
+    /// The recipient the RCPT step is on.
+    rcpt_now: usize,
+    /// The envelope carries a non-ASCII address, so MAIL needs SMTPUTF8.
+    utf8_addresses: bool,
+    /// The formatted body is not ASCII, so MAIL needs 8BITMIME.
+    eight_bit: bool,
     /// The EHLO command bytes, copied from the relay at start.
     ehlo: Vec<u8>,
-    from: String,
-    rcpts: Vec<String>,
-    /// The number of recipients the current message has, and the one the
-    /// RCPT step is on.
-    all_rcpt: usize,
-    rcpt_now: usize,
-    utf8_addresses: bool,
-    eight_bit: bool,
     credentials: Option<(String, String)>,
     mechanism: Option<Mechanism>,
     server: ServerInfo,
@@ -246,14 +251,12 @@ impl Smtp {
             body: Vec::new(),
             body_pos: 0,
             stuffing: Stuffing::LineStart,
-            body_end_queued: false,
-            ehlo: Vec::with_capacity(512),
-            from: String::new(),
+            mail: None,
             rcpts: Vec::new(),
-            all_rcpt: 0,
             rcpt_now: 0,
-            utf8_addresses: true,
+            utf8_addresses: false,
             eight_bit: false,
+            ehlo: Vec::with_capacity(512),
             credentials: None,
             mechanism: None,
             server: ServerInfo::default(),
@@ -273,28 +276,32 @@ impl Smtp {
             ));
         }
         let envelope = msg.envelope();
-        self.from.clear();
-        if let Some(from) = envelope.from() {
-            self.from.push_str(from.as_ref());
-        }
-        // Reuse each recipient's String, so a slot that has sent before does
-        // not allocate here.
-        for (i, to) in envelope.to().iter().enumerate() {
-            if i == self.rcpts.len() {
-                self.rcpts.push(String::new());
-            }
-            let slot = &mut self.rcpts[i];
-            slot.clear();
-            slot.push_str(to.as_ref());
-        }
-        self.all_rcpt = envelope.to().len();
-        self.rcpt_now = 0;
-        self.utf8_addresses =
-            self.from.is_ascii() && self.rcpts[..self.all_rcpt].iter().all(|r| r.is_ascii());
+        self.utf8_addresses = envelope
+            .from()
+            .is_some_and(|from| !AsRef::<str>::as_ref(from).is_ascii())
+            || envelope
+                .to()
+                .iter()
+                .any(|to| !AsRef::<str>::as_ref(to).is_ascii());
         self.body = msg.formatted();
         self.eight_bit = !self.body.is_ascii();
+        let mut params = Vec::new();
+        if self.utf8_addresses {
+            params.push(MailParameter::SmtpUtfEight);
+        }
+        if self.eight_bit {
+            params.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+        }
+        self.mail = Some(Mail::new(envelope.from().cloned(), params));
+        self.rcpts.clear();
+        self.rcpts.extend(
+            envelope
+                .to()
+                .iter()
+                .map(|to| Rcpt::new(to.clone(), Vec::new())),
+        );
+        self.rcpt_now = 0;
         self.body_pos = 0;
-        self.body_end_queued = false;
         self.eof = false;
         self.stuffing = Stuffing::LineStart;
         self.in_len = 0;
@@ -369,7 +376,7 @@ impl Smtp {
             if self.wants_write() && !self.write_out()? {
                 return Ok(None);
             }
-            if self.step == Step::Body && !self.pump_body()? {
+            if self.step == Step::Body && !self.pump_body() {
                 continue;
             }
             if !self.step.awaits_reply() {
@@ -403,6 +410,8 @@ impl Smtp {
         self.out_pos = 0;
         self.out_len = 0;
         self.body.clear();
+        self.mail = None;
+        self.rcpts.clear();
     }
 
     // ── the socket ───────────────────────────────────────────────────────
@@ -549,7 +558,7 @@ impl Smtp {
         }
     }
 
-    // ── replies ──────────────────────────────────────────────────────────
+    // ── replies and commands ─────────────────────────────────────────────
 
     /// Remove one complete reply from the input buffer, if there is one.
     fn take_reply(&mut self) -> Result<Option<Response>, SmtpError> {
@@ -570,13 +579,19 @@ impl Smtp {
 
     fn handle_reply(&mut self, reply: &Response) -> Result<(), SmtpError> {
         let code: u16 = reply.code().into();
-        if (self.step == Step::Auth || self.step == Step::AuthReply) && code == 334 {
-            return self.auth_challenge(reply);
+        if self.step == Step::Auth || self.step == Step::AuthReply {
+            return match code {
+                334 => self.auth_challenge(reply),
+                235 => {
+                    self.step = Step::Mail;
+                    self.queue_mail()
+                }
+                _ => Err(self.reply_error(code, reply.first_line().unwrap_or(""))),
+            };
         }
         let expected = match self.step {
             Step::Greeting | Step::Starttls => 220,
             Step::Ehlo | Step::EhloAgain | Step::Mail | Step::Rcpt | Step::BodyEnd => 250,
-            Step::Auth | Step::AuthReply => 235,
             Step::Data => 354,
             _ => 0,
         };
@@ -594,7 +609,7 @@ impl Smtp {
                 // parse, and with it its allocations.
                 if self.tls_config.is_some()
                     || self.credentials.is_some()
-                    || !self.utf8_addresses
+                    || self.utf8_addresses
                     || self.eight_bit
                 {
                     self.server = ServerInfo::from_response(reply)
@@ -609,17 +624,13 @@ impl Smtp {
                         });
                     }
                     self.step = Step::Starttls;
-                    self.queue_display(Starttls);
-                    return Ok(());
+                    self.queue(Starttls);
+                } else {
+                    self.after_ehlo()?;
                 }
-                self.after_ehlo()?;
             }
             Step::Starttls => {
                 self.step = Step::Handshake;
-            }
-            Step::Auth | Step::AuthReply => {
-                self.step = Step::Mail;
-                self.queue_mail()?;
             }
             Step::Mail => {
                 self.rcpt_now = 0;
@@ -634,7 +645,7 @@ impl Smtp {
                 self.body_pos = 0;
             }
             Step::BodyEnd => {
-                self.queue_display(Quit);
+                self.queue(Quit);
                 let _ = self.write_out();
                 self.step = Step::Done;
                 return Ok(());
@@ -655,9 +666,8 @@ impl Smtp {
             let credentials = self.credentials_now()?;
             let auth = Auth::new(mechanism, credentials, None)
                 .map_err(|e| self.reply_error(0, &e.to_string()))?;
-            self.queue_display(auth);
+            self.queue(auth);
         } else {
-            self.step = Step::Mail;
             self.queue_mail()?;
         }
         Ok(())
@@ -671,7 +681,7 @@ impl Smtp {
         let auth = Auth::new_from_response(mechanism, credentials, reply)
             .map_err(|e| self.reply_error(334, &e.to_string()))?;
         self.step = Step::AuthReply;
-        self.queue_display(auth);
+        self.queue(auth);
         Ok(())
     }
 
@@ -684,75 +694,52 @@ impl Smtp {
     }
 
     fn queue_ehlo(&mut self) {
+        let len = self.ehlo.len();
+        self.out_buf[..len].copy_from_slice(&self.ehlo);
         self.out_pos = 0;
-        self.out_buf[..self.ehlo.len()].copy_from_slice(&self.ehlo);
-        self.out_len = self.ehlo.len();
+        self.out_len = len;
     }
 
     /// Write one lettre command into the slot's output buffer. `Display` gives
     /// the bytes and nothing is formatted into a `String` first.
-    fn queue_display(&mut self, command: impl std::fmt::Display) {
-        let cap = self.out_buf.len();
-        let written = {
-            let mut out = &mut self.out_buf[..];
-            write!(out, "{command}").expect("the slot's buffer holds the command");
-            cap - out.len()
-        };
+    fn queue(&mut self, command: impl Display) {
+        self.out_len = write_command(&mut self.out_buf, &command);
         self.out_pos = 0;
-        self.out_len = written;
     }
 
+    /// Write the message's MAIL command from lettre's envelope, after checking
+    /// the extensions the body and the addresses need.
     fn queue_mail(&mut self) -> Result<(), SmtpError> {
-        let mut params: Vec<MailParameter> = Vec::new();
-        if !self.utf8_addresses {
-            if !self.server.supports_feature(Extension::SmtpUtfEight) {
-                return Err(self.error("non-ASCII address without SMTPUTF8"));
-            }
-            params.push(MailParameter::SmtpUtfEight);
+        if self.utf8_addresses && !self.server.supports_feature(Extension::SmtpUtfEight) {
+            return Err(self.error("non-ASCII address without SMTPUTF8"));
         }
-        if self.eight_bit {
-            if !self.server.supports_feature(Extension::EightBitMime) {
-                return Err(self.error("non-ASCII message without 8BITMIME"));
-            }
-            params.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+        if self.eight_bit && !self.server.supports_feature(Extension::EightBitMime) {
+            return Err(self.error("non-ASCII message without 8BITMIME"));
         }
         self.step = Step::Mail;
-        let cap = self.out_buf.len();
-        let written = {
-            let mut out = &mut self.out_buf[..];
-            write!(out, "MAIL FROM:<{}>", self.from).expect("the slot's buffer holds MAIL");
-            for param in &params {
-                write!(out, " {param}").expect("the slot's buffer holds the parameters");
-            }
-            write!(out, "\r\n").expect("the slot's buffer holds MAIL");
-            cap - out.len()
-        };
+        let mail = self
+            .mail
+            .as_ref()
+            .expect("a started message has its MAIL command");
+        self.out_len = write_command(&mut self.out_buf, mail);
         self.out_pos = 0;
-        self.out_len = written;
         Ok(())
     }
 
     fn next_rcpt(&mut self) {
-        if self.rcpt_now >= self.all_rcpt {
+        if self.rcpt_now >= self.rcpts.len() {
             self.step = Step::Data;
-            self.queue_display(Data);
+            self.queue(Data);
             return;
         }
         self.step = Step::Rcpt;
-        let to = &self.rcpts[self.rcpt_now];
-        let cap = self.out_buf.len();
-        let written = {
-            let mut out = &mut self.out_buf[..];
-            write!(out, "RCPT TO:<{to}>\r\n").expect("the slot's buffer holds RCPT");
-            cap - out.len()
-        };
+        self.out_len = write_command(&mut self.out_buf, &self.rcpts[self.rcpt_now]);
         self.out_pos = 0;
-        self.out_len = written;
     }
 
     /// Move the dot-stuffed message bytes into the output buffer, then the
     /// terminator. Returns whether the terminator is queued.
-    fn pump_body(&mut self) -> Result<bool, SmtpError> {
+    fn pump_body(&mut self) -> bool {
         let cap = self.out_buf.len();
         while self.body_pos < self.body.len() && self.out_len + 2 <= cap {
             let b = self.body[self.body_pos];
@@ -775,10 +762,9 @@ impl Smtp {
         if self.body_pos == self.body.len() && self.out_len + 5 <= cap {
             self.out_buf[self.out_len..self.out_len + 5].copy_from_slice(b"\r\n.\r\n");
             self.out_len += 5;
-            self.body_end_queued = true;
             self.step = Step::BodyEnd;
         }
-        Ok(self.body_end_queued)
+        self.step == Step::BodyEnd
     }
 
     // ── errors ───────────────────────────────────────────────────────────
@@ -798,6 +784,14 @@ impl Smtp {
             text: text.to_owned(),
         }
     }
+}
+
+/// Write one lettre command into `buf` and return its length.
+fn write_command(buf: &mut [u8], command: &impl Display) -> usize {
+    let mut out = &mut buf[..];
+    let len = out.len();
+    write!(out, "{command}").expect("the slot's buffer holds the command");
+    len - out.len()
 }
 
 /// The end of one complete reply in `buf`, or `Ok(None)` when more bytes are
