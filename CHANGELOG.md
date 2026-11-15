@@ -74,6 +74,8 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`POST /genid` on a backend reloads its site from disk, the same way it starts.** Config, `site.toml`, templates and params are read again through the start path, and the new site replaces the old one only when the whole load succeeds: the answer is 204, or 500 with the cause while the old site keeps serving. A request already answered or parked when the reload lands finishes with the generation it started under. A service route on `/genid` is refused at start.
+
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
 
 **Crawler sightings carry a time and a verdict (#205).**
@@ -210,6 +212,8 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 **A backend that refuses a request no longer takes its pool member out of rotation.** When a backend closed the connection while m6-http was still sending the request (m6-file answering an oversized header, then closing without draining it), m6-http marked the member failed and backed it off for a second, so the next request to that backend answered 502. A member that never received the whole request is now released. A member that took the whole request and then failed, a silent member and a refused connect still back off.
 
 ### Docs
+
+**The event loop is described once, in `docs/m6-architecture.md` §1.10,** with m6-http's own loop in `docs/m6-http.md` pointing at it. Two false claims went: that backend calls have no timeout (`backend_timeout_secs` exists, default 30) and that m6-http is "single-threaded epoll" by name. `CONTRIBUTING.md` says which loop changes need approval: a new disallowed-method exception, a thread, or an allocation on the loop's path.
 
 **`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
 
