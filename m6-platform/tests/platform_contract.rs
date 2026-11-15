@@ -1123,6 +1123,17 @@ mod facts {
         let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(process::is_root(), uid == "0");
     }
+
+    /// H14. The platform states the worker range a certificate-store read
+    /// leaves behind, so a caller can count the threads a service makes
+    /// instead of the platform's own.
+    ///
+    /// Break: a range whose low end is above its high end.
+    #[test]
+    fn the_certificate_store_worker_range_is_ordered() {
+        let (low, high) = process::certificate_store_workers();
+        assert!(low <= high, "{low}..={high}");
+    }
 }
 
 // ── 8. Directories and private files ─────────────────────────────────────────
