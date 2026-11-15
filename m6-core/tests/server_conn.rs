@@ -12,13 +12,16 @@
 //! as the blocking path does today.
 //!
 //! `harness = false`: its own `main`, and the counting allocator is installed
-//! before any thread starts, so the count is only this binary's own.
+//! before any thread starts, so the count is only this binary's own. The
+//! harness speaks libtest's protocol through `libtest-mimic`, and the checks
+//! are forced onto one thread so each runs in this `main` thread.
 
 use std::io::Read as _;
 use std::io::Write;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::h1::{self, Flush, Read, ServerConn};
 use m6_core::platform;
 use m6_core::platform::{Events, Interest, Poll, Token};
@@ -39,46 +42,81 @@ const RESPONSE_LEN: usize = 90;
 const RESPONSE_LEN_CLOSE: usize = RESPONSE_LEN - 5;
 
 fn main() {
-    let mut failed = false;
-    failed |= check(
-        "a_conn_serves_keep_alive_requests_without_allocating",
-        a_conn_serves_keep_alive_requests_without_allocating,
-    );
-    failed |= check(
-        "a_pipelined_pair_is_served_from_one_read",
-        a_pipelined_pair_is_served_from_one_read,
-    );
-    failed |= check(
-        "a_large_upload_grows_and_returns_the_buffer",
-        a_large_upload_grows_and_returns_the_buffer,
-    );
-    failed |= check(
-        "a_stream_body_is_pumped_per_writable_turn",
-        a_stream_body_is_pumped_per_writable_turn,
-    );
-    failed |= check(
-        "keep_alive_and_the_request_cap",
-        keep_alive_and_the_request_cap,
-    );
-    failed |= check("parse_errors_answer_as_today", parse_errors_answer_as_today);
-    failed |= check(
-        "a_chunked_body_split_across_reads_is_one_request",
-        a_chunked_body_split_across_reads_is_one_request,
-    );
-    failed |= check(
-        "a_declared_body_does_not_allocate_before_it_arrives",
-        a_declared_body_does_not_allocate_before_it_arrives,
-    );
-    failed |= check("a_response_allocates_nothing", a_response_allocates_nothing);
-    std::process::exit(if failed { 1 } else { 0 });
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs every trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![
+        Trial::test(
+            "a_conn_serves_keep_alive_requests_without_allocating",
+            || {
+                check(
+                    "a_conn_serves_keep_alive_requests_without_allocating",
+                    a_conn_serves_keep_alive_requests_without_allocating,
+                )
+            },
+        ),
+        Trial::test("a_pipelined_pair_is_served_from_one_read", || {
+            check(
+                "a_pipelined_pair_is_served_from_one_read",
+                a_pipelined_pair_is_served_from_one_read,
+            )
+        }),
+        Trial::test("a_large_upload_grows_and_returns_the_buffer", || {
+            check(
+                "a_large_upload_grows_and_returns_the_buffer",
+                a_large_upload_grows_and_returns_the_buffer,
+            )
+        }),
+        Trial::test("a_stream_body_is_pumped_per_writable_turn", || {
+            check(
+                "a_stream_body_is_pumped_per_writable_turn",
+                a_stream_body_is_pumped_per_writable_turn,
+            )
+        }),
+        Trial::test("keep_alive_and_the_request_cap", || {
+            check(
+                "keep_alive_and_the_request_cap",
+                keep_alive_and_the_request_cap,
+            )
+        }),
+        Trial::test("parse_errors_answer_as_today", || {
+            check("parse_errors_answer_as_today", parse_errors_answer_as_today)
+        }),
+        Trial::test("a_chunked_body_split_across_reads_is_one_request", || {
+            check(
+                "a_chunked_body_split_across_reads_is_one_request",
+                a_chunked_body_split_across_reads_is_one_request,
+            )
+        }),
+        Trial::test(
+            "a_declared_body_does_not_allocate_before_it_arrives",
+            || {
+                check(
+                    "a_declared_body_does_not_allocate_before_it_arrives",
+                    a_declared_body_does_not_allocate_before_it_arrives,
+                )
+            },
+        ),
+        Trial::test("a_response_allocates_nothing", || {
+            check("a_response_allocates_nothing", a_response_allocates_nothing)
+        }),
+    ];
+    libtest_mimic::run(&args, tests).exit();
 }
 
-fn check(name: &str, run: fn() -> bool) -> bool {
+/// Run one check and report its outcome as a libtest trial.
+fn check(name: &str, run: fn() -> bool) -> Result<(), Failed> {
     println!("running {name}");
     std::io::stdout().flush().expect("flush");
     let ok = run();
     println!("{name}: {}", if ok { "ok" } else { "FAILED" });
-    !ok
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{name}: FAILED").into())
+    }
 }
 
 /// A slot with an attached server end, the client end of the same pair, and

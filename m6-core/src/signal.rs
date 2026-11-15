@@ -1,19 +1,23 @@
 //! Shutting down on purpose.
 //!
 //! **`block()` must be the first statement of `main`.** The signal mask is
-//! inherited only by threads created after it, and a service's logging writer
-//! is a thread; if it starts first it takes SIGTERM at the default disposition
-//! and the process dies instead of shutting down. `Signals::new` asserts the
-//! mask is set, and that assertion has since caught a real case: a set of
-//! service runners started logging first, so SIGTERM handling was quietly
-//! wrong for every service built on them.
+//! inherited only by threads created after it, and the platform's signal
+//! descriptor refuses to open without it. A thread started first takes SIGTERM
+//! at the default disposition, and the process dies instead of shutting down.
 //!
-//! [`Lifecycle`] unlinks the socket on the way out so m6-http does not keep a
-//! dead member in its backend pool.
+//! [`Lifecycle`] is the per-service surface. A service's loop reads the
+//! platform's signal descriptor and asks it what each signal means. SIGUSR1
+//! reopens the log file and never counts toward shutdown.
 //!
-//! SIGUSR1 reopens the log file and never counts toward shutdown.
+//! **Log the shutdown line before the loop stops, not after.** `on_signal`
+//! logs it before it returns [`Action::Stop`], so the line is buffered ahead
+//! of `complete`'s completion line and `log::stop` flushes both. A line logged
+//! after the decision to stop is racing the process exit, and on a loaded
+//! machine it loses.
 
 use std::path::{Path, PathBuf};
+
+use crate::log::{error, info};
 
 /// Block SIGTERM, SIGINT and SIGUSR1 in the calling thread.
 ///
@@ -28,39 +32,20 @@ pub fn block() {
     crate::platform::block();
 }
 
-/// Reopen the log file for [`crate::platform::Signal::ReopenLogs`] and say what happened.
-fn reopen_on_signal(name: &str) {
-    match crate::log::reopen_log_file() {
-        crate::log::Reopened::NoFile => {
-            tracing::info!("{name} log reopen requested; this process writes no log file");
-        }
-        crate::log::Reopened::Done(p) => {
-            tracing::info!(path = %p.display(), "{name} log file reopened");
-        }
-        crate::log::Reopened::Failed(p, e) => {
-            tracing::error!(
-                path = %p.display(),
-                error = %e,
-                "{name} log reopen failed; still writing to the previous file"
-            );
-        }
-    }
-}
-
 /// Remove the socket file and log the completion line.
 fn finish(svc_name: &str, socket: Option<&Path>, how: &str) {
     if let Some(path) = socket {
         let _ = std::fs::remove_file(path);
     }
-    tracing::info!("{svc_name} shutdown {how}");
+    info!("{svc_name} shutdown {how}");
 }
 
 /// The `"<name> started"` line, with the socket when there is one, used by
 /// [`Lifecycle::started`].
 fn log_started_line(name: &str, socket: Option<&Path>) {
     match socket {
-        Some(path) => tracing::info!(socket = %path.display(), "{} started", name),
-        None => tracing::info!("{} started", name),
+        Some(path) => info!(socket = %path.display(), "{} started", name),
+        None => info!("{} started", name),
     }
 }
 
@@ -78,20 +63,39 @@ fn handle_terminate(name: &str, socket: Option<&Path>, count: u32) -> Action {
         finish(name, socket, "forced");
         std::process::exit(0);
     }
-    tracing::info!("{name} shutdown signal received");
+    info!("{name} shutdown signal received");
     Action::Stop
 }
 
-/// The signal thread's per-signal decisions, without the thread.
+/// The per-service signal decisions, without a thread.
 ///
 /// A loop that reads [`crate::platform::Signals`] as a descriptor owns one of
 /// these and asks it what each signal means. The first [`crate::platform::Signal::Shutdown`]
-/// answers [`Action::Stop`]; a second before the loop has ended forces an exit,
-/// exactly as the signal thread did.
+/// answers [`Action::Stop`]; a second before the loop has ended forces an exit.
 pub struct Lifecycle {
     name: String,
     socket: Option<PathBuf>,
     terminations: u32,
+}
+
+/// The lines a log reopen logs, with the service's name, so a loop that
+/// performs the reopen itself says what happened.
+fn log_reopen(name: &str, result: &std::io::Result<()>) {
+    if !crate::log::writes_log_file() {
+        info!("{name} log reopen requested; this process writes no log file");
+        crate::log::flush();
+        return;
+    }
+    match result {
+        Ok(()) => info!("{name} log file reopened"),
+        Err(e) => error!(
+            error = %e,
+            "{name} log reopen failed; still writing to the previous file"
+        ),
+    }
+    // The operator asked for this reopen, so its line is written now rather
+    // than on the loop's next tick.
+    crate::log::flush();
 }
 
 impl Lifecycle {
@@ -103,16 +107,22 @@ impl Lifecycle {
         }
     }
 
-    /// `"<name> started"`, as [`ShutdownHandle::install`] logs it.
+    /// `"<name> started"`, the lifecycle line every unit shares.
     pub fn started(&self) {
         log_started_line(&self.name, self.socket.as_deref());
+    }
+
+    /// The lines a log reopen logs, with the service's name, so a loop that
+    /// performs the reopen itself says what happened.
+    pub fn reopened(&self, result: &std::io::Result<()>) {
+        log_reopen(&self.name, result);
     }
 
     /// What to do after one signal. [`Action::Stop`] means the loop breaks.
     pub fn on_signal(&mut self, s: crate::platform::Signal) -> Action {
         match s {
             crate::platform::Signal::ReopenLogs => {
-                reopen_on_signal(&self.name);
+                self.reopened(&crate::log::reopen());
                 Action::Continue
             }
             crate::platform::Signal::Shutdown => {

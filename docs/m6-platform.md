@@ -36,24 +36,24 @@ Table 1 lists them.
 | `process::spawn` | a child starts with no signal blocked or ignored and inherits no descriptor above stderr, and stays in the parent's process group so a terminal's interrupt reaches it | `pre_exec` clears the mask and restores the three dispositions, every descriptor above stderr is marked close-on-exec first | the same |
 | `net::accept_error` | an accept loop drains to `Drained`, passes over `SkipOne` (a connection gone before it was accepted, an interrupted call) and on `Stop` (any other error) logs it once and stops accepting for the turn | `EAGAIN`, `ECONNABORTED` and `EINTR` | the same |
 | `ChildExit` | a readable descriptor when the child exits, at once when it already has, `reap` never blocks | `pidfd_open` | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
-| `net::connect_unix` | a refused connect is a dead listener (the pool marks the member failed), a missing file is `NotFound`, and a full queue never connects and never hangs | `EAGAIN` for a full queue: busy, answer 503 and keep the member | `ECONNREFUSED` for a full queue too, so it reads as a failed member for one backoff |
+| `net::connect_unix` | a refused connect is a listener that is gone, a missing file is `NotFound`, and a full queue never connects and never hangs, so the caller tries the next member and answers 503 only when every attempt was a full queue | `EAGAIN` for a full queue: busy, the next member for this request | `ECONNREFUSED` for a full queue too, so a full queue reads the same as a listener that is gone and the caller tries the next member |
 | `net::connect_tcp` | `Connected` or `InProgress`, never `EINPROGRESS` as an error | `WouldBlock` | the raw errno |
 | sockets | every socket the layer makes gives `BrokenPipe` on a write to a closed peer, never a signal | the runtime ignores `SIGPIPE` | the same, and `SO_NOSIGPIPE` on every socket |
 | `MAX_SOCKET_PATH` | a path too long to bind fails at start naming the path and the limit | 108 | 104 |
 | `process::raise_fd_limit` | the soft limit becomes the highest the kernel accepts, the number returned is what connections may use, a second call returns the same | the hard limit | `kern.maxfilesperproc`, because the hard limit reads as unlimited |
 | `host` | memory, load, uptime, disk space and interface counters are real values, an unreadable source is `None` or an empty list, never a row of zeros | `/proc` and `/sys` | `sysinfo` with its default features off, so no thread starts |
-| `process` facts | thread count, open descriptors, alive, listening on TCP, root | `/proc/<pid>` | `proc_pidinfo`, `lsof` |
+| `process` facts | thread count, open descriptors, alive, listening on TCP, root, and the worker range reading the host's certificate store leaves | `/proc/<pid>`; the store is a file read and leaves no thread | `proc_pidinfo`, `lsof`; the Security framework leaves three or four |
 | directories | `runtime_dir` is `/run/m6`, `temp_dir` honours `TMPDIR` and takes a socket, `scratch_dir` permits exec, `create_private` gives 0700 and 0600 | the same | the same |
 
 Table 1: each item of the layer, its contract, and the mechanism behind it on each OS.
 
 Three things are stated and not normalised.
 A writable report may repeat on macOS after the peer acknowledges data, because kqueue re-arms the filter and epoll does not. A loop that writes until `WouldBlock` pays one failed write for it.
-On macOS a stale socket file and a full queue are the same `ECONNREFUSED`, and the kernel's answer is passed through, so a full queue there reads as a failed member for one backoff.
+On macOS a stale socket file and a full queue are the same `ECONNREFUSED`, and the kernel's answer is passed through, so a full queue there costs the request one connect and it moves to the next member.
 Both monotonic clocks stop while the machine sleeps, so a deadline set before a laptop sleeps fires after it wakes, late by the sleep's length.
 Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives. m6 does not handle descriptor exhaustion.
+Known limitation: a full listen queue is reported differently by the two kernels. macOS refuses the next connection at once, so the client sees `ECONNREFUSED` and can retry or give up. Linux leaves the connection pending, so the client waits for a timeout it did not choose. The macOS answer is the better one, and m6 does not equalise the two, because equalising would mean accepting connections it cannot serve. At this scale the queue does not fill: the accept loop drains it every turn, and a slow process still drains it, so a full queue means the process is not running.
 Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
-m6 sets `SO_REUSEPORT` on no listener, because Linux balances connections across sockets that share a port and macOS does not.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 Everything in Table 1 is held by the tests in section 6.
 

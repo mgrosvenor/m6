@@ -22,7 +22,12 @@ name = "m6_core"
 default = ["templates", "minify"]
 # The shared integration-test harness. Off by default so no production binary
 # links it; enable it from a crate's [dev-dependencies] entry.
-testkit = ["dep:rustls-pki-types"]
+testkit = ["alloc-count", "dep:rustls-pki-types"]
+# The counting allocator on its own, without the rest of the harness, so a
+# service binary can install it and count its own loop's allocations. ALLOC-0's
+# m6-http `count-allocations` feature turns this on. Off by default and never in
+# a plain build of a service.
+alloc-count = []
 # Record a backtrace per allocation, so a test can say where one request's
 # allocations come from. Test instrumentation, off by default: no release build
 # and no ordinary test build compiles the recording code, and only the
@@ -48,9 +53,11 @@ csrf      = []
 # Blocks a service assembles itself from. Off by default because not every
 # service sends mail or makes outbound requests, on by name when it does.
 # m6-core is meant to be the only crate a service links, so these live here
-# rather than being something each service rediscovers.
+# rather than being something each service rediscovers. Neither blocks: `email`
+# is an SMTP client the service's own loop drives (`email::{Relay, Smtp}`) and
+# `http-client` is a form POST on `client::Upstream` (`client::Endpoint`).
 email       = ["dep:lettre"]
-http-client = ["dep:ureq"]
+http-client = ["dep:url"]
 
 # One SQLite file with house settings, versioned migrations and an append-only
 # table rule. Off by default, so a service that does not use it links nothing
@@ -63,6 +70,9 @@ sqlite = ["dep:rusqlite"]
 # The platform layer: the one crate that knows the operating system, re-exported
 # as `m6_core::platform` so a service names nothing below m6-core.
 m6-platform = { path = "../m6-platform" }
+# The buffered JSONL logger. Re-exported as `m6_core::log`, so a service links
+# only m6-core.
+m6-log = { path = "../m6-log" }
 # `server::bind_tcp_reuseaddr` and the TCP listener options.
 socket2    = "0.6"
 serde      = { version = "1", features = ["derive"] }
@@ -70,9 +80,6 @@ serde_json = "1"
 toml       = "0.8"
 anyhow     = "1"
 thiserror  = "1"
-tracing    = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json"] }
-tracing-appender   = "0.2"
 httparse   = "1"
 httpdate   = "1"
 rand       = "0.8"
@@ -107,8 +114,13 @@ futures-util  = { version = "0.3",  optional = true }
 # Drive multer's async field stream on the current thread without building a
 # tokio runtime per upload.
 futures-executor = { version = "0.3", optional = true }
-lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
-ureq          = { version = "2",    optional = true, features = ["json"] }
+# lettre's pieces that do not touch a socket: the message builder, the SMTP
+# commands, the reply parser and the extension and authentication types. Its
+# transport, pool and native-tls features go, because m6-core's own client
+# drives the conversation. `hostname` keeps the EHLO name.
+lettre        = { version = "0.11", optional = true, default-features = false, features = ["builder", "smtp-transport", "hostname"] }
+# `client::Endpoint` parses a URL and encodes a form. Behind `http-client`.
+url           = { version = "2",    optional = true }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
 rusqlite      = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
@@ -125,6 +137,9 @@ rustls-native-certs = "0.8"
 tempfile  = "3"
 filetime  = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
+# The custom-harness tests speak libtest's protocol (`--list --format terse`,
+# `--exact <name>`), which is what `nextest` lists and runs.
+libtest-mimic = "0.8"
 # For `tls`'s tests, which parse real certificates rather than a fixture: a
 # checked-in certificate expires, and a test that starts failing on a date is a
 # test that gets deleted. `time` comes with them because rcgen's `not_after` is
@@ -151,7 +166,7 @@ required-features = ["testkit"]
 # `block()`, and the libtest harness has already started one by the time a test
 # function runs.
 [[test]]
-name    = "log_reopen"
+name    = "reopen_moves_new_lines"
 harness = false
 
 # The three allocation checks (`Timeouts`, `Slots`, `LoopTrace`), each on the
@@ -204,6 +219,32 @@ name    = "alloc_sites"
 harness = false
 required-features = ["testkit", "alloc-trace"]
 
+# The service that sends mail from its own loop: a success, a reported failure
+# and the loop's 504, each against a loopback SMTP stub. Its own `main` so the
+# service loop owns its thread, as a real service does.
+[[test]]
+name    = "email_in_the_loop"
+harness = false
+required-features = ["email", "testkit"]
+
+# `email::Smtp`'s allocation proof: the slot's own buffers, steps and command
+# bytes allocate nothing; lettre's message bytes and reply parse are counted
+# separately. Its own `main`, so the counting allocator is this binary's own.
+[[test]]
+name    = "email_allocs"
+harness = false
+required-features = ["email", "testkit"]
+
 [[bench]]
 name    = "critical_path"
 harness = false
+
+# ALLOC-0's guard on the counting allocator itself: armed, one
+# `Vec::with_capacity(10)` counts one call and ten bytes, a disarmed thread
+# counts nothing, another thread's allocation is not this thread's, and `now()`
+# still counts every thread's. Its own `main`, so the allocator is installed
+# before any thread and the count is this binary's own.
+[[test]]
+name    = "alloc_count_armed"
+harness = false
+required-features = ["alloc-count"]

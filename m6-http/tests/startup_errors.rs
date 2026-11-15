@@ -47,7 +47,8 @@ fn write_cert_key(site: &Path) {
 /// `write_cert_key` wrote. Plain `info` logging so warnings are visible.
 fn site_toml() -> String {
     "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-     [log]\nlevel = \"info\"\nformat = \"plain\"\n"
+     [log]\nlevel = \"info\"\n\n\
+     [analytics]\nenabled = false\n"
         .to_string()
 }
 
@@ -172,6 +173,7 @@ fn a_misplaced_key_exits_2_and_names_it() {
         site.join("site.toml"),
         format!(
             "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+             [analytics]\nenabled = false\n\n\
              [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
             claim.addr(),
             site.join("cert.pem").display(),
@@ -243,7 +245,8 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
     std::fs::write(
         site.join("site.toml"),
         "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-         [log]\nlevel = \"info\"\nformat = \"plain\"\n",
+         [log]\nlevel = \"info\"\n\n\
+         [analytics]\nenabled = false\n",
     )
     .expect("site.toml");
     let system = dir.path().join("system.toml");
@@ -284,6 +287,7 @@ fn dump_config_refuses_routes_that_can_match_one_path() {
     std::fs::write(
         site.join("site.toml"),
         "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+         [analytics]\nenabled = false\n\n\
          [[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n\n\
          [[route]]\npath = \"/blog/{slug}\"\nbackend = \"b\"\n\n\
          [[route]]\npath = \"/{lang}/about\"\nbackend = \"b\"\n",
@@ -329,7 +333,8 @@ fn dump_config_prints_the_merged_server_from_the_system_file_and_exits_0() {
     write_cert_key(&site);
     std::fs::write(
         site.join("site.toml"),
-        "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n",
+        "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+         [analytics]\nenabled = false\n",
     )
     .expect("site.toml");
     let system = dir.path().join("system.toml");
@@ -374,7 +379,8 @@ fn a_pool_whose_glob_matches_no_socket_exits_2() {
         site.join("site.toml"),
         format!(
             "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-             [log]\nlevel = \"info\"\nformat = \"plain\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
+             [analytics]\nenabled = false\n\n\
              [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
              [[route]]\npath = \"/\"\nbackend = \"b\"\n",
             sockets.join("*.sock").display()
@@ -462,7 +468,8 @@ fn url_backend_site(dir: &Path, bind: &str, backend: &str) -> (PathBuf, PathBuf)
         site.join("site.toml"),
         format!(
             "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
-             [log]\nlevel = \"info\"\nformat = \"plain\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
+             [analytics]\nenabled = false\n\n\
              {backend}\n\n\
              [[route]]\npath = \"/\"\nbackend = \"remote\"\n"
         ),
@@ -558,6 +565,116 @@ fn a_url_backend_that_skips_verification_starts_with_an_empty_system_store() {
         .env("SSL_CERT_DIR", &empty_dir);
     let mut svc = Service::spawn("m6-http-empty-roots-skip", &mut cmd);
     svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    let status = svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-http should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
+        svc.output()
+    );
+}
+
+/// Write a site and system config whose `[analytics] log_path` is `log_path`.
+fn analytics_site(dir: &Path, addr: &str, log_path: &Path) -> (PathBuf, PathBuf) {
+    let site = dir.join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(
+        site.join("site.toml"),
+        format!(
+            "[site]\nname = \"startup-errors\"\ndomain = \"example.com\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
+             [analytics]\nenabled = true\nlog_path = \"{}\"\n",
+            log_path.display()
+        ),
+    )
+    .expect("site.toml");
+    let system = dir.join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{addr}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
+        ),
+    )
+    .expect("system config");
+    (site, system)
+}
+
+/// Scenario: `[analytics] log_path` names a file in a directory that does not
+/// exist. Wrong outcome: m6-http creates the directory and starts, so a typo
+/// puts analytics where the operator did not choose and the service looks
+/// healthy.
+#[test]
+fn a_missing_analytics_log_directory_exits_2_and_names_the_setting_and_path() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing").join("logs");
+    let log_path = missing.join("analytics.ndjson");
+    let (site, system) = analytics_site(dir.path(), &claim.addr(), &log_path);
+
+    let mut cmd = Command::new(testkit::binary("m6-http"));
+    cmd.arg(&site).arg(&system);
+    let mut svc = Service::spawn("m6-http-missing-log-dir", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-http did not exit for a missing analytics log directory\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    let output = svc.output();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("[analytics] log_path"),
+        "the error did not name [analytics] log_path\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains(&missing.display().to_string()),
+        "the error did not name the missing directory {}\n--- output ---\n{output}",
+        missing.display()
+    );
+    assert!(
+        output.contains("create it, owned by") && output.contains("fix [analytics] log_path"),
+        "the error did not say what to do\n--- output ---\n{output}"
+    );
+    assert!(
+        !missing.exists(),
+        "m6-http created the missing analytics directory {}\n--- output ---\n{output}",
+        missing.display()
+    );
+}
+
+/// Scenario: `[analytics] log_path` names a file in a directory that exists.
+/// Wrong outcome: a correct analytics path is refused, so a service that should
+/// start cannot.
+#[test]
+fn a_present_analytics_log_directory_starts_and_writes_the_file() {
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&log_dir).expect("log dir");
+    let log_path = log_dir.join("analytics.ndjson");
+    let (site, system) = analytics_site(dir.path(), &claim.addr(), &log_path);
+
+    let mut cmd = Command::new(testkit::binary("m6-http"));
+    cmd.arg(&site).arg(&system);
+    let mut svc = Service::spawn("m6-http-present-log-dir", &mut cmd);
+    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    assert!(
+        log_path.is_file(),
+        "the analytics file {} was not created\n--- output ---\n{}",
+        log_path.display(),
+        svc.output()
+    );
+
     let status = svc.terminate(Duration::from_secs(5));
     assert!(
         status.success(),

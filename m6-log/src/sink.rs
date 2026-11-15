@@ -118,12 +118,36 @@ impl Sink {
 
     /// A sink on a file opened for append.
     ///
-    /// A regular file never returns `EAGAIN`, so a file sink is never
+    /// The directory the file goes in must already exist. A missing directory
+    /// is refused rather than created, so a misconfigured path stops the
+    /// service at start instead of putting data where the operator did not
+    /// intend. A regular file never returns `EAGAIN`, so a file sink is never
     /// registered with a loop.
+    ///
+    /// The error names the directory, the user who should own it and the
+    /// remedy. [`crate::init_with_setting`] names the setting as well.
     pub fn file(path: &Path) -> io::Result<Sink> {
+        Sink::file_setting(path, "the log file path")
+    }
+
+    /// A sink on a file whose path was named by `setting`.
+    ///
+    /// `setting` is the configuration key a reader can edit, such as
+    /// `[analytics] log_path`, so a missing directory's error says what to fix
+    /// as well as what to create.
+    pub(crate) fn file_setting(path: &Path, setting: &str) -> io::Result<Sink> {
         let path = std::path::absolute(path)?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{setting}: the directory {} does not exist: create it, owned by {}, or fix {setting}",
+                        parent.display(),
+                        m6_platform::process::user()
+                    ),
+                ));
+            }
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let fd = file.as_raw_fd();
@@ -151,8 +175,13 @@ impl Sink {
     }
 
     /// Bytes are waiting on a destination that could not take them.
+    ///
+    /// True only after a write returned `EAGAIN`, not merely because complete
+    /// lines are buffered: a line waiting for the tick is not a reason to ask
+    /// the reactor for a writable edge. A regular file and a terminal never
+    /// return `EAGAIN`, so they are never registered.
     pub fn wants_write(&self) -> bool {
-        self.commit > 0
+        self.blocked
     }
 
     /// Write the complete lines, never waiting on a full destination.

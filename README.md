@@ -123,7 +123,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ### Request Flow (cache miss)
 
 ```
-Client → m6-http (epoll, single-thread)
+Client → m6-http (one event loop, single thread)
            │
            ├─ JWT check (local RSA/EC verify, no network hop)
            │
@@ -152,7 +152,7 @@ Client → m6-http (epoll, single-thread)
 Reverse proxy, cache, and router. The only process that listens on a public port.
 
 **Architecture:**
-- Single-threaded `epoll` event loop
+- One thread and one edge-triggered event loop over `m6_core::platform`
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, content-encoding)` — each encoding variant cached independently
 - JWT verified locally with m6-auth's public key — no per-request network hop
@@ -607,7 +607,6 @@ deliberately; `tools/conformance-scores.txt` argues that one in full.
 
 **m6-http:**
 - The cache invalidation map is built only from `[[route_group]]` globs; the second source (renderer config `params` declarations → affected route paths) is not yet parsed
-- No explicit timeout on backend calls; a stalled backend blocks one event loop iteration
 
 **m6-auth-server:**
 - m6-auth-server runs as one process per site, and its login failure counts live in memory. A restart clears them.

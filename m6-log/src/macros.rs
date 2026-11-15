@@ -1,8 +1,8 @@
-//! The logging macros: the common part of tracing's syntax, without tracing.
+//! The logging macros: an optional target, typed fields, then the message.
 //!
 //! `error!`, `warn!`, `info!`, `debug!` and `trace!` take `target: "..."`
 //! first, then `key = value`, `key = %display`, `key = ?debug` fields, then the
-//! message. The message is a format string with arguments, as tracing's is.
+//! message. The message is a format string with arguments.
 //!
 //! Each macro compares the level before it builds anything, and a line whose
 //! level is off costs one load and one compare.

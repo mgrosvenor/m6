@@ -299,6 +299,7 @@ mod phase11 {
         assert!(should_cache(200, &headers));
 
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(headers.clone()),
             body: bytes::Bytes::from_static(b"cached"),
@@ -312,6 +313,7 @@ mod phase11 {
         let cache = Cache::new();
         let key = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"body"),
@@ -345,6 +347,7 @@ mod phase11 {
         cache.insert(
             key_gzip.clone(),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(vec![(
                     "content-encoding".to_string(),
@@ -360,6 +363,7 @@ mod phase11 {
         cache.insert(
             key_br.clone(),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(vec![(
                     "content-encoding".to_string(),
@@ -398,6 +402,7 @@ mod phase11 {
         cache.insert(
             key.clone(),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(vec![(
                     "cache-control".to_string(),

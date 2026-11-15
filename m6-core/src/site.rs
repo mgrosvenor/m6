@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::log::{error, warn};
 use anyhow::Context;
 use serde_json::{Map, Value};
-use tracing::{error, warn};
 
 use crate::dict::Dict;
 use crate::error::Error;
@@ -33,6 +33,15 @@ use crate::request::{
     validate_wildcard_param, Request,
 };
 use crate::response::Response;
+
+/// Reserved on every service that uses `Site`: m6-http's source node posts
+/// here when the site's content changed.
+///
+/// A service never routes this path. [`Site::handle`] answers it itself with
+/// [`Handled::Reload`] so the loop that owns the `Site` can run the start path
+/// again, assign the result and log the reload through [`finish_reload`].
+/// `check_routes` refuses a code or config route with exactly this pattern.
+pub const GENID_PATH: &str = "/genid";
 
 /// A route a service answers in its own code, bound by pattern and method.
 #[derive(Debug, Clone)]
@@ -51,6 +60,41 @@ pub enum Handled {
     /// A config route with `handler = "<name>"`: the index into the `named`
     /// slice given to `load`.
     Named(usize, Request),
+    /// `POST /genid`: run the start path again with [`Site::reload`], assign
+    /// the new `Site` if it loaded, and answer [`genid_ok`] or
+    /// [`genid_failed`]. The loop that owns the site passes the carried facts
+    /// to [`finish_reload`] after it has answered, so the refresh writes the
+    /// one access line every other request writes.
+    Reload(Reload),
+}
+
+/// The facts a `POST /genid` needs after the reload: the request's method and
+/// path, and when it arrived, so [`finish_reload`] can write its access line.
+///
+/// Only a reload allocates these two strings. Every other request is logged
+/// from the borrowed head it already has.
+#[derive(Debug, Clone)]
+pub struct Reload {
+    pub method: String,
+    pub path: String,
+    pub started: std::time::Instant,
+}
+
+/// Write the access line for a finished `POST /genid`, then return the answer.
+///
+/// The refresh answer is built outside [`Site::finish_raw`] (it has no route,
+/// nothing to render and nothing to compress), and with this it is not silent:
+/// one line per reload, in the shape every other request logs, so an operator
+/// reading the log sees publishes and their status.
+pub fn finish_reload(reload: &Reload, resp: Response) -> Response {
+    crate::log::info!(
+        path = %reload.path,
+        method = %reload.method,
+        status = resp.status,
+        latency_us = reload.started.elapsed().as_micros(),
+        "request complete"
+    );
+    resp
 }
 
 /// A loaded site: everything the request path needs, read at start.
@@ -67,9 +111,19 @@ pub struct Site {
     /// Index into the named handlers by name. `Handled::Named` is this index,
     /// and the caller's handler vector is in the order `load` was given.
     named_index: HashMap<String, usize>,
-    /// The logging worker, held for the life of the site and never touched
-    /// again. A plain `Option` because `LogHandle` is `Sync`.
-    _log: Option<crate::log::LogHandle>,
+}
+
+/// The parts of a start that belong to the process, not to every load.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartMode {
+    /// `Site::load`: logging starts and `flash_secret` is required.
+    Service,
+    /// `Site::reload`: no second `log::init` (it would replace the running
+    /// sink and lose what it held), and the same `flash_secret` check.
+    Reload,
+    /// `Site::load_for_tests`: neither.
+    #[cfg(feature = "testkit")]
+    Test,
 }
 
 impl Site {
@@ -105,7 +159,15 @@ impl Site {
         named: &[String],
         renderer: &dyn RendererFactory,
     ) -> Site {
-        match Site::prepare(name, invocation, config, code, named, renderer, true) {
+        match Site::prepare(
+            name,
+            invocation,
+            config,
+            code,
+            named,
+            renderer,
+            StartMode::Service,
+        ) {
             Ok(site) => site,
             Err((message, code)) => {
                 eprintln!("{message}");
@@ -142,14 +204,53 @@ impl Site {
             &signatures,
             &names,
             renderer,
-            false,
+            StartMode::Test,
         ) {
             Ok(site) => site,
             Err((message, _)) => panic!("{message}"),
         }
     }
 
-    /// Everything both ways in do, up to the listener. `service` selects the
+    /// Build a new `Site` from disk with the start path, for `POST /genid`.
+    ///
+    /// This is [`Site::load`] without the argv parse, the logging init and the
+    /// `std::process::exit`: the caller still has the `code`, `named` and
+    /// `renderer` it gave `load`, and the name, config path and site directory
+    /// are this site's. The config, `site.toml`, templates and params are read
+    /// again, so the result is a full start.
+    ///
+    /// On failure nothing is replaced. The caller keeps serving this site and
+    /// answers the error, which is the message a start would have printed.
+    pub fn reload(
+        &self,
+        code: &[CodeRoute],
+        named: &[&str],
+        renderer: &dyn RendererFactory,
+    ) -> Result<Site, String> {
+        let signatures: Vec<(String, RouteMethod)> = code
+            .iter()
+            .map(|r| (r.pattern.to_string(), r.method.clone()))
+            .collect();
+        let names: Vec<String> = named.iter().map(|n| (*n).to_string()).collect();
+        Site::prepare(
+            &self.name,
+            Invocation {
+                site_dir: (*self.state.site_dir).clone(),
+                config_path: self.config_path.clone(),
+                // No logging is initialised on a reload, so there is no level
+                // to resolve. The start already validated the command line.
+                cli_log_level: None,
+            },
+            None,
+            &signatures,
+            &names,
+            renderer,
+            StartMode::Reload,
+        )
+        .map_err(|(message, _)| message)
+    }
+
+    /// Everything both ways in do, up to the listener. `mode` selects the
     /// parts that belong to a running process: logging, and the `flash_secret`
     /// presence check a service refuses to start without.
     fn prepare(
@@ -159,7 +260,7 @@ impl Site {
         code: &[(String, RouteMethod)],
         named: &[String],
         renderer: &dyn RendererFactory,
-        service: bool,
+        mode: StartMode,
     ) -> Result<Site, (String, i32)> {
         let Invocation {
             site_dir,
@@ -179,16 +280,14 @@ impl Site {
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
 
         // Logging: site.toml base, the service's `[log]`, then `--log-level`.
-        let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level)
+        let level = resolve_log(&site_toml, &config.log, cli_log_level)
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
-        let log = if service {
-            Some(
-                crate::log::init(&format, &level)
-                    .map_err(|e| (format!("logging init error: {e}"), 1))?,
-            )
-        } else {
-            None
-        };
+        // A reload must not call `log::init` again: it replaces the running
+        // sink without flushing it, and m6-log would record the already
+        // nonblocking stdout as its own.
+        if mode == StartMode::Service {
+            crate::log::init(level, None).map_err(|e| (format!("logging init error: {e}"), 1))?;
+        }
 
         let socket_path = crate::socket_path_from_config(&config_path);
 
@@ -209,7 +308,7 @@ impl Site {
         // A service that enables flash without a key would sign every cookie
         // with the empty key. Refuse at start rather than serve that.
         #[cfg(feature = "flash")]
-        if service && state.flash_secret.is_empty() {
+        if matches!(mode, StartMode::Service | StartMode::Reload) && state.flash_secret.is_empty() {
             return Err((
                 "Error: flash feature enabled but `flash_secret` is absent from config \
                  (generate: openssl rand -base64 32)"
@@ -237,7 +336,6 @@ impl Site {
             name: name.to_string(),
             code_index,
             named_index,
-            _log: log,
         })
     }
 
@@ -288,6 +386,30 @@ impl Site {
     /// dispatch, shared by the borrowed path and by a caller holding one.
     pub(crate) fn handle_raw(&self, raw: RawRequest) -> Handled {
         let started = crate::platform::now();
+
+        // The reserved path, answered before routing: the loop that owns the
+        // Site is the only one that can assign a newly loaded one, so the
+        // dispatch returns `Reload` and the loop runs the start path again.
+        // A method other than POST on exactly `/genid` is refused here, in the
+        // route-less shape the 404 uses. `POST /genid?x=1` and `POST /genid/`
+        // fall through to routing, where no route answers them.
+        if raw.path() == GENID_PATH {
+            if raw.method() == "POST" && raw.query().is_empty() {
+                return Handled::Reload(Reload {
+                    method: raw.method().to_string(),
+                    path: raw.path().to_string(),
+                    started,
+                });
+            }
+            if raw.method() != "POST" {
+                let resp = Response::status(405)
+                    .header("Allow", "POST")
+                    .header("Cache-Control", "no-store");
+                let resp = self.finish_raw(&raw, None, None, started, resp);
+                return Handled::Done(resp);
+            }
+        }
+
         let matched = find_route(raw.path(), raw.method(), &self.state.routes)
             .map(|(route, params)| (route, self.state.build_dict(&raw, route, &params)));
 
@@ -522,7 +644,9 @@ impl Site {
             }
         }
 
-        tracing::debug!(
+        // One access line per request at the default level. A line at debug is
+        // below the default and is an access log nobody enables.
+        crate::log::info!(
             path = raw.path(),
             method = raw.method(),
             status = resp.status,
@@ -563,9 +687,27 @@ impl Site {
             name: "m6-test".to_string(),
             code_index,
             named_index,
-            _log: None,
         }
     }
+}
+
+/// The answer to a `POST /genid` that rebuilt the site and swapped it in.
+///
+/// 204, no body, nothing to cache. The caller's identity is its own
+/// `M6-Genid`: the refresh has no generation id to return.
+pub fn genid_ok() -> Response {
+    Response::status(204).header("Cache-Control", "no-store")
+}
+
+/// The answer when the start path failed: the old site is still serving and
+/// the cause is the body.
+///
+/// A 500 says the request was understood and could not be completed, and
+/// `no-store` keeps a failure out of any cache between here and the source.
+pub fn genid_failed(cause: &str) -> Response {
+    Response::status(500)
+        .header("Cache-Control", "no-store")
+        .body(format!("content refresh failed: {cause}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -916,10 +1058,25 @@ fn declared_routes<'a>(
 
 /// Refuse a service's routes if one is unreadable or two can meet. The check
 /// start and `--dump-config` share.
+///
+/// It also refuses a route on [`GENID_PATH`]: `Site::handle` answers that path
+/// before routing, so a route there could never run.
 pub fn check_routes(
     code_routes: &[(String, RouteMethod)],
     config_routes: &[crate::config::RouteConfig],
 ) -> anyhow::Result<()> {
+    for (pattern, _) in code_routes {
+        anyhow::ensure!(
+            pattern != GENID_PATH,
+            "route \"{GENID_PATH}\" is reserved: m6-http's source node posts here to refresh this service's content"
+        );
+    }
+    for route in config_routes {
+        anyhow::ensure!(
+            route.path != GENID_PATH,
+            "route \"{GENID_PATH}\" is reserved: m6-http's source node posts here to refresh this service's content"
+        );
+    }
     check_route_conflicts(&declared_routes(code_routes, config_routes)?)
 }
 
@@ -2076,8 +2233,8 @@ pub(crate) fn check_compress_declared(
     crate::compress::check_declared_support(site_toml, backend_name, compresses)
 }
 
-/// The log format and level, in order of precedence: the command line, then
-/// the service's `[log]`, then `site.toml`'s `[log]`.
+/// The log level, in order of precedence: the command line, then the
+/// service's `[log]`, then `site.toml`'s `[log]`.
 ///
 /// Read once at start. The resolved level is parsed here, so an unknown level
 /// is a configuration error before anything binds.
@@ -2085,16 +2242,13 @@ pub(crate) fn resolve_log(
     site_toml: &std::path::Path,
     config_log: &crate::config::LogConfig,
     cli_log_level: Option<&str>,
-) -> std::result::Result<(String, String), String> {
-    let (site_level, site_format) =
-        crate::log::read_site_log_config(site_toml).map_err(|e| e.to_string())?;
-    let format = config_log.format.clone().unwrap_or(site_format);
+) -> std::result::Result<crate::log::Level, String> {
+    let site_level = crate::log::read_site_log_config(site_toml).map_err(|e| e.to_string())?;
     let level = cli_log_level
         .map(str::to_string)
         .or_else(|| config_log.level.clone())
         .unwrap_or(site_level);
-    crate::log::parse_level(&level).map_err(|e| e.to_string())?;
-    Ok((format, level))
+    crate::log::parse_level(&level).map_err(|e| e.to_string())
 }
 
 pub(crate) fn unknown_handlers(
@@ -2370,6 +2524,7 @@ mod tests {
             Handled::Named(index, _) => panic!("unexpected named index {index}"),
             Handled::Done(_) => panic!("the handler wins over the template"),
             Handled::Code(..) => panic!("a config route names no code route"),
+            Handled::Reload(_) => panic!("this request is a GET on /both"),
         }
     }
 
