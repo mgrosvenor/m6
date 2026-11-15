@@ -1407,6 +1407,109 @@ mod tests {
         assert!(out.contains("no genuine crawler traffic in the window"));
     }
 
+    /// The check and the JSON digest describe one traffic report the same way.
+    ///
+    /// This is the #220 guard. Every fact section D and E print must appear in
+    /// `nodes[].traffic`, with the same number. A fact printed but not
+    /// serialised, or serialised under a different name, fails here.
+    #[test]
+    fn the_check_and_the_json_digest_agree_on_traffic_and_security() {
+        use m6_core::firewall::{Block, FirewallState};
+        use m6_core::monitoring::HeavyHitter;
+
+        let mut t = traffic(LoggingHealth {
+            events_total: 9000,
+            seconds_since_last: Some(600),
+            reopen: None,
+        });
+        t.total_requests = 1234;
+        t.status.insert(200, 1200);
+        t.status.insert(404, 34);
+        t.heavy_hitters = vec![HeavyHitter {
+            ip: "203.0.113.7".into(),
+            requests: 900,
+            top_path: "/".into(),
+            distinct_user_agents: 3,
+            error_ratio: 0.5,
+        }];
+        t.notable = vec![probing_client("203.0.113.9", &["curl/8.4.0"], 1)];
+        t.crawlers = vec![crawler("GPTBot/1.0", &["203.0.113.20"])];
+        t.forged_bot_requests = 12;
+        t.forgers = vec!["203.0.113.66".into()];
+        t.probe_noise = vec!["203.0.113.5 /.git/config".into()];
+        t.firewall = Some(FirewallState {
+            blocks: vec![Block {
+                address: "203.0.113.4".into(),
+                packets: 1215,
+                bytes: 72900,
+                comment: None,
+                chain: "INPUT".into(),
+            }],
+            total_rules: 217,
+        });
+
+        let r = reading("origin", Some(t));
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-10-04T02:16:31Z".into(),
+        );
+        let out = render(&d, std::slice::from_ref(&r));
+        let v = serde_json::to_value(&d).unwrap();
+        let j = &v["nodes"][0]["traffic"];
+
+        // Section D: the totals, the loud clients, the probes and the firewall.
+        assert_eq!(j["total_requests"], 1234);
+        assert!(out.contains("1234 requests in 60m"), "{out}");
+        assert_eq!(j["window_minutes"], 60);
+        assert_eq!(j["status"]["200"], 1200);
+        assert_eq!(j["status"]["404"], 34);
+        assert_eq!(j["heavy_hitters"][0]["ip"], "203.0.113.7");
+        assert_eq!(j["heavy_hitters"][0]["requests"], 900);
+        assert_eq!(j["heavy_hitters"][0]["error_ratio"], 0.5);
+        assert!(
+            out.contains("top: 203.0.113.7 x900 / (50% refused, 3 UA)"),
+            "{out}"
+        );
+        assert_eq!(j["notable"][0]["ip"], "203.0.113.9");
+        assert_eq!(j["notable"][0]["requests"], 7);
+        assert!(out.contains("NOTABLE 203.0.113.9 x7"), "{out}");
+        assert_eq!(j["notable"][0]["user_agents"][0], "curl/8.4.0");
+        assert!(out.contains("curl/8.4.0"), "{out}");
+        assert_eq!(j["probe_noise"][0], "203.0.113.5 /.git/config");
+        assert!(
+            out.contains("single refused probes (noise, not escalated): 203.0.113.5 /.git/config"),
+            "{out}"
+        );
+        assert_eq!(j["firewall"]["blocks"], 1);
+        assert_eq!(j["firewall"]["total_rules"], 217);
+        assert!(
+            out.contains("firewall: 1 block(s) of 217 rules, 1 still being hit"),
+            "{out}"
+        );
+        assert_eq!(j["firewall"]["hit"][0]["packets"], 1215);
+        assert!(
+            out.contains("hit 203.0.113.4 1215 packets 72900 bytes"),
+            "{out}"
+        );
+
+        // Section E: the forged count and the genuine sighting.
+        assert_eq!(j["forged_bot_requests"], 12);
+        assert_eq!(j["forgers"][0], "203.0.113.66");
+        assert!(
+            out.contains("12 bot-shaped requests were FORGED by 203.0.113.66"),
+            "{out}"
+        );
+        assert_eq!(j["crawlers"][0]["user_agent"], "GPTBot/1.0");
+        assert_eq!(j["crawlers"][0]["requests"], 3);
+        assert!(out.contains("UA: GPTBot/1.0"), "{out}");
+
+        // Section A's first line comes from the same report.
+        assert_eq!(j["logging"]["state"], "quiet");
+        assert_eq!(j["logging"]["events_total"], 9000);
+        assert!(out.contains("FAULT  main log silent for 600s"), "{out}");
+    }
+
     // ── Crawler verification, issue #205 ─────────────────────────────────────
 
     fn crawler(ua: &str, ips: &[&str]) -> m6_core::monitoring::CrawlerReport {
