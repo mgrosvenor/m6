@@ -365,8 +365,9 @@ Each entry is an IP address in a local range, without a port.
 An address that is listed must be one the peer connects from, and the list needs at least one address of the internal listener's IP family.
 The internal h2c listener is for relaying nodes, and a monitor polls a node over its TLS listener.
 So `internal_peers` both admits a peer and trusts the client addresses that peer forwards.
-A request on the TLS or QUIC listener from a private network address is counted as monitor traffic, so a monitor on the private network does not move the visitor counters.
-A real visitor reaches that listener from a public address, and a request from a public address stays external at every path.
+A request on the TLS or QUIC listener from a private network address other than loopback is counted as monitor traffic, so a monitor on the private network does not move the visitor counters.
+A real visitor reaches that listener from a public address.
+A request from a public address is monitor only on `/health`, `/perf` or `/traffic`, and external on every other path.
 
 Both lists are read at startup from the system config only, so a change needs a restart.
 A redirect-mode config ignores the keys.
@@ -462,7 +463,7 @@ The name in `backend` is checked against the declared backends, and the key in `
 
 The `[health]` table configures the monitoring endpoints, which m6-http answers inside itself ahead of routing, the cache and every backend.
 Table 8 gives the keys.
-Take from it that the endpoint layout is site-wide and the three access keys belong to one node.
+Take from it that the endpoint layout is site-wide and the two access keys belong to one node.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
