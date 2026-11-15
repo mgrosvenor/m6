@@ -8,7 +8,9 @@
 //! analytics path.
 //!
 //! `harness = false` means no libtest thread shares this binary, so the
-//! counting allocator reads only what `record` allocated. The analytics Sink is
+//! counting allocator reads only what `record` allocated. A custom harness must
+//! still speak libtest's protocol (`--list --format terse`, `--exact <name>`),
+//! which `libtest-mimic` does, with the check forced onto the main thread. The analytics Sink is
 //! opened before the count, as it is at start, because `record` builds its line
 //! into that Sink: with no Sink the line is dropped and a zero would prove
 //! nothing.
@@ -21,6 +23,7 @@
 //! number of lines in the file is checked afterwards, so the zero cannot come
 //! from a line that was never built.
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::log;
 use m6_core::testkit::alloc_count;
 use m6_http_lib::analytics::{self, Event, SessionId};
@@ -32,6 +35,18 @@ static ALLOC: alloc_count::Counting = alloc_count::Counting;
 const REQUESTS: usize = 1_000;
 
 fn main() {
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the check in this (the main)
+    // thread, so the counting allocator reads only the check's own allocations.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "recording_a_request_allocates_nothing",
+        recording_a_request_allocates_nothing,
+    )];
+    libtest_mimic::run(&args, tests).exit();
+}
+
+fn recording_a_request_allocates_nothing() -> Result<(), Failed> {
     let dir = tempfile::tempdir().expect("a temp directory");
     let path = dir.path().join("analytics.jsonl");
     log::init(log::Level::Info, Some(path.as_path())).expect("the analytics sink");
@@ -109,5 +124,9 @@ fn main() {
          returning requests, {new_session} in {REQUESTS} new-session requests, \
          {lines} line(s) written (expected {expected}), {bytes_each} bytes a line"
     );
-    std::process::exit(if allocations == 0 && lines_ok { 0 } else { 1 });
+    if allocations == 0 && lines_ok {
+        Ok(())
+    } else {
+        Err(format!("{allocations} allocation(s), {lines} of {expected} line(s) written").into())
+    }
 }
