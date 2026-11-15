@@ -28,17 +28,54 @@ pub struct Config {
     pub site_dir: PathBuf,
 }
 
-/// The source node's `[genid]` table.
+/// The node's `[genid]` table.
 ///
-/// Both claims or neither: one alone would leave one half of the endpoint
-/// unguarded. Both absent leaves `/genid` answering 404 to everyone, which is
-/// how a node says it does not serve a generation ID.
-#[derive(Debug, Clone, Serialize, Default)]
+/// Two shapes, one table. A node with `upstream` is a cache node that follows
+/// another node's ID. A node without one is the source that owns the ID, and
+/// the claims say who may read or advance it.
+///
+/// On the source both claims are set or neither: one alone would leave one half
+/// of the endpoint unguarded. Both absent leaves `/genid` answering 404 to
+/// everyone, which is how a node says it does not serve a generation ID.
+#[derive(Debug, Clone, Serialize)]
 pub struct GenidConfig {
-    /// `role:<name>` or `group:<name>` a `GET /genid` needs.
+    /// `role:<name>` or `group:<name>` a `GET /genid` needs. Source only.
     pub read_require: Option<String>,
-    /// The same for `POST /genid`, which advances the generation.
+    /// The same for `POST /genid`, which advances the generation. Source only.
     pub write_require: Option<String>,
+    /// The `[[backend]]` a cache node follows. Present makes this node a cache
+    /// node, and the backend must have a `url`.
+    pub upstream: Option<String>,
+    /// The bearer token a heartbeat sends, read from `token_file` at load.
+    ///
+    /// `serde(skip)` in both directions, as `HealthConfig::metrics_token` is:
+    /// it must never be printed by `--dump-config`, and it must not be settable
+    /// inline from TOML.
+    #[serde(skip)]
+    pub token: Option<String>,
+    /// How long between heartbeats. Cache node only, default 10 s.
+    #[serde(rename = "heartbeat_secs", serialize_with = "serialize_secs")]
+    pub heartbeat: std::time::Duration,
+}
+
+/// A `Duration` as the whole seconds the config key spells.
+fn serialize_secs<S>(d: &std::time::Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(d.as_secs())
+}
+
+impl Default for GenidConfig {
+    fn default() -> Self {
+        GenidConfig {
+            read_require: None,
+            write_require: None,
+            upstream: None,
+            token: None,
+            heartbeat: std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -757,13 +794,16 @@ struct RawSystemToml {
     genid: Option<RawGenid>,
 }
 
-/// The `[genid]` keys G1b carries. G1c adds the three that describe how a node
-/// follows another's ID.
+/// The `[genid]` keys. A source sets the two claims. A cache node sets
+/// `upstream` and `token_file`, and may set `heartbeat_secs`.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawGenid {
     read_require: Option<String>,
     write_require: Option<String>,
+    upstream: Option<String>,
+    token_file: Option<String>,
+    heartbeat_secs: Option<u64>,
 }
 
 /// The `[health]` keys the system config may carry. Anything else fails to
@@ -1264,9 +1304,86 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // The generation endpoint. Both claims or neither: one alone would leave
     // one half of the endpoint unguarded, and a value that names no role or
     // group is a typo that would otherwise refuse every caller at run time.
+    // The generation state. `upstream` makes this a cache node that follows
+    // another node; without it the node is the source that owns the ID.
     let genid = match raw_genid {
         None => None,
         Some(raw) => {
+            // The keys of one shape applied to the other are typos that would
+            // otherwise be ignored, so each is refused by name.
+            if raw.upstream.is_some() {
+                for (key, value) in [
+                    ("read_require", raw.read_require.as_deref()),
+                    ("write_require", raw.write_require.as_deref()),
+                ] {
+                    if value.is_some() {
+                        anyhow::bail!(
+                            "config error: [genid] {key} applies only to the source, which has no upstream"
+                        );
+                    }
+                }
+            } else {
+                for (key, present) in [
+                    ("token_file", raw.token_file.is_some()),
+                    ("heartbeat_secs", raw.heartbeat_secs.is_some()),
+                ] {
+                    if present {
+                        anyhow::bail!(
+                            "config error: [genid] {key} applies only to a cache node with upstream"
+                        );
+                    }
+                }
+            }
+
+            let (upstream, token, heartbeat) = match raw.upstream.as_deref() {
+                None => (
+                    None,
+                    None,
+                    std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS),
+                ),
+                Some(name) => {
+                    let named = backends.iter().any(|b| b.name == name && b.url.is_some());
+                    if !named {
+                        anyhow::bail!(
+                            "config error: [genid].upstream = \"{name}\" must name a [[backend]] with a url"
+                        );
+                    }
+                    let Some(token_file) = raw.token_file.as_deref() else {
+                        anyhow::bail!(
+                            "config error: [genid].upstream = \"{name}\" needs token_file"
+                        );
+                    };
+                    let path = secret_path("[genid] token_file", token_file)?;
+                    let token = match std::fs::read_to_string(&path) {
+                        Ok(text) => text.trim().to_string(),
+                        Err(e) => anyhow::bail!(
+                            "config error: [genid] token_file {} cannot be read: {e}",
+                            path.display()
+                        ),
+                    };
+                    if token.is_empty() {
+                        anyhow::bail!(
+                            "config error: [genid] token_file {} is empty",
+                            path.display()
+                        );
+                    }
+                    let secs = raw
+                        .heartbeat_secs
+                        .unwrap_or(crate::genid::DEFAULT_HEARTBEAT_SECS);
+                    if secs == 0 {
+                        anyhow::bail!(
+                            "config error: [genid].heartbeat_secs must be at least 1, because 0 would send a heartbeat every loop turn"
+                        );
+                    }
+                    (
+                        Some(name.to_string()),
+                        Some(token),
+                        std::time::Duration::from_secs(secs),
+                    )
+                }
+            };
+
+            // The source's two claims, both or neither.
             let read = raw.read_require.is_some();
             let write = raw.write_require.is_some();
             if read != write {
@@ -1297,6 +1414,9 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             Some(GenidConfig {
                 read_require: raw.read_require,
                 write_require: raw.write_require,
+                upstream,
+                token,
+                heartbeat,
             })
         }
     };
@@ -2501,6 +2621,172 @@ domain = "test.example.com"
         let e = r.unwrap_err().to_string();
         assert!(e.contains("site.toml sets [genid]"), "{e}");
         assert!(e.contains("belongs in the system config"), "{e}");
+    }
+
+    /// A cache node's site: one URL backend named `origin`, then whatever the
+    /// test puts in `[genid]`. The token file is written with `token`, so a
+    /// positive case can read it.
+    fn load_cache_with(
+        sys_extra: &str,
+        token: &str,
+    ) -> (tempfile::TempDir, anyhow::Result<Config>) {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "auth.pem", "dummy");
+        write_file(dir.path(), "genid-token", token);
+        let mut site = minimal_site_toml();
+        site.push_str("\n[[backend]]\nname = \"origin\"\nurl = \"https://127.0.0.1:9\"\n");
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&sys_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "system.toml", &sys);
+        let result = load(dir.path(), &dir.path().join("system.toml"));
+        (dir, result)
+    }
+
+    #[test]
+    fn genid_upstream_must_name_a_backend_with_a_url() {
+        for name in ["nope", "m6-html"] {
+            let (_d, r) = load_cache_with(
+                &format!(
+                    "\n[genid]\nupstream = \"{name}\"\ntoken_file = \"{{DIR}}/genid-token\"\n"
+                ),
+                "read-token",
+            );
+            assert_eq!(
+                r.unwrap_err().to_string(),
+                format!(
+                    "config error: [genid].upstream = \"{name}\" must name a [[backend]] with a url"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn genid_upstream_needs_a_token_file() {
+        let (_d, r) = load_cache_with("\n[genid]\nupstream = \"origin\"\n", "read-token");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [genid].upstream = \"origin\" needs token_file"
+        );
+    }
+
+    #[test]
+    fn genid_token_file_is_a_secret_path() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"genid-token\"\n",
+            "read-token",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[genid] token_file") && e.contains("relative path"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn genid_token_file_must_be_readable_and_not_empty() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/missing\"\n",
+            "read-token",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[genid] token_file") && e.contains("cannot be read"),
+            "{e}"
+        );
+
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+            "  \n",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[genid] token_file") && e.contains("is empty"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn genid_heartbeat_secs_must_be_positive() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\nheartbeat_secs = 0\n",
+            "read-token",
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [genid].heartbeat_secs must be at least 1, because 0 would send a heartbeat every loop turn"
+        );
+    }
+
+    #[test]
+    fn genid_cache_keys_need_an_upstream() {
+        let auth = "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n";
+        for key in ["token_file = \"{DIR}/genid-token\"", "heartbeat_secs = 5"] {
+            let (_d, r) = load_with("", &format!("{auth}\n[genid]\n{key}\n"));
+            assert_eq!(
+                r.unwrap_err().to_string(),
+                format!(
+                    "config error: [genid] {} applies only to a cache node with upstream",
+                    key.split(' ').next().unwrap()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn genid_source_claims_do_not_apply_to_a_cache_node() {
+        let auth = "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n";
+        let (_d, r) = load_cache_with(
+            &format!(
+                "{auth}\n[genid]\nupstream = \"origin\"\ntoken_file = \"{{DIR}}/genid-token\"\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
+            ),
+            "read-token",
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [genid] read_require applies only to the source, which has no upstream"
+        );
+    }
+
+    #[test]
+    fn genid_cache_node_loads_with_the_default_heartbeat() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+            "  read-token\n",
+        );
+        let cfg = r.expect("a cache node loads");
+        let g = cfg.genid.as_ref().expect("[genid] present");
+        assert_eq!(g.upstream.as_deref(), Some("origin"));
+        assert_eq!(
+            g.token.as_deref(),
+            Some("read-token"),
+            "the file is trimmed"
+        );
+        assert_eq!(
+            g.heartbeat,
+            std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS)
+        );
+        assert_eq!(g.read_require, None);
+        assert_eq!(g.write_require, None);
+
+        // The token is a credential: `--dump-config` must never print it.
+        let dumped = serde_json::to_string(&cfg).expect("serialise");
+        assert!(!dumped.contains("read-token"), "{dumped}");
+    }
+
+    #[test]
+    fn genid_cache_node_reads_heartbeat_secs() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\nheartbeat_secs = 3\n",
+            "read-token",
+        );
+        let g = r
+            .expect("a cache node loads")
+            .genid
+            .expect("[genid] present");
+        assert_eq!(g.heartbeat, std::time::Duration::from_secs(3));
+        assert_eq!(g.upstream.as_deref(), Some("origin"));
     }
 
     #[test]

@@ -587,23 +587,36 @@ Every relative path is measured from the part of the glob before its first wildc
 
 ### 4.11. `[genid]`
 
-The `[genid]` table makes this node the source of its site's generation ID and opens the endpoint that reads and advances it.
+The `[genid]` table gives a node one of two roles.
+With the two claims it is the source of its site's generation ID, and it opens the endpoint that reads and advances that ID.
+With `upstream` it is a cache node, and it follows the source's ID.
 Table 13 gives its keys.
-Take from it that both claims are required together and that the table belongs to the system config.
+Take from it that the two shapes do not mix and that the table belongs to the system config.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `read_require` | string | none | `"role:<name>"` or `"group:<name>"`. A `GET /genid` needs a token with this claim |
-| `write_require` | string | none | The same, for `POST /genid`, which advances the generation |
+| `read_require` | string | none | `"role:<name>"` or `"group:<name>"`. A `GET /genid` needs a token with this claim. Source only |
+| `write_require` | string | none | The same, for `POST /genid`, which advances the generation. Source only |
+| `upstream` | string | none | A `[[backend]]` name whose entry has a `url`. Present makes this node a cache node. Cache node only |
+| `token_file` | string | none | Absolute path to a token with the source's read claim. The heartbeat and a forwarded `/genid` send it. Cache node only |
+| `heartbeat_secs` | integer | 10 | Seconds between heartbeats. Cache node only |
 
 **Table 13: the `[genid]` keys.**
-Both keys are set or neither is.
-A table with only one, a value that names no role or group, or either key without `[auth] public_key` stops the start with exit 2.
-Both absent leaves `/genid` answering 404 to everyone.
+A source sets both claims or neither, and needs `[auth] public_key` for either.
+A cache node sets `upstream` and `token_file`, and needs `[auth]` for nothing, because the source authorises the caller.
 
-`[genid]` belongs to the system config, because who may publish a site is one node's authority and not state every node shares.
+The start is refused with exit 2 for any of these.
+A table with only one claim, a claim that names no role or group, or a claim without `[auth] public_key`.
+`upstream` that names no `[[backend]]` with a `url`, or that is set without `token_file`.
+`token_file` that is relative, unreadable or empty.
+`heartbeat_secs = 0`.
+`read_require` or `write_require` beside `upstream`.
+`token_file` or `heartbeat_secs` without `upstream`.
+
+`[genid]` belongs to the system config, because who may publish a site, and which node follows which, is one node's state and not something every node shares.
 A source also needs `StateDirectory=` in its unit, because the ID is written to `$STATE_DIRECTORY/genid`.
-A node with `[genid]` and no `StateDirectory=` exits 2, and `--dump-config` still prints and exits 0.
+A source with `[genid]` and no `StateDirectory=` exits 2, and `--dump-config` still prints and exits 0.
+A cache node holds no file and needs no `StateDirectory=`.
 
 ```toml
 [auth]
@@ -612,6 +625,16 @@ public_key = "/etc/m6/api-auth.pub"
 [genid]
 read_require  = "role:monitor"
 write_require = "role:editor"
+```
+
+A cache node's table names the origin and the token it reads with.
+The token file is a credential, delivered like every other one, for example `/run/credentials/<unit>/genid-read` from `LoadCredential=`.
+
+```toml
+[genid]
+upstream       = "origin"
+token_file     = "/run/credentials/m6-http.service/genid-read"
+heartbeat_secs = 10
 ```
 
 The key reference ends with the generation endpoint, one node's own authority.

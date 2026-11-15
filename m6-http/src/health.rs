@@ -603,10 +603,7 @@ pub fn genid_gate(
     from_internal: bool,
     write: bool,
 ) -> Gate {
-    let loopback = client_ip
-        .parse::<IpAddr>()
-        .is_ok_and(|ip| ip.to_canonical().is_loopback());
-    if !from_internal && !loopback {
+    if !genid_address_ok(client_ip, from_internal) {
         return Gate::Refused(PerfOutcome::Disabled);
     }
     let require = if write {
@@ -627,32 +624,34 @@ pub fn genid_gate(
     }
 }
 
-/// The authorised `/perf` answer with the source's generation block added.
+/// The address rule alone: loopback, or an internal listener.
+///
+/// A cache node forwards the caller's own token to the source, so it applies
+/// this rule and nothing else. A public peer still gets the 404 an unknown
+/// path gives, before the request is forwarded.
+pub fn genid_address_ok(client_ip: &str, from_internal: bool) -> bool {
+    let loopback = client_ip
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    from_internal || loopback
+}
+
+/// The authorised `/perf` answer with this node's generation block added.
 ///
 /// The block is inserted into the report this node already built, so `m6-core`
 /// keeps no notion of a generation: it hands over the monitoring payload and
-/// m6-http adds the one field that is this binary's.
+/// m6-http adds the one field that is this binary's. A source reports the ID it
+/// owns and the peers that read it. A cache node reports the ID it follows,
+/// where it follows it from, and whether that upstream is answering.
 pub fn genid_perf_response(
     report: PerfReport,
-    genid: &crate::genid::Genid,
+    role: &crate::genid::Role,
+    config: &GenidConfig,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let mut value = serde_json::to_value(&report)
         .unwrap_or_else(|_| serde_json::json!({"error": "serialisation failed"}));
-    let peers: Vec<serde_json::Value> = genid
-        .peers(m6_core::platform::now())
-        .into_iter()
-        .map(|(ip, last_get_s)| serde_json::json!({"addr": ip.to_string(), "last_get_s": last_get_s}))
-        .collect();
     if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "genid".to_string(),
-            serde_json::json!({
-                "role": "source",
-                "id": genid.current().to_string(),
-                "sequence_running": genid.sequence_running(),
-                "peers": peers,
-            }),
-        );
+        object.insert("genid".to_string(), genid_block(role, config));
     }
     let body = serde_json::to_vec(&value)
         .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
@@ -668,6 +667,38 @@ pub fn genid_perf_response(
         ],
         body,
     )
+}
+
+/// The `genid` object `/perf` adds, by role.
+fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::Value {
+    match role {
+        crate::genid::Role::Source(g) => {
+            let peers: Vec<serde_json::Value> = g
+                .peers(m6_core::platform::now())
+                .into_iter()
+                .map(|(ip, last_get_s)| {
+                    serde_json::json!({"addr": ip.to_string(), "last_get_s": last_get_s})
+                })
+                .collect();
+            serde_json::json!({
+                "role": "source",
+                "id": g.current().to_string(),
+                "sequence_running": g.sequence_running(),
+                "peers": peers,
+            })
+        }
+        crate::genid::Role::Cache(f) => {
+            let now = m6_core::platform::now();
+            serde_json::json!({
+                "role": "cache",
+                "id": f.current().map(|id| id.to_string()),
+                "upstream": config.upstream.as_deref().unwrap_or(""),
+                "upstream_down": f.down(),
+                "upstream_rtt_ms": f.rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
+                "last_ok_s": f.last_ok_s(now),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1025,6 +1056,7 @@ mod genid_gate_tests {
         let g = GenidConfig {
             read_require: Some("role:reader".to_string()),
             write_require: Some("role:writer".to_string()),
+            ..GenidConfig::default()
         };
         let Gate::Refused(out) = genid_gate(&g, None, &[], "192.0.2.10", false, false) else {
             panic!("a public peer must be refused");

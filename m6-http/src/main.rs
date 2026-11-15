@@ -23,7 +23,7 @@ use m6_http_lib::analytics::H3Headers;
 use m6_http_lib::auth;
 use m6_http_lib::cache::{
     evaluate_preconditions, make_lookup_key, not_modified_headers, request_permits_storage,
-    should_cache, strip_set_cookie, Cache, CacheKey, CachedResponse, Precondition,
+    should_cache, strip_uncacheable, Cache, CacheKey, CachedResponse, Precondition,
 };
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::error::{self as error, ErrorMode};
@@ -363,10 +363,17 @@ struct ServerState {
     /// The `link` header line advertising the site description, when configured.
     /// `None` means the site configures none, so no line is written.
     describedby_line: Option<std::sync::Arc<[u8]>>,
-    /// The site generation ID this node holds, its change sequence and the
-    /// peers that read it. Present on every node. Only a node with `[genid]`
-    /// reads or writes the state file and answers `/genid`.
-    genid: genid::Genid,
+    /// The site generation ID this node holds. Present on every node: a source
+    /// owns it, and a cache node follows another node's. Only a node with
+    /// `[genid]` answers `/genid`; a cache node forwards it upstream.
+    genid: genid::Role,
+    /// The `[[backend]]` a cache node's heartbeat asks, by URL-backend index.
+    /// `None` on every other node. Resolved at start, like every URL backend.
+    heartbeat_backend: Option<usize>,
+    /// The encoded `GET /genid` a heartbeat sends, built once at start so a
+    /// tick neither formats nor allocates. Empty when this node has no
+    /// heartbeat.
+    heartbeat_request: Vec<u8>,
 }
 
 /// One cache entry to fetch in the background.
@@ -1242,7 +1249,9 @@ fn park(
         // sequence, which the next loop turn starts. The context is unused.
         UpstreamId::Genid => {
             let _ = ctx;
-            state.genid.post(waiter);
+            if let Some(g) = state.genid.source_mut() {
+                g.post(waiter);
+            }
         }
     }
 }
@@ -1346,6 +1355,10 @@ fn write_waiter(
             // Intercepted in `complete_waiter`: a member's answer is a status
             // for the sequence, not a response for a client.
         }
+        Waiter::Heartbeat => {
+            // Intercepted in `complete_waiter`: a heartbeat's answer is an ID
+            // and a round trip, not a response for anyone.
+        }
     }
 }
 
@@ -1366,7 +1379,8 @@ fn complete_waiter(
         let path = cx
             .state
             .genid
-            .member_path(member)
+            .source()
+            .and_then(|g| g.member_path(member))
             .map(|p| p.display().to_string());
         let ok = match &result {
             Ok(response) => match response.status {
@@ -1396,16 +1410,46 @@ fn complete_waiter(
                 false
             }
         };
-        if cx.state.genid.member_done(ok) {
+        if cx
+            .state
+            .genid
+            .source_mut()
+            .is_some_and(|g| g.member_done(ok))
+        {
             genid_finish(cx);
         }
+        return;
+    }
+    // A heartbeat's answer is an ID and a round trip, not a response: it
+    // updates the follower and is never finalised or written to anyone.
+    if let Waiter::Heartbeat = waiter {
+        let rtt = ctx.start.elapsed();
+        let outcome = match &result {
+            Ok(response) if response.status == 200 => {
+                match m6_core::headers::get(&response.headers[..], genid::GENID_HEADER)
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                {
+                    Some(id) => Ok((id, rtt)),
+                    None => Err("no M6-Genid"),
+                }
+            }
+            Ok(_) => Err("status"),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err("timed out"),
+            Err(_) => Err("connect failed"),
+        };
+        follower_answered(cx.state, outcome, cx.now, false);
         return;
     }
     let method = &ctx.req.method;
     // The generation this reply carries is the one current when it was
     // dispatched, not the one after a later advance. A synthesised 502 has no
-    // backend reply behind it, so it carries none.
-    let genid = result.as_ref().ok().map(|_| ctx.genid);
+    // backend reply behind it, so it carries none. A cache node passes none:
+    // the upstream's own `M6-Genid` travels in the headers it forwards, and a
+    // cache hit writes the entry's ID through its own writer.
+    let genid = match &cx.state.genid {
+        genid::Role::Cache(_) => None,
+        genid::Role::Source(_) => result.as_ref().ok().map(|_| ctx.genid),
+    };
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
             write_waiter(waiter, status, headers, body, method, genid, cx);
@@ -1452,7 +1496,9 @@ fn complete_h2_streams(
 /// here, with its socket path in the log, so the sequence still finishes.
 fn start_genid_sequence(state: &mut ServerState, registry: &m6_core::platform::Registry) {
     let members = state.pool_manager.socket_members();
-    state.genid.start(&members);
+    if let Some(g) = state.genid.source_mut() {
+        g.start(&members);
+    }
     let host = state.config.site.domain.clone();
     for (index, path) in members.iter().enumerate() {
         if launch_genid_member(state, registry, index as u32, path, &host).is_err() {
@@ -1460,7 +1506,11 @@ fn start_genid_sequence(state: &mut ServerState, registry: &m6_core::platform::R
                 member = %path.display(),
                 "genid: member refresh failed to start"
             );
-            if state.genid.member_done(false) {
+            if state
+                .genid
+                .source_mut()
+                .is_some_and(|g| g.member_done(false))
+            {
                 break;
             }
         }
@@ -1566,10 +1616,18 @@ fn genid_finish(cx: &mut CompletionCtx<'_>) {
         cx.state.cache.clear();
         cx.state.error_pages.clear();
 
-        let finished = cx.state.genid.finish();
+        let Some(finished) = cx.state.genid.source_mut().map(|g| g.finish()) else {
+            return;
+        };
+        let state_path = cx
+            .state
+            .genid
+            .source()
+            .and_then(|g| g.state_path())
+            .map(std::path::Path::to_path_buf);
         let mut write_error = None;
-        if let Some(path) = cx.state.genid.state_path() {
-            if let Err(e) = genid::write_state(path, finished.id) {
+        if let Some(path) = state_path {
+            if let Err(e) = genid::write_state(&path, finished.id) {
                 error!(path = %path.display(), error = %e, "genid: state write failed");
                 write_error = Some(format!("{}: {e}", path.display()));
             }
@@ -1620,7 +1678,7 @@ fn genid_finish(cx: &mut CompletionCtx<'_>) {
             break;
         }
         start_genid_sequence(cx.state, cx.registry);
-        if !cx.state.genid.finish_due() {
+        if !cx.state.genid.source().is_some_and(|g| g.finish_due()) {
             break;
         }
     }
@@ -1630,12 +1688,220 @@ fn genid_finish(cx: &mut CompletionCtx<'_>) {
 /// and complete one whose members have all answered without an event of their
 /// own (no members at all, or every connect failed at start).
 fn genid_pump(cx: &mut CompletionCtx<'_>) {
-    if cx.state.genid.take_start_requested() {
+    let start = cx
+        .state
+        .genid
+        .source_mut()
+        .is_some_and(|g| g.take_start_requested());
+    if start {
         start_genid_sequence(cx.state, cx.registry);
     }
-    if cx.state.genid.finish_due() {
+    if cx.state.genid.source().is_some_and(|g| g.finish_due()) {
         genid_finish(cx);
     }
+}
+
+/// What to do with one backend reply: store it under an ID, wake the heartbeat
+/// because it names a newer generation, or nothing.
+enum ReplyRule {
+    Store(u64),
+    Behind,
+    Nothing,
+}
+
+/// The ID an upstream stamped on a reply, parsed in place from the borrowed
+/// header value. No copy and no allocation.
+fn reply_id(headers: &[(String, String)]) -> Option<u64> {
+    m6_core::headers::get(headers, genid::GENID_HEADER)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// Apply the store rule to one reply. The rule itself lives on the
+/// [`genid::Role`]: the source stores under the ID it dispatched under, and a
+/// cache node stores only a reply that carries the ID it holds.
+///
+/// A cache node also reads every reply's `M6-Genid` here, so a reply under
+/// another ID wakes the heartbeat at once. That is one borrowed header lookup
+/// and one parse for a reply, the cost the latency budget allows.
+fn reply_rule(
+    state: &ServerState,
+    ctx: &forward::PendingUrlContext,
+    status: u16,
+    headers: &[(String, String)],
+) -> ReplyRule {
+    let id = reply_id(headers);
+    if let Some(f) = state.genid.cache() {
+        if let Some(id) = id {
+            if Some(id) != f.current() {
+                return ReplyRule::Behind;
+            }
+        }
+        if !ctx.cacheable
+            || !request_permits_storage(&ctx.req.headers)
+            || !should_cache(status, headers)
+        {
+            return ReplyRule::Nothing;
+        }
+        return state
+            .genid
+            .may_store_parsed(ctx.genid, id)
+            .map_or(ReplyRule::Nothing, ReplyRule::Store);
+    }
+    if !ctx.cacheable
+        || !request_permits_storage(&ctx.req.headers)
+        || !should_cache(status, headers)
+    {
+        return ReplyRule::Nothing;
+    }
+    if let Some(g) = state.genid.source() {
+        if ctx.genid == g.current() {
+            return ReplyRule::Store(ctx.genid);
+        }
+    }
+    ReplyRule::Nothing
+}
+
+/// Encode the heartbeat's `GET /genid` once, at start. The authority is the
+/// backend's, as every URL forward is, and the token is the one from
+/// `[genid] token_file`.
+fn encode_heartbeat_request(host: &str, token: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"GET ");
+    out.extend_from_slice(m6_core::site::GENID_PATH.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(b"\r\nAuthorization: Bearer ");
+    out.extend_from_slice(token.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+}
+
+/// Start one heartbeat on the upstream slot, from the bytes fixed at start.
+///
+/// `NoSlot` is the node being busy, not the upstream being down, so the caller
+/// leaves the heartbeat due and tries on the next turn.
+fn launch_heartbeat(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+) -> Result<(), UrlDispatchError> {
+    let Some(backend_idx) = state.heartbeat_backend else {
+        return Err(UrlDispatchError::NoSlot);
+    };
+    let (key, token, watched) = take_url_slot(state, backend_idx)?;
+    {
+        // Disjoint fields: the bytes copied from are fixed at start and this
+        // never allocates the slot's buffer beyond its first use.
+        let entry = state.upstreams.get_mut(key);
+        entry
+            .upstream
+            .request_buf()
+            .extend_from_slice(&state.heartbeat_request);
+    }
+    begin_url_slot(state, registry, backend_idx, key, token, watched, false)?;
+    let entry = state.upstreams.get_mut(key);
+    entry.waiter = Some(Waiter::Heartbeat);
+    entry.ctx = Some(forward::PendingUrlContext::for_heartbeat());
+    Ok(())
+}
+
+/// Start a cache node's heartbeat when one is due. One in flight at most, on
+/// the tick, with no timer of its own.
+fn heartbeat_pump(cx: &mut CompletionCtx<'_>) {
+    let due = cx
+        .state
+        .genid
+        .cache()
+        .is_some_and(|f| f.heartbeat_due(cx.now));
+    if !due {
+        return;
+    }
+    match launch_heartbeat(cx.state, cx.registry) {
+        Ok(()) => {
+            if let Some(f) = cx.state.genid.cache_mut() {
+                f.sent();
+            }
+        }
+        // A full upstream table retries on the next turn: the heartbeat is
+        // still due and nothing was started.
+        Err(UrlDispatchError::NoSlot) => {}
+        Err(UrlDispatchError::Failed(e)) => {
+            warn!(error = %e, "genid: heartbeat failed to start");
+            follower_answered(cx.state, Err("connect failed"), cx.now, true);
+        }
+    }
+}
+
+/// Apply one heartbeat or forwarded-request answer: the log line on the
+/// transition, the held flag, and on a new ID the flush.
+fn follower_answered(
+    state: &mut ServerState,
+    result: Result<(u64, std::time::Duration), &'static str>,
+    now: Instant,
+    behind: bool,
+) {
+    let (outcome, recovered) = {
+        let Some(f) = state.genid.cache_mut() else {
+            return;
+        };
+        let was_down = f.down();
+        let outcome = f.answered(result, now);
+        if behind {
+            f.behind(now);
+        }
+        (outcome, was_down && !f.down())
+    };
+    match outcome {
+        genid::Outcome::Down(reason) => {
+            state.cache.set_serve_held(true);
+            warn!(
+                reason,
+                "genid: upstream down; serving held content stale until it answers"
+            );
+        }
+        genid::Outcome::StillDown => {}
+        genid::Outcome::First(id) => {
+            state.cache.set_serve_held(false);
+            info!(genid = id, "genid: upstream answered; following its ID");
+        }
+        genid::Outcome::Same => {
+            state.cache.set_serve_held(false);
+        }
+        genid::Outcome::Changed { from, to } => {
+            state.cache.set_serve_held(false);
+            follower_change(state, from, to);
+        }
+    }
+    if recovered {
+        info!("genid: upstream up");
+    }
+}
+
+/// A forwarded client request could not reach the upstream: mark it down, log
+/// the transition once, and serve held content from here on.
+fn follower_failed(state: &mut ServerState, reason: &'static str, now: Instant) {
+    let first = state.genid.cache_mut().is_some_and(|f| f.failed(now));
+    if !first {
+        return;
+    }
+    state.cache.set_serve_held(true);
+    warn!(
+        reason,
+        "genid: upstream down; serving held content stale until it answers"
+    );
+}
+
+/// The change on a cache node: the route table rebuilt from the config loaded
+/// at start, the cache and the held error pages emptied, then the log line an
+/// operator reads a publish as. The cache refills on demand.
+fn follower_change(state: &mut ServerState, from: u64, to: u64) {
+    match RouteTable::from_config(&state.config) {
+        Ok(table) => state.route_table = table,
+        Err(e) => error!(
+            error = %e,
+            "genid: route table rebuild failed; keeping the old table"
+        ),
+    }
+    state.cache.clear();
+    state.error_pages.clear();
+    info!(from, to, "genid changed");
 }
 
 /// Drive the one upstream whose descriptor fired.
@@ -2245,6 +2511,7 @@ fn event_loop(
                 now,
             );
             genid_pump(&mut cx);
+            heartbeat_pump(&mut cx);
         }
 
         // A slot came free while the token table was full: accept again.
@@ -2272,33 +2539,43 @@ fn event_loop(
             state.stats.set_event_loop(trace.report());
         }
 
-        // Drain one background fetch per loop iteration.
-        if let Some(r) = state.prefetch_queue.pop_front() {
-            let lk = make_lookup_key(
-                &r.path,
-                r.query.as_deref(),
-                &r.enc,
-                &mut state.lookup_key_buf,
-            );
-            if state.cache.get(lk).is_none() {
-                let synth = synth_refresh_request(&r);
-                match handle_request(
-                    &synth,
-                    "127.0.0.1",
+        // Drain one background fetch per loop iteration, unless this node has
+        // no ID yet or its upstream is down. A cache node with nothing to
+        // compare a reply against would store none of it, and a fetch while
+        // the source is unreachable is a guaranteed failure. The queue keeps
+        // its cap and drains once the upstream answers.
+        let drain = match &state.genid {
+            genid::Role::Cache(f) => f.current().is_some() && !f.down(),
+            genid::Role::Source(_) => true,
+        };
+        if drain {
+            if let Some(r) = state.prefetch_queue.pop_front() {
+                let lk = make_lookup_key(
+                    &r.path,
+                    r.query.as_deref(),
                     &r.enc,
-                    state,
-                    true,
-                    /* from_internal */ false,
-                    poll.registry(),
-                ) {
-                    RequestOutcome::Ready(..) => {
-                        debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
-                    }
-                    RequestOutcome::Cached { .. } => {
-                        unreachable!("a background fetch is a miss, never a cached hit")
-                    }
-                    RequestOutcome::Pending { id, ctx } => {
-                        park(state, id, ctx, Waiter::Background);
+                    &mut state.lookup_key_buf,
+                );
+                if state.cache.get(lk).is_none() {
+                    let synth = synth_refresh_request(&r);
+                    match handle_request(
+                        &synth,
+                        "127.0.0.1",
+                        &r.enc,
+                        state,
+                        true,
+                        /* from_internal */ false,
+                        poll.registry(),
+                    ) {
+                        RequestOutcome::Ready(..) => {
+                            debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
+                        }
+                        RequestOutcome::Cached { .. } => {
+                            unreachable!("a background fetch is a miss, never a cached hit")
+                        }
+                        RequestOutcome::Pending { id, ctx } => {
+                            park(state, id, ctx, Waiter::Background);
+                        }
                     }
                 }
             }
@@ -3401,30 +3678,7 @@ fn launch_url_upstream(
     client_ip: &str,
     backend_idx: usize,
 ) -> Result<usize, UrlDispatchError> {
-    let addr = state.pool_manager.url_backend(backend_idx).addr();
-    let now = m6_core::platform::now();
-    let deadline = now + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-    let head = req.method.eq_ignore_ascii_case("HEAD");
-
-    // An idle connection first: its key is not in the free list, and its
-    // descriptor is registered under the token it kept while waiting.
-    let (key, token, watched) = match state.pool_manager.url_backend_mut(backend_idx).idle.take() {
-        Some(key) => {
-            let token = state.upstreams.get(key).token;
-            (key, token, true)
-        }
-        None => {
-            let Some(token) = take_token(state) else {
-                return Err(UrlDispatchError::NoSlot);
-            };
-            let Some(taken) = state.upstreams.take() else {
-                *state.sources.get_mut(token.0) = Source::Vacant;
-                state.sources.free(token.0);
-                return Err(UrlDispatchError::NoSlot);
-            };
-            (taken.key, token, false)
-        }
-    };
+    let (key, token, watched) = take_url_slot(state, backend_idx)?;
 
     let encoded = {
         // Disjoint fields: the backend's authority and the request's origin are
@@ -3455,6 +3709,63 @@ fn launch_url_upstream(
         }
         return Err(UrlDispatchError::Failed(e));
     }
+    begin_url_slot(
+        state,
+        registry,
+        backend_idx,
+        key,
+        token,
+        watched,
+        req.method.eq_ignore_ascii_case("HEAD"),
+    )?;
+    Ok(key)
+}
+
+/// Take a slot for a request to a URL backend: an idle connection when one is
+/// free, otherwise a free slot and a token. The caller writes the request into
+/// the slot's buffer and calls [`begin_url_slot`].
+fn take_url_slot(
+    state: &mut ServerState,
+    backend_idx: usize,
+) -> Result<(usize, Token, bool), UrlDispatchError> {
+    // An idle connection first: its key is not in the free list, and its
+    // descriptor is registered under the token it kept while waiting.
+    match state.pool_manager.url_backend_mut(backend_idx).idle.take() {
+        Some(key) => {
+            let token = state.upstreams.get(key).token;
+            Ok((key, token, true))
+        }
+        None => {
+            let Some(token) = take_token(state) else {
+                return Err(UrlDispatchError::NoSlot);
+            };
+            let Some(taken) = state.upstreams.take() else {
+                *state.sources.get_mut(token.0) = Source::Vacant;
+                state.sources.free(token.0);
+                return Err(UrlDispatchError::NoSlot);
+            };
+            Ok((taken.key, token, false))
+        }
+    }
+}
+
+/// Start a request already written into `key`'s buffer, register its
+/// descriptor against `token`, and leave the slot for the caller to name its
+/// waiter and context. One request per slot either way.
+#[allow(clippy::too_many_arguments)] // the slot it was taken under, not a request
+fn begin_url_slot(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    backend_idx: usize,
+    key: usize,
+    token: Token,
+    watched: bool,
+    head: bool,
+) -> Result<(), UrlDispatchError> {
+    let addr = state.pool_manager.url_backend(backend_idx).addr();
+    let now = m6_core::platform::now();
+    let deadline = now + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+
     if watched {
         // Drop the idle registration so a failed start cannot leave a stale
         // one; the slot's descriptor is registered again below.
@@ -3495,7 +3806,7 @@ fn launch_url_upstream(
     entry.waiter = None;
     entry.ctx = None;
     entry.registered_interest = interest;
-    Ok(key)
+    Ok(())
 }
 
 /// Why a socket-upstream launch failed, so the two callers can answer it their
@@ -3809,9 +4120,12 @@ fn handle_request_inner(
                     || state.stats.snapshot(),
                 );
                 match outcome {
-                    health::PerfOutcome::Ok(report) if state.config.genid.is_some() => {
-                        health::genid_perf_response(*report, &state.genid)
-                    }
+                    health::PerfOutcome::Ok(report) => match state.config.genid.as_ref() {
+                        Some(genid_config) => {
+                            health::genid_perf_response(*report, &state.genid, genid_config)
+                        }
+                        None => health::PerfOutcome::Ok(report).into_response(),
+                    },
                     other => other.into_response(),
                 }
             }
@@ -3878,6 +4192,110 @@ fn handle_request_inner(
     // which is also a 404.
     if req.path == m6_core::site::GENID_PATH {
         if let Some(genid_config) = state.config.genid.as_ref() {
+            // A cache node does not own an ID, so it forwards the caller's own
+            // request and token to the source. Only the address rule is its
+            // own: a stranger gets the 404 an unknown path gives, before
+            // anything is forwarded. The source authorises the call.
+            if let genid::Role::Cache(_) = &state.genid {
+                if !health::genid_address_ok(client_ip, from_internal) {
+                    let (code, headers, body) = health::PerfOutcome::Disabled.into_response();
+                    return RequestOutcome::Ready(
+                        code,
+                        headers,
+                        body,
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                }
+                if !matches!(req.method.as_str(), "GET" | "HEAD" | "POST") {
+                    let headers = vec![
+                        ("Allow".to_string(), "GET, HEAD, POST".to_string()),
+                        ("Cache-Control".to_string(), "no-store".to_string()),
+                    ];
+                    return RequestOutcome::Ready(
+                        405,
+                        headers,
+                        Vec::new(),
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                }
+                let Some(backend_idx) = state.heartbeat_backend else {
+                    // `config::load` refused an upstream naming no URL
+                    // backend, so this is unreachable on a loaded config.
+                    let headers = vec![
+                        (
+                            "Content-Type".to_string(),
+                            "text/plain; charset=utf-8".to_string(),
+                        ),
+                        ("Cache-Control".to_string(), "no-store".to_string()),
+                    ];
+                    return RequestOutcome::Ready(
+                        502,
+                        headers,
+                        b"Bad Gateway".to_vec(),
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                };
+                let upstream = genid_config.upstream.clone().unwrap_or_default();
+                let ctx = forward::PendingUrlContext {
+                    req: req.clone(),
+                    client_ip: client_ip.to_string(),
+                    enc: String::new(),
+                    backend_name: upstream.clone(),
+                    kind: forward::PendingKind::Url,
+                    route_path: None,
+                    cacheable: false,
+                    is_prefetch: false,
+                    start: m6_core::platform::now(),
+                    error_status_override: None,
+                    extra_headers: Vec::new(),
+                    genid: state.genid.dispatched(),
+                    genid_forward: true,
+                };
+                return match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
+                    Ok(id) => RequestOutcome::Pending {
+                        id,
+                        ctx: Box::new(ctx),
+                    },
+                    Err(UrlDispatchError::NoSlot) => {
+                        let headers = vec![
+                            ("Retry-After".to_string(), "1".to_string()),
+                            ("Cache-Control".to_string(), "no-store".to_string()),
+                        ];
+                        RequestOutcome::Ready(
+                            503,
+                            headers,
+                            b"Service Unavailable".to_vec(),
+                            health::GENID_BACKEND.to_string(),
+                            None,
+                        )
+                    }
+                    Err(UrlDispatchError::Failed(e)) => {
+                        warn!(
+                            backend = %upstream,
+                            error = %e,
+                            "genid: forwarding to the upstream failed"
+                        );
+                        let headers = vec![
+                            (
+                                "Content-Type".to_string(),
+                                "text/plain; charset=utf-8".to_string(),
+                            ),
+                            ("Cache-Control".to_string(), "no-store".to_string()),
+                        ];
+                        RequestOutcome::Ready(
+                            502,
+                            headers,
+                            b"Bad Gateway".to_vec(),
+                            health::GENID_BACKEND.to_string(),
+                            None,
+                        )
+                    }
+                };
+            }
+
             let write = req.method == "POST";
             let gate = health::genid_gate(
                 genid_config,
@@ -3902,10 +4320,12 @@ fn handle_request_inner(
             }
             match req.method.as_str() {
                 "GET" | "HEAD" => {
-                    let id = state.genid.current();
+                    let id = state.genid.source().map(genid::Genid::current).unwrap_or(0);
                     if req.method == "GET" {
                         if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
-                            state.genid.saw_peer(ip, m6_core::platform::now());
+                            if let Some(g) = state.genid.source_mut() {
+                                g.saw_peer(ip, m6_core::platform::now());
+                            }
                         }
                     }
                     let headers = vec![
@@ -4135,7 +4555,8 @@ fn handle_request_inner(
             start: m6_core::platform::now(),
             error_status_override: None,
             extra_headers: Vec::new(),
-            genid: state.genid.current(),
+            genid: state.genid.dispatched(),
+            genid_forward: false,
         };
         let id = match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
             Ok(id) => id,
@@ -4232,7 +4653,8 @@ fn handle_request_inner(
         start: backend_start,
         error_status_override: None,
         extra_headers: Vec::new(),
-        genid: state.genid.current(),
+        genid: state.genid.dispatched(),
+        genid_forward: false,
     };
     RequestOutcome::Pending {
         id: UpstreamId::Slot(slot),
@@ -4420,7 +4842,8 @@ fn dispatch_custom_error_async(
             start: m6_core::platform::now(),
             error_status_override: Some(status),
             extra_headers: Vec::new(),
-            genid: state.genid.current(),
+            genid: state.genid.dispatched(),
+            genid_forward: false,
         };
         let id = dispatch_url_backend(state, registry, &error_req, client_ip, backend_idx).ok()?;
         return Some(RequestOutcome::Pending {
@@ -4453,7 +4876,8 @@ fn dispatch_custom_error_async(
         start: m6_core::platform::now(),
         error_status_override: Some(status),
         extra_headers: Vec::new(),
-        genid: state.genid.current(),
+        genid: state.genid.dispatched(),
+        genid_forward: false,
     };
     Some(RequestOutcome::Pending {
         id: UpstreamId::Slot(slot),
@@ -4905,24 +5329,25 @@ fn complete_socket_response(
             // Stamp Date BEFORE the cache decision so the stored entry carries
             // the generation time.
             set_date(&mut http_resp.headers);
-            if ctx.cacheable
-                && request_permits_storage(&req.headers)
-                && should_cache(http_resp.status, &http_resp.headers)
-                // A reply dispatched before an advance carries content the
-                // backend has since replaced. Storing it would let the cache
-                // hold the old generation under the new ID.
-                && ctx.genid == state.genid.current()
-            {
-                let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
-                state.cache.insert(
-                    key,
-                    CachedResponse {
-                        genid: ctx.genid,
-                        status: http_resp.status,
-                        headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
-                        body: Bytes::from(http_resp.body.clone()),
-                    },
-                );
+            match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
+                ReplyRule::Store(stored) => {
+                    let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
+                    state.cache.insert(
+                        key,
+                        CachedResponse {
+                            genid: stored,
+                            status: http_resp.status,
+                            headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                            body: Bytes::from(http_resp.body.clone()),
+                        },
+                    );
+                }
+                ReplyRule::Behind => {
+                    if let Some(f) = state.genid.cache_mut() {
+                        f.behind(m6_core::platform::now());
+                    }
+                }
+                ReplyRule::Nothing => {}
             }
             (
                 http_resp.status,
@@ -5107,24 +5532,25 @@ fn finalize_url_response_inner(
             // Same as the synchronous path: Date is stamped before the cache
             // decision so the stored entry carries the generation time.
             set_date(&mut http_resp.headers);
-            if ctx.cacheable
-                && request_permits_storage(&ctx.req.headers)
-                && should_cache(http_resp.status, &http_resp.headers)
-                // The same store rule as the socket path: a reply from the
-                // generation before an advance is not content this cache may
-                // keep.
-                && ctx.genid == state.genid.current()
-            {
-                let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
-                state.cache.insert(
-                    key,
-                    CachedResponse {
-                        genid: ctx.genid,
-                        status: http_resp.status,
-                        headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
-                        body: Bytes::from(http_resp.body.clone()),
-                    },
-                );
+            match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
+                ReplyRule::Store(stored) => {
+                    let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+                    state.cache.insert(
+                        key,
+                        CachedResponse {
+                            genid: stored,
+                            status: http_resp.status,
+                            headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                            body: Bytes::from(http_resp.body.clone()),
+                        },
+                    );
+                }
+                ReplyRule::Behind => {
+                    if let Some(f) = state.genid.cache_mut() {
+                        f.behind(m6_core::platform::now());
+                    }
+                }
+                ReplyRule::Nothing => {}
             }
             (
                 http_resp.status,
@@ -5136,9 +5562,65 @@ fn finalize_url_response_inner(
         }
         Err(e) => {
             warn!(backend = %ctx.backend_name, error = %e, "url backend error (async)");
-            (502u16, vec![], vec![], "error".to_string(), true)
+            // A forwarded `POST /genid` that misses the deadline answers 504:
+            // the source may still be completing the publish, and `GET /genid`
+            // then says whether it happened.
+            let status = if ctx.genid_forward && e.kind() == std::io::ErrorKind::TimedOut {
+                504u16
+            } else {
+                502u16
+            };
+            (status, vec![], vec![], "error".to_string(), true)
         }
     };
+
+    // A failed forward to the upstream tells a cache node two things: the
+    // upstream may be down, and the node may still hold content for this key.
+    // The held entry is served at any age, flagged stale, so a working site
+    // with old pages beats the error page.
+    if is_connection_failure && !ctx.is_prefetch && matches!(state.genid, genid::Role::Cache(_)) {
+        let reason = if status == 504 {
+            "timed out"
+        } else {
+            "connect failed"
+        };
+        follower_failed(state, reason, m6_core::platform::now());
+    }
+    if matches!(status, 502..=504)
+        && !ctx.is_prefetch
+        && matches!(state.genid, genid::Role::Cache(_))
+    {
+        let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+        if let Some((entry, age)) = state.cache.lookup_held(&key) {
+            let mut headers = (*entry.headers).clone();
+            set_age(&mut headers, age);
+            headers.push((
+                genid::GENID_HEADER.to_string(),
+                itoa::Buffer::new().format(entry.genid).to_string(),
+            ));
+            let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+            analytics::finish_proxied_response(
+                analytics_on,
+                &mut headers,
+                &req.headers,
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path: &req.path,
+                    status: entry.status,
+                    cache_state: "STALE",
+                    client_ip: &ctx.client_ip,
+                    latency_ns: Some(latency_ns),
+                },
+                &mut state.traffic,
+            );
+            return Completion::Ready((
+                entry.status,
+                headers,
+                entry.body.to_vec(),
+                "cache".to_string(),
+            ));
+        }
+    }
 
     // Only re-derive an error page for a genuine connection-level failure (no
     // body to show). A completed round trip to a URL/proxy backend — even
@@ -5491,13 +5973,17 @@ fn run(args: Vec<String>) -> i32 {
         None
     };
 
-    // The generation ID, after the `--dump-config` and redirect-mode returns:
-    // a dump with `[genid]` and no StateDirectory prints and exits 0, because
-    // it is not about to serve. A source reads its state file once here, and a
-    // source with no state fails the start rather than serving a generation
-    // that a restart would renumber.
-    let genid = match config.genid {
-        None => genid::Genid::new(0, None),
+    // The generation state, after the `--dump-config` and redirect-mode
+    // returns: a dump with `[genid]` and no StateDirectory prints and exits 0,
+    // because it is not about to serve. A cache node holds no file. A source
+    // reads its state file once here, and a source with no state fails the
+    // start rather than serving a generation that a restart would renumber.
+    let genid = match &config.genid {
+        None => genid::Role::Source(genid::Genid::new(0, None)),
+        Some(cfg) if cfg.upstream.is_some() => genid::Role::Cache(genid::Follower::new(
+            cfg.heartbeat,
+            m6_core::platform::now(),
+        )),
         Some(_) => {
             let Some(directory) =
                 m6_core::platform::state_directory().filter(|directory| directory.is_absolute())
@@ -5510,7 +5996,7 @@ fn run(args: Vec<String>) -> i32 {
             };
             let path = directory.join("genid");
             match genid::read_state(&path) {
-                Ok(id) => genid::Genid::new(id, Some(path)),
+                Ok(id) => genid::Role::Source(genid::Genid::new(id, Some(path))),
                 Err(e) => {
                     eprintln!("config error: [genid] state file {}: {e}", path.display());
                     return 2;
@@ -5545,6 +6031,29 @@ fn run(args: Vec<String>) -> i32 {
         eprintln!("config error: {e}");
         return 2;
     }
+
+    // A cache node's heartbeat: the backend it asks, and the request bytes it
+    // copies into a slot, both fixed at start. `config::load` already refused
+    // an upstream that names no URL backend, so the index is always here.
+    let heartbeat_backend = config
+        .genid
+        .as_ref()
+        .and_then(|genid| genid.upstream.as_deref())
+        .and_then(|name| pool_manager.find_url(name));
+    let heartbeat_request = match (
+        heartbeat_backend,
+        config
+            .genid
+            .as_ref()
+            .and_then(|genid| genid.token.as_deref()),
+    ) {
+        (Some(idx), Some(token)) => {
+            let mut buf = Vec::with_capacity(256);
+            encode_heartbeat_request(pool_manager.url_backend(idx).host.as_str(), token, &mut buf);
+            buf
+        }
+        _ => Vec::new(),
+    };
 
     // Compute error mode
     let error_mode = ErrorMode::from_config(&config.errors);
@@ -5735,6 +6244,8 @@ fn run(args: Vec<String>) -> i32 {
         alt_svc_line,
         describedby_line,
         genid,
+        heartbeat_backend,
+        heartbeat_request,
     };
 
     if state.config.server.warm_on_start {
