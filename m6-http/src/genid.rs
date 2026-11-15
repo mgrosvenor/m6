@@ -129,6 +129,11 @@ pub struct Follower {
     rtt: Option<Duration>,
     /// How long between heartbeats.
     heartbeat: Duration,
+    /// The node is serving a disk copy at start whose ID no heartbeat has
+    /// confirmed. Cleared by the first successful answer, whichever ID it
+    /// names: a `Same` answer confirms the copy, and a `Changed` one flushes
+    /// it on the same turn.
+    unverified: bool,
 }
 
 /// What one heartbeat or forwarded request changed, so the caller logs the
@@ -147,6 +152,35 @@ pub enum Outcome {
     StillDown,
 }
 
+/// What the first heartbeat answer decides about a disk copy read at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    /// The answer named the ID the files carried: install the loaded cache.
+    Keep,
+    /// The answer named another ID: drop the loaded cache.
+    Discard,
+    /// The upstream did not answer: install the loaded cache, unverified.
+    Unverified,
+}
+
+/// The one decision the first heartbeat makes about a held disk load.
+///
+/// This is the same equality the store rule uses: content is only served
+/// under the ID it was written under. The first answer is the first time the
+/// node has an ID to compare, so it is the only place the held copy can be
+/// installed or dropped.
+pub fn settle(pending_id: u64, outcome: &Outcome) -> Settle {
+    match outcome {
+        Outcome::First(id) if *id == pending_id => Settle::Keep,
+        Outcome::First(_) => Settle::Discard,
+        Outcome::Down(_) => Settle::Unverified,
+        // The rest cannot be the first answer: before it the follower holds no
+        // ID, so `answered` returns only `First` or `Down`. If one ever
+        // arrives, an unconfirmed load is the unsafe reading, so it goes.
+        Outcome::Same | Outcome::Changed { .. } | Outcome::StillDown => Settle::Discard,
+    }
+}
+
 impl Follower {
     /// A follower that holds no ID and owes a heartbeat at `now`.
     pub fn new(heartbeat: Duration, now: Instant) -> Follower {
@@ -158,6 +192,7 @@ impl Follower {
             last_ok: None,
             rtt: None,
             heartbeat,
+            unverified: false,
         }
     }
 
@@ -172,6 +207,22 @@ impl Follower {
 
     pub fn rtt(&self) -> Option<Duration> {
         self.rtt
+    }
+
+    /// Whether the node is serving a disk copy its upstream has not confirmed.
+    pub fn unverified(&self) -> bool {
+        self.unverified
+    }
+
+    /// Hold `id` without an answer: the node serves the disk copy it read at
+    /// start, and the ID it carries is the one the files were written under.
+    ///
+    /// The next successful answer compares against this ID as usual, so an
+    /// unchanged site clears the flag and a changed one runs the same flush a
+    /// confirmed change would.
+    pub fn install_unverified(&mut self, id: u64) {
+        self.current = Some(id);
+        self.unverified = true;
     }
 
     /// Seconds since the last successful answer, for `/perf`.
@@ -207,6 +258,9 @@ impl Follower {
                 self.rtt = Some(rtt);
                 self.last_ok = Some(now);
                 self.down = false;
+                // A success confirms whatever copy the node is serving,
+                // including one installed unverified at start.
+                self.unverified = false;
                 match self.current {
                     None => {
                         self.current = Some(id);
@@ -749,5 +803,70 @@ mod tests {
         assert!(!f.heartbeat_due(later));
         f.behind(later);
         assert!(f.heartbeat_due(later));
+    }
+
+    // ── The settle of a disk load held from start ────────────────────────────
+
+    /// The first answer naming the ID the files carried installs the load.
+    ///
+    /// Break: return `Discard` for the matching ID, and the restarted node
+    /// throws away a cache whose site has not changed.
+    #[test]
+    fn settle_keeps_the_same_id() {
+        assert_eq!(settle(7, &Outcome::First(7)), Settle::Keep);
+    }
+
+    /// The first answer naming another ID drops the load: the site changed
+    /// while the node was down.
+    ///
+    /// Break: return `Keep` for every `First`, and this test fails.
+    #[test]
+    fn settle_discards_another_id() {
+        assert_eq!(settle(7, &Outcome::First(8)), Settle::Discard);
+        assert_eq!(settle(7, &Outcome::First(0)), Settle::Discard);
+    }
+
+    /// No answer installs the load unverified: the site serves from disk until
+    /// the source answers.
+    ///
+    /// Break: return `Discard` for `Down`, and a node whose source is down
+    /// starts with no pages at all.
+    #[test]
+    fn settle_installs_an_unanswered_upstream() {
+        assert_eq!(
+            settle(7, &Outcome::Down("connect failed")),
+            Settle::Unverified
+        );
+        assert_eq!(settle(7, &Outcome::Down("no M6-Genid")), Settle::Unverified);
+    }
+
+    /// An unverified install holds the file's ID, and the first success clears
+    /// the flag. A `Same` answer confirms the copy without a flush, and a
+    /// `Changed` one reports the change the caller flushes.
+    ///
+    /// Break: clear `unverified` in `install_unverified`, and the node claims
+    /// an upstream has confirmed the copy before one answered.
+    #[test]
+    fn an_unverified_install_is_cleared_by_the_first_success() {
+        let (mut f, t0) = follower();
+        assert_eq!(f.current(), None, "nothing is installed before a load");
+        f.install_unverified(7);
+        assert_eq!(f.current(), Some(7));
+        assert!(f.unverified());
+        assert_eq!(
+            f.answered(Ok((7, Duration::ZERO)), t0),
+            Outcome::Same,
+            "the disk ID is the ID, so an unchanged site is not a change"
+        );
+        assert!(!f.unverified(), "a success confirms the copy");
+        assert!(!f.down());
+
+        f.install_unverified(9);
+        assert_eq!(
+            f.answered(Ok((10, Duration::ZERO)), t0),
+            Outcome::Changed { from: 9, to: 10 },
+            "a changed site is the usual change, from the disk ID"
+        );
+        assert!(!f.unverified(), "a change clears the flag too");
     }
 }

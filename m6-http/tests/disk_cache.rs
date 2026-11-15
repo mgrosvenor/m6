@@ -399,6 +399,12 @@ impl Stack {
         }
     }
 
+    fn stop_source(&mut self) {
+        if let Some(mut svc) = self.source.take() {
+            svc.kill();
+        }
+    }
+
     fn source_output(&self) -> String {
         self.source
             .as_ref()
@@ -515,6 +521,29 @@ impl Stack {
         let block = self.disk_block();
         let pat = format!("\"{key}\":");
         block.split(&pat).nth(1).and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+        })
+    }
+
+    /// The `disk_cache.state` string from `/perf`.
+    fn disk_state(&self) -> Option<String> {
+        let block = self.disk_block();
+        block
+            .split("\"state\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .map(str::to_string)
+    }
+
+    /// A cumulative counter anywhere in the `/perf` report, such as
+    /// `cache_hits_total`. The cache node counts its own answers, so a hit on
+    /// the restarted node is visible there without reading the source's log.
+    fn perf_u64(&self, key: &str) -> Option<u64> {
+        let body = self.perf().text();
+        let pat = format!("\"{key}\":");
+        body.split(&pat).nth(1).and_then(|rest| {
             rest.split(|c: char| !c.is_ascii_digit())
                 .next()
                 .and_then(|n| n.parse().ok())
@@ -963,4 +992,221 @@ fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
         stack.cache_output()
     );
     assert_eq!(stack.generation_dirs(), vec!["1".to_string()]);
+}
+
+/// A restart whose source still holds the same ID starts warm: the first GET
+/// after the restart is a cache hit, served from the entry the previous
+/// process wrote, with no request reaching the source.
+///
+/// Break: install a load without waiting for the first heartbeat, and test b
+/// serves the old body on its first GET and fails. Break the load itself, and
+/// the first GET is a miss.
+#[test]
+fn a_restart_with_the_same_id_starts_warm() {
+    let mut stack = Stack::new();
+    stack.start();
+    assert!(
+        stack.wait_perf_id("0", Duration::from_secs(10)),
+        "/perf never showed the source's ID:\n{}",
+        stack.cache_output()
+    );
+    let served = stack.get_cache("/", &[]);
+    assert_eq!(served.status, 200);
+    assert_eq!(served.text(), "first: one");
+    assert!(
+        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        "no file appeared under the generation directory:\n{}",
+        stack.cache_output()
+    );
+
+    stack.stop_cache();
+    stack.start_cache();
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+            == Some("kept")),
+        "the restart never kept the disk copy: {:?}\n{}",
+        stack.disk_block(),
+        stack.cache_output()
+    );
+    assert_eq!(
+        stack.disk_u64("loaded_entries"),
+        Some(1),
+        "one served path is one loaded entry"
+    );
+    assert_eq!(stack.disk_u64("loaded_bad"), Some(0));
+
+    let hits = stack.perf_u64("cache_hits_total").expect("a hit counter");
+    let hit = stack.get_cache("/", &[]);
+    assert_eq!(hit.status, 200);
+    assert_eq!(
+        hit.text(),
+        "first: one",
+        "the restarted node served what it wrote"
+    );
+    assert!(hit.header("age").is_some(), "a cached hit carries its age");
+    assert_eq!(
+        stack.perf_u64("cache_hits_total"),
+        Some(hits + 1),
+        "the first GET after the restart is a hit, and a hit is the only path \
+         that increments this counter"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || stack
+            .cache_output()
+            .contains("disk cache kept")),
+        "the kept decision is logged:\n{}",
+        stack.cache_output()
+    );
+}
+
+/// A restart after a publish starts cold: the ID moved while the node was
+/// down, so the loaded copy is dropped, the first GET reaches the source and
+/// the old generation's directory is removed.
+///
+/// Break: keep the load on every first answer, and the first GET serves
+/// `first: one` from a generation the site has left.
+#[test]
+fn a_restart_after_a_publish_starts_cold() {
+    let mut stack = Stack::new();
+    stack.start();
+    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
+    assert!(
+        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        "the first generation never wrote a file:\n{}",
+        stack.cache_output()
+    );
+    stack.stop_cache();
+
+    // The publish happens while the cache node is stopped, which is the case a
+    // restart has to notice: its disk copy is one generation old.
+    std::fs::write(
+        stack.source_site.join("data/page.json"),
+        "{\"title\": \"two\"}",
+    )
+    .unwrap();
+    let token = stack.write_token();
+    let posted = stack.post_source("/genid", Some(&token));
+    assert_eq!(posted.status, 200, "{}", posted.text());
+    assert_eq!(posted.genid(), "1");
+
+    stack.start_cache();
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+            == Some("discarded")),
+        "the restart never discarded the old generation: {:?}\n{}",
+        stack.disk_block(),
+        stack.cache_output()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || stack.cache_output().contains(
+            "disk cache discarded: the site changed while this node was down"
+        )),
+        "the reason is logged:\n{}",
+        stack.cache_output()
+    );
+    let served = stack.get_cache("/", &[]);
+    assert_eq!(served.status, 200);
+    assert_eq!(
+        served.text(),
+        "first: two",
+        "the first GET reached the source's new generation"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || !stack
+            .cache_dir
+            .join("0")
+            .exists()),
+        "the old generation's directory was never removed:\n{}",
+        stack.cache_output()
+    );
+    assert_eq!(stack.generation_dirs(), vec!["1".to_string()]);
+}
+
+/// A restart with the source down serves the disk copy unverified, and the
+/// first successful heartbeat confirms it. Nothing is flushed while the site
+/// has not changed, and the first publish after the recovery flushes it.
+///
+/// Break: discard the load when no answer arrives, and the node has no pages
+/// with its source down.
+#[test]
+fn a_restart_with_the_source_down_serves_the_disk_copy() {
+    let mut stack = Stack::new();
+    stack.start();
+    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
+    assert!(
+        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        "the first generation never wrote a file:\n{}",
+        stack.cache_output()
+    );
+    stack.stop_cache();
+    stack.stop_source();
+
+    stack.start_cache();
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+            == Some("unverified")),
+        "the restart never served the disk copy unverified: {:?}\n{}",
+        stack.disk_block(),
+        stack.cache_output()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || stack.cache_output().contains(
+            "disk cache served unverified: the upstream did not answer"
+        )),
+        "the unverified install is logged:\n{}",
+        stack.cache_output()
+    );
+    let offline = stack.get_cache("/", &[]);
+    assert_eq!(offline.status, 200, "a cache serves what it has when down");
+    assert_eq!(offline.text(), "first: one");
+
+    // The source keeps its state directory, so its ID is still 0.
+    stack.start_source();
+    assert!(
+        wait_until(Duration::from_secs(10), || stack
+            .genid_block()
+            .contains("\"upstream_down\":false")),
+        "the cache node never reconnected:\n{}",
+        stack.cache_output()
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+            == Some("kept")),
+        "the confirmed disk copy is kept: {:?}\n{}",
+        stack.disk_block(),
+        stack.cache_output()
+    );
+    assert_eq!(stack.perf_id().as_deref(), Some("0"));
+    let hits = stack.perf_u64("cache_hits_total").expect("a hit counter");
+    let unchanged = stack.get_cache("/", &[]);
+    assert_eq!(unchanged.text(), "first: one");
+    assert_eq!(
+        stack.perf_u64("cache_hits_total"),
+        Some(hits + 1),
+        "an unchanged site is not flushed"
+    );
+
+    std::fs::write(
+        stack.source_site.join("data/page.json"),
+        "{\"title\": \"two\"}",
+    )
+    .unwrap();
+    let token = stack.write_token();
+    let posted = stack.post_source("/genid", Some(&token));
+    assert_eq!(posted.status, 200, "{}", posted.text());
+    assert_eq!(posted.genid(), "1");
+    assert!(
+        stack.wait_perf_id("1", Duration::from_secs(10)),
+        "the cache never followed the publish:\n{}",
+        stack.cache_output()
+    );
+    let fresh = stack.get_cache("/", &[]);
+    assert_eq!(fresh.status, 200);
+    assert_eq!(
+        fresh.text(),
+        "first: two",
+        "the publish flushed the loaded copy, so the GET reached the source"
+    );
 }

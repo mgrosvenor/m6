@@ -643,28 +643,42 @@ pub fn genid_address_ok(client_ip: &str, from_internal: bool) -> bool {
 /// m6-http adds the one field that is this binary's. A source reports the ID it
 /// owns and the peers that read it. A cache node reports the ID it follows,
 /// where it follows it from, and whether that upstream is answering.
+/// The disk-cache figures `/perf` adds, gathered so the response keeps one
+/// argument for them: the writer's counters, the load's counts, and the first
+/// heartbeat's decision.
+pub struct DiskPerf<'a> {
+    pub writer: &'a crate::disk_cache::DiskWriter,
+    pub queued: usize,
+    pub loaded_entries: usize,
+    pub loaded_bad: usize,
+    pub state: crate::disk_cache::LoadState,
+}
+
 pub fn genid_perf_response(
     report: PerfReport,
     role: &crate::genid::Role,
     config: &GenidConfig,
-    disk: Option<&crate::disk_cache::DiskWriter>,
-    queued: usize,
+    disk: Option<DiskPerf<'_>>,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let mut value = serde_json::to_value(&report)
         .unwrap_or_else(|_| serde_json::json!({"error": "serialisation failed"}));
     if let Some(object) = value.as_object_mut() {
         object.insert("genid".to_string(), genid_block(role, config));
-        if let Some(writer) = disk {
+        if let Some(disk) = disk {
+            let writer = disk.writer;
             object.insert(
                 "disk_cache".to_string(),
                 serde_json::json!({
                     "dir_bytes": writer.dir_bytes(),
-                    "queued": queued,
+                    "queued": disk.queued,
                     "written_last_tick": writer.written_last_tick(),
                     "written_bytes_last_tick": writer.written_bytes_last_tick(),
                     "skipped_full": writer.skipped_full(),
                     "ticks": writer.ticks(),
                     "tick_last_ns": writer.tick_last_ns(),
+                    "loaded_entries": disk.loaded_entries,
+                    "loaded_bad": disk.loaded_bad,
+                    "state": disk.state.as_str(),
                 }),
             );
         }
