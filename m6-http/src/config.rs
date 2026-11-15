@@ -21,6 +21,9 @@ pub struct Config {
     /// Where a source node's generation ID comes from, and who may read or
     /// advance it. `None` means this node has no `/genid`.
     pub genid: Option<GenidConfig>,
+    /// A cache node's disk cache directory. `None` means the node keeps its
+    /// cache in memory only.
+    pub cache_dir: Option<PathBuf>,
     pub backends: Vec<BackendConfig>,
     pub routes: Vec<RouteConfig>,
     pub route_groups: Vec<RouteGroupConfig>,
@@ -760,6 +763,9 @@ struct RawSiteToml {
     security: Option<SecurityConfig>,
     auth: Option<AuthConfig>,
     genid: Option<RawGenid>,
+    /// The disk cache directory. Node state, so the table is refused in
+    /// `site.toml` in two-file mode.
+    cache: Option<RawCache>,
     #[serde(rename = "backend", default)]
     backends: Vec<BackendConfig>,
     #[serde(rename = "route", default)]
@@ -808,6 +814,16 @@ struct RawSystemToml {
     /// The generation-ID endpoint. Node state: a site's content ships to every
     /// node, its publish claims do not.
     genid: Option<RawGenid>,
+    /// The disk cache directory. Node state, so it belongs beside the node's
+    /// credentials rather than in the site that ships to every node.
+    cache: Option<RawCache>,
+}
+
+/// The `[cache]` keys. A cache node may point `dir` at a directory it owns.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawCache {
+    dir: Option<String>,
 }
 
 /// The `[genid]` keys. A source sets the two claims. A cache node sets
@@ -1026,13 +1042,14 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // mode, the one file in one-file mode. The system config is parsed strictly
     // only when it is a second file, so a one-file config is not refused for the
     // site-only keys it necessarily carries.
-    let (node_server, node, auth, node_health, raw_genid) = if one_file {
+    let (node_server, node, auth, node_health, raw_genid, raw_cache) = if one_file {
         (
             site_parsed.server.clone().unwrap_or_default(),
             site_parsed.node,
             site_parsed.auth,
             None,
             site_parsed.genid,
+            site_parsed.cache,
         )
     } else {
         let system_parsed: RawSystemToml = toml::from_str(&system_raw)
@@ -1043,6 +1060,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             system_parsed.auth,
             system_parsed.health,
             system_parsed.genid,
+            system_parsed.cache,
         )
     };
     let site_server = site_parsed.server.unwrap_or_default();
@@ -1438,6 +1456,37 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     };
 
+    // The disk cache. A cache node only, because a source sits beside its
+    // backends and a cold source cache costs one local render per page, while
+    // a cache node's cold miss crosses the network. The directory must be
+    // absolute and writable by this process: a probe file is created and
+    // removed at start, so an unwritable mount fails the start rather than
+    // every later write.
+    let cache_dir = match raw_cache {
+        None => None,
+        Some(raw) => {
+            let dir = raw.dir.ok_or_else(|| {
+                anyhow::anyhow!("config error: [cache] needs dir = \"<absolute path>\"")
+            })?;
+            let is_cache_node = genid.as_ref().is_some_and(|g| g.upstream.is_some());
+            if !is_cache_node {
+                anyhow::bail!("config error: [cache].dir is for a cache node ([genid] upstream)");
+            }
+            let path = PathBuf::from(&dir);
+            if !path.is_absolute() {
+                anyhow::bail!("config error: [cache].dir must be an absolute path");
+            }
+            let probe = path.join(".m6-probe");
+            match std::fs::write(&probe, b"") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => anyhow::bail!("config error: [cache].dir {}: {e}", path.display()),
+            }
+            Some(path)
+        }
+    };
+
     Ok(Config {
         site: SiteConfig {
             name: site_name,
@@ -1455,6 +1504,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         security,
         auth,
         genid,
+        cache_dir,
         backends,
         routes,
         route_groups,
@@ -1481,7 +1531,7 @@ const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "me
 ///
 /// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
 /// `[node]` in `site.toml` is named here so `load` refuses it.
-const NODE_SECTIONS: &[&str] = &["auth", "genid", "node"];
+const NODE_SECTIONS: &[&str] = &["auth", "cache", "genid", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
 const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
@@ -3039,8 +3089,8 @@ domain = "test.example.com"
             health,
             ["metrics_peers", "metrics_require", "metrics_token_file"]
         );
-        assert_eq!(NODE_SECTIONS, ["auth", "genid", "node"]);
-        assert_eq!(all.len(), 12 + 3 + 3);
+        assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "node"]);
+        assert_eq!(all.len(), 12 + 3 + 4);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
@@ -3159,5 +3209,178 @@ domain = "test.example.com"
         let e = r.unwrap_err().to_string();
         assert!(e.contains("[[route]] /x"), "{e}");
         assert!(e.contains("Cache-Control"), "{e}");
+    }
+
+    // ── [cache] dir ────────────────────────────────────────────────────────
+
+    /// The site and system config of a cache node, ready for a `[cache]`
+    /// table to be appended to the system file. The token file exists, and the
+    /// origin is a URL backend.
+    fn setup_cache_node(dir: &Path) {
+        write_file(
+            dir,
+            "site.toml",
+            "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n\
+             [[backend]]\nname = \"origin\"\nurl = \"https://127.0.0.1:9443\"\ntls_skip_verify = true\n\n\
+             [[route]]\npath = \"/\"\nbackend = \"origin\"\n",
+        );
+        write_file(
+            dir,
+            "system.toml",
+            "[node]\nname = \"edge-a\"\n\n\
+             [server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n\
+             [genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+        );
+        write_file(dir, "cert.pem", "dummy");
+        write_file(dir, "key.pem", "dummy");
+        write_file(dir, "genid-token", "read-token\n");
+    }
+
+    fn append_to_system(dir: &Path, extra: &str) {
+        let path = dir.join("system.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(extra);
+        std::fs::write(&path, text).unwrap();
+    }
+
+    /// On a cache node `[cache] dir` is read into `Config::cache_dir`, and the
+    /// start-time probe leaves no file behind.
+    ///
+    /// Break: skip the probe removal, and `.m6-probe` stays in the directory.
+    #[test]
+    fn a_cache_node_reads_its_disk_directory() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        append_to_system(
+            dir.path(),
+            &format!("\n[cache]\ndir = \"{}\"\n", cache.display()),
+        );
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.cache_dir.as_deref(), Some(cache.as_path()));
+        assert!(
+            !cache.join(".m6-probe").exists(),
+            "the write probe file must be removed at start"
+        );
+    }
+
+    /// A relative directory is refused by name.
+    ///
+    /// Break: accept it, and the writer resolves it against the process's
+    /// working directory instead of the deployment's.
+    #[test]
+    fn a_relative_cache_dir_is_refused() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        append_to_system(dir.path(), "\n[cache]\ndir = \"cache\"\n");
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "config error: [cache].dir must be an absolute path");
+    }
+
+    /// A source may not have one. Its cache sits beside its backends, so a
+    /// warm restart is worth least there.
+    ///
+    /// Break: accept [cache] dir on a source, and `[cache] dir` is documented
+    /// for a node that never writes one.
+    #[test]
+    fn a_cache_dir_on_a_source_is_refused() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cache = dir.path().join("cache");
+        append_to_system(
+            dir.path(),
+            &format!("\n[cache]\ndir = \"{}\"\n", cache.display()),
+        );
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "config error: [cache].dir is for a cache node ([genid] upstream)"
+        );
+    }
+
+    /// The directory must exist and be writable by this process. A path that
+    /// is a file, and a path that is missing, both fail the start with the io
+    /// error and the path.
+    ///
+    /// Break: create the directory instead of probing it, and a typo in the
+    /// path starts a node that writes its cache somewhere nobody looks.
+    #[test]
+    fn an_unusable_cache_dir_is_refused_with_the_io_error_and_path() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        append_to_system(
+            dir.path(),
+            &format!("\n[cache]\ndir = \"{}\"\n", file.display()),
+        );
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with(&format!("config error: [cache].dir {}: ", file.display())),
+            "{e}"
+        );
+
+        let missing = dir.path().join("missing/deeper");
+        let mut sys = std::fs::read_to_string(dir.path().join("system.toml")).unwrap();
+        sys = sys.replace(
+            &format!("dir = \"{}\"", file.display()),
+            &format!("dir = \"{}\"", missing.display()),
+        );
+        std::fs::write(dir.path().join("system.toml"), sys).unwrap();
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with(&format!(
+                "config error: [cache].dir {}: ",
+                missing.display()
+            )),
+            "{e}"
+        );
+    }
+
+    /// A `[cache]` table with no `dir` is a mistake, not a node with the
+    /// default memory-only cache.
+    ///
+    /// Break: treat it as `None`, and the operator's misspelt key silently
+    /// does nothing.
+    #[test]
+    fn a_cache_table_without_dir_is_refused() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        append_to_system(dir.path(), "\n[cache]\n");
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "config error: [cache] needs dir = \"<absolute path>\"");
+    }
+
+    /// `[cache]` belongs to the system config, because it is this node's own
+    /// state.
+    ///
+    /// Break: accept it in site.toml, and a directory shared by every node is
+    /// written by every node.
+    #[test]
+    fn a_cache_section_in_site_toml_is_refused() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut site = std::fs::read_to_string(dir.path().join("site.toml")).unwrap();
+        site.push_str(&format!("\n[cache]\ndir = \"{}\"\n", cache.display()));
+        std::fs::write(dir.path().join("site.toml"), site).unwrap();
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[cache]"), "{e}");
+        assert!(e.contains("this node's own state"), "{e}");
+        assert!(e.contains("belongs in the system config"), "{e}");
     }
 }
