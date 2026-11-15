@@ -54,6 +54,7 @@ fn report_handler(site: &Site) {
             req
         }
         Handled::Code(..) | Handled::Done(_) => panic!("/ok is a named handler route"),
+        Handled::Reload(_) => panic!("/ok is not a reloaded route"),
     };
     let response = m6_core::Response::text("ok");
     alloc_count::trace::start();
@@ -81,6 +82,7 @@ fn report_template(site: &Site) {
         Handled::Named(..) | Handled::Code(..) => {
             panic!("a template route is answered by the site")
         }
+        Handled::Reload(_) => panic!("a template route is not reloaded"),
     }
     report("template /page, Site::handle", &sites);
 }
@@ -97,6 +99,7 @@ fn measure_handler(site: &Site) {
     let req = match handled {
         Handled::Named(_, req) => req,
         Handled::Code(..) | Handled::Done(_) => panic!("/ok is a named handler route"),
+        Handled::Reload(_) => panic!("/ok is not a reloaded route"),
     };
     let response = m6_core::Response::text("ok");
     let finished = site.finish(&req, response);
@@ -114,6 +117,7 @@ fn measure_template(site: &Site) {
         Handled::Named(..) | Handled::Code(..) => {
             panic!("a template route is answered by the site")
         }
+        Handled::Reload(_) => panic!("a template route is not reloaded"),
     }
 }
 

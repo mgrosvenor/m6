@@ -45,7 +45,14 @@ const HANDLER_BUDGET: usize = 29;
 /// count in the suite. The target is zero and this is today's count against
 /// it, so it may only ever be lowered, and ALLOC-3 carries the plan for the
 /// rest. Restoring the template-name `.clone()` costs one more.
-const TEMPLATE_BUDGET: usize = 51;
+///
+/// 51 on the branch; 55 on integration 6bb7a2f, where CACHE-HDR's
+/// `Site::finish` computes the page's `ETag` from its final bytes. That block
+/// is four allocations: three in the `format!` of the quoted hex value and
+/// one for the field name. The page's own validator is the integration's
+/// behaviour, not an allocation coming back, so the budget takes the measured
+/// integer; the rendered-page job (I-177) owns those four.
+const TEMPLATE_BUDGET: usize = 55;
 
 const BIG: &[u8] = b"GET /big HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
 const RAW: &[u8] = b"GET /raw HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
