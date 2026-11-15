@@ -140,7 +140,7 @@ def spawn(lang: str, binary: Path, stage: Path, sock: Path) -> subprocess.Popen:
         shutil.copy2(payload, site / "status.json")
         (site / "site.toml").write_text(
             '[site]\nname = "backend-example"\ndomain = "localhost"\n\n'
-            '[log]\nlevel = "error"\nformat = "text"\n'
+            '[log]\nlevel = "error"\n'
         )
         conf = stage / lang / "example.toml"
         conf.write_text('[log]\nlevel = "error"\n\n[server]\nsocket_mode = "0666"\n')
