@@ -376,8 +376,8 @@ cd examples/03-contact
 ### 4.1. `render-contact/Cargo.toml`
 
 `render-contact` is a Rust crate in the m6-examples workspace.
-Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that re-exports the *SMTP* transport.
-`lettre` supplies the transport itself, and `anyhow` and `serde_json` handle errors and JSON.
+Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that supplies the *SMTP* client a service's loop drives.
+`anyhow` and `serde_json` handle errors and JSON.
 
 ```toml
 [package]
@@ -387,7 +387,6 @@ edition = "2021"
 
 [dependencies]
 m6-core    = { path = "../../../../m6/m6-core", features = ["email"] }
-lettre     = { version = "0.11", features = ["smtp-transport", "native-tls"] }
 anyhow     = "1"
 serde_json = "1"
 ```
@@ -397,18 +396,22 @@ The relative path is why the m6 and m6-examples checkouts must sit side by side.
 ### 4.2. `render-contact/src/main.rs`
 
 `main.rs` has two functions plus `main`.
-`load_state` builds the *SMTP* transport from the config.
-`handle_post` reads the form and sends the message.
-`main` loads the site, calls `load_state` at start, and runs the loop.
+`load_state` builds the relay and its certificate store from the config.
+`message` builds one `Message`.
+`main` loads the site, calls `load_state` at start, and runs the loop with one `Smtp` slot per connection slot.
 
 ```rust
-use lettre::transport::smtp::authentication::Credentials;
+use std::sync::Arc;
+use std::time::Duration;
+
+use m6_core::email::{lettre, Relay, RelayConfig, Smtp};
 use m6_core::prelude::*;
+use m6_core::rustls::ClientConfig;
 
 struct Global {
-    mailer: SmtpTransport,
-    from:   String,
-    to:     String,
+    relay: Relay,
+    from:  String,
+    to:    String,
 }
 
 fn load_state(site: &Site) -> Result<Global> {
@@ -421,59 +424,57 @@ fn load_state(site: &Site) -> Result<Global> {
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.username missing")))?;
     let password = config["smtp"]["password"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.password missing")))?;
+    let starttls = config["smtp"]["starttls"].as_bool().unwrap_or(true);
     let from = config["smtp"]["from"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.from missing")))?.to_string();
     let to = config["smtp"]["to"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.to missing")))?.to_string();
 
-    let creds = Credentials::new(username.to_string(), password.to_string());
-    let mailer = SmtpTransport::relay(host)
-        .map_err(|e| Error::Other(e.into()))?
-        .port(port)
-        .credentials(creds)
-        .build();
+    let tls = if starttls {
+        Some(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(client::system_roots()
+                    .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?)
+                .with_no_client_auth(),
+        ))
+    } else {
+        None
+    };
+    let credentials = (!username.is_empty())
+        .then(|| (username.to_string(), password.to_string()));
+    let relay = Relay::new(&RelayConfig {
+        host: host.to_string(),
+        port,
+        starttls: tls,
+        credentials,
+        timeout: Duration::from_secs(20),
+    }).map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?;
 
-    Ok(Global { mailer, from, to })
+    Ok(Global { relay, from, to })
 }
 
-fn handle_post(req: &Request, global: &Global) -> Result<Response> {
-    let name    = req.field("name")?;
-    let email   = req.field("email")?;
-    let message = req.field("message")?;
-
+fn message(global: &Global, name: &str, email: &str, text: &str) -> Result<Message> {
     let from_addr: lettre::Address = global.from.parse()
         .map_err(|e: lettre::address::AddressError| Error::Other(anyhow::anyhow!("{e}")))?;
     let to_addr: lettre::Address = global.to.parse()
         .map_err(|e: lettre::address::AddressError| Error::Other(anyhow::anyhow!("{e}")))?;
 
-    let msg = Message::builder()
+    Message::builder()
         .from(lettre::message::Mailbox::new(None, from_addr))
         .to(lettre::message::Mailbox::new(None, to_addr))
         .subject(format!("Contact from {}", name))
-        .body(format!("From: {} <{}>\n\n{}", name, email, message))
-        .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?;
-
-    global.mailer.send(&msg).map_err(|e| Error::Other(e.into()))?;
-
-    Response::render_with("templates/contact.html", req, json!({"sent": true, "name": name}))
+        .body(format!("From: {} <{}>\n\n{}", name, email, text))
+        .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))
 }
-
-const ROUTES: &[CodeRoute] = &[
-    CodeRoute { pattern: "/contact", method: RouteMethod::Get },
-    CodeRoute { pattern: "/contact", method: RouteMethod::Post },
-];
-
-// Part E's `main` runs the loop from `m6-app-anatomy.md` section 2. Its start:
-let site = Site::load("render-contact", ROUTES, &[], &TeraFactory);
-let state = load_state(&site)?;
-// Its POST arm calls `handle_post(&req, &state)`.
-// Its GET arm renders the template the config route names.
 ```
 
-The snippet stops at start: part E adds the loop and its two `Handled::Code` arms.
 `load_state` runs once at startup, and the loop passes its value to each request arm.
-`handle_post` reads three fields, `name`, `email` and `message`, sends them, then renders the template again with `sent` set.
-The route's template in the config serves a GET to `/contact`, so the form appears on first visit.
+The POST arm builds one message and calls `smtp.start(&state.relay, &msg)` on its connection's slot.
+The connection's state becomes `Sending`, and the loop registers `smtp.fd()` with `smtp.interest()` under the outgoing token and puts `smtp.deadline()` in the outgoing `Timeouts`.
+The client's own token stays `READABLE` while it waits.
+When the outgoing token fires, `smtp.drive()` returns `Ok(None)` and the loop reregisters, or `Ok(Some(()))` and the handler renders `templates/contact.html` with `sent: true`, or `Err` and the handler answers with the cause.
+The outgoing deadline passing first answers 504.
+A client that closes while `Sending` frees its slot, which closes the relay connection.
 
 ### 4.3. `configs/render-contact.conf`
 
@@ -493,6 +494,8 @@ cache    = "no-store"
 [smtp]
 host     = "localhost"
 port     = 1025
+# The local development relay on localhost speaks plain SMTP. Production relays take STARTTLS on port 587: delete this line.
+starttls = false
 username = ""
 password = ""
 from     = "noreply@example.com"
@@ -500,7 +503,8 @@ to       = "owner@example.com"
 ```
 
 The `[smtp]` values are development defaults.
-In production they move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
+`starttls = false` is what lets the example talk to the local plain relay: m6-core refuses plain SMTP to any host but `localhost`, `127.0.0.1` or `::1`, so delete the line for a relay elsewhere.
+In production the values move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
 
 A key set in both files is refused at startup, and a missing secrets file is ignored, so the example runs with no setup.
 In production, deliver the secrets file with `LoadCredential=secrets.toml:/etc/m6/render-contact.toml` and set `secrets_file = "/run/credentials/render-contact.service/secrets.toml"`.

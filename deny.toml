@@ -117,10 +117,6 @@ allow = [
     # requirement at all. `quoted_printable`, via lettre, uses it.
     "0BSD",
     "OpenSSL",
-    # The Mozilla root certificate store, shipped as data by webpki-roots. The
-    # Community Data License Agreement is permissive; it governs the data set
-    # rather than code, which is why it is not one of the usual names.
-    "CDLA-Permissive-2.0",
 ]
 
 [bans]

@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
 The prelude is deliberately small.
 It exports `Site`, `Handled`, `CodeRoute` and `RouteMethod`, `Dict`, `Error` and `Result`, `Request` and `Response`, `ServerConn`, `Read`, `Flush` and `head_slots`, the event module's `Timeouts`, `Slots` and `LoopTrace`, the platform layer's `Signals`, `Signal`, `Poll`, `Events`, `Interest` and `Token`, `listen_unix`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
-Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, lettre's `Message`, `SmtpTransport` and `Transport`, `ureq`, and `rusqlite`.
+Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, `Message`, `Relay`, `RelayConfig`, `Smtp` and `Endpoint`, and `rusqlite`.
 
 A service that renders no templates says so, and takes core with `default-features = false` to stop linking Tera.
 
@@ -87,8 +87,8 @@ Table 2 gives the nine features.
 | `multipart` | off | `multipart` module, `Request::file`. Pulls multer, tokio, bytes, futures-util. |
 | `flash` | off | `Response::flash` and *HMAC* (hash-based message authentication code) signed one-shot messages. Pulls hmac, sha2. |
 | `csrf` | off | *CSRF* (cross-site request forgery) token generation in the request dictionary, and `Request::verify_csrf`. No new dependencies. |
-| `email` | off | `lettre` in the prelude. |
-| `http-client` | off | `ureq` in the prelude. |
+| `email` | off | `email` module: an SMTP client a service's loop drives (`Relay`, `Smtp`), and lettre for building messages. Pulls lettre without its transport. |
+| `http-client` | off | `client::Endpoint`: a form POST to a URL resolved at start, driven by the service's loop on `client::Upstream`. Pulls url. |
 | `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite with bundled SQLite. |
 
 **Table 2: the nine features, their defaults and what each one compiles.**
@@ -120,6 +120,8 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
+| | `client` | `Upstream`, `Addr`, `TlsClient`, `Reply` and `system_roots`: one outgoing HTTP request a loop drives. `Endpoint` is behind `http-client`. |
+| | `email` | `Relay`, `RelayConfig`, `Smtp` and `SmtpError`: an SMTP client a loop drives. Feature `email`. |
 | **Request and response** | `dict` | The request dictionary: a shared base plus a per-request overlay. |
 | | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, and percent-encoding. |
 | | `response` | `Response`, every constructor a handler needs, and `send`. |
@@ -372,7 +374,30 @@ Error keys need no step, because they arrive as query parameters at the query st
 The page path allocates on every request today: the owned `Request` and its dictionary, Tera and compression.
 EL-6a measures that count in `site_allocs` and ALLOC-3 reduces it.
 
-Those modules are a service's own parts: its configuration, its socket helpers, its signals, its renderer and the site's request path.
+### 4.7. `email` and `client::Endpoint`
+
+A service that sends mail or posts a form does both as work its own loop drives.
+The `email` feature compiles the `email` module: `Relay`, `RelayConfig`, `Smtp` and `SmtpError`, plus lettre for building a `Message`.
+The `http-client` feature compiles `client::Endpoint` on the `client::Upstream` a loop already drives.
+Neither blocks, and neither starts a thread.
+
+**email.** `Relay::new(&RelayConfig { .. })` runs at start.
+It refuses plain SMTP to any host but `127.0.0.1`, `::1` or `localhost`, resolves the host once with `net::resolve`, and reads the EHLO name.
+A host that does not resolve is an error, so the service stops at start, and a relay whose address changes needs a restart.
+`Smtp::new(read_cap, write_cap)` makes one slot per outgoing table entry, with its buffers.
+`Smtp::start` keeps the bytes from `formatted()` and begins a non-blocking connect.
+The service registers `fd()` with `interest()`, keeps the deadline from `deadline()` in its outgoing `Timeouts`, and calls `drive()` when the token fires.
+`Ok(None)` reregisters and returns to the loop, `Ok(Some(()))` means the relay accepted the message, and `Err` names the step, the relay's code and its first line.
+The service answers 504 when its deadline passes first, and `close()` drops the connection and frees the slot.
+The connection's state is one `enum` of steps inside the slot, so the service's loop has one arm per outgoing token.
+Plain SMTP is accepted only to a relay on the same host.
+
+**client::Endpoint.** `Endpoint::new(url, tls)` runs at start: it parses an `http` or `https` URL, resolves the host once, and keeps the `Host` header, path and query.
+`post_form(&mut up, fields, deadline)` encodes `application/x-www-form-urlencoded` straight into the `Upstream`'s request buffer and starts it, and the service drives the `Upstream` as it drives an `Smtp`.
+One connection per call, with `Connection: close`, so there is no idle list.
+`m6_core::rustls` re-exports the TLS library, so a service names `m6_core::rustls::ClientConfig` and takes no `rustls` dependency of its own.
+
+These two modules sit beside the loop, not in it.
 Section 5 turns to the objects a handler receives and returns.
 
 ---
