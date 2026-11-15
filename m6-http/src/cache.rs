@@ -2492,10 +2492,11 @@ mod not_modified_header_tests {
     /// client can update its stored response from it.
     #[test]
     fn a_304_carries_the_selected_representation_metadata() {
+        let cc = "public, max-age=0, must-revalidate, s-maxage=86400";
         let out = not_modified_headers(&h(&[
             ("etag", "\"abc\""),
             ("last-modified", "Sat, 05 Sep 2026 12:00:00 GMT"),
-            ("cache-control", "public, max-age=60"),
+            ("cache-control", cc),
             ("vary", "Accept-Encoding"),
             ("date", "Sat, 05 Sep 2026 12:00:01 GMT"),
         ]));
@@ -2503,6 +2504,16 @@ mod not_modified_header_tests {
         for want in ["etag", "last-modified", "cache-control", "vary", "date"] {
             assert!(names.contains(&want.to_string()), "304 dropped {want}");
         }
+        // The same values, not merely the same names: a client replaces its
+        // stored entry from this response, so a stale or rewritten directive
+        // would change how it caches the representation.
+        let value = |name: &str| {
+            out.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("etag"), Some("\"abc\""));
+        assert_eq!(value("cache-control"), Some(cc));
     }
 
     /// The damaging omission. A client updating its stored entry from a 304

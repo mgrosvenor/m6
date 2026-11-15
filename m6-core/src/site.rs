@@ -579,7 +579,14 @@ impl Site {
         // Minification, then compression: minifying first compresses better.
         // Both are skipped for a `verbatim` response, which a handler has
         // already decided. A streamed body has no bytes and no flag.
-        if !resp.verbatim {
+        //
+        // A cache keeps what it stores, so minification is paid once per fill
+        // and its saving collected on every hit. A `no-store` response has no
+        // second hit, so the cost lands on every request, where it is about
+        // what rendering the page costs, for a few bytes saved after
+        // compression. The default ETag is skipped by the same rule in
+        // `response.rs`.
+        if !resp.verbatim && !crate::response::cache_control_no_store(&resp.headers) {
             if let Some(bytes) = resp.body.as_bytes() {
                 if !bytes.is_empty() {
                     let content_type =
@@ -630,6 +637,26 @@ impl Site {
                     // which RFC 9110 12.5.3 permits.
                     _ => {}
                 }
+            }
+        }
+
+        // Give a successful page a validator while its bytes are final.
+        //
+        // The body is minified and compressed, so an ETag computed here names
+        // the representation that goes on the wire. A page that arrives at the
+        // edge without a tag cannot be revalidated: the browser would have to
+        // take the whole document again, and the edge could not answer
+        // `If-None-Match` from its stored copy. `Response::send` computes the
+        // same hash at serialisation; doing it here means the tag is part of
+        // the response the caller and its cache see, and `default_etag` having
+        // one rule stops a second tag from being added.
+        //
+        // Only successes: an ETag on a 404 or 500 invites a client to keep
+        // revalidating an error as though it were content.
+        if resp.status < 300 && !resp.verbatim && !resp.body.is_empty() {
+            if let Some(hash) = crate::response::default_etag(&resp.headers, &resp.body) {
+                resp.headers
+                    .push(("ETag".to_string(), format!("\"{hash:x}\"")));
             }
         }
 
@@ -2271,8 +2298,8 @@ fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<
     None
 }
 
-/// A renderer that renders nothing: these tests route and finish, they do
-/// not render templates.
+/// The renderer for the test sites: the template engine when the
+/// `templates` feature is on, and the no-op renderer otherwise.
 #[cfg(test)]
 fn test_renderer() -> &'static dyn RendererFactory {
     #[cfg(feature = "templates")]
@@ -2290,14 +2317,20 @@ mod tests {
     use super::*;
     use crate::h1::parse_head;
 
+    /// The `/login` template. The two-space runs and the blank line are what a
+    /// minifier removes, so `minify_tests` looks for them in a finished body as
+    /// the evidence that it did not run.
+    pub(super) const LOGIN_PAGE: &str = "<p>  a  </p>\n\n<p>  b  </p>";
+
     /// A site over a temp directory and the given config, with nothing loaded
     /// from the command line or the log.
-    fn site_from(toml: &str, named: &[&str]) -> (Site, tempfile::TempDir) {
+    pub(super) fn site_from(toml: &str, named: &[&str]) -> (Site, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("templates")).unwrap();
         // Written before the site is built: the renderer loads templates at
         // start, so a file written after would never be seen.
         std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
+        std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
         let config_path = dir.path().join("m6-site.toml");
         std::fs::write(&config_path, toml).unwrap();
         let config = crate::config::load(&config_path, dir.path()).unwrap();
@@ -2305,6 +2338,38 @@ mod tests {
             FrameworkState::build(config, dir.path().to_path_buf(), &[], test_renderer()).unwrap();
         let site = Site::from_state(state, named.iter().map(|n| (*n).to_string()).collect());
         (site, dir)
+    }
+
+    /// A page's default is the browser-caching pattern, and it carries an
+    /// ETag: the browser revalidates every time, the edge keeps it for a day,
+    /// and either can turn an unchanged page into a 304.
+    #[test]
+    fn a_page_defaults_to_revalidation_and_carries_an_etag() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            &[],
+        );
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut slots) {
+            crate::h1::HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        let response = match site.handle(&head) {
+            Handled::Done(response) => response,
+            _ => panic!("a template route is answered by core"),
+        };
+
+        assert_eq!(
+            crate::headers::get(&response.headers[..], "cache-control"),
+            Some(crate::config::PAGE_CACHE_CONTROL),
+            "the page must send the browser-caching pattern: {:?}",
+            response.headers
+        );
+        assert!(
+            crate::headers::get(&response.headers[..], "etag").is_some(),
+            "the finish path adds the ETag: {:?}",
+            response.headers
+        );
     }
 
     /// A config route naming a handler comes back with that handler's index in
@@ -3115,7 +3180,8 @@ mod config_route_handler_tests {
         (state, site_dir)
     }
 
-    /// What a browser sees: a script labelled `text/javascript` comes back
+    /// What a browser sees: a script route with no `cache` key defaults to
+    /// `no-store`, and the script labelled `text/javascript` still comes back
     /// brotli-compressed under the default config.
     #[test]
     fn a_text_javascript_response_is_brotli_compressed_by_default() {
@@ -3151,6 +3217,10 @@ mod config_route_handler_tests {
         let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
         assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(
+            head.contains("cache-control: no-store"),
+            "the route has no `cache` key, so it defaults to no-store: {head}"
+        );
         assert!(head.contains("content-encoding: br"), "{head}");
     }
 
@@ -3236,7 +3306,10 @@ tail = false
         assert_eq!(explicit.routes.routes()[0].cache, "public, max-age=60");
 
         let (template, _d3) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
-        assert_eq!(template.routes.routes()[0].cache, "public");
+        assert_eq!(
+            template.routes.routes()[0].cache,
+            crate::config::PAGE_CACHE_CONTROL
+        );
     }
 
     /// `Last-Modified` is derived from templates and params files, so it
@@ -4060,6 +4133,100 @@ mod route_rule_tests {
         assert!(
             err.to_string().contains("can both answer GET /blog/x"),
             "{err}"
+        );
+    }
+}
+
+/// The finish path's minification rule: a response a cache keeps is minified
+/// once per fill, and a response no cache keeps goes out as it rendered.
+#[cfg(test)]
+mod minify_tests {
+    use super::tests::{site_from, LOGIN_PAGE};
+    use super::*;
+    use crate::h1::{parse_head, HeadResult};
+
+    /// One `GET` through `Site::handle`, with the client's `Accept-Encoding`.
+    fn handle_get(site: &Site, path: &str, accept_encoding: &str) -> Handled {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {accept_encoding}\r\n\r\n"
+        );
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(request.as_bytes(), &mut slots) {
+            HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        site.handle(&head)
+    }
+
+    /// A cache keeps nothing of a `no-store` page, so minifying it is paid on
+    /// every request and never repaid. The page must leave `handle` with the
+    /// bytes the template rendered, spaces and blank line intact.
+    #[test]
+    fn a_no_store_page_is_sent_unminified() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
+             cache = \"no-store\"\n",
+            &[],
+        );
+        match handle_get(&site, "/login", "identity") {
+            Handled::Done(resp) => {
+                let body = resp.body.as_bytes().expect("a rendered page is buffered");
+                assert_eq!(
+                    body,
+                    LOGIN_PAGE.as_bytes(),
+                    "a no-store page must carry the template's whitespace: {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+            _ => panic!("a template route comes back Done"),
+        }
+    }
+
+    /// A cacheable page is minified once and served to many hits, which is
+    /// where its saving is collected. Its whitespace must be gone.
+    #[test]
+    fn a_cacheable_page_is_still_minified() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n",
+            &[],
+        );
+        match handle_get(&site, "/login", "identity") {
+            Handled::Done(resp) => {
+                let body = resp.body.as_bytes().expect("a rendered page is buffered");
+                assert!(
+                    !body.windows(2).any(|pair| pair == b"  "),
+                    "a public page is minified, so no two spaces remain: {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+            _ => panic!("a template route comes back Done"),
+        }
+    }
+
+    /// A config route naming a handler defaults to `no-store`, so its answer
+    /// is unminified for the same reason. JSON is a minified type by default,
+    /// and this body is deliberately spaced.
+    #[test]
+    fn a_no_store_json_answer_is_sent_unminified() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/api\"\nhandler = \"json\"\n",
+            &["json"],
+        );
+        let req = match handle_get(&site, "/api", "identity") {
+            Handled::Named(0, req) => req,
+            Handled::Named(index, _) => panic!("`json` is index 0, got {index}"),
+            _ => panic!("a config route naming a handler comes back Named"),
+        };
+        let answer = Response::status(200)
+            .header("Content-Type", "application/json")
+            .body(b"{ \"a\": 1 }".to_vec());
+        let resp = site.finish(&req, answer);
+        assert_eq!(
+            resp.body
+                .as_bytes()
+                .expect("a handler's JSON answer is buffered"),
+            b"{ \"a\": 1 }".as_slice(),
+            "a no-store JSON answer must not be minified"
         );
     }
 }

@@ -342,7 +342,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on |
+| `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 11 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info` |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |
@@ -494,13 +494,13 @@ Table 6 gives the keys a `[[route]]` may carry.
 | `template` | a template to render, which needs no code at all |
 | `params` | JSON files merged into this route's request dictionary. A path holding `{placeholder}` resolves per request |
 | `status` | the status a template route answers with, default 200 |
-| `cache` | `public` or `no-store`. A handler route defaults to `no-store` and a template route to `public` |
+| `cache` | a `Cache-Control` value. A handler route defaults to `no-store` and a template route to `public, max-age=0, must-revalidate, s-maxage=86400` (`m6_core::PAGE_CACHE_CONTROL`) |
 | `methods` | exactly the methods this route answers, `GET` also answering `HEAD`. Omitted, it answers every method. An unknown name fails the load |
 | `headers` | extra response headers, as `[[key, value]]` pairs |
 | anything else | kept verbatim and read by the handler through `Request::route_setting` |
 
 **Table 6: the eight keys core defines on a `[[route]]`, and what happens to a ninth.**
-Take from it that the defaults for `cache` depend on the kind of route, because letting a handler route inherit `public` would put computed output in a shared cache by omission, and that core deliberately does not know what `root` means.
+Take from it that the defaults for `cache` depend on the kind of route, because letting a handler route inherit the page default would put computed output in a shared cache by omission, and that core deliberately does not know what `root` means.
 
 A route carrying both a template and a handler goes to the handler.
 Two routes that could answer one request are refused at load, so no request needs a tie-break.

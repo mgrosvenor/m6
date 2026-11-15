@@ -4,7 +4,8 @@
 //! On macOS every socket made here has `SO_NOSIGPIPE`, so a write to a closed
 //! peer is an error and never a signal. On Linux there is no such option and
 //! none is needed: the Rust runtime ignores `SIGPIPE` in every binary, so the
-//! same write is `BrokenPipe` on both.
+//! same write is `BrokenPipe` on both. `SO_REUSEPORT` is set only by
+//! [`listen_shared`], which is what lets several processes serve one port.
 //!
 //! The default socket buffer sizes differ (about 128 KiB on macOS, about
 //! 208 KiB on Linux, both tunable by the host). A test that depends on a size
@@ -12,7 +13,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::Path;
 
 pub use mio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
@@ -99,6 +100,54 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     Ok(TcpListener::from_std(std::net::TcpListener::from(
         OwnedFd::from(sock),
     )))
+}
+
+/// A non-blocking TCP listener and UDP socket bound to one address with
+/// `SO_REUSEPORT`, so several processes serve the same public port. Start only.
+///
+/// The option is set on each socket before its `bind`, which is the only point
+/// where it has an effect. Linux spreads a new TCP connection across the
+/// sockets that share a port by a hash of its 4-tuple and gives every UDP
+/// datagram to one socket. macOS spreads neither: the socket bound last to the
+/// port receives every connection and every datagram, so a second process there
+/// is a takeover rather than a scale-out. Nothing may assume an even spread on
+/// either target, and on Linux a QUIC client that changes address can land on
+/// another process.
+///
+/// m6-http opens it only for the public 443 port's TLS listener and its QUIC
+/// UDP socket, and for no other socket.
+///
+/// The TCP socket also carries `SO_REUSEADDR`, as [`listen_tcp`] does, so a
+/// restart rebinds a port whose connections are in `TIME_WAIT`. The returned
+/// pair are `std` sockets because the service's loop registers their
+/// descriptors itself.
+pub fn listen_shared(addr: SocketAddr) -> io::Result<(std::net::TcpListener, std::net::UdpSocket)> {
+    let tcp = socket2::Socket::new(
+        domain_of(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    os::prepare_socket(&tcp)?;
+    tcp.set_reuse_address(true)?;
+    tcp.set_reuse_port(true)?;
+    tcp.bind(&addr.into())?;
+    tcp.listen(128)?;
+    tcp.set_nonblocking(true)?;
+
+    let udp = socket2::Socket::new(
+        domain_of(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    os::prepare_socket(&udp)?;
+    udp.set_reuse_port(true)?;
+    udp.bind(&addr.into())?;
+    udp.set_nonblocking(true)?;
+
+    Ok((
+        std::net::TcpListener::from(OwnedFd::from(tcp)),
+        std::net::UdpSocket::from(OwnedFd::from(udp)),
+    ))
 }
 
 /// A non-blocking connect to a unix listener. It completes at once or fails.
@@ -210,4 +259,16 @@ fn domain_of(addr: SocketAddr) -> socket2::Domain {
         SocketAddr::V4(_) => socket2::Domain::IPV4,
         SocketAddr::V6(_) => socket2::Domain::IPV6,
     }
+}
+
+/// Ask the kernel to report a socket writable only while its send queue holds
+/// fewer than `bytes`, so a whole response body is not handed over at once and
+/// the order m6 frames it in is the order it leaves.
+///
+/// Linux sets `TCP_NOTSENT_LOWAT`. macOS has no equivalent, so its kernel order
+/// stands and this is a no-op. A kernel that will not set the option still
+/// sends everything, in its own order, so the caller logs the error rather than
+/// refusing the connection.
+pub fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
+    super::os::limit_send_queue(fd, bytes)
 }

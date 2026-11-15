@@ -187,7 +187,10 @@ mod tests {
         let bytes = resp.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert!(text.contains("Content-Length: 0\r\n"));
+        // RFC 9110 8.6: a 204 MUST NOT carry Content-Length. This test used to
+        // assert the opposite, which is the `Content-Length: 0` the core writer
+        // added to every bodyless status.
+        assert!(!text.to_ascii_lowercase().contains("content-length"));
         assert!(text.ends_with("\r\n\r\n"));
     }
 }
