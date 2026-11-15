@@ -48,6 +48,8 @@ No existing field changes, so no migration is needed.
 
 ### Migration
 
+**Remove `format` from `[log]`.** Every service now writes JSON lines through m6-log, so there is no format to choose, and a config that still sets `[log] format` is refused at start with "unknown key [log] format". m6-core's `LogHandle`, `init`, `init_with_analytics`, `reopen_log_file` and `Reopened` are gone; a service sets up logging through m6-log.
+
 **Every setting that names a secret, key or certificate takes an absolute path, and a relative one stops the service at startup with exit 2, naming the setting: `secrets_file` (every service built on m6-core), `[server] tls_cert`, `tls_key`, `[auth] public_key` and `[health] metrics_token_file` (m6-http), `[storage] path`, `[keys] private_key` and `[keys] public_key` (m6-auth-server and m6-auth-cli), and `perf_token_file` (m6-monitor).** Before upgrading, replace each relative value with the absolute path it resolved to. m6-http resolved them against the site directory. m6-auth-server and m6-auth-cli resolved `[keys]` against the site directory and `[storage] path` against the config file's directory, so `configs/m6-auth.conf` with `path = "data/auth.db"` used `<site>/configs/data/auth.db`. m6-core and m6-monitor resolved them against the working directory. `m6-auth-cli token create` no longer takes `--site-dir`. The documented production layout delivers m6-http's certificate, key and auth public key through systemd `LoadCredential` as well, and a certificate renewal restarts m6-http: a deployment that follows it changes its certbot deploy hook from a touch of the system config to `systemctl restart` of the m6-http unit.
 
 **m6-http refuses at start, with exit 2, a config it used to warn about.** That covers a key or section it does not know, a key in the file it does not belong to (docs/m6-site-toml.md §3.3, Table 1), a system config with no `[node]`, a `[health] metrics_token_file` that is missing, empty or set together with `metrics_require`, and a cache key on a `[[route]]` or `[[route_group]]` (set `Cache-Control` on the backend's response instead).
@@ -253,6 +255,10 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**Every m6 service and m6-core log through m6-log, and `tracing` is gone.** The log lines are written into m6-log's buffer inside the event loop and flushed by it, so no service has a logging thread or a `tracing` subscriber any more.
+
+**m6-http's per-request analytics line allocates nothing.** The line is built from borrowed request fields straight into m6-log's buffer. Verified with `analytics_allocs`: 0 allocations in 1000 returning-visitor requests and 0 in 1000 new-session requests, with all 2002 lines written. The one allocation left is the `Set-Cookie` value for a new session, once per visitor rather than once per request.
 
 **Choosing a backend socket is plain round robin, and a request whose connect fails tries the next member.** The least-connections choice and the 1 to 30 second per-member backoff are gone, with the failure count and the retry deadline they read. Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members, and a client receives 502 only when every member has failed. A backend that stops and restarts on the same path serves again on its next turn. The `/perf` pool counts report every member as in rotation. Verified on the sandbox with a real `m6-http` in front of three and four unix-socket backends, and a member killed and then restarted on the same path.
 
