@@ -359,9 +359,15 @@ pub struct PerfReport {
     /// a network round trip inside a monitoring endpoint, which is how a
     /// monitoring endpoint learns to hang.
     pub url_backends: Vec<String>,
-    /// The TLS chain this process loaded, and how long each certificate has
-    /// left. Leaf first, so `tls[0]` is the certificate an *ACME* client
-    /// renews. Empty on a process serving no TLS.
+    /// The TLS chain this process loaded, how long each certificate has
+    /// left, and each certificate's SHA-256 fingerprint. Leaf first, so
+    /// `tls[0]` is the certificate an *ACME* client renews. Empty on a process
+    /// serving no TLS.
+    ///
+    /// The fingerprint is what tells two certificates with one expiry apart,
+    /// so a fleet can be checked for serving one certificate rather than for
+    /// expiring on one day. [`crate::tls::Fingerprint`] says what is hashed
+    /// and why. It is the DER a client already receives in the handshake.
     ///
     /// From the loaded material rather than from a file on disk, which is the
     /// whole value of reporting it here: a renewal that wrote a new certificate

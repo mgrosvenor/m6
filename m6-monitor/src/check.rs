@@ -467,9 +467,15 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         // certificate reported anywhere an operator does not already look is
         // reported nowhere. From the certificate m6-http loaded, so it is what
         // the node is serving rather than what is on its disk.
+        //
+        // The fingerprint sits beside the expiry because the expiry alone
+        // cannot tell two certificates apart when they expire on the same day,
+        // and issue #275 is that: a reader comparing two nodes needs the
+        // identity, not only the countdown. Twelve characters, like the build
+        // hash, enough to compare by eye.
         let _ = writeln!(
             o,
-            "        {} {} build {} cert {}",
+            "        {} {} build {} cert {} fp {}",
             n.binary.as_deref().unwrap_or("m6"),
             n.version
                 .as_deref()
@@ -480,6 +486,9 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
                 .unwrap_or("unknown"),
             n.cert_expires_in_seconds
                 .map(fmt_cert_expiry)
+                .unwrap_or_else(|| "-".into()),
+            n.cert_fingerprint
+                .map(|f| f.short())
                 .unwrap_or_else(|| "-".into()),
         );
     }

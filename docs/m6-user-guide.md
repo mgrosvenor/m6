@@ -999,6 +999,14 @@ systemctl restart m6-http
 
 systemd copies the certificate and key into m6-http's credential directory when the unit starts, so the hook restarts m6-http after each renewal, and until then m6-http serves the previous certificate.
 
+`/perf` reports each loaded certificate with its expiry and its SHA-256 fingerprint, and the fingerprint is the identity two certificates with one expiry do not share.
+It is the same value `openssl x509 -noout -fingerprint -sha256 -in fullchain.pem` prints, in lower-case hex with no colons, taken over the certificate's DER.
+Every client already receives those bytes in the handshake, so the value discloses nothing a visitor does not have.
+
+A fleet whose nodes share one certificate sets `[monitor] one_certificate = true`, and then a node whose leaf fingerprint differs is a fault in `/check` and in `/digest`.
+Without the key the monitor warns only when some nodes agree and one does not, and it stays silent for a two-node fleet and for two certificates that expire on the same day.
+Leave the key unset when each node renews its own certificate.
+
 ### 7.2. Secrets and state
 
 Every m6 setting that names a secret, key or certificate takes an absolute path, and a relative one stops the service at startup with exit 2, naming the setting.

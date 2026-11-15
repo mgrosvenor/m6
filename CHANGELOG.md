@@ -105,6 +105,8 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **A cache node needs `[genid] upstream = "<backend>"` and `token_file`, and the source must run this version first.** The token file is an absolute path to a token with the source's read claim, delivered like every other credential. A cache node stores nothing from an upstream that sends no `M6-Genid`, so a source older than this release cannot fill it.
 
+**`[monitor] one_certificate` is new and optional, default false.** A deployment whose fleet is meant to carry one certificate sets it to true to turn a differing node into a fault in `/check` and `/digest`. Leave it unset where each node renews its own certificate. `m6-monitor` ignores a `[monitor]` key it does not know, so an older monitor starts against a config that has this key and simply does not check it. No other setting changes.
+
 ### Added
 
 **CI fails when a document names a commit that no longer exists.** `tools/check-commit-hashes.sh` reads every tracked Markdown file and runs `git cat-file` on each lowercase hex token of 7 to 40 characters that names a commit.
@@ -207,6 +209,14 @@ Each replacement is one assignment, so a request sees the old generation or the 
 A request already holding an entry finishes on the content it took, and the old generation stays whole for every holder until it drops.
 The swap keeps the cache's byte bound and clears the serve-held policy, because it runs exactly when the upstream has answered with the new ID.
 Verified by the `cache.rs` generation swap tests, which pin the full flush, the held response and the old generation staying whole, the bound and the serve-held reset, and by `genid_cache_allocs.rs`, which measures 2 allocations for a 4096-entry swap and 0 in 2000 store checks and 1000 hits.
+
+**`/perf` reports a SHA-256 fingerprint of every certificate it loaded, so two certificates that expire on the same day are distinguishable, and `[monitor] one_certificate = true` declares that a fleet shares one certificate (#275).**
+`TlsCertificate.fingerprint` is 64 lower-case hex characters over the certificate's DER, the same value `openssl x509 -noout -fingerprint -sha256` prints.
+The whole certificate is hashed and not its key, because a renewal with the same key pair still issues a different certificate: the serial, the validity and the signature all change, and the fingerprint moves with them.
+The value is computed once per certificate when the chain is loaded, in `tls::record_loaded`, and never per request, and a node older than the field reports `null`, which the monitor reads as "cannot say".
+`m6-monitor` groups the fleet by the leaf fingerprint instead of by `notAfter`, so two certificates with one expiry no longer look like one certificate, and the check line gains `fp <12 hex>`.
+With `[monitor] one_certificate` set, a node whose leaf fingerprint differs is a fault, which is how a two-node fleet and a same-expiry reissue can be read, and a node that reports an expiry but no fingerprint is warned about instead of counted as agreement.
+Verified on 2026-11-16 on a macOS sandbox: `tls_reload` and the new unit tests pass, the fingerprint of two certificates issued into one second differs while their `notAfter` is equal, and each of the five new tests fails when its half is removed (no fingerprint computed at load, no fingerprint in the digest, the declaration ignored).
 
 ### Security
 
