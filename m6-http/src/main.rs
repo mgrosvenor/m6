@@ -6274,7 +6274,10 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     // The CLI --log-level overrides site.toml [log].level.
-    let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
+    let log_level = cli
+        .log_level
+        .as_deref()
+        .unwrap_or_else(|| config.log.level.as_deref().unwrap_or("info"));
     let level = match m6_core::log::parse_level(log_level) {
         Ok(level) => level,
         Err(e) => {
