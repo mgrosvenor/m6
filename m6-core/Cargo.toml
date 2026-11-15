@@ -120,6 +120,9 @@ rustls-native-certs = "0.8"
 tempfile  = "3"
 filetime  = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
+# The custom-harness tests speak libtest's protocol (`--list --format terse`,
+# `--exact <name>`), which is what `nextest` lists and runs.
+libtest-mimic = "0.8"
 # For `tls`'s tests, which parse real certificates rather than a fixture: a
 # checked-in certificate expires, and a test that starts failing on a date is a
 # test that gets deleted. `time` comes with them because rcgen's `not_after` is

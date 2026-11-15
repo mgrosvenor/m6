@@ -3,13 +3,15 @@
 //! This binary has its own `main` (`harness = false` in `Cargo.toml`) for two
 //! reasons. `tracing`'s subscriber is installed once per process, and
 //! `signal::block()` must run before any other thread exists, which the libtest
-//! harness does not allow. The check follows the order a
-//! rotation tool uses: rename the file, send the signal, wait for the path to
-//! reappear, then write again.
+//! harness does not allow. The harness speaks libtest's protocol through
+//! `libtest-mimic`, forced onto one thread so the check runs in `main`. The
+//! check follows the order a rotation tool uses: rename the file, send the
+//! signal, wait for the path to reappear, then write again.
 
 use std::path::Path;
 use std::time::Duration;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::monitoring::LoggingHealth;
 use m6_core::platform::{Signal, Signals};
 use m6_core::signal::{self, Action, Lifecycle};
@@ -24,11 +26,19 @@ fn lines(path: &Path) -> Vec<String> {
 }
 
 fn main() {
-    sigusr1_reopens_the_file_and_is_not_a_shutdown();
-    println!("sigusr1_reopens_the_file_and_is_not_a_shutdown ... ok");
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so `signal::block()` in the check still runs before any other
+    // thread exists.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "sigusr1_reopens_the_file_and_is_not_a_shutdown",
+        sigusr1_reopens_the_file_and_is_not_a_shutdown,
+    )];
+    libtest_mimic::run(&args, tests).exit();
 }
 
-fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
+fn sigusr1_reopens_the_file_and_is_not_a_shutdown() -> Result<(), Failed> {
     signal::block();
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("a.ndjson");
@@ -76,4 +86,6 @@ fn sigusr1_reopens_the_file_and_is_not_a_shutdown() {
         .reopen
         .expect("this process writes a file");
     assert!(reopen.seconds_since_last_reopen.unwrap() <= 1);
+    println!("sigusr1_reopens_the_file_and_is_not_a_shutdown ... ok");
+    Ok(())
 }
