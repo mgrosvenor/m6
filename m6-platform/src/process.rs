@@ -126,6 +126,18 @@ pub fn thread_count(pid: u32) -> io::Result<usize> {
     os::thread_count(pid)
 }
 
+/// The idle worker threads the host's certificate store leaves in a process
+/// after it has been read, as `(min, max)`.
+///
+/// The range is a platform fact, not a measurement: macOS reads the store
+/// through the Security framework, whose libdispatch workers stay behind
+/// (three or four, swinging between starts), while Linux reads the store's
+/// files and leaves no thread. A caller that counts a service's threads adds
+/// this range to the threads the service makes itself.
+pub fn certificate_store_workers() -> (usize, usize) {
+    os::certificate_store_workers()
+}
+
 /// How many descriptors the process `pid` holds open. `Err` for a pid that is
 /// gone.
 ///
