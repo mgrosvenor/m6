@@ -323,8 +323,23 @@ impl HeaderBuilder {
         buf[8..used_spans].copy_from_slice(&self.buf[8..used_spans]);
         let text = &self.buf[old_text_start..];
         let at = 8 + 16 * new_cap;
-        buf[at..at + text.len()].copy_from_slice(text);
-        buf.truncate(at + text.len());
+        // `at` is already `buf.len()` (the slot area was resized to it), so the
+        // text is appended rather than written through an index past the end.
+        buf.extend_from_slice(text);
+        // Spans are absolute offsets, so moving the text area shifts every one
+        // of them. Forgetting this read the wrong bytes: a header value that
+        // landed past the old end panicked on a range past the tape.
+        let delta = at as i64 - old_text_start as i64;
+        if delta != 0 {
+            for i in 0..self.count as usize {
+                let o = 8 + 16 * i;
+                for (a, b) in [(o, o + 4), (o + 8, o + 12)] {
+                    let off = u32::from_le_bytes(buf[a..b].try_into().unwrap());
+                    let shifted = (off as i64 + delta) as u32;
+                    buf[a..b].copy_from_slice(&shifted.to_le_bytes());
+                }
+            }
+        }
         self.buf = buf;
         self.cap = new_cap as u32;
     }
@@ -1973,6 +1988,29 @@ mod tests {
         let k1 = CacheKey::new("/blog", None, "gzip");
         let k2 = CacheKey::new("/blog", None, "br");
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn a_tape_survives_growing_past_its_reservation() {
+        let pairs: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("header-{i}"), format!("value-{i}-padding-padding")))
+            .collect();
+        let mut b = HeaderBuilder::with_capacity(pairs.len(), 0);
+        for (k, v) in &pairs {
+            b.push(k, v);
+        }
+        let block = b.freeze();
+        assert_eq!(block.to_pairs(), pairs);
+    }
+
+    #[test]
+    fn a_block_finds_fields_case_insensitively() {
+        let block = HeaderBlock::from_pairs(vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("set-cookie".to_string(), "a=b".to_string()),
+        ]);
+        assert_eq!(block.find("content-TYPE"), Some("text/html"));
+        assert_eq!(block.storable().len(), 1);
     }
 
     #[test]
