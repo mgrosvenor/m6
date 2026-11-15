@@ -2019,9 +2019,9 @@ pub use m6_core::h1::{parse_head, parse_request, HeadError, HeadResult, ParseRes
 /// length.
 ///
 /// The framing is unambiguous without it -- a 304 has no body by definition,
-/// and every protocol here signals end-of-message its own way (H1 closes or
-/// uses the next request boundary, H2/H3 use END_STREAM) -- so omitting it is
-/// both correct and safe. Emitting the *correct* non-zero length would also be
+/// and every protocol here signals end-of-message its own way (H1 uses the
+/// next request boundary, H2/H3 use END_STREAM) -- so omitting it is both
+/// correct and safe. Emitting the *correct* non-zero length would also be
 /// legal, but it would mean carrying the stored body's length through the 304
 /// path for no benefit to any client.
 pub fn status_may_have_content_length(status: u16) -> bool {
@@ -2120,11 +2120,13 @@ fn write_response(
         out.extend_from_slice(itoa::Buffer::new().format(cl).as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    // A response the recipient cannot frame must close, whatever either side
-    // would prefer: without Content-Length the body ends at end-of-connection,
-    // so keeping it open would make the next response unreadable.
-    let framed = status_may_have_content_length(status);
-    if keep_alive && framed {
+    // RFC 9112 6.3 rule 1: a 304 ends at the empty line whatever fields it
+    // carries, and a 204 or 1xx likewise, so a bodyless response is
+    // self-delimiting without Content-Length. Every other status got a
+    // Content-Length above. No response written here can be unframed, so
+    // none needs `close` for framing; announcing one makes every client drop
+    // a usable connection after a 304.
+    if keep_alive {
         out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
     } else {
         out.extend_from_slice(b"connection: close\r\n\r\n");
@@ -2389,7 +2391,7 @@ pub fn write_cached_h1(
         out.extend_from_slice(b"\r\n");
     }
 
-    if keep_alive && status_may_have_content_length(entry.status) {
+    if keep_alive {
         out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
     } else {
         out.extend_from_slice(b"connection: close\r\n\r\n");
@@ -2875,6 +2877,32 @@ mod bodyless_status_tests {
         let head = head_of(304);
         assert!(head.contains("ETag"), "304 lost its ETag:\n{head}");
         assert!(head.starts_with("HTTP/1.1 304 Not Modified"), "{head}");
+    }
+
+    /// RFC 9112 6.3 rule 1: a 304 ends at the empty line whatever its fields
+    /// say, so it is self-delimiting and has no framing reason to close. m6
+    /// advertised `connection: close` on every 304, so a client had to
+    /// reconnect for the next request even though the server stayed open.
+    #[test]
+    fn a_304_does_not_advertise_a_close() {
+        let raw = build_response(
+            304,
+            &[("ETag".to_string(), "\"x\"".to_string())],
+            b"",
+            "GET",
+            true,
+            None,
+        );
+        let head = String::from_utf8_lossy(&raw);
+        let head = head.split("\r\n\r\n").next().unwrap_or("").to_string();
+        assert!(
+            head.contains("connection: keep-alive"),
+            "a 304 must keep the connection:\n{head}"
+        );
+        assert!(
+            !head.contains("connection: close"),
+            "a 304 must not advertise a close:\n{head}"
+        );
     }
 }
 
