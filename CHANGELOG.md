@@ -297,6 +297,8 @@ Comments only.
 
 ### Changed
 
+**A cached HTTP/2 hit copies no request field, response header or body.** The request's decoded fields are ranges into a per-connection buffer, reused across streams, in place of a `String` per HPACK name and value. A cache hit is carried to the HTTP/2 writer as the cache entry itself, so the header list is borrowed from the entry's `Arc` and the body from its `Bytes`, and the fields a hit adds (`Alt-Svc`, merged `Vary`, `Age`, the described-by `Link`, `Set-Cookie`) are written at serialisation. Header names are lowercased into a reused scratch buffer rather than a new `String` per field, so the bytes on the wire are the same ones, lowercase as RFC 9113 8.2.1 requires. `h2_tls_hit` in `m6-http/tests/allocations.rs` fell from 91.000 to 15.000 calls per request, and its budget is now that integer with no allowance. Verified with the `count-allocations` guard, two new wire tests that decode the emitted block and assert lowercase names and single `Age`/`Vary`/`Alt-Svc` fields, and a break that restores each removed copy and puts the row over its budget.
+
 **Every m6 service and m6-core log through m6-log, and `tracing` is gone.** The log lines are written into m6-log's buffer inside the event loop and flushed by it, so no service has a logging thread or a `tracing` subscriber any more.
 
 **m6-http's per-request analytics line allocates nothing.** The line is built from borrowed request fields straight into m6-log's buffer. Verified with `analytics_allocs`: 0 allocations in 1000 returning-visitor requests and 0 in 1000 new-session requests, with all 2002 lines written. The one allocation left is the `Set-Cookie` value for a new session, once per visitor rather than once per request.

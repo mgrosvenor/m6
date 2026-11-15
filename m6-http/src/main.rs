@@ -715,7 +715,6 @@ struct EventLoopIo {
 /// miss that must go to a backend.
 enum Routed {
     Cached {
-        status: u16,
         entry: CachedResponse,
         age: std::time::Duration,
         set_cookie: Option<String>,
@@ -884,7 +883,6 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
         .filter(|_| analytics::is_html_response(&cached.headers))
         .map(analytics::session_cookie_header_value);
         return Routed::Cached {
-            status: cached.status,
             entry: cached,
             age,
             set_cookie,
@@ -919,27 +917,20 @@ fn on_request_impl(
         h2c,
     ) {
         Routed::Cached {
-            status,
             entry,
             age,
             set_cookie,
             ..
         } => {
-            let mut headers = (*entry.headers).clone();
-            set_alt_svc(&mut headers, quic_port);
-            set_vary_accept_encoding(&mut headers, true);
-            set_age(&mut headers, age);
-            set_describedby_link(&mut headers, &state.config.site.describedby);
-            if let Some(sc) = set_cookie {
-                headers.push(("Set-Cookie".to_string(), sc));
+            // The entry is shared (`Arc` headers, `Bytes` body), so a hit
+            // carries it by reference all the way to the writer. The fields a
+            // hit adds are written from their start-time values there, in
+            // place of cloning the header list to append them.
+            RequestOutcome::Cached {
+                entry,
+                age,
+                set_cookie,
             }
-            RequestOutcome::Ready(
-                status,
-                headers,
-                entry.body.to_vec(),
-                "cache".to_string(),
-                Some(entry.genid),
-            )
         }
         Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
         Routed::Miss {
@@ -1160,7 +1151,7 @@ fn drive_conn_token(
     };
     let mut drive = if is_h2c {
         match h2c.as_mut() {
-            Some(h) => h.drive_one(slot, state, &mut on_h2, registry),
+            Some(h) => h.drive_one(slot, state, &mut on_h2, &hit, registry),
             None => return ConnOutcome::Closed,
         }
     } else {

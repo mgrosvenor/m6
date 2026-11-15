@@ -1072,6 +1072,7 @@ impl H2cListener {
         key: usize,
         state: &mut S,
         on_request: &mut F,
+        hit: &HitHeaders,
         registry: &Registry,
     ) -> ConnDrive
     where
@@ -1092,6 +1093,7 @@ impl H2cListener {
             &conn.client_ip,
             state,
             on_request,
+            Some(hit),
             &mut drive.pending,
         );
         drive.moved = moved;
@@ -1223,6 +1225,7 @@ fn drive_conn<S, FH, FO>(
             &conn.client_ip,
             state,
             on_owned,
+            Some(hit),
             &mut drive.pending,
         );
         drive.moved |= moved;
@@ -1331,6 +1334,7 @@ fn drive_conn<S, FH, FO>(
                 &conn.client_ip,
                 state,
                 on_owned,
+                Some(hit),
                 &mut drive.pending,
             );
             drive.moved |= moved;
@@ -1683,8 +1687,28 @@ fn drive_h1<S, FH, FO>(
                                             h1.state = H1State::WaitingBackend;
                                             break; // the upstream's completion resumes this connection
                                         }
-                                        RequestOutcome::Cached { .. } => {
-                                            unreachable!("the owned path returns Ready, not Cached")
+                                        RequestOutcome::Cached {
+                                            entry,
+                                            age,
+                                            set_cookie,
+                                        } => {
+                                            // A hit on a body-bearing request is
+                                            // written from the entry's own
+                                            // bytes, the same as the bodyless
+                                            // fast path.
+                                            let hit = hit.expect("cached hit carries hit headers");
+                                            let mut out = Vec::new();
+                                            write_cached_h1(
+                                                &mut out,
+                                                &entry,
+                                                age,
+                                                hit,
+                                                set_cookie.as_deref(),
+                                                &req.method,
+                                                h1.keep_alive,
+                                            );
+                                            h1.state = H1State::Writing { buf: out, pos: 0 };
+                                            continue;
                                         }
                                     }
                                 }

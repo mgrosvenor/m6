@@ -10,11 +10,13 @@
 ///   [length: u24][type: u8][flags: u8][stream_id: u31][payload: length bytes]
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::time::Instant;
 
-use crate::fields::{validate_request_headers, FIELD_OVERHEAD};
+use crate::cache::CachedResponse;
+use crate::fields::{validate_request_header_bytes, FIELD_OVERHEAD};
 use crate::forward::{HttpRequest, PendingDispatch};
-use crate::http11::RequestOutcome;
+use crate::http11::{HitHeaders, RequestOutcome};
 use m6_core::headers::MAX_REQUEST_HEAD;
 
 /// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over a private backbone).
@@ -245,9 +247,23 @@ struct H2Response {
     genid: Option<u64>,
 }
 
+/// One decoded request field: a name and a value, each a range into
+/// `Http2Conn::decode_buf`.
+///
+/// HTTP/2 decodes a header block into the connection's own buffer once, and
+/// every later view (validation, the cache key, the forwarded request) is a
+/// range into it rather than a `String`. A view that must outlive the decode
+/// call (a stream parked across loop turns) keeps these ranges and re-borrows
+/// the bytes when it is read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct H2Field {
+    name: Range<u32>,
+    value: Range<u32>,
+}
+
 struct H2Stream {
     state: StreamState,
-    headers: Vec<(String, String)>,
+    headers: Vec<H2Field>,
     body: Vec<u8>,
     headers_done: bool,
     send_window: i32,
@@ -259,7 +275,7 @@ struct H2Stream {
     // Buffered response body for flow-controlled delivery.
     // None  = request not yet dispatched.
     // Some  = response queued; resp_sent bytes already flushed.
-    resp_body: Option<Vec<u8>>,
+    resp_body: Option<bytes::Bytes>,
     resp_sent: usize,
     /// Pending backend request: set by maybe_dispatch when backend is async.
     pending: bool,
@@ -269,7 +285,9 @@ impl H2Stream {
     fn new(initial_send_window: i32) -> Self {
         H2Stream {
             state: StreamState::Open,
-            headers: Vec::new(),
+            // A request's decoded head is a handful of fields; sizing the
+            // list for one means the decode does not grow it field by field.
+            headers: Vec::with_capacity(16),
             body: Vec::new(),
             headers_done: false,
             send_window: initial_send_window,
@@ -297,6 +315,18 @@ pub struct Http2Conn {
     phase: Phase,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    /// Decoded request fields, appended by `decode_hpack` as the HPACK
+    /// callback hands over name and value bytes. Every `H2Field` in a stream
+    /// is a range into this buffer. It is cleared only when no stream holds a
+    /// range, so the bytes are reused across streams on one connection.
+    decode_buf: Vec<u8>,
+    /// Lowercased header names and merged `Vary` values for response
+    /// encoding, reused across responses. One field's bytes are appended,
+    /// then borrowed as a slice, so a response costs no `String` per field.
+    hdr_scratch: Vec<u8>,
+    /// Stream ids in the order `flush_pending_streams` visits them, reused so
+    /// a response does not collect a fresh `Vec` of ids.
+    flush_ids: Vec<u32>,
 
     streams: HashMap<u32, H2Stream>,
     hpack_dec: hpack::Decoder<'static>,
@@ -391,6 +421,9 @@ impl Http2Conn {
             phase: Phase::Preface,
             recv_buf: Vec::with_capacity(16_384),
             send_buf: Vec::with_capacity(16_384),
+            decode_buf: Vec::with_capacity(MAX_REQUEST_HEAD.min(16 * 1024)),
+            hdr_scratch: Vec::with_capacity(8 * 1024),
+            flush_ids: Vec::with_capacity(16),
             streams: HashMap::new(),
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
@@ -442,6 +475,7 @@ impl Http2Conn {
         client_ip: &str,
         state: &mut S,
         on_request: &mut F,
+        hit: Option<&HitHeaders>,
         pending: &mut Vec<PendingDispatch>,
     ) -> bool
     where
@@ -462,7 +496,7 @@ impl Http2Conn {
         }
 
         loop {
-            match self.process_frame(state, on_request, client_ip) {
+            match self.process_frame(state, on_request, client_ip, hit) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
@@ -667,6 +701,7 @@ impl Http2Conn {
         state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<bool, &'static str>
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
@@ -790,10 +825,10 @@ impl Http2Conn {
 
         match ftype {
             TYPE_DATA => {
-                self.handle_data(stream_id, flags, payload, state, on_request, client_ip)?
+                self.handle_data(stream_id, flags, payload, state, on_request, client_ip, hit)?
             }
             TYPE_HEADERS => {
-                self.handle_headers(stream_id, flags, payload, state, on_request, client_ip)?
+                self.handle_headers(stream_id, flags, payload, state, on_request, client_ip, hit)?
             }
             TYPE_PRIORITY => {
                 // RFC 9113 5.3.1: "A stream cannot depend on itself. An
@@ -842,9 +877,9 @@ impl Http2Conn {
                 self.peer_goaway = true;
             }
             TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, payload)?,
-            TYPE_CONTINUATION => {
-                self.handle_continuation(stream_id, flags, payload, state, on_request, client_ip)?
-            }
+            TYPE_CONTINUATION => self.handle_continuation(
+                stream_id, flags, payload, state, on_request, client_ip, hit,
+            )?,
             _ => {}
         }
         Ok(true)
@@ -1230,6 +1265,7 @@ impl Http2Conn {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // a frame's fields, its stream, the state and the dispatch context
     fn handle_headers<S, F>(
         &mut self,
         stream_id: u32,
@@ -1238,6 +1274,7 @@ impl Http2Conn {
         state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
@@ -1385,25 +1422,40 @@ impl Http2Conn {
         }
 
         if flags & FLAG_END_HEADERS != 0 {
-            let mut combined = self.header_block_buf.clone();
+            // The header block is assembled by moving the continuation buffer
+            // out and back rather than cloning it, so its capacity survives
+            // the frame. The decoded fields go straight into the stream's
+            // list, as ranges into the connection's decode buffer: nothing is
+            // copied into a String here.
+            let mut combined = std::mem::take(&mut self.header_block_buf);
             combined.extend_from_slice(header_block);
-            self.header_block_buf.clear();
             self.continuation_stream_id = None;
             self.check_hpack_block(&combined)?;
-            let dec = &mut self.hpack_dec;
-            let stream = self.streams.get_mut(&stream_id).unwrap();
-            // A second complete header block on a stream is a TRAILER section
-            // (RFC 9113 8.1). Decode it separately so it can be checked on its
-            // own: trailers carry no pseudo-headers, and merging first would
-            // make one indistinguishable from a legitimate leading field.
-            let is_trailers = stream.headers_done;
-            let mut block = Vec::new();
-            let list_size = decode_hpack(dec, &combined, &mut block)?;
-            if let Some(status) = crate::fields::head_limit_status(
-                block.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())),
-                list_size,
-            ) {
-                let method = self.refusal_method(stream_id, &block);
+            self.begin_header_block();
+            let (is_trailers, first, list_size) = {
+                let stream = self.streams.get_mut(&stream_id).unwrap();
+                let is_trailers = stream.headers_done;
+                let first = stream.headers.len();
+                let list_size = decode_hpack(
+                    &mut self.hpack_dec,
+                    &combined,
+                    &mut self.decode_buf,
+                    &mut stream.headers,
+                );
+                (is_trailers, first, list_size)
+            };
+            self.header_block_buf = combined;
+            self.header_block_buf.clear();
+            let list_size = list_size?;
+            let status = {
+                let stream = &self.streams[&stream_id];
+                crate::fields::head_limit_status(
+                    field_byte_pairs(&stream.headers[first..], &self.decode_buf),
+                    list_size,
+                )
+            };
+            if let Some(status) = status {
+                let method = self.refusal_method(stream_id, &[]);
                 self.refuse_head(stream_id, status, &method);
                 return Ok(());
             }
@@ -1433,7 +1485,14 @@ impl Http2Conn {
                     self.streams.remove(&stream_id);
                     return Ok(());
                 }
-                if let Some((name, _)) = block.iter().find(|(k, _)| k.starts_with(':')) {
+                let pseudo = {
+                    let stream = &self.streams[&stream_id];
+                    stream.headers[first..]
+                        .iter()
+                        .find(|f| field_name(&self.decode_buf, f).starts_with(':'))
+                        .map(|f| field_name(&self.decode_buf, f).to_string())
+                };
+                if let Some(name) = pseudo {
                     m6_core::log::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
                     self.push_frame(
                         TYPE_RST_STREAM,
@@ -1445,9 +1504,9 @@ impl Http2Conn {
                     return Ok(());
                 }
             }
-            let stream = self.streams.get_mut(&stream_id).unwrap();
-            stream.headers.extend(block);
-            stream.headers_done = true;
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                stream.headers_done = true;
+            }
         } else {
             if self.header_block_buf.len() + header_block.len() > MAX_HEADER_BLOCK {
                 self.send_goaway(ERR_ENHANCE_YOUR_CALM);
@@ -1458,10 +1517,11 @@ impl Http2Conn {
             self.continuation_stream_id = Some(stream_id);
         }
 
-        self.maybe_dispatch(stream_id, state, on_request, client_ip);
+        self.maybe_dispatch(stream_id, state, on_request, client_ip, hit);
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // a frame's fields, its stream, the state and the dispatch context
     fn handle_continuation<S, F>(
         &mut self,
         stream_id: u32,
@@ -1470,6 +1530,7 @@ impl Http2Conn {
         state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
@@ -1485,28 +1546,56 @@ impl Http2Conn {
         self.header_block_buf.extend_from_slice(payload);
         if flags & FLAG_END_HEADERS != 0 {
             self.continuation_stream_id = None;
-            let all = self.header_block_buf.clone();
-            self.header_block_buf.clear();
+            let all = std::mem::take(&mut self.header_block_buf);
             self.check_hpack_block(&all)?;
-            let mut tmp = Vec::new();
-            let list_size = decode_hpack(&mut self.hpack_dec, &all, &mut tmp)?;
-            if let Some(status) = crate::fields::head_limit_status(
-                tmp.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())),
-                list_size,
-            ) {
-                let method = self.refusal_method(stream_id, &tmp);
+            self.begin_header_block();
+            // A stream reset while its header block was still arriving: the
+            // block must still be decoded so the HPACK table stays in step,
+            // but there is no stream to keep the fields on.
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                let mut scratch = Vec::new();
+                let result = decode_hpack(
+                    &mut self.hpack_dec,
+                    &all,
+                    &mut self.decode_buf,
+                    &mut scratch,
+                );
+                self.header_block_buf = all;
+                self.header_block_buf.clear();
+                result?;
+                return Ok(());
+            };
+            let first = stream.headers.len();
+            let list_size = decode_hpack(
+                &mut self.hpack_dec,
+                &all,
+                &mut self.decode_buf,
+                &mut stream.headers,
+            );
+            self.header_block_buf = all;
+            self.header_block_buf.clear();
+            let list_size = list_size?;
+            let status = {
+                let stream = &self.streams[&stream_id];
+                crate::fields::head_limit_status(
+                    field_byte_pairs(&stream.headers[first..], &self.decode_buf),
+                    list_size,
+                )
+            };
+            if let Some(status) = status {
+                let method = self.refusal_method(stream_id, &[]);
                 self.refuse_head(stream_id, status, &method);
                 return Ok(());
             }
             if let Some(stream) = self.streams.get_mut(&stream_id) {
-                stream.headers.extend(tmp);
                 stream.headers_done = true;
             }
-            self.maybe_dispatch(stream_id, state, on_request, client_ip);
+            self.maybe_dispatch(stream_id, state, on_request, client_ip, hit);
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // a frame's fields, its stream, the state and the dispatch context
     fn handle_data<S, F>(
         &mut self,
         stream_id: u32,
@@ -1515,6 +1604,7 @@ impl Http2Conn {
         state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
@@ -1600,12 +1690,24 @@ impl Http2Conn {
         }
 
         if should_dispatch {
-            self.maybe_dispatch(stream_id, state, on_request, client_ip);
+            self.maybe_dispatch(stream_id, state, on_request, client_ip, hit);
         }
         Ok(())
     }
 
     // ── Request dispatch ──────────────────────────────────────────────────────
+
+    /// Start decoding a new header block into the connection's buffer.
+    ///
+    /// The buffer is per connection and reused across streams. Its bytes can
+    /// only be cleared when no stream still holds a range into it: a stream
+    /// waiting for the rest of its body keeps its decoded head there across
+    /// loop turns, and so does a trailer block.
+    fn begin_header_block(&mut self) {
+        if self.streams.values().all(|s| s.headers.is_empty()) {
+            self.decode_buf.clear();
+        }
+    }
 
     fn maybe_dispatch<S, F>(
         &mut self,
@@ -1613,6 +1715,7 @@ impl Http2Conn {
         state: &mut S,
         on_request: &mut F,
         peer_ip: &str,
+        hit: Option<&HitHeaders>,
     ) where
         F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
     {
@@ -1622,7 +1725,7 @@ impl Http2Conn {
             .map(|s| {
                 s.headers_done
                 && (s.state == StreamState::HalfClosedRemote
-                    || is_headersonly(&s.headers))
+                    || is_headersonly(&s.headers, &self.decode_buf))
                 && s.state != StreamState::Closed
                 && s.resp_body.is_none()  // not already dispatched
                 && !s.pending // not already waiting on async
@@ -1652,7 +1755,7 @@ impl Http2Conn {
         // mismatch between what a message claims and what it carries is the
         // same class of ambiguity that makes request smuggling work, and here
         // m6 is the one that would forward it on.
-        match declared_content_length(&headers) {
+        match declared_content_length(&headers, &self.decode_buf) {
             Err(()) => {
                 m6_core::log::debug!(
                     stream_id,
@@ -1686,7 +1789,9 @@ impl Http2Conn {
             Ok(_) => {}
         }
 
-        if let Err(why) = validate_request_headers(&headers) {
+        if let Err(why) =
+            validate_request_header_bytes(field_byte_pairs(&headers, &self.decode_buf))
+        {
             m6_core::log::debug!(stream_id, reason = why, "h2: malformed request headers");
             self.push_frame(
                 TYPE_RST_STREAM,
@@ -1698,7 +1803,7 @@ impl Http2Conn {
             return;
         }
 
-        let (req, forwarded_for) = build_request(&headers, body);
+        let (req, forwarded_for) = build_request(&headers, &self.decode_buf, body);
 
         // Per REQUEST, not per connection. One backbone connection from a
         // cache node is long-lived and multiplexes requests from many
@@ -1708,12 +1813,10 @@ impl Http2Conn {
             forwarded_for.as_deref(),
             peer_ip,
             self.forwarded_trust,
-        )
-        .to_string();
+        );
 
-        match on_request(state, &req, &client_ip) {
+        match on_request(state, &req, client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
-                let method = req.method.clone();
                 self.dispatch_h2_response(
                     stream_id,
                     H2Response {
@@ -1722,7 +1825,24 @@ impl Http2Conn {
                         body: resp_body,
                         genid,
                     },
-                    &method,
+                    &req.method,
+                );
+            }
+            RequestOutcome::Cached {
+                entry,
+                age,
+                set_cookie,
+            } => {
+                // A cache hit is written from the entry's own bytes: the
+                // header strings and the body are borrowed, never cloned.
+                let hit = hit.expect("a cache hit carries the hit headers");
+                self.dispatch_cached_h2_response(
+                    stream_id,
+                    &entry,
+                    age,
+                    set_cookie.as_deref(),
+                    hit,
+                    &req.method,
                 );
             }
             RequestOutcome::Pending { id, ctx } => {
@@ -1734,9 +1854,6 @@ impl Http2Conn {
                     id,
                     ctx,
                 });
-            }
-            RequestOutcome::Cached { .. } => {
-                unreachable!("h2 dispatches an owned request, which returns Ready")
             }
         }
     }
@@ -1795,13 +1912,11 @@ impl Http2Conn {
         // frames disagreed with the framing the client had been promised.
         let advertised_len = resp_body.len();
         let resp_body = if method.eq_ignore_ascii_case("HEAD") {
-            Vec::new()
+            bytes::Bytes::new()
         } else {
-            resp_body
+            bytes::Bytes::from(resp_body)
         };
-        let header_block =
-            self.encode_response_headers(status, &resp_headers, advertised_len, genid);
-        self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &header_block);
+        self.push_response_headers(stream_id, status, &resp_headers, advertised_len, genid);
 
         // Store response body for flow-controlled delivery. An empty body sends
         // a bare DATA + END_STREAM, which closes the stream cleanly.
@@ -1856,10 +1971,14 @@ impl Http2Conn {
     /// connection-level and per-stream send windows.  Called after dispatching
     /// a request and after every WINDOW_UPDATE.
     fn flush_pending_streams(&mut self) {
-        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+        // The id list is per connection and reused, so a response does not
+        // collect a fresh `Vec` of stream ids.
+        let mut stream_ids = std::mem::take(&mut self.flush_ids);
+        stream_ids.clear();
+        stream_ids.extend(self.streams.keys().copied());
         let max = self.peer_max_frame as usize;
 
-        'outer: for stream_id in stream_ids {
+        'outer: for &stream_id in &stream_ids {
             loop {
                 // Determine how many bytes we can send right now.
                 let (to_send, is_last) = {
@@ -1966,53 +2085,72 @@ impl Http2Conn {
                 }
             }
         }
+        self.flush_ids = stream_ids;
     }
 
     // ── Frame encoding helpers ────────────────────────────────────────────────
 
-    fn encode_response_headers(
+    /// Encode a response header list as one HEADERS frame in `send_buf`.
+    ///
+    /// Every field's name is lowercased into `hdr_scratch` and borrowed back
+    /// from it, so a response allocates no `String` per header and no `Vec` of
+    /// pairs. `hpack_enc.encode_into` writes straight into the connection's
+    /// send buffer, so the encoded block is not a second allocation either.
+    ///
+    /// HTTP/2 requires lowercase field names on the wire (RFC 9113 8.2.1).
+    /// The bytes written are the same as when the name was lowercased into an
+    /// owned `String`: only the copy is gone.
+    fn push_response_headers(
         &mut self,
+        stream_id: u32,
         status: u16,
         headers: &[(String, String)],
         body_len: usize,
         genid: Option<u64>,
-    ) -> Vec<u8> {
-        let status_str = status.to_string();
-        let bodylen_str = body_len.to_string();
-        // Lives until `encode` copies the bytes out, so the decimal form costs
-        // no `String`.
-        let mut genid_buf = itoa::Buffer::new();
+    ) {
+        let mut scratch = std::mem::take(&mut self.hdr_scratch);
+        scratch.clear();
+        let mut plan = empty_plan();
+        let mut n = 0usize;
 
-        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(3 + headers.len());
-        pairs.push((b":status", status_str.as_bytes()));
+        let mut status_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            FieldPart::Bytes(b":status"),
+            FieldPart::Bytes(status_buf.format(status).as_bytes()),
+        );
         // RFC 9110 8.6: a 1xx/204 must not carry Content-Length, and a 304 must
         // not unless it equals the 200's. m6 sent `content-length: 0` on every
         // 304 -- the one value that actively misinforms, since it claims the
         // representation is empty when it is not.
+        let mut body_buf = itoa::Buffer::new();
         if crate::http11::status_may_have_content_length(status) {
-            pairs.push((b"content-length", bodylen_str.as_bytes()));
+            push_field(
+                &mut plan,
+                &mut n,
+                FieldPart::Bytes(b"content-length"),
+                FieldPart::Bytes(body_buf.format(body_len).as_bytes()),
+            );
         }
-        let filtered: Vec<(String, String)> = headers
-            .iter()
-            .filter(|(k, _)| {
-                let kl = k.to_lowercase();
-                !matches!(
-                    kl.as_str(),
-                    "connection" | "transfer-encoding" | "keep-alive" | "content-length"
-                )
-            })
-            .map(|(k, v)| (k.to_lowercase(), v.clone()))
-            .collect();
-        for (k, v) in &filtered {
-            pairs.push((k.as_bytes(), v.as_bytes()));
+        for (k, v) in headers {
+            if is_hop_by_hop_or_length(k) {
+                continue;
+            }
+            let name = lower_part(&mut scratch, k.as_bytes());
+            push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
         }
+        let mut genid_buf = itoa::Buffer::new();
         if let Some(genid) = genid {
             // Lower case: RFC 9113 8.2.1 allows no other spelling, and a client
-            // that enforces it rejects the whole header block.
-            pairs.push((
-                crate::genid::GENID_HEADER_LOWER.as_bytes(),
-                genid_buf.format(genid).as_bytes(),
-            ));
+            // that enforces it rejects the whole header block. `GENID_HEADER_LOWER`
+            // is already lowercase, so `lower_part` borrows it with no copy.
+            push_field(
+                &mut plan,
+                &mut n,
+                lower_part(&mut scratch, crate::genid::GENID_HEADER_LOWER.as_bytes()),
+                FieldPart::Bytes(genid_buf.format(genid).as_bytes()),
+            );
         }
         // Applied at serialisation so every response carries them regardless
         // of which path produced it (cache hit, backend, error page). The
@@ -2020,11 +2158,198 @@ impl Http2Conn {
         // borrowed rather than copied.
         let security = crate::security::read();
         if let Some(ref guard) = security {
-            for (k, v) in guard.absent_from(&filtered) {
-                pairs.push((k.as_bytes(), v.as_bytes()));
+            for (k, v) in guard.absent_from(headers) {
+                let name = lower_part(&mut scratch, k.as_bytes());
+                push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
             }
         }
-        self.hpack_enc.encode(pairs)
+        self.write_headers_frame(stream_id, &plan[..n], &scratch);
+        self.hdr_scratch = scratch;
+    }
+
+    /// Complete a cache hit straight from the entry's own bytes.
+    ///
+    /// The header strings and the body are borrowed, not cloned. The fields a
+    /// hit adds (`Alt-Svc`, merged `Vary`, `Age`, the described-by `Link`,
+    /// `Set-Cookie`) are written here from their start-time or per-hit values,
+    /// in the same order the owned path produced them, so the wire bytes do
+    /// not change.
+    fn dispatch_cached_h2_response(
+        &mut self,
+        stream_id: u32,
+        entry: &CachedResponse,
+        age: std::time::Duration,
+        set_cookie: Option<&str>,
+        hit: &HitHeaders,
+        method: &str,
+    ) {
+        self.push_cached_headers(stream_id, entry, age, set_cookie, hit);
+        let body = if method.eq_ignore_ascii_case("HEAD") {
+            bytes::Bytes::new()
+        } else {
+            entry.body.clone()
+        };
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.resp_body = Some(body);
+            s.resp_sent = 0;
+        }
+        self.flush_pending_streams();
+    }
+
+    fn push_cached_headers(
+        &mut self,
+        stream_id: u32,
+        entry: &CachedResponse,
+        age: std::time::Duration,
+        set_cookie: Option<&str>,
+        hit: &HitHeaders,
+    ) {
+        let is_html = crate::analytics::is_html_response(&entry.headers[..]);
+        let write_describedby = hit.describedby.is_some() && is_html;
+
+        // Vary is merged (or left alone on `Vary: *`) exactly as
+        // `set_vary_accept_encoding(.., true)` does, so the paths agree.
+        let vary = crate::http11::VaryMerge::new(&entry.headers[..]);
+        let vary_star = vary.is_star();
+
+        let mut scratch = std::mem::take(&mut self.hdr_scratch);
+        scratch.clear();
+        let vary_value = if vary_star {
+            None
+        } else {
+            let start = scratch.len() as u32;
+            let mut first = true;
+            for field in vary {
+                if !first {
+                    scratch.extend_from_slice(b", ");
+                }
+                first = false;
+                scratch.extend_from_slice(field.as_bytes());
+            }
+            Some(FieldPart::Scratch(start, scratch.len() as u32 - start))
+        };
+
+        let mut plan = empty_plan();
+        let mut n = 0usize;
+        let mut status_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            FieldPart::Bytes(b":status"),
+            FieldPart::Bytes(status_buf.format(entry.status).as_bytes()),
+        );
+        let mut body_buf = itoa::Buffer::new();
+        if crate::http11::status_may_have_content_length(entry.status) {
+            push_field(
+                &mut plan,
+                &mut n,
+                FieldPart::Bytes(b"content-length"),
+                FieldPart::Bytes(body_buf.format(entry.body.len()).as_bytes()),
+            );
+        }
+        for (k, v) in entry.headers.iter() {
+            if is_hop_by_hop_or_length(k)
+                || k.eq_ignore_ascii_case("alt-svc")
+                || k.eq_ignore_ascii_case("age")
+            {
+                continue;
+            }
+            if !vary_star && k.eq_ignore_ascii_case("vary") {
+                continue;
+            }
+            if write_describedby && k.eq_ignore_ascii_case("link") && link_is_describedby(v) {
+                continue;
+            }
+            let name = lower_part(&mut scratch, k.as_bytes());
+            push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
+        }
+        // The order the owned path appended them: alt-svc, vary, age, link,
+        // set-cookie, then the generation and the security headers.
+        let (alt_name, alt_value) = split_header_line(&hit.alt_svc);
+        push_field(
+            &mut plan,
+            &mut n,
+            lower_part(&mut scratch, alt_name),
+            FieldPart::Bytes(alt_value),
+        );
+        if let Some(vary_value) = vary_value {
+            push_field(&mut plan, &mut n, FieldPart::Bytes(b"vary"), vary_value);
+        }
+        let mut age_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            FieldPart::Bytes(b"age"),
+            FieldPart::Bytes(age_buf.format(age.as_secs()).as_bytes()),
+        );
+        if write_describedby {
+            if let Some(line) = hit.describedby.as_deref() {
+                let (name, value) = split_header_line(line);
+                push_field(
+                    &mut plan,
+                    &mut n,
+                    lower_part(&mut scratch, name),
+                    FieldPart::Bytes(value),
+                );
+            }
+        }
+        if let Some(cookie) = set_cookie {
+            push_field(
+                &mut plan,
+                &mut n,
+                FieldPart::Bytes(b"set-cookie"),
+                FieldPart::Bytes(cookie.as_bytes()),
+            );
+        }
+        let mut genid_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            lower_part(&mut scratch, crate::genid::GENID_HEADER.as_bytes()),
+            FieldPart::Bytes(genid_buf.format(entry.genid).as_bytes()),
+        );
+        let security = crate::security::read();
+        if let Some(ref guard) = security {
+            for (k, v) in guard.absent_from(&entry.headers[..]) {
+                let name = lower_part(&mut scratch, k.as_bytes());
+                push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
+            }
+        }
+        self.write_headers_frame(stream_id, &plan[..n], &scratch);
+        self.hdr_scratch = scratch;
+    }
+
+    /// Write `plan` as one HEADERS frame at the end of `send_buf`.
+    fn write_headers_frame(
+        &mut self,
+        stream_id: u32,
+        plan: &[(FieldPart<'_>, FieldPart<'_>)],
+        scratch: &[u8],
+    ) {
+        let start = self.send_buf.len();
+        self.send_buf.extend_from_slice(&[0u8; FRAME_HDR]);
+        {
+            let Http2Conn {
+                hpack_enc,
+                send_buf,
+                ..
+            } = self;
+            hpack_enc
+                .encode_into(
+                    plan.iter()
+                        .map(|(name, value)| (name.resolve(scratch), value.resolve(scratch))),
+                    send_buf,
+                )
+                .expect("writing to a Vec cannot fail");
+        }
+        let payload_len = self.send_buf.len() - start - FRAME_HDR;
+        self.send_buf[start] = (payload_len >> 16) as u8;
+        self.send_buf[start + 1] = (payload_len >> 8) as u8;
+        self.send_buf[start + 2] = payload_len as u8;
+        self.send_buf[start + 3] = TYPE_HEADERS;
+        self.send_buf[start + 4] = FLAG_END_HEADERS;
+        self.send_buf[start + 5..start + 9]
+            .copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
     }
 
     fn push_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) {
@@ -2042,7 +2367,7 @@ impl Http2Conn {
 
     /// The method of a request being refused, from the block that carried it or
     /// from the fields already stored for its stream (a trailer section).
-    fn refusal_method(&self, stream_id: u32, block: &[(String, String)]) -> String {
+    fn refusal_method(&self, stream_id: u32, block: &[H2Field]) -> String {
         block
             .iter()
             .chain(
@@ -2051,8 +2376,8 @@ impl Http2Conn {
                     .map(|s| s.headers.as_slice())
                     .unwrap_or(&[]),
             )
-            .find(|(name, _)| name == ":method")
-            .map(|(_, value)| value.clone())
+            .find(|f| field_name(&self.decode_buf, f) == ":method")
+            .map(|f| field_value(&self.decode_buf, f).to_string())
             .unwrap_or_default()
     }
 
@@ -2258,10 +2583,97 @@ fn validate_hpack_block(block: &[u8], max_table_size: usize) -> Result<(), &'sta
     Ok(())
 }
 
+/// The largest response header list the encoder will plan in one frame.
+///
+/// A backend reply is parsed into a fixed 64-header array (`forward.rs`), and
+/// a response adds at most a handful of fields of its own, so this is above
+/// any list a response can carry.
+const MAX_RESPONSE_FIELDS: usize = 128;
+
+/// One field in a response header block, before it is serialised.
+///
+/// `Bytes` is a slice that already lives long enough (a cached value, a
+/// static name, an `itoa` buffer). `Scratch` is a range in the connection's
+/// `hdr_scratch`, where a lowercased name or a merged `Vary` value was
+/// written. Either way the encoder borrows the bytes: no `String` per field.
+#[derive(Clone, Copy)]
+enum FieldPart<'a> {
+    Bytes(&'a [u8]),
+    Scratch(u32, u32),
+}
+
+impl<'a> FieldPart<'a> {
+    fn resolve<'s>(&self, scratch: &'s [u8]) -> &'s [u8]
+    where
+        'a: 's,
+    {
+        match self {
+            FieldPart::Bytes(bytes) => bytes,
+            FieldPart::Scratch(start, len) => &scratch[*start as usize..(*start + *len) as usize],
+        }
+    }
+}
+
+fn empty_plan<'a>() -> [(FieldPart<'a>, FieldPart<'a>); MAX_RESPONSE_FIELDS] {
+    [(FieldPart::Bytes(&[]), FieldPart::Bytes(&[])); MAX_RESPONSE_FIELDS]
+}
+
+fn push_field<'a>(
+    plan: &mut [(FieldPart<'a>, FieldPart<'a>); MAX_RESPONSE_FIELDS],
+    len: &mut usize,
+    name: FieldPart<'a>,
+    value: FieldPart<'a>,
+) {
+    debug_assert!(*len < MAX_RESPONSE_FIELDS, "response header plan overflow");
+    if *len < MAX_RESPONSE_FIELDS {
+        plan[*len] = (name, value);
+        *len += 1;
+    }
+}
+
+/// Lowercase a field name into `scratch`, or borrow it when it is already
+/// lowercase. HTTP/2 requires lowercase on the wire; this keeps the wire bytes
+/// identical to a lowercased copy without making one.
+fn lower_part<'a>(scratch: &mut Vec<u8>, name: &'a [u8]) -> FieldPart<'a> {
+    if !name.iter().any(|b| b.is_ascii_uppercase()) {
+        FieldPart::Bytes(name)
+    } else {
+        let start = scratch.len() as u32;
+        scratch.extend(name.iter().map(|b| b.to_ascii_lowercase()));
+        FieldPart::Scratch(start, scratch.len() as u32 - start)
+    }
+}
+
+/// Split a start-time header line (`alt-svc: ...`) into name and value.
+fn split_header_line(line: &[u8]) -> (&[u8], &[u8]) {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return (line, &[]);
+    };
+    let value = &line[colon + 1..];
+    (line[..colon].trim_ascii_start(), value.trim_ascii_start())
+}
+
+/// Whether a response field is one the framing layer owns and must not carry.
+fn is_hop_by_hop_or_length(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("content-length")
+}
+
+/// Whether a cached `Link` already advertises the site description.
+fn link_is_describedby(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(b"rel=\"describedby\"".len())
+        .any(|w| w.eq_ignore_ascii_case(b"rel=\"describedby\""))
+}
+
 fn decode_hpack(
     dec: &mut hpack::Decoder<'_>,
     block: &[u8],
-    out: &mut Vec<(String, String)>,
+    buf: &mut Vec<u8>,
+    out: &mut Vec<H2Field>,
 ) -> Result<usize, &'static str> {
     // Counted as each field is decoded, and a field is kept only while the
     // list is within the limit. A small block of one-byte references to a
@@ -2273,23 +2685,63 @@ fn decode_hpack(
     dec.decode_with_cb(block, |k, v| {
         list_size = list_size.saturating_add(k.len() + v.len() + FIELD_OVERHEAD);
         if list_size <= MAX_REQUEST_HEAD {
-            out.push((
-                String::from_utf8_lossy(&k).into_owned(),
-                String::from_utf8_lossy(&v).into_owned(),
-            ));
+            let name = push_field_bytes(buf, &k);
+            let value = push_field_bytes(buf, &v);
+            out.push(H2Field { name, value });
         }
     })
     .map_err(|_| "HPACK decode error")?;
     Ok(list_size)
 }
 
-fn is_headersonly(headers: &[(String, String)]) -> bool {
-    for (k, v) in headers {
+/// Append one field part to the decode buffer and return its range.
+///
+/// Invalid UTF-8 is replaced exactly as `String::from_utf8_lossy` replaced it
+/// before, so a later `&str` view of the bytes says the same thing the old
+/// owned `String` said. A valid part, which is every part a conforming peer
+/// sends, is a plain copy.
+fn push_field_bytes(buf: &mut Vec<u8>, bytes: &[u8]) -> Range<u32> {
+    let start = buf.len() as u32;
+    match std::str::from_utf8(bytes) {
+        Ok(_) => buf.extend_from_slice(bytes),
+        Err(_) => buf.extend_from_slice(String::from_utf8_lossy(bytes).as_bytes()),
+    }
+    start..buf.len() as u32
+}
+
+/// The bytes of one field part, re-borrowed from the connection's buffer.
+fn field_bytes<'a>(buf: &'a [u8], range: &Range<u32>) -> &'a [u8] {
+    buf.get(range.start as usize..range.end as usize)
+        .unwrap_or(&[])
+}
+
+fn field_name<'a>(buf: &'a [u8], field: &H2Field) -> &'a str {
+    std::str::from_utf8(field_bytes(buf, &field.name)).unwrap_or("")
+}
+
+fn field_value<'a>(buf: &'a [u8], field: &H2Field) -> &'a str {
+    std::str::from_utf8(field_bytes(buf, &field.value)).unwrap_or("")
+}
+
+/// Every field in `list` as a borrowed name and value.
+fn fields<'a>(list: &'a [H2Field], buf: &'a [u8]) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    list.iter()
+        .map(move |f| (field_name(buf, f), field_value(buf, f)))
+}
+
+/// Every field in `list` as raw bytes, for the validators that work on bytes.
+fn field_byte_pairs<'a>(
+    list: &'a [H2Field],
+    buf: &'a [u8],
+) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+    list.iter()
+        .map(move |f| (field_bytes(buf, &f.name), field_bytes(buf, &f.value)))
+}
+
+fn is_headersonly(headers: &[H2Field], buf: &[u8]) -> bool {
+    for (k, v) in fields(headers, buf) {
         if k == ":method" {
-            return matches!(
-                v.as_str(),
-                "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT"
-            );
+            return matches!(v, "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT");
         }
     }
     false
@@ -2301,8 +2753,8 @@ fn is_headersonly(headers: &[(String, String)]) -> bool {
 /// the value (5.6.3). HTTP/2 previously used `v.trim().parse::<usize>()`, which
 /// read `+5` as 5 and silently ignored a value that failed to parse, serving a
 /// request whose framing the peer never declared.
-fn declared_content_length(headers: &[(String, String)]) -> Result<Option<usize>, ()> {
-    let Some((_, value)) = headers.iter().find(|(k, _)| k == "content-length") else {
+fn declared_content_length(headers: &[H2Field], buf: &[u8]) -> Result<Option<usize>, ()> {
+    let Some((_, value)) = fields(headers, buf).find(|(k, _)| *k == "content-length") else {
         return Ok(None);
     };
     let value = value.trim_matches([' ', '\t']);
@@ -2318,7 +2770,11 @@ fn declared_content_length(headers: &[(String, String)]) -> Result<Option<usize>
 /// or a cache key. Returning the value separately is what lets the *caller*
 /// decide whether the peer was entitled to assert it, without the header
 /// itself surviving that decision.
-fn build_request(headers: &[(String, String)], body: Vec<u8>) -> (HttpRequest, Option<String>) {
+///
+/// The fields are ranges into the connection's decode buffer; the request
+/// still owns its strings because the handler and a parked backend dispatch
+/// outlive the stream, which is the one place the design rule allows a copy.
+fn build_request(headers: &[H2Field], buf: &[u8], body: Vec<u8>) -> (HttpRequest, Option<String>) {
     let mut method = String::new();
     let mut path = String::new();
     let mut query = None;
@@ -2326,27 +2782,27 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> (HttpRequest, O
     let mut authority: Option<String> = None;
     let mut forwarded_for: Option<String> = None;
 
-    for (k, v) in headers {
-        match k.as_str() {
-            ":method" => method = v.clone(),
+    for (k, v) in fields(headers, buf) {
+        match k {
+            ":method" => method = v.to_string(),
             ":path" => {
                 if let Some(q) = v.find('?') {
                     path = v[..q].to_string();
                     query = Some(v[q + 1..].to_string());
                 } else {
-                    path = v.clone();
+                    path = v.to_string();
                 }
             }
-            ":authority" => authority = Some(v.clone()),
+            ":authority" => authority = Some(v.to_string()),
             k if k.starts_with(':') => {}
             // Strip proxy-owned headers on ingress — see
             // `forward::UNTRUSTED_INBOUND`.
             k if crate::forward::is_untrusted_inbound(k) => {
                 if k.eq_ignore_ascii_case("x-forwarded-for") {
-                    forwarded_for = Some(v.clone());
+                    forwarded_for = Some(v.to_string());
                 }
             }
-            _ => fwd.push((k.clone(), v.clone())),
+            _ => fwd.push((k.to_string(), v.to_string())),
         }
     }
 
@@ -2378,7 +2834,6 @@ fn build_request(headers: &[(String, String)], body: Vec<u8>) -> (HttpRequest, O
 
 #[cfg(test)]
 mod authority_tests {
-    use super::build_request;
 
     /// `build_request` hands back the request and the `x-forwarded-for` it
     /// stripped; these tests are about the request half.
@@ -2386,11 +2841,15 @@ mod authority_tests {
         pair.0
     }
 
-    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    fn build(pairs: &[(&str, &str)]) -> (crate::forward::HttpRequest, Option<String>) {
+        let mut buf = Vec::new();
+        let mut fields = Vec::new();
+        for (k, v) in pairs {
+            let name = super::push_field_bytes(&mut buf, k.as_bytes());
+            let value = super::push_field_bytes(&mut buf, v.as_bytes());
+            fields.push(super::H2Field { name, value });
+        }
+        super::build_request(&fields, &buf, Vec::new())
     }
     fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
         req.headers
@@ -2402,14 +2861,11 @@ mod authority_tests {
     /// The case every browser and curl actually sends: :authority, no Host.
     #[test]
     fn authority_becomes_host() {
-        let req = req_of(build_request(
-            &h(&[
-                (":method", "GET"),
-                (":path", "/x"),
-                (":authority", "www.example.com"),
-            ]),
-            vec![],
-        ));
+        let req = req_of(build(&[
+            (":method", "GET"),
+            (":path", "/x"),
+            (":authority", "www.example.com"),
+        ]));
         assert_eq!(host_of(&req), Some("www.example.com"));
     }
 
@@ -2417,15 +2873,12 @@ mod authority_tests {
     /// and must not be duplicated.
     #[test]
     fn explicit_host_wins_and_is_not_duplicated() {
-        let req = req_of(build_request(
-            &h(&[
-                (":method", "GET"),
-                (":path", "/x"),
-                (":authority", "authority.example"),
-                ("host", "host.example"),
-            ]),
-            vec![],
-        ));
+        let req = req_of(build(&[
+            (":method", "GET"),
+            (":path", "/x"),
+            (":authority", "authority.example"),
+            ("host", "host.example"),
+        ]));
         assert_eq!(host_of(&req), Some("host.example"));
         assert_eq!(
             req.headers
@@ -2438,25 +2891,19 @@ mod authority_tests {
 
     #[test]
     fn no_authority_means_no_synthesized_host() {
-        let req = req_of(build_request(
-            &h(&[(":method", "GET"), (":path", "/x")]),
-            vec![],
-        ));
+        let req = req_of(build(&[(":method", "GET"), (":path", "/x")]));
         assert_eq!(host_of(&req), None);
     }
 
     /// Other pseudo-headers stay stripped -- they must never reach a backend.
     #[test]
     fn other_pseudo_headers_are_still_dropped() {
-        let req = req_of(build_request(
-            &h(&[
-                (":method", "GET"),
-                (":path", "/x?a=1"),
-                (":scheme", "https"),
-                (":authority", "e.example"),
-            ]),
-            vec![],
-        ));
+        let req = req_of(build(&[
+            (":method", "GET"),
+            (":path", "/x?a=1"),
+            (":scheme", "https"),
+            (":authority", "e.example"),
+        ]));
         assert!(
             !req.headers.iter().any(|(k, _)| k.starts_with(':')),
             "{:?}",
@@ -2484,7 +2931,7 @@ mod frame_validation_tests {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(()),
                 Err(e) => return Err(e),
@@ -2570,7 +3017,7 @@ mod frame_validation_tests {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         let result = loop {
-            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => break Ok(()),
                 Err(e) => break Err(e),
@@ -2692,7 +3139,7 @@ mod frame_validation_tests {
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), None)
         };
-        let _ = c.process_frame(&mut (), &mut on_request, "127.0.0.1");
+        let _ = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None);
 
         // Walk the outgoing buffer for WINDOW_UPDATE frames and check each
         // increment. A zero increment would be a protocol error we caused.
@@ -2881,7 +3328,7 @@ mod stream_state_tests {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(()),
                 Err(e) => return Err(e),
@@ -3171,7 +3618,7 @@ mod stream_state_tests {
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
-        while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1") {}
+        while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
         assert_eq!(
             c.phase,
             Phase::GoingAway,
@@ -3194,7 +3641,7 @@ mod stream_state_tests {
         c.recv_buf.extend_from_slice(&open_stream(1));
         assert!(
             matches!(
-                c.process_frame(&mut (), &mut on_request, "127.0.0.1"),
+                c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
                 Ok(true)
             ),
             "the HEADERS frame opens the stream"
@@ -3207,7 +3654,7 @@ mod stream_state_tests {
         c.recv_buf.extend_from_slice(&data[..split]);
         assert!(
             !matches!(
-                c.process_frame(&mut (), &mut on_request, "127.0.0.1"),
+                c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
                 Ok(true)
             ),
             "a partial frame must wait for the rest"
@@ -3216,7 +3663,7 @@ mod stream_state_tests {
         c.recv_buf.extend_from_slice(&data[split..]);
         assert!(
             matches!(
-                c.process_frame(&mut (), &mut on_request, "127.0.0.1"),
+                c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
                 Ok(true)
             ),
             "the completed frame must be processed"
@@ -3280,7 +3727,7 @@ mod f005_regression {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(()),
                 Err(e) => return Err(e),
@@ -3693,7 +4140,7 @@ mod hpack_table_size_setting_tests {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => panic!("must be accepted, not an error: {e}"),
@@ -3762,7 +4209,7 @@ mod forwarded_client_ip_tests {
                 *seen.borrow_mut() = (ip.to_string(), survived);
                 RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
             };
-            while let Ok(true) = c.process_frame(&mut (), &mut on_request, peer_ip) {}
+            while let Ok(true) = c.process_frame(&mut (), &mut on_request, peer_ip, None) {}
         }
         seen.into_inner()
     }
@@ -3876,8 +4323,9 @@ mod hpack_robustness {
             // through, not to make it safe.
             let panicked = std::panic::catch_unwind(|| {
                 let mut dec = hpack::Decoder::new();
+                let mut buf = Vec::new();
                 let mut out = Vec::new();
-                let _ = decode_hpack(&mut dec, &block, &mut out);
+                let _ = decode_hpack(&mut dec, &block, &mut buf, &mut out);
             })
             .is_err();
             if panicked {
@@ -3904,8 +4352,9 @@ mod hpack_robustness {
             let block = part.to_vec();
             let ok = std::panic::catch_unwind(|| {
                 let mut dec = hpack::Decoder::new();
+                let mut buf = Vec::new();
                 let mut out = Vec::new();
-                let _ = decode_hpack(&mut dec, &block, &mut out);
+                let _ = decode_hpack(&mut dec, &block, &mut buf, &mut out);
             })
             .is_ok();
             assert!(
@@ -3956,7 +4405,7 @@ mod issue_7_intermittent_conformance {
         let mut on_request =
             |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
         assert!(matches!(
-            c.process_frame(&mut (), &mut on_request, "127.0.0.1"),
+            c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
             Ok(true)
         ));
 
@@ -4000,7 +4449,7 @@ mod issue_7_intermittent_conformance {
 
         let mut on_request =
             |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
-        while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1") {}
+        while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
 
         let acks: Vec<_> = sent_frames(&c.send_buf, TYPE_PING)
             .into_iter()
@@ -4307,7 +4756,7 @@ mod header_list_size_tests {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => panic!("a header list size must not be a connection error: {e}"),
@@ -4346,15 +4795,20 @@ mod header_list_size_tests {
     fn an_amplified_block_never_holds_more_than_the_limit_in_memory() {
         let block = amplified_block(2_000);
         let mut dec = hpack::Decoder::new();
+        let mut buf = Vec::new();
         let mut out = Vec::new();
-        let size = decode_hpack(&mut dec, &block, &mut out).expect("a valid block");
+        let size = decode_hpack(&mut dec, &block, &mut buf, &mut out).expect("a valid block");
         assert!(
             size > 2_000 * 4_000,
             "the true size is still counted: {size}"
         );
         let held: usize = out
             .iter()
-            .map(|(k, v)| k.len() + v.len() + FIELD_OVERHEAD)
+            .map(|f| {
+                field_bytes(&buf, &f.name).len()
+                    + field_bytes(&buf, &f.value).len()
+                    + FIELD_OVERHEAD
+            })
             .sum();
         assert!(
             held <= MAX_REQUEST_HEAD,
@@ -4430,5 +4884,139 @@ mod header_list_size_tests {
                 .then(|| u32::from_be_bytes([s[2], s[3], s[4], s[5]]))
         });
         assert_eq!(advertised, Some(MAX_REQUEST_HEAD as u32));
+    }
+}
+
+#[cfg(test)]
+mod header_encoding_tests {
+    use super::*;
+
+    /// Decode the first HEADERS frame's block out of a connection's send
+    /// buffer, as a client would read it off the wire.
+    fn headers_block(c: &Http2Conn) -> Vec<(String, String)> {
+        assert_eq!(c.send_buf[3], TYPE_HEADERS, "the first frame is HEADERS");
+        let len = u24_be(&c.send_buf[0..3]) as usize;
+        let mut dec = hpack::Decoder::new();
+        let mut out = Vec::new();
+        dec.decode_with_cb(&c.send_buf[FRAME_HDR..FRAME_HDR + len], |k, v| {
+            out.push((
+                String::from_utf8_lossy(&k).into_owned(),
+                String::from_utf8_lossy(&v).into_owned(),
+            ));
+        })
+        .expect("a server-produced block decodes");
+        out
+    }
+
+    fn value<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        fields
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn count(fields: &[(String, String)], name: &str) -> usize {
+        fields
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .count()
+    }
+
+    fn conn() -> Http2Conn {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.streams.insert(1, H2Stream::new(c.peer_initial_window));
+        c.last_stream_id = 1;
+        c
+    }
+
+    /// RFC 9113 8.2.1: field names on the wire are lowercase. The encoder
+    /// lowercases into its scratch buffer instead of into a `String`; the
+    /// bytes a client receives are the ones a lowercased copy produced.
+    #[test]
+    fn owned_response_field_names_are_lowercase_and_hop_by_hop_fields_are_dropped() {
+        let mut c = conn();
+        c.push_response_headers(
+            1,
+            200,
+            &[
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("X-MiXeD".to_string(), "kept".to_string()),
+                ("Connection".to_string(), "close".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+                ("Keep-Alive".to_string(), "timeout=5".to_string()),
+            ],
+            2,
+            None,
+        );
+        let fields = headers_block(&c);
+        assert!(
+            fields
+                .iter()
+                .all(|(k, _)| !k.bytes().any(|b| b.is_ascii_uppercase())),
+            "a field name reached the wire with case: {fields:?}"
+        );
+        assert_eq!(value(&fields, "content-type"), Some("text/plain"));
+        assert_eq!(value(&fields, "x-mixed"), Some("kept"));
+        assert_eq!(value(&fields, "content-length"), Some("2"));
+        for dropped in ["connection", "transfer-encoding", "keep-alive"] {
+            assert_eq!(count(&fields, dropped), 0, "{dropped} was not dropped");
+        }
+    }
+
+    /// A borrowed cache hit writes the same fields, values and order the owned
+    /// path wrote: names lowercase, `Age`/`Vary` replaced rather than
+    /// duplicated, and the start-time `Alt-Svc` line used.
+    #[test]
+    fn borrowed_cache_hit_writes_lowercase_fields_and_replaces_age_vary_and_alt_svc() {
+        let entry = CachedResponse {
+            status: 200,
+            headers: std::sync::Arc::new(vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                (
+                    "Cache-Control".to_string(),
+                    "public, max-age=60".to_string(),
+                ),
+                ("Content-Length".to_string(), "9".to_string()),
+                ("Connection".to_string(), "close".to_string()),
+                ("Age".to_string(), "41".to_string()),
+                ("Vary".to_string(), "Cookie".to_string()),
+                ("Alt-Svc".to_string(), "h3=\":1\"; ma=1".to_string()),
+            ]),
+            body: bytes::Bytes::from_static(b"cacheable"),
+            genid: 7,
+        };
+        let hit = HitHeaders {
+            alt_svc: std::sync::Arc::from(&b"alt-svc: h3=\":8443\"; ma=86400"[..]),
+            describedby: None,
+        };
+        let mut c = conn();
+        c.dispatch_cached_h2_response(
+            1,
+            &entry,
+            std::time::Duration::from_secs(3),
+            Some("sid=abc"),
+            &hit,
+            "GET",
+        );
+        let fields = headers_block(&c);
+        assert!(
+            fields
+                .iter()
+                .all(|(k, _)| !k.bytes().any(|b| b.is_ascii_uppercase())),
+            "a field name reached the wire with case: {fields:?}"
+        );
+        assert_eq!(value(&fields, "content-type"), Some("text/plain"));
+        assert_eq!(value(&fields, "cache-control"), Some("public, max-age=60"));
+        assert_eq!(value(&fields, "content-length"), Some("9"));
+        assert_eq!(value(&fields, "age"), Some("3"));
+        assert_eq!(value(&fields, "vary"), Some("Cookie, Accept-Encoding"));
+        assert_eq!(value(&fields, "alt-svc"), Some("h3=\":8443\"; ma=86400"));
+        assert_eq!(value(&fields, "set-cookie"), Some("sid=abc"));
+        assert_eq!(value(&fields, "m6-genid"), Some("7"));
+        for once in ["content-length", "age", "vary", "alt-svc", "m6-genid"] {
+            assert_eq!(count(&fields, once), 1, "{once} appears more than once");
+        }
+        assert_eq!(count(&fields, "connection"), 0);
     }
 }
