@@ -126,11 +126,11 @@ Take from it that only m6-http listens on a public port, and that every other pr
     │ Tera     │       │ Static     │     │              │   │  (any lang) │
     │ template │       │ files      │     │ JWT issue    │   │             │
     │ renderer │       │ Brotli/    │     │ JWT refresh  │   │ Rust:       │
-    │          │       │ gzip       │     │ Login/logout │   │ m6-render   │
+    │          │       │ gzip       │     │ Login/logout │   │ m6-core     │
     │          │       │ Symlink    │     │ Rate limit   │   │ library     │
     │          │       │ guard      │     │ Key rotation │   │             │
     └────┬─────┘       └────────────┘     └──────┬───────┘   └─────────────┘
-         │  m6-render library (Rust)             │  m6-auth library (Rust)
+         │  m6-core   library (Rust)             │  m6-auth library (Rust)
          └───────────────────────────────────────┘
                                                  │
                                           ┌──────▼──────┐
@@ -273,7 +273,7 @@ No operation here costs more than 22.6 ns, so the hot path's own work is tens of
 Tera template renderer.
 Handles all HTML routes.
 
-**Architecture (via m6-render library):**
+**Architecture (via m6-core library):**
 - One process and one event loop, accepting on listener readiness
 - `Site` built once at start, holding the config, the route table and the renderer
 - Plain state in `main`, passed to each request arm
@@ -368,7 +368,7 @@ Serves assets, downloads, and any file from the site directory.
 - Brotli and gzip compression applied per request.
   m6-http caches the compressed response
 - No cache in m6-file: all caching is m6-http's responsibility
-- Always returns `Cache-Control: public`
+- `Cache-Control` from the query string alone: `public, max-age=0, must-revalidate, s-maxage=86400` unversioned, and `public, max-age=31536000, immutable` for `?v=<hash>`
 
 **Benchmark results (release, Apple M4, criterion + percentile reporter):**
 
@@ -414,10 +414,10 @@ Shared library crate used by `m6-auth-server` and `m6-auth-cli`.
 
 ---
 
-### 3.6 m6-render (library)
+### 3.6 m6-core (library)
 
-Library for writing custom renderers in Rust.
-Used by `m6-html` and any Rust custom renderer crate.
+The crate every m6 service links.
+It supplies the loop parts, routing, configuration, the request dictionary and the response helpers, so a service writes its routes, their handlers and its loop.
 
 - `Site` for routing, the request dictionary, templates and the site-wide finish
 - Code routes as `CodeRoute` values, answered from one `match` on `Handled`
@@ -425,7 +425,7 @@ Used by `m6-html` and any Rust custom renderer crate.
 - `Request` / `Response` / `Error` types
 - Configuration read once at start, and a change takes a restart
 
-`docs/m6-app-anatomy.md` walks through the loop a renderer writes.
+`docs/m6-app-anatomy.md` walks through the loop a service writes.
 
 ---
 
