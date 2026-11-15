@@ -208,7 +208,7 @@ fn status(resp: &[u8]) -> u16 {
 /// A backend that sends HEADERS with END_STREAM and finishes it in a
 /// CONTINUATION frame has its body-less 200 forwarded.
 #[test]
-fn a_split_bodyless_response_is_forwarded() {
+fn rfc9113_6_2_a_split_bodyless_response_is_forwarded() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let backend_port = listener.local_addr().expect("addr").port();
     thread::spawn(move || {

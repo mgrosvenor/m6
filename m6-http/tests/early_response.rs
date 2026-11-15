@@ -410,7 +410,7 @@ fn body(resp: &[u8]) -> String {
 /// A socket backend that reads 1 KiB of a large request, answers it in full and
 /// closes: the client gets that status and body, not a 502.
 #[test]
-fn a_socket_backend_that_answers_early_is_forwarded() {
+fn rfc9112_9_6_a_socket_backend_that_answers_early_is_forwarded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("m6-file-1.sock");
     let glob = dir.path().join("m6-file-*.sock").display().to_string();
@@ -434,7 +434,7 @@ fn a_socket_backend_that_answers_early_is_forwarded() {
 /// 413 and a body and closes: the write's EPIPE/ECONNRESET must not win over the
 /// reply, and the backend's own 413 and body must reach the client.
 #[test]
-fn an_https_backend_that_answers_early_is_forwarded() {
+fn rfc9112_9_6_an_https_backend_that_answers_early_is_forwarded() {
     let backend = spawn_tls_backend(Refusal::Answer(EARLY_413_HEAD));
     let port = backend.port;
     let fx = Fixture::start(
@@ -458,7 +458,7 @@ fn an_https_backend_that_answers_early_is_forwarded() {
 /// A socket backend that closes while the request is still being written, with
 /// no reply at all, is a 502.
 #[test]
-fn a_socket_backend_that_closes_without_a_reply_is_a_502() {
+fn rfc9112_9_6_a_socket_backend_that_closes_without_a_reply_is_a_502() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("m6-file-1.sock");
     let glob = dir.path().join("m6-file-*.sock").display().to_string();
@@ -479,7 +479,7 @@ fn a_socket_backend_that_closes_without_a_reply_is_a_502() {
 
 /// An HTTPS URL backend that closes after half a response head is a 502.
 #[test]
-fn an_https_backend_that_closes_mid_head_is_a_502() {
+fn rfc9112_9_6_an_https_backend_that_closes_mid_head_is_a_502() {
     let backend = spawn_tls_backend(Refusal::PartialHead);
     let port = backend.port;
     let fx = Fixture::start(
