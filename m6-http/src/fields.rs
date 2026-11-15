@@ -54,6 +54,26 @@ pub(crate) fn validate_request_headers(headers: &[(String, String)]) -> Result<(
 /// 32 bytes of overhead.
 pub const FIELD_OVERHEAD: usize = 32;
 
+/// Whether a response field is connection-specific and therefore forbidden on
+/// HTTP/2 and HTTP/3 (RFC 9113 8.2.2, RFC 9114 4.2).
+///
+/// These are HTTP/1.1 hop-by-hop fields: they describe the one connection the
+/// message travelled on, and neither h2 nor h3 has a connection to describe.
+/// Both protocols say a message carrying one is malformed.
+///
+/// One helper for both serialisers, because the h3 writer dropping its own
+/// copy of this rule is exactly how example 08's `/logs` came to be answered
+/// as 200 with no body: the m6-html backend closes its HTTP/1.1 connection, so
+/// every page it returns carries `Connection: close`, h2 stripped it and h3
+/// forwarded it, and a client enforcing RFC 9114 4.2 read no body at all.
+pub fn is_connection_specific(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+}
+
 /// The status an over-limit decoded request head earns, if it is over one.
 ///
 /// 414 is the request line: `:method` and `:path` joined by one space, the way
