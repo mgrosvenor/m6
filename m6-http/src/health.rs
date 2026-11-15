@@ -14,6 +14,7 @@ use std::net::IpAddr;
 
 use crate::auth::{self, Decision, PublicKey};
 use crate::config::{GenidConfig, HealthConfig};
+use crate::stats::Iface;
 
 pub use m6_core::monitoring::{HealthReport, PerfOutcome, PerfReport, PerfSubject, PoolHealth};
 
@@ -39,6 +40,35 @@ pub const GENID_BACKEND: &str = "genid";
 /// keeps it moving on its own.
 pub fn is_monitoring_endpoint(backend: &str) -> bool {
     backend == HEALTH_BACKEND || backend == PERF_BACKEND
+}
+
+/// Which population a request on a public listener belongs to, from the peer
+/// address the connection proved.
+///
+/// The TLS and QUIC listener faces the internet, so a real visitor's address
+/// is public after NAT. The monitor runs on the private network, and its polls
+/// arrive from a private, link-local, shared or unique-local address. That
+/// address class is the signal this returns: [`Iface::Monitor`] for such a
+/// peer and [`Iface::External`] for every other one. A connect from a private
+/// address cannot be forged from the internet, so no header is read and no
+/// list is consulted.
+///
+/// Loopback is external on purpose. It is the address of a shell on this host,
+/// a development client and every loopback test, so counting it as monitor
+/// would hide the traffic of the machine the server runs on. A health check on
+/// loopback is classified by its path instead, which every monitoring endpoint
+/// already is.
+///
+/// The internal h2c listener is classified by the socket instead, before this
+/// is called. Classification is one address parse and a range check: no
+/// allocation, and no table whose lookup grows with traffic.
+pub fn peer_iface(peer: IpAddr) -> Iface {
+    let peer = peer.to_canonical();
+    if !peer.is_loopback() && m6_core::net::is_private_ip(peer) {
+        Iface::Monitor
+    } else {
+        Iface::External
+    }
 }
 
 #[cfg(test)]

@@ -415,6 +415,13 @@ impl Http11Listener {
         self.conns.get_mut(key)
     }
 
+    /// The peer address a connection slot was accepted from, for the handshake
+    /// statistics. `None` for a free slot or an address that no longer parses,
+    /// which the caller counts as external.
+    pub fn peer_ip(&self, key: usize) -> Option<std::net::IpAddr> {
+        self.conns.get(key).client_ip.parse().ok()
+    }
+
     pub fn free_slot(&mut self, key: usize) {
         self.conns.free(key);
     }

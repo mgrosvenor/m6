@@ -807,7 +807,12 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     let (http_version, iface) = if h2c {
         (HttpVersion::Http2, state.h2c_iface)
     } else {
-        (HttpVersion::from_wire(version), state.tls_iface)
+        (
+            HttpVersion::from_wire(version),
+            client_ip
+                .parse::<std::net::IpAddr>()
+                .map_or(state.tls_iface, health::peer_iface),
+        )
     };
     if let m6_http_lib::cache::Lookup::Fresh(cached, age)
     | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
@@ -1276,9 +1281,19 @@ fn drive_conn_token(
         } else {
             HttpVersion::Http11
         };
+        // A handshake belongs to the same population as the requests that
+        // connection will carry: the internal socket for the backbone, the
+        // peer's address class for a monitor against a visitor on TLS.
+        let iface = if is_h2c {
+            state.h2c_iface
+        } else {
+            tcp.as_ref()
+                .and_then(|t| t.peer_ip(slot))
+                .map_or(state.tls_iface, health::peer_iface)
+        };
         state
             .stats
-            .record_handshake(hs.elapsed_ns, Channel::new(v, state.tls_iface), hs.resumed);
+            .record_handshake(hs.elapsed_ns, Channel::new(v, iface), hs.resumed);
         // An h2 connection is idle-governed by `h2_idle_timeouts`, not the
         // 30 s read deadline set at accept, so drop that deadline and start
         // the idle clock now: a peer that finishes the handshake but never
@@ -2962,7 +2977,10 @@ fn drain_udp(
             let resumed = qconn.conn.is_resumed();
             state.stats.record_handshake(
                 qconn.created.elapsed().as_nanos() as u64,
-                Channel::new(HttpVersion::Http3, state.tls_iface),
+                Channel::new(
+                    HttpVersion::Http3,
+                    health::peer_iface(qconn.client_addr.ip()),
+                ),
                 resumed,
             );
         }
@@ -3406,8 +3424,12 @@ fn handle_h3_request(
     | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
     {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        // QUIC shares the public bind, so it is external like TLS.
-        let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+        // QUIC shares the public bind, so the peer's address class separates a
+        // monitor poll from a visitor exactly as it does on TLS.
+        let chan = Channel::new(
+            HttpVersion::Http3,
+            health::peer_iface(qconn.client_addr.ip()),
+        );
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
         let precond = evaluate_preconditions(
@@ -3601,8 +3623,12 @@ fn handle_h3_request(
             set_alt_svc(&mut resp_headers, h3.quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
-            // /health and /perf are separated inside `Stats::record`.
-            let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+            // /health and /perf are separated inside `Stats::record`, and a
+            // poll on any other path is separated here by the peer address.
+            let chan = Channel::new(
+                HttpVersion::Http3,
+                health::peer_iface(qconn.client_addr.ip()),
+            );
             state
                 .stats
                 .record(elapsed_ns, false, status, chan, &backend_name);

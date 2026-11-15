@@ -158,8 +158,9 @@
 //!
 //! # Caveats
 //!
-//! Channel counters include the monitor's own polls and header checks (issue
-//! #107). `monitor_requests` on each node row says how many.
+//! Channel counters separate the monitor's own polls and header checks (issue
+//! #107) into `http/<version>/monitor`. `monitor_requests` on each node row
+//! says how many.
 //!
 //! The node's own periodic stats log is not the history. It lives in the
 //! node's journal, which is capped, it is a 10 second series with no channels,
