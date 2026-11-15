@@ -1004,7 +1004,7 @@ It is the same value `openssl x509 -noout -fingerprint -sha256 -in fullchain.pem
 Every client already receives those bytes in the handshake, so the value discloses nothing a visitor does not have.
 
 A fleet whose nodes share one certificate sets `[monitor] one_certificate = true`, and then a node whose leaf fingerprint differs is a fault in `/check` and in `/digest`.
-Without the key the monitor warns only when some nodes agree and one does not, and it stays silent for a two-node fleet and for two certificates that expire on the same day.
+Without the key the monitor warns only when some nodes agree and one does not, so it stays silent for a two-node fleet even when the two nodes differ.
 Leave the key unset when each node renews its own certificate.
 
 ### 7.2. Secrets and state

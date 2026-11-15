@@ -377,9 +377,9 @@ A refusal never reaches routing or the cache, so a catch-all route can never ans
 `/perf` and `/traffic` are gated by the `[health]` keys in Table 1.
 
 `/perf` reports three traffic populations and never pools them.
-`http/<version>/external` is a real visitor, from a public address on the TLS or QUIC listener.
+`http/<version>/external` is a real visitor from a public address on the TLS or QUIC listener, or a loopback client on either.
 `http/<version>/internal` is a cache node's forward on the listener `[server] internal_binds` names.
-`http/<version>/monitor` is a poll of `/health`, `/perf` or `/traffic`, or any request on the TLS or QUIC listener from a private network address.
+`http/<version>/monitor` is a poll of `/health`, `/perf` or `/traffic`, or any request on the TLS or QUIC listener from a private network address other than loopback.
 The backend name identifies the three endpoints and the peer address identifies the rest, so no header and no configuration key is involved.
 Every monitor request also moves `monitor_requests_total`, and none of them moves `requests_total` or the hit and miss counters.
 

@@ -53,7 +53,7 @@ The refusal is decided at the edge, before the body is read, the cache is looked
 `GET` also answers `HEAD`, so a GET-only route names both in `Allow` (RFC 9110 9.3.2).
 `OPTIONS` is answered at the edge with 405 and `Allow` and never forwarded (RFC 9110 9.3.7), and a route cannot name it.
 An unknown or empty `methods` list stops the start with exit 2, and `--dump-config` fails the same way.
-Verified by six end-to-end tests against a real m6-http and backend socket, an RFC 9110 conformance test over HTTP/1.1, HTTP/2 and HTTP/3, a startup test of the exit 2, and unit tests of the fixed method set.
+Verified by seven end-to-end tests against a real m6-http and backend socket, an RFC 9110 conformance test over HTTP/1.1, HTTP/2 and HTTP/3, a startup test of the exit 2, and unit tests of the fixed method set.
 
 **The JSON digest carries the traffic and security report the text check prints (#220).**
 `/digest` gains `nodes[].traffic`, with the facts `/check` sections D and E print from the node's `/traffic`: `window_minutes`, `events_dropped`, `total_requests`, `status`, `logging` (`state`, `events_total`, `seconds_since_last`), `heavy_hitters`, `notable` with the agents and paths it presented, `crawlers`, `forged_bot_requests` and `forgers`, `probe_noise`, and `firewall` (`blocks`, `total_rules`, `hit`, `hit_total`).
@@ -345,6 +345,15 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 **A backend that refuses a request no longer takes its pool member out of rotation.** When a backend closed the connection while m6-http was still sending the request (m6-file answering an oversized header, then closing without draining it), m6-http marked the member failed and backed it off for a second, so the next request to that backend answered 502. A member that never received the whole request is now released. A member that took the whole request and then failed, a silent member and a refused connect still back off.
 
 ### Docs
+
+**The README, `docs/m6-http.md`, `docs/m6-site-toml.md`, `docs/m6-testing.md`, `docs/m6-user-guide.md` and one changelog count now match the code.**
+The renderer library is `m6-core`, because `m6-render` was deleted.
+The monitor population excludes loopback, and a public address is monitor only on `/health`, `/perf` and `/traffic`.
+The `[health]` table has two access keys.
+The certificate comparison groups on the fingerprint.
+`m6-file` computes `Cache-Control` from the query string.
+The route-method change names seven end-to-end tests.
+Verified by counting the tests, reading the classifying code and running `tools/check-commit-hashes.sh`.
 
 **`README.md` follows the documentation ruleset, and its example check count, its backend pool description and its configuration example now match the code (#128).**
 Fifteen numbered sections, a contents list, and every table and figure numbered, captioned and referenced.

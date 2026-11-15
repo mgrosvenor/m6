@@ -180,8 +180,8 @@ Two of them need more than a row:
 
 ## 5. Where the tests are
 
-Table 6 gives the integration suites, by crate.
-Take from it that every suite is named, so a claim about m6's behaviour can be traced to the file that checks it.
+Table 6 gives a selection of the integration suites, by crate.
+Take from it that a claim about a behaviour in the selection can be traced to the file that checks it, while `tests/` holds more suites than this table lists.
 
 | crate | integration suites |
 |---|---|
