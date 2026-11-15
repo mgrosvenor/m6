@@ -244,6 +244,9 @@ Comments only.
 
 ### Changed
 
+**Every test binary answers the standard test-list protocol, so `cargo nextest` runs the whole workspace.**
+Nine binaries that run without libtest's harness (the allocation counters and the loop tests that need one thread or a blocked signal mask) now answer `--list --format terse` and accept a name filter, so a test runner can list and run them like any other. Each still forces one thread after parsing its arguments. Verified on Linux with `cargo nextest run --workspace`: 1989 tests in 97 binaries listed and passed.
+
 **Every clock read outside `m6-platform` is refused by its gate, including reads through `chrono`, `time` and `filetime`.**
 Five shipping reads that asked the operating system directly now take the time from `m6_core::platform::now()` or `wall()`, and `chrono` only formats a value it is given.
 Verified: the platform gate on Linux and macOS.
