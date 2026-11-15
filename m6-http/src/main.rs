@@ -896,9 +896,11 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     }
 }
 
-/// Handle one owned request: h2 (which builds its request in `http2.rs`) and
-/// the h1 body path. On a hit it returns the owned `Ready` form, keeping the
-/// h2 allocation profile unchanged.
+/// Handle one owned request from the HTTP/1.1 body path.
+///
+/// h2 does not reach this: `on_request_h2` answers a cached hit from borrowed
+/// views and calls `into_owned` only on a miss. On a hit here the shared
+/// `Cached` form goes back to `drive_h1`, which writes it without copying.
 fn on_request_impl(
     state: &mut ServerState,
     req: &forward::HttpRequest,

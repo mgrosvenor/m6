@@ -1979,10 +1979,10 @@ impl Http2Conn {
             return;
         }
 
-        // Take the request out of the stream so the headers and body move
-        // rather than clone. Every path below either removes the stream
-        // (reject) or moves the body into `req` (Ready) / `ctx.req` (Pending),
-        // so the taken fields are never read again.
+        // Take the request out of the stream so the fields and body move rather
+        // than clone. They are read in place by the borrowed view below; a miss
+        // moves the body into its owned request, and a parked dispatch keeps
+        // the owned request in `ctx.req`.
         let (mut headers, body) = {
             let s = self.streams.get_mut(&stream_id).unwrap();
             (std::mem::take(&mut s.headers), std::mem::take(&mut s.body))
