@@ -314,6 +314,14 @@ fn the_monitor_runs_one_thread() {
     let plain = settled_threads(svc2.pid(), &svc2);
     drop(svc2);
     assert_single_loop("three nodes with tunnels", plain);
+    // One process, three nodes: a thread per node would add two to this count
+    // relative to the one-node run, beyond the platform workers' swing.
+    assert!(
+        plain <= one + 1,
+        "three nodes run {plain} threads against one node's {one}: a thread per node \
+         adds one per node, and the platform workers swing by at most one between \
+         these two processes"
+    );
 
     let config_text = config_text.replace(
         "\nwg_handshakes_file",

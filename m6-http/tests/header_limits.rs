@@ -31,7 +31,6 @@ use std::net::{TcpStream, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1118,13 +1117,13 @@ impl FileBackend {
         )
         .unwrap();
 
-        // One name per test, not one per process: the six tests that use this
-        // fixture run at once in one test process, so a pid-only name is one
-        // path all six bind, and each unlinks the socket another has bound.
-        // The counter gives every test its own name, and the remove below can
-        // then touch no socket but this test's own.
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        // A counter, not just the pid: every test in this binary is a
+        // different backend, and the harness runs them on several threads of
+        // ONE process. A pid-only name made them fight over one socket, which
+        // surfaced as "another process listens on ..." or as a BrokenPipe
+        // against whichever backend won.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = PathBuf::from(format!("/tmp/m6hlf-{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket);
         let mut file = Service::spawn(
@@ -1145,8 +1144,19 @@ impl FileBackend {
     fn send(&self, request: &[u8]) -> Reply {
         let mut stream = UnixStream::connect(&self.socket).expect("connect to m6-file");
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        stream.write_all(request).expect("write request");
-        stream.flush().ok();
+        // The backend can refuse an oversized head and close while this write
+        // is still in flight, which surfaces as BrokenPipe. That refusal is the
+        // reply the caller asserts. Any other write failure leaves the request
+        // unsent, so the reply would prove nothing.
+        if let Err(e) = stream.write_all(request).and_then(|()| stream.flush()) {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "writing the request to m6-file failed: {e}"
+            );
+        }
         read_reply(&mut stream)
     }
 }

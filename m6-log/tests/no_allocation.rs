@@ -2,12 +2,14 @@
 //! `Line` allocate nothing.
 //!
 //! The counting allocator is process-wide, so this test is its own binary with
-//! `harness = false`. Its `main` runs on one thread and exits non-zero when
-//! anything allocated.
+//! `harness = false`. The harness speaks libtest's protocol through
+//! `libtest-mimic`, forced onto one thread: the check runs in `main` and fails
+//! when anything allocated.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_log::{with_analytics, Level, Line};
 
 struct Counting;
@@ -38,6 +40,19 @@ static GLOBAL: Counting = Counting;
 const LINES: u64 = 100_000;
 
 fn main() {
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "no_allocation_after_init",
+        no_allocation_after_init,
+    )];
+    libtest_mimic::run(&args, tests).exit();
+}
+
+fn no_allocation_after_init() -> Result<(), Failed> {
     let devnull = std::fs::File::options()
         .write(true)
         .open("/dev/null")
@@ -95,7 +110,9 @@ fn main() {
         "the operational Sink wrote nothing"
     );
     assert!(analytics_written > 0, "the analytics Sink wrote nothing");
-    if allocated != 0 {
-        std::process::exit(1);
+    if allocated == 0 {
+        Ok(())
+    } else {
+        Err(format!("{allocated} allocation(s) in {} lines", LINES * 6).into())
     }
 }
