@@ -156,6 +156,34 @@ In `m6-core/src/response.rs`, `as_bytes()` returns `None` for a stream, so the m
 Allocation on the file path is now bounded by what the response sends.
 The cache path raised a different question: whether its latency had regressed at all.
 
+### 3.1. Allocations per request
+
+`m6-http` counts its own heap allocations behind the `count-allocations` feature, which is off by default.
+A plain build installs no allocator and compiles the arm and stop calls out, so its loop is unchanged.
+With the feature on, the run loop arms `m6_core::testkit::alloc_count` when it starts and logs `calls` and `bytes` once at stop.
+The count covers every `alloc`, `alloc_zeroed` and `realloc` the loop thread made while serving, from m6-http, m6-core, rustls, quiche and every other Rust library in the process.
+
+Run the test with the feature, serially:
+
+```text
+cargo test -p m6-http --test allocations --features count-allocations -- --test-threads=1 --nocapture
+```
+
+`tests/allocations.rs` starts the binary cargo built with the feature, sends one warm-up request and then 1,000 requests on one connection and 2,000 requests on another, sends SIGTERM and reads each stop line.
+The per-request figure is `(2N count - N count) / N`, so the one handshake and the one backend-connecting first request in each run sit in both counts and cancel.
+The four rows measured on macOS on 2026-11-15:
+
+- `h1_tls_hit`, a cached page on one keep-alive connection over TLS: 11.000 calls per request.
+- `h2_tls_hit`, the same over HTTP/2: 91.000 calls per request.
+- `h1_tls_miss_insert`, a new query string each time so each request reaches the backend and is stored: 91.001 calls per request.
+- `h1_tls_new_connection_per_connection`, a cached page with a full TLS handshake per request, measured per connection: 123.000 calls per connection.
+
+The difference did not repeat exactly under load: over the runs h1 read 10.997 to 11.003, h2 90.996 to 91.004 and the miss row 90.998 to 91.004.
+The three request budgets are the top of that observed spread, with nothing added on top: 11,003, 91,004 and 91,004 calls per 1,000 requests.
+The miss row's one call above 91,000 is the single cache-table growth that its 1,000 inserts trigger.
+The new-connection row is a measure, not a budget: a full handshake per connection read 122.859 to 123.849 per connection across the runs, so a per-connection ceiling would flake.
+The budgets only go down. Each ALLOC job lowers the row it attacks, and a row above its budget fails the test.
+
 ---
 
 ## 4. Cache-hit latency, and why it is load dependent

@@ -107,6 +107,18 @@ pub fn uid() -> u32 {
     nix::unistd::Uid::effective().as_raw()
 }
 
+/// The effective user's name.
+///
+/// A start-time error tells the operator who should own a directory the service
+/// will not create, so it names this user. Falls back to the numeric id when
+/// the name cannot be read, the one fact always available.
+pub fn user() -> String {
+    nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .ok()
+        .flatten()
+        .map_or_else(|| uid().to_string(), |user| user.name)
+}
+
 /// Whether this process runs as root.
 pub fn is_root() -> bool {
     nix::unistd::Uid::effective().is_root()
@@ -124,6 +136,18 @@ pub fn is_alive(pid: u32) -> bool {
 /// `proc_pidinfo` with `PROC_PIDLISTTHREADS`, one id per thread.
 pub fn thread_count(pid: u32) -> io::Result<usize> {
     os::thread_count(pid)
+}
+
+/// The idle worker threads the host's certificate store leaves in a process
+/// after it has been read, as `(min, max)`.
+///
+/// The range is a platform fact, not a measurement: macOS reads the store
+/// through the Security framework, whose libdispatch workers stay behind
+/// (three or four, swinging between starts), while Linux reads the store's
+/// files and leaves no thread. A caller that counts a service's threads adds
+/// this range to the threads the service makes itself.
+pub fn certificate_store_workers() -> (usize, usize) {
+    os::certificate_store_workers()
 }
 
 /// How many descriptors the process `pid` holds open. `Err` for a pid that is

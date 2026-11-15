@@ -619,7 +619,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"

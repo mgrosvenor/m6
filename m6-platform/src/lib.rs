@@ -322,10 +322,9 @@ pub fn require_blocked() {
     assert!(
         blocked_here(),
         "m6_core::signal::block() must be the first statement of main, before \
-         anything spawns a thread. Without it the signal mask is not inherited \
-         by threads that already exist (the tracing-appender writer, for one), \
-         the kernel delivers SIGTERM to one of them, and the process dies at \
-         the default disposition instead of shutting down."
+         anything else runs. Without it the signal mask is not inherited, the \
+         kernel delivers SIGTERM at the default disposition, and the process \
+         dies instead of the loop reading the shutdown request."
     );
 }
 
@@ -429,6 +428,28 @@ pub fn runtime_dir() -> PathBuf {
 pub fn temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
+
+/// The unit's `StateDirectory=`, when the service manager set one.
+///
+/// The variable's name lives here because reading a service manager's variable
+/// is this layer's job. `None` when the variable is absent or empty. A path the
+/// unit set is absolute, and the caller decides whether to accept anything
+/// else rather than guess a working directory.
+pub fn state_directory() -> Option<PathBuf> {
+    std::env::var_os(STATE_DIR_VAR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The service manager's variable for a unit's writable state directory.
+///
+/// Named here so a service reads it through [`state_directory`] and never
+/// spells the variable itself.
+pub const STATE_DIR_VAR: &str = "STATE_DIRECTORY";
+
+/// The phrase a start prints when it needs `StateDirectory=` and the service
+/// manager set none. The caller supplies the setting that needs it.
+pub const STATE_DIR_UNSET: &str = "STATE_DIRECTORY is not set";
 
 /// A directory a test can compile into and then execute from.
 ///

@@ -145,7 +145,11 @@ Evidence from a private deployment cannot be re-run by anyone else, which makes 
 
 Security issues go to [`SECURITY.md`](SECURITY.md), not to the issue tracker.
 
-## 9. Summary
+## 9. Changes the event-loop rule needs approved
+
+A change that adds an `#[expect(clippy::disallowed_methods)]`, a thread, a heap allocation on a loop's hot path or an `unsafe` block names the owner's approval in its pull request description, and quotes the reason he gave.
+
+## 10. Summary
 
 Branch from develop, open a pull request into develop, and pass every check in Table 2.
 File the issue first, say in the commit what changed and how it was verified, and report defects against something a reader can run.

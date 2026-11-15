@@ -182,6 +182,26 @@ jobs:
           # prints no `failures:` line, so cargo's own status decides as well.
           [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
 
+      # `cargo test --workspace` builds only the targets whose `required-features`
+      # the workspace turns on. Any other target is omitted, not run, so the test
+      # is invisible and rots. Each line below names a target and the feature
+      # that makes it visible. The coordinator's gate runs the same four lines
+      # with `cargo nextest run`. The m6-core `testkit` targets are already in
+      # the workspace build because m6-html and m6-http ask for `testkit` in
+      # their dev-dependencies, and they are named here so that removing one of
+      # those requests cannot hide them.
+      - name: Feature-gated tests, named explicitly
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # `testkit` also turns on `alloc-count`, so all five counting tests build.
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          # `email` makes these two visible, `testkit` is the harness they use.
+          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
+          # `count-allocations` builds the counting allocator into the binary the test reads.
+          cargo test -p m6-http --features count-allocations --test allocations
+          # `count-allocations` builds the counter into m6-monitor's binary.
+          cargo test -p m6-monitor --features count-allocations --test client_allocs
+
       # Nothing in the workspace turns on some off-by-default core features
       # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
       # compiles or runs their code. That is the `templates` scar (two csrf
@@ -278,6 +298,25 @@ jobs:
             exit 1
           fi
           [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+      # `cargo test --workspace` builds only the targets whose `required-features`
+      # the workspace turns on. Any other target is omitted, not run, so the test
+      # is invisible and rots. Each line below names a target and the feature
+      # that makes it visible. The coordinator's gate runs the same four lines
+      # with `cargo nextest run`. The m6-core `testkit` targets are already in
+      # the workspace build because m6-html and m6-http ask for `testkit` in
+      # their dev-dependencies, and they are named here so that removing one of
+      # those requests cannot hide them.
+      - name: Feature-gated tests, named explicitly
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # `testkit` also turns on `alloc-count`, so all five counting tests build.
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          # `email` makes these two visible, `testkit` is the harness they use.
+          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
+          # `count-allocations` builds the counting allocator into the binary the test reads.
+          cargo test -p m6-http --features count-allocations --test allocations
+          # `count-allocations` builds the counter into m6-monitor's binary.
+          cargo test -p m6-monitor --features count-allocations --test client_allocs
       - name: Opt-in core features, zero warnings and tests
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
@@ -347,6 +386,25 @@ jobs:
             exit 1
           fi
           [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+      # `cargo test --workspace` builds only the targets whose `required-features`
+      # the workspace turns on. Any other target is omitted, not run, so the test
+      # is invisible and rots. Each line below names a target and the feature
+      # that makes it visible. The coordinator's gate runs the same four lines
+      # with `cargo nextest run`. The m6-core `testkit` targets are already in
+      # the workspace build because m6-html and m6-http ask for `testkit` in
+      # their dev-dependencies, and they are named here so that removing one of
+      # those requests cannot hide them.
+      - name: Feature-gated tests, named explicitly
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # `testkit` also turns on `alloc-count`, so all five counting tests build.
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          # `email` makes these two visible, `testkit` is the harness they use.
+          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
+          # `count-allocations` builds the counting allocator into the binary the test reads.
+          cargo test -p m6-http --features count-allocations --test allocations
+          # `count-allocations` builds the counter into m6-monitor's binary.
+          cargo test -p m6-monitor --features count-allocations --test client_allocs
       - name: Opt-in core features, zero warnings and tests
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |

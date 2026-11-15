@@ -111,6 +111,7 @@ use m6_core::signal::{Action, Lifecycle};
 const ROUTES: &[CodeRoute] = &[CodeRoute { pattern: "/healthz", method: RouteMethod::Get }];
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
+const LOG: Token = Token(usize::MAX - 2);
 const TICK: Duration = Duration::from_secs(1);
 const READ_CAP: usize = 16 * 1024;
 const WRITE_CAP: usize = 64 * 1024;
@@ -132,10 +133,11 @@ fn main() -> anyhow::Result<()> {
     let mut conns = Slots::new(1024, 1024, || ServerConn::new(READ_CAP, WRITE_CAP));
     let mut deadlines = Timeouts::new(1024, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(256);
+    let mut last_tick = m6_core::platform::now();
 
     // Run: nothing blocks.
     'run: loop {
-        poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK)))?;
+        poll.poll(&mut events, Some(deadlines.timeout(m6_core::platform::now(), TICK)))?;
         for event in &events {
             match event.token() {
                 LISTENER => {
@@ -155,7 +157,7 @@ fn main() -> anyhow::Result<()> {
                         poll.registry()
                             .register(&mut stream, Token(taken.key), Interest::READABLE)?;
                         if read_timeout.is_some() {
-                            deadlines.touch(Token(taken.key), Instant::now());
+                            deadlines.touch(Token(taken.key), m6_core::platform::now());
                         }
                         conns.get_mut(taken.key).attach(stream);
                     }
@@ -163,6 +165,8 @@ fn main() -> anyhow::Result<()> {
                 SIGNALS => {
                     let mut stop = false;
                     while let Some(signal) = signals.read() {
+                        // One arm answers a reopen: `Lifecycle` calls
+                        // `m6_core::log::reopen()` and logs the outcome.
                         if lifecycle.on_signal(signal) == Action::Stop {
                             stop = true;
                         }
@@ -171,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                         break 'run;
                     }
                 }
+                LOG => m6_core::log::flush(),
                 Token(k) => {
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
@@ -184,7 +189,7 @@ fn main() -> anyhow::Result<()> {
                                 poll.registry().reregister(stream, Token(k), interest)?;
                             }
                             if read_timeout.is_some() {
-                                deadlines.touch(Token(k), Instant::now());
+                                deadlines.touch(Token(k), m6_core::platform::now());
                             }
                         }
                         _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
@@ -192,19 +197,31 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while a write has returned EAGAIN, so the loop never waits on
+        // the log. A failed watch is logged and the service serves on.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+        // The accounting tick: flush the log buffers once a second.
+        if m6_core::platform::now() - last_tick >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
+            last_tick = m6_core::platform::now();
+        }
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
     }
 
     // Stop: blocking and allocation are fine.
     lifecycle.complete();
+    m6_core::log::stop()?;
     Ok(())
 }
 
 /// One connection's turn: write what it owes, read, dispatch, write, and
 /// report whether it stays open.
-fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
+fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
     loop {
         if conn.interest() == Interest::WRITABLE {
             match conn.flush()? {
@@ -220,6 +237,17 @@ fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
                 let response = match site.handle(&head) {
                     Handled::Done(response) => response,
                     Handled::Code(0, req) => site.finish(&req, Response::text("ok")),
+                    // `POST /genid`: the start path again, then one assignment.
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&[], &[], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        finish_reload(&reload, response)
+                    }
                     Handled::Code(..) | Handled::Named(..) => unreachable!(),
                 };
                 (Some(response), false)
@@ -241,8 +269,10 @@ fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
 
 The loop has one `match` on the event's token.
 `LISTENER` takes free slots and accepts until the kernel has no more.
-`SIGNALS` drains the signal descriptor through `Lifecycle`.
+`SIGNALS` drains the signal descriptor through `Lifecycle`, and a reopen request flushes the analytics file and opens its path again.
+`LOG` writes what a full stdout held.
 Every other token is one connection, and `turn` reads, dispatches and writes until its socket would block.
+`watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes both buffers once a second.
 `deadlines.expired` closes a peer that sent nothing before its read deadline.
 
 Two details keep the shape correct.
@@ -313,7 +343,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
 | `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on |
-| `[log]` | core | `level`, default `info`. `format`, default `json` |
+| `[log]` | core | `level`, default `info` |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |
 | `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash. An absolute path, and a relative one is exit 2 |
@@ -332,8 +362,8 @@ Every other top-level key lands in `RendererConfig::user_config` and is readable
 That is how a service gets its own settings without inventing a second configuration file, and `m6-monitor` puts its whole fleet under `[monitor]` this way.
 
 The logging level has three sources and the last one wins: `site.toml`'s `[log]`, then this file's `[log]`, then `--log-level`.
-The format has the first two.
 An unknown level in any of the three stops the service at start with exit 2.
+A `format` key is refused as an unknown key in either file, because every m6 log is a JSON line.
 
 ### 4.1 One name in three places
 
@@ -400,6 +430,8 @@ const ROUTES: &[CodeRoute] = &[
 
 A request that one of them answers comes back as `Handled::Code(index, req)`, and the service's one `match` calls the body for that index and then `site.finish`.
 
+`POST /genid` is reserved: `Site::handle` answers it before routing, and the loop runs the start path again with `Site::reload` and assigns the new `Site` when that is `Ok`.
+
 ```rust
 let response = match site.handle(&head) {
     Handled::Done(response) => response,
@@ -408,6 +440,16 @@ let response = match site.handle(&head) {
     Handled::Code(2, req) => item(&req),
     Handled::Code(index, _) => unreachable!("route {index} is not in this match"),
     Handled::Named(index, req) => named(index, &req),
+    Handled::Reload(reload) => {
+        let response = match site.reload(ROUTES, &[], &NoTemplates) {
+            Ok(next) => {
+                *site = next;
+                genid_ok()
+            }
+            Err(e) => genid_failed(&e),
+        };
+        finish_reload(&reload, response)
+    }
 };
 ```
 
@@ -499,8 +541,9 @@ This section gives the one ordering rule that cannot be relaxed, the three lines
 
 `m6_core::signal::block()` runs before anything else, logging included, and `Signals::new()` opens the descriptor the loop waits on.
 The ordering is the rule.
-A thread inherits the signal mask as it stands when the thread is created, and `tracing_appender` spawns a writer thread.
-A service that initialised logging before blocking would have a thread with SIGTERM unblocked, the kernel would deliver the process-directed signal there, and the default disposition would kill the process.
+A thread inherits the signal mask as it stands when the thread is created.
+A service that started a thread before blocking would have a thread with SIGTERM unblocked, the kernel would deliver the process-directed signal there, and the default disposition would kill the process.
+`Signals::new()` refuses to open without the mask and says so.
 
 The first signal stops accepting, removes the socket and exits 0.
 It does not wait for a request in progress, so a request cut off by a restart is lost.
@@ -600,7 +643,7 @@ This section lists it, because services have re-implemented parts of it before.
 - Conditional requests: `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`, with weak comparison where the specification requires it.
 - brotli and gzip, and HTML, CSS, JSON and JavaScript minification, both configurable per MIME type, with minification before compression.
 - Configuration read once at start, and a change takes a restart.
-- Structured logging, JSON or text, at a level and format fixed for the life of the process.
+- Structured logging as JSON lines, at a level fixed for the life of the process, flushed by the loop that writes them.
 - A request dictionary layered over a shared base, assembled in twelve ordered steps.
   The sources are the service's own configuration keys, `global_params`, the route's params files, path parameters, the query string, a form body, cookies, built-ins, forwarded authentication claims, and the flash and *CSRF* (*cross-site request forgery*) values when those features are on.
 - Path parameter validation, which allows alphanumerics, `-`, `_`, `.`, and `/` only where a route's parameter spans segments, and refuses `..` anywhere as a substring.

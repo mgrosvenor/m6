@@ -26,6 +26,10 @@ pub mod path;
 /// The platform layer, the one crate that knows the operating system. See
 /// `docs/m6-platform.md`.
 pub use m6_platform as platform;
+/// The TLS library `client` and `email` take their configuration from,
+/// re-exported so a service names `m6_core::rustls::ClientConfig` with no
+/// `rustls` dependency of its own and cannot get a second copy.
+pub use rustls;
 pub mod random;
 pub mod render;
 pub mod request;
@@ -41,9 +45,15 @@ pub mod util;
 pub mod wireguard;
 
 // Behind a feature so it is never compiled into a production binary.
-// Enable it in `dev-dependencies` only. The module's own `//!` doc describes it.
-#[cfg(feature = "testkit")]
+// `testkit` is the whole harness, `alloc-count` only the counting allocator
+// ALLOC-0 needs. Both are off by default. Enable them in `dev-dependencies`
+// only, or in a test binary that declares its own `#[global_allocator]`. The
+// module's own `//!` doc describes it.
+#[cfg(any(feature = "testkit", feature = "alloc-count"))]
 pub mod testkit;
+
+#[cfg(feature = "email")]
+pub mod email;
 
 #[cfg(feature = "multipart")]
 pub mod multipart;
@@ -72,12 +82,14 @@ pub use http::{header, is_same_origin_path, HeaderSource, RawRequest, RawRespons
 pub use mime::{mime_from_path, should_compress_default};
 pub use negotiate::{canonical_coding, coding_quality, preferred_coding};
 pub use path::validate_path_param;
-pub use random::random_hex_token;
+pub use random::{random_hex_token, random_hex_token_into};
 pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use request::Request;
 pub use response::{Body, Response};
 pub use server::socket_path_from_config;
-pub use site::{CodeRoute, Handled, Site};
+pub use site::{
+    finish_reload, genid_failed, genid_ok, CodeRoute, Handled, Reload, Site, GENID_PATH,
+};
 
 /// Everything a service normally wants, in one line.
 ///
@@ -138,10 +150,12 @@ pub mod prelude {
     pub use serde_json::{json, Map, Value};
 
     #[cfg(feature = "email")]
-    pub use lettre::{Message, SmtpTransport, Transport};
+    pub use crate::email::{Relay, RelayConfig, Smtp};
+    #[cfg(feature = "email")]
+    pub use lettre::Message;
 
     #[cfg(feature = "http-client")]
-    pub use ureq;
+    pub use crate::client::Endpoint;
 
     #[cfg(feature = "multipart")]
     pub use crate::multipart::Upload;

@@ -157,8 +157,8 @@ fn https_get(port: u16, path: &str, tls: Arc<rustls::ClientConfig>) -> Reply {
 
 /// A fake Unix-socket backend that answers by request path and records every
 /// path it is asked for, so a test can assert on what was (and was not)
-/// fetched. `n` sockets are bound; two make a buggy retry observable, because a
-/// failed member is marked down and a retry then lands on the second member.
+/// fetched. `n` sockets are bound; two make a retry observable, because a
+/// request whose member refuses its connect takes the next member in turn.
 struct Fixture {
     requests: Arc<Mutex<Vec<String>>>,
     sockets: Vec<PathBuf>,
@@ -325,7 +325,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "custom"

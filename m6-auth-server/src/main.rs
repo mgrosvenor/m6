@@ -32,6 +32,7 @@ use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
+use m6_core::{genid_failed, genid_ok};
 
 use config::AuthConfig;
 use handlers::{AppState, Busy};
@@ -40,6 +41,9 @@ use rate_limit::RateLimiter;
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -94,7 +98,7 @@ struct Retry {
 /// one database connection.
 ///
 /// Returns `Err` for `main` to print and exit 2. The database branches name the
-/// path they failed on: the directory that cannot be created, the database that
+/// path they failed on: the directory that is missing, the database that
 /// cannot be opened and the connection that cannot stop waiting for a lock. The
 /// config and key branches name the setting or key that failed.
 fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
@@ -109,8 +113,13 @@ fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
     .context("loading key material")?;
 
     if let Some(parent) = cfg.db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating the database directory {}", parent.display()))?;
+        if !parent.is_dir() {
+            anyhow::bail!(
+                "[storage] path: the directory {} does not exist: create it, owned by {}, or fix [storage] path",
+                parent.display(),
+                m6_core::platform::process::user()
+            );
+        }
     }
     let db = m6_auth::Db::open(&cfg.db_path)
         .map_err(|e| anyhow::anyhow!("opening the database {}: {e}", cfg.db_path.display()))?;
@@ -123,7 +132,7 @@ fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
         )
     })?;
 
-    tracing::info!(issuer = %cfg.issuer, "auth config loaded");
+    m6_core::log::info!(issuer = %cfg.issuer, "auth config loaded");
 
     Ok((
         AppState {
@@ -156,7 +165,7 @@ fn main() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
+    let mut site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let (state, db) = build_state(&site).unwrap_or_else(|e| fail("building the auth state", e));
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
@@ -191,7 +200,7 @@ fn main() -> Result<()> {
     let mut busy_timeouts = Timeouts::new(initial, BUSY_RETRY);
     let mut retries: Vec<Option<Retry>> = (0..initial).map(|_| None).collect();
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout", "log"]);
     let mut accepting = true;
     let mut last = m6_core::platform::now();
     let mut last_report = last;
@@ -216,6 +225,7 @@ fn main() -> Result<()> {
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 2,
+            Some(LOG) => 4,
             Some(_) => 1,
             None => 3,
         };
@@ -281,6 +291,7 @@ fn main() -> Result<()> {
                         break 'run;
                     }
                 }
+                LOG => m6_core::log::flush(),
                 // One connection's turn, then wait for what it still needs,
                 // touch its deadline, or close it. A connection holding a
                 // deferred request is not read: its client is waiting for that
@@ -291,7 +302,7 @@ fn main() -> Result<()> {
                     }
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &mut retries[k], &site, &state, &db) {
+                    match turn(conn, &mut retries[k], &mut site, &state, &db) {
                         Ok(true) => {
                             touch_retry(&mut busy_timeouts, &retries, k);
                             after_turn(
@@ -317,6 +328,12 @@ fn main() -> Result<()> {
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
         // A deferred request: try its handler again when the retry deadline
         // passes, and answer 503 once the database has been locked for a
         // second. The retry keeps the request, so it is not read again.
@@ -339,7 +356,7 @@ fn main() -> Result<()> {
                         continue;
                     }
                     Err(_) => {
-                        tracing::warn!(
+                        m6_core::log::warn!(
                             route = ROUTES[retry.route].pattern,
                             "database still locked after a second"
                         );
@@ -351,7 +368,7 @@ fn main() -> Result<()> {
             // makes it writable: a partial flush must re-register the interest.
             let was = conn.interest();
             conn.respond_response(response);
-            match turn(conn, &mut retries[k], &site, &state, &db) {
+            match turn(conn, &mut retries[k], &mut site, &state, &db) {
                 Ok(true) => {
                     touch_retry(&mut busy_timeouts, &retries, k);
                     after_turn(&poll, &mut conns, &mut deadlines, read_timeout, k, was, now)?;
@@ -393,6 +410,7 @@ fn main() -> Result<()> {
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
             let _ = trace.report();
             last_report = end;
         }
@@ -402,6 +420,7 @@ fn main() -> Result<()> {
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();
+    m6_core::log::stop()?;
     Ok(())
 }
 
@@ -414,7 +433,7 @@ fn main() -> Result<()> {
 fn turn(
     conn: &mut ServerConn,
     retry: &mut Option<Retry>,
-    site: &Site,
+    site: &mut Site,
     state: &AppState,
     db: &m6_auth::Db,
 ) -> io::Result<bool> {
@@ -457,6 +476,19 @@ fn turn(
                                 return Ok(true);
                             }
                         }
+                    }
+                    // The reserved path: run the start path again and assign
+                    // the new Site in the loop's own binding, or keep serving
+                    // the old one and answer the cause.
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&ROUTES, &[], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        m6_core::site::finish_reload(&reload, response)
                     }
                     Handled::Named(..) => unreachable!(
                         "m6-auth-server registers no named handlers, so every route is in code"

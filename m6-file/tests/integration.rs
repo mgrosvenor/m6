@@ -169,6 +169,28 @@ fn l1_sigterm_exits_zero() {
     m6_core::testkit::assert_lifecycle_logged("m6-file", &guard.svc.output());
 }
 
+/// A request writes an access line at the default level, so a service that has
+/// not raised its level still has an access log.
+#[test]
+fn an_access_line_is_logged_at_the_default_level() {
+    let (guard, socket_path) = spawn_server("l2-access-log");
+
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let resp = http_request(&socket_path, req);
+    assert!(resp.contains("200 OK"), "expected 200, got:\n{resp}");
+
+    let logged = wait::until(Duration::from_secs(5), || {
+        let output = guard.svc.output();
+        output.contains(r#""level":"INFO""#) && output.contains(r#""message":"request complete""#)
+    });
+    assert!(
+        logged,
+        "no access line at the default level\n--- output ---\n{}",
+        guard.svc.output()
+    );
+}
+
 // ─── L2 Path Resolution ───────────────────────────────────────────────────────
 
 #[test]

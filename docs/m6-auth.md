@@ -82,8 +82,7 @@ A missing positional argument prints the usage line and exits 2.
 The socket path comes from the config file's stem, so `configs/m6-auth.conf` becomes `/run/m6/m6-auth.sock`.
 The directory `/run/m6` is created at startup, and a stale socket file at that path is removed before the bind.
 
-The service logs to stdout.
-The default format is *JSON* (JavaScript Object Notation), and `[log] format` in `site.toml` can select text.
+The service logs to stdout as *JSON* (JavaScript Object Notation) lines, and `[log] level` in `site.toml` sets how much it writes.
 Logging is core's, so every m6 service writes the same lifecycle lines.
 Section 11.3 lists the lines this service adds.
 

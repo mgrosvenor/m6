@@ -530,7 +530,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1108,7 +1107,7 @@ impl FileBackend {
         std::fs::write(site.join("public/index.html"), b"ok").unwrap();
         std::fs::write(
             site.join("site.toml"),
-            "[site]\nname = \"header-limits\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\nformat = \"text\"\n",
+            "[site]\nname = \"header-limits\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -1117,7 +1116,14 @@ impl FileBackend {
         )
         .unwrap();
 
-        let socket = PathBuf::from(format!("/tmp/m6hlf-{}.sock", std::process::id()));
+        // A counter, not just the pid: every test in this binary is a
+        // different backend, and the harness runs them on several threads of
+        // ONE process. A pid-only name made them fight over one socket, which
+        // surfaced as "another process listens on ..." or as a BrokenPipe
+        // against whichever backend won.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let socket = PathBuf::from(format!("/tmp/m6hlf-{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket);
         let mut file = Service::spawn(
             "m6-file",
@@ -1137,8 +1143,19 @@ impl FileBackend {
     fn send(&self, request: &[u8]) -> Reply {
         let mut stream = UnixStream::connect(&self.socket).expect("connect to m6-file");
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        stream.write_all(request).expect("write request");
-        stream.flush().ok();
+        // The backend can refuse an oversized head and close while this write
+        // is still in flight, which surfaces as BrokenPipe. That refusal is the
+        // reply the caller asserts. Any other write failure leaves the request
+        // unsent, so the reply would prove nothing.
+        if let Err(e) = stream.write_all(request).and_then(|()| stream.flush()) {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "writing the request to m6-file failed: {e}"
+            );
+        }
         read_reply(&mut stream)
     }
 }
