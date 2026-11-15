@@ -220,7 +220,7 @@ pub fn serve(req: &Request) -> Result<Response> {
         ("Last-Modified".to_string(), last_modified.clone()),
     ];
     let precondition =
-        m6_core::evaluate_preconditions(200, &validators, req.headers(), req.method());
+        m6_core::evaluate_preconditions(200, &validators[..], req.headers(), req.method());
 
     let cache_control = cache_control_for(req.query());
 
