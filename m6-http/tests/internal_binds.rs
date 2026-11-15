@@ -33,6 +33,7 @@ fn write_site(dir: &std::path::Path) -> std::path::PathBuf {
         site.join("site.toml"),
         format!(
             "[site]\nname = \"internal-binds\"\ndomain = \"localhost\"\n\n\
+             [analytics]\nenabled = false\n\n\
              [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
              [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
              [rate_limit]\nrequests_per_min = 2\n",

@@ -52,6 +52,7 @@ A writable report may repeat on macOS after the peer acknowledges data, because 
 On macOS a stale socket file and a full queue are the same `ECONNREFUSED`, and the kernel's answer is passed through, so a full queue there costs the request one connect and it moves to the next member.
 Both monotonic clocks stop while the machine sleeps, so a deadline set before a laptop sleeps fires after it wakes, late by the sleep's length.
 Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives. m6 does not handle descriptor exhaustion.
+Known limitation: a full listen queue is reported differently by the two kernels. macOS refuses the next connection at once, so the client sees `ECONNREFUSED` and can retry or give up. Linux leaves the connection pending, so the client waits for a timeout it did not choose. The macOS answer is the better one, and m6 does not equalise the two, because equalising would mean accepting connections it cannot serve. At this scale the queue does not fill: the accept loop drains it every turn, and a slow process still drains it, so a full queue means the process is not running.
 Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 Everything in Table 1 is held by the tests in section 6.

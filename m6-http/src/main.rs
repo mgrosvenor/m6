@@ -5910,9 +5910,12 @@ fn run(args: Vec<String>) -> i32 {
         .analytics
         .enabled
         .then(|| PathBuf::from(&config.analytics.log_path));
-    if let Err(e) = m6_core::log::init(level, analytics_path.as_deref()) {
-        eprintln!("logging init error: {}", e);
-        return 1;
+    let analytics = analytics_path
+        .as_deref()
+        .map(|path| ("[analytics] log_path", path));
+    if let Err(e) = m6_core::log::init_with_setting(level, analytics) {
+        eprintln!("m6-http: {e}");
+        return 2;
     }
 
     // --dump-config

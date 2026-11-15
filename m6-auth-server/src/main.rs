@@ -98,7 +98,7 @@ struct Retry {
 /// one database connection.
 ///
 /// Returns `Err` for `main` to print and exit 2. The database branches name the
-/// path they failed on: the directory that cannot be created, the database that
+/// path they failed on: the directory that is missing, the database that
 /// cannot be opened and the connection that cannot stop waiting for a lock. The
 /// config and key branches name the setting or key that failed.
 fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
@@ -113,8 +113,13 @@ fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
     .context("loading key material")?;
 
     if let Some(parent) = cfg.db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating the database directory {}", parent.display()))?;
+        if !parent.is_dir() {
+            anyhow::bail!(
+                "[storage] path: the directory {} does not exist: create it, owned by {}, or fix [storage] path",
+                parent.display(),
+                m6_core::platform::process::user()
+            );
+        }
     }
     let db = m6_auth::Db::open(&cfg.db_path)
         .map_err(|e| anyhow::anyhow!("opening the database {}: {e}", cfg.db_path.display()))?;
