@@ -225,6 +225,17 @@ pub struct NodeDigest {
     pub tunnel: Option<TunnelDigest>,
     /// When the node last reopened its log file, from `/perf`.
     pub log_reopen: LogReopenDigest,
+    /// This node's traffic and security summary, from `/traffic`.
+    ///
+    /// The check prints these facts in sections D and E. The digest carried
+    /// none of them until #220, so a consumer of `/digest` was told less about
+    /// a node's traffic than a reader of `/check`. `None` when the node did
+    /// not answer `/traffic`, which is why `traffic_error` sits beside it.
+    pub traffic: Option<TrafficDigest>,
+    /// Why `traffic` is absent, when it is. Two silences read differently: a
+    /// node with no traffic summary and a node whose summary is empty must not
+    /// look the same, the rule `perf_error` already follows.
+    pub traffic_error: Option<String>,
 }
 
 /// When a node last reopened its log file, as figures and a state.
@@ -418,6 +429,267 @@ fn pct(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
 }
 
+/// How many notable clients one node's digest carries.
+///
+/// The check prints every notable client. A digest is one JSON body per
+/// request, so it carries this many and the true count in `notable_total`:
+/// bounded, and a consumer can still see that the list was cut.
+pub const NOTABLE_KEPT: usize = 32;
+
+/// How many crawler sightings one node's digest carries, and the same rule as
+/// [`NOTABLE_KEPT`]: `crawlers_total` carries the true count.
+pub const CRAWLERS_KEPT: usize = 32;
+
+/// How many forged-bot addresses, and how many single probes, one node's
+/// digest carries. Both are lists of addresses from a node's own JSON, and
+/// neither has a producer-side cap.
+pub const FORGERS_KEPT: usize = 32;
+pub const PROBE_NOISE_KEPT: usize = 32;
+
+/// How many firing firewall blocks one node's digest carries. The check prints
+/// five, so the digest carries the same five and `hit_total` for the rest.
+pub const FIREWALL_HITS_KEPT: usize = 5;
+
+/// How many probe and injection paths one notable client's digest carries. The
+/// check prints eight and four, and the digest keeps those sizes.
+pub const NOTABLE_PROBE_PATHS_KEPT: usize = 8;
+pub const NOTABLE_INJECTION_PATHS_KEPT: usize = 4;
+
+/// One node's traffic and security summary, from `/traffic`.
+///
+/// This is the digest's copy of what the check prints in section D, "SECURITY
+/// AND TRAFFIC", and section E, "CRAWLERS". The field names are the wire's
+/// (`m6_core::monitoring::TrafficReport`), and every list that can grow with
+/// traffic is cut to a named constant with its true count beside it, so one
+/// request cannot make the digest unbounded.
+///
+/// It carries client addresses, user agents and the firewall's blocked
+/// addresses. It carries no token, no key and no fingerprint. See the module
+/// documentation of `/digest`'s access control in `main.rs`: the endpoint
+/// answers on the monitor's unix socket, and these are the facts the node
+/// already sent over the backbone to get here.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficDigest {
+    /// The window summarised, in minutes.
+    pub window_minutes: u64,
+    /// Events the window overwrote while still inside it. Non-zero means the
+    /// totals below are short by that many requests.
+    pub events_dropped: u64,
+    pub total_requests: u64,
+    /// Responses by status code, as the node counted them.
+    pub status: std::collections::BTreeMap<u16, u64>,
+    pub logging: LoggingDigest,
+    /// The loudest clients, whatever they are. The node reports at most eight.
+    pub heavy_hitters: Vec<HeavyHitterDigest>,
+    /// Clients the node graded worth attention. At most [`NOTABLE_KEPT`].
+    pub notable: Vec<NotableDigest>,
+    /// How many notable clients the node reported, before the cut.
+    pub notable_total: usize,
+    /// Genuine crawler traffic. At most [`CRAWLERS_KEPT`].
+    pub crawlers: Vec<CrawlerDigest>,
+    /// How many crawler sightings the node reported, before the cut.
+    pub crawlers_total: usize,
+    /// Bot-shaped requests the node discarded as forged.
+    pub forged_bot_requests: u64,
+    /// The addresses that sent them, at most [`FORGERS_KEPT`].
+    pub forgers: Vec<String>,
+    /// How many forging addresses the node reported, before the cut.
+    pub forgers_total: usize,
+    /// Single refused probes, at most [`PROBE_NOISE_KEPT`].
+    pub probe_noise: Vec<String>,
+    /// How many single probes the node reported, before the cut.
+    pub probe_noise_total: usize,
+    /// The node's deliberate firewall blocks. `None` means no collector is
+    /// installed there, which the check prints as "no data" rather than as
+    /// "no blocks".
+    pub firewall: Option<FirewallDigest>,
+}
+
+/// Whether a node's main log is still emitting, as figures and the state the
+/// check prints.
+///
+/// `state` is `ok` while it emits, `quiet` when the last event is older than
+/// [`m6_core::monitoring::LoggingHealth::QUIET_SECONDS`], and `never` when
+/// nothing has been logged at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoggingDigest {
+    pub state: &'static str,
+    pub events_total: u64,
+    /// `None` means nothing has ever been emitted.
+    pub seconds_since_last: Option<u64>,
+}
+
+/// One loud client, as section D's `top:` line prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeavyHitterDigest {
+    pub ip: String,
+    pub requests: u64,
+    pub top_path: String,
+    /// The wire calls this `user_agents`; the digest names the fact, because
+    /// it is a count and not a sample of agents.
+    pub distinct_user_agents: usize,
+    /// Share of responses that were 4xx or 5xx, which is the figure the check
+    /// prints as a percentage.
+    pub error_ratio: f64,
+}
+
+/// One client the node graded as notable, with the evidence section D prints.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotableDigest {
+    pub ip: String,
+    pub requests: u64,
+    pub distinct_user_agents: usize,
+    pub rotating_user_agents: bool,
+    /// A sample, at most `m6_core::telemetry::USER_AGENTS_KEPT`.
+    pub user_agents: Vec<String>,
+    /// At most [`NOTABLE_PROBE_PATHS_KEPT`].
+    pub probe_paths: Vec<String>,
+    /// At most [`NOTABLE_INJECTION_PATHS_KEPT`].
+    pub injection_paths: Vec<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// One genuine crawler sighting, as section E prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrawlerDigest {
+    pub user_agent: String,
+    pub requests: u64,
+    /// At most the three the check prints, with the true count beside them.
+    pub client_ips: Vec<String>,
+    pub client_ips_total: usize,
+    /// The paths it asked for, at most the eight the node reports.
+    pub paths: Vec<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// One node's firewall state, as section D prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FirewallDigest {
+    /// Deliberate per-address blocks installed on the node.
+    pub blocks: usize,
+    /// Rules carrying a counter, of any kind.
+    pub total_rules: usize,
+    /// Blocks that have dropped at least one packet, at most
+    /// [`FIREWALL_HITS_KEPT`].
+    pub hit: Vec<FirewallHitDigest>,
+    /// How many blocks have dropped something, before the cut.
+    pub hit_total: usize,
+}
+
+/// One block that is still being hit.
+#[derive(Debug, Clone, Serialize)]
+pub struct FirewallHitDigest {
+    pub address: String,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+fn traffic_digest(t: &m6_core::monitoring::TrafficReport) -> TrafficDigest {
+    let logging_state = match t.logging.seconds_since_last {
+        None => "never",
+        Some(_) if t.logging.is_blind() => "quiet",
+        Some(_) => "ok",
+    };
+    TrafficDigest {
+        window_minutes: t.window_minutes,
+        events_dropped: t.events_dropped,
+        total_requests: t.total_requests,
+        status: t.status.clone(),
+        logging: LoggingDigest {
+            state: logging_state,
+            events_total: t.logging.events_total,
+            seconds_since_last: t.logging.seconds_since_last,
+        },
+        heavy_hitters: t
+            .heavy_hitters
+            .iter()
+            .map(|h| HeavyHitterDigest {
+                ip: h.ip.clone(),
+                requests: h.requests,
+                top_path: h.top_path.clone(),
+                distinct_user_agents: h.distinct_user_agents,
+                error_ratio: h.error_ratio,
+            })
+            .collect(),
+        notable: t
+            .notable
+            .iter()
+            .take(NOTABLE_KEPT)
+            .map(|c| NotableDigest {
+                ip: c.ip.clone(),
+                requests: c.requests,
+                distinct_user_agents: c.distinct_user_agents,
+                rotating_user_agents: c.rotating_user_agents,
+                user_agents: c
+                    .user_agents
+                    .iter()
+                    .take(m6_core::telemetry::USER_AGENTS_KEPT)
+                    .cloned()
+                    .collect(),
+                probe_paths: c
+                    .probe_paths
+                    .iter()
+                    .take(NOTABLE_PROBE_PATHS_KEPT)
+                    .cloned()
+                    .collect(),
+                injection_paths: c
+                    .injection_paths
+                    .iter()
+                    .take(NOTABLE_INJECTION_PATHS_KEPT)
+                    .cloned()
+                    .collect(),
+                first_seen: c.first_seen.clone(),
+                last_seen: c.last_seen.clone(),
+            })
+            .collect(),
+        notable_total: t.notable.len(),
+        crawlers: t
+            .crawlers
+            .iter()
+            .take(CRAWLERS_KEPT)
+            .map(|c| CrawlerDigest {
+                user_agent: c.user_agent.clone(),
+                requests: c.requests,
+                client_ips: c.client_ips.iter().take(3).cloned().collect(),
+                client_ips_total: c.client_ips.len(),
+                paths: c.paths.clone(),
+                first_seen: c.first_seen.clone(),
+                last_seen: c.last_seen.clone(),
+            })
+            .collect(),
+        crawlers_total: t.crawlers.len(),
+        forged_bot_requests: t.forged_bot_requests,
+        forgers: t.forgers.iter().take(FORGERS_KEPT).cloned().collect(),
+        forgers_total: t.forgers.len(),
+        probe_noise: t
+            .probe_noise
+            .iter()
+            .take(PROBE_NOISE_KEPT)
+            .cloned()
+            .collect(),
+        probe_noise_total: t.probe_noise.len(),
+        firewall: t.firewall.as_ref().map(|fw| {
+            let hit: Vec<&m6_core::firewall::Block> = fw.active().collect();
+            FirewallDigest {
+                blocks: fw.blocks.len(),
+                total_rules: fw.total_rules,
+                hit: hit
+                    .iter()
+                    .take(FIREWALL_HITS_KEPT)
+                    .map(|b| FirewallHitDigest {
+                        address: b.address.clone(),
+                        packets: b.packets,
+                        bytes: b.bytes,
+                    })
+                    .collect(),
+                hit_total: hit.len(),
+            }
+        }),
+    }
+}
+
 /// The faults for one node's log reopen, when a limit is set.
 fn log_reopen_findings(
     node: &str,
@@ -570,6 +842,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             perf_error: r.perf_error.clone(),
             tunnel: r.tunnel.as_ref().map(tunnel_digest),
             log_reopen: LogReopenDigest::unknown("no /perf reading"),
+            traffic: r.traffic.as_ref().map(traffic_digest),
+            traffic_error: r.traffic_error.clone(),
         };
 
         // Before the unreachable `continue` below: a node whose HTTPS poll
@@ -2497,6 +2771,275 @@ pub(crate) mod tests {
             "{:?}",
             d.findings
         );
+    }
+
+    // ── traffic and security, from /traffic ─────────────────────────────────
+
+    /// The fixture section D and E print, with one of everything they can show.
+    fn traffic_fixture() -> m6_core::monitoring::TrafficReport {
+        use m6_core::firewall::{Block, FirewallState};
+        use m6_core::monitoring::{
+            CrawlerReport, HeavyHitter, LoggingHealth, NotableClient, TrafficReport,
+        };
+        let mut status = std::collections::BTreeMap::new();
+        status.insert(200, 1200);
+        status.insert(404, 40);
+        TrafficReport {
+            node: "origin".into(),
+            window_minutes: 60,
+            events_dropped: 7,
+            total_requests: 1234,
+            status,
+            notable: vec![NotableClient {
+                ip: "203.0.113.9".into(),
+                requests: 7,
+                distinct_user_agents: 526,
+                user_agents: vec!["curl/8.4.0".into(), "GPTBot/1.0".into()],
+                status: Default::default(),
+                probe_paths: vec!["/.env".into(), "/.git/config".into()],
+                injection_paths: vec!["/wp-admin/setup.php".into()],
+                rotating_user_agents: true,
+                first_seen: "2026-10-04T01:20:54Z".into(),
+                last_seen: "2026-10-04T01:20:58Z".into(),
+            }],
+            heavy_hitters: vec![HeavyHitter {
+                ip: "203.0.113.7".into(),
+                requests: 900,
+                top_path: "/".into(),
+                distinct_user_agents: 3,
+                error_ratio: 0.5,
+            }],
+            crawlers: vec![CrawlerReport {
+                user_agent: "GPTBot/1.0".into(),
+                requests: 12,
+                client_ips: vec![
+                    "203.0.113.20".into(),
+                    "203.0.113.21".into(),
+                    "203.0.113.22".into(),
+                    "203.0.113.23".into(),
+                ],
+                paths: vec!["/".into(), "/robots.txt".into()],
+                first_seen: "2026-10-04T01:00:00Z".into(),
+                last_seen: "2026-10-04T01:50:00Z".into(),
+            }],
+            forged_bot_requests: 12,
+            forgers: vec!["203.0.113.66".into()],
+            probe_noise: vec!["203.0.113.5 /.git/config".into()],
+            logging: LoggingHealth {
+                events_total: 9000,
+                seconds_since_last: Some(600),
+                reopen: None,
+            },
+            firewall: Some(FirewallState {
+                blocks: vec![
+                    Block {
+                        address: "203.0.113.4".into(),
+                        packets: 1215,
+                        bytes: 72900,
+                        comment: None,
+                        chain: "INPUT".into(),
+                    },
+                    Block {
+                        address: "203.0.113.6".into(),
+                        packets: 0,
+                        bytes: 0,
+                        comment: None,
+                        chain: "INPUT".into(),
+                    },
+                ],
+                total_rules: 217,
+            }),
+        }
+    }
+
+    /// The JSON carries every fact sections D and E print, under the same
+    /// names the node's `/traffic` uses.
+    #[test]
+    fn the_json_digest_carries_the_traffic_and_security_section() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.traffic = Some(traffic_fixture());
+        let d = build(&[r], &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        let t = &v["nodes"][0]["traffic"];
+
+        assert_eq!(t["window_minutes"], 60);
+        assert_eq!(t["events_dropped"], 7);
+        assert_eq!(t["total_requests"], 1234);
+        assert_eq!(t["status"]["200"], 1200);
+        assert_eq!(t["status"]["404"], 40);
+        assert_eq!(t["logging"]["state"], "quiet");
+        assert_eq!(t["logging"]["events_total"], 9000);
+        assert_eq!(t["logging"]["seconds_since_last"], 600);
+
+        assert_eq!(t["heavy_hitters"][0]["ip"], "203.0.113.7");
+        assert_eq!(t["heavy_hitters"][0]["requests"], 900);
+        assert_eq!(t["heavy_hitters"][0]["top_path"], "/");
+        assert_eq!(t["heavy_hitters"][0]["distinct_user_agents"], 3);
+        assert_eq!(t["heavy_hitters"][0]["error_ratio"], 0.5);
+
+        assert_eq!(t["notable"][0]["ip"], "203.0.113.9");
+        assert_eq!(t["notable"][0]["requests"], 7);
+        assert_eq!(t["notable"][0]["distinct_user_agents"], 526);
+        assert_eq!(t["notable"][0]["rotating_user_agents"], true);
+        assert_eq!(t["notable"][0]["user_agents"][0], "curl/8.4.0");
+        assert_eq!(t["notable"][0]["probe_paths"][0], "/.env");
+        assert_eq!(t["notable"][0]["injection_paths"][0], "/wp-admin/setup.php");
+        assert_eq!(t["notable_total"], 1);
+
+        assert_eq!(t["crawlers"][0]["user_agent"], "GPTBot/1.0");
+        assert_eq!(t["crawlers"][0]["requests"], 12);
+        assert_eq!(t["crawlers"][0]["client_ips"][0], "203.0.113.20");
+        assert_eq!(t["crawlers"][0]["client_ips_total"], 4);
+        assert_eq!(t["crawlers"][0]["paths"][1], "/robots.txt");
+        assert_eq!(t["crawlers_total"], 1);
+
+        assert_eq!(t["forged_bot_requests"], 12);
+        assert_eq!(t["forgers"][0], "203.0.113.66");
+        assert_eq!(t["forgers_total"], 1);
+        assert_eq!(t["probe_noise"][0], "203.0.113.5 /.git/config");
+        assert_eq!(t["probe_noise_total"], 1);
+
+        assert_eq!(t["firewall"]["blocks"], 2);
+        assert_eq!(t["firewall"]["total_rules"], 217);
+        assert_eq!(t["firewall"]["hit_total"], 1);
+        assert_eq!(t["firewall"]["hit"][0]["address"], "203.0.113.4");
+        assert_eq!(t["firewall"]["hit"][0]["packets"], 1215);
+        assert_eq!(t["firewall"]["hit"][0]["bytes"], 72900);
+    }
+
+    /// A node with no `/traffic` is a null section plus the reason, which is
+    /// what the check's "unknown <reason>" line prints. Absence must never
+    /// read as an empty traffic report.
+    #[test]
+    fn a_missing_traffic_report_says_why_in_the_digest() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.traffic_error = Some("404: /traffic not available on this node".into());
+        let d = build(&[r], &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v["nodes"][0]["traffic"].is_null());
+        assert_eq!(
+            v["nodes"][0]["traffic_error"],
+            "404: /traffic not available on this node"
+        );
+    }
+
+    /// The lists a node's traffic can grow without bound are cut in the
+    /// digest, and the cut is visible because the true count is beside it.
+    #[test]
+    fn the_traffic_lists_are_capped_with_their_totals() {
+        let mut t = traffic_fixture();
+        let notable = t.notable[0].clone();
+        t.notable = (0..NOTABLE_KEPT + 8)
+            .map(|i| {
+                let mut c = notable.clone();
+                c.ip = format!("203.0.113.{i}");
+                c
+            })
+            .collect();
+        let crawler = t.crawlers[0].clone();
+        t.crawlers = (0..CRAWLERS_KEPT + 4)
+            .map(|i| {
+                let mut c = crawler.clone();
+                c.user_agent = format!("TestBot/{i}");
+                c
+            })
+            .collect();
+        t.forgers = (0..FORGERS_KEPT + 3)
+            .map(|i| format!("198.51.100.{i}"))
+            .collect();
+        t.probe_noise = (0..PROBE_NOISE_KEPT + 3)
+            .map(|i| format!("198.51.100.{i} /.env"))
+            .collect();
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.traffic = Some(t);
+        let d = build(&[r], &Thresholds::default(), now());
+        let t = &serde_json::to_value(&d).unwrap()["nodes"][0]["traffic"];
+
+        assert_eq!(t["notable"].as_array().unwrap().len(), NOTABLE_KEPT);
+        assert_eq!(t["notable_total"], NOTABLE_KEPT + 8);
+        assert_eq!(t["crawlers"].as_array().unwrap().len(), CRAWLERS_KEPT);
+        assert_eq!(t["crawlers_total"], CRAWLERS_KEPT + 4);
+        assert_eq!(t["forgers"].as_array().unwrap().len(), FORGERS_KEPT);
+        assert_eq!(t["forgers_total"], FORGERS_KEPT + 3);
+        assert_eq!(t["probe_noise"].as_array().unwrap().len(), PROBE_NOISE_KEPT);
+        assert_eq!(t["probe_noise_total"], PROBE_NOISE_KEPT + 3);
+    }
+
+    /// The serialised digest before and after this change, for one fleet. The
+    /// "before" removes the two fields #220 added, so it is the shape
+    /// `/digest` had at 024ec86 for the same readings.
+    fn digest_sizes(readings: &[NodeReading]) -> (usize, usize) {
+        let d = build(readings, &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        let after = serde_json::to_vec(&v).unwrap().len();
+        let mut before_v = v.clone();
+        for n in before_v["nodes"].as_array_mut().unwrap() {
+            let o = n.as_object_mut().unwrap();
+            o.remove("traffic");
+            o.remove("traffic_error");
+        }
+        (serde_json::to_vec(&before_v).unwrap().len(), after)
+    }
+
+    /// A three-node fleet's digest has a known ceiling. This is the guard
+    /// against the traffic section making `/digest` grow with a node's traffic:
+    /// the fixture is filled to every cap, and the serialised body must stay
+    /// under 128 KiB. The measured sizes are printed so a change in them is
+    /// visible in the test output.
+    #[test]
+    fn a_fleet_sized_digest_stays_bounded() {
+        // A realistic three-node window first: one of everything the check
+        // prints, which is what a fleet's quiet hour looks like.
+        let realistic: Vec<NodeReading> = ["origin", "edge-a", "edge-b"]
+            .iter()
+            .map(|name| {
+                let mut r = reading(name, "ok", Some(perf(plain_host(), vec![])));
+                r.traffic = Some(traffic_fixture());
+                r
+            })
+            .collect();
+        let (before, after) = digest_sizes(&realistic);
+        eprintln!("realistic three-node digest: {before} bytes before, {after} bytes after");
+
+        let mut maxed = traffic_fixture();
+        let notable = maxed.notable[0].clone();
+        maxed.notable = (0..NOTABLE_KEPT)
+            .map(|i| {
+                let mut c = notable.clone();
+                c.ip = format!("203.0.113.{i}");
+                c
+            })
+            .collect();
+        let crawler = maxed.crawlers[0].clone();
+        maxed.crawlers = (0..CRAWLERS_KEPT)
+            .map(|i| {
+                let mut c = crawler.clone();
+                c.user_agent = format!("TestBot/{i}");
+                c
+            })
+            .collect();
+        maxed.forgers = (0..FORGERS_KEPT)
+            .map(|i| format!("198.51.100.{i}"))
+            .collect();
+        maxed.probe_noise = (0..PROBE_NOISE_KEPT)
+            .map(|i| format!("198.51.100.{i} /.env"))
+            .collect();
+
+        let rs: Vec<NodeReading> = ["origin", "edge-a", "edge-b"]
+            .iter()
+            .map(|name| {
+                let mut r = reading(name, "ok", Some(perf(plain_host(), vec![])));
+                r.traffic = Some(maxed.clone());
+                r
+            })
+            .collect();
+        let (before, after) = digest_sizes(&rs);
+        eprintln!("capped three-node digest: {before} bytes before, {after} bytes after");
+        assert!(
+            after < 128 * 1024,
+            "the traffic section must not grow without bound: {after} bytes"
+        );
+        assert!(after > before, "the fixture must actually add a section");
     }
 }
 

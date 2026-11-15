@@ -55,6 +55,14 @@ The refusal is decided at the edge, before the body is read, the cache is looked
 An unknown or empty `methods` list stops the start with exit 2, and `--dump-config` fails the same way.
 Verified by six end-to-end tests against a real m6-http and backend socket, an RFC 9110 conformance test over HTTP/1.1, HTTP/2 and HTTP/3, a startup test of the exit 2, and unit tests of the fixed method set.
 
+**The JSON digest carries the traffic and security report the text check prints (#220).**
+`/digest` gains `nodes[].traffic`, with the facts `/check` sections D and E print from the node's `/traffic`: `window_minutes`, `events_dropped`, `total_requests`, `status`, `logging` (`state`, `events_total`, `seconds_since_last`), `heavy_hitters`, `notable` with the agents and paths it presented, `crawlers`, `forged_bot_requests` and `forgers`, `probe_noise`, and `firewall` (`blocks`, `total_rules`, `hit`, `hit_total`).
+`nodes[].traffic_error` carries the reason when a node has no report.
+The section carries client addresses, user agents and firewall block addresses, and no token, key or fingerprint.
+Every list that a node's traffic can grow without bound is cut to a named size, with its true count beside it, so one request cannot make the digest unbounded: a three-node digest with one of everything is 6,214 bytes against 2,821 before, and 56,689 bytes with every list filled to its cap.
+`traffic` is additive and no existing field changes, so no migration is needed.
+Verified: 212 m6-monitor tests pass, the check-versus-JSON agreement test fails when the section is removed, and the size test measures both figures.
+
 **Each crawler sighting on `/traffic` and in the monitor report now carries the time it was first and last seen, and the monitor checks each address behind a sighting against the method the crawler's operator documents. A reverse DNS name counts only when resolving it forward returns the address (#205).**
 
 The new JSON fields are additive.
