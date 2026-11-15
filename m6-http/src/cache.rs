@@ -937,6 +937,21 @@ pub enum Lookup {
     Miss,
 }
 
+impl Lookup {
+    /// Whether the entry this lookup returned is still inside its freshness
+    /// lifetime.
+    ///
+    /// False for a stale entry and for a miss, so a caller reads it only on a
+    /// lookup that returned an entry. The answer is the variant the lookup
+    /// chose, not a comparison against the entry's age: freshness depends on
+    /// the response's own directives (RFC 9111 4.2), and re-deriving it from a
+    /// duration elsewhere is how the same entry gets called valid in one place
+    /// and invalid in another.
+    pub fn is_fresh(&self) -> bool {
+        matches!(self, Lookup::Fresh(..))
+    }
+}
+
 type CacheMap = AHashMap<CacheKey, CacheEntry>;
 
 /// Default ceiling on total cached bytes.

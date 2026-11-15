@@ -2079,6 +2079,24 @@ pub struct StatsSnapshot {
     pub requests_total: u64,
     pub cache_hits_total: u64,
     pub cache_misses_total: u64,
+    /// The hit/miss pair split into the four facts a cache actually has.
+    ///
+    /// A hit on an entry still inside its freshness lifetime and a hit on one
+    /// past it are different events, and so are a miss answered by a backend
+    /// fetch and a miss answered by this node itself. The two totals above stay
+    /// as they were: `cache_hits_total` is the sum of the two hit fields, and
+    /// `cache_misses_total` the sum of the two miss fields.
+    ///
+    /// `#[serde(default)]` so a node older than these fields reads as 0, the
+    /// same shape `backend_errors_by_name` and `event_loop` use.
+    #[serde(default)]
+    pub cache_hits_valid_total: u64,
+    #[serde(default)]
+    pub cache_hits_invalid_total: u64,
+    #[serde(default)]
+    pub cache_misses_fetched_total: u64,
+    #[serde(default)]
+    pub cache_misses_answered_locally_total: u64,
     pub backend_errors_total: u64,
     /// The same errors, attributed to the backend that produced them.
     ///

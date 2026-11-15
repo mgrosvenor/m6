@@ -366,11 +366,58 @@ impl ChannelStats {
 // them; only the shape is shared.
 pub use m6_core::telemetry::{ChannelSnapshot, StatsSnapshot};
 
+/// The four cache outcomes a request can have, as one value a call site states.
+///
+/// A hit and a miss are one bit each, and that bit is not enough to describe a
+/// cache. A hit can be served from an entry still inside its freshness lifetime
+/// or from one past it. A miss can be answered by fetching a backend or by
+/// m6-http itself. Those are four different facts, and a caller that passes
+/// "hit" for the first two (or "miss" for the last two) has thrown away
+/// something it knew at the moment it knew it.
+///
+/// So `Stats::record` takes this instead of a `bool`, and every call site names
+/// the fact it observed rather than a bit it hopes the reporter will decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOutcome {
+    /// A hit on an entry still inside its freshness lifetime (RFC 9111 4.2).
+    ValidHit,
+    /// A hit on an entry past its freshness lifetime, served under the
+    /// response's `stale-while-revalidate` window or the client's `max-stale`.
+    InvalidHit,
+    /// A miss answered by fetching a backend.
+    FetchedMiss,
+    /// A miss answered by m6-http itself, with no backend contacted: a
+    /// route-table 404 or an error page it renders locally.
+    AnsweredLocally,
+}
+
+impl CacheOutcome {
+    /// Which half of the hit/miss pair this outcome falls in, so the existing
+    /// two counters keep exactly the meaning they had.
+    fn is_hit(self) -> bool {
+        matches!(self, CacheOutcome::ValidHit | CacheOutcome::InvalidHit)
+    }
+}
+
 pub struct Stats {
     // Cumulative
     pub requests_total: u64,
+    /// Every cache hit. `cache_hits_valid_total + cache_hits_invalid_total`
+    /// sums to this.
     pub cache_hits_total: u64,
+    /// Every cache miss, from both of the miss outcomes below.
     pub cache_misses_total: u64,
+    /// Hits on an entry still inside its freshness lifetime.
+    pub cache_hits_valid_total: u64,
+    /// Hits on an entry past its freshness lifetime: a stale serve, under the
+    /// response's `stale-while-revalidate` window or the client's `max-stale`.
+    pub cache_hits_invalid_total: u64,
+    /// Misses answered by fetching a backend. This is the miss that costs a
+    /// round trip, and no counter said so before this one.
+    pub cache_misses_fetched_total: u64,
+    /// Misses answered by m6-http itself, with no backend contacted: the
+    /// route-table 404 and the error pages it renders locally.
+    pub cache_misses_answered_locally_total: u64,
     pub backend_errors_total: u64,
     /// Errors attributed to the BACKEND that produced them.
     ///
@@ -495,6 +542,10 @@ impl Stats {
             requests_total: 0,
             cache_hits_total: 0,
             cache_misses_total: 0,
+            cache_hits_valid_total: 0,
+            cache_hits_invalid_total: 0,
+            cache_misses_fetched_total: 0,
+            cache_misses_answered_locally_total: 0,
             backend_errors_total: 0,
             backend_errors_by_name: std::collections::BTreeMap::new(),
             window_requests: 0,
@@ -546,10 +597,15 @@ impl Stats {
     /// breakdown for free. It also forced the cache-hit sites to be corrected:
     /// they recorded before evaluating preconditions, so a conditional request
     /// answered 304 or 412 would have been counted as the cached 200.
+    ///
+    /// Takes [`CacheOutcome`] rather than a `bool`, so the four cache facts are
+    /// counted where the caller still knows which one happened. The hit and
+    /// miss totals keep their old meaning: every hit is one of the two hit
+    /// outcomes and every miss is one of the two miss outcomes.
     pub fn record(
         &mut self,
         elapsed_ns: u64,
-        cache_hit: bool,
+        cache: CacheOutcome,
         status: u16,
         channel: Channel,
         backend: &str,
@@ -585,6 +641,17 @@ impl Stats {
             }
             return;
         }
+
+        // One increment, before the latency branches below: the four outcomes
+        // differ in which total they move, never in whether they move it, so a
+        // counter cannot be missed on the zero-duration path.
+        match cache {
+            CacheOutcome::ValidHit => self.cache_hits_valid_total += 1,
+            CacheOutcome::InvalidHit => self.cache_hits_invalid_total += 1,
+            CacheOutcome::FetchedMiss => self.cache_misses_fetched_total += 1,
+            CacheOutcome::AnsweredLocally => self.cache_misses_answered_locally_total += 1,
+        }
+        let cache_hit = cache.is_hit();
 
         // A 5xx that m6-http generated itself is not a BACKEND error, and
         // counting it as one makes the metric cry wolf.
@@ -797,6 +864,10 @@ impl Stats {
             requests_total: self.requests_total,
             cache_hits_total: self.cache_hits_total,
             cache_misses_total: self.cache_misses_total,
+            cache_hits_valid_total: self.cache_hits_valid_total,
+            cache_hits_invalid_total: self.cache_hits_invalid_total,
+            cache_misses_fetched_total: self.cache_misses_fetched_total,
+            cache_misses_answered_locally_total: self.cache_misses_answered_locally_total,
             backend_errors_total: self.backend_errors_total,
             backend_errors_by_name: self
                 .backend_errors_by_name
@@ -956,10 +1027,22 @@ mod tests {
     fn monitor_polls_are_counted_separately_from_site_traffic() {
         let mut s = Stats::new();
         let ch = Channel::new(Version::Http11, Iface::External);
-        s.record(1_000, false, 200, ch, "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 200, ch, "m6-html");
         for _ in 0..25 {
-            s.record(9_000, false, 200, ch, crate::health::HEALTH_BACKEND);
-            s.record(9_000, false, 200, ch, crate::health::PERF_BACKEND);
+            s.record(
+                9_000,
+                CacheOutcome::FetchedMiss,
+                200,
+                ch,
+                crate::health::HEALTH_BACKEND,
+            );
+            s.record(
+                9_000,
+                CacheOutcome::FetchedMiss,
+                200,
+                ch,
+                crate::health::PERF_BACKEND,
+            );
         }
 
         // Site traffic is untouched by 50 monitor polls.
@@ -1015,7 +1098,7 @@ mod tests {
             Version::Http2,
             crate::health::peer_iface("10.0.0.9".parse().unwrap()),
         );
-        s.record(120_000, false, 200, poll, "m6-html");
+        s.record(120_000, CacheOutcome::AnsweredLocally, 200, poll, "m6-html");
 
         assert_eq!(
             s.requests_total, 0,
@@ -1040,7 +1123,7 @@ mod tests {
             Version::Http2,
             crate::health::peer_iface("203.0.113.7".parse().unwrap()),
         );
-        s.record(3_000, true, 200, visit, "m6-html");
+        s.record(3_000, CacheOutcome::ValidHit, 200, visit, "m6-html");
 
         assert_eq!(s.requests_total, 1);
         assert_eq!(s.cache_hits_total, 1);
@@ -1058,7 +1141,13 @@ mod tests {
         // public visitor address, and that must not turn the forward into
         // external traffic.
         let forward = Channel::new(Version::Http2, Iface::Internal);
-        s.record(200_000_000, false, 200, forward, "m6-html");
+        s.record(
+            200_000_000,
+            CacheOutcome::FetchedMiss,
+            200,
+            forward,
+            "m6-html",
+        );
 
         assert_eq!(s.requests_total, 1);
         assert_eq!(s.monitor_requests_total, 0);
@@ -1075,8 +1164,20 @@ mod tests {
     fn a_failing_monitor_poll_does_not_pollute_traffic_figures() {
         let mut s = Stats::new();
         let ch = Channel::new(Version::Http11, Iface::External);
-        s.record(500, false, 503, ch, crate::health::HEALTH_BACKEND);
-        s.record(400, false, 401, ch, crate::health::PERF_BACKEND);
+        s.record(
+            500,
+            CacheOutcome::FetchedMiss,
+            503,
+            ch,
+            crate::health::HEALTH_BACKEND,
+        );
+        s.record(
+            400,
+            CacheOutcome::FetchedMiss,
+            401,
+            ch,
+            crate::health::PERF_BACKEND,
+        );
         assert_eq!(s.backend_errors_total, 0);
         assert_eq!(s.requests_total, 0);
         assert_eq!(s.monitor_requests_total, 2);
@@ -1091,21 +1192,21 @@ mod tests {
         let mut s = Stats::new();
         s.record(
             50,
-            true,
+            CacheOutcome::ValidHit,
             200,
             Channel::new(Version::Http11, Iface::External),
             "m6-html",
         );
         s.record(
             200,
-            false,
+            CacheOutcome::FetchedMiss,
             200,
             Channel::new(Version::Http11, Iface::External),
             "m6-html",
         );
         s.record(
             800,
-            false,
+            CacheOutcome::FetchedMiss,
             200,
             Channel::new(Version::Http11, Iface::External),
             "m6-html",
@@ -1120,6 +1221,111 @@ mod tests {
         assert_eq!(s.miss_samples[1], 800);
     }
 
+    /// Each of the four cache outcomes moves its own counter, once, and the
+    /// two totals it belongs to. One call per fact, so a counter that moved
+    /// twice, or one that moved with the wrong outcome, fails here.
+    #[test]
+    fn each_cache_outcome_increments_its_own_counter_once() {
+        let mut s = Stats::new();
+        let ch = Channel::new(Version::Http11, Iface::External);
+        for (outcome, key) in [
+            (CacheOutcome::ValidHit, "cache_hits_valid_total"),
+            (CacheOutcome::InvalidHit, "cache_hits_invalid_total"),
+            (CacheOutcome::FetchedMiss, "cache_misses_fetched_total"),
+            (
+                CacheOutcome::AnsweredLocally,
+                "cache_misses_answered_locally_total",
+            ),
+        ] {
+            let before = s.snapshot();
+            s.record(1_000, outcome, 200, ch, "m6-html");
+            let after = s.snapshot();
+            let moved = |b: &StatsSnapshot, a: &StatsSnapshot| -> Vec<&'static str> {
+                let mut v = Vec::new();
+                if a.cache_hits_valid_total != b.cache_hits_valid_total {
+                    v.push("cache_hits_valid_total");
+                }
+                if a.cache_hits_invalid_total != b.cache_hits_invalid_total {
+                    v.push("cache_hits_invalid_total");
+                }
+                if a.cache_misses_fetched_total != b.cache_misses_fetched_total {
+                    v.push("cache_misses_fetched_total");
+                }
+                if a.cache_misses_answered_locally_total != b.cache_misses_answered_locally_total {
+                    v.push("cache_misses_answered_locally_total");
+                }
+                v
+            };
+            assert_eq!(
+                moved(&before, &after),
+                vec![key],
+                "{outcome:?} must move {key} and nothing else"
+            );
+        }
+        assert_eq!(s.cache_hits_total, 2, "both hits are hits");
+        assert_eq!(s.cache_misses_total, 2, "both misses are misses");
+        assert_eq!(s.requests_total, 4, "each outcome is one request");
+    }
+
+    /// The two totals keep the meaning they had: both hit outcomes are hits
+    /// and both miss outcomes are misses, so the four fields partition the
+    /// pair an operator already reads.
+    #[test]
+    fn the_four_counts_partition_the_existing_hit_and_miss_totals() {
+        let mut s = Stats::new();
+        let ch = Channel::new(Version::Http11, Iface::External);
+        for i in 0..7u64 {
+            let outcome = match i % 4 {
+                0 => CacheOutcome::ValidHit,
+                1 => CacheOutcome::InvalidHit,
+                2 => CacheOutcome::FetchedMiss,
+                _ => CacheOutcome::AnsweredLocally,
+            };
+            // Half at zero duration: the four counters live above the branch
+            // that skips a zero-nanosecond latency sample, so this is the arm
+            // where an increment can go missing.
+            let elapsed = if i % 2 == 0 { 0 } else { 1_000 + i };
+            s.record(elapsed, outcome, 200, ch, "m6-html");
+        }
+        let snap = s.snapshot();
+        assert_eq!(
+            snap.cache_hits_valid_total + snap.cache_hits_invalid_total,
+            snap.cache_hits_total
+        );
+        assert_eq!(
+            snap.cache_misses_fetched_total + snap.cache_misses_answered_locally_total,
+            snap.cache_misses_total
+        );
+        assert_eq!(
+            snap.cache_hits_total + snap.cache_misses_total,
+            snap.requests_total
+        );
+    }
+
+    /// A monitoring poll is not a cache outcome, so it moves none of the four
+    /// counters and neither total, exactly as it already stays out of
+    /// `requests_total`.
+    #[test]
+    fn a_monitor_poll_moves_no_cache_counter() {
+        let mut s = Stats::new();
+        let ch = Channel::new(Version::Http11, Iface::External);
+        s.record(
+            9_000,
+            CacheOutcome::ValidHit,
+            200,
+            ch,
+            crate::health::HEALTH_BACKEND,
+        );
+        let snap = s.snapshot();
+        assert_eq!(snap.cache_hits_valid_total, 0);
+        assert_eq!(snap.cache_hits_invalid_total, 0);
+        assert_eq!(snap.cache_misses_fetched_total, 0);
+        assert_eq!(snap.cache_misses_answered_locally_total, 0);
+        assert_eq!(snap.cache_hits_total, 0);
+        assert_eq!(snap.cache_misses_total, 0);
+        assert_eq!(snap.monitor_requests_total, 1);
+    }
+
     #[test]
     fn test_exact_percentiles() {
         let mut s = Stats::new();
@@ -1127,7 +1333,7 @@ mod tests {
         for i in 1u64..=100 {
             s.record(
                 i,
-                true,
+                CacheOutcome::ValidHit,
                 200,
                 Channel::new(Version::Http11, Iface::External),
                 "m6-html",
@@ -1146,9 +1352,16 @@ mod tests {
         let mut s = Stats::new();
         let start = m6_core::platform::now();
         for i in 1..=1000u64 {
+            // Both halves, so the four cache counters are exercised at their
+            // real cost: one extra integer increment per call, no allocation.
+            let cache = if i % 2 == 0 {
+                CacheOutcome::ValidHit
+            } else {
+                CacheOutcome::FetchedMiss
+            };
             s.record(
                 i,
-                i % 2 == 0,
+                cache,
                 200,
                 Channel::new(Version::Http11, Iface::External),
                 "m6-html",
@@ -1203,10 +1416,22 @@ mod channel_tests {
         let tunnel_h2 = Channel::new(Version::Http2, Iface::Internal);
 
         // A fast public cache hit.
-        stats.record(3_000, true, 200, public_h2, "m6-html");
+        stats.record(3_000, CacheOutcome::ValidHit, 200, public_h2, "m6-html");
         // Two slow intercontinental misses over the tunnel.
-        stats.record(200_000_000, false, 200, tunnel_h2, "m6-html");
-        stats.record(210_000_000, false, 404, tunnel_h2, "m6-html");
+        stats.record(
+            200_000_000,
+            CacheOutcome::FetchedMiss,
+            200,
+            tunnel_h2,
+            "m6-html",
+        );
+        stats.record(
+            210_000_000,
+            CacheOutcome::FetchedMiss,
+            404,
+            tunnel_h2,
+            "m6-html",
+        );
 
         let snap = stats.snapshot();
         assert_eq!(snap.requests_total, 3);
@@ -1239,7 +1464,7 @@ mod channel_tests {
     fn backend_errors_are_attributed_to_their_channel() {
         let mut stats = Stats::new();
         let h1 = Channel::new(Version::Http11, Iface::External);
-        stats.record(1_000_000, false, 502, h1, "m6-html");
+        stats.record(1_000_000, CacheOutcome::FetchedMiss, 502, h1, "m6-html");
         let snap = stats.snapshot();
         assert_eq!(snap.backend_errors_total, 1);
         let c = snap
@@ -1255,7 +1480,7 @@ mod channel_tests {
         let mut stats = Stats::new();
         stats.record(
             1_000,
-            true,
+            CacheOutcome::ValidHit,
             200,
             Channel::new(Version::Http3, Iface::External),
             "m6-html",
@@ -1278,12 +1503,12 @@ mod status_code_tests {
     fn only_codes_actually_emitted_are_reported() {
         let mut s = Stats::new();
         for _ in 0..5 {
-            s.record(1_000, true, 200, ch(), "m6-html");
+            s.record(1_000, CacheOutcome::ValidHit, 200, ch(), "m6-html");
         }
         for _ in 0..3 {
-            s.record(2_000, false, 404, ch(), "m6-html");
+            s.record(2_000, CacheOutcome::FetchedMiss, 404, ch(), "m6-html");
         }
-        s.record(3_000, true, 304, ch(), "m6-html");
+        s.record(3_000, CacheOutcome::ValidHit, 304, ch(), "m6-html");
 
         let snap = s.snapshot();
         // Exactly the three codes seen -- not 500 rows of zeros around them.
@@ -1299,11 +1524,11 @@ mod status_code_tests {
     #[test]
     fn backend_errors_are_derived_from_the_status() {
         let mut s = Stats::new();
-        s.record(1_000, false, 200, ch(), "m6-html");
-        s.record(1_000, false, 404, ch(), "m6-html");
-        s.record(1_000, false, 499, ch(), "m6-html");
-        s.record(1_000, false, 500, ch(), "m6-html");
-        s.record(1_000, false, 503, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 200, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 404, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 499, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 500, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 503, ch(), "m6-html");
         let snap = s.snapshot();
         assert_eq!(
             snap.backend_errors_total, 2,
@@ -1317,10 +1542,10 @@ mod status_code_tests {
     #[test]
     fn out_of_range_statuses_do_not_index_the_table() {
         let mut s = Stats::new();
-        s.record(1_000, false, 0, ch(), "m6-html");
-        s.record(1_000, false, 99, ch(), "m6-html");
-        s.record(1_000, false, 600, ch(), "m6-html");
-        s.record(1_000, false, u16::MAX, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 0, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 99, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 600, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, u16::MAX, ch(), "m6-html");
         let snap = s.snapshot();
         assert!(
             snap.status_counts.is_empty(),
@@ -1333,8 +1558,8 @@ mod status_code_tests {
     #[test]
     fn boundaries_are_inclusive_at_100_and_599() {
         let mut s = Stats::new();
-        s.record(1_000, false, 100, ch(), "m6-html");
-        s.record(1_000, false, 599, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 100, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 599, ch(), "m6-html");
         let snap = s.snapshot();
         assert_eq!(snap.status_counts.get(&100), Some(&1));
         assert_eq!(snap.status_counts.get(&599), Some(&1));
@@ -1357,8 +1582,8 @@ mod backend_error_attribution_tests {
     #[test]
     fn self_generated_5xx_is_not_a_backend_error() {
         let mut s = Stats::new();
-        s.record(1_000, false, 501, ch(), "method-check");
-        s.record(1_000, false, 500, ch(), "error-local");
+        s.record(1_000, CacheOutcome::FetchedMiss, 501, ch(), "method-check");
+        s.record(1_000, CacheOutcome::FetchedMiss, 500, ch(), "error-local");
         // Was `"health"`. Changed 2026-09-10, when /health and /perf stopped
         // being ordinary self-generated responses and became separately
         // accounted monitoring polls: they no longer reach `requests_total`
@@ -1366,7 +1591,7 @@ mod backend_error_attribution_tests {
         // behaviour. `error` is self-generated and is site traffic, which is
         // what this test is actually about. The monitoring case is covered by
         // `monitor_polls_are_counted_separately_from_site_traffic`.
-        s.record(1_000, false, 503, ch(), "error");
+        s.record(1_000, CacheOutcome::FetchedMiss, 503, ch(), "error");
         let snap = s.snapshot();
         assert_eq!(snap.backend_errors_total, 0, "m6 generated these itself");
         // The responses are still counted; only the attribution changes.
@@ -1378,8 +1603,8 @@ mod backend_error_attribution_tests {
     #[test]
     fn a_real_backend_5xx_still_counts() {
         let mut s = Stats::new();
-        s.record(1_000, false, 502, ch(), "m6-html");
-        s.record(1_000, false, 500, ch(), "origin");
+        s.record(1_000, CacheOutcome::FetchedMiss, 502, ch(), "m6-html");
+        s.record(1_000, CacheOutcome::FetchedMiss, 500, ch(), "origin");
         assert_eq!(s.snapshot().backend_errors_total, 2);
     }
 
@@ -1389,7 +1614,7 @@ mod backend_error_attribution_tests {
     fn a_cached_5xx_is_not_recounted() {
         let mut s = Stats::new();
         for _ in 0..10 {
-            s.record(1_000, true, 500, ch(), "cache");
+            s.record(1_000, CacheOutcome::ValidHit, 500, ch(), "cache");
         }
         assert_eq!(s.snapshot().backend_errors_total, 0);
     }
@@ -1421,7 +1646,7 @@ mod perf_reservoir_tests {
     fn hit(s: &mut Stats, ns: u64) {
         s.record(
             ns,
-            true,
+            CacheOutcome::ValidHit,
             200,
             Channel::new(Version::Http2, Iface::External),
             "cache",
@@ -1650,7 +1875,13 @@ mod handshake_tests {
     fn the_min_sentinel_never_escapes() {
         let mut s = Stats::new();
         // Traffic but no handshake: an h2c or internal channel.
-        s.record(1_000, false, 200, ch(Version::Http11), "");
+        s.record(
+            1_000,
+            CacheOutcome::FetchedMiss,
+            200,
+            ch(Version::Http11),
+            "",
+        );
         let snap = s.snapshot();
         for c in &snap.channels {
             assert_eq!(c.handshake_full.total, 0);
@@ -1737,7 +1968,13 @@ mod handshake_tests {
     fn no_handshake_is_no_samples_not_zero_nanoseconds() {
         let mut s = Stats::new();
         // Traffic, but no handshake recorded -- a plaintext or reused connection.
-        s.record(1_000, true, 200, ch(Version::Http11), "cache");
+        s.record(
+            1_000,
+            CacheOutcome::ValidHit,
+            200,
+            ch(Version::Http11),
+            "cache",
+        );
         let snap = s.snapshot();
         let h1 = snap
             .channels
