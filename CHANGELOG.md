@@ -300,6 +300,13 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 ### Docs
 
+**`README.md` follows the documentation ruleset, and its example check count, its backend pool description and its configuration example now match the code (#128).**
+Fifteen numbered sections, a contents list, and every table and figure numbered, captioned and referenced.
+The install section says 98 checks, which is what example 05's suite reports and what this file's earlier entries record.
+Backend pools say round robin, because `m6-http/src/pool.rs` chooses the next member in turn.
+The configuration example is split into `site.toml` and the system config, because `[server] tls_cert`, `tls_key` and `[auth] public_key` belong to the system config, a key in the wrong file stops the start with exit 2, and the system config needs `[node]`.
+The `m6-auth-cli` synopsis gains `user roles`, `group member ls` and `passwd --password`.
+
 **The event loop is described once, in `docs/m6-architecture.md` §1.10,** with m6-http's own loop in `docs/m6-http.md` pointing at it. Two false claims went: that backend calls have no timeout (`backend_timeout_secs` exists, default 30) and that m6-http is "single-threaded epoll" by name. `CONTRIBUTING.md` says which loop changes need approval: a new disallowed-method exception, a thread, or an allocation on the loop's path.
 
 **`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
