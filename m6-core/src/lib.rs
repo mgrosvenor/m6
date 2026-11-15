@@ -26,6 +26,10 @@ pub mod path;
 /// The platform layer, the one crate that knows the operating system. See
 /// `docs/m6-platform.md`.
 pub use m6_platform as platform;
+/// The TLS library `client` and `email` take their configuration from,
+/// re-exported so a service names `m6_core::rustls::ClientConfig` with no
+/// `rustls` dependency of its own and cannot get a second copy.
+pub use rustls;
 pub mod random;
 pub mod render;
 pub mod request;
@@ -44,6 +48,9 @@ pub mod wireguard;
 // Enable it in `dev-dependencies` only. The module's own `//!` doc describes it.
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+#[cfg(feature = "email")]
+pub mod email;
 
 #[cfg(feature = "multipart")]
 pub mod multipart;
@@ -138,10 +145,12 @@ pub mod prelude {
     pub use serde_json::{json, Map, Value};
 
     #[cfg(feature = "email")]
-    pub use lettre::{Message, SmtpTransport, Transport};
+    pub use crate::email::{Relay, RelayConfig, Smtp};
+    #[cfg(feature = "email")]
+    pub use lettre::Message;
 
     #[cfg(feature = "http-client")]
-    pub use ureq;
+    pub use crate::client::Endpoint;
 
     #[cfg(feature = "multipart")]
     pub use crate::multipart::Upload;

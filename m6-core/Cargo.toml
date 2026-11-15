@@ -43,9 +43,11 @@ csrf      = []
 # Blocks a service assembles itself from. Off by default because not every
 # service sends mail or makes outbound requests, on by name when it does.
 # m6-core is meant to be the only crate a service links, so these live here
-# rather than being something each service rediscovers.
+# rather than being something each service rediscovers. Neither blocks: `email`
+# is an SMTP client the service's own loop drives (`email::{Relay, Smtp}`) and
+# `http-client` is a form POST on `client::Upstream` (`client::Endpoint`).
 email       = ["dep:lettre"]
-http-client = ["dep:ureq"]
+http-client = ["dep:url"]
 
 # One SQLite file with house settings, versioned migrations and an append-only
 # table rule. Off by default, so a service that does not use it links nothing
@@ -102,8 +104,13 @@ futures-util  = { version = "0.3",  optional = true }
 # Drive multer's async field stream on the current thread without building a
 # tokio runtime per upload.
 futures-executor = { version = "0.3", optional = true }
-lettre        = { version = "0.11", optional = true, features = ["smtp-transport", "native-tls"] }
-ureq          = { version = "2",    optional = true, features = ["json"] }
+# lettre's pieces that do not touch a socket: the message builder, the SMTP
+# commands, the reply parser and the extension and authentication types. Its
+# transport, pool and native-tls features go, because m6-core's own client
+# drives the conversation. `hostname` keeps the EHLO name.
+lettre        = { version = "0.11", optional = true, default-features = false, features = ["builder", "smtp-transport", "hostname"] }
+# `client::Endpoint` parses a URL and encodes a form. Behind `http-client`.
+url           = { version = "2",    optional = true }
 hmac          = { version = "0.12", optional = true }
 sha2          = { version = "0.10", optional = true }
 rusqlite      = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
@@ -183,6 +190,22 @@ required-features = ["testkit"]
 name    = "site_allocs"
 harness = false
 required-features = ["testkit"]
+
+# The service that sends mail from its own loop: a success, a reported failure
+# and the loop's 504, each against a loopback SMTP stub. Its own `main` so the
+# service loop owns its thread, as a real service does.
+[[test]]
+name    = "email_in_the_loop"
+harness = false
+required-features = ["email", "testkit"]
+
+# `email::Smtp`'s allocation proof: the slot's own buffers, steps and command
+# bytes allocate nothing; lettre's message bytes and reply parse are counted
+# separately. Its own `main`, so the counting allocator is this binary's own.
+[[test]]
+name    = "email_allocs"
+harness = false
+required-features = ["email", "testkit"]
 
 [[bench]]
 name    = "critical_path"

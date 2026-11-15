@@ -91,7 +91,7 @@ fn roots_from(
     if certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "the platform certificate store loaded no certificate",
+            "no certificate authority in the system store (the platform certificate store loaded no certificate)",
         ));
     }
     let mut roots = rustls::RootCertStore::empty();
@@ -100,11 +100,139 @@ fn roots_from(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "the platform certificate store loaded {ignored} certificate(s) and none could be parsed"
+                "no certificate authority in the system store (the platform certificate store loaded {ignored} certificate(s) and none could be parsed)"
             ),
         ));
     }
     Ok(roots)
+}
+
+/// One URL a service posts forms to, resolved at start.
+///
+/// [`Endpoint::new`] parses the URL, resolves its host once with
+/// [`crate::net::resolve`] and keeps the `Host` header, path and query.
+/// [`Endpoint::post_form`] encodes an `application/x-www-form-urlencoded` POST
+/// into an [`Upstream`]'s request buffer and starts it, so the service drives
+/// the request from its own loop exactly as it drives a plain `Upstream`. One
+/// connection per call: there is no idle list. HTTPS uses the config given at
+/// start.
+#[cfg(feature = "http-client")]
+pub struct Endpoint {
+    addr: Addr,
+    https: bool,
+    /// The `Host` header value, with the port when it is not the scheme's.
+    host: String,
+    /// The request target: path plus query.
+    target: String,
+    tls: Arc<rustls::ClientConfig>,
+    name: rustls::pki_types::ServerName<'static>,
+}
+
+#[cfg(feature = "http-client")]
+impl Endpoint {
+    /// At start: parse an `http` or `https` URL, resolve its host once with
+    /// [`crate::net::resolve`], and keep the `Host` header, path and query.
+    ///
+    /// `tls` is used for `https` and ignored for `http`. Any failure is an
+    /// error, so a misconfigured URL stops the service at start.
+    pub fn new(url: &str, tls: Arc<rustls::ClientConfig>) -> io::Result<Endpoint> {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{url}: {e}")))?;
+        let https = match parsed.scheme() {
+            "http" => false,
+            "https" => true,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{url}: scheme {other:?} is not http or https"),
+                ))
+            }
+        };
+        let host = parsed.host_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{url}: no host"))
+        })?;
+        let default_port = if https { 443 } else { 80 };
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{url}: no port"))
+        })?;
+        let addr = crate::net::resolve(host, port)?;
+        let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{url}: {e}")))?;
+        let mut host_header = host.to_owned();
+        if port != default_port {
+            use std::fmt::Write as _;
+            let _ = write!(host_header, ":{port}");
+        }
+        let mut target = parsed.path().to_owned();
+        if let Some(query) = parsed.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        Ok(Endpoint {
+            addr: Addr::Tcp(addr),
+            https,
+            host: host_header,
+            target,
+            tls,
+            name,
+        })
+    }
+
+    /// Encode a POST of `fields` and start it on `up`.
+    ///
+    /// The body is `application/x-www-form-urlencoded` and the request asks
+    /// `Connection: close`. `Content-Length` counts the encoded bytes, so the
+    /// fields are encoded twice into the buffer rather than through an
+    /// intermediate `String`: once to sum the length, once to write.
+    pub fn post_form(
+        &self,
+        up: &mut Upstream,
+        fields: &[(&str, &str)],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let mut body_len = 0usize;
+        for (i, (name, value)) in fields.iter().enumerate() {
+            if i > 0 {
+                body_len += 1;
+            }
+            body_len += encoded_len(name) + 1 + encoded_len(value);
+        }
+        let request = up.request_buf();
+        write!(
+            request,
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.target, self.host, body_len
+        )?;
+        for (i, (name, value)) in fields.iter().enumerate() {
+            if i > 0 {
+                request.push(b'&');
+            }
+            encode_into(name, request);
+            request.push(b'=');
+            encode_into(value, request);
+        }
+        let tls = self.https.then(|| TlsClient {
+            config: self.tls.clone(),
+            name: self.name.clone(),
+        });
+        up.start(&self.addr, tls.as_ref(), false, deadline)
+    }
+}
+
+/// The encoded length of one form field name or value.
+#[cfg(feature = "http-client")]
+fn encoded_len(s: &str) -> usize {
+    url::form_urlencoded::byte_serialize(s.as_bytes())
+        .map(str::len)
+        .sum()
+}
+
+/// Append one form field name or value, encoded, straight into `out`.
+#[cfg(feature = "http-client")]
+fn encode_into(s: &str, out: &mut Vec<u8>) {
+    for piece in url::form_urlencoded::byte_serialize(s.as_bytes()) {
+        out.extend_from_slice(piece.as_bytes());
+    }
 }
 
 /// A parsed response head and body, borrowing the slot and the caller's header
@@ -492,22 +620,7 @@ impl Upstream {
         let (Some(tls), Some(stream)) = (&mut self.tls, &mut self.stream) else {
             return Ok(true);
         };
-        loop {
-            let (read, written) = match tls.complete_io(stream) {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            };
-            if !tls.is_handshaking() {
-                return Ok(true);
-            }
-            // No progress and still handshaking: wait for the next readiness
-            // edge rather than spin on `complete_io`.
-            if read == 0 && written == 0 {
-                return Ok(false);
-            }
-        }
+        drive_tls_handshake(tls, stream)
     }
 
     /// Write the rest of the request, then read and parse. Returns `Ok(true)`
@@ -626,45 +739,8 @@ impl Upstream {
             let before = self.read_len;
             match (&mut self.tls, &mut self.stream) {
                 (Some(tls), Some(stream)) => {
-                    // Feed the socket into rustls, then drain plaintext.
-                    loop {
-                        match tls.read_tls(stream) {
-                            Ok(0) => {
-                                self.eof = true;
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(e)
-                                if e.kind() == io::ErrorKind::ConnectionReset
-                                    || e.kind() == io::ErrorKind::BrokenPipe =>
-                            {
-                                self.eof = true;
-                                break;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                        if let Err(e) = tls.process_new_packets() {
-                            let _ = tls.write_tls(stream);
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-                        }
-                    }
-                    // Drain plaintext into the read buffer.
-                    loop {
-                        if self.read_len == self.read_buf.len() {
-                            break;
-                        }
-                        match tls.reader().read(&mut self.read_buf[self.read_len..]) {
-                            Ok(0) => break,
-                            Ok(n) => self.read_len += n,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                                self.eof = true;
-                                break;
-                            }
-                            Err(e) => return Err(e),
-                        }
+                    if read_tls_into(tls, stream, &mut self.read_buf, &mut self.read_len)? {
+                        self.eof = true;
                     }
                 }
                 (None, Some(stream)) => match stream.read(&mut self.read_buf[self.read_len..]) {
@@ -963,11 +1039,22 @@ fn flush_tls(
     stream: &mut Stream,
     #[cfg(test)] block_next_write: &std::cell::Cell<bool>,
 ) -> io::Result<bool> {
+    #[cfg(test)]
+    if !tls.is_handshaking() && block_next_write.replace(false) {
+        return Ok(false);
+    }
+    flush_tls_to(tls, stream)
+}
+
+/// Write pending TLS ciphertext to `stream` until it would block.
+///
+/// The one writer shared by [`Upstream`] and [`crate::email::Smtp`], so the
+/// socket and rustls handshake in one place.
+pub(crate) fn flush_tls_to(
+    tls: &mut ClientConnection,
+    stream: &mut impl Write,
+) -> io::Result<bool> {
     while tls.wants_write() {
-        #[cfg(test)]
-        if !tls.is_handshaking() && block_next_write.replace(false) {
-            return Ok(false);
-        }
         match tls.write_tls(stream) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
@@ -976,6 +1063,81 @@ fn flush_tls(
         }
     }
     Ok(true)
+}
+
+/// Feed the socket into `tls` and drain its plaintext into `buf[*len..]`.
+///
+/// Returns whether the peer closed. The one reader shared by [`Upstream`] and
+/// [`crate::email::Smtp`].
+pub(crate) fn read_tls_into(
+    tls: &mut ClientConnection,
+    stream: &mut (impl Read + Write),
+    buf: &mut [u8],
+    len: &mut usize,
+) -> io::Result<bool> {
+    let mut eof = false;
+    loop {
+        match tls.read_tls(stream) {
+            Ok(0) => {
+                eof = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::ConnectionReset
+                    || e.kind() == io::ErrorKind::BrokenPipe =>
+            {
+                eof = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        if let Err(e) = tls.process_new_packets() {
+            let _ = tls.write_tls(stream);
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
+    loop {
+        if *len == buf.len() {
+            break;
+        }
+        match tls.reader().read(&mut buf[*len..]) {
+            Ok(0) => break,
+            Ok(n) => *len += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                eof = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(eof)
+}
+
+/// Drive the TLS handshake until it completes or the socket would block.
+pub(crate) fn drive_tls_handshake(
+    tls: &mut ClientConnection,
+    stream: &mut (impl Read + Write),
+) -> io::Result<bool> {
+    loop {
+        let (read, written) = match tls.complete_io(stream) {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if !tls.is_handshaking() {
+            return Ok(true);
+        }
+        // No progress and still handshaking: wait for the next readiness
+        // edge rather than spin on `complete_io`.
+        if read == 0 && written == 0 {
+            return Ok(false);
+        }
+    }
 }
 
 /// Locate the end of the HTTP header section (`\r\n\r\n`), as the offset of the
@@ -2355,5 +2517,134 @@ mod socket_tests {
         let root = ck.cert.der().clone();
         let roots = roots_from([root]).expect("one parsable certificate");
         assert_eq!(roots.len(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "http-client"))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: the loopback HTTP stub is a blocking thread"
+)]
+mod endpoint_tests {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn empty_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+    }
+
+    /// Read one request (head and its `Content-Length` body) and answer 200.
+    fn stub(listener: std::net::TcpListener) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                if let Some(pos) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let n = sock.read(&mut buf).expect("read head");
+                assert!(n > 0, "the request head must arrive");
+                got.extend_from_slice(&buf[..n]);
+            };
+            let len: usize = std::str::from_utf8(&got[..head_end])
+                .expect("utf8 head")
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .expect("a Content-Length")
+                .parse()
+                .expect("a length");
+            while got.len() < head_end + len {
+                let n = sock.read(&mut buf).expect("read body");
+                assert!(n > 0, "the body must arrive");
+                got.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("answer");
+            got
+        })
+    }
+
+    /// Drive one request to its reply with a poll, then assert the reply.
+    fn drive(up: &mut Upstream, deadline: std::time::Instant) {
+        let mut poll = crate::platform::Poll::new().expect("poll");
+        let mut events = crate::platform::Events::with_capacity(8);
+        let token = crate::platform::Token(0);
+        poll.registry()
+            .register_fd(up.fd(), token, up.interest())
+            .expect("register");
+        let mut registered = up.interest();
+        loop {
+            if up.drive().expect("drive") {
+                // The reply borrows the slot; the caller reads it before the
+                // next start. Return through a raw pointer-free path: parse in
+                // place and stop.
+                break;
+            }
+            if up.interest() != registered {
+                registered = up.interest();
+                poll.registry()
+                    .reregister_fd(up.fd(), token, registered)
+                    .expect("reregister");
+            }
+            poll.poll(&mut events, Some(Duration::from_millis(100)))
+                .expect("poll");
+            if crate::platform::now() >= deadline {
+                panic!("the stub did not answer before the deadline");
+            }
+        }
+        let mut slots = reply_slots();
+        let reply = up.reply(&mut slots).expect("reply");
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, b"ok");
+    }
+
+    #[test]
+    fn post_form_sends_an_encoded_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = stub(listener);
+        let url = format!("http://127.0.0.1:{port}/v0/verify?x=1");
+        let endpoint = super::Endpoint::new(&url, empty_config()).expect("endpoint");
+        let mut up = Upstream::new(16 * 1024, 16 * 1024);
+        let deadline = crate::platform::now() + Duration::from_secs(10);
+        endpoint
+            .post_form(&mut up, &[("secret", "a b&c"), ("response", "t")], deadline)
+            .expect("post_form");
+        drive(&mut up, deadline);
+        let got = peer.join().expect("stub");
+        let text = String::from_utf8(got.clone()).expect("utf8 request");
+        let head = text.split("\r\n\r\n").next().expect("head");
+        assert!(
+            head.starts_with("POST /v0/verify?x=1 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!("\r\nHost: 127.0.0.1:{port}\r\n")),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nContent-Type: application/x-www-form-urlencoded\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("\r\nContent-Length: 25\r\n"), "{head}");
+        assert_eq!(&got[got.len() - 25..], b"secret=a+b%26c&response=t");
+        assert_eq!(
+            got.len(),
+            got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4 + 25
+        );
+    }
+
+    #[test]
+    fn an_endpoint_url_that_is_not_http_is_refused() {
+        assert!(super::Endpoint::new("ftp://127.0.0.1/", empty_config()).is_err());
+        assert!(super::Endpoint::new("http:///x", empty_config()).is_err());
     }
 }

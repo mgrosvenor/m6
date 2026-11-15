@@ -191,21 +191,14 @@ fn build_tls_client_config_alpn(
         cfg.alpn_protocols = vec![alpn.to_vec()];
         Ok(cfg)
     } else {
-        let mut root_store = rustls::RootCertStore::empty();
-        let native_roots = rustls_native_certs::load_native_certs();
-        let first_error = native_roots
-            .errors
-            .first()
-            .map(|e| format!(": {e}"))
-            .unwrap_or_default();
-        for cert in native_roots.certs {
-            let _ = root_store.add(cert);
-        }
-        if root_store.is_empty() {
-            anyhow::bail!(
-                "no certificate authority in the system store (load_native_certs found none{first_error}): install the host's CA certificates, or set tls_skip_verify on this backend"
-            );
-        }
+        // One place loads the host's root store: `client::system_roots` in
+        // m6-core. Its message says what the store held; this one adds the two
+        // ways out for a backend.
+        let root_store = m6_core::client::system_roots().map_err(|e| {
+            anyhow::anyhow!(
+                "{e}: install the host's CA certificates, or set tls_skip_verify on this backend"
+            )
+        })?;
         let mut cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
