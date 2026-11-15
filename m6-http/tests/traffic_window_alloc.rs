@@ -3,8 +3,10 @@
 //! `harness = false` means no libtest thread shares this binary, so the counter
 //! reads only what the pushes allocated. The window is allocated before the
 //! count starts, as it is at start in the server: everything it uses is
-//! allocated once and the ring never grows.
+//! allocated once and the ring never grows. The harness speaks libtest's
+//! protocol through `libtest-mimic`, forced onto one thread.
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::testkit::alloc_count;
 use m6_http_lib::health::{Kind, TrafficWindow};
 
@@ -15,6 +17,19 @@ static ALLOC: alloc_count::Counting = alloc_count::Counting;
 const PUSHES: usize = 100_000;
 
 fn main() {
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "a_push_allocates_nothing",
+        a_push_allocates_nothing,
+    )];
+    libtest_mimic::run(&args, tests).exit();
+}
+
+fn a_push_allocates_nothing() -> Result<(), Failed> {
     let mut window = TrafficWindow::new();
 
     // Built before the count: the pushes borrow them, and none of them is
@@ -42,5 +57,9 @@ fn main() {
     let allocations = alloc_count::now() - start;
 
     println!("a_push_allocates_nothing: {allocations} allocation(s) in {PUSHES} pushes");
-    std::process::exit(if allocations == 0 { 0 } else { 1 });
+    if allocations == 0 {
+        Ok(())
+    } else {
+        Err(format!("{allocations} allocation(s) in {PUSHES} pushes").into())
+    }
 }

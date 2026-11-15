@@ -133,6 +133,9 @@ tempfile      = "3"
 filetime      = "0.2"
 anyhow        = "1"
 criterion     = { version = "0.5", features = ["html_reports"] }
+# The custom-harness tests speak libtest's protocol (`--list --format terse`,
+# `--exact <name>`), which is what `nextest` lists and runs.
+libtest-mimic = "0.8"
 rcgen         = "0.13"
 # The cold-start bench is the only user of these four. A [[bin]] cannot use
 # dev-dependencies, so the bench is a [[bench]] and they live here.

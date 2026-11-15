@@ -1643,17 +1643,28 @@ impl Http2Conn {
         // Stream error, not connection error: the fault is in this request's
         // header list, and the connection (and its HPACK dynamic table) stay
         // valid for other streams.
-        // RFC 9113 8.1.2.6: a declared content-length that disagrees with the
-        // DATA actually received is a malformed request. This is not only a
-        // conformance point -- a length mismatch between what a message claims
-        // and what it carries is the same class of ambiguity that makes request
-        // smuggling work, and here m6 is the one that would forward it on.
-        if let Some(declared) = headers
-            .iter()
-            .find(|(k, _)| k == "content-length")
-            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        {
-            if declared != body.len() {
+        // RFC 9113 8.1.2.6 and RFC 9110 8.6: a declared content-length must be
+        // `1*DIGIT` and must agree with the DATA actually received. Both are
+        // malformed requests. This is not only a conformance point -- a length
+        // mismatch between what a message claims and what it carries is the
+        // same class of ambiguity that makes request smuggling work, and here
+        // m6 is the one that would forward it on.
+        match declared_content_length(&headers) {
+            Err(()) => {
+                m6_core::log::debug!(
+                    stream_id,
+                    "h2: content-length is not 1*DIGIT, which RFC 9110 8.6 requires"
+                );
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                );
+                self.streams.remove(&stream_id);
+                return;
+            }
+            Ok(Some(declared)) if declared != body.len() => {
                 m6_core::log::debug!(
                     stream_id,
                     declared,
@@ -1669,6 +1680,7 @@ impl Http2Conn {
                 self.streams.remove(&stream_id);
                 return;
             }
+            Ok(_) => {}
         }
 
         if let Err(why) = validate_request_headers(&headers) {
@@ -2260,6 +2272,23 @@ fn is_headersonly(headers: &[(String, String)]) -> bool {
     false
 }
 
+/// The declared `content-length`, or the fact that the field is malformed.
+///
+/// RFC 9110 8.6: `Content-Length = 1*DIGIT`, with optional SP and HTAB around
+/// the value (5.6.3). HTTP/2 previously used `v.trim().parse::<usize>()`, which
+/// read `+5` as 5 and silently ignored a value that failed to parse, serving a
+/// request whose framing the peer never declared.
+fn declared_content_length(headers: &[(String, String)]) -> Result<Option<usize>, ()> {
+    let Some((_, value)) = headers.iter().find(|(k, _)| k == "content-length") else {
+        return Ok(None);
+    };
+    let value = value.trim_matches([' ', '\t']);
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    value.parse().map(Some).map_err(|_| ())
+}
+
 /// Build the request, and hand back the `x-forwarded-for` it was carrying.
 ///
 /// The header is stripped either way -- it never reaches a handler, a backend
@@ -2464,7 +2493,22 @@ mod frame_validation_tests {
     /// A HEADERS frame opening `stream_id` and carrying one extra header,
     /// HPACK-encoded as a literal-without-indexing with a new name.
     pub(super) fn open_stream_with_header(stream_id: u32, name: &str, value: &str) -> Vec<u8> {
-        let mut block = vec![0x82, 0x87, 0x84]; // :method GET, :scheme https, :path /
+        open_stream_with_method_and_header(stream_id, 0x82, name, value)
+    }
+
+    /// The same, with `:method` chosen from the HPACK static table: `0x82` is
+    /// GET and `0x83` is POST.
+    ///
+    /// A body-bearing method matters to the content-length tests: GET is
+    /// dispatched on the header block alone, so its body is always empty and a
+    /// content-length check would measure that dispatch rather than the field.
+    fn open_stream_with_method_and_header(
+        stream_id: u32,
+        method: u8,
+        name: &str,
+        value: &str,
+    ) -> Vec<u8> {
+        let mut block = vec![method, 0x87, 0x84]; // :scheme https, :path /
         block.extend_from_slice(&[0x01, 0x0b]); // :authority, literal
         block.extend_from_slice(b"example.com");
         block.push(0x00); // literal, new name, no indexing
@@ -2486,6 +2530,77 @@ mod frame_validation_tests {
         block.extend_from_slice(&[0x01, 0x0b]);
         block.extend_from_slice(b"example.com");
         frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &block)
+    }
+
+    /// Drive a request whose `content-length` is `value` and whose DATA is
+    /// `body`, returning the connection so its output frames can be read.
+    fn request_with_content_length(
+        value: &str,
+        body: &[u8],
+    ) -> (Http2Conn, Result<(), &'static str>) {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let mut frames = open_stream_with_method_and_header(1, 0x83, "content-length", value);
+        frames.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, body));
+        c.recv_buf.extend_from_slice(&frames);
+        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+        };
+        let result = loop {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
+                Ok(true) => continue,
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        (c, result)
+    }
+
+    /// RFC 9110 8.6: `Content-Length` is `1*DIGIT`. The old parser read `+5` as
+    /// 5 and silently ignored a non-numeric value, so both were served as
+    /// though the field were valid or absent. Each is a malformed request
+    /// (RFC 9113 8.1.2.6) and gets RST_STREAM(PROTOCOL_ERROR) on its stream.
+    #[test]
+    fn content_length_that_is_not_1_digit_is_a_malformed_request() {
+        for value in ["+5", "5x", "-5", "abc"] {
+            let (c, result) = request_with_content_length(value, b"hello");
+            assert!(
+                result.is_ok(),
+                "content-length {value:?}: a malformed request is a stream error, not a connection error"
+            );
+            let resets = super::stream_state_tests::sent_frames(&c.send_buf, TYPE_RST_STREAM);
+            assert_eq!(
+                resets.len(),
+                1,
+                "content-length {value:?} must be refused once"
+            );
+            assert_eq!(
+                resets[0].0, 1,
+                "the RST_STREAM must name the request's stream"
+            );
+            assert_eq!(
+                u32::from_be_bytes(resets[0].1[..4].try_into().unwrap()),
+                ERR_PROTOCOL_ERROR,
+                "content-length {value:?} must be PROTOCOL_ERROR"
+            );
+        }
+    }
+
+    /// SP and HTAB around a digits-only value are legal and must be trimmed
+    /// rather than turned into part of the number or refused.
+    #[test]
+    fn content_length_with_ows_is_served() {
+        let (c, result) = request_with_content_length(" 5 ", b"hello");
+        assert!(result.is_ok(), "a valid request is not a connection error");
+        let resets = super::stream_state_tests::sent_frames(&c.send_buf, TYPE_RST_STREAM);
+        assert!(
+            resets.is_empty(),
+            "OWS around 1*DIGIT is legal, got RST_STREAM frames: {resets:?}"
+        );
+        assert!(
+            !super::stream_state_tests::sent_frames(&c.send_buf, TYPE_HEADERS).is_empty(),
+            "the request must be dispatched, not refused"
+        );
     }
 
     /// A HEADERS frame declaring PRIORITY but carrying fewer than the five
