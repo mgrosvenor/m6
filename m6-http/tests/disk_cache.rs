@@ -347,6 +347,10 @@ impl Stack {
         cmd.arg(self.d().join("cache-site"))
             .arg(&self.cache_system)
             .env("RUST_LOG", "debug")
+            // Test instrumentation: a debug build may shorten the stats
+            // interval, so `/perf` has a loop trace to report while a test
+            // runs. A release build ignores the variable.
+            .env("M6_TEST_STATS_INTERVAL_SECS", "1")
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-cache", &mut cmd);
@@ -488,6 +492,20 @@ impl Stack {
                 .next()
                 .and_then(|n| n.parse().ok())
         })
+    }
+
+    /// The longest loop iteration `/perf` currently reports, in nanoseconds.
+    fn longest_loop_work_ns(&self) -> u64 {
+        let body = self.perf().text();
+        body.match_indices("\"work_max_ns\":")
+            .filter_map(|(i, pat)| {
+                body[i + pat.len()..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .and_then(|n| n.parse().ok())
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     fn perf_id(&self) -> Option<String> {
@@ -633,6 +651,19 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
         stack.disk_block().contains("\"queued\":0"),
         "the tick drained the queue: {}",
         stack.disk_block()
+    );
+    // The loop's own longest iteration while the writer was busy, for the
+    // report's latency line. The first `/perf` window covers startup, so this
+    // waits for the next one, which contains the tick that did the write. It
+    // is a measurement, not an assertion.
+    let startup = stack.longest_loop_work_ns();
+    wait_until(Duration::from_secs(2), || {
+        let now = stack.longest_loop_work_ns();
+        now > 0 && now != startup
+    });
+    println!(
+        "loop work_max_ns: startup window {startup}, window with the disk tick {}",
+        stack.longest_loop_work_ns()
     );
 
     let files = stack.files_for("0");
