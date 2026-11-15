@@ -668,6 +668,11 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
 
     let files = stack.files_for("0");
     assert_eq!(files.len(), 1, "one served path is one file: {files:?}");
+    println!(
+        "left {} bytes in {}",
+        std::fs::metadata(&files[0]).unwrap().len(),
+        files[0].display()
+    );
     let (id, key, response) = disk_cache::decode(&std::fs::read(&files[0]).unwrap())
         .unwrap_or_else(|e| panic!("decode {}: {e}", files[0].display()));
     assert_eq!(
