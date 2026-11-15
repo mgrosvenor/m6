@@ -55,21 +55,28 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // cache, ALLOC-3 rendering) lowers the row it attacks. Never raise one: a count
 // above its budget is the defect the guard exists for.
 //
-// The integer the code makes is 2 for h1_tls_hit (both are rustls; the request
-// read buffer and the response buffer are the connection's own, so our code
-// allocates nothing on a cached hit), 15 for h2_tls_hit and 58 for
-// h1_tls_miss_insert: the miss row is 91 less the seventeen per-header
-// `format!` calls and the twelve copies the `Cache-Control` directive parse
-// made. The hit row read 2.000 to 2.003 over the runs and the miss row 58.004
-// to 58.007. The h2 row is 15 exactly: the borrow removed every copy whose
-// count varied. The budgets are the fixes' ceilings: 2,200, 15,000 and 58,207.
-// The new-connection row is a measure, not a budget: a full handshake per
-// connection read 122.859 to 123.849 per connection across the same runs, so a
-// per-connection ceiling would flake. It is reported. A path that allocates one
-// more time per request adds 1,000 and fails the three budgeted rows, which is
-// the break.
+// The integers the code makes are 2 for h1_tls_hit and 3 for h2_tls_hit (all
+// of them rustls; see below), 58 for h1_tls_miss_insert. The miss row is 91
+// less the seventeen per-header `format!` calls and the twelve copies the
+// `Cache-Control` directive parse made. The budgets are the fixes' ceilings:
+// 2,200, 3,000 and 58,207. The new-connection row is a measure, not a budget: a
+// full handshake per connection read 122.859 to 123.849 per connection across
+// the same runs, so a per-connection ceiling would flake. It is reported.
+//
+// The 3 left on h2's cached hit are rustls's, and nothing of ours:
+// two `rustls::msgs::base::Payload::into_vec` calls per decrypted request
+// (`CommonState::take_received_plaintext`) and one
+// `rustls::msgs::message::outbound::PrefixedPayload::with_capacity` per response
+// (`RecordLayer::encrypt_outgoing`). They are the accepted per-record buffers
+// (I-174); rustls's buffered API cannot be told to decrypt or encrypt in place.
+// Our request fields, cache key and header list are borrowed views of the
+// connection's read buffer, and the decoded field list is reused across
+// streams, so a cached hit allocates none of them.
+//
+// A path that allocates one more time per request adds 1,000 and fails the
+// three budgeted rows, which is the break.
 const H1_TLS_HIT_CALLS: u64 = 2_200;
-const H2_TLS_HIT_CALLS: u64 = 15_000;
+const H2_TLS_HIT_CALLS: u64 = 3_000;
 const H1_TLS_MISS_INSERT_CALLS: u64 = 58_207;
 
 /// The number of requests in the short run. The budgets are per 1,000 of the

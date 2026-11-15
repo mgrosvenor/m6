@@ -32,6 +32,7 @@ use m6_http_lib::forward::{self, UpstreamId, Waiter};
 use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
+use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
 
@@ -953,6 +954,62 @@ fn on_request_impl(
     }
 }
 
+/// Handle a request decoded on an HTTP/2 connection.
+///
+/// A cache hit is answered entirely from the borrowed view: the lookup key and
+/// the header list are read out of the connection's read buffer, and the shared
+/// cache entry goes back to the writer, so this path allocates nothing.
+/// `into_owned` runs only for a miss, which is a slow path.
+fn on_request_h2(
+    state: &mut ServerState,
+    req: H2Request<'_>,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::platform::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        req.method,
+        req.path,
+        req.query,
+        "HTTP/2",
+        req.headers(),
+        client_ip,
+        h2c,
+    ) {
+        Routed::Cached {
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => RequestOutcome::Cached {
+            entry,
+            age,
+            set_cookie,
+        },
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let req = req.into_owned();
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let outcome = handle_request(
+                &req,
+                client_ip,
+                enc,
+                state,
+                false,
+                h2c && state.h2c_iface == Iface::Internal,
+                registry,
+            );
+            finish_miss(state, outcome, start, version, iface, quic_port)
+        }
+    }
+}
+
 /// Handle a borrowed h1 head (the bodyless fast path). On a hit it returns the
 /// shared `Cached` form so `drive_h1` writes it with no allocation.
 fn on_request_head(
@@ -1146,8 +1203,9 @@ fn drive_conn_token(
     let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
         on_request_head(state, head, buf, ip, quic_port, registry)
     };
-    let mut on_h2 = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
-        on_request_impl(state, req, ip, quic_port, registry, is_h2c)
+    let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| match req {
+        RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
+        RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
     };
     let mut drive = if is_h2c {
         match h2c.as_mut() {

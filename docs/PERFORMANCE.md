@@ -174,12 +174,12 @@ The per-request figure is `(2N count - N count) / N`, so the one handshake and t
 The four rows measured on macOS on 2026-11-15:
 
 - `h1_tls_hit`, a cached page on one keep-alive connection over TLS: 2.000 calls per request, both of them rustls's own record buffers. Our code allocates nothing on this path.
-- `h2_tls_hit`, the same over HTTP/2: 15.000 calls per request.
+- `h2_tls_hit`, the same over HTTP/2: 3.000 calls per request, all three of them rustls's own record buffers. Our code allocates nothing on this path either.
 - `h1_tls_miss_insert`, a new query string each time so each request reaches the backend and is stored: 58.001 calls per request. A miss is a slow path, so its budget is a ceiling rather than a target.
 - `h1_tls_new_connection_per_connection`, a cached page with a full TLS handshake per request, measured per connection: 117.000 calls per connection.
 
-The difference did not repeat exactly under load: over the runs h1 read 1.997 to 2.003, h2 14.996 to 15.004 and the miss row 58.004 to 58.007.
-The request budgets are the top of that observed spread, with nothing added on top: 2,200 for h1's cached hit, 15,000 for h2's, and 58,207 for the miss that inserts, in calls per 1,000 requests.
+The difference did not repeat exactly under load: over the runs h1 read 1.997 to 2.003, h2 2.996 to 3.004 and the miss row 58.004 to 58.007.
+The request budgets are the top of that observed spread, with nothing added on top: 2,200 for h1's cached hit, 3,000 for h2's, and 58,207 for the miss that inserts, in calls per 1,000 requests.
 The miss row's one call above 58,000 is the single cache-table growth that its 1,000 inserts trigger.
 The new-connection row is a measure, not a budget: a full handshake per connection read 122.859 to 123.849 per connection across the runs, so a per-connection ceiling would flake.
 The budgets only go down. Each ALLOC job lowers the row it attacks, and a row above its budget fails the test.

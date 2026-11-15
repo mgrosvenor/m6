@@ -30,7 +30,7 @@ use rustls::ServerConnection;
 
 use crate::cache::CachedResponse;
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
-use crate::http2::{H2Io, Http2Conn};
+use crate::http2::{H2Io, Http2Conn, RequestRef};
 use m6_core::event::{Slots, Taken};
 use m6_core::platform::{Interest, Registry, Token};
 
@@ -493,7 +493,7 @@ impl Http11Listener {
     ) -> ConnDrive
     where
         FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
-        FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         let mut drive = ConnDrive {
             pending: std::mem::take(&mut self.pending),
@@ -586,7 +586,7 @@ impl Http11Listener {
         let mut on_head = |_: &mut (), _: &RequestHead<'_>, _: &[u8], _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
         };
-        let mut on_owned = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_owned = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
         };
         if let Some(tls) = conn.tls.as_mut() {
@@ -1076,7 +1076,7 @@ impl H2cListener {
         registry: &Registry,
     ) -> ConnDrive
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         let mut drive = ConnDrive {
             pending: std::mem::take(&mut self.pending),
@@ -1192,7 +1192,7 @@ fn drive_conn<S, FH, FO>(
     drive: &mut ConnDrive,
 ) where
     FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
-    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+    FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -1540,7 +1540,7 @@ fn drive_h1<S, FH, FO>(
     drive: &mut ConnDrive,
 ) where
     FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
-    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+    FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
 {
     loop {
         match &h1.state {
@@ -1657,7 +1657,7 @@ fn drive_h1<S, FH, FO>(
                                     crate::forward::strip_untrusted_inbound(&mut req.headers);
                                     h1.keep_alive =
                                         wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
-                                    match on_owned(state, &req, client_ip) {
+                                    match on_owned(state, RequestRef::Owned(&req), client_ip) {
                                         RequestOutcome::Ready(
                                             status,
                                             resp_headers,
@@ -1697,9 +1697,9 @@ fn drive_h1<S, FH, FO>(
                                             // bytes, the same as the bodyless
                                             // fast path.
                                             let hit = hit.expect("cached hit carries hit headers");
-                                            let mut out = Vec::new();
+                                            h1.out_buf.clear();
                                             write_cached_h1(
-                                                &mut out,
+                                                &mut h1.out_buf,
                                                 &entry,
                                                 age,
                                                 hit,
@@ -1707,7 +1707,7 @@ fn drive_h1<S, FH, FO>(
                                                 &req.method,
                                                 h1.keep_alive,
                                             );
-                                            h1.state = H1State::Writing { buf: out, pos: 0 };
+                                            h1.state = H1State::Writing { pos: 0 };
                                             continue;
                                         }
                                     }

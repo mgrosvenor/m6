@@ -63,6 +63,11 @@ const DEFAULT_WINDOW: u32 = 65_535;
 const DEFAULT_MAX_FRAME: u32 = 16_384;
 const MAX_CONCURRENT: u32 = 100;
 
+/// How many retired streams one connection keeps for reuse. A connection only
+/// needs one per stream it has open at once, and the cap bounds the body buffers
+/// a peer could park here by opening and closing large uploads.
+const FREE_STREAMS: usize = MAX_CONCURRENT as usize;
+
 /// Hard ceiling on a single buffered HTTP/2 request body.
 ///
 /// Not an RFC requirement -- a robustness one. Request bodies were accumulated
@@ -261,6 +266,147 @@ struct H2Field {
     value: Range<u32>,
 }
 
+/// The forwarded header list of an HTTP/2 request, as borrowed name/value
+/// views into the connection's `decode_buf`.
+///
+/// Pseudo-headers and proxy-owned inbound headers are filtered out at lookup,
+/// and `Host` is `:authority` when the client sent no explicit one. Nothing is
+/// copied into a `String`, a `Vec` or a `HeaderMap`: a cache hit reads the key
+/// and the list it needs straight out of the read buffer.
+pub struct H2Headers<'a> {
+    fields: &'a [H2Field],
+    buf: &'a [u8],
+    authority: Option<&'a str>,
+}
+
+/// One request decoded on an HTTP/2 connection.
+///
+/// Every field is a view of the connection's buffers. `into_owned` is called
+/// only when a miss hands the request to a backend, which is the slow path; a
+/// cache hit is answered from these views and allocates nothing.
+pub struct H2Request<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    headers: H2Headers<'a>,
+    body: Vec<u8>,
+}
+
+/// What an `on_request` callback was handed: the owned request of the HTTP/1.1
+/// body path, or the borrowed request of an HTTP/2 connection.
+pub enum RequestRef<'a> {
+    Owned(&'a HttpRequest),
+    H2(H2Request<'a>),
+}
+
+impl<'a> H2Headers<'a> {
+    fn new(fields: &'a [H2Field], buf: &'a [u8]) -> H2Headers<'a> {
+        let authority = fields
+            .iter()
+            .find(|f| field_name(buf, f) == ":authority")
+            .map(|f| field_value(buf, f));
+        H2Headers {
+            fields,
+            buf,
+            authority,
+        }
+    }
+
+    /// Every field that may be forwarded, in wire order.
+    fn forwarded(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
+        fields(self.fields, self.buf)
+            .filter(|(k, _)| !k.starts_with(':') && !crate::forward::is_untrusted_inbound(k))
+    }
+
+    fn has_explicit_host(&self) -> bool {
+        self.forwarded()
+            .any(|(k, _)| k.eq_ignore_ascii_case("host"))
+    }
+}
+
+impl m6_core::http::HeaderSource for H2Headers<'_> {
+    fn find(&self, name: &str) -> Option<&str> {
+        match self.forwarded().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            Some((_, v)) => Some(v),
+            // RFC 9113 8.3.1: :authority is HTTP/2's Host. Present it only when
+            // the client did not send an explicit Host, exactly as the owned
+            // path did when it filled one in.
+            None if name.eq_ignore_ascii_case("host") => self.authority,
+            None => None,
+        }
+    }
+
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        let authority = if name.eq_ignore_ascii_case("host") && !self.has_explicit_host() {
+            self.authority
+        } else {
+            None
+        };
+        self.forwarded()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+            .chain(authority)
+    }
+}
+
+impl<'a> H2Request<'a> {
+    fn new(list: &'a [H2Field], buf: &'a [u8], body: Vec<u8>) -> H2Request<'a> {
+        let mut method = "";
+        let mut path = "";
+        let mut query = None;
+        for (k, v) in fields(list, buf) {
+            match k {
+                ":method" => method = v,
+                ":path" => match v.find('?') {
+                    Some(q) => {
+                        path = &v[..q];
+                        query = Some(&v[q + 1..]);
+                    }
+                    None => path = v,
+                },
+                _ => {}
+            }
+        }
+        H2Request {
+            method,
+            path,
+            query,
+            headers: H2Headers::new(list, buf),
+            body,
+        }
+    }
+
+    /// The forwarded header list, borrowed from the connection's buffer.
+    pub fn headers(&self) -> &H2Headers<'a> {
+        &self.headers
+    }
+
+    /// The owned request the miss path hands to a backend.
+    ///
+    /// This is the one place a request becomes `String`s, and only a miss
+    /// reaches it. The bytes are the same ones the old `build_request` copied:
+    /// same fields, same order, same synthesized `Host`.
+    pub fn into_owned(self) -> HttpRequest {
+        let mut headers = Vec::with_capacity(self.headers.fields.len());
+        for (k, v) in self.headers.forwarded() {
+            headers.push((k.to_string(), v.to_string()));
+        }
+        if let Some(authority) = self.headers.authority {
+            if !m6_core::headers::contains(&headers[..], "host") {
+                headers.push(("Host".to_string(), authority.to_string()));
+            }
+        }
+        HttpRequest {
+            method: self.method.to_string(),
+            path: self.path.to_string(),
+            query: self.query.map(str::to_string),
+            version: "HTTP/2".to_string(),
+            headers,
+            body: self.body,
+        }
+    }
+}
+
 struct H2Stream {
     state: StreamState,
     headers: Vec<H2Field>,
@@ -297,6 +443,23 @@ impl H2Stream {
             pending: false,
         }
     }
+
+    /// Reset a retired stream for the next stream id, keeping its allocations.
+    fn reset(&mut self, initial_send_window: i32) {
+        self.state = StreamState::Open;
+        self.headers.clear();
+        if self.body.capacity() > 64 * 1024 {
+            self.body = Vec::new();
+        } else {
+            self.body.clear();
+        }
+        self.headers_done = false;
+        self.send_window = initial_send_window;
+        self.recv_window = DEFAULT_WINDOW as i32;
+        self.resp_body = None;
+        self.resp_sent = 0;
+        self.pending = false;
+    }
 }
 
 // ── Connection phase ──────────────────────────────────────────────────────────
@@ -329,6 +492,14 @@ pub struct Http2Conn {
     flush_ids: Vec<u32>,
 
     streams: HashMap<u32, H2Stream>,
+    /// Retired stream state, reused so a request does not allocate its decoded
+    /// field list and body buffer on every stream. Bounded by FREE_STREAMS.
+    free_streams: Vec<H2Stream>,
+    /// The decoded field list of the request just dispatched, kept so the next
+    /// stream's decode reuses its capacity. The dispatch path takes the list out
+    /// of its stream (the ranges have to outlive the stream's borrow), and this
+    /// is where it goes back to rather than being freed per request.
+    spare_headers: Option<Vec<H2Field>>,
     hpack_dec: hpack::Decoder<'static>,
     hpack_enc: hpack::Encoder<'static>,
 
@@ -425,6 +596,8 @@ impl Http2Conn {
             hdr_scratch: Vec::with_capacity(8 * 1024),
             flush_ids: Vec::with_capacity(16),
             streams: HashMap::new(),
+            free_streams: Vec::new(),
+            spare_headers: None,
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
             last_stream_id: 0,
@@ -479,7 +652,7 @@ impl Http2Conn {
         pending: &mut Vec<PendingDispatch>,
     ) -> bool
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if self.phase == Phase::Done {
             return false;
@@ -704,7 +877,7 @@ impl Http2Conn {
         hit: Option<&HitHeaders>,
     ) -> Result<bool, &'static str>
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if self.phase == Phase::Preface {
             if self.recv_buf.len() < CLIENT_PREFACE.len() {
@@ -745,16 +918,52 @@ impl Http2Conn {
             return Ok(false);
         }
 
-        // Move the receive buffer out of `self` so the payload can be borrowed
-        // as a slice while the frame handlers borrow `self` mutably. The bytes
-        // after this frame go back now; the frame itself is dropped once the
-        // handler has consumed the payload, so a frame's payload is never
-        // copied into an intermediate Vec.
+        // One buffer, two offsets. The frame's payload is a slice of the
+        // connection's receive buffer, and the bytes after it are the tail of
+        // the same Vec, never a second one. The buffer is moved out of `self`
+        // only so the payload can be borrowed as a slice while the frame
+        // handlers borrow `self` mutably; it goes back with the consumed frame
+        // drained from the front, which keeps the Vec's capacity (so the next
+        // `fill_recv` appends instead of reallocating) and copies no payload.
         let mut frame = std::mem::take(&mut self.recv_buf);
-        let remainder = frame.split_off(FRAME_HDR + length);
-        self.recv_buf = remainder;
-        let payload = &frame[FRAME_HDR..FRAME_HDR + length];
+        let end = FRAME_HDR + length;
+        let outcome = self.run_frame(
+            &frame[FRAME_HDR..end],
+            length,
+            ftype,
+            flags,
+            stream_id,
+            state,
+            on_request,
+            client_ip,
+            hit,
+        );
+        if matches!(outcome, Ok(true)) {
+            frame.drain(..end);
+        }
+        self.recv_buf = frame;
+        outcome
+    }
 
+    /// Dispatch one complete frame whose payload is `payload`, a slice of the
+    /// receive buffer. The caller owns moving the buffer back and consuming the
+    /// frame, so every early return here leaves the buffer with its caller.
+    #[allow(clippy::too_many_arguments)] // a frame's header fields plus the dispatch context
+    fn run_frame<S, F>(
+        &mut self,
+        payload: &[u8],
+        length: usize,
+        ftype: u8,
+        flags: u8,
+        stream_id: u32,
+        state: &mut S,
+        on_request: &mut F,
+        client_ip: &str,
+        hit: Option<&HitHeaders>,
+    ) -> Result<bool, &'static str>
+    where
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
+    {
         // Is a header block still being assembled? RFC 9113 6.10: a HEADERS
         // frame and the CONTINUATION frames that follow it are "a single
         // logical unit". State transitions therefore apply to the completed
@@ -795,7 +1004,7 @@ impl Http2Conn {
             }
             FrameVerdict::StreamError(code) => {
                 self.push_frame(TYPE_RST_STREAM, 0, stream_id, &code.to_be_bytes());
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 self.note_reset(stream_id);
                 return Ok(true);
             }
@@ -818,7 +1027,7 @@ impl Http2Conn {
             }
             FrameVerdict::StreamError(code) => {
                 self.push_frame(TYPE_RST_STREAM, 0, stream_id, &code.to_be_bytes());
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 return Ok(true);
             }
         }
@@ -844,7 +1053,7 @@ impl Http2Conn {
                         stream_id,
                         &ERR_PROTOCOL_ERROR.to_be_bytes(),
                     );
-                    self.streams.remove(&stream_id);
+                    self.retire_stream(stream_id);
                     self.note_reset(stream_id);
                 }
             }
@@ -855,7 +1064,7 @@ impl Http2Conn {
                 // sending DATA on it would have read as idle -- a connection
                 // error -- instead of closed. Bumping last_stream_id keeps the
                 // derivation honest.
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 self.last_stream_id = self.last_stream_id.max(stream_id);
                 self.note_reset(stream_id);
             }
@@ -887,6 +1096,39 @@ impl Http2Conn {
 
     // ── Stream state machine (RFC 9113 5.1) ───────────────────────────────────
 
+    /// A stream for a new id, from the retired pool when there is one. The
+    /// allocations (the field list and the body buffer) are reused rather than
+    /// made per request.
+    fn new_stream(&mut self, initial_send_window: i32) -> H2Stream {
+        let mut stream = match self.free_streams.pop() {
+            Some(stream) => stream,
+            None => H2Stream::new(initial_send_window),
+        };
+        if let Some(list) = self.spare_headers.take() {
+            stream.headers = list;
+        }
+        stream.reset(initial_send_window);
+        stream
+    }
+
+    /// Retire a stream, keeping its allocations for the next one on this
+    /// connection. The list and body are cleared when the stream is reused, and
+    /// a body buffer larger than 64 KiB is dropped so a peer cannot park one.
+    fn retire_stream(&mut self, stream_id: u32) {
+        let Some(mut stream) = self.streams.remove(&stream_id) else {
+            return;
+        };
+        if self.free_streams.len() < FREE_STREAMS {
+            stream.headers.clear();
+            if stream.body.capacity() > 64 * 1024 {
+                stream.body = Vec::new();
+            } else {
+                stream.body.clear();
+            }
+            self.free_streams.push(stream);
+        }
+    }
+
     /// Drop a stream that has just been answered, remembering its send window.
     ///
     /// Bounded at the same size as the reset memory: this exists to cover the
@@ -894,7 +1136,7 @@ impl Http2Conn {
     /// one round trip, not an unbounded history.
     fn close_stream_remembering_window(&mut self, stream_id: u32) {
         let window = self.streams.get(&stream_id).map(|s| s.send_window);
-        self.streams.remove(&stream_id);
+        self.retire_stream(stream_id);
         if let Some(w) = window {
             if self.closed_windows.len() >= RESET_MEMORY {
                 self.closed_windows.pop_front();
@@ -1232,7 +1474,7 @@ impl Http2Conn {
                     stream_id,
                     &ERR_FLOW_CONTROL.to_be_bytes(),
                 );
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 self.note_reset(stream_id);
                 return Ok(());
             }
@@ -1277,7 +1519,7 @@ impl Http2Conn {
         hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if stream_id == 0 {
             return Err("HEADERS on stream 0");
@@ -1413,10 +1655,11 @@ impl Http2Conn {
         }
         let header_block = &payload[pos..payload.len() - pad];
 
-        let stream = self
-            .streams
-            .entry(stream_id)
-            .or_insert_with(|| H2Stream::new(self.peer_initial_window));
+        if !self.streams.contains_key(&stream_id) {
+            let stream = self.new_stream(self.peer_initial_window);
+            self.streams.insert(stream_id, stream);
+        }
+        let stream = self.streams.get_mut(&stream_id).expect("just inserted");
         if flags & FLAG_END_STREAM != 0 {
             stream.state = StreamState::HalfClosedRemote;
         }
@@ -1482,7 +1725,7 @@ impl Http2Conn {
                         stream_id,
                         &ERR_PROTOCOL_ERROR.to_be_bytes(),
                     );
-                    self.streams.remove(&stream_id);
+                    self.retire_stream(stream_id);
                     return Ok(());
                 }
                 let pseudo = {
@@ -1500,7 +1743,7 @@ impl Http2Conn {
                         stream_id,
                         &ERR_PROTOCOL_ERROR.to_be_bytes(),
                     );
-                    self.streams.remove(&stream_id);
+                    self.retire_stream(stream_id);
                     return Ok(());
                 }
             }
@@ -1533,7 +1776,7 @@ impl Http2Conn {
         hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         // The flood bound. Checked on every CONTINUATION, not merely at the end
         // of the block: the whole point of the attack is that the block never
@@ -1607,7 +1850,7 @@ impl Http2Conn {
         hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if stream_id == 0 {
             return Err("DATA on stream 0");
@@ -1676,7 +1919,7 @@ impl Http2Conn {
             false
         };
         if over_cap {
-            self.streams.remove(&stream_id);
+            self.retire_stream(stream_id);
             self.push_frame(
                 TYPE_RST_STREAM,
                 0,
@@ -1717,7 +1960,7 @@ impl Http2Conn {
         peer_ip: &str,
         hit: Option<&HitHeaders>,
     ) where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         let ready = self
             .streams
@@ -1767,7 +2010,7 @@ impl Http2Conn {
                     stream_id,
                     &ERR_PROTOCOL_ERROR.to_be_bytes(),
                 );
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 return;
             }
             Ok(Some(declared)) if declared != body.len() => {
@@ -1783,7 +2026,7 @@ impl Http2Conn {
                     stream_id,
                     &ERR_PROTOCOL_ERROR.to_be_bytes(),
                 );
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 return;
             }
             Ok(_) => {}
@@ -1799,23 +2042,31 @@ impl Http2Conn {
                 stream_id,
                 &ERR_PROTOCOL_ERROR.to_be_bytes(),
             );
-            self.streams.remove(&stream_id);
+            self.retire_stream(stream_id);
             return;
         }
 
-        let (req, forwarded_for) = build_request(&headers, &self.decode_buf, body);
+        // A request parked across loop turns stores ranges into the connection's
+        // buffer (the decoded fields above); the view built here re-borrows them
+        // for this call only. A cached hit is answered from the view, so nothing
+        // is copied into a String, Vec or HeaderMap on that path.
+        let is_head = fields(&headers, &self.decode_buf)
+            .find(|(k, _)| *k == ":method")
+            .is_some_and(|(_, v)| v.eq_ignore_ascii_case("HEAD"));
 
         // Per REQUEST, not per connection. One backbone connection from a
         // cache node is long-lived and multiplexes requests from many
         // different visitors, so a connection-level address would attribute
-        // all of them to whoever opened it.
-        let client_ip = crate::forward::attributed_client_ip(
-            forwarded_for.as_deref(),
-            peer_ip,
-            self.forwarded_trust,
-        );
+        // all of them to whoever opened it. The value is stripped from the
+        // forwarded list either way.
+        let forwarded_for = fields(&headers, &self.decode_buf)
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+            .map(|(_, v)| v);
+        let client_ip =
+            crate::forward::attributed_client_ip(forwarded_for, peer_ip, self.forwarded_trust);
 
-        match on_request(state, &req, client_ip) {
+        let req = H2Request::new(&headers, &self.decode_buf, body);
+        match on_request(state, RequestRef::H2(req), client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
                 self.dispatch_h2_response(
                     stream_id,
@@ -1825,7 +2076,7 @@ impl Http2Conn {
                         body: resp_body,
                         genid,
                     },
-                    &req.method,
+                    is_head,
                 );
             }
             RequestOutcome::Cached {
@@ -1842,7 +2093,7 @@ impl Http2Conn {
                     age,
                     set_cookie.as_deref(),
                     hit,
-                    &req.method,
+                    is_head,
                 );
             }
             RequestOutcome::Pending { id, ctx } => {
@@ -1856,6 +2107,10 @@ impl Http2Conn {
                 });
             }
         }
+        // The view borrowed this list; it is ours again now. Keeping it means
+        // the next stream decodes into the same allocation instead of growing a
+        // fresh `Vec` field by field.
+        self.spare_headers = Some(headers);
     }
 
     /// Complete a synchronous (Ready) H2 response: send server push, encode headers,
@@ -1863,7 +2118,7 @@ impl Http2Conn {
     /// `on_request` and `client_ip` were parameters until 2026-09-18: push
     /// re-entered the request handler to fetch each hinted asset. With push gone
     /// this only writes the response it was handed. See issue #93.
-    fn dispatch_h2_response(&mut self, stream_id: u32, resp: H2Response, method: &str) {
+    fn dispatch_h2_response(&mut self, stream_id: u32, resp: H2Response, is_head: bool) {
         let H2Response {
             status,
             headers: resp_headers,
@@ -1911,7 +2166,7 @@ impl Http2Conn {
         // is what made HTTP/2 abort the stream with INTERNAL_ERROR: the DATA
         // frames disagreed with the framing the client had been promised.
         let advertised_len = resp_body.len();
-        let resp_body = if method.eq_ignore_ascii_case("HEAD") {
+        let resp_body = if is_head {
             bytes::Bytes::new()
         } else {
             bytes::Bytes::from(resp_body)
@@ -1958,7 +2213,7 @@ impl Http2Conn {
                 body,
                 genid,
             },
-            method,
+            method.eq_ignore_ascii_case("HEAD"),
         );
         if self.flush_io(io).is_err() {
             self.phase = Phase::Done;
@@ -2181,10 +2436,10 @@ impl Http2Conn {
         age: std::time::Duration,
         set_cookie: Option<&str>,
         hit: &HitHeaders,
-        method: &str,
+        is_head: bool,
     ) {
         self.push_cached_headers(stream_id, entry, age, set_cookie, hit);
-        let body = if method.eq_ignore_ascii_case("HEAD") {
+        let body = if is_head {
             bytes::Bytes::new()
         } else {
             entry.body.clone()
@@ -2403,7 +2658,7 @@ impl Http2Conn {
                 body,
                 genid: None,
             },
-            method,
+            method.eq_ignore_ascii_case("HEAD"),
         );
         let complete = self
             .streams
@@ -2411,7 +2666,7 @@ impl Http2Conn {
             .is_some_and(|s| s.resp_body.as_ref().is_some_and(|b| s.resp_sent >= b.len()));
         if complete {
             self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_NO_ERROR.to_be_bytes());
-            self.streams.remove(&stream_id);
+            self.retire_stream(stream_id);
             self.note_reset(stream_id);
         }
     }
@@ -2764,84 +3019,12 @@ fn declared_content_length(headers: &[H2Field], buf: &[u8]) -> Result<Option<usi
     value.parse().map(Some).map_err(|_| ())
 }
 
-/// Build the request, and hand back the `x-forwarded-for` it was carrying.
-///
-/// The header is stripped either way -- it never reaches a handler, a backend
-/// or a cache key. Returning the value separately is what lets the *caller*
-/// decide whether the peer was entitled to assert it, without the header
-/// itself surviving that decision.
-///
-/// The fields are ranges into the connection's decode buffer; the request
-/// still owns its strings because the handler and a parked backend dispatch
-/// outlive the stream, which is the one place the design rule allows a copy.
-fn build_request(headers: &[H2Field], buf: &[u8], body: Vec<u8>) -> (HttpRequest, Option<String>) {
-    let mut method = String::new();
-    let mut path = String::new();
-    let mut query = None;
-    let mut fwd = Vec::new();
-    let mut authority: Option<String> = None;
-    let mut forwarded_for: Option<String> = None;
-
-    for (k, v) in fields(headers, buf) {
-        match k {
-            ":method" => method = v.to_string(),
-            ":path" => {
-                if let Some(q) = v.find('?') {
-                    path = v[..q].to_string();
-                    query = Some(v[q + 1..].to_string());
-                } else {
-                    path = v.to_string();
-                }
-            }
-            ":authority" => authority = Some(v.to_string()),
-            k if k.starts_with(':') => {}
-            // Strip proxy-owned headers on ingress — see
-            // `forward::UNTRUSTED_INBOUND`.
-            k if crate::forward::is_untrusted_inbound(k) => {
-                if k.eq_ignore_ascii_case("x-forwarded-for") {
-                    forwarded_for = Some(v.to_string());
-                }
-            }
-            _ => fwd.push((k.to_string(), v.to_string())),
-        }
-    }
-
-    // RFC 9113 8.3.1: :authority is HTTP/2's Host, and an intermediary
-    // translating to HTTP/1.1 must carry it across. Dropping it with the other
-    // pseudo-headers left every h2 request (which is most of them -- curl and
-    // every browser send :authority and no Host) looking hostless to
-    // everything downstream: host-dependent logic silently never fired, and
-    // requests forwarded to a backend carried no Host at all.
-    //
-    // A client that sent both wins with its own Host, which is only reachable
-    // from a non-conforming client; :authority fills in otherwise.
-    if let Some(authority) = authority {
-        if !m6_core::headers::contains(&fwd[..], "host") {
-            fwd.push(("Host".to_string(), authority));
-        }
-    }
-
-    let req = HttpRequest {
-        method,
-        path,
-        query,
-        version: "HTTP/2".to_string(),
-        headers: fwd,
-        body,
-    };
-    (req, forwarded_for)
-}
-
 #[cfg(test)]
 mod authority_tests {
 
-    /// `build_request` hands back the request and the `x-forwarded-for` it
-    /// stripped; these tests are about the request half.
-    fn req_of(pair: (crate::forward::HttpRequest, Option<String>)) -> crate::forward::HttpRequest {
-        pair.0
-    }
-
-    fn build(pairs: &[(&str, &str)]) -> (crate::forward::HttpRequest, Option<String>) {
+    /// Materialize the borrowed request exactly as the miss path does, so these
+    /// tests cover the one conversion a request makes on its way to a backend.
+    fn build(pairs: &[(&str, &str)]) -> crate::forward::HttpRequest {
         let mut buf = Vec::new();
         let mut fields = Vec::new();
         for (k, v) in pairs {
@@ -2849,7 +3032,7 @@ mod authority_tests {
             let value = super::push_field_bytes(&mut buf, v.as_bytes());
             fields.push(super::H2Field { name, value });
         }
-        super::build_request(&fields, &buf, Vec::new())
+        super::H2Request::new(&fields, &buf, Vec::new()).into_owned()
     }
     fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
         req.headers
@@ -2861,11 +3044,11 @@ mod authority_tests {
     /// The case every browser and curl actually sends: :authority, no Host.
     #[test]
     fn authority_becomes_host() {
-        let req = req_of(build(&[
+        let req = build(&[
             (":method", "GET"),
             (":path", "/x"),
             (":authority", "www.example.com"),
-        ]));
+        ]);
         assert_eq!(host_of(&req), Some("www.example.com"));
     }
 
@@ -2873,12 +3056,12 @@ mod authority_tests {
     /// and must not be duplicated.
     #[test]
     fn explicit_host_wins_and_is_not_duplicated() {
-        let req = req_of(build(&[
+        let req = build(&[
             (":method", "GET"),
             (":path", "/x"),
             (":authority", "authority.example"),
             ("host", "host.example"),
-        ]));
+        ]);
         assert_eq!(host_of(&req), Some("host.example"));
         assert_eq!(
             req.headers
@@ -2891,19 +3074,19 @@ mod authority_tests {
 
     #[test]
     fn no_authority_means_no_synthesized_host() {
-        let req = req_of(build(&[(":method", "GET"), (":path", "/x")]));
+        let req = build(&[(":method", "GET"), (":path", "/x")]);
         assert_eq!(host_of(&req), None);
     }
 
     /// Other pseudo-headers stay stripped -- they must never reach a backend.
     #[test]
     fn other_pseudo_headers_are_still_dropped() {
-        let req = req_of(build(&[
+        let req = build(&[
             (":method", "GET"),
             (":path", "/x?a=1"),
             (":scheme", "https"),
             (":authority", "e.example"),
-        ]));
+        ]);
         assert!(
             !req.headers.iter().any(|(k, _)| k.starts_with(':')),
             "{:?}",
@@ -2927,7 +3110,7 @@ mod frame_validation_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
@@ -3013,7 +3196,7 @@ mod frame_validation_tests {
         let mut frames = open_stream_with_method_and_header(1, 0x83, "content-length", value);
         frames.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, body));
         c.recv_buf.extend_from_slice(&frames);
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         let result = loop {
@@ -3136,7 +3319,7 @@ mod frame_validation_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), None)
         };
         let _ = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None);
@@ -3324,7 +3507,7 @@ mod stream_state_tests {
     /// Drive a connection over `bytes`, returning the driver's verdict.
     fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
         c.recv_buf.extend_from_slice(bytes);
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
@@ -3615,7 +3798,7 @@ mod stream_state_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&f);
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
@@ -3633,7 +3816,7 @@ mod stream_state_tests {
     fn a_frame_larger_than_one_read_is_reassembled() {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
 
@@ -3723,7 +3906,7 @@ mod f005_regression {
     use super::*;
 
     fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
@@ -4136,7 +4319,7 @@ mod hpack_table_size_setting_tests {
         c.phase = Phase::Active;
         c.recv_buf
             .extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
@@ -4181,6 +4364,7 @@ mod hpack_table_size_setting_tests {
 mod forwarded_client_ip_tests {
     use super::frame_validation_tests::{frame, open_stream_with_header};
     use super::*;
+    use m6_core::http::HeaderSource;
 
     /// Drive one request through a connection and report the address the
     /// request handler was given, plus whether the header survived into the
@@ -4201,11 +4385,11 @@ mod forwarded_client_ip_tests {
 
         let seen = std::cell::RefCell::new((String::new(), false));
         {
-            let mut on_request = |_: &mut (), req: &HttpRequest, ip: &str| -> RequestOutcome {
-                let survived = req
-                    .headers
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"));
+            let mut on_request = |_: &mut (), req: RequestRef<'_>, ip: &str| -> RequestOutcome {
+                let survived = match req {
+                    RequestRef::H2(req) => req.headers().find("x-forwarded-for").is_some(),
+                    RequestRef::Owned(_) => unreachable!("this connection decodes h2"),
+                };
                 *seen.borrow_mut() = (ip.to_string(), survived);
                 RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
             };
@@ -4403,7 +4587,7 @@ mod issue_7_intermittent_conformance {
             .extend_from_slice(&frame(TYPE_GOAWAY, 0, 0, &payload));
 
         let mut on_request =
-            |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
+            |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome { unreachable!() };
         assert!(matches!(
             c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
             Ok(true)
@@ -4448,7 +4632,7 @@ mod issue_7_intermittent_conformance {
             .extend_from_slice(&frame(TYPE_PING, 0, 0, b"h2spec  "));
 
         let mut on_request =
-            |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
+            |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome { unreachable!() };
         while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
 
         let acks: Vec<_> = sent_frames(&c.send_buf, TYPE_PING)
@@ -4598,7 +4782,7 @@ mod server_push_tests {
                 body: vec![b'x'; ASSET],
                 genid: None,
             },
-            "GET",
+            false,
         );
     }
 
@@ -4751,7 +4935,7 @@ mod header_list_size_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&wire);
         let mut reached = false;
-        let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             reached = true;
             RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
@@ -4997,7 +5181,7 @@ mod header_encoding_tests {
             std::time::Duration::from_secs(3),
             Some("sid=abc"),
             &hit,
-            "GET",
+            false,
         );
         let fields = headers_block(&c);
         assert!(
