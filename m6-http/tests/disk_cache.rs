@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse};
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, HeaderBlock};
 use m6_http_lib::disk_cache;
 
 /// The body of the load test's page, in bytes. At about 400 us per file in this
@@ -796,7 +796,7 @@ fn a_full_tick_under_load_stops_at_the_time_budget() {
             CacheKey::new(&format!("/load/{i}"), None, ""),
             CachedResponse {
                 status: 200,
-                headers: Arc::new(Vec::new()),
+                headers: HeaderBlock::empty(),
                 body: bytes::Bytes::from(vec![b'x'; LOAD_BODY_LEN]),
                 genid: 0,
             },

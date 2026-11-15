@@ -356,6 +356,12 @@ impl m6_core::http::HeaderSource for H2Headers<'_> {
             .map(|(_, v)| v)
             .chain(authority)
     }
+
+    fn is_empty(&self) -> bool {
+        // The fields this source presents: the forwarded ones plus `:authority`
+        // when it stands in for Host.
+        self.forwarded().next().is_none() && self.authority.is_none()
+    }
 }
 
 impl<'a> H2Request<'a> {
@@ -2601,12 +2607,12 @@ impl Http2Conn {
         set_cookie: Option<&str>,
         hit: &HitHeaders,
     ) {
-        let is_html = crate::analytics::is_html_response(&entry.headers[..]);
+        let is_html = crate::analytics::is_html_response(&entry.headers);
         let write_describedby = hit.describedby.is_some() && is_html;
 
         // Vary is merged (or left alone on `Vary: *`) exactly as
         // `set_vary_accept_encoding(.., true)` does, so the paths agree.
-        let vary = crate::http11::VaryMerge::new(&entry.headers[..]);
+        let vary = crate::http11::VaryMerge::new(&entry.headers);
         let vary_star = vary.is_star();
 
         let mut scratch = std::mem::take(&mut self.hdr_scratch);
@@ -2707,7 +2713,7 @@ impl Http2Conn {
         );
         let security = crate::security::read();
         if let Some(ref guard) = security {
-            for (k, v) in guard.absent_from(&entry.headers[..]) {
+            for (k, v) in guard.absent_from(&entry.headers) {
                 let name = lower_part(&mut scratch, k.as_bytes());
                 push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
             }
@@ -5304,7 +5310,7 @@ mod header_encoding_tests {
     fn borrowed_cache_hit_writes_lowercase_fields_and_replaces_age_vary_and_alt_svc() {
         let entry = CachedResponse {
             status: 200,
-            headers: std::sync::Arc::new(vec![
+            headers: crate::cache::HeaderBlock::from_pairs(vec![
                 ("Content-Type".to_string(), "text/plain".to_string()),
                 (
                     "Cache-Control".to_string(),

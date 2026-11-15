@@ -266,7 +266,10 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
+            headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
+                "cache-control".to_string(),
+                "public".to_string(),
+            )]),
             body: bytes::Bytes::from_static(b"ATTACKER CONTROLLED"),
         },
     );

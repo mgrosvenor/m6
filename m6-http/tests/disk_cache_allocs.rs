@@ -14,11 +14,9 @@
 //! is one thousand. Store the key's bytes a second time in a queue, and it is
 //! one thousand again.
 
-use std::sync::Arc;
-
 use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::testkit::alloc_count;
-use m6_http_lib::cache::{Cache, CacheKey, CachedResponse};
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, HeaderBlock};
 
 #[global_allocator]
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
@@ -57,7 +55,7 @@ fn response() -> CachedResponse {
     CachedResponse {
         genid: 7,
         status: 200,
-        headers: Arc::new(Vec::new()),
+        headers: HeaderBlock::empty(),
         body: bytes::Bytes::from_static(b"cached body"),
     }
 }

@@ -3,15 +3,483 @@ use ahash::AHashMap;
 use m6_core::http::HeaderSource;
 use std::borrow::Borrow;
 
+/// A response's header names and values in one byte arena, with each field a
+/// pair of `u32` ranges into it.
+///
+/// This is the cache entry's stored shape. Storing a backend reply used to
+/// allocate a `String` for every name and every value — twelve calls per
+/// inserted response on the miss row — because the entry outlives the reply
+/// and the reply's slices cannot be borrowed from it. The bytes still have to
+/// be copied once, because the entry owns them, but they are copied into one
+/// arena: the entry then holds ranges, and every reader borrows `&str` from
+/// the arena rather than cloning.
+///
+/// The tape is `bytes::Bytes`, so a clone is a refcount bump and a cache hit
+/// still shares the entry's header bytes. The layout is
+///
+/// ```text
+/// [u32 count][u32 slot_capacity][(noff, nlen, voff, vlen) * capacity][bytes...]
+/// ```
+///
+/// with absolute `u32` offsets. The slot area is fixed at construction (with
+/// spare slots for the headers a response gains on its way out), so appending
+/// a field only extends the text and bumps the count. A field whose name is
+/// `Set-Cookie` or `M6-Genid` is marked not-storable and is dropped when the
+/// block is stored; that is the only per-field metadata, packed into the top
+/// bit of the name length.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeaderBlock {
+    tape: bytes::Bytes,
+}
+
+/// Bit 31 of a field's name length: the field must not be stored.
+const NOT_STORED: u32 = 1 << 31;
+
+/// Text capacity reserved beyond the fields present when the block is built,
+/// for the `Date` and session cookie a response gains before it is written.
+const SPARE_TEXT: usize = 128;
+/// Field slots reserved for the same reason.
+const SPARE_SLOTS: usize = 4;
+
+impl HeaderBlock {
+    /// Build from owned pairs. One allocation for the whole block.
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        HeaderBuilder::from_pairs(&pairs).freeze()
+    }
+
+    /// Build from borrowed pairs. One allocation for the whole block.
+    pub fn from_strs(pairs: &[(&str, &str)]) -> Self {
+        HeaderBuilder::from_strs(pairs).freeze()
+    }
+
+    /// An empty block, for a response with no headers.
+    pub fn empty() -> Self {
+        HeaderBuilder::with_capacity(0, 0).freeze()
+    }
+
+    fn view(&self) -> TapeView<'_> {
+        TapeView { buf: &self.tape }
+    }
+
+    pub fn len(&self) -> usize {
+        self.view().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate `(name, value)` in stored order, every field included.
+    pub fn iter(&self) -> TapeIter<'_> {
+        self.view().iter(false)
+    }
+
+    /// Iterate only the fields a shared cache may store.
+    pub fn iter_storable(&self) -> TapeIter<'_> {
+        self.view().iter(true)
+    }
+
+    pub fn find(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    pub fn find_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
+    /// Copy every field with a given name into `out`, as owned pairs.
+    pub fn copy_named_to(&self, name: &str, out: &mut Vec<(String, String)>) {
+        for (k, v) in self.iter() {
+            if k.eq_ignore_ascii_case(name) {
+                out.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+
+    /// The number of bytes this block holds, for the cache's capacity bound.
+    ///
+    /// Counts the reserved spare text, so the bound stays conservative: the
+    /// allocation is the tape's capacity, and the tape's length understates it
+    /// by exactly the slack a response writes into on its way out.
+    pub fn footprint(&self) -> usize {
+        self.tape.len() + SPARE_TEXT
+    }
+
+    /// The storable subset, as a block.
+    ///
+    /// A backend reply may carry `Set-Cookie` (one visitor's session) or a
+    /// stale `M6-Genid`; neither may be stored. When nothing is marked, this
+    /// is a refcount bump and allocates nothing, which is the ordinary case.
+    pub fn storable(&self) -> HeaderBlock {
+        let view = self.view();
+        if view.iter(true).count() == view.count() {
+            return self.clone();
+        }
+        let mut b = HeaderBuilder::with_capacity(view.count(), view.text_len());
+        for (k, v, stored) in view.marked() {
+            if stored {
+                b.push(k, v);
+            }
+        }
+        b.freeze()
+    }
+
+    /// Owned pairs, for a protocol whose encoder takes them. Allocates.
+    pub fn to_pairs(&self) -> Vec<(String, String)> {
+        self.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+}
+
+impl Default for HeaderBlock {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::fmt::Debug for HeaderBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl m6_core::http::HeaderSource for HeaderBlock {
+    fn find(&self, name: &str) -> Option<&str> {
+        HeaderBlock::find(self, name)
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+    fn is_empty(&self) -> bool {
+        HeaderBlock::is_empty(self)
+    }
+}
+
+impl From<Vec<(String, String)>> for HeaderBlock {
+    fn from(v: Vec<(String, String)>) -> Self {
+        Self::from_pairs(v)
+    }
+}
+
+impl From<&[(String, String)]> for HeaderBlock {
+    fn from(v: &[(String, String)]) -> Self {
+        Self::from_pairs(v.to_vec())
+    }
+}
+
+/// Serialise as the sequence of `[name, value]` pairs the disk format stores.
+///
+/// The disk writer encodes straight into its file buffer, so this borrows the
+/// tape rather than building an owned pair list for every entry it writes.
+impl serde::Serialize for HeaderBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
+        for (name, value) in self.iter() {
+            seq.serialize_element(&(name, value))?;
+        }
+        seq.end()
+    }
+}
+
+impl From<Vec<(&str, &str)>> for HeaderBlock {
+    fn from(v: Vec<(&str, &str)>) -> Self {
+        Self::from_strs(&v)
+    }
+}
+
+/// Build a [`HeaderBlock`] in place, reserving the slots and the text it will
+/// need up front so the ordinary case is exactly one allocation.
+pub struct HeaderBuilder {
+    buf: Vec<u8>,
+    cap: u32,
+    count: u32,
+}
+
+impl HeaderBuilder {
+    /// `slots` fields are expected; `text_bytes` is their names and values.
+    pub fn with_capacity(slots: usize, text_bytes: usize) -> Self {
+        let cap = (slots + SPARE_SLOTS) as u32;
+        let mut buf = Vec::with_capacity(8 + 16 * cap as usize + text_bytes + SPARE_TEXT);
+        buf.resize(8 + 16 * cap as usize, 0);
+        buf[4..8].copy_from_slice(&cap.to_le_bytes());
+        HeaderBuilder { buf, cap, count: 0 }
+    }
+
+    pub fn from_pairs(pairs: &[(String, String)]) -> Self {
+        let text: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let mut b = Self::with_capacity(pairs.len(), text);
+        for (k, v) in pairs {
+            b.push(k, v);
+        }
+        b
+    }
+
+    pub fn from_strs(pairs: &[(&str, &str)]) -> Self {
+        let text: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let mut b = Self::with_capacity(pairs.len(), text);
+        for (k, v) in pairs {
+            b.push(k, v);
+        }
+        b
+    }
+
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn view(&self) -> TapeView<'_> {
+        TapeView { buf: &self.buf }
+    }
+
+    pub fn find(&self, name: &str) -> Option<&str> {
+        self.view()
+            .iter(false)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    pub fn find_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.view()
+            .iter(false)
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
+    pub fn iter(&self) -> TapeIter<'_> {
+        self.view().iter(false)
+    }
+
+    pub fn iter_storable(&self) -> TapeIter<'_> {
+        self.view().iter(true)
+    }
+
+    /// Append a field. The name is as sent; readers compare case-insensitively.
+    ///
+    /// `Set-Cookie` and `M6-Genid` are marked not-storable here, once, so the
+    /// cache's strip step is a filter rather than a scan for magic names.
+    pub fn push(&mut self, name: &str, value: &str) {
+        self.push_marked(
+            name,
+            value,
+            !(name.eq_ignore_ascii_case("set-cookie")
+                || name.eq_ignore_ascii_case(crate::genid::GENID_HEADER)),
+        );
+    }
+
+    fn push_marked(&mut self, name: &str, value: &str, stored: bool) {
+        self.reserve(1, name.len() + value.len());
+        let noff = self.buf.len() as u32;
+        self.buf.extend_from_slice(name.as_bytes());
+        let voff = self.buf.len() as u32;
+        self.buf.extend_from_slice(value.as_bytes());
+        let nlen = name.len() as u32 | if stored { 0 } else { NOT_STORED };
+        self.set_span(self.count as usize, noff, nlen, voff, value.len() as u32);
+        self.count += 1;
+        self.buf[0..4].copy_from_slice(&self.count.to_le_bytes());
+    }
+
+    /// Append a field whose value is written by `f` straight into the arena.
+    /// No intermediate `String`: `Date` is formatted here rather than into an
+    /// allocation that is then copied.
+    pub fn push_with(&mut self, name: &str, f: impl FnOnce(&mut Vec<u8>)) {
+        self.reserve(1, name.len() + SPARE_TEXT);
+        let start = self.buf.len();
+        f(&mut self.buf);
+        let vlen = (self.buf.len() - start) as u32;
+        let noff = self.buf.len() as u32;
+        self.buf.extend_from_slice(name.as_bytes());
+        self.set_span(
+            self.count as usize,
+            noff,
+            name.len() as u32,
+            start as u32,
+            vlen,
+        );
+        self.count += 1;
+        self.buf[0..4].copy_from_slice(&self.count.to_le_bytes());
+    }
+
+    fn set_span(&mut self, i: usize, noff: u32, nlen: u32, voff: u32, vlen: u32) {
+        let o = 8 + 16 * i;
+        self.buf[o..o + 4].copy_from_slice(&noff.to_le_bytes());
+        self.buf[o + 4..o + 8].copy_from_slice(&nlen.to_le_bytes());
+        self.buf[o + 8..o + 12].copy_from_slice(&voff.to_le_bytes());
+        self.buf[o + 12..o + 16].copy_from_slice(&vlen.to_le_bytes());
+    }
+
+    fn reserve(&mut self, slots: usize, text: usize) {
+        let have_slots = self.cap.saturating_sub(self.count) as usize;
+        if have_slots >= slots && self.buf.capacity() - self.buf.len() >= text {
+            return;
+        }
+        let new_cap = (self.cap as usize + slots + SPARE_SLOTS).max(16);
+        let mut buf = Vec::with_capacity(8 + 16 * new_cap + self.buf.len() + text);
+        buf.resize(8 + 16 * new_cap, 0);
+        buf[4..8].copy_from_slice(&(new_cap as u32).to_le_bytes());
+        let old_text_start = 8 + 16 * self.cap as usize;
+        let used_spans = 8 + 16 * self.count as usize;
+        buf[8..used_spans].copy_from_slice(&self.buf[8..used_spans]);
+        let text = &self.buf[old_text_start..];
+        let at = 8 + 16 * new_cap;
+        // `at` is already `buf.len()` (the slot area was resized to it), so the
+        // text is appended rather than written through an index past the end.
+        buf.extend_from_slice(text);
+        // Spans are absolute offsets, so moving the text area shifts every one
+        // of them. Forgetting this read the wrong bytes: a header value that
+        // landed past the old end panicked on a range past the tape.
+        let delta = at as i64 - old_text_start as i64;
+        if delta != 0 {
+            for i in 0..self.count as usize {
+                let o = 8 + 16 * i;
+                for (a, b) in [(o, o + 4), (o + 8, o + 12)] {
+                    let off = u32::from_le_bytes(buf[a..b].try_into().unwrap());
+                    let shifted = (off as i64 + delta) as u32;
+                    buf[a..b].copy_from_slice(&shifted.to_le_bytes());
+                }
+            }
+        }
+        self.buf = buf;
+        self.cap = new_cap as u32;
+    }
+
+    /// Freeze into the shared immutable form. `Bytes::from(Vec)` takes the
+    /// buffer's allocation, so this adds no allocation.
+    pub fn freeze(mut self) -> HeaderBlock {
+        self.buf[0..4].copy_from_slice(&self.count.to_le_bytes());
+        self.buf[4..8].copy_from_slice(&self.cap.to_le_bytes());
+        HeaderBlock {
+            tape: bytes::Bytes::from(self.buf),
+        }
+    }
+}
+
+impl std::fmt::Debug for HeaderBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl m6_core::http::HeaderSource for HeaderBuilder {
+    fn find(&self, name: &str) -> Option<&str> {
+        HeaderBuilder::find(self, name)
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.view()
+            .iter(false)
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+    fn is_empty(&self) -> bool {
+        HeaderBuilder::is_empty(self)
+    }
+}
+
+/// A borrowed view of a header tape.
+struct TapeView<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> TapeView<'a> {
+    fn count(&self) -> usize {
+        u32::from_le_bytes(self.buf[0..4].try_into().unwrap()) as usize
+    }
+
+    fn cap(&self) -> usize {
+        u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize
+    }
+
+    fn text_len(&self) -> usize {
+        self.buf.len().saturating_sub(8 + 16 * self.cap())
+    }
+
+    fn span(&self, i: usize) -> (u32, u32, u32, u32) {
+        let o = 8 + 16 * i;
+        (
+            u32::from_le_bytes(self.buf[o..o + 4].try_into().unwrap()),
+            u32::from_le_bytes(self.buf[o + 4..o + 8].try_into().unwrap()),
+            u32::from_le_bytes(self.buf[o + 8..o + 12].try_into().unwrap()),
+            u32::from_le_bytes(self.buf[o + 12..o + 16].try_into().unwrap()),
+        )
+    }
+
+    fn field(&self, i: usize) -> (&'a str, &'a str, bool) {
+        let (noff, nlen, voff, vlen) = self.span(i);
+        let stored = nlen & NOT_STORED == 0;
+        let nlen = (nlen & !NOT_STORED) as usize;
+        let name =
+            std::str::from_utf8(&self.buf[noff as usize..noff as usize + nlen]).unwrap_or_default();
+        let value = std::str::from_utf8(&self.buf[voff as usize..voff as usize + vlen as usize])
+            .unwrap_or_default();
+        (name, value, stored)
+    }
+
+    fn iter(&self, storable_only: bool) -> TapeIter<'a> {
+        TapeIter {
+            view: TapeView { buf: self.buf },
+            i: 0,
+            storable_only,
+        }
+    }
+
+    fn marked(&self) -> impl Iterator<Item = (&'a str, &'a str, bool)> + '_ {
+        (0..self.count()).map(move |i| self.field(i))
+    }
+}
+
+pub struct TapeIter<'a> {
+    view: TapeView<'a>,
+    i: usize,
+    storable_only: bool,
+}
+
+impl<'a> Iterator for TapeIter<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.i >= self.view.count() {
+                return None;
+            }
+            let (k, v, stored) = self.view.field(self.i);
+            self.i += 1;
+            if self.storable_only && !stored {
+                continue;
+            }
+            return Some((k, v));
+        }
+    }
+}
+
 /// A cached HTTP response.
 ///
-/// `headers` and `hints` are `Arc<Vec<...>>` so clone is a single atomic
-/// refcount bump — no string copies on the cache-hit hot path.
-///
+/// `headers` is one byte arena behind a refcount (`bytes::Bytes`) and `body` is
+/// a `bytes::Bytes`, so a clone is two refcount bumps — no string copies on the
+/// cache-hit hot path. The arena is the stored shape, not a per-request copy:
+/// see [`HeaderBlock`].
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     pub status: u16,
-    pub headers: std::sync::Arc<Vec<(String, String)>>,
+    pub headers: HeaderBlock,
     pub body: bytes::Bytes,
     /// The source's site generation when the response was dispatched. Written
     /// as `M6-Genid` on a hit, so a client can tell which generation it saw.
@@ -170,9 +638,11 @@ const REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// and matches what a recipient is expected to do when one is absent. An
 /// `Expires` at or before `Date` means already stale, hence zero rather than
 /// a negative that would wrap.
-fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration> {
+fn expires_lifetime(headers: &(impl HeaderSource + ?Sized)) -> Option<std::time::Duration> {
     let get = |name: &str| {
-        m6_core::headers::get(headers, name).and_then(|v| httpdate::parse_http_date(v.trim()).ok())
+        headers
+            .find(name)
+            .and_then(|v| httpdate::parse_http_date(v.trim()).ok())
     };
     let expires = get("expires")?;
     let date = get("date").unwrap_or_else(m6_core::platform::wall);
@@ -251,12 +721,9 @@ pub struct CacheControl {
 
 impl CacheControl {
     /// Parse every `Cache-Control` field line in `headers` as one directive list.
-    pub fn parse(headers: &[(String, String)]) -> Self {
+    pub fn parse(headers: &(impl HeaderSource + ?Sized)) -> Self {
         let mut cc = CacheControl::default();
-        for (name, value) in headers {
-            if !name.eq_ignore_ascii_case("cache-control") {
-                continue;
-            }
+        for value in headers.find_all("cache-control") {
             for d in DirectiveList::new(value) {
                 let secs = || d.value.and_then(|v| v.trim().parse::<u64>().ok());
                 let name = d.name;
@@ -393,7 +860,7 @@ fn directive(raw: &str) -> Option<Directive<'_>> {
 ///
 /// `s-maxage` wins over `max-age` when both are present: this is a shared
 /// cache, and that is exactly what `s-maxage` is for.
-fn directives(headers: &[(String, String)]) -> Directives {
+fn directives(headers: &(impl HeaderSource + ?Sized)) -> Directives {
     let cc = CacheControl::parse(headers);
     Directives {
         lifetime: cc.shared_lifetime(),
@@ -895,11 +1362,15 @@ impl Cache {
         // directions. A missing or under-reported Age is corrected by Date, and
         // a clock skewed such that Date is in the future yields a zero apparent
         // age rather than a negative one, leaving Age to stand.
-        let age_value = m6_core::headers::get(&response.headers[..], "age")
+        let age_value = response
+            .headers
+            .find("age")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(std::time::Duration::from_secs)
             .unwrap_or_default();
-        let apparent_age = m6_core::headers::get(&response.headers[..], "date")
+        let apparent_age = response
+            .headers
+            .find("date")
             .and_then(|v| httpdate::parse_http_date(v).ok())
             .and_then(|d| m6_core::platform::wall().duration_since(d).ok())
             .unwrap_or_default();
@@ -1219,17 +1690,15 @@ impl Cache {
 /// though it is a `Bytes` that may share an allocation, because the
 /// conservative direction here is to over-count.
 fn entry_footprint(key: &CacheKey, response: &CachedResponse) -> usize {
-    let headers: usize = response
-        .headers
-        .iter()
-        .map(|(k, v)| k.len() + v.len() + 2)
-        .sum();
-    key.0.len() + response.body.len() + headers + std::mem::size_of::<CacheEntry>()
+    key.0.len()
+        + response.body.len()
+        + response.headers.footprint()
+        + std::mem::size_of::<CacheEntry>()
 }
 
 /// Determine whether a response should be cached.
 /// Returns true if Cache-Control: public and status is 2xx.
-pub fn should_cache(status: u16, headers: &[(String, String)]) -> bool {
+pub fn should_cache(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool {
     if !status_is_storable(status) {
         return false;
     }
@@ -1239,8 +1708,8 @@ pub fn should_cache(status: u16, headers: &[(String, String)]) -> bool {
     // storing such a response would replay one client's variant to everyone.
     // `Vary: Accept-Encoding` is the exception — encoding is already part of
     // the key.
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("vary") {
+    for value in headers.find_all("vary") {
+        {
             let varies_only_on_encoding = value
                 .split(',')
                 .map(|f| f.trim())
@@ -1413,15 +1882,17 @@ pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
 /// writes it once. Keeping the upstream's copy as well would send the header
 /// twice on a cache node, where the upstream is another m6-http and stamps
 /// every reply.
-pub fn strip_uncacheable(headers: &[(String, String)]) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(k, _)| {
-            !k.eq_ignore_ascii_case("set-cookie")
-                && !k.eq_ignore_ascii_case(crate::genid::GENID_HEADER)
-        })
-        .cloned()
-        .collect()
+pub fn strip_uncacheable(headers: &[(String, String)]) -> HeaderBlock {
+    let mut b = HeaderBuilder::with_capacity(headers.len(), 0);
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("set-cookie")
+            || k.eq_ignore_ascii_case(crate::genid::GENID_HEADER)
+        {
+            continue;
+        }
+        b.push(k, v);
+    }
+    b.freeze()
 }
 
 #[cfg(test)]
@@ -1541,13 +2012,36 @@ mod tests {
     }
 
     #[test]
+    fn a_tape_survives_growing_past_its_reservation() {
+        let pairs: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("header-{i}"), format!("value-{i}-padding-padding")))
+            .collect();
+        let mut b = HeaderBuilder::with_capacity(pairs.len(), 0);
+        for (k, v) in &pairs {
+            b.push(k, v);
+        }
+        let block = b.freeze();
+        assert_eq!(block.to_pairs(), pairs);
+    }
+
+    #[test]
+    fn a_block_finds_fields_case_insensitively() {
+        let block = HeaderBlock::from_pairs(vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("set-cookie".to_string(), "a=b".to_string()),
+        ]);
+        assert_eq!(block.find("content-TYPE"), Some("text/html"));
+        assert_eq!(block.storable().len(), 1);
+    }
+
+    #[test]
     fn test_cache_insert_and_get() {
         let cache = Cache::new();
         let key = CacheKey::new("/hello", None, "");
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![]),
+            headers: HeaderBlock::empty(),
             body: bytes::Bytes::from_static(b"world"),
         };
         cache.insert(key.clone(), resp);
@@ -1574,7 +2068,7 @@ mod tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(headers),
+            headers: HeaderBlock::from_pairs(headers),
             body: bytes::Bytes::from_static(b"world"),
         }
     }
@@ -1722,7 +2216,7 @@ mod tests {
         ];
         let stripped = strip_uncacheable(&headers);
         assert_eq!(
-            stripped,
+            stripped.to_pairs(),
             vec![("Content-Type".to_string(), "text/html".to_string())]
         );
     }
@@ -1801,7 +2295,7 @@ mod tests {
 
     #[test]
     fn test_freshness_absent_and_unparseable() {
-        assert_eq!(directives(&[]).lifetime, None);
+        assert_eq!(directives(&HeaderBlock::empty()).lifetime, None);
         assert_eq!(directives(&cc("public")).lifetime, None);
         assert_eq!(directives(&cc("max-age=abc")).lifetime, None);
         assert_eq!(
@@ -1819,7 +2313,7 @@ mod tests {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![]),
+            headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
         };
         cache.insert(k1.clone(), resp.clone());
@@ -1850,7 +2344,7 @@ mod tests {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![]),
+            headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
         };
         cache.insert(k.clone(), resp);
@@ -1870,7 +2364,10 @@ mod tests {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
+            headers: HeaderBlock::from_pairs(vec![(
+                "cache-control".to_string(),
+                "public".to_string(),
+            )]),
             body: bytes::Bytes::from_static(b"cached body"),
         };
 
@@ -1909,7 +2406,7 @@ mod tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(headers),
+            headers: HeaderBlock::from_pairs(headers),
             body: bytes::Bytes::from_static(body),
         }
     }
@@ -1918,7 +2415,7 @@ mod tests {
         r.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v)
     }
 
     /// Round-trip: whatever encoding went in comes back out. A cache that
@@ -2047,7 +2544,7 @@ mod tests {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![]),
+            headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
         };
         cache.insert(CacheKey::new("/page", Some("a=1"), ""), resp.clone());
@@ -2173,7 +2670,7 @@ mod method_gate_tests {
             CachedResponse {
                 genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![]),
+                headers: HeaderBlock::empty(),
                 body: bytes::Bytes::from_static(b"full GET body"),
             },
         );
@@ -2360,7 +2857,7 @@ mod age_tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(
+            headers: HeaderBlock::from_pairs(
                 headers
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2456,7 +2953,7 @@ mod heuristic_freshness_tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
+            headers: HeaderBlock::from_pairs(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"x"),
         }
     }
@@ -2524,7 +3021,7 @@ mod expires_tests {
             CachedResponse {
                 genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(headers),
+                headers: HeaderBlock::from_pairs(headers),
                 body: bytes::Bytes::from_static(b"x"),
             },
         );
@@ -2779,7 +3276,7 @@ mod request_directive_tests {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
+            headers: HeaderBlock::from_pairs(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"body"),
         };
         cache.insert(key.clone(), resp);
@@ -2839,7 +3336,7 @@ mod corrected_age_tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(
+            headers: HeaderBlock::from_pairs(
                 headers
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3001,7 +3498,7 @@ mod capacity_tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![(
+            headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
                 "public, max-age=86400".to_string(),
             )]),
@@ -3097,7 +3594,7 @@ mod capacity_accounting_tests {
         CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![(
+            headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
                 "public, max-age=86400".to_string(),
             )]),
@@ -3196,7 +3693,7 @@ mod generation_swap_tests {
         CachedResponse {
             genid,
             status: 200,
-            headers: std::sync::Arc::new(vec![(
+            headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
                 "public, max-age=86400".to_string(),
             )]),

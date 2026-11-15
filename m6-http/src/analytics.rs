@@ -84,6 +84,9 @@ impl HeaderSource for H3Headers<'_> {
             std::str::from_utf8(h.value()).ok()
         })
     }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Extract `_m6sid` from a raw `Cookie` header value (e.g. `"a=1; _m6sid=xyz; b=2"`).
@@ -266,10 +269,10 @@ pub fn record(
 /// gating on this keeps `_m6sid` off the vast majority of responses a page
 /// load generates (every static asset it references) instead of writing a
 /// fresh `Set-Cookie` on each one.
-pub fn is_html_response(resp_headers: &[(String, String)]) -> bool {
+pub fn is_html_response(resp_headers: &(impl m6_core::http::HeaderSource + ?Sized)) -> bool {
     // Case-insensitive prefix check with no allocation: `to_ascii_lowercase`
     // built a `String` on the cached-hit hot path.
-    m6_core::headers::get(resp_headers, "content-type").is_some_and(|v| {
+    resp_headers.find("content-type").is_some_and(|v| {
         v.as_bytes()
             .get(..9)
             .is_some_and(|p| p.eq_ignore_ascii_case(b"text/html"))
