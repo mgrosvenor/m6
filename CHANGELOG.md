@@ -399,6 +399,10 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 ### Removed
 
+**`ureq`, `native-tls`, `openssl` and their dependents left m6-core, and email is a client the service's own loop drives.** A form POST is `client::Endpoint` over the loop's `Upstream`, and an SMTP send is `email::Smtp` driven by the loop's step, with lettre supplying the message bytes, the envelope, the command sequence and the reply parse. The socket, the descriptor and the deadline are ours, as they are for every other client. A send that a backend refuses answers 500 naming the reply code, and one that never answers answers 504 on the loop's deadline rather than blocking it.
+
+Nine crates left the lockfile: ureq, webpki-roots, native-tls, openssl, openssl-sys, foreign-types 0.3.2, foreign-types-shared 0.1.1 and futures-io. Verified: `cargo tree -i` reports no match for ureq, native-tls or webpki-roots, no source names the removed transports, the allocation test measures 0 in our code around the send with lettre's own allocations recorded as the accepted exception, and the three loop tests fail when the loop is replaced by a blocking call.
+
 m6-http's bundled webpki-roots store, a second store beside the host's.
 
 **App, its builders, AppContext, with_thread_state and `[thread_pool]` are gone: m6-core is not a framework.** Every service writes its own main with its own event loop, and m6-core supplies the parts: h1::ServerConn, site::Site, net::listen_unix, and the event module's Signals, Timeouts, Slots and LoopTrace (see docs/m6-app-anatomy.md). The params cache takes no lock.
