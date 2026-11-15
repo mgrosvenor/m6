@@ -376,6 +376,12 @@ struct CacheEntry {
     /// Instant past which even a stale serve is refused. Equal to
     /// `expires_at` when the response did not permit stale serving at all.
     serve_stale_until: Option<std::time::Instant>,
+    /// Whether this entry's key is on the disk writer's ring.
+    ///
+    /// The writer's dedup is this flag rather than a second set: set when the
+    /// key is pushed, cleared when a tick takes it. A re-store before the tick
+    /// preserves the flag, so the tick writes the current entry once.
+    queued: bool,
     /// Roughly how many bytes this entry holds, for the capacity bound.
     ///
     /// Body plus header strings plus the key. Approximate on purpose: the
@@ -720,6 +726,40 @@ impl Cache {
         Some((entry.response.clone(), age))
     }
 
+    /// Any entry for `key`, at any age, without touching its read order.
+    ///
+    /// The disk writer's read: a write is not a visit by a client, and making
+    /// it one would keep junk alive in the eviction order. The clone is an
+    /// `Arc` and a `Bytes`, the same refcount bumps a hit makes.
+    pub fn get_any<Q>(&self, key: &Q) -> Option<CachedResponse>
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let map = self.map.read().ok()?;
+        map.get(key).map(|e| e.response.clone())
+    }
+
+    /// Set whether this entry's key is queued for the disk writer, returning
+    /// the previous value.
+    ///
+    /// A missing entry returns `false`: there is nothing to mark.
+    pub fn set_queued(&mut self, key: &CacheKey, queued: bool) -> bool {
+        let Ok(mut map) = self.map.write() else {
+            return false;
+        };
+        match map.get_mut(key) {
+            Some(entry) => std::mem::replace(&mut entry.queued, queued),
+            None => false,
+        }
+    }
+
+    /// The bound this cache was built with, which the disk writer shares so a
+    /// disk copy cannot outgrow its memory original.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// Store a response. Only call if the response should be cached.
     ///
     /// Deadlines are derived from the response's own `Cache-Control` here
@@ -805,6 +845,12 @@ impl Cache {
         let serve_stale_until = expires_at.map(|e| e + stale_window);
         let footprint = entry_footprint(&key, &response);
         if let Ok(mut map) = self.map.write() {
+            // A re-store before the disk writer's tick must keep the entry's
+            // queued flag: the writer writes the current entry once, so the
+            // replacement is the one that gets written and the ring does not
+            // grow a duplicate. This one extra probe is on the store path,
+            // never on a hit.
+            let was_queued = map.get(&key).is_some_and(|e| e.queued);
             let replaced = map.insert(
                 key,
                 CacheEntry {
@@ -813,6 +859,7 @@ impl Cache {
                     upstream_age,
                     expires_at,
                     serve_stale_until,
+                    queued: was_queued,
                     footprint,
                     last_read: std::sync::atomic::AtomicU64::new(
                         READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

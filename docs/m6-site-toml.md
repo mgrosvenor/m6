@@ -637,8 +637,39 @@ token_file     = "/run/credentials/m6-http.service/genid-read"
 heartbeat_secs = 10
 ```
 
-The key reference ends with the generation endpoint, one node's own authority.
+The generation endpoint is one node's own authority.
+Section 4.12 adds the cache node's disk directory.
 Section 5 states which route answers a request.
+
+### 4.12. `[cache] dir`
+
+A cache node may write the responses it caches to a directory it owns.
+The table is system config only, because the directory is one node's state.
+Table 14 gives its key.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `dir` | string | none | Absolute path to a directory the process can write. Cache node only |
+
+**Table 14: the `[cache] dir` key.**
+
+The directory must exist and be writable by the process.
+The start creates and removes a probe file, `.m6-probe`, to prove both, and refuses the start with the io error and the path when it cannot.
+A relative path is refused.
+A source node is refused, because its cache sits beside its backends and a cold cache costs one local render per page.
+A node without the table keeps its cache in memory only.
+
+A cache node's layout is `<dir>/<genid decimal>/<64 hex characters>`, the file name being the SHA-256 of the cache key's bytes.
+The writer removes the other generation directories under `dir` over its ticks, so the directory holds files for the generation the node follows.
+The files are a cache: deleting the whole directory is safe, and costs a refill.
+
+```toml
+[cache]
+dir = "/var/cache/m6-http"
+```
+
+The unit's `CacheDirectory=m6-http` creates `/var/cache/m6-http` and owns it.
+Section 4.11 states how the generation directory is chosen.
 
 ## 5. Route matching
 

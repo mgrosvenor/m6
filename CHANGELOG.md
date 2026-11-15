@@ -78,6 +78,10 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**A cache node with `[cache] dir` writes the responses it caches to disk, a bounded amount on each accounting tick, never on the request path.** Each file carries the site generation ID and a SHA-256 check value. The disk copy is bounded by the memory cache's size and moves to a new directory when the ID changes. A write failure is logged once with the path and the error, and the entry is dropped without failing a request. `/perf` reports the directory's bytes, the queued keys and the write counters.
+
+Migration: none for a node without `[cache] dir`. The key is refused on a source node.
+
 **The source node holds the site's generation ID, and `/genid` there reloads every backend.** m6-http on the source node owns the ID; a `POST /genid` to it drives the reload of every member of every pool, and a member that fails is named in the log with its socket and the status it answered. Only a response carrying the current ID is stored in the cache, so a response rendered before a reload cannot be cached after it. A reload on a backend now writes an access line like any other request.
 
 **`POST /genid` on a backend reloads its site from disk, the same way it starts.** Config, `site.toml`, templates and params are read again through the start path, and the new site replaces the old one only when the whole load succeeds: the answer is 204, or 500 with the cause while the old site keeps serving. A request already answered or parked when the reload lands finishes with the generation it started under. A service route on `/genid` is refused at start.

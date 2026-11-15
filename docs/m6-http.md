@@ -224,6 +224,45 @@ It asks that upstream for the ID and follows it.
 A cache node reports its own `genid` object from an authorised `/perf`: `role` is `cache`, `id` is the ID it holds or `null`, and `upstream`, `upstream_down`, `upstream_rtt_ms` and `last_ok_s` describe the node it follows.
 A source restart keeps its ID, so a cache node sees no change when it comes back.
 
+### Disk cache (cache nodes)
+
+A cache node with `[cache] dir` in its system config writes the responses it caches to disk, and the request path never touches a file.
+The key is for a cache node only.
+A source keeps its cache in memory, because it sits beside its backends and a cold cache costs one local render per page.
+A source that sets it is refused at start with `config error: [cache].dir is for a cache node ([genid] upstream)`.
+
+The layout is `<dir>/<genid decimal>/<64 hex characters>`, the file name being the SHA-256 of the cache key's bytes.
+One subdirectory per generation means a change needs no per-file rewrite, and every other subdirectory is removed over the ticks that follow.
+
+A stored entry pushes its key on the writer's ring once, and nothing is written there.
+The entry's `queued` flag is the dedup, so a second store before the tick adds nothing.
+The ring holds 4,096 keys and never grows.
+A push to a full ring is skipped and counted as `skipped_queue_full` in `/perf`, and a later store of the same key tries again.
+
+On each accounting tick the writer removes up to 512 files from an old generation's directory, then writes current entries until it has written 4 MiB or the queue is empty.
+Removals run first, so their bytes are available to the write bound.
+A tick that runs out of budget with more to write leaves the remaining keys on the ring, still queued, and the next tick continues with them.
+A single entry larger than 4 MiB is written on its own, because a file is never split.
+The writer reads each entry again at the tick, so an entry replaced since it was queued is written as it is now, and an entry evicted since is skipped.
+
+Only public cacheable responses enter the cache, so only public cacheable responses reach the disk.
+A file holds the generation ID, the key, the status and headers as JSON, the body, and a SHA-256 check value over every byte before it.
+The writer encodes into one buffer reserved at start, writes `<name>.tmp` with one write, and renames it into place.
+There is no `fsync`.
+A crash can leave a short or torn file, and the check value catches it.
+
+The disk copy is bounded by the memory cache's `max_bytes`, 128 MiB by default.
+A write that would pass the bound is skipped and logged once per generation at info.
+A write failure is logged once with the path and the error, and the entry is dropped without a retry.
+A failed write never fails a request, because no request waits for one.
+
+On a generation change the queue and the size map are cleared, the new subdirectory is used from the next write, and every other subdirectory is queued for removal.
+Removal takes up to 512 files per tick, then the empty directory.
+While the node has no current ID nothing is written, because nothing is stored in memory then either.
+
+An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `skipped_full` and `skipped_queue_full`.
+`dir_bytes` counts the files in the current generation's directory.
+
 ---
 
 ## Error Handling

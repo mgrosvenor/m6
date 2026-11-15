@@ -26,6 +26,7 @@ use m6_http_lib::cache::{
     should_cache, strip_uncacheable, Cache, CacheKey, CachedResponse, Precondition,
 };
 use m6_http_lib::config::{self, Config};
+use m6_http_lib::disk_cache::DiskWriter;
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
 use m6_http_lib::forward::{self, UpstreamId, Waiter};
@@ -283,6 +284,9 @@ struct ServerState {
     route_table: RouteTable,
     pool_manager: PoolManager,
     cache: Cache,
+    /// The disk copy of the cache on a cache node with `[cache] dir`.
+    /// `None` everywhere else, so a hit and a store gain one `Option` test.
+    disk: Option<DiskWriter>,
     public_key: Option<PublicKey>,
     error_mode: ErrorMode,
     stats: Stats,
@@ -1864,6 +1868,11 @@ fn follower_answered(
         genid::Outcome::StillDown => {}
         genid::Outcome::First(id) => {
             state.cache.set_serve_held(false);
+            // The disk copy starts with the first ID. Nothing was stored
+            // before it, so this only creates the generation's directory.
+            if let Some(disk) = state.disk.as_mut() {
+                disk.use_id(id);
+            }
             info!(genid = id, "genid: upstream answered; following its ID");
         }
         genid::Outcome::Same => {
@@ -1911,6 +1920,13 @@ fn follower_change(state: &mut ServerState, from: u64, to: u64) {
     }
     drop(state.cache.swap_generation());
     state.error_pages = HashMap::new();
+    // The new generation gets its own directory. The queue and the size map
+    // are cleared and every other subdirectory is queued for removal over the
+    // ticks that follow. The swap above already emptied the memory cache, so
+    // no queued flag survives on a key this writer still holds.
+    if let Some(disk) = state.disk.as_mut() {
+        disk.use_id(to);
+    }
     info!(from, to, "genid changed");
 }
 
@@ -2541,6 +2557,12 @@ fn event_loop(
         if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
             m6_core::log::tick(m6_core::platform::wall());
             last_log_tick = now2;
+            // The disk cache's work rides the same tick: a bounded amount of
+            // writing and removing, never on the request path. The writer
+            // takes the cache by `&mut`, so this is the only place it runs.
+            if let Some(disk) = state.disk.as_mut() {
+                disk.tick(&mut state.cache);
+            }
         }
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
@@ -4131,9 +4153,12 @@ fn handle_request_inner(
                 );
                 match outcome {
                     health::PerfOutcome::Ok(report) => match state.config.genid.as_ref() {
-                        Some(genid_config) => {
-                            health::genid_perf_response(*report, &state.genid, genid_config)
-                        }
+                        Some(genid_config) => health::genid_perf_response(
+                            *report,
+                            &state.genid,
+                            genid_config,
+                            state.disk.as_ref(),
+                        ),
                         None => health::PerfOutcome::Ok(report).into_response(),
                     },
                     other => other.into_response(),
@@ -5342,8 +5367,11 @@ fn complete_socket_response(
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
+                    // The ring takes its own copy of the key: the one clone a
+                    // stored entry costs, the same kind the insert makes.
+                    // Nothing is written here, only queued.
                     state.cache.insert(
-                        key,
+                        key.clone(),
                         CachedResponse {
                             genid: stored,
                             status: http_resp.status,
@@ -5351,6 +5379,9 @@ fn complete_socket_response(
                             body: Bytes::from(http_resp.body.clone()),
                         },
                     );
+                    if let Some(disk) = state.disk.as_mut() {
+                        disk.queue(key, &mut state.cache);
+                    }
                 }
                 ReplyRule::Behind => {
                     if let Some(f) = state.genid.cache_mut() {
@@ -5545,8 +5576,10 @@ fn finalize_url_response_inner(
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+                    // The same one-clone queue as the synchronous path: the
+                    // disk write itself waits for the tick.
                     state.cache.insert(
-                        key,
+                        key.clone(),
                         CachedResponse {
                             genid: stored,
                             status: http_resp.status,
@@ -5554,6 +5587,9 @@ fn finalize_url_response_inner(
                             body: Bytes::from(http_resp.body.clone()),
                         },
                     );
+                    if let Some(disk) = state.disk.as_mut() {
+                        disk.queue(key, &mut state.cache);
+                    }
                 }
                 ReplyRule::Behind => {
                     if let Some(f) = state.genid.cache_mut() {
@@ -6220,11 +6256,26 @@ fn run(args: Vec<String>) -> i32 {
             format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
         ))
     };
+    let cache = Cache::new();
+    // The disk writer shares the memory cache's bound, so a disk copy cannot
+    // outgrow the memory it shadows. Built at start, where a missing or
+    // unwritable directory is already an error.
+    let disk = match config.cache_dir.as_ref() {
+        Some(dir) => match DiskWriter::new(dir.clone(), cache.max_bytes()) {
+            Ok(writer) => Some(writer),
+            Err(e) => {
+                eprintln!("config error: [cache].dir {}: {e}", dir.display());
+                return 2;
+            }
+        },
+        None => None,
+    };
     let mut state = ServerState {
         config,
         route_table,
         pool_manager,
-        cache: Cache::new(),
+        cache,
+        disk,
         public_key,
         error_mode,
         stats: initial_stats(),
@@ -6317,6 +6368,7 @@ mod www_redirect_tests {
     fn cfg(domain: &str, redirect_www: bool) -> Config {
         Config {
             genid: None,
+            cache_dir: None,
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: domain.to_string(),
