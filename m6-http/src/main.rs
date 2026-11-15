@@ -34,6 +34,7 @@ use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
 use m6_http_lib::http2::SEND_QUEUE_BYTES;
+use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
 
@@ -722,7 +723,6 @@ struct EventLoopIo {
 /// miss that must go to a backend.
 enum Routed {
     Cached {
-        status: u16,
         entry: CachedResponse,
         age: std::time::Duration,
         set_cookie: Option<String>,
@@ -891,7 +891,6 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
         .filter(|_| analytics::is_html_response(&cached.headers))
         .map(analytics::session_cookie_header_value);
         return Routed::Cached {
-            status: cached.status,
             entry: cached,
             age,
             set_cookie,
@@ -904,9 +903,11 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     }
 }
 
-/// Handle one owned request: h2 (which builds its request in `http2.rs`) and
-/// the h1 body path. On a hit it returns the owned `Ready` form, keeping the
-/// h2 allocation profile unchanged.
+/// Handle one owned request from the HTTP/1.1 body path.
+///
+/// h2 does not reach this: `on_request_h2` answers a cached hit from borrowed
+/// views and calls `into_owned` only on a miss. On a hit here the shared
+/// `Cached` form goes back to `drive_h1`, which writes it without copying.
 fn on_request_impl(
     state: &mut ServerState,
     req: &forward::HttpRequest,
@@ -926,27 +927,20 @@ fn on_request_impl(
         h2c,
     ) {
         Routed::Cached {
-            status,
             entry,
             age,
             set_cookie,
             ..
         } => {
-            let mut headers = (*entry.headers).clone();
-            set_alt_svc(&mut headers, quic_port);
-            set_vary_accept_encoding(&mut headers, true);
-            set_age(&mut headers, age);
-            set_describedby_link(&mut headers, &state.config.site.describedby);
-            if let Some(sc) = set_cookie {
-                headers.push(("Set-Cookie".to_string(), sc));
+            // The entry is shared (`Arc` headers, `Bytes` body), so a hit
+            // carries it by reference all the way to the writer. The fields a
+            // hit adds are written from their start-time values there, in
+            // place of cloning the header list to append them.
+            RequestOutcome::Cached {
+                entry,
+                age,
+                set_cookie,
             }
-            RequestOutcome::Ready(
-                status,
-                headers,
-                entry.body.to_vec(),
-                "cache".to_string(),
-                Some(entry.genid),
-            )
         }
         Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
         Routed::Miss {
@@ -957,6 +951,62 @@ fn on_request_impl(
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
             let outcome = handle_request(
                 req,
+                client_ip,
+                enc,
+                state,
+                false,
+                h2c && state.h2c_iface == Iface::Internal,
+                registry,
+            );
+            finish_miss(state, outcome, start, version, iface, quic_port)
+        }
+    }
+}
+
+/// Handle a request decoded on an HTTP/2 connection.
+///
+/// A cache hit is answered entirely from the borrowed view: the lookup key and
+/// the header list are read out of the connection's read buffer, and the shared
+/// cache entry goes back to the writer, so this path allocates nothing.
+/// `into_owned` runs only for a miss, which is a slow path.
+fn on_request_h2(
+    state: &mut ServerState,
+    req: H2Request<'_>,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::platform::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        req.method,
+        req.path,
+        req.query,
+        "HTTP/2",
+        req.headers(),
+        client_ip,
+        h2c,
+    ) {
+        Routed::Cached {
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => RequestOutcome::Cached {
+            entry,
+            age,
+            set_cookie,
+        },
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let req = req.into_owned();
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let outcome = handle_request(
+                &req,
                 client_ip,
                 enc,
                 state,
@@ -1181,12 +1231,13 @@ fn drive_conn_token(
     let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
         on_request_head(state, head, buf, ip, quic_port, registry)
     };
-    let mut on_h2 = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
-        on_request_impl(state, req, ip, quic_port, registry, is_h2c)
+    let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| match req {
+        RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
+        RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
     };
     let mut drive = if is_h2c {
         match h2c.as_mut() {
-            Some(h) => h.drive_one(slot, state, &mut on_h2, registry),
+            Some(h) => h.drive_one(slot, state, &mut on_h2, &hit, registry),
             None => return ConnOutcome::Closed,
         }
     } else {

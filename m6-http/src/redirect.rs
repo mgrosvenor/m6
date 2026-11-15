@@ -33,6 +33,7 @@
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
 use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
+use crate::http2::RequestRef;
 use m6_core::event::Timeouts;
 use m6_core::log::{info, warn};
 use m6_core::platform::process::raise_fd_limit;
@@ -177,7 +178,13 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let mut on_head = |_: &mut (), head: &RequestHead<'_>, _: &[u8], _: &str| {
         redirect_head(head.method, head.path, head.query, head.headers)
     };
-    let mut on_owned = |_: &mut (), req: &HttpRequest, _: &str| redirect_for(req);
+    let mut on_owned = |_: &mut (), req: RequestRef<'_>, _: &str| match req {
+        RequestRef::Owned(req) => redirect_for(req),
+        RequestRef::H2(req) => {
+            let owned = req.into_owned();
+            redirect_for(&owned)
+        }
+    };
     let hit = HitHeaders {
         alt_svc: std::sync::Arc::from(&[] as &[u8]),
         describedby: None,

@@ -129,8 +129,14 @@ where
             let (s, h, b, be) = handler(&req, ip);
             RequestOutcome::Ready(s, h, b, be, None)
         };
-        let mut on_owned = |_: &mut (), req: &HttpRequest, ip: &str| {
-            let (s, h, b, be) = handler(req, ip);
+        let mut on_owned = |_: &mut (), req: m6_http_lib::http2::RequestRef<'_>, ip: &str| {
+            let (s, h, b, be) = match req {
+                m6_http_lib::http2::RequestRef::Owned(req) => handler(req, ip),
+                m6_http_lib::http2::RequestRef::H2(req) => {
+                    let owned = req.into_owned();
+                    handler(&owned, ip)
+                }
+            };
             RequestOutcome::Ready(s, h, b, be, None)
         };
         let hit = HitHeaders {
