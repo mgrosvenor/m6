@@ -257,18 +257,25 @@ impl CacheControl {
             if !name.eq_ignore_ascii_case("cache-control") {
                 continue;
             }
-            for (dname, dval) in split_directives(value) {
-                let secs = || dval.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
-                match dname.as_str() {
-                    "no-store" => cc.no_store = true,
-                    "no-cache" => cc.no_cache = true,
-                    "private" => cc.private = true,
-                    "public" => cc.public = true,
-                    "must-revalidate" => cc.must_revalidate = true,
-                    "max-age" => cc.max_age = secs(),
-                    "s-maxage" => cc.s_maxage = secs(),
-                    "stale-while-revalidate" => cc.stale_while_revalidate = secs(),
-                    _ => {}
+            for d in DirectiveList::new(value) {
+                let secs = || d.value.and_then(|v| v.trim().parse::<u64>().ok());
+                let name = d.name;
+                if name.eq_ignore_ascii_case("no-store") {
+                    cc.no_store = true;
+                } else if name.eq_ignore_ascii_case("no-cache") {
+                    cc.no_cache = true;
+                } else if name.eq_ignore_ascii_case("private") {
+                    cc.private = true;
+                } else if name.eq_ignore_ascii_case("public") {
+                    cc.public = true;
+                } else if name.eq_ignore_ascii_case("must-revalidate") {
+                    cc.must_revalidate = true;
+                } else if name.eq_ignore_ascii_case("max-age") {
+                    cc.max_age = secs();
+                } else if name.eq_ignore_ascii_case("s-maxage") {
+                    cc.s_maxage = secs();
+                } else if name.eq_ignore_ascii_case("stale-while-revalidate") {
+                    cc.stale_while_revalidate = secs();
                 }
             }
         }
@@ -287,52 +294,98 @@ impl CacheControl {
     }
 }
 
-/// Split one `Cache-Control` field value into `(lowercased-name, value)` pairs,
-/// respecting quoted-string values so a comma inside quotes does not split.
-fn split_directives(value: &str) -> Vec<(String, Option<String>)> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut escaped = false;
-    for ch in value.chars() {
-        match ch {
-            '\\' if in_quotes && !escaped => {
-                escaped = true;
-                cur.push(ch);
-            }
-            '"' if !escaped => {
-                in_quotes = !in_quotes;
-                cur.push(ch);
-            }
-            ',' if !in_quotes => {
-                push_directive(&mut out, &cur);
-                cur.clear();
-            }
-            _ => {
-                escaped = false;
-                cur.push(ch);
-            }
-        }
-    }
-    push_directive(&mut out, &cur);
-    out
+/// One `Cache-Control` directive, borrowed from the field value it came from.
+///
+/// The name is not lowercased into a `String`: every comparison against it is
+/// `eq_ignore_ascii_case`, which is what the lowercase copy was for. Parsing a
+/// field value therefore allocates nothing at all, where this used to build a
+/// `String` per directive and a `Vec` to hold them.
+struct Directive<'a> {
+    /// The directive's name, trimmed. Compare with `eq_ignore_ascii_case`.
+    name: &'a str,
+    /// The directive's value with an enclosing quoted-string removed.
+    value: Option<&'a str>,
 }
 
-fn push_directive(out: &mut Vec<(String, Option<String>)>, raw: &str) {
+/// The directives in one `Cache-Control` field value, as borrowed slices.
+///
+/// Quotes are respected, so a comma inside a quoted value (`no-cache="a,b"`,
+/// a legal form) does not split a directive. Empty elements from a trailing or
+/// doubled comma are skipped, which is what the `Vec` form did by returning
+/// early from `push_directive`.
+struct DirectiveList<'a> {
+    rest: &'a str,
+}
+
+impl<'a> DirectiveList<'a> {
+    fn new(value: &'a str) -> DirectiveList<'a> {
+        DirectiveList { rest: value }
+    }
+}
+
+impl<'a> Iterator for DirectiveList<'a> {
+    type Item = Directive<'a>;
+
+    fn next(&mut self) -> Option<Directive<'a>> {
+        loop {
+            let rest = self.rest;
+            let mut in_quotes = false;
+            let mut escaped = false;
+            let mut split_at = None;
+            for (i, ch) in rest.char_indices() {
+                match ch {
+                    '\\' if in_quotes && !escaped => escaped = true,
+                    '"' if !escaped => {
+                        in_quotes = !in_quotes;
+                        escaped = false;
+                    }
+                    ',' if !in_quotes => {
+                        split_at = Some(i);
+                        break;
+                    }
+                    _ => escaped = false,
+                }
+            }
+            match split_at {
+                Some(i) => {
+                    self.rest = &rest[i + 1..];
+                    if let Some(d) = directive(&rest[..i]) {
+                        return Some(d);
+                    }
+                }
+                // The last element of the list. The iterator is spent, whether
+                // or not it yields one.
+                None => {
+                    self.rest = "";
+                    return directive(rest);
+                }
+            }
+        }
+    }
+}
+
+/// Split one element of a directive list into a borrowed [`Directive`].
+fn directive(raw: &str) -> Option<Directive<'_>> {
     let t = raw.trim();
     if t.is_empty() {
-        return;
+        return None;
     }
     match t.split_once('=') {
-        Some((n, v)) => {
-            let v = v.trim();
-            let v = v
+        Some((name, value)) => {
+            let value = value.trim();
+            let value = value
                 .strip_prefix('"')
                 .and_then(|r| r.strip_suffix('"'))
-                .unwrap_or(v);
-            out.push((n.trim().to_ascii_lowercase(), Some(v.to_string())));
+                .unwrap_or(value);
+            Some(Directive {
+                name: name.trim(),
+                value: Some(value),
+            })
         }
-        None => out.push((t.to_ascii_lowercase(), None)),
+        None => Some(Directive {
+            name: t,
+            value: None,
+        }),
     }
 }
 
@@ -1284,22 +1337,27 @@ impl RequestDirectives {
         let mut saw_cache_control = false;
         for value in req_headers.find_all("cache-control") {
             saw_cache_control = true;
-            // split_directives already handles quoted values and the
-            // commas that can appear inside them (`no-cache="Set-Cookie"`
-            // is legal), so this must not re-split on '='.
-            for (k, v) in split_directives(value) {
-                let secs = || v.as_deref().and_then(|v| v.trim().parse::<u64>().ok());
-                match k.to_ascii_lowercase().as_str() {
-                    "no-cache" => d.no_cache = true,
-                    "no-store" => d.no_store = true,
-                    "max-age" => d.max_age = secs(),
-                    "min-fresh" => d.min_fresh = secs(),
-                    // Bare `max-stale` means unlimited; with a value it is
-                    // bounded. The nested Option distinguishes them, which
-                    // a plain Option<u64> could not.
-                    "max-stale" => d.max_stale = Some(secs()),
-                    "only-if-cached" => d.only_if_cached = true,
-                    _ => {}
+            // `DirectiveList` already handles quoted values and the commas
+            // that can appear inside them (`no-cache="Set-Cookie"` is legal),
+            // so this must not re-split on '='.
+            for dir in DirectiveList::new(value) {
+                let secs = || dir.value.and_then(|v| v.trim().parse::<u64>().ok());
+                let name = dir.name;
+                if name.eq_ignore_ascii_case("no-cache") {
+                    d.no_cache = true;
+                } else if name.eq_ignore_ascii_case("no-store") {
+                    d.no_store = true;
+                } else if name.eq_ignore_ascii_case("max-age") {
+                    d.max_age = secs();
+                } else if name.eq_ignore_ascii_case("min-fresh") {
+                    d.min_fresh = secs();
+                // Bare `max-stale` means unlimited; with a value it is
+                // bounded. The nested Option distinguishes them, which
+                // a plain Option<u64> could not.
+                } else if name.eq_ignore_ascii_case("max-stale") {
+                    d.max_stale = Some(secs());
+                } else if name.eq_ignore_ascii_case("only-if-cached") {
+                    d.only_if_cached = true;
                 }
             }
         }

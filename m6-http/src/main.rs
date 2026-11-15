@@ -40,9 +40,17 @@ use m6_http_lib::stats::Stats;
 /// never on in a release build of a service. A plain build installs no
 /// allocator, and the loop's arm and stop lines below are compiled out with it,
 /// so the loop is the code it always was.
-#[cfg(feature = "count-allocations")]
+#[cfg(all(feature = "count-allocations", not(feature = "alloc-attribution")))]
 #[global_allocator]
 static ALLOCATOR: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_count::Counting;
+
+/// ALLOC-ATTR: dhat replaces the counter only when attribution is asked for,
+/// because the two global allocators cannot coexist. Still behind
+/// `count-allocations` (the feature implies it), still off in any released
+/// service, and it changes no request path.
+#[cfg(feature = "alloc-attribution")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
 
 /// RFC 9114 8.1: H3_MESSAGE_ERROR, the stream error a server must raise for a
 /// malformed request. Named here rather than taken from quiche so the wire
@@ -5944,8 +5952,28 @@ fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
+    // ALLOC-ATTR: the profiler is held for the whole process so every
+    // allocation is attributed. `run` returns before the explicit drop, because
+    // `std::process::exit` does not run destructors and dhat writes its file on
+    // drop. The path is set by the test; a plain run writes dhat-heap.json in
+    // the working directory.
+    #[cfg(feature = "alloc-attribution")]
+    let profiler = dhat::Profiler::builder()
+        .file_name(
+            std::env::var_os("M6_DHAT_OUT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("dhat-heap.json")),
+        )
+        // 32 frames, not dhat's default 10: a `Vec::with_capacity` or a
+        // formatted `String` is more than ten allocator and iterator frames
+        // deep, and the caller is the whole point of this profile.
+        .trim_backtraces(Some(32))
+        .build();
     let args: Vec<String> = std::env::args().collect();
-    std::process::exit(run(args));
+    let code = run(args);
+    #[cfg(feature = "alloc-attribution")]
+    drop(profiler);
+    std::process::exit(code);
 }
 
 fn run(args: Vec<String>) -> i32 {
