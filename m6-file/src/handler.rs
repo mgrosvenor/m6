@@ -6,6 +6,20 @@ use m6_core::{Request, Response, Result};
 
 use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
 
+/// The entity tag for one file representation.
+///
+/// **Weak on purpose.** The tag is the file's mtime (whole seconds) and size,
+/// two cheap `stat` fields that, unlike a content hash, do not read the body on
+/// every request. It cannot be strong: a same-size edit inside one mtime second,
+/// or an edit that preserves the mtime, leaves both inputs unchanged while the
+/// bytes differ. RFC 9110 8.8.1 requires a strong validator to change whenever
+/// the representation data changes and names clock resolution as a cause of
+/// weakness, so the tag carries `W/`. `Last-Modified` remains, which is what
+/// the date comparison uses.
+fn file_etag(mtime_secs: u64, len: u64, suffix: &str) -> String {
+    format!("W/\"{mtime_secs:x}-{len:x}{suffix}\"")
+}
+
 /// Resolve the file this request addresses, from the route's `root` setting
 /// and the path parameters core captured.
 ///
@@ -25,7 +39,11 @@ use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding}
 ///
 /// A request built without a route (a test, or a caller that never routes)
 /// has no pattern to consult, and reads the dictionary as given.
-fn resolve_fs_path(req: &Request, site_dir: &Path) -> Option<PathBuf> {
+///
+/// Returns the path relative to `site_dir`. The caller resolves it with
+/// core's `resolve_within`, which follows every symlink and applies the same
+/// check `Request`'s file helpers use.
+fn resolve_fs_relpath(req: &Request) -> Option<PathBuf> {
     let pattern = req.route_pattern();
     // `Some(wildcard)` when the route captures `name`, `None` when it does not.
     let capture = |name: &str| -> Option<bool> {
@@ -61,30 +79,9 @@ fn resolve_fs_path(req: &Request, site_dir: &Path) -> Option<PathBuf> {
         None => param("filename")?.unwrap_or(""),
     };
     if rel.is_empty() {
-        Some(site_dir.join(&root))
+        Some(PathBuf::from(&root))
     } else {
-        Some(site_dir.join(&root).join(rel))
-    }
-}
-
-/// True if `fs_path` is a symlink resolving outside `site_dir`.
-///
-/// Only pays the `canonicalize` cost when a symlink is actually present;
-/// regular files return immediately. A path that cannot be resolved at all is
-/// treated as escaping — it will 404 either way.
-fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(fs_path) else {
-        return false; // missing file — the normal 404 path handles it
-    };
-    if !meta.file_type().is_symlink() {
-        return false;
-    }
-    match (
-        std::fs::canonicalize(fs_path),
-        std::fs::canonicalize(site_dir),
-    ) {
-        (Ok(real), Ok(root)) => !real.starts_with(root),
-        _ => true,
+        Some(PathBuf::from(&root).join(rel))
     }
 }
 
@@ -101,19 +98,30 @@ fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
 /// hash and therefore a different URL — so it can be pinned for a year and
 /// marked `immutable`, which also stops a browser revalidating it on reload.
 ///
-/// Everything else splits the two audiences deliberately:
-/// - `max-age=60` / `stale-while-revalidate=60` are honoured by BROWSERS, and
-///   no invalidation can reach a browser cache. They stay short so a deploy is
-///   visible promptly. Raising either one strands visitors on the old file.
-/// - `s-maxage=86400` is honoured ONLY by shared caches (RFC 9111 5.2.2.10).
-///   A browser ignores it. It lengthens just the edge's copy, which a cache
-///   invalidation at deploy time empties.
+/// Everything else uses the browser-caching pattern: the browser revalidates
+/// on every request, the shared cache keeps the response for a day.
+///
+/// - `max-age=0` makes the browser's copy stale immediately, and
+///   `must-revalidate` forbids serving it once stale (RFC 9111 5.2.2.1 and
+///   5.2.2.2). A deploy is therefore visible on the next request, and an
+///   unchanged file costs one conditional request and a 304.
+/// - `s-maxage=86400` is honoured ONLY by shared caches, and it overrides
+///   `max-age` for them (RFC 9111 5.2.2.10). The edge keeps its copy for a day
+///   and answers the browser's `If-None-Match` itself, without the backend.
+/// - `public` is what makes the response storable by a shared cache.
+///
+/// `no-cache` is deliberately absent. It has the same browser behaviour as
+/// `max-age=0, must-revalidate`, but it also forces the shared cache to
+/// revalidate, which is the latency `s-maxage` exists to remove (RFC 9111
+/// 5.2.2.4). `stale-while-revalidate` is deliberately absent too: it would let
+/// the browser serve the stale copy while revalidating, which is what the
+/// pattern forbids.
 fn cache_control_for(query: &str) -> &'static str {
     let versioned = query.split('&').any(|p| p.starts_with("v=") && p.len() > 2);
     if versioned {
         "public, max-age=31536000, immutable"
     } else {
-        "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+        "public, max-age=0, must-revalidate, s-maxage=86400"
     }
 }
 
@@ -135,19 +143,18 @@ pub fn serve(req: &Request) -> Result<Response> {
     }
 
     let site_dir = req.site_path("");
-    let Some(fs_path) = resolve_fs_path(req, &site_dir) else {
+    let Some(rel) = resolve_fs_relpath(req) else {
         return Ok(Response::not_found());
     };
 
-    // Fast symlink check: if the path is (or contains) a symlink that escapes
-    // site_dir, return 404.  Regular files skip canonicalize entirely.
-    //
-    // Runs before the `tail` dispatch below — tail routes read the same
-    // filesystem through the same resolver, so exempting them just moved the
-    // escape one route type over.
-    if escapes_site_dir(&fs_path, &site_dir) {
+    // Resolve the path with every symlink followed, then check the result
+    // against the resolved site root and use that same resolved path below.
+    // The old check ran only on the name the request supplied, so a symlinked
+    // directory in the middle passed it. Runs before the `tail` dispatch: tail
+    // routes read the same filesystem through the same resolver.
+    let Ok(fs_path) = m6_core::path::resolve_within(&site_dir, &rel) else {
         return Ok(Response::not_found());
-    }
+    };
 
     if req.route_bool("tail", false) {
         return serve_tail(req, &fs_path);
@@ -202,7 +209,7 @@ pub fn serve(req: &Request) -> Result<Response> {
         Encoding::Brotli => "-br",
         Encoding::Gzip => "-gz",
     };
-    let mut etag = format!("\"{:x}-{:x}{}\"", mtime_secs, metadata.len(), etag_suffix);
+    let mut etag = file_etag(mtime_secs, metadata.len(), etag_suffix);
 
     // Preconditions come from m6-core, which implements all four steps of
     // RFC 9110 13.2.2 in the required order. What was here did steps 3 and 4
@@ -212,7 +219,8 @@ pub fn serve(req: &Request) -> Result<Response> {
         ("ETag".to_string(), etag.clone()),
         ("Last-Modified".to_string(), last_modified.clone()),
     ];
-    let precondition = m6_core::evaluate_preconditions(&validators, req.headers(), req.method());
+    let precondition =
+        m6_core::evaluate_preconditions(200, &validators, req.headers(), req.method());
 
     let cache_control = cache_control_for(req.query());
 
@@ -311,7 +319,7 @@ pub fn serve(req: &Request) -> Result<Response> {
             Ok(compressed) => (compressed, Some("br")),
             Err(e) => {
                 warn!(path = %fs_path.display(), error = %e, "brotli compression failed, serving identity");
-                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                etag = file_etag(mtime_secs, metadata.len(), "");
                 (data, None)
             }
         },
@@ -319,7 +327,7 @@ pub fn serve(req: &Request) -> Result<Response> {
             Ok(compressed) => (compressed, Some("gzip")),
             Err(e) => {
                 warn!(path = %fs_path.display(), error = %e, "gzip compression failed, serving identity");
-                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                etag = file_etag(mtime_secs, metadata.len(), "");
                 (data, None)
             }
         },
@@ -702,6 +710,48 @@ mod tests {
         );
     }
 
+    /// RFC 9110 8.8.1: a strong validator has to change whenever the
+    /// representation data changes. mtime-seconds plus size cannot promise
+    /// that, so the tag must be weak or a same-second, same-size edit would
+    /// leave it validating bytes that no longer exist.
+    #[test]
+    fn the_file_etag_is_weak() {
+        let dir = css_dir();
+        let (etag, _, _) = fetch(dir.path(), None);
+        assert!(
+            etag.starts_with("W/\""),
+            "the mtime-and-size ETag must be weak: {etag}"
+        );
+    }
+
+    /// And the weak tag still moves when both of its inputs move: a rewrite
+    /// with a different length and a different whole-second mtime must not
+    /// leave the old validator in place.
+    #[test]
+    fn an_etag_changes_when_the_file_changes() {
+        let dir = css_dir();
+        let path = dir.path().join("assets/style.css");
+        let (before, _, _) = fetch(dir.path(), None);
+
+        let mut changed = compressible_css();
+        changed.extend_from_slice(b"\n.extra { color: red; }\n");
+        std::fs::write(&path, &changed).unwrap();
+        let when =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+
+        let (after, _, _) = fetch(dir.path(), None);
+        assert_ne!(
+            before, after,
+            "the ETag survived a different mtime and length"
+        );
+    }
+
     /// A conditional request carrying the brotli tag must 304 for brotli, and
     /// must NOT 304 for a client that can only take gzip: that pairing is
     /// exactly what the shared tag made indistinguishable.
@@ -841,6 +891,44 @@ mod tests {
         assert_eq!(wire(&asset_req(dir.path(), "escape", None, &[])).0, 404);
     }
 
+    /// The break: `escapes_site_dir` looked only at the last component, so a
+    /// symlinked directory in the middle of the path was followed and the
+    /// outside file was served. Restore that check and this test gets 200 with
+    /// `ESCAPED SECRET` in the body.
+    #[test]
+    fn a_symlinked_directory_inside_the_site_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.css"), b"ESCAPED SECRET").unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("assets")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("assets/linked")).unwrap();
+
+        let (status, _, body) = wire(&asset_req(site.path(), "linked/secret.css", None, &[]));
+        assert_eq!(
+            status, 404,
+            "a symlinked directory leaving the site was served"
+        );
+        assert!(body.is_empty(), "the response carried the outside file");
+    }
+
+    /// A symlink that stays inside the site is a normal deployment and is
+    /// served, so the fix refuses escapes rather than every symlink.
+    #[test]
+    fn a_symlinked_directory_inside_the_site_is_served() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("static/assets")).unwrap();
+        std::fs::write(site.path().join("static/assets/app.css"), b"body{}").unwrap();
+        std::os::unix::fs::symlink(
+            site.path().join("static/assets"),
+            site.path().join("assets"),
+        )
+        .unwrap();
+
+        let (status, _, body) = wire(&asset_req(site.path(), "app.css", None, &[]));
+        assert_eq!(status, 200, "an in-site directory symlink was refused");
+        assert_eq!(body, b"body{}");
+    }
+
     /// A `relpath` that climbs out of the root is a 404 even when it reaches
     /// the handler without core's path check, and a regular file on the
     /// other side does not change that.
@@ -886,12 +974,12 @@ mod cache_control_tests {
         }
     }
 
-    /// Everything else keeps the short window. The webfont matters most here:
-    /// it is requested unversioned from @font-face inside style.css, and
+    /// Everything else takes the revalidating branch. The webfont matters most
+    /// here: it is requested unversioned from @font-face inside style.css, and
     /// pinning it for a year would strand clients on an old file that no
     /// server-side invalidation can reach.
     #[test]
-    fn unversioned_and_malformed_urls_keep_the_short_window() {
+    fn unversioned_and_malformed_urls_are_not_versioned() {
         for url in [
             "/assets/fonts/montserrat-normal.woff2",
             "/assets/css/style.css",
@@ -917,30 +1005,46 @@ mod cache_control_tests {
         );
         assert_eq!(
             cache_control_for(&query_of("/assets/fonts/montserrat-normal.woff2")),
-            "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+            "public, max-age=0, must-revalidate, s-maxage=86400"
         );
     }
 
     /// The property that holds the unversioned directive together, stated as
     /// its own test so the reason survives.
     ///
-    /// An edge cache can be emptied on deploy, and a browser cache cannot be
-    /// reached at all. So the long window may only ever appear on `s-maxage`,
-    /// which browsers ignore. Raising `max-age` or `stale-while-revalidate` to
-    /// buy the same hit rate would strand every visitor on the previous file
-    /// for a day.
+    /// A browser cache cannot be reached at all, so its copy must be stale
+    /// immediately and unusable without a successful validation. An edge cache
+    /// can be emptied on deploy, so it may keep the same response for a day.
+    /// The long window may therefore appear only on `s-maxage`, the one
+    /// directive browsers ignore.
     #[test]
     fn unversioned_lengthens_only_the_edge_never_the_browser() {
         let cc = cache_control_for(&query_of("/assets/css/style.css"));
 
+        // The edge keeps it, and keeps it for a day.
         assert!(
             cc.contains("s-maxage=86400"),
             "edge must hold it long: {cc}"
         );
-        assert!(cc.contains("max-age=60"), "browser must stay short: {cc}");
+
+        // The browser revalidates on every use: zero freshness plus an
+        // obligation to validate once stale.
         assert!(
-            cc.contains("stale-while-revalidate=60"),
-            "browser-visible stale window must stay short: {cc}"
+            cc.contains("max-age=0"),
+            "the browser's copy must be stale at once: {cc}"
+        );
+        assert!(
+            cc.contains("must-revalidate"),
+            "the browser must not serve a stale copy without validating: {cc}"
+        );
+
+        // `no-cache` would make the edge revalidate too, and
+        // `stale-while-revalidate` would let the browser serve stale while it
+        // revalidates asynchronously. Neither belongs in the pattern.
+        assert!(!cc.contains("no-cache"), "no-cache reaches the edge: {cc}");
+        assert!(
+            !cc.contains("stale-while-revalidate"),
+            "the browser may not serve stale while revalidating: {cc}"
         );
 
         // The directive browsers obey must never carry the long value. Checked

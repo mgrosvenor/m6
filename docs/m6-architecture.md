@@ -367,7 +367,7 @@ A backend that restarts on the same path serves again on its next turn.
 
 ## 4. Why one process faces the internet
 
-Everything about the edge follows from it being the only process on a public port.
+Everything about the edge follows from it being the only process on a public port, which is what `[server] reuse_port` off, the default, keeps true. Turning that setting on lets several m6-http processes share the public port, and then the port is a set of processes rather than one.
 This section says why the protocol burden is concentrated there, why it runs one thread, why the cache is shaped as it is, why it distrusts its own clients, and why there is no fallback file.
 
 ### 4.1 Why the protocol burden is concentrated
@@ -705,7 +705,7 @@ Table 11 gives them by area.
 | processes | a connection serves at most 100 requests before closing | persistent connections are the default, and an unbounded one lets one peer hold a slot indefinitely by pipelining |
 | processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds its connection slot until it disconnects, and enough of those fill the table while the service looks healthy |
 | processes | exit 0 clean, 1 runtime error, 2 configuration or usage error before binding | a supervisor can tell a bad config from a crash, which is what lets a deploy validate a new binary and refuse to install |
-| content | minification runs before compression, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, and a minifier that does not understand a file should pass it through rather than corrupt it |
+| content | minification runs before compression, a `no-store` response is not minified, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, a response no cache keeps would pay the cost on every request for a few saved bytes, and a minifier that does not understand a file should pass it through rather than corrupt it |
 | content | inline script minification is off by default | the engine parses scripts as modules, which has different scoping, and it can silently rewrite a valid classic script into a broken one |
 | content | text types declare a charset and JSON does not | without it clients fall back to a legacy encoding and render UTF-8 as mojibake, and the parameter is undefined for JSON |
 | auth | access tokens are short-lived with a longer refresh on its own path | a stolen access token expires on its own, and the refresh path is the only thing that needs to be revocable |
@@ -727,7 +727,7 @@ Table 12 lists what is absent and the reason, and the last row is the one to rea
 | a build step | content authoring is not web serving. Coupling them would force m6 to hold opinions about content formats, build tools and file pipelines, and a separate tool that understands the site directory needs no m6 internals |
 | Windows | the deployment model is systemd units and Unix sockets |
 | a built-in OAuth2 or OIDC provider, MFA, WebAuthn | out of scope at 1.0 |
-| horizontal scaling of the edge itself | it is one process per node by design (§1.8) and scales through caching and more nodes |
+| horizontal scaling of the edge itself | it is one process per node by default (§1.8) and scales through caching and more nodes. `[server] reuse_port` lets several processes share the public port, which is a deliberate second way and not the model the design assumes |
 | HTTP/2 server push | the specification deprecated it, and receipt of a push promise is correctly an error |
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |

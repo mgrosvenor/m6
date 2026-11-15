@@ -149,6 +149,10 @@ total_for() { awk -v k="$1" '$1==k {print $3}' "$SCORES" 2>/dev/null; }
 # "$WORK"`, so on a fresh box it failed and every later append went nowhere:
 # the score file's own bookkeeping was silently not written.
 mkdir -p "$WORK"
+
+# The servers under test. Gates use the dev profile, so the default is
+# target/debug; M6_BIN_DIR points it at another build.
+BIN="${M6_BIN_DIR:-$ROOT/target/debug}"
 MEASURED="$WORK/measured.txt"
 : > "$MEASURED"
 RESULT=0
@@ -263,9 +267,9 @@ start_edge() {
   local site="$WORK/edge-site"
   mkdir -p "$site/public" "$site/configs"
 
-  if [[ ! -x "$ROOT/target/release/m6-http" || ! -x "$ROOT/target/release/m6-file" \
-        || ! -x "$ROOT/target/release/m6-html" ]]; then
-    fail "no release build; run: cargo build --workspace --release"
+  if [[ ! -x "$BIN/m6-http" || ! -x "$BIN/m6-file" \
+        || ! -x "$BIN/m6-html" ]]; then
+    fail "no build in $BIN; run: cargo build --workspace --bins"
     RESULT=1
     return 1
   fi
@@ -304,7 +308,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [analytics]
 enabled = false
@@ -344,7 +347,7 @@ TOML
   # appears late means an empty pool and 502 on every request.
   local sock="$WORK/edge-m6-file-1.sock"
   rm -f "$sock"
-  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/m6-file" \
+  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$BIN/m6-file" \
     "$site" "$site/configs/m6-file.conf" > "$WORK/edge-file.log" 2>&1 &
   local fpid=$!
   PIDS+=("$fpid")
@@ -363,7 +366,7 @@ TOML
     > "$site/configs/m6-html.conf"
   local hsock="$WORK/edge-m6-html-1.sock"
   rm -f "$hsock"
-  M6_SOCKET_OVERRIDE="$hsock" $SETSID nohup "$ROOT/target/release/m6-html" \
+  M6_SOCKET_OVERRIDE="$hsock" $SETSID nohup "$BIN/m6-html" \
     "$site" "$site/configs/m6-html.conf" > "$WORK/edge-html.log" 2>&1 &
   local hpid=$!
   PIDS+=("$hpid")
@@ -371,7 +374,7 @@ TOML
   [[ -S "$hsock" ]] || { fail "edge renderer never created $hsock"; RESULT=1; return 1; }
 
   require_free_port "$TLS_PORT" "the loopback edge" || return 1
-  $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/conf.toml" \
+  $SETSID nohup "$BIN/m6-http" "$site" "$WORK/conf.toml" \
     > "$WORK/edge.log" 2>&1 &
   local pid=$!
   PIDS+=("$pid")
@@ -410,7 +413,7 @@ public_key  = "$site/auth.pub"
 TOML
   local sock="$WORK/auth.sock"
   rm -f "$sock"
-  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/m6-auth-server" \
+  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$BIN/m6-auth-server" \
     "$site" "$site/m6-auth.conf" > "$WORK/auth.log" 2>&1 &
   local pid=$!
   PIDS+=("$pid")
@@ -435,6 +438,9 @@ start_redirect() {
 [site]
 name   = "conformance"
 domain = "localhost"
+
+[analytics]
+enabled = false
 TOML
   cat > "$WORK/redirect.toml" <<TOML
 [server]
@@ -445,7 +451,7 @@ redirect_bind = "127.0.0.1:$REDIRECT_PORT"
 name = "conformance"
 TOML
   require_free_port "$REDIRECT_PORT" "the redirect listener" || return 1
-  $SETSID nohup "$ROOT/target/release/m6-http" "$site" "$WORK/redirect.toml" \
+  $SETSID nohup "$BIN/m6-http" "$site" "$WORK/redirect.toml" \
     > "$WORK/redirect.log" 2>&1 &
   local pid=$!
   PIDS+=("$pid")
@@ -456,7 +462,7 @@ start_backend() {  # start_backend <name> <bridge-port> <site-dir> <config>
   local name="$1" port="$2" site="$3" conf="$4"
   local sock="$WORK/$name.sock"
   rm -f "$sock"
-  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$ROOT/target/release/$name" "$site" "$conf" \
+  M6_SOCKET_OVERRIDE="$sock" $SETSID nohup "$BIN/$name" "$site" "$conf" \
     > "$WORK/$name.log" 2>&1 &
   PIDS+=($!)
   for _ in $(seq 1 200); do [[ -S "$sock" ]] && break; sleep 0.05; done
@@ -671,7 +677,7 @@ run_resume() {
   # failure and not a skip.
   local missing=""
   for b in m6-probe-h1 m6-probe-h2 m6-probe-h3; do
-    [[ -x "$ROOT/target/release/$b" ]] || missing="$missing $b"
+    [[ -x "$BIN/$b" ]] || missing="$missing $b"
   done
   if [[ -n "$missing" ]]; then
     fail "resume: no release build of$missing — a gate that cannot measure must fail."
@@ -687,7 +693,7 @@ run_resume() {
   local r_log ok_all=0
   for proto in h1 h2; do
     r_log="$WORK/resume-$proto.out"
-    if "$ROOT/target/release/m6-probe-$proto" \
+    if "$BIN/m6-probe-$proto" \
         --addr "127.0.0.1:$TLS_PORT" --n 5 > "$r_log" 2>&1; then
       pass "resume:$proto  $(grep -a -m1 'RESUMPTION:' "$r_log" || echo 'resumed')"
     else
@@ -706,7 +712,7 @@ run_resume() {
   # entry, deliberately, because a replayed request reaching a backend could
   # have side effects. A 425 with early data used is a PASS for the safety gate.
   r_log="$WORK/resume-h3.out"
-  if "$ROOT/target/release/m6-probe-h3" \
+  if "$BIN/m6-probe-h3" \
       --addr "127.0.0.1:$TLS_PORT" --0rtt / > "$r_log" 2>&1; then
     pass "resume:h3  $(grep -a -m1 'early data actually used' "$r_log" || echo 'resumed')"
   else

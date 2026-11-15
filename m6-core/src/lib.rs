@@ -73,7 +73,7 @@ pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decom
 pub use conditional::{
     evaluate_preconditions, is_not_modified, not_modified_headers, Precondition,
 };
-pub use config::{RendererConfig, RouteConfig};
+pub use config::{RendererConfig, RouteConfig, PAGE_CACHE_CONTROL};
 pub use cookie::{Cookie, SameSite};
 pub use dict::Dict;
 pub use error::{Error, Result};

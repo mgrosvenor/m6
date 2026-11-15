@@ -455,7 +455,7 @@ jobs:
           sudo install -m755 h3spec /usr/local/bin/h3spec
 
       - name: Build the servers under test
-        run: cargo build --workspace --release
+        run: cargo build --workspace --bins
 
       # WITHOUT --allow-missing-tools, deliberately. All three testers are
       # installed above, so an absent one here is a failure and not a skip.

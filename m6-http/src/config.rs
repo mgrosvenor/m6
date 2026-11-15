@@ -152,6 +152,21 @@ pub struct ServerConfig {
     /// connection, such as a benchmark, wants a higher value.
     #[serde(default = "default_max_requests_per_connection")]
     pub max_requests_per_connection: u32,
+    /// Let another m6-http process bind the same address, by setting
+    /// `SO_REUSEPORT` before `bind` on the TLS listener and the QUIC UDP socket
+    /// of `bind`. Default false, so an accidental second instance still fails
+    /// at bind instead of quietly sharing traffic.
+    ///
+    /// True routes both sockets through `m6_platform::net::listen_shared`, so
+    /// they are bound in one call and always share the public 443 port. No
+    /// other socket is shared: the redirect listener on port 80, the internal
+    /// h2c listener, the health endpoints and every backend socket keep their
+    /// own binding. Linux spreads a new connection across the sockets by a
+    /// hash of its 4-tuple and macOS does not, so the split is not even and no
+    /// process is guaranteed traffic. A QUIC client that changes address may
+    /// land on another process. Read at start, and a change needs a restart.
+    #[serde(default)]
+    pub reuse_port: bool,
     /// Optional H2C (HTTP/2 cleartext) listener address.
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
@@ -777,6 +792,7 @@ struct RawServerSection {
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
     max_requests_per_connection: Option<u32>,
+    reuse_port: Option<bool>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
@@ -1144,6 +1160,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
         max_requests_per_connection,
+        reuse_port: node_server.reuse_port.unwrap_or(false),
         h2c_bind,
         internal_binds,
         internal_peers,
@@ -1506,6 +1523,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "redirect_bind",
     "warm_on_start",
     "max_requests_per_connection",
+    "reuse_port",
 ];
 /// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
@@ -2027,6 +2045,20 @@ sockets = "/run/m6/*.sock"
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_requests_per_connection"), "error: {err}");
+    }
+
+    /// The default is what keeps an accidental second instance from binding a
+    /// live port, so it is false unless the node asks for sharing.
+    #[test]
+    fn reuse_port_defaults_off() {
+        let cfg = load_with_system_server_line("").unwrap();
+        assert!(!cfg.server.reuse_port);
+    }
+
+    #[test]
+    fn reuse_port_is_read_from_the_system_config() {
+        let cfg = load_with_system_server_line("reuse_port = true").unwrap();
+        assert!(cfg.server.reuse_port);
     }
 
     #[test]
@@ -3045,6 +3077,7 @@ domain = "test.example.com"
                 "internal_peers",
                 "max_requests_per_connection",
                 "redirect_bind",
+                "reuse_port",
                 "tls_cert",
                 "tls_key",
                 "warm_on_start",
@@ -3057,7 +3090,7 @@ domain = "test.example.com"
             ["metrics_peers", "metrics_require", "metrics_token_file"]
         );
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "node"]);
-        assert_eq!(all.len(), 11 + 3 + 4);
+        assert_eq!(all.len(), 12 + 3 + 4);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
