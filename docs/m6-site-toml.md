@@ -366,6 +366,8 @@ Each entry is an IP address in a local range, without a port.
 An address that is listed must be one the peer connects from, and the list needs at least one address of the internal listener's IP family.
 The internal h2c listener is for relaying nodes, and a monitor polls a node over its TLS listener.
 So `internal_peers` both admits a peer and trusts the client addresses that peer forwards.
+A request on the TLS or QUIC listener from a private network address is counted as monitor traffic, so a monitor on the private network does not move the visitor counters.
+A real visitor reaches that listener from a public address, and a request from a public address stays external at every path.
 
 Both lists are read at startup from the system config only, so a change needs a restart.
 A redirect-mode config ignores the keys.

@@ -1516,7 +1516,7 @@ The monitor sends `Cache-Control: no-store` on every page itself, so the routes 
 The node's own `periodic stats` log is a 10 second series in the node's journal, which is capped.
 It has no channels, reachability, host figures or tunnel, and it disappears while a node is down.
 Only the history keeps those, and it keeps them through an outage.
-Channel counters include the monitor's own polls and header checks (issue #107), and `monitor_requests` on each node row says how many.
+Channel counters separate the monitor's own polls and header checks (issue #107) into `http/<version>/monitor`, and `monitor_requests` on each node row says how many.
 
 ### 7.10. Deploy updates
 

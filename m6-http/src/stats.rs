@@ -9,10 +9,10 @@ const EMIT_INTERVAL_SECS: u64 = 10;
 const RESERVOIR: usize = 4096;
 
 /// Per-channel reservoir. Smaller than the aggregate one on purpose, but not as
-/// small as it was: six channels × three categories (hit, miss, handshake) at
-/// 1024 u64s is 144 KB, against 72 KB at 512 and 1.1 MB at the aggregate 4096.
+/// small as it was: nine channels × three categories (hit, miss, handshake) at
+/// 1024 u64s is 216 KB, against 108 KB at 512 and 1.1 MB at the aggregate 4096.
 ///
-/// 1024 rather than 512 on the owner's call. The extra 72 KB is nothing on these
+/// 1024 rather than 512 on the owner's call. The extra 108 KB is nothing on these
 /// VMs and it doubles the window a p99 is drawn from, which matters most for
 /// handshakes: they arrive far less often than requests, so a fixed number of
 /// samples covers a much longer stretch of wall clock time on that channel than
@@ -69,22 +69,39 @@ impl Version {
     }
 }
 
-/// Which network the request arrived on, as declared by `[server]
-/// internal_binds`. A listener that list names is internal, every other is
-/// external. Nothing is inferred from an address.
+/// Which population a request belongs to.
 ///
-/// The origin serves two completely different populations and pooling them
-/// makes both numbers meaningless: real visitors arrive on the public NIC
-/// over TLS or QUIC, while cache-miss forwards from the cache nodes arrive
-/// over a private tunnel as h2c. Where a cache node is on another continent
-/// the second group carries 200-300ms of RTT that has nothing to do with how
-/// fast this node is.
+/// An origin serves three populations and pooling any two of them makes their
+/// numbers meaningless: real visitors arrive on the public NIC over TLS or
+/// QUIC, cache-miss forwards from the cache nodes arrive over a private tunnel
+/// as h2c, and the fleet monitor polls the public listener on a loop. Where a
+/// cache node is on another continent the backbone carries 200-300ms of RTT
+/// that has nothing to do with how fast this node is, and a monitor polling
+/// every few seconds moves the visitor hit rate while no visitor has moved.
+///
+/// The class is decided from what the connection already proves, never from a
+/// header:
+///
+///   internal  the listener `[server] internal_binds` names. The socket decides
+///             this, whatever peer address it carries.
+///   monitor   a response from `/health`, `/perf` or `/traffic` (the backend
+///             name says so), or a request on the TLS or QUIC listener whose
+///             peer is on the private network. A real visitor reaches that listener
+///             from a public address after NAT, and the monitor runs on the
+///             private network.
+///   external  every other request.
+///
+/// `crate::health::peer_iface` applies the peer half at the call site, where the
+/// peer address is already in hand. `Stats::record` applies the path half from
+/// the backend name, because that is the one point every serving path reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Iface {
-    /// Public network interface.
+    /// Public network interface, from a public peer.
     External,
     /// Private backbone between nodes.
     Internal,
+    /// The fleet monitor's own polls.
+    Monitor,
 }
 
 impl Iface {
@@ -92,6 +109,25 @@ impl Iface {
         match self {
             Iface::External => "external",
             Iface::Internal => "internal",
+            Iface::Monitor => "monitor",
+        }
+    }
+
+    /// Dense position for the channel index. The order is part of the table
+    /// layout, not a wire format: `Channel::from_index` reverses it.
+    fn position(self) -> usize {
+        match self {
+            Iface::External => 0,
+            Iface::Internal => 1,
+            Iface::Monitor => 2,
+        }
+    }
+
+    fn from_position(position: usize) -> Iface {
+        match position {
+            1 => Iface::Internal,
+            2 => Iface::Monitor,
+            _ => Iface::External,
         }
     }
 }
@@ -108,28 +144,26 @@ impl Channel {
         Channel { version, iface }
     }
 
-    /// Dense index for the fixed-size table: 3 versions × 2 interfaces.
+    /// Dense index for the fixed-size table: 3 versions × 3 interfaces.
     fn index(self) -> usize {
         let v = match self.version {
             Version::Http11 => 0,
             Version::Http2 => 1,
             Version::Http3 => 2,
         };
-        v * 2 + matches!(self.iface, Iface::Internal) as usize
+        v * 3 + self.iface.position()
     }
 
     fn from_index(i: usize) -> Channel {
-        let version = match i / 2 {
+        let version = match i / 3 {
             0 => Version::Http11,
             1 => Version::Http2,
             _ => Version::Http3,
         };
-        let iface = if i % 2 == 1 {
-            Iface::Internal
-        } else {
-            Iface::External
-        };
-        Channel { version, iface }
+        Channel {
+            version,
+            iface: Iface::from_position(i % 3),
+        }
     }
 
     pub fn label(self) -> String {
@@ -137,7 +171,7 @@ impl Channel {
     }
 }
 
-const CHANNELS: usize = 6;
+const CHANNELS: usize = 9;
 
 /// Counters and latency samples for one channel.
 struct ChannelStats {
@@ -315,6 +349,16 @@ impl ChannelStats {
             }
         }
     }
+
+    /// Record a monitor poll on its channel.
+    ///
+    /// A monitor poll touches no cache and has no hit or miss, so only
+    /// `requests` moves. The per-channel display skips a channel whose hit and
+    /// miss counts are both zero, which keeps the monitor out of the visitor
+    /// rows while `/perf` still carries the count.
+    fn record_monitor(&mut self) {
+        self.requests += 1;
+    }
 }
 
 // The snapshot types moved to `m6_core::telemetry`, so the nodes that write
@@ -385,15 +429,19 @@ pub struct Stats {
     miss_count: usize,
     miss_window_added: usize,
 
-    // ── Monitoring endpoints, accounted separately ────────────────────────
+    // ── The monitor population, accounted separately ──────────────────────
     //
-    // /health and /perf are not site traffic, but they are not nothing
-    // either. They used to be dropped on the floor at three call sites, which
-    // kept the traffic counters honest and made the monitor itself invisible:
-    // you could not tell a working uptime check from a monitor that had
-    // silently stopped, and a flood aimed at /health showed up nowhere at all.
+    // /health, /perf and /traffic are not site traffic, but they are not
+    // nothing either. They used to be dropped on the floor at three call
+    // sites, which kept the traffic counters honest and made the monitor itself
+    // invisible: you could not tell a working uptime check from a monitor that
+    // had silently stopped, and a flood aimed at /health showed up nowhere at
+    // all.
     //
-    // Counted here instead of discarded. Nothing that follows is mixed into
+    // Counted here instead of discarded. A monitor poll on ANY path is
+    // counted here: `Stats::record` recognises the three endpoints by backend
+    // name, and a poll on another path arrives on a channel already classified
+    // `Monitor` from the peer address. Nothing that follows is mixed into
     // requests_total, the hit rate, or the latency reservoirs above, so "the
     // request count stopped moving" still detects a traffic stall even while a
     // 30-second monitor keeps polling. That property is the whole reason the
@@ -407,7 +455,7 @@ pub struct Stats {
     monitor_window_added: usize,
 
     /// Per (version, interface) breakdown. Fixed-size dense table rather than
-    /// a map: six entries, indexed arithmetically, no allocation and no hash
+    /// a map: nine entries, indexed arithmetically, no allocation and no hash
     /// on the request path.
     channels: Vec<ChannelStats>,
 
@@ -506,13 +554,25 @@ impl Stats {
         channel: Channel,
         backend: &str,
     ) {
-        // /health and /perf are accounted separately and return here, so
-        // nothing below touches the traffic counters. The decision lives in
-        // this one place rather than at each call site: it used to be three
-        // `if !is_monitoring_endpoint(..)` guards in main.rs, one per protocol
-        // path, and the h3 one was added later precisely because a guard is
-        // easy to forget when a fourth call site appears.
-        if crate::health::is_monitoring_endpoint(backend) {
+        // The monitor population is accounted separately and returns here, so
+        // nothing below touches the traffic counters. Two signals make a
+        // request a monitor poll and both are already in hand:
+        //
+        //   the path    `/health`, `/perf` and `/traffic` answer from local
+        //               state and are tagged with a monitoring backend name.
+        //   the peer    a request on the TLS or QUIC listener from a local
+        //               address arrived on the monitor network, and the
+        //               serving path classified it `Iface::Monitor` before it
+        //               got here. It never needs a header or a config key.
+        //
+        // The decision lives in this one place rather than at each call site:
+        // it used to be three `if !is_monitoring_endpoint(..)` guards in
+        // main.rs, one per protocol path, and the h3 one was added later
+        // precisely because a guard is easy to forget when a fourth call site
+        // appears.
+        if crate::health::is_monitoring_endpoint(backend) || channel.iface == Iface::Monitor {
+            let channel = Channel::new(channel.version, Iface::Monitor);
+            self.channels[channel.index()].record_monitor();
             self.monitor_requests_total += 1;
             self.window_monitor_requests += 1;
             if elapsed_ns > 0 {
@@ -919,6 +979,93 @@ mod tests {
         assert_eq!(snap.monitor_requests_total, 50);
         assert_eq!(snap.requests_total, 1);
         assert!(snap.monitor_p50_ns > 0, "monitor latency not sampled");
+        // The three endpoints now also have a channel row, so a reader of
+        // `/perf` alone can see the monitor population.
+        let monitor = snap
+            .channels
+            .iter()
+            .find(|c| c.iface == "monitor")
+            .expect("monitor channel missing");
+        assert_eq!(monitor.requests, 50);
+        assert_eq!((monitor.hits, monitor.misses), (0, 0));
+    }
+
+    /// The three populations, each identified by something the connection
+    /// already proves rather than by a header or a new config key.
+    ///
+    /// This is #107's defect: a monitor poll on `/capabilities` is an ordinary
+    /// GET on the public listener, so before the peer's address class was part
+    /// of the channel it landed in `http/2/external` and moved the visitor hit
+    /// rate while no visitor had moved.
+    ///
+    /// Breaks, one per test:
+    ///
+    ///   `a_monitor_poll...` fails if `peer_iface` returns `External` for a
+    ///   private peer, which puts the poll in `requests_total` and the external
+    ///   channel.
+    ///   `a_real_external...` fails if `peer_iface` returns `Monitor` for a
+    ///   public peer, which hides real traffic from every visitor figure.
+    ///   `an_internal...` fails if `Stats::record` indexes a request on
+    ///   `Iface::Internal` as external instead of on the channel it was given,
+    ///   which is how a backbone forward would appear among visitors.
+    #[test]
+    fn a_monitor_poll_on_another_path_is_not_external_traffic() {
+        let mut s = Stats::new();
+        let poll = Channel::new(
+            Version::Http2,
+            crate::health::peer_iface("10.0.0.9".parse().unwrap()),
+        );
+        s.record(120_000, false, 200, poll, "m6-html");
+
+        assert_eq!(
+            s.requests_total, 0,
+            "the monitor poll entered requests_total"
+        );
+        assert_eq!(s.cache_misses_total, 0);
+        assert_eq!(s.monitor_requests_total, 1);
+        let snap = s.snapshot();
+        assert_eq!(snap.channels.len(), 1);
+        assert_eq!(snap.channels[0].channel, "http/2/monitor");
+        assert_eq!(snap.channels[0].requests, 1);
+        assert!(
+            snap.channels.iter().all(|c| c.iface != "external"),
+            "a monitor poll was reported as external"
+        );
+    }
+
+    #[test]
+    fn a_real_external_request_stays_external() {
+        let mut s = Stats::new();
+        let visit = Channel::new(
+            Version::Http2,
+            crate::health::peer_iface("203.0.113.7".parse().unwrap()),
+        );
+        s.record(3_000, true, 200, visit, "m6-html");
+
+        assert_eq!(s.requests_total, 1);
+        assert_eq!(s.cache_hits_total, 1);
+        assert_eq!(s.monitor_requests_total, 0);
+        let snap = s.snapshot();
+        assert_eq!(snap.channels.len(), 1);
+        assert_eq!(snap.channels[0].channel, "http/2/external");
+        assert_eq!((snap.channels[0].hits, snap.channels[0].misses), (1, 0));
+    }
+
+    #[test]
+    fn an_internal_backbone_request_stays_internal() {
+        let mut s = Stats::new();
+        // The h2c listener is internal by its socket. Its peer may forward a
+        // public visitor address, and that must not turn the forward into
+        // external traffic.
+        let forward = Channel::new(Version::Http2, Iface::Internal);
+        s.record(200_000_000, false, 200, forward, "m6-html");
+
+        assert_eq!(s.requests_total, 1);
+        assert_eq!(s.monitor_requests_total, 0);
+        let snap = s.snapshot();
+        assert_eq!(snap.channels.len(), 1);
+        assert_eq!(snap.channels[0].channel, "http/2/internal");
+        assert_eq!(snap.channels[0].requests, 1);
     }
 
     /// A monitor 5xx is not a backend error: no backend was contacted. It also
@@ -1039,7 +1186,7 @@ mod channel_tests {
     #[test]
     fn channel_index_round_trips_for_every_combination() {
         for version in [Version::Http11, Version::Http2, Version::Http3] {
-            for iface in [Iface::External, Iface::Internal] {
+            for iface in [Iface::External, Iface::Internal, Iface::Monitor] {
                 let ch = Channel::new(version, iface);
                 assert!(ch.index() < CHANNELS);
                 assert_eq!(Channel::from_index(ch.index()), ch);

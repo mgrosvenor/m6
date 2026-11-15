@@ -386,6 +386,8 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             for c in &p.metrics.channels {
                 let total = c.hits + c.misses;
                 if total == 0 {
+                    // A monitor channel has requests and no hit or miss, so it
+                    // is skipped here. This section compares visitor traffic.
                     continue;
                 }
                 // The visitor channel is marked because it is what a reader should

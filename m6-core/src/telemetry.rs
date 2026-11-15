@@ -2089,7 +2089,9 @@ pub struct StatsSnapshot {
     /// only here.
     #[serde(default)]
     pub backend_errors_by_name: std::collections::BTreeMap<String, u64>,
-    /// /health and /perf polls. Cumulative, and deliberately excluded from
+    /// Every request in the monitor population: `/health`, `/perf` and
+    /// `/traffic` polls, and any request on the TLS or QUIC listener from an
+    /// private network address. Cumulative, and deliberately excluded from
     /// `requests_total` so a stalled site is still detectable while a monitor
     /// keeps polling. Reported rather than discarded so the monitor itself is
     /// observable: a check that stops, or one that floods, shows up here.
