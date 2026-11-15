@@ -170,7 +170,7 @@ fn site_toml(backend_port: u16) -> String {
     format!(
         "[site]\nname = \"iss315\"\ndomain = \"localhost\"\n\n\
          [server]\nbackend_timeout_secs = 5\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"info\"\n\n\
          [errors]\nmode = \"internal\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
