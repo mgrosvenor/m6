@@ -246,30 +246,16 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 /// A read or parse failure is an error naming the file, a `level` that is
 /// present and not a string is an error naming the key, and any key other than
 /// `level` is an error naming the setting. An absent key keeps the default
-/// `"info"`. The refusal matches the service config: every m6 log is a JSON
-/// line, so `format` and a misspelled `level` stop the service at start.
+/// `"info"`. The table itself is read by [`crate::config::LogConfig`], which
+/// every service uses for the same table.
 pub fn read_site_log_config(site_toml: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(site_toml)
         .map_err(|e| anyhow::anyhow!("{} cannot be read: {e}", site_toml.display()))?;
     let val: toml::Value = text.parse::<toml::Value>().map_err(|e| {
         anyhow::anyhow!("{} is not valid TOML: {}", site_toml.display(), e.message())
     })?;
-    let Some(log) = val.get("log") else {
-        return Ok("info".to_string());
-    };
-    let table = log
-        .as_table()
-        .ok_or_else(|| anyhow::anyhow!("[log] must be a table"))?;
-    if let Some(key) = table.keys().find(|k| k.as_str() != "level") {
-        anyhow::bail!("unknown key [log] {key}: known keys are level");
-    }
-    match table.get("level") {
-        Some(v) => Ok(v
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
-            .to_string()),
-        None => Ok("info".to_string()),
-    }
+    let log = crate::config::LogConfig::from_toml(val.get("log"))?;
+    Ok(log.level.unwrap_or_else(|| "info".to_string()))
 }
 
 /// Parse a log level string. Accepts `trace`, `debug`, `info`, `warn` (or

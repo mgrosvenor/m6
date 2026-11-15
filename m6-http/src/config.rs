@@ -5,6 +5,11 @@ use anyhow::Context;
 use m6_core::config::secret_path;
 use serde::{Deserialize, Serialize};
 
+/// The one `[log]` type, owned by m6-core. Re-exported so this crate's `Config`
+/// uses the same type every other service uses, and `[log]` in site.toml is
+/// parsed by the same function as `[log]` in a service's own config.
+pub use m6_core::config::LogConfig;
+
 /// Full merged configuration for m6-http.
 #[derive(Debug, Clone, Serialize)]
 pub struct Config {
@@ -258,25 +263,6 @@ fn default_backend_timeout_secs() -> u64 {
 
 fn default_max_requests_per_connection() -> u32 {
     crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LogConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        LogConfig {
-            level: default_log_level(),
-        }
-    }
 }
 
 /// Per-request traffic logging (session cookie, referrer, UA, cache state,
@@ -729,7 +715,7 @@ struct RawSiteToml {
     site: Option<RawSiteSection>,
     server: Option<RawServerSection>,
     node: Option<NodeConfig>,
-    log: Option<LogConfig>,
+    log: Option<toml::Value>,
     analytics: Option<AnalyticsConfig>,
     health: Option<HealthConfig>,
     rate_limit: Option<RateLimitConfig>,
@@ -1147,9 +1133,13 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .filter(|m| !m.is_empty())
             .collect(),
     };
-    let log = site_parsed.log.unwrap_or_default();
-    m6_core::log::parse_level(&log.level)
-        .map_err(|e| anyhow::anyhow!("config error: [log] {e}"))?;
+    // The one `[log]` parse, shared with every other service. site.toml is the
+    // bottom of the precedence chain, so an absent level here is `info`.
+    let raw = LogConfig::from_toml(site_parsed.log.as_ref())
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", site_toml_path.display()))?;
+    let level = raw.level.unwrap_or_else(|| "info".to_string());
+    m6_core::log::parse_level(&level).map_err(|e| anyhow::anyhow!("config error: [log] {e}"))?;
+    let log = LogConfig { level: Some(level) };
     let analytics = site_parsed.analytics.unwrap_or_default();
     let mut health = site_parsed.health.unwrap_or_default();
     // The node's own health keys come from the system config only.
@@ -3099,6 +3089,30 @@ domain = "test.example.com"
         let (_d, r) = load_with("[log]\nlevel = \"verbose\"\n", "");
         let e = r.unwrap_err().to_string();
         assert!(e.contains("unknown log level"), "{e}");
+    }
+
+    /// site.toml's `[log]` is read into m6-core's `LogConfig`, the same type a
+    /// service's own config uses, and that value is what main hands the logger.
+    /// A second declaration in this crate used to hold the same table.
+    #[test]
+    fn a_site_toml_log_level_reaches_the_one_log_config_type() {
+        let (_d, r) = load_with("[log]\nlevel = \"warn\"\n", "");
+        let cfg = r.unwrap();
+        let level = cfg.log.level.as_deref().expect("site.toml set a level");
+        assert_eq!(level, "warn");
+        assert_eq!(
+            m6_core::log::parse_level(level).unwrap(),
+            m6_core::log::Level::Warn
+        );
+    }
+
+    /// site.toml is the bottom of the precedence chain, so an absent level
+    /// there is `info`, not "unset". `--dump-config` printed this value before
+    /// the type moved and still prints it now.
+    #[test]
+    fn an_absent_site_toml_log_level_is_info() {
+        let (_d, r) = load_with("", "");
+        assert_eq!(r.unwrap().log.level.as_deref(), Some("info"));
     }
 
     #[test]

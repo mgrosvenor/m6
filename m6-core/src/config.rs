@@ -103,10 +103,45 @@ pub struct CompressionLevel {
     pub gzip: u32,
 }
 
-/// Log configuration from `[log]` in the renderer config file.
-#[derive(Debug, Clone, Default)]
+/// Log configuration from a `[log]` table.
+///
+/// One type and one parse for every file that can set a level: `site.toml`
+/// sets the site default and a service's own config overrides it. `None` means
+/// the file did not set one, so the next source in the order decides. The
+/// level itself is parsed by [`crate::log::parse_level`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LogConfig {
     pub level: Option<String>,
+}
+
+impl LogConfig {
+    /// Parse the `[log]` table of a config file.
+    ///
+    /// An absent table is [`LogConfig::default`], which sets no level. Every
+    /// service reads the table through this function, so the same file gets
+    /// the same answer from every process: a `[log]` that is not a table, a
+    /// key other than `level`, and a `level` that is not a string are all
+    /// refused here.
+    pub fn from_toml(value: Option<&toml::Value>) -> anyhow::Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        let table = value
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("[log] must be a table"))?;
+        if let Some(key) = table.keys().find(|k| k.as_str() != "level") {
+            anyhow::bail!("unknown key [log] {key}: known keys are level");
+        }
+        let level = match table.get("level") {
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        Ok(Self { level })
+    }
 }
 
 /// Fully parsed renderer configuration.
@@ -406,7 +441,9 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     }
     check_keys(&tv, "params_cache", &["size"])?;
     check_keys(&tv, "server", &["read_timeout_s", "socket_mode"])?;
-    check_keys(&tv, "log", &["level"])?;
+    // The one `[log]` parse, kept here so a bad log table is refused before the
+    // rest of the file is read.
+    let log = LogConfig::from_toml(tv.get("log"))?;
     if let Some(toml::Value::Table(tbl)) = tv.get("compression") {
         for (mime, val) in tbl {
             let table = format!("compression.\"{mime}\"");
@@ -510,18 +547,6 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             }
         }
     }
-
-    // --- log ---
-    let log = LogConfig {
-        level: match tv.get("log").and_then(|l| l.get("level")) {
-            Some(v) => Some(
-                v.as_str()
-                    .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
-                    .to_string(),
-            ),
-            None => None,
-        },
-    };
 
     // --- site_toml ---
     let site_toml = match tv.get("site_toml") {
@@ -1045,6 +1070,29 @@ template = "templates/home.html"
             .unwrap_err()
             .to_string();
         assert!(err.contains("must be true or false"), "{err}");
+    }
+
+    /// The one `[log]` parse. A service config and site.toml reach
+    /// `LogConfig::from_toml` with the same table, so this covers the refusals
+    /// every process gives, and the level a file did set.
+    #[test]
+    fn the_one_log_parse_reads_a_level_and_refuses_the_rest() {
+        let v: toml::Value = toml::from_str("[log]\nlevel = \"warn\"\n").unwrap();
+        let log = LogConfig::from_toml(v.get("log")).unwrap();
+        assert_eq!(log.level.as_deref(), Some("warn"));
+
+        for (body, needle) in [
+            ("log = 3\n", "[log] must be a table"),
+            ("[log]\nformat = \"text\"\n", "unknown key [log] format"),
+            ("[log]\nlevel = 3\n", "[log] level must be a string"),
+        ] {
+            let v: toml::Value = toml::from_str(body).unwrap();
+            let err = LogConfig::from_toml(v.get("log")).unwrap_err().to_string();
+            assert!(err.contains(needle), "{body:?}: {err}");
+        }
+
+        let absent: toml::Value = toml::from_str("").unwrap();
+        assert_eq!(LogConfig::from_toml(absent.get("log")).unwrap().level, None);
     }
 
     #[test]
