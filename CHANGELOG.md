@@ -223,6 +223,13 @@ quiche already lower-cases the names it encodes, so HTTP/3 was correct on the wi
 Verified with `h2_serves_the_same_body_as_h1` and `h3_serves_the_same_body_as_h1`, which fetch the same cached page through a real m6-http process and compare it with HTTP/1.1.
 The h2 test fails on the previous code with a protocol error from a strict h2 client and passes after the fix.
 
+**An HTTP/3 response no longer carries the backend's connection-specific fields, which cost the whole body.**
+m6-http copied every field of a backend's HTTP/1.1 reply into the h3 field section, including `Connection: close`, which m6-html sends because it closes its connection after each page.
+RFC 9114 4.2 makes a response carrying a connection-specific field malformed, and a client MUST treat it as such: nghttp3 (curl) reset the stream and read no body, so example 08's `/logs`, 1454 bytes over HTTP/1.1, arrived as 200 with zero bytes over HTTP/3.
+HTTP/1.1 must carry the field and HTTP/2's serialiser already dropped it; both now take the connection-specific set from `m6_http_lib::fields::is_connection_specific`, which covers `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding` and `Upgrade` (RFC 9113 8.2.2, RFC 9114 4.2).
+Verified with `rfc9114_4_2_h3_serves_the_same_body_as_h1_when_the_backend_closes`, which serves a no-store page from a backend that closes its connection, fetches it over HTTP/1.1, HTTP/2 and HTTP/3 and compares the three bodies: 2671 bytes on h1 and h2 with a reset stream on h3 before the fix, 2671 on all three after it.
+On the examples' 08 stack with curl, `/logs` went from `200, 0 bytes` to `200, 1454 bytes`.
+
 **A service writes its access line at the default log level (#179).**
 `Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
 It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.

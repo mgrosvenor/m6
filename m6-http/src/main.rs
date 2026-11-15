@@ -3657,6 +3657,16 @@ fn send_h3_response(
         }
     }
     for (k, v) in headers {
+        // RFC 9114 4.2: a response must not carry connection-specific fields.
+        // They are HTTP/1.1 hop-by-hop metadata with no meaning on h3, and a
+        // client MUST treat a field section containing one as malformed:
+        // nghttp3 (curl) resets the stream and reads no body, so a page the
+        // backend answered with `Connection: close` arrived as 200 and zero
+        // bytes. HTTP/2 already drops the same set at its serialiser
+        // (`http2::is_hop_by_hop_or_length`); this path did not.
+        if m6_http_lib::fields::is_connection_specific(k) {
+            continue;
+        }
         // Omit content-length for non-empty bodies: quiche+ngtcp2 interop bug where
         // nghttp3 prematurely signals body-complete when content-length is present
         // alongside a separate DATA frame. Without it, nghttp3 reads until stream FIN.

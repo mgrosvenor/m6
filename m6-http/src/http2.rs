@@ -3051,11 +3051,12 @@ fn split_header_line(line: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// Whether a response field is one the framing layer owns and must not carry.
+///
+/// The connection-specific set comes from `fields::is_connection_specific` so
+/// h2 and h3 cannot drift apart on RFC 9113 8.2.2 / RFC 9114 4.2; h2 adds
+/// `content-length` because its serialiser writes the length it computed.
 fn is_hop_by_hop_or_length(name: &str) -> bool {
-    name.eq_ignore_ascii_case("connection")
-        || name.eq_ignore_ascii_case("transfer-encoding")
-        || name.eq_ignore_ascii_case("keep-alive")
-        || name.eq_ignore_ascii_case("content-length")
+    crate::fields::is_connection_specific(name) || name.eq_ignore_ascii_case("content-length")
 }
 
 /// Whether a cached `Link` already advertises the site description.

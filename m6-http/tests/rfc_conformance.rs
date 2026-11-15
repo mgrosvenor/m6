@@ -7,7 +7,10 @@
 //!
 //! - a backend's HTTP/2 header block split across HEADERS and CONTINUATION, and
 //!   END_STREAM arriving before END_HEADERS (RFC 9113 6.2, 6.10, 8.1);
-//! - the field names m6 writes on h2 and h3 (RFC 9113 8.2.1, RFC 9114 4.2);
+//! - the field names m6 writes on h2 and h3 (RFC 9113 8.2.1, RFC 9114 4.2),
+//!   and the connection-specific fields it must not write at all (RFC 9114 4.2);
+//! - a backend that closes its HTTP/1.1 connection, so every reply carries
+//!   `Connection: close`, which h3 must drop and h1 must keep;
 //! - `Content-Length` as `1*DIGIT` on h1 and h2 (RFC 9110 8.6, 5.6.3);
 //! - `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5).
 //!
@@ -64,6 +67,24 @@ fn body() -> Vec<u8> {
     b.extend_from_slice(b"</body>");
     b.truncate(BODY_LEN);
     b
+}
+
+/// The example 08 `/logs` shape: a page m6-html renders, with
+/// `Cache-Control: no-store` so m6-http forwards it on every request instead of
+/// answering from cache, and `Connection: close` because the backend closes its
+/// HTTP/1.1 connection after each reply. `Content-Length` is present and the
+/// body is small, so size is not what made it fail.
+fn no_store_backend_response() -> Vec<u8> {
+    let body = body();
+    let mut r = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Cache-Control: no-store\r\nLast-Modified: Sun, 15 Nov 2026 10:32:10 GMT\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    r.extend_from_slice(&body);
+    r
 }
 
 /// The backend's reply: cacheable, so every protocol's request after the warm-up
@@ -148,9 +169,12 @@ impl Fixture {
     }
 
     fn start_backend(&self) {
+        self.start_backend_with(backend_response());
+    }
+
+    fn start_backend_with(&self, reply: Vec<u8>) {
         let sock = self._dir.path().join("b-1.sock");
         let listener = UnixListener::bind(&sock).expect("bind backend socket");
-        let reply = backend_response();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -463,6 +487,21 @@ fn h3_get(port: u16, path: &str, extra: &[(&str, &str)]) -> Result<(u16, Fields,
                                 }
                             }
                         }
+                        // RFC 9114 4.2: a response carrying a connection-specific
+                        // field is malformed, and a client MUST treat it as such --
+                        // it resets the stream and reads no body. Checked here
+                        // rather than trusted to the quiche client, which is
+                        // tolerant, for the same reason the field-name case is
+                        // checked by the callers.
+                        for (name, _) in &names {
+                            if m6_http_lib::fields::is_connection_specific(name) {
+                                return Err(format!(
+                                    "HTTP/3 response carried the connection-specific field \
+                                     {name:?} (RFC 9114 4.2); a conforming client treats the \
+                                     message as malformed and reads no body"
+                                ));
+                            }
+                        }
                     }
                     Ok((sid, quiche::h3::Event::Data)) => {
                         let mut tmp = [0u8; 4096];
@@ -521,6 +560,66 @@ fn h3_serves_the_same_body_as_h1() {
         h3.len(),
         h1.len(),
         "HTTP/3 body length must equal HTTP/1.1's ({} vs {})",
+        h3.len(),
+        h1.len()
+    );
+}
+
+/// The example 08 `/logs` defect: a page the backend closes the connection on.
+///
+/// `/logs` is a rendered page from m6-html with `Cache-Control: no-store`, so
+/// m6-http forwards every request for it, and the backend answers `Connection:
+/// close` because it closes its HTTP/1.1 connection after each reply. That field
+/// reached the h3 field section unchanged. HTTP/1.1 requires it and HTTP/2's
+/// serialiser drops it, but RFC 9114 4.2 makes a response carrying it malformed,
+/// so nghttp3 (curl) reset the stream and the page arrived as 200 with zero
+/// bytes. HTTP/3 must serve the same body as HTTP/1.1 and HTTP/2, and must not
+/// carry the field at all.
+///
+/// The reproduction is a **miss** for all three protocols, so the forwarded-reply
+/// path is the one under test; the cached path is `h3_serves_the_same_body_as_h1`.
+#[test]
+fn rfc9114_4_2_h3_serves_the_same_body_as_h1_when_the_backend_closes() {
+    let fixture = Fixture::new();
+    fixture.start_backend_with(no_store_backend_response());
+    let _svc = fixture.start();
+
+    let (h1_status, h1) = h1_get(fixture.port(), &fixture.cert_der, "/");
+    assert_eq!(h1_status, 200, "HTTP/1.1 status");
+    assert_eq!(h1.len(), BODY_LEN, "HTTP/1.1 body length");
+
+    let (h2_status, _, h2) = match h2_get(fixture.port(), &fixture.cert_der, "/", &[]) {
+        Ok(result) => result,
+        Err(e) => panic!(
+            "HTTP/2 fetch failed ({}); HTTP/1.1 read {} bytes",
+            e,
+            h1.len()
+        ),
+    };
+    assert_eq!(h2_status, 200, "HTTP/2 status");
+    assert_eq!(
+        h2.len(),
+        h1.len(),
+        "HTTP/2 body length must equal HTTP/1.1's ({} vs {})",
+        h2.len(),
+        h1.len()
+    );
+
+    let (h3_status, fields, h3) = match h3_get(fixture.port(), "/", &[]) {
+        Ok(result) => result,
+        Err(e) => panic!(
+            "HTTP/3 fetch failed ({}); HTTP/1.1 read {} bytes and HTTP/2 read {}. \
+             A response field the client must treat as malformed costs the whole body.",
+            e,
+            h1.len(),
+            h2.len()
+        ),
+    };
+    assert_eq!(h3_status, 200, "HTTP/3 status");
+    assert_eq!(
+        h3.len(),
+        h1.len(),
+        "HTTP/3 body length must equal HTTP/1.1's ({} vs {}); fields: {fields:?}",
         h3.len(),
         h1.len()
     );
