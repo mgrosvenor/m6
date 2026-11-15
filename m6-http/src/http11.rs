@@ -324,8 +324,9 @@ pub const INITIAL_CONNECTIONS: usize = 1024;
 /// `bind_tcp_reuseaddr` takes a `SocketAddr` because it has to choose a socket
 /// domain before binding, which `TcpListener::bind`'s `ToSocketAddrs` hides.
 /// The first resolved address wins, which is what `TcpListener::bind` does too
-/// for a single-address host like `127.0.0.1` or `0.0.0.0`.
-fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
+/// for a single-address host like `127.0.0.1` or `0.0.0.0`. `main` resolves
+/// with this too, so a shared node's TLS and QUIC sockets bind one address.
+pub fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     addr.to_socket_addrs()?
         .next()
@@ -353,6 +354,18 @@ impl Http11Listener {
         Self::bind_maybe_tls(addr, None, max_requests, initial, ceiling)
     }
 
+    /// Wrap the TCP half of a pair bound with `SO_REUSEPORT` by
+    /// `m6_core::platform::net::listen_shared`, for `[server] reuse_port`.
+    pub fn from_shared(
+        listener: std::net::TcpListener,
+        tls_config: Arc<rustls::ServerConfig>,
+        max_requests: u32,
+        initial: usize,
+        ceiling: usize,
+    ) -> anyhow::Result<Self> {
+        Self::from_bound(listener, Some(tls_config), max_requests, initial, ceiling)
+    }
+
     fn bind_maybe_tls(
         addr: &str,
         tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -365,6 +378,16 @@ impl Http11Listener {
         // a failed bind as a warning: the process comes up with no listener at
         // all, running and healthy to systemd, serving nobody.
         let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
+        Self::from_bound(listener, tls_config, max_requests, initial, ceiling)
+    }
+
+    fn from_bound(
+        listener: std::net::TcpListener,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+        max_requests: u32,
+        initial: usize,
+        ceiling: usize,
+    ) -> anyhow::Result<Self> {
         listener.set_nonblocking(true)?;
         Ok(Http11Listener {
             listener,

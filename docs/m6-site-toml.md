@@ -264,7 +264,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 |---|---|---|
 | `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
 | `[node]` name | System config | Names this node |
-| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, max_requests_per_connection | System config | Differs per node |
+| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, max_requests_per_connection, reuse_port | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
@@ -337,9 +337,17 @@ Take from it that the bind, the certificate and the key are required, and every 
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
 | `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 | `max_requests_per_connection` | integer | no | Default `100`, and `0` is a config error. The most requests one HTTP/1.1 connection serves before m6-http closes it, so a client that makes more than this many HTTP/1.1 requests reconnects, with a new TLS handshake. System config only, read at start |
+| `reuse_port` | boolean | no | Default `false`. When `true`, only the public 443 port is shared: its TLS listener and QUIC UDP socket on `bind` are bound with `SO_REUSEPORT` in one call, so several m6-http processes serve that port. The redirect port 80, the internal h2c socket, the health endpoints and every backend socket are not shared. Linux spreads a new connection by a hash and macOS does not, so the split is not even. System config only, read at start |
 
 **Table 3: the `[server]` keys.**
 The bind addresses and the internal lists choose where the process listens and whom it trusts, and the certificate and key choose what it presents.
+
+`reuse_port` is off by default, so an accidental second m6-http on a node's public port fails at bind and an existing config binds exactly as before.
+Set it to `true` on every process that should serve the public 443 port: only its TLS listener and its QUIC UDP socket on `bind` are bound in one call, so a request is answered by one of the processes.
+That is the whole scope. No other socket is shared: the redirect listener on `redirect_bind` (port 80), the internal h2c listener on `h2c_bind`, the health endpoints and every backend socket keep the binding they had.
+A redirector binds one plain-HTTP listener on `redirect_bind` and has no TLS or QUIC listener to share.
+Linux spreads a new TCP connection by a hash of its 4-tuple and macOS does not, so the split is not even and no process is guaranteed traffic.
+A QUIC client that changes address may land on another process.
 
 The certificate and key files are read once at start.
 A renewal writes both and restarts m6-http, which then serves the new pair on HTTP/1.1, HTTP/2 and HTTP/3.
@@ -674,6 +682,7 @@ Section 8 gives the codes a failure returns.
 
 m6-http exits 0 on a clean stop, 2 on a configuration or usage error, and 1 on a runtime failure.
 A bind failure splits by listener: the TLS listener on `[server].bind` and the h2c listener on `h2c_bind` exit 1, and the HTTP/3 UDP socket on `[server].bind` exits 2.
+With `[server] reuse_port` set, the TLS listener and the QUIC socket are bound in one call before the TLS configuration is built, so a failure to bind either exits 2.
 [`m6-http.md`](m6-http.md) owns the exit-code table.
 Exit 2 repeats on every start until the operator fixes the file, and section 9 lists the checks that produce it.
 

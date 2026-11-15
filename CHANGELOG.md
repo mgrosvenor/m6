@@ -78,6 +78,14 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`[server] reuse_port` lets two or three m6-http processes serve the public 443 port.**
+It defaults to false, so an accidental second instance still fails at bind and an existing config binds exactly as before.
+When set, only the TLS listener and its QUIC UDP socket on `[server].bind` are bound through `m6_platform::net::listen_shared` with `SO_REUSEPORT`, in one call before the TLS configuration is built.
+No other socket is shared: the redirect listener on port 80, the internal h2c listener, the health endpoints and every backend socket are unchanged.
+Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and macOS does not, so the split is not even and no process is guaranteed traffic.
+A UDP datagram goes to one socket, so a QUIC client that changes address may land on another process.
+Verified on the sandbox with three m6-http processes on one port and one unix-socket backend set: every request was answered 200 before and after one process was stopped.
+
 **A count of heap allocations per request, as a test.** Building m6-http with the `count-allocations` feature counts every allocation the loop makes while serving, and logs the calls and bytes once at stop. `tests/allocations.rs` holds the count per cached request over HTTP/1.1 and HTTP/2 with TLS, per cache miss and per new connection, to a budget that only goes down. A normal build is unchanged. Verified on 2026-11-15 on a macOS sandbox with the difference of two runs on one warm connection, N = 1,000 and 2N = 2,000: 11.000 and 91.000 calls per request, 91.001 for a miss that inserts and 123.000 calls per connection. The three request budgets are the top of the observed spread, 11,003, 91,004 and 91,004 calls per 1,000 requests, with nothing added on top, and the test passed three runs in a row. The new-connection row is measured per connection and reported rather than budgeted, because a full handshake per connection varies with the server's read sizes. Adding one `String::from("x")` to the request path failed the three budgeted rows by one call per request and raised the new-connection figure by the same.
 
 **The source node holds the site's generation ID, and `/genid` there reloads every backend.** m6-http on the source node owns the ID; a `POST /genid` to it drives the reload of every member of every pool, and a member that fails is named in the log with its socket and the status it answered. Only a response carrying the current ID is stored in the cache, so a response rendered before a reload cannot be cached after it. A reload on a backend now writes an access line like any other request.

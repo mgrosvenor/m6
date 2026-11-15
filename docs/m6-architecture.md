@@ -367,7 +367,7 @@ A backend that restarts on the same path serves again on its next turn.
 
 ## 4. Why one process faces the internet
 
-Everything about the edge follows from it being the only process on a public port.
+Everything about the edge follows from it being the only process on a public port, which is what `[server] reuse_port` off, the default, keeps true. Turning that setting on lets several m6-http processes share the public port, and then the port is a set of processes rather than one.
 This section says why the protocol burden is concentrated there, why it runs one thread, why the cache is shaped as it is, why it distrusts its own clients, and why there is no fallback file.
 
 ### 4.1 Why the protocol burden is concentrated
@@ -727,7 +727,7 @@ Table 12 lists what is absent and the reason, and the last row is the one to rea
 | a build step | content authoring is not web serving. Coupling them would force m6 to hold opinions about content formats, build tools and file pipelines, and a separate tool that understands the site directory needs no m6 internals |
 | Windows | the deployment model is systemd units and Unix sockets |
 | a built-in OAuth2 or OIDC provider, MFA, WebAuthn | out of scope at 1.0 |
-| horizontal scaling of the edge itself | it is one process per node by design (§1.8) and scales through caching and more nodes |
+| horizontal scaling of the edge itself | it is one process per node by default (§1.8) and scales through caching and more nodes. `[server] reuse_port` lets several processes share the public port, which is a deliberate second way and not the model the design assumes |
 | HTTP/2 server push | the specification deprecated it, and receipt of a push promise is correctly an error |
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |

@@ -1,6 +1,6 @@
 # m6-http
 
-Reverse proxy, cache, and router. The only process in an m6 deployment that listens on a public port. Does not manage other processes — that is systemd's job.
+Reverse proxy, cache, and router. The process in an m6 deployment that listens on a public port, and the only one unless `[server] reuse_port` asks several of them to share the public port. Does not manage other processes — that is systemd's job.
 
 ---
 
@@ -33,6 +33,8 @@ Logs to stdout as structured JSON.
 6. Read renderer configs to build params-file → URL invalidation map entries
 7. Bind the TLS listener. If `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
 8. Start the event loop
+
+With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_platform::net::listen_shared`, before the TLS configuration is built. The redirect listener on port 80, the internal h2c listener, the health endpoints and every backend socket are not shared.
 
 ---
 
