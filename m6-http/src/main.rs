@@ -26,6 +26,7 @@ use m6_http_lib::cache::{
     should_cache, strip_uncacheable, Cache, CacheKey, CachedResponse, Precondition,
 };
 use m6_http_lib::config::{self, Config};
+use m6_http_lib::disk_cache::DiskWriter;
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
 use m6_http_lib::forward::{self, UpstreamId, Waiter};
@@ -33,6 +34,7 @@ use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
 use m6_http_lib::http2::SEND_QUEUE_BYTES;
+use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
 
@@ -302,6 +304,9 @@ struct ServerState {
     route_table: RouteTable,
     pool_manager: PoolManager,
     cache: Cache,
+    /// The disk copy of the cache on a cache node with `[cache] dir`.
+    /// `None` everywhere else, so a hit and a store gain one `Option` test.
+    disk: Option<DiskWriter>,
     public_key: Option<PublicKey>,
     error_mode: ErrorMode,
     stats: Stats,
@@ -718,7 +723,6 @@ struct EventLoopIo {
 /// miss that must go to a backend.
 enum Routed {
     Cached {
-        status: u16,
         entry: CachedResponse,
         age: std::time::Duration,
         set_cookie: Option<String>,
@@ -887,7 +891,6 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
         .filter(|_| analytics::is_html_response(&cached.headers))
         .map(analytics::session_cookie_header_value);
         return Routed::Cached {
-            status: cached.status,
             entry: cached,
             age,
             set_cookie,
@@ -900,9 +903,11 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     }
 }
 
-/// Handle one owned request: h2 (which builds its request in `http2.rs`) and
-/// the h1 body path. On a hit it returns the owned `Ready` form, keeping the
-/// h2 allocation profile unchanged.
+/// Handle one owned request from the HTTP/1.1 body path.
+///
+/// h2 does not reach this: `on_request_h2` answers a cached hit from borrowed
+/// views and calls `into_owned` only on a miss. On a hit here the shared
+/// `Cached` form goes back to `drive_h1`, which writes it without copying.
 fn on_request_impl(
     state: &mut ServerState,
     req: &forward::HttpRequest,
@@ -922,27 +927,20 @@ fn on_request_impl(
         h2c,
     ) {
         Routed::Cached {
-            status,
             entry,
             age,
             set_cookie,
             ..
         } => {
-            let mut headers = (*entry.headers).clone();
-            set_alt_svc(&mut headers, quic_port);
-            set_vary_accept_encoding(&mut headers, true);
-            set_age(&mut headers, age);
-            set_describedby_link(&mut headers, &state.config.site.describedby);
-            if let Some(sc) = set_cookie {
-                headers.push(("Set-Cookie".to_string(), sc));
+            // The entry is shared (`Arc` headers, `Bytes` body), so a hit
+            // carries it by reference all the way to the writer. The fields a
+            // hit adds are written from their start-time values there, in
+            // place of cloning the header list to append them.
+            RequestOutcome::Cached {
+                entry,
+                age,
+                set_cookie,
             }
-            RequestOutcome::Ready(
-                status,
-                headers,
-                entry.body.to_vec(),
-                "cache".to_string(),
-                Some(entry.genid),
-            )
         }
         Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
         Routed::Miss {
@@ -953,6 +951,62 @@ fn on_request_impl(
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
             let outcome = handle_request(
                 req,
+                client_ip,
+                enc,
+                state,
+                false,
+                h2c && state.h2c_iface == Iface::Internal,
+                registry,
+            );
+            finish_miss(state, outcome, start, version, iface, quic_port)
+        }
+    }
+}
+
+/// Handle a request decoded on an HTTP/2 connection.
+///
+/// A cache hit is answered entirely from the borrowed view: the lookup key and
+/// the header list are read out of the connection's read buffer, and the shared
+/// cache entry goes back to the writer, so this path allocates nothing.
+/// `into_owned` runs only for a miss, which is a slow path.
+fn on_request_h2(
+    state: &mut ServerState,
+    req: H2Request<'_>,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::platform::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        req.method,
+        req.path,
+        req.query,
+        "HTTP/2",
+        req.headers(),
+        client_ip,
+        h2c,
+    ) {
+        Routed::Cached {
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => RequestOutcome::Cached {
+            entry,
+            age,
+            set_cookie,
+        },
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let req = req.into_owned();
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let outcome = handle_request(
+                &req,
                 client_ip,
                 enc,
                 state,
@@ -1177,12 +1231,13 @@ fn drive_conn_token(
     let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
         on_request_head(state, head, buf, ip, quic_port, registry)
     };
-    let mut on_h2 = |state: &mut ServerState, req: &forward::HttpRequest, ip: &str| {
-        on_request_impl(state, req, ip, quic_port, registry, is_h2c)
+    let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| match req {
+        RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
+        RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
     };
     let mut drive = if is_h2c {
         match h2c.as_mut() {
-            Some(h) => h.drive_one(slot, state, &mut on_h2, registry),
+            Some(h) => h.drive_one(slot, state, &mut on_h2, &hit, registry),
             None => return ConnOutcome::Closed,
         }
     } else {
@@ -1920,6 +1975,11 @@ fn follower_answered(
         genid::Outcome::StillDown => {}
         genid::Outcome::First(id) => {
             state.cache.set_serve_held(false);
+            // The disk copy starts with the first ID. Nothing was stored
+            // before it, so this only creates the generation's directory.
+            if let Some(disk) = state.disk.as_mut() {
+                disk.use_id(id);
+            }
             info!(genid = id, "genid: upstream answered; following its ID");
         }
         genid::Outcome::Same => {
@@ -1967,6 +2027,13 @@ fn follower_change(state: &mut ServerState, from: u64, to: u64) {
     }
     drop(state.cache.swap_generation());
     state.error_pages = HashMap::new();
+    // The new generation gets its own directory. The queue and the size map
+    // are cleared and every other subdirectory is queued for removal over the
+    // ticks that follow. The swap above already emptied the memory cache, so
+    // no queued flag survives on a key this writer still holds.
+    if let Some(disk) = state.disk.as_mut() {
+        disk.use_id(to);
+    }
     info!(from, to, "genid changed");
 }
 
@@ -2332,6 +2399,8 @@ fn event_loop(
     let mut last = m6_core::platform::now();
     let mut last_log_tick = last;
     let mut accepting = tcp.is_some() || h2c.is_some();
+    // Set by a disk slice that found nothing it could do; see the slice below.
+    let mut disk_slice_stalled = false;
 
     // ALLOC-0: count this thread's allocations from the first iteration. The
     // counter is read once at stop, after the loop, where ordinary logging may
@@ -2358,6 +2427,18 @@ fn event_loop(
             .unwrap_or(tick)
             .min(tick);
         poll_timeout = poll_timeout.min(quic_timeout);
+        // A disk slice rides each idle turn: while the writer has work the
+        // loop polls with a zero timeout, so the next slice starts as soon as
+        // this turn's events are handled. A request on a descriptor is delayed
+        // by at most one slice. With the queue empty the normal wait returns.
+        if !disk_slice_stalled
+            && state
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.has_work(&state.cache))
+        {
+            poll_timeout = std::time::Duration::ZERO;
+        }
         // Edge-triggered: a capped accept leaves connections in the kernel
         // queue that the h2c listener will not be reported for again. Drain
         // before waiting, and do not block while more remain.
@@ -2603,6 +2684,30 @@ fn event_loop(
         if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
             m6_core::log::tick(m6_core::platform::wall());
             last_log_tick = now2;
+        }
+
+        // The disk cache's work: one slice of at most 1 ms per idle turn,
+        // never on the request path and never a whole queue. The writer takes
+        // the cache by `&mut`, so this is the only place it runs. The zero poll
+        // timeout above is what makes this an idle-turn slice while the queue
+        // is non-empty; the loop blocks normally again once it is empty.
+        if state
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.has_work(&state.cache))
+        {
+            if let Some(disk) = state.disk.as_mut() {
+                let stats = disk.tick(&mut state.cache);
+                // A slice that found nothing it could do will not make
+                // progress by running again at once: a persistent removal
+                // error would spin the loop at a zero timeout. Let the normal
+                // wait run before the next attempt; a slice that does work
+                // clears the flag.
+                disk_slice_stalled =
+                    stats.written == 0 && stats.removed == 0 && disk.has_work(&state.cache);
+            }
+        } else {
+            disk_slice_stalled = false;
         }
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
@@ -4280,9 +4385,13 @@ fn handle_request_inner(
                 );
                 match outcome {
                     health::PerfOutcome::Ok(report) => match state.config.genid.as_ref() {
-                        Some(genid_config) => {
-                            health::genid_perf_response(*report, &state.genid, genid_config)
-                        }
+                        Some(genid_config) => health::genid_perf_response(
+                            *report,
+                            &state.genid,
+                            genid_config,
+                            state.disk.as_ref(),
+                            state.cache.queued(),
+                        ),
                         None => health::PerfOutcome::Ok(report).into_response(),
                     },
                     other => other.into_response(),
@@ -5491,15 +5600,21 @@ fn complete_socket_response(
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
-                    state.cache.insert(
-                        key,
-                        CachedResponse {
-                            genid: stored,
-                            status: http_resp.status,
-                            headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
-                            body: Bytes::from(http_resp.body.clone()),
-                        },
-                    );
+                    // On a node with a disk writer the insert sets the entry's
+                    // queued flag in the same map write that stores it, so the
+                    // request path copies no key and pushes nothing. Nothing is
+                    // written here.
+                    let response = CachedResponse {
+                        genid: stored,
+                        status: http_resp.status,
+                        headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                        body: Bytes::from(http_resp.body.clone()),
+                    };
+                    if state.disk.is_some() {
+                        state.cache.insert_queued(key, response);
+                    } else {
+                        state.cache.insert(key, response);
+                    }
                 }
                 ReplyRule::Behind => {
                     if let Some(f) = state.genid.cache_mut() {
@@ -5694,15 +5809,19 @@ fn finalize_url_response_inner(
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
-                    state.cache.insert(
-                        key,
-                        CachedResponse {
-                            genid: stored,
-                            status: http_resp.status,
-                            headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
-                            body: Bytes::from(http_resp.body.clone()),
-                        },
-                    );
+                    // The same store as the synchronous path: the flag rides
+                    // the insert, and the disk write itself waits for the tick.
+                    let response = CachedResponse {
+                        genid: stored,
+                        status: http_resp.status,
+                        headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                        body: Bytes::from(http_resp.body.clone()),
+                    };
+                    if state.disk.is_some() {
+                        state.cache.insert_queued(key, response);
+                    } else {
+                        state.cache.insert(key, response);
+                    }
                 }
                 ReplyRule::Behind => {
                     if let Some(f) = state.genid.cache_mut() {
@@ -6428,11 +6547,26 @@ fn run(args: Vec<String>) -> i32 {
             format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
         ))
     };
+    let cache = Cache::new();
+    // The disk writer shares the memory cache's bound, so a disk copy cannot
+    // outgrow the memory it shadows. Built at start, where a missing or
+    // unwritable directory is already an error.
+    let disk = match config.cache_dir.as_ref() {
+        Some(dir) => match DiskWriter::new(dir.clone(), cache.max_bytes()) {
+            Ok(writer) => Some(writer),
+            Err(e) => {
+                eprintln!("config error: [cache].dir {}: {e}", dir.display());
+                return 2;
+            }
+        },
+        None => None,
+    };
     let mut state = ServerState {
         config,
         route_table,
         pool_manager,
-        cache: Cache::new(),
+        cache,
+        disk,
         public_key,
         error_mode,
         stats: initial_stats(),
@@ -6525,6 +6659,7 @@ mod www_redirect_tests {
     fn cfg(domain: &str, redirect_www: bool) -> Config {
         Config {
             genid: None,
+            cache_dir: None,
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: domain.to_string(),

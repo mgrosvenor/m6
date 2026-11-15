@@ -186,6 +186,16 @@ harness = false
 name = "genid_cache_allocs"
 harness = false
 
+# The disk writer's queue allocation check, on the main thread for the same
+# reason: one process-wide counter, one check at a time.
+[[test]]
+name = "disk_cache_allocs"
+harness = false
+
+# The disk cache's write and restart-read integration suite.
+[[test]]
+name = "disk_cache"
+
 # The /traffic window's per-event allocation check, on the main thread for the
 # same reason.
 [[test]]

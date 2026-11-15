@@ -45,6 +45,7 @@
 ///   repeat, and a request must not carry a response pseudo-header.
 /// - **8.3.1**: `:method`, `:scheme` and `:path` are mandatory for anything
 ///   that is not CONNECT, and `:path` must not be empty.
+#[cfg(test)]
 pub(crate) fn validate_request_headers(headers: &[(String, String)]) -> Result<(), &'static str> {
     validate_request_header_bytes(headers.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())))
 }

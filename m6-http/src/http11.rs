@@ -30,7 +30,7 @@ use rustls::ServerConnection;
 
 use crate::cache::CachedResponse;
 use crate::forward::{HttpRequest, PendingDispatch, PendingUrlContext, UpstreamId};
-use crate::http2::{H2Io, Http2Conn};
+use crate::http2::{H2Io, Http2Conn, RequestRef};
 use m6_core::event::{Slots, Taken};
 use m6_core::platform::{Interest, Registry, Token};
 
@@ -516,7 +516,7 @@ impl Http11Listener {
     ) -> ConnDrive
     where
         FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
-        FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         let mut drive = ConnDrive {
             pending: std::mem::take(&mut self.pending),
@@ -609,7 +609,7 @@ impl Http11Listener {
         let mut on_head = |_: &mut (), _: &RequestHead<'_>, _: &[u8], _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
         };
-        let mut on_owned = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_owned = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
         };
         if let Some(tls) = conn.tls.as_mut() {
@@ -1095,10 +1095,11 @@ impl H2cListener {
         key: usize,
         state: &mut S,
         on_request: &mut F,
+        hit: &HitHeaders,
         registry: &Registry,
     ) -> ConnDrive
     where
-        F: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         let mut drive = ConnDrive {
             pending: std::mem::take(&mut self.pending),
@@ -1115,6 +1116,7 @@ impl H2cListener {
             &conn.client_ip,
             state,
             on_request,
+            Some(hit),
             &mut drive.pending,
         );
         drive.moved = moved;
@@ -1213,7 +1215,7 @@ fn drive_conn<S, FH, FO>(
     drive: &mut ConnDrive,
 ) where
     FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
-    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+    FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
 {
     // Plaintext connection: HTTP/1.1 only, straight to the state machine. No
     // handshake to pump and no ALPN to dispatch on.
@@ -1246,6 +1248,7 @@ fn drive_conn<S, FH, FO>(
             &conn.client_ip,
             state,
             on_owned,
+            Some(hit),
             &mut drive.pending,
         );
         drive.moved |= moved;
@@ -1354,6 +1357,7 @@ fn drive_conn<S, FH, FO>(
                 &conn.client_ip,
                 state,
                 on_owned,
+                Some(hit),
                 &mut drive.pending,
             );
             drive.moved |= moved;
@@ -1559,7 +1563,7 @@ fn drive_h1<S, FH, FO>(
     drive: &mut ConnDrive,
 ) where
     FH: for<'a> FnMut(&mut S, &RequestHead<'a>, &'a [u8], &str) -> RequestOutcome,
-    FO: FnMut(&mut S, &HttpRequest, &str) -> RequestOutcome,
+    FO: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
 {
     loop {
         match &h1.state {
@@ -1676,7 +1680,7 @@ fn drive_h1<S, FH, FO>(
                                     crate::forward::strip_untrusted_inbound(&mut req.headers);
                                     h1.keep_alive =
                                         wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
-                                    match on_owned(state, &req, client_ip) {
+                                    match on_owned(state, RequestRef::Owned(&req), client_ip) {
                                         RequestOutcome::Ready(
                                             status,
                                             resp_headers,
@@ -1706,8 +1710,28 @@ fn drive_h1<S, FH, FO>(
                                             h1.state = H1State::WaitingBackend;
                                             break; // the upstream's completion resumes this connection
                                         }
-                                        RequestOutcome::Cached { .. } => {
-                                            unreachable!("the owned path returns Ready, not Cached")
+                                        RequestOutcome::Cached {
+                                            entry,
+                                            age,
+                                            set_cookie,
+                                        } => {
+                                            // A hit on a body-bearing request is
+                                            // written from the entry's own
+                                            // bytes, the same as the bodyless
+                                            // fast path.
+                                            let hit = hit.expect("cached hit carries hit headers");
+                                            h1.out_buf.clear();
+                                            write_cached_h1(
+                                                &mut h1.out_buf,
+                                                &entry,
+                                                age,
+                                                hit,
+                                                set_cookie.as_deref(),
+                                                &req.method,
+                                                h1.keep_alive,
+                                            );
+                                            h1.state = H1State::Writing { pos: 0 };
+                                            continue;
                                         }
                                     }
                                 }

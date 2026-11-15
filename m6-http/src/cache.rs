@@ -429,6 +429,12 @@ struct CacheEntry {
     /// Instant past which even a stale serve is refused. Equal to
     /// `expires_at` when the response did not permit stale serving at all.
     serve_stale_until: Option<std::time::Instant>,
+    /// Whether this entry's key is on the disk writer's ring.
+    ///
+    /// The writer's dedup is this flag rather than a second set: set when the
+    /// key is pushed, cleared when a tick takes it. A re-store before the tick
+    /// preserves the flag, so the tick writes the current entry once.
+    queued: bool,
     /// Roughly how many bytes this entry holds, for the capacity bound.
     ///
     /// Body plus header strings plus the key. Approximate on purpose: the
@@ -497,14 +503,24 @@ static READ_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 use std::sync::{Arc, RwLock};
 
+/// The two counters a cache keeps in step with its map.
+///
+/// They share one allocation so a generation swap allocates the map and this,
+/// and nothing else. The queued count is what lets an idle tick skip the scan.
+struct Counters {
+    /// Total footprint of everything in `map`, maintained on insert and evict.
+    bytes: std::sync::atomic::AtomicUsize,
+    /// Entries whose `queued` flag is set, for the disk writer.
+    queued: std::sync::atomic::AtomicUsize,
+}
+
 /// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap, and
 /// [`Cache::swap_generation`] publishes a whole new generation with one
 /// assignment.
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,
-    /// Total footprint of everything in `map`, maintained on insert and evict.
-    bytes: Arc<std::sync::atomic::AtomicUsize>,
+    counters: Arc<Counters>,
     max_bytes: usize,
     /// Serve an entry that is past its freshness and stale windows rather than
     /// asking the backend, while this node's upstream is down.
@@ -529,7 +545,10 @@ impl Cache {
     pub fn with_max_bytes(max_bytes: usize) -> Self {
         Cache {
             map: Arc::new(RwLock::new(CacheMap::new())),
-            bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            counters: Arc::new(Counters {
+                bytes: std::sync::atomic::AtomicUsize::new(0),
+                queued: std::sync::atomic::AtomicUsize::new(0),
+            }),
             max_bytes,
             serve_held: false,
         }
@@ -548,7 +567,9 @@ impl Cache {
 
     /// Total bytes currently held.
     pub fn bytes_held(&self) -> usize {
-        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+        self.counters
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A cache whose hasher is seeded deterministically. **Benchmarks only.**
@@ -576,7 +597,10 @@ impl Cache {
         );
         Cache {
             map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))),
-            bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            counters: Arc::new(Counters {
+                bytes: std::sync::atomic::AtomicUsize::new(0),
+                queued: std::sync::atomic::AtomicUsize::new(0),
+            }),
             max_bytes: DEFAULT_MAX_BYTES,
             serve_held: false,
         }
@@ -773,12 +797,83 @@ impl Cache {
         Some((entry.response.clone(), age))
     }
 
+    /// Any entry for `key`, at any age, without touching its read order.
+    ///
+    /// The disk writer's read: a write is not a visit by a client, and making
+    /// it one would keep junk alive in the eviction order. The clone is an
+    /// `Arc` and a `Bytes`, the same refcount bumps a hit makes.
+    pub fn get_any<Q>(&self, key: &Q) -> Option<CachedResponse>
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let map = self.map.read().ok()?;
+        map.get(key).map(|e| e.response.clone())
+    }
+
+    /// Entries waiting for the disk writer.
+    pub fn queued(&self) -> usize {
+        self.counters
+            .queued
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Visit every entry whose `queued` flag is set, in map order, and clear
+    /// the flag of each one the closure accepts.
+    ///
+    /// The closure returns `true` to consume the entry, which clears its flag,
+    /// or `false` to stop and leave that entry and the rest queued. The disk
+    /// writer uses `false` when the tick's byte budget is spent. This is the
+    /// whole queue: a store sets one bool, and nothing is copied or pushed, so
+    /// the request path allocates nothing for the writer.
+    pub fn scan_queued(&mut self, mut f: impl FnMut(&CacheKey, &CachedResponse) -> bool) {
+        let Ok(mut map) = self.map.write() else {
+            return;
+        };
+        let mut cleared = 0usize;
+        for (key, entry) in map.iter_mut() {
+            if !entry.queued {
+                continue;
+            }
+            if !f(key, &entry.response) {
+                break;
+            }
+            entry.queued = false;
+            cleared += 1;
+        }
+        if cleared > 0 {
+            self.counters
+                .queued
+                .fetch_sub(cleared, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The bound this cache was built with, which the disk writer shares so a
+    /// disk copy cannot outgrow its memory original.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Store a response. Only call if the response should be cached.
+    pub fn insert(&self, key: CacheKey, response: CachedResponse) {
+        self.insert_impl(key, response, false);
+    }
+
+    /// Store a response and mark it for the disk writer in the same step.
+    ///
+    /// This is the store path on a node with `[cache] dir`. The marking is one
+    /// bool on the entry the insert is building, so it costs no key copy and
+    /// no queue push.
+    pub fn insert_queued(&self, key: CacheKey, response: CachedResponse) {
+        self.insert_impl(key, response, true);
+    }
+
     /// Store a response. Only call if the response should be cached.
     ///
     /// Deadlines are derived from the response's own `Cache-Control` here
     /// rather than passed in, so every caller gets correct expiry without
     /// having to know about it.
-    pub fn insert(&self, key: CacheKey, response: CachedResponse) {
+    fn insert_impl(&self, key: CacheKey, response: CachedResponse, queued: bool) {
         let d = directives(&response.headers);
         let now = m6_core::platform::now();
         // Any `Age` the upstream already declared. A response that reached us
@@ -858,6 +953,13 @@ impl Cache {
         let serve_stale_until = expires_at.map(|e| e + stale_window);
         let footprint = entry_footprint(&key, &response);
         if let Ok(mut map) = self.map.write() {
+            // A re-store before the disk writer's tick must keep the entry's
+            // queued flag: the writer writes the current entry once, so the
+            // replacement is the one that gets written and the ring does not
+            // grow a duplicate. This one extra probe is on the store path,
+            // never on a hit.
+            let was_queued = map.get(&key).is_some_and(|e| e.queued);
+            let is_queued = queued || was_queued;
             let replaced = map.insert(
                 key,
                 CacheEntry {
@@ -866,6 +968,7 @@ impl Cache {
                     upstream_age,
                     expires_at,
                     serve_stale_until,
+                    queued: is_queued,
                     footprint,
                     last_read: std::sync::atomic::AtomicU64::new(
                         READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -874,11 +977,19 @@ impl Cache {
             );
             let freed = replaced.map(|e| e.footprint).unwrap_or(0);
             let held = self
+                .counters
                 .bytes
                 .fetch_add(footprint, std::sync::atomic::Ordering::Relaxed)
                 .saturating_sub(freed)
                 + footprint;
-            self.bytes.store(held, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .bytes
+                .store(held, std::sync::atomic::Ordering::Relaxed);
+            if is_queued && !was_queued {
+                self.counters
+                    .queued
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if held > self.max_bytes {
                 self.evict_until_under(&mut map);
             }
@@ -921,7 +1032,10 @@ impl Cache {
             .collect();
         entries.sort_unstable_by_key(|(tick, _)| *tick);
 
-        let mut held = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut held = self
+            .counters
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut cutoff = 0u64;
         for (tick, footprint) in &entries {
             if held <= target {
@@ -933,18 +1047,29 @@ impl Cache {
 
         let before = map.len();
         let mut freed = 0usize;
+        let mut dropped_queued = 0usize;
         map.retain(|_, e| {
             let keep = e.last_read.load(std::sync::atomic::Ordering::Relaxed) >= cutoff;
             if !keep {
                 freed += e.footprint;
+                if e.queued {
+                    dropped_queued += 1;
+                }
             }
             keep
         });
+        if dropped_queued > 0 {
+            self.counters
+                .queued
+                .fetch_sub(dropped_queued, std::sync::atomic::Ordering::Relaxed);
+        }
         let now_held = self
+            .counters
             .bytes
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(freed);
-        self.bytes
+        self.counters
+            .bytes
             .store(now_held, std::sync::atomic::Ordering::Relaxed);
         m6_core::log::info!(
             dropped = before - map.len(),
@@ -993,8 +1118,14 @@ impl Cache {
                     // drifts up while the map shrinks and the cache evicts on
                     // every insert forever. Deploys call this on every
                     // invalidation, so the drift would be relentless.
-                    self.bytes
+                    self.counters
+                        .bytes
                         .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
+                    if e.queued {
+                        self.counters
+                            .queued
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -1011,7 +1142,12 @@ impl Cache {
     pub fn clear(&self) {
         if let Ok(mut map) = self.map.write() {
             map.clear();
-            self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .bytes
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .queued
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
