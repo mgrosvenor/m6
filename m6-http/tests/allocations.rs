@@ -55,19 +55,19 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // cache, ALLOC-3 rendering) lowers the row it attacks. Never raise one: a count
 // above its budget is the defect the guard exists for.
 //
-// The integer the code makes is 11 for h1_tls_hit, 91 for h2_tls_hit and 91 for
-// h1_tls_miss_insert plus the one cache-table growth that its 1,000 inserts
-// trigger. The difference did not repeat exactly under load: over the runs h1
-// read 10.997 to 11.003, h2 90.996 to 91.004 and the miss row 90.998 to 91.004.
-// Each budget is the top of that observed spread, with nothing added on top:
-// 11,003, 91,004 and 91,004. The new-connection row is a measure, not a budget:
-// a full handshake per connection read 122.859 to 123.849 per connection across
-// the same runs, so a per-connection ceiling would flake. It is reported. A path
-// that allocates one more time per request adds 1,000 and fails the three
-// budgeted rows, which is the break.
-const H1_TLS_HIT_CALLS: u64 = 11_003;
+// The integer the code makes after ALLOC-H1's first phase is 2 for h1_tls_hit
+// (the two rustls calls; the writer and the read buffer are the connection's
+// own), 91 for h2_tls_hit and 87 for h1_tls_miss_insert plus the one
+// cache-table growth that its 1,000 inserts trigger. The phase lowered the h1
+// hit and miss budgets to the counts it measured: 2,200 and 87,204. The
+// new-connection row is a measure, not a budget: a full handshake per
+// connection read 122.859 to 123.849 per connection across the same runs, so a
+// per-connection ceiling would flake. It is reported. A path that allocates one
+// more time per request adds 1,000 and fails the three budgeted rows, which is
+// the break.
+const H1_TLS_HIT_CALLS: u64 = 2_200;
 const H2_TLS_HIT_CALLS: u64 = 91_004;
-const H1_TLS_MISS_INSERT_CALLS: u64 = 91_004;
+const H1_TLS_MISS_INSERT_CALLS: u64 = 87_204;
 
 /// The number of requests in the short run. The budgets are per 1,000 of the
 /// row's unit, which is this many.
