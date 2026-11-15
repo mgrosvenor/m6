@@ -41,7 +41,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
 use std::sync::Arc;
@@ -172,6 +172,35 @@ impl Server {
         // answer within the bound. Both are the "refused to answer" outcome
         // `assert_concluded` already treats as legitimate for garbage.
         m6_core::testkit::read_one(&mut s, &method).unwrap_or_default()
+    }
+
+    /// Send raw bytes, read one response, and report whether the peer closed
+    /// the connection within the bound.
+    ///
+    /// `raw` stops at the end of a response and cannot see what happens next,
+    /// so "answered 400 with the connection closed" needs the extra read this
+    /// makes. A read that would block is a peer that kept the connection open.
+    fn raw_and_closed(&self, bytes: &[u8]) -> (Vec<u8>, bool) {
+        let Some(mut s) = self.connect() else {
+            return (Vec::new(), true);
+        };
+        if s.write_all(bytes).is_err() {
+            return (Vec::new(), true);
+        }
+        let _ = s.flush();
+        let method = bytes.split(|b| *b == b' ').next().unwrap_or(b"GET");
+        let method = String::from_utf8_lossy(method);
+        let resp = m6_core::testkit::read_one(&mut s, &method).unwrap_or_default();
+        let mut extra = [0u8; 1];
+        let closed = match s.read(&mut extra) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        };
+        (resp, closed)
     }
 
     /// Wait until a request actually reaches the backend.
@@ -415,22 +444,37 @@ fn content_length_with_transfer_encoding_is_not_accepted() {
     s.assert_still_healthy("CL + TE");
 }
 
-/// A negative or non-numeric length must not be parsed as a number, wrap, or
-/// be treated as absent.
+/// A length that is not `1*DIGIT` must be refused, not parsed as a number, not
+/// ignored, and not treated as absent.
+///
+/// The four values are the ones CHANGELOG.md names. `+5` is the regression:
+/// Rust's integer parser reads a leading `+`, so the old parser took it as 5
+/// and then waited for a body the client never sent. `-5`, `5x` and an empty
+/// value already failed to parse, so they pin that the refusal stays a 400
+/// with the connection closed rather than a silent keep-alive.
+///
+/// The assertion is deliberately exact. An empty reply or any 4xx used to
+/// count as "concluded", which passes whether or not the parser rejects
+/// anything: `raw` returns empty when its one-second read bound expires, and
+/// that is exactly what a server waiting for the missing body produces.
 #[test]
 fn malformed_content_length_values_are_rejected() {
     let s = start_server();
-    for bad in ["-1", "abc", "1 2", "0x10", "+5", "99999999999999999999999"] {
+    for bad in ["+5", "-5", "5x", ""] {
         let req = format!(
             "POST /public/open.txt HTTP/1.1\r\nHost: localhost\r\n\
              Content-Length: {bad}\r\nConnection: close\r\n\r\n"
         );
-        let resp = s.raw(req.as_bytes());
-        assert_concluded(&resp, &format!("content-length: {bad}"));
+        let (resp, closed) = s.raw_and_closed(req.as_bytes());
         let head = head_of(&resp);
         assert!(
-            resp.is_empty() || head.starts_with("HTTP/1.1 4"),
-            "Content-Length {bad:?} should be refused, got:\n{head}"
+            head.starts_with("HTTP/1.1 400"),
+            "Content-Length {bad:?} must be answered 400, got:\n{head}\n\
+             (an empty reply means the server waited for a body it was never sent)"
+        );
+        assert!(
+            closed,
+            "the 400 for Content-Length {bad:?} must close the connection"
         );
         s.assert_still_healthy(&format!("content-length: {bad}"));
     }

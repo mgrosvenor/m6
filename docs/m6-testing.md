@@ -43,8 +43,8 @@ Take from it that only the last one runs everything.
 
 | command | what it runs |
 |---|---|
-| `cargo test --workspace -- --test-threads=1` | every unit and integration test |
-| `./check.sh` | release build, clippy, tests, formatting, conformance, benchmarks |
+| `cargo test --workspace --no-fail-fast` | every unit and integration test |
+| `./check.sh` | dev build, clippy, tests, formatting, conformance, benchmarks (with the release build conformance needs) |
 | `./check.sh --no-bench` | the same without the benchmarks |
 | `tools/conformance.sh [h1\|h2\|h3\|resume]` | one protocol, or all of them with no argument |
 | `M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh` | all of it, on Linux, with the testers installed |
@@ -54,9 +54,9 @@ Take from it that only the last one runs everything.
 
 Three rules apply to all of them:
 
-- **`--test-threads=1` is not caution.**
-  Three of m6-http's suites (`edge_proxy.rs`, `security_e2e.rs`, `analytics_e2e.rs`) start real processes on fixed loopback ports.
-  Run them concurrently and their test functions race for those ports, then fail with 502s that have nothing to do with the code.
+- **Tests share one machine, not one port.**
+  Every integration suite claims a free loopback port from `testkit::claim_port` and holds it for the service's lifetime, so the suite runs on the harness's default threads.
+  A suite that binds a fixed port, or two test runs at once on one host, reintroduces the 502s and bind failures the claim exists to close.
 - **Run the gate on the build host.**
   The performance check failed its own second run on a laptop because a release build was going at the same time, which moved the readings by half.
   The conformance testers are not installed on a laptop at all.
@@ -98,6 +98,18 @@ The gate builds `cargo build --workspace --bins` in the dev profile before `carg
 The scripts do not use `binary`.
 `tools/conformance.sh` and `tools/perfcheck.sh` run `target/release` directly and refuse to start when it is missing, so run `cargo build --workspace --release` before them.
 `bench.sh` builds the release binaries it needs itself.
+
+### 3.1. The accounting-tick test hook
+
+`m6-http` runs its accounting stats every ten seconds, and `Stats::new()` is the whole production value: no config key chooses it.
+
+Two integration suites, `metrics_access` and `loop_never_waits`, assert on the tick and spawn the real binary, so a `#[cfg(test)]` default cannot reach them.
+
+A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` and uses that many seconds when it parses as a positive integer.
+
+A developer who runs a debug `m6-http` by hand inherits the hook: exporting the variable shortens that process's tick, and every `/perf` trace window with it.
+
+A release build does not read the variable, so a released service always ticks at ten seconds.
 
 ## 4. Conformance: h1spec, h2spec and h3spec
 

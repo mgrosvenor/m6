@@ -2528,7 +2528,10 @@ mod tests {
     #[test]
     fn the_file_stays_under_its_cap_and_prunes_whole_polls() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Store::open(&cfg(dir.path(), 1)).unwrap();
+        // The assertion below is this cap plus one SQLite page, so the two
+        // move together. A 1 MB cap with a 2 MB bound let a 1.9 MB file pass a
+        // test whose name says the file stays under its cap.
+        let mut s = Store::open(&cfg(dir.path(), 2)).unwrap();
         let mut pruned = 0;
         for k in 0..1500 {
             let mut rs = vec![reading("a"), reading("b"), reading("c")];

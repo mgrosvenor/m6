@@ -1139,17 +1139,16 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
     );
 }
 
-/// A client that closes while its `/slow` is in flight does not leak the pool
-/// member: when the reply arrives for the gone waiter, the member is released,
-/// and the two requests that follow still land one on each member.
+/// A client that closes while its `/slow` is in flight must leave the pool
+/// usable: when the reply arrives for the gone waiter, both members are still
+/// in rotation, and the two requests that follow land one on each.
 ///
-/// The spread is incidental to the leak. It says both members are in rotation
-/// and reachable after the closed client, which a member taken out of service
-/// fails. A single leaked in-flight count has no external observable here: a
-/// two-member pool still picks that member for one of two overlapping
-/// requests. The two commands do overlap, because the backends release every
-/// held reply only once the second has arrived, so the distribution is the
-/// sequence and no duration is asserted.
+/// This proves rotation, not release. A leaked in-flight count that still lets
+/// the member be picked would pass it, because a single leaked count has no
+/// external observable here: a two-member pool still picks that member for one
+/// of two overlapping requests. The two commands do overlap, because the
+/// backends release every held reply only once the second has arrived, so the
+/// distribution is the sequence and no duration is asserted.
 #[test]
 fn a_closed_client_does_not_leak_its_upstream() {
     let fx = Fixture::start(2, 30, "leak");

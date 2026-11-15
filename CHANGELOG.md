@@ -125,10 +125,10 @@ A client that makes more requests than this on one connection reconnects, with a
 
 ### Security
 
-**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` or a `-5` is refused instead of read as 5 (RFC 9110 8.6).**
-A signed value was parsed as its digits, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
-A value with any other byte is now a malformed message, answered 400 with the connection closed, and a digits-only value is served as before.
-Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5 ` and `0x5` over a keep-alive connection and fails on the old parser by waiting out the read timeout.
+**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
+Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
+A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.
+Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5x` and an empty value with `Connection: close`, and asserts each is answered 400 with the connection closed. On the old parser the `+5` case is answered with nothing inside the read bound, so that case fails.
 
 **SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected; no configuration changes.
 

@@ -1145,10 +1145,18 @@ impl FileBackend {
         let mut stream = UnixStream::connect(&self.socket).expect("connect to m6-file");
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
         // The backend can refuse an oversized head and close while this write
-        // is still in flight, which surfaces as BrokenPipe. The reply is the
-        // assertion; write failure only means the refusal came first.
-        let _ = stream.write_all(request);
-        stream.flush().ok();
+        // is still in flight, which surfaces as BrokenPipe. That refusal is the
+        // reply the caller asserts. Any other write failure leaves the request
+        // unsent, so the reply would prove nothing.
+        if let Err(e) = stream.write_all(request).and_then(|()| stream.flush()) {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "writing the request to m6-file failed: {e}"
+            );
+        }
         read_reply(&mut stream)
     }
 }

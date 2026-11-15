@@ -1,8 +1,8 @@
 //! A full destination never blocks, keeps the buffered lines, and reports the
 //! count it dropped once it drains.
 //!
-//! Both tests replace process standard output, so this binary is run with
-//! `--test-threads=1`.
+//! Both behaviours replace process standard output, so they run one after the
+//! other inside one `#[test]`. The binary needs no `--test-threads=1`.
 
 #![allow(
     clippy::disallowed_methods,

@@ -126,9 +126,11 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 /// The cost production hashes at.
 ///
 /// A test fixture that needs a user hashes it at bcrypt's lowest cost, 4, through
-/// `user_create_with_cost` or `user_set_password_with_cost`. The production
-/// functions pass this number, and `production_hashes_at_cost_twelve` reads it,
-/// so no test can lower the round count a deployed site uses.
+/// `user_create_with_cost` or `user_set_password_with_cost`, which only exist
+/// under `cfg(test)` or the `testkit` feature. The production functions pass
+/// this number, and `production_hashes_at_cost_twelve` hashes through
+/// `user_create` and reads the cost out of the stored hash, so a call site
+/// cannot lower the round count a deployed site uses.
 const BCRYPT_COST: u32 = 12;
 
 /// A fixed cost-12 bcrypt hash, verified on the missing-user path so a login
@@ -231,7 +233,7 @@ impl Db {
     // ── User ops ─────────────────────────────────────────────────────────────
 
     pub fn user_create(&self, username: &str, password: &str, roles: &[&str]) -> Result<User> {
-        self.user_create_with_cost(username, password, roles, BCRYPT_COST)
+        self.user_create_at_cost(username, password, roles, BCRYPT_COST)
     }
 
     /// As [`Db::user_create`], hashing at `cost`.
@@ -240,7 +242,22 @@ impl Db {
     /// lowest cost, 4, which an unoptimised build hashes in a fraction of the
     /// time. The production path passes `BCRYPT_COST`, and no site setting
     /// chooses the round count.
+    ///
+    /// Compiled only for this crate's tests or with the `testkit` feature,
+    /// which the fixture crates enable from their dev-dependencies. A
+    /// production build cannot call this with a cost below [`BCRYPT_COST`].
+    #[cfg(any(test, feature = "testkit"))]
     pub fn user_create_with_cost(
+        &self,
+        username: &str,
+        password: &str,
+        roles: &[&str],
+        cost: u32,
+    ) -> Result<User> {
+        self.user_create_at_cost(username, password, roles, cost)
+    }
+
+    fn user_create_at_cost(
         &self,
         username: &str,
         password: &str,
@@ -355,18 +372,25 @@ impl Db {
     }
 
     pub fn user_set_password(&self, username: &str, password: &str) -> Result<()> {
-        self.user_set_password_with_cost(username, password, BCRYPT_COST)
+        self.user_set_password_at_cost(username, password, BCRYPT_COST)
     }
 
     /// As [`Db::user_set_password`], hashing at `cost`.
     ///
-    /// The production path passes `BCRYPT_COST`. A test fixture passes 4.
+    /// The production path passes `BCRYPT_COST`. A test fixture passes 4, and
+    /// this is compiled only for this crate's tests or with the `testkit`
+    /// feature the fixture crates enable from their dev-dependencies.
+    #[cfg(any(test, feature = "testkit"))]
     pub fn user_set_password_with_cost(
         &self,
         username: &str,
         password: &str,
         cost: u32,
     ) -> Result<()> {
+        self.user_set_password_at_cost(username, password, cost)
+    }
+
+    fn user_set_password_at_cost(&self, username: &str, password: &str, cost: u32) -> Result<()> {
         let hash = bcrypt::hash(password, cost)?;
         let n = self.0.execute(
             "UPDATE users SET password = ?1 WHERE username = ?2",
@@ -762,26 +786,35 @@ mod tests {
 
     /// Production hashes at cost 12 even though these tests hash at 4.
     ///
-    /// Lowering `BCRYPT_COST` would weaken every stored password in the field,
-    /// and it is the kind of change that ships silently because nothing reads
-    /// the number. This reads it.
+    /// Reading `BCRYPT_COST` alone would not catch a call site that passed
+    /// some other number to `user_create`. This hashes through `user_create`
+    /// and reads the cost back out of the stored bcrypt hash, so lowering the
+    /// round count anywhere on the production path fails it.
     #[test]
     fn production_hashes_at_cost_twelve() {
-        // Read through functions, because an assertion about a constant
-        // expression is rejected by clippy and the number is exactly what this
-        // test exists to read.
-        fn production_cost() -> u32 {
-            BCRYPT_COST
-        }
+        let (db, _f) = tmp_db();
+        db.user_create("cost-check", "hunter2", &["user"])
+            .expect("create a user at production's cost");
+        let hash: String =
+            db.0.query_row(
+                "SELECT password FROM users WHERE username = ?1",
+                ["cost-check"],
+                |row| row.get(0),
+            )
+            .expect("the stored hash");
+        // bcrypt's modular crypt format: $2b$<cost>$<salt><hash>.
+        let cost: u32 = hash
+            .split('$')
+            .nth(2)
+            .and_then(|field| field.parse().ok())
+            .unwrap_or_else(|| panic!("not a bcrypt hash: {hash}"));
         assert_eq!(
-            production_cost(),
-            12,
-            "the production bcrypt cost was lowered, which weakens every stored password"
+            cost, 12,
+            "user_create hashed at cost {cost}, so every stored password is weaker than production requires"
         );
         assert!(
-            TEST_BCRYPT_COST < production_cost(),
-            "the test cost {TEST_BCRYPT_COST} is not cheaper than production's {}",
-            production_cost()
+            TEST_BCRYPT_COST < cost,
+            "the test cost {TEST_BCRYPT_COST} is not cheaper than production's {cost}"
         );
     }
 
