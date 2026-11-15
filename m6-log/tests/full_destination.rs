@@ -1,8 +1,8 @@
 //! A full destination never blocks, keeps the buffered lines, and reports the
 //! count it dropped once it drains.
 //!
-//! Both tests replace process standard output, so this binary is run with
-//! `--test-threads=1`.
+//! Both behaviours replace process standard output, so they run one after the
+//! other inside one `#[test]`. The binary needs no `--test-threads=1`.
 
 #![allow(
     clippy::disallowed_methods,
@@ -29,8 +29,19 @@ const LINES: u64 = 100_000;
 const PROMPTLY: Duration = Duration::from_secs(2);
 const DEADLINE: Duration = Duration::from_secs(5);
 
+/// Both behaviours below replace the process's standard output, and the
+/// harness writes its own `test ... ok` lines to that same descriptor. Two
+/// `#[test]` functions in one binary therefore race the harness against the
+/// redirect even though the bodies take turns on `STDOUT`: the failure is an
+/// empty line in the captured stream ("every line is JSON: EOF"). They are one
+/// test so the harness has no output to write between them.
 #[test]
 fn a_full_destination_never_blocks_and_drops_are_counted() {
+    a_never_blocking_destination_drops_and_reports();
+    a_refused_report_keeps_the_count();
+}
+
+fn a_never_blocking_destination_drops_and_reports() {
     let _stdout = STDOUT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -93,8 +104,7 @@ fn a_full_destination_never_blocks_and_drops_are_counted() {
 
 /// A report line the destination refuses must not consume the failed count:
 /// the next report, once the destination accepts, still names the whole loss.
-#[test]
-fn a_refused_report_keeps_the_dropped_count() {
+fn a_refused_report_keeps_the_count() {
     let _stdout = STDOUT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

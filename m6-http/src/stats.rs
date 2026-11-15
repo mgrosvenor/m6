@@ -421,6 +421,9 @@ pub struct Stats {
     pub rps_peak: u64,
     window_start: Instant,
     last_emit: Instant,
+    /// How often the periodic line is emitted and `/perf`'s loop trace is
+    /// refreshed. `EMIT_INTERVAL_SECS` in production.
+    emit_interval: std::time::Duration,
     /// The loop trace, copied on the accounting tick and served by `/perf`.
     event_loop: [m6_core::event::TriggerReport; 16],
     event_loop_len: usize,
@@ -434,6 +437,11 @@ impl Default for Stats {
 
 impl Stats {
     pub fn new() -> Self {
+        Self::with_interval(std::time::Duration::from_secs(EMIT_INTERVAL_SECS))
+    }
+
+    /// As [`Stats::new`], with a chosen accounting interval.
+    pub fn with_interval(emit_interval: std::time::Duration) -> Self {
         let now = m6_core::platform::now();
         Stats {
             requests_total: 0,
@@ -464,6 +472,7 @@ impl Stats {
             rps_peak: 0,
             window_start: now,
             last_emit: now,
+            emit_interval,
             event_loop: [m6_core::event::TriggerReport::default(); 16],
             event_loop_len: 0,
         }
@@ -582,7 +591,7 @@ impl Stats {
     pub fn maybe_emit(&mut self, pool_members: usize) -> bool {
         let now = m6_core::platform::now();
         let elapsed = now.duration_since(self.last_emit);
-        if elapsed.as_secs() < EMIT_INTERVAL_SECS {
+        if elapsed < self.emit_interval {
             return false;
         }
 

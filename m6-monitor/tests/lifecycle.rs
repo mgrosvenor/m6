@@ -310,6 +310,14 @@ fn the_monitor_runs_one_thread() {
     let plain = settled_threads(svc2.pid(), &svc2);
     drop(svc2);
     assert_single_loop("three nodes with tunnels", plain, workers);
+    // One process, three nodes: a thread per node would add two to this count
+    // relative to the one-node run, beyond the platform workers' swing.
+    assert!(
+        plain <= one + 1,
+        "three nodes run {plain} threads against one node's {one}: a thread per node \
+         adds one per node, and the platform workers swing by at most one between \
+         these two processes"
+    );
 
     let config_text = config_text.replace(
         "\nwg_handshakes_file",
@@ -329,12 +337,18 @@ fn assert_single_loop(what: &str, count: usize, workers: usize) {
     // The log writer is a thread even when the log goes to stdout, so the loop
     // and the writer are two. LOG-2 replaces tracing-appender and this becomes
     // one.
+    // The platform's certificate-store workers are spawned by the service's
+    // own store read and can exit before the probe in THIS process runs, so the
+    // probe can read 0 while the service still holds four (macOS leaves three
+    // or four idle). The bound allows that whole range above the measured
+    // count; the three-node comparison below is what still fails a thread per
+    // node.
     let expected = 1 + LOG_WRITER_THREADS + workers;
     assert!(
-        (expected.saturating_sub(1)..=expected + 1).contains(&count),
+        (expected.saturating_sub(1)..=expected + 4).contains(&count),
         "{what}: m6-monitor runs {count} threads, not the one loop thread, \
          tracing-appender's writer until LOG-2 and the platform's {workers} \
-         certificate-store worker(s), give or take the one those swing by"
+         certificate-store worker(s), up to four of which can outlive the probe"
     );
 }
 

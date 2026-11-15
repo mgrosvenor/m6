@@ -203,6 +203,14 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
     b
 }
 
+/// RFC 9110 5.6.3 optional whitespace: SP and HTAB, and nothing else.
+///
+/// `str::trim` also strips VT, FF and Unicode whitespace, so `Content-Length:
+/// \x0B5` was read as 5 even though the field grammar is `1*DIGIT` with OWS.
+fn trim_ows(value: &str) -> &str {
+    value.trim_matches([' ', '\t'])
+}
+
 /// Largest decoded chunked body accepted, matching the Content-Length cap.
 const MAX_CHUNKED_BODY: usize = 16 * 1024 * 1024;
 
@@ -754,7 +762,7 @@ fn finish_head<'a>(
             let Ok(value) = std::str::from_utf8(h.value) else {
                 return HeadResult::Error(HeadError::Malformed);
             };
-            let value = value.trim();
+            let value = trim_ows(value);
             match first_cl {
                 Some(prev) if prev != value => return HeadResult::Error(HeadError::Malformed),
                 Some(_) => {}
@@ -790,10 +798,20 @@ fn finish_head<'a>(
     }
 
     let body_len: usize = match first_cl {
-        Some(v) => match v.parse() {
-            Ok(n) => n,
-            Err(_) => return HeadResult::Error(HeadError::Malformed),
-        },
+        Some(v) => {
+            // RFC 9110 8.6: `Content-Length = 1*DIGIT`. Rust's integer parser
+            // also accepts a leading `+`, so `+5` was read as 5 and the server
+            // then waited for a body the peer never sent: a ten-second stall
+            // here, and a framing disagreement anywhere that trims or rewrites
+            // the field. Refuse anything that is not digits.
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return HeadResult::Error(HeadError::Malformed);
+            }
+            match v.parse() {
+                Ok(n) => n,
+                Err(_) => return HeadResult::Error(HeadError::Malformed),
+            }
+        }
         None if saw_cl => return HeadResult::Error(HeadError::Malformed),
         None => 0,
     };
@@ -2575,6 +2593,29 @@ mod parse_head_tests {
         }
         raw.push_str("\r\n");
         assert!(is_error(raw.as_bytes()), "more than 64 headers");
+    }
+
+    /// RFC 9110 8.6 and 5.6.3: `Content-Length` is `1*DIGIT` with SP and HTAB
+    /// allowed around it. `str::trim` also strips VT, FF and Unicode
+    /// whitespace, so `Content-Length: \x0B5` was read as 5.
+    #[test]
+    fn content_length_trims_sp_and_htab_only() {
+        fn with(value: &[u8]) -> Vec<u8> {
+            let mut raw = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ".to_vec();
+            raw.extend_from_slice(value);
+            raw.extend_from_slice(b"\r\n\r\n");
+            raw
+        }
+        for ok in [&b"5"[..], b" 5", b"5 ", b"\t5\t"] {
+            assert!(!is_error(&with(ok)), "SP and HTAB are OWS: {ok:?}");
+        }
+        // VT, FF and NBSP are whitespace to `str::trim` and not to HTTP.
+        for bad in [&b"\x0b5"[..], b"5\x0c", b"\xc2\xa05", b"5\xc2\xa0"] {
+            assert!(
+                is_error(&with(bad)),
+                "non-OWS whitespace around the value: {bad:?}"
+            );
+        }
     }
 
     /// The two limits, each felt at its boundary: what is exactly at the limit
