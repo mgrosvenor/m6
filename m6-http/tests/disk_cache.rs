@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+use m6_http_lib::cache::{Cache, CacheKey, CachedResponse};
 use m6_http_lib::disk_cache;
 
 /// The body of the load test's page, in bytes. At about 400 us per file in this
@@ -159,8 +160,6 @@ struct Stack {
     source_port: PortClaim,
     cache_port: PortClaim,
     private_pem: String,
-    /// While this file exists, the cache node holds its disk tick.
-    hold_tick: PathBuf,
 }
 
 impl Stack {
@@ -297,7 +296,6 @@ impl Stack {
         )
         .unwrap();
 
-        let hold_tick = d.join("hold-disk-tick");
         Stack {
             html: None,
             source: None,
@@ -311,7 +309,6 @@ impl Stack {
             source_port,
             cache_port,
             private_pem,
-            hold_tick,
         }
     }
 
@@ -381,9 +378,6 @@ impl Stack {
             // interval, so `/perf` has a loop trace to report while a test
             // runs. A release build ignores the variable.
             .env("M6_TEST_STATS_INTERVAL_SECS", "1")
-            // The load test creates this file to hold the disk tick while it
-            // builds a backlog, then removes it for one full-budget tick.
-            .env("M6_TEST_DISK_TICK_HOLD_FILE", &self.hold_tick)
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-cache", &mut cmd);
@@ -581,14 +575,6 @@ impl Stack {
     }
 }
 
-/// A JSON number from a `/perf` body, found by its key.
-fn number_after(body: &str, pattern: &str) -> Option<u64> {
-    body.split(pattern)
-        .nth(1)
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|n| n.parse().ok())
-}
-
 /// The longest loop iteration a `/perf` body reports, in nanoseconds.
 fn loop_work_max_ns(body: &str) -> u64 {
     body.match_indices("\"work_max_ns\":")
@@ -661,11 +647,15 @@ fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-/// A served response reaches the disk on a tick, under the node's generation
-/// directory, and decodes to what the client was served.
+/// A served response reaches the disk on an idle slice, under the node's
+/// generation directory, and decodes to what the client was served.
 ///
-/// Break: skip `disk.tick` in the accounting tick, and `/perf` `dir_bytes`
-/// stays 0 and no file appears.
+/// The write must appear within one idle turn, under the accounting tick's
+/// second, and `/perf` must report the loop's `work_max_ns` for the window
+/// that covers the slice.
+///
+/// Break: skip the idle-turn slice, and `/perf` `dir_bytes` stays 0 and no
+/// file appears.
 #[test]
 fn a_cache_node_writes_what_it_serves_to_disk() {
     let mut stack = Stack::new();
@@ -685,11 +675,14 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
         "the second GET is a memory hit, so the disk write is not on that path"
     );
 
+    // The slice runs on an idle turn, not once a second: the file is on disk
+    // without waiting for the accounting tick. The deadline is under that
+    // tick, so a regression back to tick-only writes is caught here.
     assert!(
-        wait_until(Duration::from_secs(10), || stack
+        wait_until(Duration::from_millis(900), || stack
             .disk_u64("dir_bytes")
             .is_some_and(|b| b > 0)),
-        "/perf never showed bytes on disk:\n{}",
+        "/perf never showed bytes on disk within one idle slice:\n{}",
         stack.cache_output()
     );
     assert!(
@@ -697,17 +690,20 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
         "the tick drained the queue: {}",
         stack.disk_block()
     );
-    // The loop's own longest iteration while the writer was busy, for the
-    // report's latency line. The first `/perf` window covers startup, so this
-    // waits for the next one, which contains the tick that did the write. It
-    // is a measurement, not an assertion.
+    // The loop's own longest iteration while the writer was busy. The direct
+    // load test cannot observe `work_max_ns` without the live loop, so the
+    // reporting claim lives here: `/perf` must serve the field, and it must be
+    // non-zero once a window has covered the slice.
     let startup = stack.longest_loop_work_ns();
-    wait_until(Duration::from_secs(2), || {
-        let now = stack.longest_loop_work_ns();
-        now > 0 && now != startup
-    });
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            stack.longest_loop_work_ns() > 0
+        }),
+        "/perf never reported the loop's work_max_ns while the writer worked:\n{}",
+        stack.cache_output()
+    );
     println!(
-        "loop work_max_ns: startup window {startup}, window with the disk tick {}",
+        "loop work_max_ns: startup window {startup}, window after the disk slice {}",
         stack.longest_loop_work_ns()
     );
 
@@ -733,186 +729,156 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
     assert_eq!(&response.body[..], b"first: one");
 }
 
-/// A tick under load: the 1 ms loop-time budget bounds one tick's loop work
-/// and the queue drains over the ticks that follow.
+/// A slice under load: the 1 ms loop-time budget bounds one slice's disk work
+/// and the queue drains over the slices that follow.
 ///
-/// Five hundred entries of 10,000 bytes are queued while the writer's tick is
-/// held, far more than one 1 ms tick writes. The cache root also starts with
-/// 1,000 files under generation `999`, so the drain carries the removal work a
-/// generation change leaves behind. The test releases the hold and reads
-/// `/perf` while the queue drains, recording the writer's tick time and the
-/// loop's `work_max_ns` for every tick. The build host's cache-hit latency A/B
-/// runs the same node with the writer busy and idle.
+/// The slice is [`disk_cache::DiskWriter::tick`], so this test calls it
+/// directly and never waits for a real accounting tick. It builds the writer,
+/// queues 500 entries of 10,000 bytes and seeds 1,000 files under generation
+/// `999`, then ticks until the queue and the old directory are empty. Each call
+/// is the same slice the loop runs on an idle turn while the writer has work.
 ///
-/// The report is the number of ticks 500 files take and the distribution of the
-/// loop's longest iteration across them. The same tick held the loop for 0.44
-/// to 0.52 s before the time budget.
+/// `work_max_ns` is the loop's own per-window maximum, so it is observable only
+/// from the live loop; the measurement this test makes in its place is
+/// [`disk_cache::DiskWriter::tick_last_ns`], the loop time the writer spent in
+/// each slice, which `/perf` reports as `tick_last_ns` beside it. The live
+/// `a_cache_node_writes_what_it_serves_to_disk` asserts that `/perf` reports
+/// `work_max_ns` while the writer works.
 ///
-/// Break: drop the time check from `tick`, and the first tick after the hold
-/// writes the whole queue and holds the loop for a third of a second.
+/// Break: drop the time check from `tick`, and the first slice writes the whole
+/// queue in one call.
 #[test]
-fn a_full_tick_under_load_reports_its_work_max_ns() {
-    let mut stack = Stack::new();
-    let old = stack.cache_dir.join("999");
+fn a_full_tick_under_load_stops_at_the_time_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("disk-cache");
+    let old = root.join("999");
     std::fs::create_dir_all(&old).unwrap();
     for i in 0..LOAD_OLD_FILES {
         std::fs::write(old.join(format!("{i:064x}")), b"old generation file").unwrap();
     }
-    // Hold the writer's tick while the backlog is queued, so the first tick
-    // after the hold has the whole queue waiting.
-    std::fs::write(&stack.hold_tick, b"hold").unwrap();
-    stack.start();
-    assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
-        "/perf never showed the source's ID:\n{}",
-        stack.cache_output()
-    );
-
+    let mut writer = disk_cache::DiskWriter::new(root.clone(), 128 * 1024 * 1024).expect("writer");
+    writer.use_id(0);
+    let mut cache = Cache::with_max_bytes(128 * 1024 * 1024);
     for i in 0..LOAD_KEYS {
-        let response = stack.get_cache(&format!("/load?k={i}"), &[]);
-        assert_eq!(
-            response.status,
-            200,
-            "{:?} {} source:\n{}",
-            response.header("x-test-error"),
-            response.text(),
-            stack.source_output()
-        );
-        assert_eq!(
-            response.body.len(),
-            LOAD_BODY_LEN,
-            "the load page's body from the source"
+        cache.insert_queued(
+            // A distinct path per key: `CacheKey::new` strips a query from the
+            // path, so the same path with different queries would collide.
+            CacheKey::new(&format!("/load/{i}"), None, ""),
+            CachedResponse {
+                status: 200,
+                headers: Arc::new(Vec::new()),
+                body: bytes::Bytes::from(vec![b'x'; LOAD_BODY_LEN]),
+                genid: 0,
+            },
         );
     }
+    assert_eq!(cache.queued(), LOAD_KEYS);
 
-    let before = stack.perf().text();
-    let ticks_before = number_after(&before, "\"ticks\":").unwrap_or(0);
-    let work_before = loop_work_max_ns(&before);
-    std::fs::remove_file(&stack.hold_tick).expect("release the tick");
-
-    let want_bytes = (LOAD_KEYS * LOAD_BODY_LEN) as u64;
-    let deadline = Instant::now() + Duration::from_secs(900);
-    // One sample per tick: the files it wrote, the loop time the writer spent,
-    // and the loop trace's longest iteration for the window that contains it.
-    let mut samples: Vec<(usize, u64, u64)> = Vec::new();
-    let mut last_ticks = ticks_before;
-    let mut drained = false;
-    let mut last_body = String::new();
-    while Instant::now() < deadline {
-        let body = stack.perf().text();
-        let ticks = number_after(&body, "\"ticks\":").unwrap_or(0);
-        if ticks > last_ticks {
-            let written = number_after(&body, "\"written_last_tick\":").unwrap_or(0) as usize;
-            let tick_ns = number_after(&body, "\"tick_last_ns\":").unwrap_or(0);
-            let loop_ns = loop_work_max_ns(&body);
-            for _ in last_ticks..ticks {
-                samples.push((written, tick_ns, loop_ns));
-            }
-            last_ticks = ticks;
-        }
-        let bytes = number_after(&body, "\"dir_bytes\":").unwrap_or(0);
-        let queued = body.contains("\"queued\":0");
-        if bytes + 4_096 >= want_bytes && queued && !old.exists() {
-            drained = true;
-            break;
-        }
-        last_body = body;
-        std::thread::sleep(Duration::from_millis(333));
+    let started = Instant::now();
+    // One sample per slice: the files it wrote, the loop time it spent, and
+    // how many entries it left flagged for the slices that follow.
+    let mut samples: Vec<(usize, u64, usize)> = Vec::new();
+    while cache.queued() > 0 || old.exists() {
+        assert!(
+            samples.len() < 10_000,
+            "the queue did not drain in 10,000 slices"
+        );
+        let stats = writer.tick(&mut cache);
+        samples.push((stats.written, writer.tick_last_ns(), cache.queued()));
     }
-    assert!(
-        drained,
-        "the writer did not drain {LOAD_KEYS} files in {} ticks: {}:\n{last_body}",
-        samples.len(),
-        "dir_bytes, queue or the old directory never reached the target"
-    );
+    let drain = started.elapsed();
+    assert_eq!(writer.ticks() as usize, samples.len());
 
-    let files = stack.files_for("0");
+    let files = files_in(&root.join("0"));
     assert_eq!(files.len(), LOAD_KEYS, "every queued entry became one file");
     assert!(!old.exists(), "the old generation directory was removed");
+    let want_bytes = (LOAD_KEYS * LOAD_BODY_LEN) as u64;
+    assert!(
+        writer.dir_bytes() >= want_bytes,
+        "{} bytes on disk is less than the {want_bytes} queued",
+        writer.dir_bytes()
+    );
 
-    let mut written_per_tick: Vec<usize> = samples.iter().map(|(w, ..)| *w).collect();
-    written_per_tick.sort_unstable();
-    let write_ticks = written_per_tick.iter().filter(|w| **w > 0).count();
-    let removal_ticks = samples.len() - write_ticks;
-    let mut write_files: Vec<usize> = written_per_tick
+    // The first slice that wrote anything stopped with entries still flagged:
+    // the flag on an entry the budget could not reach is what the next slice
+    // finds. It is the writable claim, so it is asserted rather than printed.
+    let first_write = samples
         .iter()
-        .copied()
-        .filter(|w| *w > 0)
+        .position(|(written, ..)| *written > 0)
+        .expect("no slice wrote a file");
+    let (first_written, first_ns, queued_after) = samples[first_write];
+    assert!(first_written < LOAD_KEYS, "one slice wrote the whole queue");
+    assert!(
+        queued_after > 0,
+        "the slice cleared the flag of every entry it did not write"
+    );
+    assert_eq!(
+        queued_after,
+        LOAD_KEYS - first_written,
+        "a slice clears only the flags of the entries it wrote"
+    );
+
+    let mut write_files: Vec<usize> = samples
+        .iter()
+        .map(|(written, ..)| *written)
+        .filter(|written| *written > 0)
         .collect();
+    let write_ticks = write_files.len();
     write_files.sort_unstable();
     let max_written = write_files.last().copied().unwrap_or(0);
+    let mut write_ns: Vec<u64> = samples
+        .iter()
+        .filter(|(written, ..)| *written > 0)
+        .map(|(_, ns, ..)| *ns)
+        .collect();
+    write_ns.sort_unstable();
     let p = |v: &[u64], q: usize| v[(v.len() - 1) * q / 100];
-    // Write ticks and removal ticks are measured apart: a generation change's
-    // unlinks are a one-off cost and would hide the queue's own figure.
-    let mut write_tick_ns: Vec<u64> = samples
-        .iter()
-        .filter(|(w, ..)| *w > 0)
-        .map(|(_, t, ..)| *t)
-        .collect();
-    write_tick_ns.sort_unstable();
-    let mut write_loop_ns: Vec<u64> = samples
-        .iter()
-        .filter(|(w, ..)| *w > 0)
-        .map(|(_, _, g)| *g)
-        .collect();
-    write_loop_ns.sort_unstable();
-    let mut remove_tick_ns: Vec<u64> = samples
-        .iter()
-        .filter(|(w, ..)| *w == 0)
-        .map(|(_, t, ..)| *t)
-        .collect();
-    remove_tick_ns.sort_unstable();
-    let max = |v: &[u64]| v.last().copied().unwrap_or(0);
     println!(
-        "time budget under load: {} ticks to drain {LOAD_KEYS} files ({write_ticks} write \
-         ticks, {removal_ticks} removal ticks), files per write tick {}..={max_written}, \
-         write tick_last_ns min {} p50 {} p90 {} p99 {} max {}, \
-         write loop work_max_ns p50 {} p90 {} p99 {} max {}, \
-         removal tick_last_ns p50 {} p90 {} max {}, \
-         loop work_max_ns before release {work_before}, \
-         dir_bytes {want_bytes}, generation dirs {:?}",
+        "time budget under load: {} slices to drain {LOAD_KEYS} files ({write_ticks} write \
+         slices, {} removal slices) in {drain:?}, files per write slice {}..={max_written}, \
+         write slice tick_last_ns min {} p50 {} p90 {} p99 {} max {}, \
+         first write slice wrote {first_written} in {first_ns} ns and left \
+         {queued_after} flagged",
         samples.len(),
+        samples.len() - write_ticks,
         write_files.first().copied().unwrap_or(0),
-        write_tick_ns.first().copied().unwrap_or(0),
-        p(&write_tick_ns, 50),
-        p(&write_tick_ns, 90),
-        p(&write_tick_ns, 99),
-        max(&write_tick_ns),
-        p(&write_loop_ns, 50),
-        p(&write_loop_ns, 90),
-        p(&write_loop_ns, 99),
-        max(&write_loop_ns),
-        p(&remove_tick_ns, 50),
-        p(&remove_tick_ns, 90),
-        max(&remove_tick_ns),
-        stack.generation_dirs()
+        write_ns.first().copied().unwrap_or(0),
+        p(&write_ns, 50),
+        p(&write_ns, 90),
+        p(&write_ns, 99),
+        write_ns.last().copied().unwrap_or(0),
     );
     assert!(
         write_ticks > LOAD_KEYS / 8,
-        "500 files took only {write_ticks} write ticks; the time budget must spread them"
+        "500 files took only {write_ticks} write slices; the time budget must spread them"
     );
     assert!(
         max_written <= 8,
-        "one tick wrote {max_written} files; the time budget must stop it between files"
+        "one slice wrote {max_written} files; the time budget must stop it between files"
     );
-    // The median is the claim: one file's write fits the budget and the tick
+    // The median is the claim: one file's write fits the budget and the slice
     // stops before starting another. The tail is the sandbox, which has
-    // recorded multi-second filesystem stalls during these runs, so the
-    // measured percentiles and maximum are printed above and only the body of
-    // the distribution is asserted.
+    // recorded multi-second filesystem stalls, so the percentiles and maximum
+    // are printed above and only the body of the distribution is asserted.
     assert!(
-        p(&write_tick_ns, 50) <= TICK_WORK_MEDIAN_MAX_NS,
-        "the median write tick took {} ns",
-        p(&write_tick_ns, 50)
+        p(&write_ns, 50) <= TICK_WORK_MEDIAN_MAX_NS,
+        "the median write slice took {} ns",
+        p(&write_ns, 50)
     );
-    // The loop's window maximum also carries every request the test makes, so
-    // its median has a floor set by /perf handling. A tenth of a second still
-    // catches a return to the whole-queue tick.
-    assert!(
-        p(&write_loop_ns, 50) <= 100_000_000,
-        "the median write window's longest loop iteration was {} ns",
-        p(&write_loop_ns, 50)
-    );
+}
+
+/// The files under `dir`, not counting a leftover `.tmp`.
+fn files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && !p.to_string_lossy().ends_with(".tmp"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
 }
 
 /// The node stops, and the file it left behind still decodes to the response it

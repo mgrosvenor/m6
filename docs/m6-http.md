@@ -252,20 +252,20 @@ A source keeps its cache in memory, because it sits beside its backends and a co
 A source that sets it is refused at start with `config error: [cache].dir is for a cache node ([genid] upstream)`.
 
 The layout is `<dir>/<genid decimal>/<64 hex characters>`, the file name being the SHA-256 of the cache key's bytes.
-One subdirectory per generation means a change needs no per-file rewrite, and every other subdirectory is removed over the ticks that follow.
+One subdirectory per generation means a change needs no per-file rewrite, and every other subdirectory is removed over the slices that follow.
 
 A stored entry is marked with a `queued` flag in the same insert that stores it, and nothing is written there.
 The flag is the dedup, so a second store before the tick adds nothing.
 No key is copied and no queue entry is pushed, so the store allocates nothing for the writer.
-On the tick the writer scans the cache for flagged entries, and an entry the budget cannot reach keeps its flag for the next tick.
+On a slice the writer scans the cache for flagged entries, and an entry the budget cannot reach keeps its flag for the next slice.
 
-On each accounting tick the writer removes files from an old generation's directory, then writes current entries.
-A tick stops after 1 ms of loop time, checked between files, so a full queue costs the loop about a millisecond and the rest waits for later ticks.
-The 4 MiB write bound and the 512-file removal bound remain upper bounds, and whichever limit is reached first ends the tick.
+The work rides idle turns: while the writer has a flagged entry or an old directory to remove, the loop polls with a zero timeout and runs one slice per turn, and it goes back to its normal wait when the queue is empty.
+A request that arrives on a descriptor waits for at most one slice, and a slice stops after 1 ms of loop time, checked between files, so a full queue costs the loop about a millisecond and the rest waits for later turns.
+The 4 MiB write bound and the 512-file removal bound remain upper bounds, and whichever limit is reached first ends the slice.
 Removals run first, so their bytes are available to the write bound.
-A tick that runs out of budget with more to write leaves the remaining keys flagged, and the next tick continues with them.
+A slice that runs out of budget with more to write leaves the remaining keys flagged, and the next slice continues with them.
 A single entry larger than 4 MiB is written on its own, because a file is never split.
-The writer reads each entry again at the tick, so an entry replaced since it was queued is written as it is now, and an entry evicted since is skipped.
+The writer reads each entry again at the slice, so an entry replaced since it was queued is written as it is now, and an entry evicted since is skipped.
 
 Only public cacheable responses enter the cache, so only public cacheable responses reach the disk.
 A file holds the generation ID, the key, the status and headers as JSON, the body, and a SHA-256 check value over every byte before it.
@@ -279,15 +279,15 @@ A write failure is logged once with the path and the error, and the entry is dro
 A failed write never fails a request, because no request waits for one.
 
 On a generation change the queue and the size map are cleared, the new subdirectory is used from the next write, and every other subdirectory is queued for removal.
-Removal takes up to 512 files per tick, or fewer when the 1 ms time budget runs out first, then the empty directory.
+Removal takes up to 512 files per slice, or fewer when the 1 ms time budget runs out first, then the empty directory.
 While the node has no current ID nothing is written, because nothing is stored in memory then either.
 
 An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick`, `skipped_full`, `ticks` and `tick_last_ns`.
 `dir_bytes` counts the files in the current generation's directory.
 `queued` counts the entries whose flag is set.
-`written_bytes_last_tick` is the encoded size of the last tick's writes, including a single entry larger than the 4 MiB budget.
-`ticks` counts the ticks taken since the node started.
-`tick_last_ns` is the loop time the last tick took, measured from the platform clock.
+`written_bytes_last_tick` is the encoded size of the last slice's writes, including a single entry larger than the 4 MiB budget.
+`ticks` counts the slices taken since the node started.
+`tick_last_ns` is the loop time the last slice took, measured from the platform clock.
 
 ---
 
@@ -618,7 +618,7 @@ One thread, one edge-triggered `m6_core::platform::Poll` loop, no async runtime.
 The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
 Every connection and every upstream gets its own `Token(k)` in the `Slots` table.
 A turn matches the token and runs one arm: accept on a listener until it would block, drain the UDP socket for QUIC, read the signal descriptor and hand it to `m6_core::signal::Lifecycle`, flush the log, or drive one connection or upstream.
-The wait is bounded by a 1 s accounting tick, every deadline table and quiche's own timeout.
+The wait is bounded by a 1 s accounting tick, every deadline table and quiche's own timeout, and is zero while the disk writer has work: each idle turn then runs one slice.
 
 ---
 

@@ -1,16 +1,19 @@
-//! A cache node's disk copy of its memory cache, written from the loop's tick.
+//! A cache node's disk copy of its memory cache, written in slices off the
+//! request path.
 //!
 //! The request path never touches a file. A stored entry carries a `queued`
-//! flag, set in the same insert that stores it, and the accounting tick scans
-//! the cache for flagged entries and does all the disk work: up to
+//! flag, set in the same insert that stores it, and a disk slice scans the
+//! cache for flagged entries and does all the disk work: up to
 //! [`WRITE_BUDGET`] bytes of current entries, and up to [`REMOVE_BUDGET`] files
 //! of an old generation's directory. Those two are upper bounds. The tick stops
 //! after [`TIME_BUDGET`] of loop time, checked between files, so a full queue
-//! costs the loop about a millisecond and the rest waits for the ticks that
-//! follow. A tick that runs out of any budget leaves the remaining entries
-//! flagged, so the next tick continues where it stopped. Nothing is copied or
-//! pushed on the request path, so a store for the writer allocates nothing
-//! beyond the store it already made.
+//! costs the loop about a millisecond and the rest waits for the slices that
+//! follow. While [`DiskWriter::has_work`] is true the loop polls without
+//! blocking, so a slice rides each idle turn; when the queue is empty it
+//! returns to its normal wait. A slice that runs out of any budget leaves the
+//! remaining entries flagged, so the next slice continues where it stopped.
+//! Nothing is copied or pushed on the request path, so a store for the writer
+//! allocates nothing beyond the store it already made.
 //!
 //! The layout is `<dir>/<genid decimal>/<sha256 of the key>`, one subdirectory
 //! per generation, so an ID change needs no per-file rewrite. A file is written
@@ -36,9 +39,9 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::{Cache, CachedResponse};
 
-/// Loop time one tick may spend on disk work, removals included. The write and
-/// removal budgets below are upper bounds that a tick may still hit first. A
-/// file is never split, so the tick checks this between files and stops before
+/// Loop time one slice may spend on disk work, removals included. The write and
+/// removal budgets below are upper bounds that a slice may still hit first. A
+/// file is never split, so the slice checks this between files and stops before
 /// starting one it cannot afford: the loop waits about a millisecond, not the
 /// half second a full queue used to take.
 pub const TIME_BUDGET: Duration = Duration::from_millis(1);
@@ -185,16 +188,17 @@ impl DiskWriter {
         }
     }
 
-    /// Write and remove a bounded amount of disk work.
+    /// Write and remove a bounded amount of disk work: one slice of the loop's
+    /// idle turns.
     ///
     /// Removals run first, because they free bytes the write bound is checked
     /// against. Then the writer scans the cache for entries with the `queued`
     /// flag until it has written [`WRITE_BUDGET`] bytes, the queue is empty, or
     /// [`TIME_BUDGET`] of loop time is used. The time check runs between files,
-    /// so a file is never split and the tick never starts one it cannot afford.
-    /// An entry that would pass the byte bound is skipped and counted. An entry
-    /// larger than a whole tick's budget is written on its own when nothing
-    /// else was, because a file is never split.
+    /// so a file is never split and the slice never starts one it cannot
+    /// afford. An entry that would pass the byte bound is skipped and counted.
+    /// An entry larger than a whole slice's budget is written on its own when
+    /// nothing else was, because a file is never split.
     pub fn tick(&mut self, cache: &mut Cache) -> TickStats {
         let mut stats = TickStats::default();
         self.written_last_tick = 0;
@@ -288,6 +292,15 @@ impl DiskWriter {
     /// Loop time the last tick took, in nanoseconds, from the platform clock.
     pub fn tick_last_ns(&self) -> u64 {
         self.tick_last_ns
+    }
+
+    /// Whether the writer has a slice to run: entries the cache has flagged,
+    /// or an old generation directory waiting for removal.
+    ///
+    /// The loop polls without blocking while this is true, so one slice runs
+    /// on each idle turn, and goes back to its normal wait when it is false.
+    pub fn has_work(&self, cache: &Cache) -> bool {
+        cache.queued() > 0 || !self.removals.is_empty()
     }
 
     /// Write the encode buffer to `path` through `path.tmp` and a rename.
@@ -662,6 +675,50 @@ mod tests {
         assert_eq!(third.written, 2, "the third tick writes the rest");
         assert_eq!(cache.queued(), 0);
         assert_eq!(files(&dir.path().join("7")).len(), 10);
+    }
+
+    /// The writer has work while the cache holds a flagged entry or an old
+    /// generation directory waits for removal, and not a slice after both are
+    /// empty. That is the condition the loop polls a zero timeout on: true
+    /// keeps one slice per idle turn, false returns the normal wait.
+    ///
+    /// Break: return false always, and the loop waits a second between
+    /// slices; return true always, and it spins at a zero timeout.
+    #[test]
+    fn the_writer_has_work_until_the_queue_and_removals_are_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = Cache::new();
+        let mut w = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).unwrap();
+        assert!(!w.has_work(&cache), "a new writer has nothing to do");
+        w.use_id(7);
+        stored_queued(&mut cache, "/w", b"body");
+        assert!(
+            w.has_work(&cache),
+            "a queued entry is work for an idle turn"
+        );
+        while w.has_work(&cache) {
+            w.tick(&mut cache);
+        }
+        assert_eq!(cache.queued(), 0);
+        assert!(
+            !w.has_work(&cache),
+            "the loop returns to its normal wait once the queue is empty"
+        );
+        // A generation change queues the old directory for removal, which is
+        // work even with an empty cache.
+        let old = dir.path().join("8");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("file"), b"old").unwrap();
+        w.use_id(9);
+        assert!(
+            w.has_work(&cache),
+            "an old generation is work for an idle turn"
+        );
+        while w.has_work(&cache) {
+            w.tick(&mut cache);
+        }
+        assert!(!old.exists());
+        assert!(!w.has_work(&cache));
     }
 
     /// The tick stops when its loop-time budget is used, between files, and

@@ -2348,6 +2348,8 @@ fn event_loop(
     let mut last = m6_core::platform::now();
     let mut last_log_tick = last;
     let mut accepting = tcp.is_some() || h2c.is_some();
+    // Set by a disk slice that found nothing it could do; see the slice below.
+    let mut disk_slice_stalled = false;
 
     // ALLOC-0: count this thread's allocations from the first iteration. The
     // counter is read once at stop, after the loop, where ordinary logging may
@@ -2374,6 +2376,18 @@ fn event_loop(
             .unwrap_or(tick)
             .min(tick);
         poll_timeout = poll_timeout.min(quic_timeout);
+        // A disk slice rides each idle turn: while the writer has work the
+        // loop polls with a zero timeout, so the next slice starts as soon as
+        // this turn's events are handled. A request on a descriptor is delayed
+        // by at most one slice. With the queue empty the normal wait returns.
+        if !disk_slice_stalled
+            && state
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.has_work(&state.cache))
+        {
+            poll_timeout = std::time::Duration::ZERO;
+        }
         // Edge-triggered: a capped accept leaves connections in the kernel
         // queue that the h2c listener will not be reported for again. Drain
         // before waiting, and do not block while more remain.
@@ -2619,16 +2633,30 @@ fn event_loop(
         if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
             m6_core::log::tick(m6_core::platform::wall());
             last_log_tick = now2;
-            // The disk cache's work rides the same tick: a bounded amount of
-            // writing and removing, never on the request path. The writer
-            // takes the cache by `&mut`, so this is the only place it runs.
-            // A debug build may hold the disk work through the load test's
-            // file, so a backlog can reach a full 4 MiB tick before it runs.
-            if !disk_tick_held() {
-                if let Some(disk) = state.disk.as_mut() {
-                    disk.tick(&mut state.cache);
-                }
+        }
+
+        // The disk cache's work: one slice of at most 1 ms per idle turn,
+        // never on the request path and never a whole queue. The writer takes
+        // the cache by `&mut`, so this is the only place it runs. The zero poll
+        // timeout above is what makes this an idle-turn slice while the queue
+        // is non-empty; the loop blocks normally again once it is empty.
+        if state
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.has_work(&state.cache))
+        {
+            if let Some(disk) = state.disk.as_mut() {
+                let stats = disk.tick(&mut state.cache);
+                // A slice that found nothing it could do will not make
+                // progress by running again at once: a persistent removal
+                // error would spin the loop at a zero timeout. Let the normal
+                // wait run before the next attempt; a slice that does work
+                // clears the flag.
+                disk_slice_stalled =
+                    stats.written == 0 && stats.removed == 0 && disk.has_work(&state.cache);
             }
+        } else {
+            disk_slice_stalled = false;
         }
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
@@ -6546,24 +6574,6 @@ fn run(args: Vec<String>) -> i32 {
         return 1;
     }
     code
-}
-
-/// Whether the load test is holding the disk writer's tick.
-///
-/// A debug build only. The load test creates the file this names, queues more
-/// entries than one tick's 4 MiB budget, then removes it, so the next tick is
-/// a full-budget tick with a known state. A release build never reads the
-/// variable and always writes on the tick.
-#[cfg(debug_assertions)]
-fn disk_tick_held() -> bool {
-    std::env::var_os("M6_TEST_DISK_TICK_HOLD_FILE")
-        .is_some_and(|path| std::path::Path::new(&path).exists())
-}
-
-/// A release build does not read the test's hold file.
-#[cfg(not(debug_assertions))]
-fn disk_tick_held() -> bool {
-    false
 }
 
 /// The accounting tick for this process.
