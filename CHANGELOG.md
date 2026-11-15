@@ -125,6 +125,11 @@ A client that makes more requests than this on one connection reconnects, with a
 
 ### Security
 
+**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
+Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
+A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.
+Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5x` and an empty value with `Connection: close`, and asserts each is answered 400 with the connection closed. On the old parser the `+5` case is answered with nothing inside the read bound, so that case fails.
+
 **SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected; no configuration changes.
 
 **HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
@@ -238,6 +243,9 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**Every test binary answers the standard test-list protocol, so `cargo nextest` runs the whole workspace.**
+Nine binaries that run without libtest's harness (the allocation counters and the loop tests that need one thread or a blocked signal mask) now answer `--list --format terse` and accept a name filter, so a test runner can list and run them like any other. Each still forces one thread after parsing its arguments. Verified on Linux with `cargo nextest run --workspace`: 1989 tests in 97 binaries listed and passed.
 
 **Every clock read outside `m6-platform` is refused by its gate, including reads through `chrono`, `time` and `filetime`.**
 Five shipping reads that asked the operating system directly now take the time from `m6_core::platform::now()` or `wall()`, and `chrono` only formats a value it is given.

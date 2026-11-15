@@ -2,7 +2,9 @@
 //!
 //! This binary has its own `main` (`harness = false` in `Cargo.toml`) so the
 //! process runs on one thread from start to finish, as a service does. The
-//! check follows the order a rotation tool uses: rename the file, call
+//! harness speaks libtest's protocol through `libtest-mimic`, forced onto one
+//! thread so the check runs in `main`, which is what `nextest` lists and runs.
+//! The check follows the order a rotation tool uses: rename the file, call
 //! `log::reopen()` as a loop's `Signal::ReopenLogs` arm does, wait for the
 //! path to reappear, then write again. The signal path itself is proved end to
 //! end against m6-html by `shutdown_signals.rs`.
@@ -10,6 +12,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::log::{self, Level, Line};
 use m6_core::monitoring::LoggingHealth;
 use m6_core::testkit::wait::until;
@@ -32,11 +35,18 @@ fn write_line(n: u64) {
 }
 
 fn main() {
-    reopen_moves_new_lines_to_the_new_file();
-    println!("reopen_moves_new_lines_to_the_new_file ... ok");
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the check still runs before any other thread exists.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "reopen_moves_new_lines_to_the_new_file",
+        reopen_moves_new_lines_to_the_new_file,
+    )];
+    libtest_mimic::run(&args, tests).exit();
 }
 
-fn reopen_moves_new_lines_to_the_new_file() {
+fn reopen_moves_new_lines_to_the_new_file() -> Result<(), Failed> {
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("a.ndjson");
     log::init(Level::Info, Some(&live)).expect("init");
@@ -71,4 +81,6 @@ fn reopen_moves_new_lines_to_the_new_file() {
         .expect("this process writes a file");
     assert!(reopen.seconds_since_last_reopen.unwrap() <= 1);
     log::stop().expect("stop the log");
+    println!("reopen_moves_new_lines_to_the_new_file ... ok");
+    Ok(())
 }

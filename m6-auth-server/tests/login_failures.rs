@@ -128,11 +128,14 @@ fn spawn_server(env: &TestEnv) -> Service {
 }
 
 /// Create a test user via the database before the server starts.
+///
+/// Cost 4 is bcrypt's lowest: a fixture needs a user, not production's round
+/// count, and an unoptimised cost-12 hash costs seconds per test.
 fn seed_user(site_dir: &Path, username: &str, password: &str) {
     let db_path = site_dir.join("data/auth.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = m6_auth::Db::open(&db_path).expect("open db");
-    db.user_create(username, password, &["user"])
+    db.user_create_with_cost(username, password, &["user"], 4)
         .expect("create user");
 }
 
