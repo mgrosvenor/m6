@@ -28,7 +28,9 @@ const BODY_LEN: usize = 64 * 1024;
 /// that is left, so the difference must drop by one.
 ///
 /// Measured on 2292e60 (the branch RS-1 left), before the copy was removed.
-const BASE_IDENTITY_DIFFERENCE: usize = 2;
+/// The copy and then the candidate `Vec` went; the block now allocates nothing
+/// for an `identity` request, so the difference is zero.
+const BASE_IDENTITY_DIFFERENCE: usize = 1;
 
 /// The allocations one `/ok` request makes with every removal in place.
 ///
@@ -36,7 +38,7 @@ const BASE_IDENTITY_DIFFERENCE: usize = 2;
 /// ever be lowered: a change that raises it is refused rather than priced in.
 /// A dependency update that moves it down records the new number, with the
 /// reason, in that commit.
-const HANDLER_BUDGET: usize = 29;
+const HANDLER_BUDGET: usize = 28;
 
 /// The allocations one `/page` request makes with every removal in place.
 ///
@@ -47,12 +49,14 @@ const HANDLER_BUDGET: usize = 29;
 /// rest. Restoring the template-name `.clone()` costs one more.
 ///
 /// 51 on the branch; 55 on integration 6bb7a2f, where CACHE-HDR's
-/// `Site::finish` computes the page's `ETag` from its final bytes. That block
-/// is four allocations: three in the `format!` of the quoted hex value and
-/// one for the field name. The page's own validator is the integration's
-/// behaviour, not an allocation coming back, so the budget takes the measured
-/// integer; the rendered-page job (I-177) owns those four.
-const TEMPLATE_BUDGET: usize = 55;
+/// `Site::finish` computes the page's `ETag` from its final bytes (four
+/// allocations). The page's own validator is the integration's behaviour, not
+/// an allocation coming back, so the budget took that integer. The
+/// rendered-page job then removed the owned request (9), the compression
+/// candidate `Vec` (1) and two of the ETag's four (the pre-sized value), and
+/// took the cached `Last-Modified` (1): 42. Those four are gone; what remains
+/// in the tag is the pair of owned header `String`s the response stores.
+const TEMPLATE_BUDGET: usize = 42;
 
 const BIG: &[u8] = b"GET /big HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
 const RAW: &[u8] = b"GET /raw HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
@@ -110,8 +114,8 @@ fn checks() -> Result<(), Failed> {
     if difference != BASE_IDENTITY_DIFFERENCE - 1 {
         return Err(format!(
             "an identity response costs {difference} more allocations than an \
-             uncompressed type, expected {}: the body is copied for compression that is \
-             not applied",
+             uncompressed type, expected {}: the compression block allocated for a \
+             coding it never applied",
             BASE_IDENTITY_DIFFERENCE - 1
         )
         .into());

@@ -34,6 +34,16 @@ const SERVER: Token = Token(0);
 const DEADLINE: Duration = Duration::from_secs(10);
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
+/// What one request on the page path may allocate.
+///
+/// 71 when ALLOC-RENDER attributed it, on a tree that predates the four RS-2
+/// removals and does not carry CACHE-HDR's `ETag`; 67 on integration 6bb7a2f
+/// plus RS-2. The rendered-page job (I-177) removed the owned request and the
+/// compression candidate `Vec`, took half of the `ETag` pair and cached
+/// `Last-Modified`: 56 here. The target is zero; a change that raises this is
+/// refused, and one that lowers it records the new number in that commit.
+const PAGE_BUDGET: usize = 56;
+
 fn main() {
     let mut args = Arguments::from_args();
     // One thread: `libtest-mimic` then runs the trial in this (the main)
@@ -64,7 +74,14 @@ fn page_path_allocations_do_not_grow() -> Result<(), Failed> {
     if counted[1..].iter().any(|&n| n != first) {
         return Err(format!("allocations vary per request: {counted:?}").into());
     }
-    println!("page path allocations per request after the first: {first}");
+    println!("page path allocations per request after the first: {first} (budget {PAGE_BUDGET})");
+    if first != PAGE_BUDGET {
+        return Err(format!(
+            "the page path allocates {first} times, budget {PAGE_BUDGET}: a per-request \
+             allocation has come back, or a removal was not recorded"
+        )
+        .into());
+    }
     Ok(())
 }
 

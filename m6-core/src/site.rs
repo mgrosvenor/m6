@@ -43,6 +43,78 @@ use crate::response::Response;
 /// `check_routes` refuses a code or config route with exactly this pattern.
 pub const GENID_PATH: &str = "/genid";
 
+/// The request facts the dictionary build and the finish path read.
+///
+/// Implemented by the owned [`RawRequest`] a handler is given and by the
+/// borrowed [`RequestHead`], so a template route is answered from the read
+/// buffer without copying the head into a `RawRequest` only to drop it. The
+/// handler, code, `/genid` and unmatched paths still get the owned request
+/// they need.
+pub(crate) trait RequestMeta {
+    fn method(&self) -> &str;
+    fn path(&self) -> &str;
+    /// The raw query string, `""` when there is none.
+    fn query(&self) -> &str;
+    fn header(&self, name: &str) -> Option<&str>;
+    fn body(&self) -> &[u8];
+    fn content_type(&self) -> Option<&str>;
+}
+
+impl RequestMeta for RawRequest {
+    fn method(&self) -> &str {
+        RawRequest::method(self)
+    }
+
+    fn path(&self) -> &str {
+        RawRequest::path(self)
+    }
+
+    fn query(&self) -> &str {
+        RawRequest::query(self)
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        RawRequest::header(self, name)
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    fn content_type(&self) -> Option<&str> {
+        RawRequest::content_type(self)
+    }
+}
+
+impl RequestMeta for RequestHead<'_> {
+    fn method(&self) -> &str {
+        self.method
+    }
+
+    fn path(&self) -> &str {
+        self.path
+    }
+
+    fn query(&self) -> &str {
+        self.query.unwrap_or("")
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+    }
+
+    fn body(&self) -> &[u8] {
+        RequestHead::body(self)
+    }
+
+    fn content_type(&self) -> Option<&str> {
+        self.header("content-type")
+    }
+}
+
 /// A route a service answers in its own code, bound by pattern and method.
 #[derive(Debug, Clone)]
 pub struct CodeRoute {
@@ -376,10 +448,48 @@ impl Site {
         &self.name
     }
 
-    /// Handle a borrowed request head. Builds the owned request the service's
-    /// handler needs from the head, then dispatches.
+    /// Handle a borrowed request head.
+    ///
+    /// A template route is answered from the head itself: its dictionary and
+    /// finish path only read the request, and no handler is handed a
+    /// [`Request`]. So the head is never copied into a `RawRequest` for it.
+    /// Every other outcome (a handler, a code route, `/genid`, an unmatched
+    /// path) builds the owned request the service's handler needs, as before.
     pub fn handle(&self, head: &RequestHead<'_>) -> Handled {
+        if head.path != GENID_PATH && borrowed_body_is_complete(head) {
+            if let Some((route, params)) = find_route(head.path, head.method, &self.state.routes) {
+                if route.handler.is_none() {
+                    if let Some(template) = &route.template {
+                        return self.answer_template(head, route, &params, template);
+                    }
+                }
+            }
+        }
         self.handle_raw(raw_from_head(head))
+    }
+
+    /// Answer a config template route from the borrowed head: build the
+    /// dictionary, render, finish. The same steps `handle_raw` runs for the
+    /// same route, without the owned request it would build and drop.
+    fn answer_template(
+        &self,
+        head: &RequestHead<'_>,
+        route: &CompiledRoute,
+        params: &PathParams,
+        template: &str,
+    ) -> Handled {
+        let started = crate::platform::now();
+        let resp = match self.state.build_dict(head, route, params) {
+            Ok(dict) => {
+                let resp = Response::render_request_dict(template, route.status);
+                self.finish_raw(head, Some(&dict), Some(route), started, resp)
+            }
+            Err(e) => {
+                let resp = crate::response::error_to_response(&e);
+                self.finish_raw(head, None, None, started, resp)
+            }
+        };
+        Handled::Done(resp)
     }
 
     /// `handle` for a caller that already owns a [`RawRequest`]: the one
@@ -488,7 +598,7 @@ impl Site {
     /// that does not (an unmatched path's 404).
     fn finish_raw(
         &self,
-        raw: &RawRequest,
+        raw: &dyn RequestMeta,
         dict: Option<&Dict>,
         route: Option<&CompiledRoute>,
         started: std::time::Instant,
@@ -522,8 +632,8 @@ impl Site {
             // attaching a validator to a 404 or a 500 invites a client to keep
             // revalidating an error as though it were content.
             if resp.status < 300 {
-                if let Some(lm) = route.last_modified {
-                    resp = resp.header("Last-Modified", &httpdate::fmt_http_date(lm));
+                if let Some(lm) = &route.last_modified_http {
+                    resp = resp.header("Last-Modified", lm);
                 }
             }
             for (k, v) in &route.headers {
@@ -607,19 +717,27 @@ impl Site {
             let compression = &self.state.config.compression;
             if let Some(level) = compression.get(mime) {
                 // Ask the client what it will accept, rather than testing
-                // whether a coding name appears anywhere in the header.
-                let mut candidates: Vec<&str> = Vec::with_capacity(2);
+                // whether a coding name appears anywhere in the header. A
+                // fixed two-slot array, because there are exactly two codings
+                // and a `Vec` here would allocate on every compressed answer.
+                let mut candidates = [""; 2];
+                let mut candidate_count = 0;
                 if level.brotli > 0 {
-                    candidates.push("br");
+                    candidates[candidate_count] = "br";
+                    candidate_count += 1;
                 }
                 if level.gzip > 0 {
-                    candidates.push("gzip");
+                    candidates[candidate_count] = "gzip";
+                    candidate_count += 1;
                 }
                 // Compress from the body while it is still borrowed: the
                 // compressed bytes are built before the borrow ends, so a
                 // request that asks for `identity` never copies a body it
                 // sends unchanged.
-                let coded = match crate::preferred_coding(accept_encoding, &candidates) {
+                let coded = match crate::preferred_coding(
+                    accept_encoding,
+                    &candidates[..candidate_count],
+                ) {
                     Some("br") => resp
                         .body
                         .as_bytes()
@@ -659,8 +777,13 @@ impl Site {
         // revalidating an error as though it were content.
         if resp.status < 300 && !resp.verbatim && !resp.body.is_empty() {
             if let Some(hash) = crate::response::default_etag(&resp.headers, &resp.body) {
-                resp.headers
-                    .push(("ETag".to_string(), format!("\"{hash:x}\"")));
+                // Sized for the quotes and sixteen hex digits. `format!`
+                // grows its String two or three times for the same value,
+                // which is two allocations this header does not need.
+                use std::fmt::Write as _;
+                let mut value = String::with_capacity(18);
+                write!(value, "\"{hash:x}\"").expect("writing to a String cannot fail");
+                resp.headers.push(("ETag".to_string(), value));
             }
         }
 
@@ -857,6 +980,12 @@ pub struct CompiledRoute {
     /// arrives. Omitting the header is correct there — RFC 9110 lets a server
     /// leave it out, and a wrong date is far worse than an absent one.
     pub last_modified: Option<std::time::SystemTime>,
+    /// The same instant, already formatted for the `Last-Modified` field.
+    ///
+    /// Built once here rather than per request: the value is a property of the
+    /// route's inputs, and `httpdate::fmt_http_date` allocates a `String` on
+    /// every call it is asked to format.
+    pub last_modified_http: Option<String>,
     /// Name of the registered handler this route dispatches to, if any.
     ///
     /// `Some` for a config route carrying `handler = "..."`. `None` for a
@@ -1368,6 +1497,7 @@ impl FrameworkState {
                 // A code route renders whatever its handler decides at request
                 // time, so there is no input file whose mtime describes it.
                 last_modified: None,
+                last_modified_http: None,
                 // A code route is bound by pattern and method at the call
                 // site, so it names no handler and carries no config of its
                 // own. The config-declared form below is the one that does.
@@ -1389,7 +1519,8 @@ impl FrameworkState {
                 status: rc.status,
                 cache: rc.cache.clone(),
                 headers: rc.headers.clone(),
-                last_modified: None, // filled in below, once templates_mtime is known
+                last_modified: None,
+                last_modified_http: None, // filled in below, once templates_mtime is known
                 handler: rc.handler.clone(),
                 settings: Arc::clone(&rc.settings),
                 base_dict: Arc::new(Map::new()), // filled in below
@@ -1441,6 +1572,7 @@ impl FrameworkState {
                 }
             }
             route.last_modified = newest;
+            route.last_modified_http = newest.map(httpdate::fmt_http_date);
         }
 
         // Collect template paths from config routes.
@@ -1607,7 +1739,7 @@ impl FrameworkState {
     /// layering rather than by this loop; see `crate::dict`.
     pub(crate) fn build_dict(
         &self,
-        raw: &RawRequest,
+        raw: &dyn RequestMeta,
         route: &CompiledRoute,
         path_params: &PathParams,
     ) -> crate::error::Result<Dict> {
@@ -1703,17 +1835,17 @@ impl FrameworkState {
         if raw.method() == "POST" {
             match raw.content_type() {
                 Some(ct) if ct.contains("application/x-www-form-urlencoded") => {
-                    for (k, v) in parse_form_body(&raw.body) {
+                    for (k, v) in parse_form_body(raw.body()) {
                         if !is_path_param(&k) {
                             dict.insert(k, Value::String(v));
                         }
                     }
                 }
                 other => {
-                    if !raw.body.is_empty() {
+                    if !raw.body().is_empty() {
                         warn!(
                             content_type = other.unwrap_or("<none>"),
-                            body_len = raw.body.len(),
+                            body_len = raw.body().len(),
                             "POST body not decoded: only application/x-www-form-urlencoded \
                              is supported, so no form fields are available to the handler"
                         );
@@ -1977,6 +2109,21 @@ fn newest_mtime_under(dir: &std::path::Path) -> Option<std::time::SystemTime> {
 /// copy `h1::owned_request` makes for both the borrowed path and the owned one.
 fn raw_from_head(head: &RequestHead<'_>) -> RawRequest {
     crate::h1::owned_request(head, head.body().to_vec())
+}
+
+/// Whether a borrowed head carries all of its body, so the dictionary can read
+/// it in place.
+///
+/// A `Transfer-Encoding` request is decoded into an owned buffer by
+/// `h1::materialize`, so its head holds no body bytes and must take the owned
+/// path. A `Content-Length` body is borrowed whole only once the parser has all
+/// of it, which is when the slot hands the head on.
+fn borrowed_body_is_complete(head: &RequestHead<'_>) -> bool {
+    !head
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+        && head.body().len() == head.body_len
 }
 
 /// The start path's `site_toml` check.
@@ -2466,6 +2613,8 @@ mod tests {
         // start, so a file written after would never be seen.
         std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
         std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
+        // Prints a form field, so a test can see the dictionary a POST built.
+        std::fs::write(dir.path().join("templates/form.html"), "<p>{{ name }}</p>").unwrap();
         let config_path = dir.path().join("m6-site.toml");
         std::fs::write(&config_path, toml).unwrap();
         let config = crate::config::load(&config_path, dir.path()).unwrap();
@@ -2478,6 +2627,37 @@ mod tests {
     /// A page's default is the browser-caching pattern, and it carries an
     /// ETag: the browser revalidates every time, the edge keeps it for a day,
     /// and either can turn an unchanged page into a 304.
+    /// A form POST to a config template route is answered from the borrowed
+    /// head: the dictionary reads the body the head framed, so the template
+    /// sees the field without the head being copied into a `RawRequest` that
+    /// would only be dropped. This is the borrowed path's body test.
+    #[test]
+    fn a_template_route_reads_a_form_body_from_the_borrowed_head() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            &[],
+        );
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\n\
+                        Content-Type: application/x-www-form-urlencoded\r\n\
+                        Content-Length: 8\r\n\r\nname=Ada";
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(request, &mut slots) {
+            crate::h1::HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+
+        let resp = match site.handle(&head) {
+            Handled::Done(resp) => resp,
+            _ => panic!("a template route is answered by core"),
+        };
+        let body = resp.body.as_bytes().expect("a rendered page is buffered");
+        assert_eq!(
+            std::str::from_utf8(body).unwrap(),
+            "<p>Ada</p>",
+            "the template must see the form field read from the head's body"
+        );
+    }
+
     #[test]
     fn a_page_defaults_to_revalidation_and_carries_an_etag() {
         let (site, _dir) = site_from(
@@ -2803,6 +2983,7 @@ mod tests {
             cache: "public".to_string(),
             headers: vec![],
             last_modified: None,
+            last_modified_http: None,
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
@@ -2833,6 +3014,7 @@ mod tests {
             cache: "public".to_string(),
             headers: vec![],
             last_modified: None,
+            last_modified_http: None,
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
@@ -2856,6 +3038,7 @@ mod tests {
                 cache: "public".to_string(),
                 headers: vec![],
                 last_modified: None,
+                last_modified_http: None,
                 handler: None,
                 settings: Arc::new(Map::new()),
                 base_dict: Arc::new(Map::new()),
@@ -2870,6 +3053,7 @@ mod tests {
                 cache: "public".to_string(),
                 headers: vec![],
                 last_modified: None,
+                last_modified_http: None,
                 handler: None,
                 settings: Arc::new(Map::new()),
                 base_dict: Arc::new(Map::new()),
@@ -3140,6 +3324,7 @@ mod wildcard_route_tests {
             cache: String::new(),
             headers: Vec::new(),
             last_modified: None,
+            last_modified_http: None,
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
@@ -4005,6 +4190,7 @@ mod route_rule_tests {
             cache: String::new(),
             headers: Vec::new(),
             last_modified: None,
+            last_modified_http: None,
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),

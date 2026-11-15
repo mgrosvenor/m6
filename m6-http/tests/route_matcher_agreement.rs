@@ -44,6 +44,7 @@ fn core_routes(patterns: &[&str]) -> CoreTable {
                     cache: "public".to_string(),
                     headers: vec![],
                     last_modified: None,
+                    last_modified_http: None,
                     handler: None,
                     settings: Arc::new(Map::new()),
                     base_dict: Arc::new(Map::new()),
