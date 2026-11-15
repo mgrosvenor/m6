@@ -386,7 +386,7 @@ fn the_route_answers_only_the_exact_post() {
         &mut p,
         b"POST /genid HTTP/1.1\r\nHost: localhost\r\n\r\n",
     ) {
-        Handled::Reload => {}
+        Handled::Reload(_) => {}
         _ => panic!("POST /genid must ask the loop to reload"),
     }
 
@@ -423,4 +423,37 @@ fn the_route_answers_only_the_exact_post() {
         0o660,
         "the socket's directory permissions are the only authentication"
     );
+}
+
+/// An untested refusal is not a guarantee: a route on the reserved path could
+/// never run, because `Site::handle` answers the path before routing, so start
+/// refuses it. This drives the start path itself, so the proof is the exit
+/// code a deploy would get, not the presence of a string in the source.
+#[test]
+#[should_panic(expected = "route \"/genid\" is reserved")]
+fn a_route_on_genid_is_refused_at_start() {
+    // The same check refuses a code route, whether or not a config route
+    // exists beside it.
+    let e = m6_core::site::check_routes(
+        &[("/genid".to_string(), m6_core::site::RouteMethod::Get)],
+        &[],
+    )
+    .expect_err("a code route on /genid must be refused");
+    assert!(e.to_string().contains("is reserved"), "{e}");
+
+    let dir = tempfile::TempDir::new().expect("a temp site");
+    std::fs::create_dir_all(dir.path().join("templates")).expect("templates");
+    std::fs::write(dir.path().join("templates/index.html"), "reserved").expect("template");
+    std::fs::write(
+        dir.path().join("site.toml"),
+        "[[backend]]\nname = \"m6-site\"\ncompresses = true\n",
+    )
+    .expect("site.toml");
+    std::fs::write(
+        dir.path().join("m6-site.toml"),
+        "[[route]]\npath = \"/genid\"\ntemplate = \"templates/index.html\"\n",
+    )
+    .expect("config");
+
+    let _site = site(dir.path());
 }

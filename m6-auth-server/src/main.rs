@@ -475,13 +475,16 @@ fn turn(
                     // The reserved path: run the start path again and assign
                     // the new Site in the loop's own binding, or keep serving
                     // the old one and answer the cause.
-                    Handled::Reload => match site.reload(&ROUTES, &[], &NoTemplates) {
-                        Ok(next) => {
-                            *site = next;
-                            genid_ok()
-                        }
-                        Err(e) => genid_failed(&e),
-                    },
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&ROUTES, &[], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        m6_core::site::finish_reload(&reload, response)
+                    }
                     Handled::Named(..) => unreachable!(
                         "m6-auth-server registers no named handlers, so every route is in code"
                     ),

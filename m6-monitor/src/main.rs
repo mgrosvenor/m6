@@ -510,13 +510,16 @@ fn turn(
                 // The reserved path: run the start path again and assign the
                 // new Site in the loop's own binding, or keep serving the old
                 // one and answer the cause.
-                Answer::Reload => Answer::Response(match site.reload(&ROUTES, &[], &NoTemplates) {
-                    Ok(next) => {
-                        *site = next;
-                        genid_ok()
-                    }
-                    Err(e) => genid_failed(&e),
-                }),
+                Answer::Reload(reload) => {
+                    let response = match site.reload(&ROUTES, &[], &NoTemplates) {
+                        Ok(next) => {
+                            *site = next;
+                            genid_ok()
+                        }
+                        Err(e) => genid_failed(&e),
+                    };
+                    Answer::Response(m6_core::site::finish_reload(&reload, response))
+                }
                 answer => answer,
             };
             match reply {
@@ -526,7 +529,7 @@ fn turn(
                     body,
                 } => conn.respond(status, headers, body),
                 Answer::Response(response) => conn.respond_response(response),
-                Answer::Reload => unreachable!("the reload arm above replaced it"),
+                Answer::Reload(_) => unreachable!("the reload arm above replaced it"),
             }
         }
         match conn.flush()? {
@@ -549,8 +552,8 @@ enum Answer<'a> {
     },
     Response(Response),
     /// `POST /genid`: the turn runs the start path again and assigns the new
-    /// Site, which only the loop can do.
-    Reload,
+    /// Site, which only the loop can do, then writes the reload's access line.
+    Reload(m6_core::site::Reload),
 }
 
 /// The answer to one parsed request.
@@ -593,7 +596,7 @@ fn answer<'a>(
             _ => Answer::Response(site.finish(&req, Response::not_found())),
         },
         Handled::Named(..) => unreachable!("m6-monitor registers no named handler"),
-        Handled::Reload => Answer::Reload,
+        Handled::Reload(reload) => Answer::Reload(reload),
     }
 }
 

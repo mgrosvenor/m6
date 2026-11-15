@@ -324,13 +324,16 @@ let resp = match site.handle(&head) {
         let r = handler::serve(&req).unwrap_or_else(|e| error_response(&e));
         site.finish(&req, r)
     }
-    Handled::Reload => match site.reload(ROUTES, &[], &NoTemplates) {
-        Ok(next) => {
-            *site = next;
-            genid_ok()
-        }
-        Err(e) => genid_failed(&e),
-    },
+    Handled::Reload(reload) => {
+        let response = match site.reload(ROUTES, &[], &NoTemplates) {
+            Ok(next) => {
+                *site = next;
+                genid_ok()
+            }
+            Err(e) => genid_failed(&e),
+        };
+        finish_reload(&reload, response)
+    }
     Handled::Named(..) | Handled::Code(..) => unreachable!("load checked every route and name"),
 };
 ```

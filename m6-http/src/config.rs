@@ -18,11 +18,27 @@ pub struct Config {
     pub errors: ErrorsConfig,
     pub security: SecurityConfig,
     pub auth: Option<AuthConfig>,
+    /// Where a source node's generation ID comes from, and who may read or
+    /// advance it. `None` means this node has no `/genid`.
+    pub genid: Option<GenidConfig>,
     pub backends: Vec<BackendConfig>,
     pub routes: Vec<RouteConfig>,
     pub route_groups: Vec<RouteGroupConfig>,
     /// Directory where site.toml lives.
     pub site_dir: PathBuf,
+}
+
+/// The source node's `[genid]` table.
+///
+/// Both claims or neither: one alone would leave one half of the endpoint
+/// unguarded. Both absent leaves `/genid` answering 404 to everyone, which is
+/// how a node says it does not serve a generation ID.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GenidConfig {
+    /// `role:<name>` or `group:<name>` a `GET /genid` needs.
+    pub read_require: Option<String>,
+    /// The same for `POST /genid`, which advances the generation.
+    pub write_require: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,6 +707,7 @@ struct RawSiteToml {
     errors: Option<ErrorsConfig>,
     security: Option<SecurityConfig>,
     auth: Option<AuthConfig>,
+    genid: Option<RawGenid>,
     #[serde(rename = "backend", default)]
     backends: Vec<BackendConfig>,
     #[serde(rename = "route", default)]
@@ -735,6 +752,18 @@ struct RawSystemToml {
     /// Only the access keys: a node's own credentials and peers belong to the
     /// node, not to the site that is shipped to every node.
     health: Option<RawSystemHealth>,
+    /// The generation-ID endpoint. Node state: a site's content ships to every
+    /// node, its publish claims do not.
+    genid: Option<RawGenid>,
+}
+
+/// The `[genid]` keys G1b carries. G1c adds the three that describe how a node
+/// follows another's ID.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawGenid {
+    read_require: Option<String>,
+    write_require: Option<String>,
 }
 
 /// The `[health]` keys the system config may carry. Anything else fails to
@@ -941,12 +970,13 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // mode, the one file in one-file mode. The system config is parsed strictly
     // only when it is a second file, so a one-file config is not refused for the
     // site-only keys it necessarily carries.
-    let (node_server, node, auth, node_health) = if one_file {
+    let (node_server, node, auth, node_health, raw_genid) = if one_file {
         (
             site_parsed.server.clone().unwrap_or_default(),
             site_parsed.node,
             site_parsed.auth,
             None,
+            site_parsed.genid,
         )
     } else {
         let system_parsed: RawSystemToml = toml::from_str(&system_raw)
@@ -956,6 +986,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             system_parsed.node,
             system_parsed.auth,
             system_parsed.health,
+            system_parsed.genid,
         )
     };
     let site_server = site_parsed.server.unwrap_or_default();
@@ -1230,6 +1261,46 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         anyhow::bail!("config error: [errors] mode = \"custom\" requires `path`");
     }
 
+    // The generation endpoint. Both claims or neither: one alone would leave
+    // one half of the endpoint unguarded, and a value that names no role or
+    // group is a typo that would otherwise refuse every caller at run time.
+    let genid = match raw_genid {
+        None => None,
+        Some(raw) => {
+            let read = raw.read_require.is_some();
+            let write = raw.write_require.is_some();
+            if read != write {
+                anyhow::bail!(
+                    "config error: [genid] needs both read_require and write_require, or neither"
+                );
+            }
+            for (key, value) in [
+                ("read_require", raw.read_require.as_deref()),
+                ("write_require", raw.write_require.as_deref()),
+            ] {
+                let Some(value) = value else { continue };
+                if auth.is_none() {
+                    anyhow::bail!(
+                        "config error: [genid] read_require and write_require need [auth] with a public_key"
+                    );
+                }
+                let named = matches!(
+                    crate::auth::Require::parse(value),
+                    Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
+                );
+                if !named {
+                    anyhow::bail!(
+                        "config error: [genid].{key} = \"{value}\" must be \"role:<name>\" or \"group:<name>\""
+                    );
+                }
+            }
+            Some(GenidConfig {
+                read_require: raw.read_require,
+                write_require: raw.write_require,
+            })
+        }
+    };
+
     Ok(Config {
         site: SiteConfig {
             name: site_name,
@@ -1246,6 +1317,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         errors,
         security,
         auth,
+        genid,
         backends,
         routes,
         route_groups,
@@ -1271,7 +1343,7 @@ const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "me
 ///
 /// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
 /// `[node]` in `site.toml` is named here so `load` refuses it.
-const NODE_SECTIONS: &[&str] = &["auth", "node"];
+const NODE_SECTIONS: &[&str] = &["auth", "genid", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
 const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
@@ -2344,6 +2416,94 @@ domain = "test.example.com"
     }
 
     #[test]
+    fn genid_needs_both_requires_or_neither() {
+        let auth = "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n";
+        for only in [
+            "\n[genid]\nread_require = \"role:monitor\"\n",
+            "\n[genid]\nwrite_require = \"role:editor\"\n",
+        ] {
+            let (_d, r) = load_with("", &format!("{auth}{only}"));
+            let e = r.unwrap_err().to_string();
+            assert_eq!(
+                e,
+                "config error: [genid] needs both read_require and write_require, or neither"
+            );
+        }
+        let (_d, ok) = load_with(
+            "",
+            &format!(
+                "{auth}\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
+            ),
+        );
+        let cfg = ok.expect("both claims load");
+        let g = cfg.genid.expect("[genid] present");
+        assert_eq!(g.read_require.as_deref(), Some("role:monitor"));
+        assert_eq!(g.write_require.as_deref(), Some("role:editor"));
+    }
+
+    #[test]
+    fn genid_require_needs_auth() {
+        let (_d, r) = load_with(
+            "",
+            "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [genid] read_require and write_require need [auth] with a public_key"
+        );
+    }
+
+    #[test]
+    fn genid_require_must_name_a_role_or_group() {
+        for (key, bad) in [
+            ("read_require", "admin"),
+            ("write_require", "role:"),
+            ("write_require", "user:x"),
+        ] {
+            let body = match key {
+                "read_require" => {
+                    format!("read_require = \"{bad}\"\nwrite_require = \"role:editor\"\n")
+                }
+                _ => format!("read_require = \"role:monitor\"\nwrite_require = \"{bad}\"\n"),
+            };
+            let (_d, r) = load_with(
+                "",
+                &format!("\n[auth]\npublic_key = \"{{DIR}}/auth.pem\"\n\n[genid]\n{body}"),
+            );
+            let e = r.unwrap_err().to_string();
+            assert!(
+                e.contains(&format!("[genid].{key}"))
+                    && e.contains("must be \"role:<name>\" or \"group:<name>\""),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn genid_in_the_system_config_loads() {
+        let (_d, r) = load_with(
+            "",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[genid]\nread_require = \"group:ops\"\nwrite_require = \"role:editor\"\n",
+        );
+        let cfg = r.expect("a source loads");
+        assert_eq!(
+            cfg.genid.expect("present").read_require.as_deref(),
+            Some("group:ops")
+        );
+    }
+
+    #[test]
+    fn genid_in_site_toml_is_refused() {
+        let (_d, r) = load_with(
+            "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
+            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("site.toml sets [genid]"), "{e}");
+        assert!(e.contains("belongs in the system config"), "{e}");
+    }
+
+    #[test]
     fn health_keys_in_site_toml_are_refused() {
         let (_d, r) = load_with(
             "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
@@ -2560,8 +2720,8 @@ domain = "test.example.com"
             health,
             ["metrics_peers", "metrics_require", "metrics_token_file"]
         );
-        assert_eq!(NODE_SECTIONS, ["auth", "node"]);
-        assert_eq!(all.len(), 11 + 3 + 2);
+        assert_eq!(NODE_SECTIONS, ["auth", "genid", "node"]);
+        assert_eq!(all.len(), 11 + 3 + 3);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),

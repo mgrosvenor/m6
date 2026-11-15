@@ -122,14 +122,16 @@ where
         let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
             let req = match m6_core::h1::materialize(head, buf) {
                 m6_core::h1::ParseResult::Complete(r) => r,
-                _ => return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string()),
+                _ => {
+                    return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string(), None)
+                }
             };
             let (s, h, b, be) = handler(&req, ip);
-            RequestOutcome::Ready(s, h, b, be)
+            RequestOutcome::Ready(s, h, b, be, None)
         };
         let mut on_owned = |_: &mut (), req: &HttpRequest, ip: &str| {
             let (s, h, b, be) = handler(req, ip);
-            RequestOutcome::Ready(s, h, b, be)
+            RequestOutcome::Ready(s, h, b, be, None)
         };
         let hit = HitHeaders {
             alt_svc: std::sync::Arc::from(&[] as &[u8]),
