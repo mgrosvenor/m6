@@ -178,6 +178,12 @@ Verified by the `cache.rs` generation swap tests, which pin the full flush, the 
 
 **rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host; the update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
 
+**A login throttle blocks five wrong passwords even when the series takes longer than `window_secs`.**
+The count was anchored at the first failure, so the fifth failure could reset it to one and the sixth was answered 302 instead of 429.
+The example's development config sets a five-second window, and an unoptimised password check takes about a second, so five wrong passwords span more than five seconds on a loaded host.
+The window is now measured from the most recent failure, and a block lifts after `window_secs` with no further failure.
+Verified with `failures_spread_across_more_than_one_window_exhaust_the_budget`, which fails with the first-failure window restored, and with example 05's 98 checks on the running stack.
+
 **A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
 Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
 A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.

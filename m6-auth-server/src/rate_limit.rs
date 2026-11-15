@@ -30,6 +30,19 @@ pub const DEFAULT_WINDOW_SECS: u64 = 15 * 60;
 /// So: `is_blocked` only reads, `record_failure` is called when the credentials
 /// were actually wrong, and `clear` wipes the IP's count on a successful login.
 ///
+/// ## The window is measured from the most recent failure
+///
+/// It used to be measured from the first failure, so a series that took longer
+/// than the window forgot its earliest attempts and never blocked. A login that
+/// verifies a password in an unoptimised build takes about a second, so five
+/// wrong passwords against the example's five-second window can span more than
+/// five seconds on a loaded host. The sixth was then answered normally and the
+/// suite reported the throttle as missing. Measuring from the most recent
+/// failure also stops an attacker spacing attempts to stay under the count.
+///
+/// A block lifts after `window_secs` with no further failure. A correct password
+/// still clears the count at once.
+///
 /// ## Still in memory, deliberately
 ///
 /// A restart forgets every count. That is a real limit and it is the right
@@ -61,13 +74,16 @@ impl RateLimiter {
     /// Read-only on purpose: called before the password is checked, so a
     /// correct password is never counted against the budget.
     pub fn is_blocked(&self, ip: &str) -> bool {
+        self.is_blocked_at(ip, m6_core::platform::now())
+    }
+
+    /// [`is_blocked`](Self::is_blocked) at a caller-supplied time, so a test can
+    /// walk a series of failures without sleeping.
+    fn is_blocked_at(&self, ip: &str, now: Instant) -> bool {
         match self.map.get(ip) {
-            Some((count, started)) => {
-                if started.elapsed().as_secs() >= self.window_secs {
-                    false // window has rolled over
-                } else {
-                    *count >= self.max_attempts
-                }
+            Some((count, last)) => {
+                now.saturating_duration_since(*last).as_secs() < self.window_secs
+                    && *count >= self.max_attempts
             }
             None => false,
         }
@@ -75,13 +91,18 @@ impl RateLimiter {
 
     /// Count one failed login against `ip`.
     pub fn record_failure(&mut self, ip: &str) {
-        let now = m6_core::platform::now();
-        let window = self.window_secs;
+        self.record_failure_at(ip, m6_core::platform::now());
+    }
+
+    /// [`record_failure`](Self::record_failure) at a caller-supplied time, so a
+    /// test can space a series of failures without sleeping.
+    fn record_failure_at(&mut self, ip: &str, now: Instant) {
         let entry = self.map.entry(ip.to_string()).or_insert((0, now));
-        if entry.1.elapsed().as_secs() >= window {
-            *entry = (0, now);
+        if now.saturating_duration_since(entry.1).as_secs() >= self.window_secs {
+            entry.0 = 0;
         }
         entry.0 += 1;
+        entry.1 = now;
     }
 
     /// Forget `ip`'s failures. Called on a successful login.
@@ -157,6 +178,30 @@ mod tests {
         assert!(!rl.is_blocked("192.0.2.1"));
     }
 
+    /// A series of failures each inside the window but spanning more than one
+    /// window still uses up the budget. The old code measured the window from
+    /// the first failure, so the fifth reset the count to one and the sixth was
+    /// answered normally. That is what a loaded host showed: five wrong
+    /// passwords, each about a second apart, did not throttle the sixth.
+    #[test]
+    fn failures_spread_across_more_than_one_window_exhaust_the_budget() {
+        let mut rl = RateLimiter::with_limits(5, 5);
+        let start = m6_core::platform::now();
+        for i in 0..5 {
+            let at = start + Duration::from_millis(1400 * i);
+            rl.record_failure_at("192.0.2.1", at);
+        }
+        let sixth = start + Duration::from_millis(5600);
+        assert!(
+            rl.is_blocked_at("192.0.2.1", sixth),
+            "five failures 1.4s apart must block the sixth against a 5s window"
+        );
+        assert!(
+            !rl.is_blocked_at("192.0.2.1", sixth + Duration::from_secs(5)),
+            "the block must lift after a window with no further failure"
+        );
+    }
+
     /// A client that has used up its failure budget is blocked, so the login
     /// path answers 429. After the window elapses the rollover in `is_blocked`
     /// must unblock it again. Removing that rollover keeps the client blocked
@@ -167,14 +212,14 @@ mod tests {
         rl.record_failure("192.0.2.1");
         assert!(rl.is_blocked("192.0.2.1"), "the budget must block first");
 
-        // Move the recorded window start into the past instead of sleeping. The
-        // test module sees the private field, and a fixed sleep only works when
-        // the machine is idle.
-        let (_, started) = rl
+        // Move the recorded most recent failure into the past instead of
+        // sleeping. The test module sees the private field, and a fixed sleep
+        // only works when the machine is idle.
+        let (_, last) = rl
             .map
             .get_mut("192.0.2.1")
             .expect("the failure is recorded");
-        *started = m6_core::platform::now() - Duration::from_secs(61);
+        *last = m6_core::platform::now() - Duration::from_secs(61);
 
         assert!(
             !rl.is_blocked("192.0.2.1"),
