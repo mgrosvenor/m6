@@ -418,7 +418,8 @@ Take from it that the throttle is configuration, and a restart clears it.
 Only a failed credential check counts.
 A correct password clears the address's count.
 A blocked address gets 429 with `Retry-After: 60` before the password is checked.
-The window starts at the first failure and does not slide on each later failure.
+The window is measured from the most recent failure, so five failures each inside the window use up the budget however long the series takes.
+A block lifts after `window_secs` with no further failure.
 
 The service listens on a Unix socket, so it takes the value of `X-Forwarded-For`, then `X-Real-IP`.
 When neither is present, the address is the string `unix`.
@@ -431,6 +432,7 @@ A restart forgets them, and section 4 gives the restart rule for the two keys.
 The service runs as one process per site, so one count covers every login.
 The source comment says that brute force slow enough to survive restarts is left to the firewall.
 The tests `forwarded_addresses_select_the_rate_limit_bucket`, `requests_without_a_forwarded_address_share_one_bucket` and `a_restart_forgets_the_failure_counts` in `m6-auth-server/tests/integration.rs` pin these limits.
+The unit test `failures_spread_across_more_than_one_window_exhaust_the_budget` in `m6-auth-server/src/rate_limit.rs` pins the window's start and its rollover.
 
 The throttle bounds one route and one address at a time.
 Section 11 covers the process around it.
