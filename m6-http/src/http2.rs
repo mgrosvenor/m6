@@ -1983,7 +1983,7 @@ impl Http2Conn {
         // rather than clone. Every path below either removes the stream
         // (reject) or moves the body into `req` (Ready) / `ctx.req` (Pending),
         // so the taken fields are never read again.
-        let (headers, body) = {
+        let (mut headers, body) = {
             let s = self.streams.get_mut(&stream_id).unwrap();
             (std::mem::take(&mut s.headers), std::mem::take(&mut s.body))
         };
@@ -2060,8 +2060,9 @@ impl Http2Conn {
         // all of them to whoever opened it. The value is stripped from the
         // forwarded list either way.
         let forwarded_for = fields(&headers, &self.decode_buf)
-            .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
-            .map(|(_, v)| v);
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+            .map(|(_, v)| v)
+            .last();
         let client_ip =
             crate::forward::attributed_client_ip(forwarded_for, peer_ip, self.forwarded_trust);
 
@@ -2109,7 +2110,9 @@ impl Http2Conn {
         }
         // The view borrowed this list; it is ours again now. Keeping it means
         // the next stream decodes into the same allocation instead of growing a
-        // fresh `Vec` field by field.
+        // fresh `Vec` field by field. Cleared, so no range into `decode_buf`
+        // outlives the request it belongs to.
+        headers.clear();
         self.spare_headers = Some(headers);
     }
 
