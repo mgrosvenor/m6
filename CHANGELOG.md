@@ -48,13 +48,41 @@ No existing field changes, so no migration is needed.
 
 ### Migration
 
+**Remove `format` from `[log]`.** Every service now writes JSON lines through m6-log, so there is no format to choose, and a config that still sets `[log] format` is refused at start with "unknown key [log] format". m6-core's `LogHandle`, `init`, `init_with_analytics`, `reopen_log_file` and `Reopened` are gone; a service sets up logging through m6-log.
+
 **Every setting that names a secret, key or certificate takes an absolute path, and a relative one stops the service at startup with exit 2, naming the setting: `secrets_file` (every service built on m6-core), `[server] tls_cert`, `tls_key`, `[auth] public_key` and `[health] metrics_token_file` (m6-http), `[storage] path`, `[keys] private_key` and `[keys] public_key` (m6-auth-server and m6-auth-cli), and `perf_token_file` (m6-monitor).** Before upgrading, replace each relative value with the absolute path it resolved to. m6-http resolved them against the site directory. m6-auth-server and m6-auth-cli resolved `[keys]` against the site directory and `[storage] path` against the config file's directory, so `configs/m6-auth.conf` with `path = "data/auth.db"` used `<site>/configs/data/auth.db`. m6-core and m6-monitor resolved them against the working directory. `m6-auth-cli token create` no longer takes `--site-dir`. The documented production layout delivers m6-http's certificate, key and auth public key through systemd `LoadCredential` as well, and a certificate renewal restarts m6-http: a deployment that follows it changes its certbot deploy hook from a touch of the system config to `systemctl restart` of the m6-http unit.
+
+**A log or database directory that does not exist now stops the service at start with exit 2, naming the setting and the path, in place of being created.** Create the directory each setting names, owned by the user the service runs as, or point the setting at a directory that exists: the parent of `[analytics] log_path` for m6-http and the parent of `[storage] path` for m6-auth-server. A deployment's converge that creates `<site>/logs` and the config directory, owned by `m6`, already covers m6-http's default analytics path. It must also create m6-auth-server's database directory where auth is enabled. That unit is enabled on no node today, and the shipped `configs/m6-auth.conf` still names the relative `data/auth.db` this release refuses, so an operator who enables it must create the directory and make the path absolute.
 
 **m6-http refuses at start, with exit 2, a config it used to warn about.** That covers a key or section it does not know, a key in the file it does not belong to (docs/m6-site-toml.md §3.3, Table 1), a system config with no `[node]`, a `[health] metrics_token_file` that is missing, empty or set together with `metrics_require`, and a cache key on a `[[route]]` or `[[route_group]]` (set `Cache-Control` on the backend's response instead).
 Before upgrading, run `m6-http <site> <system config> --dump-config` on every node and fix what it names: add `[node] name = "<node>"` to each system config, and move every node key out of `site.toml`.
 Every m6 service refuses an unknown log level (in `site.toml`, its own config or `--log-level`), a `site.toml` that is missing or is not valid TOML (the default path included), an unknown key in one of m6-core's own tables (`[thread_pool]`, `[params_cache]`, `[server]`, `[log]`, `[compression]`), and a socket whose mode it cannot set.
 
+**A backend host name that does not resolve when m6-http starts now stops it with exit 2.** Host names in `url` and HTTP/2 backends are resolved once at start, so a backend whose address changes needs m6-http restarted.
+
+**A database path m6-auth-server cannot open now stops it at start with exit 2**, instead of answering 500 to each request.
+
+**m6-http verifies an https:// or h2s:// backend against the host's certificate authorities only, and a host with none stops it at start with exit 2.** A backend that relied on the bundled Mozilla list on a host with no CA certificates needs the host's CA package installed.
+
+**A service config that still has `[thread_pool]` is refused at start.** Delete it from every service config. To use more cores, run more instances (a systemd template unit with `M6_SOCKET_OVERRIDE` per instance and a glob in `site.toml`'s `[[backend]]` sockets). Code built on `App`: replace `App::new()` and its `route_*` calls with a main that loads `site::Site`, opens its listener with `net::listen_unix` and runs the loop in docs/m6-app-anatomy.md, with your routes as `CodeRoute` values and one match on `Handled`.
+
+**m6-monitor reads the fleet list and every node's host name at start.** A change to the fleet, or to a node's address, needs a restart. A node whose host name does not resolve at start stops m6-monitor with exit 2, naming the node.
+
+**m6-monitor's history file gains the index `health_ok_node_at` at start**, with no action needed. `[monitor] health_last_ok_max_age_s` is optional; its default is three poll intervals.
+
+**One request-header limit, as nginx sets it.** A header field over 8 KiB or a head over 32 KiB now gets 400 ("Request Header Or Cookie Too Large") from m6-http, and a request line over 8 KiB gets 414, on HTTP/1.1, HTTP/2 and HTTP/3, before any backend is contacted. The limits are `m6_core::headers::MAX_HEADER_LINE` and `MAX_REQUEST_HEAD`, and m6-core backends answer the same codes. HTTP/1.1 heads up to 20 MiB and HTTP/2 heads up to 64 KiB used to be forwarded and then refused by an m6 backend, which the client saw as 502. Each connection slot's head buffer is 32 KiB. On HTTP/3, quiche refuses a field section over 32 KiB by closing the connection instead of answering 400.
+
+`m6_core::mio` is gone: use `m6_core::platform::{Poll, Events, Interest, Token}`, `platform::net`'s sockets and `Registry::register_fd` in place of `SourceFd`. `m6_core::event::{Signals, Signal}` are `m6_core::platform::{Signals, Signal}` and `Signal::Terminate` is `Signal::Shutdown`. `event::raise_open_file_limit` is `platform::process::raise_fd_limit`. `m6_core::host` is `m6_core::platform::host`. `m6_core::signal::ShutdownHandle` and `Service` are removed: use `platform::Signals` in the service's own loop. A service that spawns a child uses `platform::process::spawn`, and an accept loop matches `platform::net::accept_error`. Shipping code reads the clock through `platform::now()` and `platform::wall()`.
+
+**A cache node needs `[genid] upstream = "<backend>"` and `token_file`, and the source must run this version first.** The token file is an absolute path to a token with the source's read claim, delivered like every other credential. A cache node stores nothing from an upstream that sends no `M6-Genid`, so a source older than this release cannot fill it.
+
 ### Added
+
+**A count of heap allocations per request, as a test.** Building m6-http with the `count-allocations` feature counts every allocation the loop makes while serving, and logs the calls and bytes once at stop. `tests/allocations.rs` holds the count per cached request over HTTP/1.1 and HTTP/2 with TLS, per cache miss and per new connection, to a budget that only goes down. A normal build is unchanged. Verified on 2026-11-15 on a macOS sandbox with the difference of two runs on one warm connection, N = 1,000 and 2N = 2,000: 11.000 and 91.000 calls per request, 91.001 for a miss that inserts and 123.000 calls per connection. The three request budgets are the top of the observed spread, 11,003, 91,004 and 91,004 calls per 1,000 requests, with nothing added on top, and the test passed three runs in a row. The new-connection row is measured per connection and reported rather than budgeted, because a full handshake per connection varies with the server's read sizes. Adding one `String::from("x")` to the request path failed the three budgeted rows by one call per request and raised the new-connection figure by the same.
+
+**The source node holds the site's generation ID, and `/genid` there reloads every backend.** m6-http on the source node owns the ID; a `POST /genid` to it drives the reload of every member of every pool, and a member that fails is named in the log with its socket and the status it answered. Only a response carrying the current ID is stored in the cache, so a response rendered before a reload cannot be cached after it. A reload on a backend now writes an access line like any other request.
+
+**`POST /genid` on a backend reloads its site from disk, the same way it starts.** Config, `site.toml`, templates and params are read again through the start path, and the new site replaces the old one only when the whole load succeeds: the answer is 204, or 500 with the cause while the old site keeps serving. A request already answered or parked when the reload lands finishes with the generation it started under. A service route on `/genid` is refused at start.
 
 **User guide section 7.2, Secrets and state: configuration in /etc/m6, secrets by systemd's `LoadCredential` (m6-http's certificate and keys included), databases by `StateDirectory`. The m6-auth unit uses both, and the m6-http unit uses `LoadCredential`.**
 
@@ -97,7 +125,43 @@ The default is 100, as before, and 0 is a config error.
 The key is read at start, so a change needs a restart.
 A client that makes more requests than this on one connection reconnects, with a new TLS handshake.
 
+**m6_core::client::Upstream, a non-blocking HTTP/1.1 client for an event loop.** It connects to a unix socket or a TCP address, optionally over TLS, writes one request and parses the response as bytes arrive, and can carry the next request on the same connection. Its buffers are allocated once, so a request over a unix socket or plain TCP allocates nothing. m6-http's unix-socket backends use it.
+
+**m6_core::dns, a DNS question on its own non-blocking UDP socket.** dns::Query asks one PTR, or one A and AAAA pair, of the first nameserver in /etc/resolv.conf, and dns::Confirm makes the reverse-then-forward check a crawler claim needs, each driven by the caller's event loop. Messages are built and parsed by hickory-proto. Nothing else in m6 resolves names while serving: host names are resolved once at start.
+
+**m6-core supplies the parts a service's own event loop is built from.** h1::ServerConn serves one HTTP/1.1 connection from buffers made at start, reading and writing until the socket would block, with no allocation per request. net::listen_unix and net::listen_tcp open a non-blocking listener. site::Site loads a site's config, templates and params at start, and handle and finish answer a request with the routing, rendering, minification and compression App used, returning the service's own routes to the service to answer.
+
+**m6-log, a buffered JSONL logger for an event loop.** Lines are written into a 16 KiB buffer allocated at start and flushed when full, every second and at stop, as nginx's buffered access log does. Warnings and errors are written at once. No thread, no lock, no allocation per line. A destination that cannot take more is never waited on: lines are kept, then dropped and counted, as HAProxy does.
+
+**m6-monitor's hourly check reports each node's `/health` and the age of its last 200.** A node is ok only when `/health` answers 200 with status ok, and every other node is a fault on its line and in the verdict.
+
+**A cache node follows the site generation ID.**
+A cache node is an m6-http whose `[genid] upstream` names the source.
+It asks the source for the ID at start and every `heartbeat_secs` (default 10).
+A new ID flushes the cache, which then refills on demand.
+It stores a response only when its `M6-Genid` equals the ID it holds.
+While the upstream does not answer, it serves every page it holds, at any age, rather than an error, and `/perf` reports `upstream_down`.
+`/genid` on a cache node is forwarded to the source with the caller's own token.
+`/perf` reports the node's ID, its upstream's round trip and whether the upstream is down.
+Verified by `genid_cache_node.rs`, which starts a real source and a real cache node and covers the start-time ID, a publish through the node, a wake from a newer reply, serving held content with the source stopped, recovery, the forwarded `/genid` token check and warm fetches waiting for the ID, and by `genid_cache_allocs.rs`, which measures 0 allocations in 2000 store checks.
+
+**A generation change on a cache node swaps the cache in one step.**
+The rule is a full flush: no entry survives into the new generation, and the cache refills on demand.
+Each replacement is one assignment, so a request sees the old generation or the new one and never a half-emptied cache.
+A request already holding an entry finishes on the content it took, and the old generation stays whole for every holder until it drops.
+The swap keeps the cache's byte bound and clears the serve-held policy, because it runs exactly when the upstream has answered with the new ID.
+Verified by the `cache.rs` generation swap tests, which pin the full flush, the held response and the old generation staying whole, the bound and the serve-held reset, and by `genid_cache_allocs.rs`, which measures 2 allocations for a 4096-entry swap and 0 in 2000 store checks and 1000 hits.
+
 ### Security
+
+**rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host; the update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
+
+**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
+Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
+A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.
+Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5x` and an empty value with `Connection: close`, and asserts each is answered 400 with the connection closed. On the old parser the `+5` case is answered with nothing inside the read bound, so that case fails.
+
+**SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected; no configuration changes.
 
 **HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
 Only the compressed header block was bounded, at 256 KiB, and HPACK lets one byte stand for a table entry of up to 4096 bytes, so a block under that cap could decode to a far larger header list.
@@ -113,6 +177,26 @@ m6-file now reads `relpath`, `filename` and each `root` placeholder only when th
 Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query_relpath_cannot_choose_a_file_on_a_filename_route`, which send those requests over HTTP. The first fails on the previous code with `200 OK` and the service's config in the body. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
 
 ### Fixed
+
+**A service writes its access line at the default log level (#179).**
+`Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
+It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.
+Verified with `an_access_line_is_logged_at_the_default_level`, which finds no line on the previous code and an INFO line after it.
+
+**A split body-less HTTP/2 backend response is forwarded instead of a 502 (#315).**
+A backend that put END_STREAM on a HEADERS frame and finished the header block in CONTINUATION frames had its stream completed before the block ended, so the reply was failed as "stream ended without headers" and the edge answered 502.
+The client now completes a stream only when the header block ends and END_STREAM has been seen, as RFC 9113 sections 4.3 and 6.2 require, in the shared h2c and h2s path.
+Verified with `a_split_bodyless_response_is_forwarded`, which sees a 502 on the previous code and the backend's 200 after it.
+
+**A backend's early response is forwarded instead of a 502.**
+When a backend answered before it had read the whole request body (a 413 for an oversized upload, for example) and then closed, m6 treated the failed write as the result and answered 502, and on Linux the reply was lost.
+The client now reads a reply the backend has already sent before it reports a write error, over plain and TLS connections, and the backend's own status reaches the client.
+Verified: the socket and m6-http early-response tests on Linux and macOS (on Linux, 0 of 10 passed before the fix and 10 of 10 after).
+
+**The test kit's scratch directory and port claims work on any host, so the suite has no list of known failures.**
+`m6_core::testkit` chose `/var/tmp` for scratch files whether or not the process could write there, and kept port claims per build, so two builds on one host could claim the same port and one test reached the other's server.
+Scratch files now go to the first of `TMPDIR`, `/var/tmp` and the system temp directory that can create, write and run a file, and port claims live in one directory per user that every build shares.
+Verified: the full workspace suite on Linux and macOS with no failure.
 
 **m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
 Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed.
@@ -150,7 +234,13 @@ Verified by this pull request's own CI run.
 **The signal-mask guard fails closed (#178).**
 When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
 
+**URL backends and HTTP/2 upstreams no longer block or wait on a timer.** An http:// or https:// backend ran each request on its own thread with a new TCP and TLS connection, and its reply was noticed on a 10 ms poll. An h2c or h2s upstream connected, and for h2s completed its TLS handshake, inside the event loop, so an unreachable upstream stalled every request on the node. All of them now connect, write and read in the loop, http(s) connections are reused, and backend_timeout_secs applies to HTTP/2 upstream streams too. An idle m6-http wakes about once a second instead of 100 times.
+
+**A backend that refuses a request no longer takes its pool member out of rotation.** When a backend closed the connection while m6-http was still sending the request (m6-file answering an oversized header, then closing without draining it), m6-http marked the member failed and backed it off for a second, so the next request to that backend answered 502. A member that never received the whole request is now released. A member that took the whole request and then failed, a silent member and a refused connect still back off.
+
 ### Docs
+
+**The event loop is described once, in `docs/m6-architecture.md` §1.10,** with m6-http's own loop in `docs/m6-http.md` pointing at it. Two false claims went: that backend calls have no timeout (`backend_timeout_secs` exists, default 30) and that m6-http is "single-threaded epoll" by name. `CONTRIBUTING.md` says which loop changes need approval: a new disallowed-method exception, a thread, or an allocation on the loop's path.
 
 **`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
 
@@ -196,6 +286,23 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**HTTP/2 and HTTP/3 send responses in the order the client's `priority` header asks for, and the kernel's send queue is bounded so that order survives the socket.** m6 ignored the field and let the kernel choose what left first, so a page's stylesheet waited behind a large image on the same connection. `priority::from_headers` parses the RFC 9218 Dictionary itself, in place and without allocating, because quiche's parser for the same field needs its `sfv` feature and would add a dependency for two members. On HTTP/2 a stream records the priority from its request's HEADERS, and the flusher takes its next frame from the lowest urgency that has a response the windows allow, in stream-id order. A non-incremental response is sent to its end before the next one starts, and an incremental one takes a frame each in turn (RFC 9218 section 10). `TCP_NOTSENT_LOWAT` bounds the send queue on Linux, so m6 rather than the kernel decides the order. Verified with the parser's tests against the RFC's examples and its out-of-range and garbage rows, and with `incremental_streams_interleave` and `one_end_stream_when_the_peer_ends_after_ours`. The m6-http lib tests pass.
+
+**Every m6 service and m6-core log through m6-log, and `tracing` is gone.** The log lines are written into m6-log's buffer inside the event loop and flushed by it, so no service has a logging thread or a `tracing` subscriber any more.
+
+**m6-http's per-request analytics line allocates nothing.** The line is built from borrowed request fields straight into m6-log's buffer. Verified with `analytics_allocs`: 0 allocations in 1000 returning-visitor requests and 0 in 1000 new-session requests, with all 2002 lines written. The one allocation left is the `Set-Cookie` value for a new session, once per visitor rather than once per request.
+
+**Choosing a backend socket is plain round robin, and a request whose connect fails tries the next member.** The least-connections choice and the 1 to 30 second per-member backoff are gone, with the failure count and the retry deadline they read. Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members, and a client receives 502 only when every member has failed. A backend that stops and restarts on the same path serves again on its next turn. The `/perf` pool counts report every member as in rotation. Verified on the sandbox with a real `m6-http` in front of three and four unix-socket backends, and a member killed and then restarted on the same path.
+
+**Every test binary answers the standard test-list protocol, so `cargo nextest` runs the whole workspace.**
+Nine binaries that run without libtest's harness (the allocation counters and the loop tests that need one thread or a blocked signal mask) now answer `--list --format terse` and accept a name filter, so a test runner can list and run them like any other. Each still forces one thread after parsing its arguments. Verified on Linux with `cargo nextest run --workspace`: 1989 tests in 97 binaries listed and passed.
+
+**Every clock read outside `m6-platform` is refused by its gate, including reads through `chrono`, `time` and `filetime`.**
+Five shipping reads that asked the operating system directly now take the time from `m6_core::platform::now()` or `wall()`, and `chrono` only formats a value it is given.
+Verified: the platform gate on Linux and macOS.
+
+**The minimum supported Rust version is 1.89** (was 1.88), the version the updated SQLite binding requires.
 
 **m6-http drives only the connections that have events, accepts only when a client is waiting, and resumes a blocked write when the socket can take more.** Every HTTP/1.1 connection shared the listener's token, so any event drove every connection and tried a failing accept, and a response that filled the socket buffer waited for the next unrelated wake-up. Each descriptor now has its own token, each turn reads and writes until the socket would block, a connection with unsent bytes asks for write readiness, and idle and read timeouts are deadlines rather than checks on every pass. On the build host this removed one failing accept4 per loop pass and one or two recvfrom calls per request.
 
@@ -308,6 +415,30 @@ They fail if a backend 404 or 500 loses the fetched page or its status, if a fai
 
 **The build-host sync now keeps `tools/perf-history.jsonl`, and the script brings it back after perfcheck so the committed performance history records every run (#193).**
 The sync used to delete the file the build host wrote, so the history never entered git. The sync now sends the committed history to the host, perfcheck appends its record there, and the script replaces the local file with the result only if the copy is complete and no shorter. The clean-tree guard ignores the file, a copy-back failure fails the run without stopping the examples, and `.gitattributes` merges the file by union so two branches that each add a record do not conflict.
+
+**m6-html and m6-file each run one event loop in one thread.** They accepted on one thread and handed each connection to a worker over a locked queue, about 15 µs per request, and a worker held its connection for its whole keep-alive life. Now each service's main accepts, reads, answers and writes with every socket non-blocking: an idle keep-alive connection costs a buffer, not a thread, and a large file streams as the client reads it. Connections beyond what the process can serve wait in the kernel's listen queue: there is no 503 for a full queue. Run several instances to use several cores.
+
+**m6-auth-server runs one event loop with one database connection.** It handed each connection to a worker thread, and each worker opened its own database connection on its first request, answering 500 when that open failed. Now one loop serves every connection, the database is opened once at start, and a database that cannot be opened stops the service with exit 2. The login rate limit is per process.
+
+**m6-auth-server never waits on a database lock.** It waited up to 5 seconds for SQLite's lock, which in a single-threaded service holds every request. It now sets SQLite's busy timeout to zero once started, retries a request that found the database locked every 5 ms from its event loop while serving others, and answers 503 with Retry-After after one second. A retried login does not verify the password twice. m6-auth-cli keeps its 5-second wait.
+
+**m6-monitor runs one thread with its own event loop.** It ran a background poll thread, one thread per node per poll with blocking HTTP requests, a thread per tunnel probe, a history writer thread and a thread per reverse DNS lookup. Each poll is now a set of non-blocking requests, connects and DNS queries driven by its loop, the page, digest and check are built once per poll and served from memory, and history is written in one short transaction per poll, never waiting on a locked database. The reports are unchanged. The monitor trusts the host's certificate store instead of a bundled one.
+
+**/traffic no longer reads the analytics log.** m6-http read up to 24 MiB of its log file inside its event loop to answer /traffic. It now keeps the last 32,768 events it logs in memory, in space allocated at start, and builds the report from those in the last hour. A report after a restart covers only the time since the restart, and window_minutes says how long that is. A node that wraps the ring inside the hour reports the shorter span it holds and counts the events it dropped. A path is stored up to 512 bytes and a user agent up to 256, and a cut value ends in `...`: the log keeps them whole. A request whose path or user agent was cut counts as probe-shaped, so a marker cannot be hidden past the cut.
+
+**A node answering `/health` with 200 and an unrecognised status, or with no usable answer, is now a fault in m6-monitor's digest.**
+
+**One platform layer.** m6 named the operating system, or an OS crate, in every service loop, three thread counters, a Linux-only test, the host readings and the bench tools. They now live in one crate, `m6-platform`, re-exported as `m6_core::platform` and selected by OS family: readiness over mio, the clock, a shutdown or reload request as a descriptor, a child's exit as a descriptor (pidfd on Linux, kqueue on macOS), sockets with the right options, the open-file and socket-path limits, host and process facts. A gate test refuses platform conditionals, OS crates, direct clock reads and service-manager variables anywhere else. One shared contract suite and the echo reference app run unchanged on macOS arm64, Linux x86_64 and Linux arm64, and CI builds and tests all three. A child a service spawned inherited its blocked signals (and on macOS the ignored disposition) and could not be stopped: fixed. The thread-based `ShutdownHandle` is removed. Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives.
+
+### Removed
+
+**`ureq`, `native-tls`, `openssl` and their dependents left m6-core, and email is a client the service's own loop drives.** A form POST is `client::Endpoint` over the loop's `Upstream`, and an SMTP send is `email::Smtp` driven by the loop's step, with lettre supplying the message bytes, the envelope, the command sequence and the reply parse. The socket, the descriptor and the deadline are ours, as they are for every other client. A send that a backend refuses answers 500 naming the reply code, and one that never answers answers 504 on the loop's deadline rather than blocking it.
+
+Nine crates left the lockfile: ureq, webpki-roots, native-tls, openssl, openssl-sys, foreign-types 0.3.2, foreign-types-shared 0.1.1 and futures-io. Verified: `cargo tree -i` reports no match for ureq, native-tls or webpki-roots, no source names the removed transports, the allocation test measures 0 in our code around the send with lettre's own allocations recorded as the accepted exception, and the three loop tests fail when the loop is replaced by a blocking call.
+
+m6-http's bundled webpki-roots store, a second store beside the host's.
+
+**App, its builders, AppContext, with_thread_state and `[thread_pool]` are gone: m6-core is not a framework.** Every service writes its own main with its own event loop, and m6-core supplies the parts: h1::ServerConn, site::Site, net::listen_unix, and the event module's Signals, Timeouts, Slots and LoopTrace (see docs/m6-app-anatomy.md). The params cache takes no lock.
 
 ### Verified
 

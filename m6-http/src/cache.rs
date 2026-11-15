@@ -13,6 +13,9 @@ pub struct CachedResponse {
     pub status: u16,
     pub headers: std::sync::Arc<Vec<(String, String)>>,
     pub body: bytes::Bytes,
+    /// The source's site generation when the response was dispatched. Written
+    /// as `M6-Genid` on a hit, so a client can tell which generation it saw.
+    pub genid: u64,
 }
 // Conditional requests and preconditions live in `m6_core::conditional`.
 // They are version-independent semantics with two consumers, and the second
@@ -172,7 +175,7 @@ fn expires_lifetime(headers: &[(String, String)]) -> Option<std::time::Duration>
         m6_core::headers::get(headers, name).and_then(|v| httpdate::parse_http_date(v.trim()).ok())
     };
     let expires = get("expires")?;
-    let date = get("date").unwrap_or_else(std::time::SystemTime::now);
+    let date = get("date").unwrap_or_else(m6_core::platform::wall);
     Some(
         expires
             .duration_since(date)
@@ -441,14 +444,21 @@ static READ_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 use std::sync::{Arc, RwLock};
 
-/// Cache backed by `Arc<RwLock<HashMap>>` — swap the whole map atomically.
-/// Clone is cheap, as it only clones the Arc.
+/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap, and
+/// [`Cache::swap_generation`] publishes a whole new generation with one
+/// assignment.
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,
     /// Total footprint of everything in `map`, maintained on insert and evict.
     bytes: Arc<std::sync::atomic::AtomicUsize>,
     max_bytes: usize,
+    /// Serve an entry that is past its freshness and stale windows rather than
+    /// asking the backend, while this node's upstream is down.
+    ///
+    /// A plain field, not an `Arc`: the loop owns the `Cache` value in
+    /// `ServerState` and is the only writer, so a hit path reads one `bool`.
+    serve_held: bool,
 }
 
 impl Default for Cache {
@@ -468,7 +478,19 @@ impl Cache {
             map: Arc::new(RwLock::new(CacheMap::new())),
             bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes,
+            serve_held: false,
         }
+    }
+
+    /// Whether an expired entry is served instead of missed. Set by the
+    /// follower while the upstream is down, cleared on its next success.
+    pub fn set_serve_held(&mut self, held: bool) {
+        self.serve_held = held;
+    }
+
+    /// Whether expired entries are being served while the upstream is down.
+    pub fn serve_held(&self) -> bool {
+        self.serve_held
     }
 
     /// Total bytes currently held.
@@ -503,6 +525,7 @@ impl Cache {
             map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))),
             bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes: DEFAULT_MAX_BYTES,
+            serve_held: false,
         }
     }
 
@@ -616,7 +639,7 @@ impl Cache {
         let Some(expires_at) = entry.expires_at else {
             return Some(std::time::Duration::from_secs(u32::MAX as u64));
         };
-        expires_at.checked_duration_since(std::time::Instant::now())
+        expires_at.checked_duration_since(m6_core::platform::now())
     }
 
     /// How long an entry has been stale, or `None` if absent or still fresh.
@@ -628,7 +651,7 @@ impl Cache {
         let map = self.map.read().ok()?;
         let entry = map.get(key)?;
         let expires_at = entry.expires_at?;
-        std::time::Instant::now().checked_duration_since(expires_at)
+        m6_core::platform::now().checked_duration_since(expires_at)
     }
 
     /// Look up an entry, distinguishing fresh from servable-but-stale.
@@ -657,7 +680,7 @@ impl Cache {
             READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         // Current age: how long we have held it, plus whatever age it already
         // had on arrival. Resetting to zero at each hop is what makes a chain
         // of caches report content as fresher than it is.
@@ -670,9 +693,31 @@ impl Cache {
             Lookup::Fresh(entry.response.clone(), age)
         } else if entry.serve_stale_until.is_some_and(|until| now < until) {
             Lookup::Stale(entry.response.clone(), age)
+        } else if self.serve_held {
+            // The upstream is down. A working site with old pages beats an
+            // error page, so an entry past every window is served at any age,
+            // flagged stale.
+            Lookup::Stale(entry.response.clone(), age)
         } else {
             Lookup::Miss
         }
+    }
+
+    /// Any entry for `key`, at any age, with its current age.
+    ///
+    /// The last resort after a forward to the upstream failed: the node still
+    /// holds content for this key even though `lookup` may have refused it.
+    /// The clone is the same one the stale branch makes.
+    pub fn lookup_held<Q>(&self, key: &Q) -> Option<(CachedResponse, std::time::Duration)>
+    where
+        CacheKey: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let map = self.map.read().ok()?;
+        let entry = map.get(key)?;
+        let now = m6_core::platform::now();
+        let age = entry.upstream_age + now.saturating_duration_since(entry.stored_at);
+        Some((entry.response.clone(), age))
     }
 
     /// Store a response. Only call if the response should be cached.
@@ -682,7 +727,7 @@ impl Cache {
     /// having to know about it.
     pub fn insert(&self, key: CacheKey, response: CachedResponse) {
         let d = directives(&response.headers);
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         // Any `Age` the upstream already declared. A response that reached us
         // one hop old must not have its age reset to zero here, or each hop
         // would silently make the content look fresher than it is.
@@ -708,7 +753,7 @@ impl Cache {
             .unwrap_or_default();
         let apparent_age = m6_core::headers::get(&response.headers[..], "date")
             .and_then(|v| httpdate::parse_http_date(v).ok())
-            .and_then(|d| std::time::SystemTime::now().duration_since(d).ok())
+            .and_then(|d| m6_core::platform::wall().duration_since(d).ok())
             .unwrap_or_default();
         let upstream_age = age_value.max(apparent_age);
         //
@@ -848,7 +893,7 @@ impl Cache {
             .saturating_sub(freed);
         self.bytes
             .store(now_held, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(
+        m6_core::log::info!(
             dropped = before - map.len(),
             bytes_held = now_held,
             max_bytes = self.max_bytes,
@@ -885,7 +930,7 @@ impl Cache {
                 if let (Some(kpath), Some(query), Some(enc)) =
                     (parts.next(), parts.next(), parts.next())
                 {
-                    tracing::debug!(
+                    m6_core::log::debug!(
                         path = %kpath, query = %query, encoding = %enc,
                         "cache: evicted"
                     );
@@ -915,6 +960,36 @@ impl Cache {
             map.clear();
             self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Replace the live generation with an empty cache in one assignment.
+    ///
+    /// The rule for a site generation change is a full flush (`DESIGN-genid`
+    /// point 8): no entry survives into the new generation, and the cache
+    /// refills on demand. This method is that whole rule. It builds the
+    /// replacement beside the live cache and publishes it with
+    /// `std::mem::replace`, which is read-copy-update's answer in one process
+    /// and the same publish rule G1a uses for the `Site`.
+    ///
+    /// Atomicity follows from ownership. `&mut self` means the loop cannot be
+    /// reading the cache while the swap runs, and one assignment means it
+    /// sees either the old generation or the new one, never a map that is
+    /// partly emptied. A request that already took an entry holds the
+    /// `CachedResponse` clone the hit path makes, so it finishes on the
+    /// content it holds. A holder of the old `Cache` (a clone) keeps that
+    /// generation whole, and it is freed when the last holder drops.
+    ///
+    /// `max_bytes` carries over, so a swap cannot change the bound. The
+    /// held-serving flag starts clear: the swap happens when the upstream has
+    /// answered with a new ID, which is the moment held content stops being
+    /// served.
+    ///
+    /// The old cache is returned so a caller that must keep an in-flight
+    /// reader's generation can, and so the drop is visible at the call site.
+    #[must_use = "the old generation is dropped at once unless the caller keeps it"]
+    pub fn swap_generation(&mut self) -> Cache {
+        let fresh = Cache::with_max_bytes(self.max_bytes);
+        std::mem::replace(self, fresh)
     }
 
     /// Sum of the footprints actually in the map.
@@ -1137,6 +1212,24 @@ pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Headers safe to store in a cache entry, with `Set-Cookie` and `M6-Genid`
+/// removed.
+///
+/// The entry carries its generation in `CachedResponse.genid`, and a hit
+/// writes it once. Keeping the upstream's copy as well would send the header
+/// twice on a cache node, where the upstream is another m6-http and stamps
+/// every reply.
+pub fn strip_uncacheable(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("set-cookie")
+                && !k.eq_ignore_ascii_case(crate::genid::GENID_HEADER)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1351,7 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/hello", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::from_static(b"world"),
@@ -1284,6 +1378,7 @@ mod tests {
             vec![("cache-control".to_string(), cc.to_string())]
         };
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(headers),
             body: bytes::Bytes::from_static(b"world"),
@@ -1368,6 +1463,74 @@ mod tests {
             cached_with_cc("public, max-age=0"),
         );
         assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
+    }
+
+    /// The held flag is the only thing between an expired entry and a miss.
+    ///
+    /// Break: read `serve_held` on the fresh branch too, and the entry comes
+    /// back `Stale` before its lifetime is up.
+    #[test]
+    fn an_expired_entry_is_a_miss_unless_held() {
+        let mut cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/held", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        assert!(matches!(lookup_path(&cache, "/held"), Lookup::Miss));
+        assert!(!cache.serve_held());
+        cache.set_serve_held(true);
+        assert!(cache.serve_held());
+        match lookup_path(&cache, "/held") {
+            Lookup::Stale(r, _) => assert_eq!(r.body, b"world" as &[u8]),
+            _ => panic!("a held entry past its windows must be served stale"),
+        }
+        // A fresh entry is unchanged by the flag: the hit path stays a hit.
+        cache.insert(
+            CacheKey::new("/fresh", None, ""),
+            cached_with_cc("public, max-age=3600"),
+        );
+        assert!(matches!(lookup_path(&cache, "/fresh"), Lookup::Fresh(..)));
+        cache.set_serve_held(false);
+        assert!(matches!(lookup_path(&cache, "/held"), Lookup::Miss));
+    }
+
+    /// `lookup_held` answers for any entry at any age, including one `lookup`
+    /// refuses, and says nothing when the key was never stored.
+    #[test]
+    fn lookup_held_returns_any_age() {
+        let cache = Cache::new();
+        let mut buf = String::with_capacity(512);
+        assert!(cache
+            .lookup_held(make_lookup_key("/absent", None, "", &mut buf))
+            .is_none());
+        cache.insert(
+            CacheKey::new("/hello", None, ""),
+            cached_with_cc("public, max-age=0"),
+        );
+        let mut buf = String::with_capacity(512);
+        let (entry, age) = cache
+            .lookup_held(make_lookup_key("/hello", None, "", &mut buf))
+            .expect("a held entry is returned at any age");
+        assert_eq!(entry.body, b"world" as &[u8]);
+        assert!(matches!(lookup_path(&cache, "/hello"), Lookup::Miss));
+        assert!(age >= std::time::Duration::ZERO);
+    }
+
+    /// A cache node's upstream is another m6-http and stamps every reply, so
+    /// the stored copy must not carry the header: the entry's own `genid` is
+    /// the one the hit writer emits.
+    #[test]
+    fn stored_headers_keep_neither_set_cookie_nor_the_generation() {
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("Set-Cookie".to_string(), "_m6sid=abc".to_string()),
+            ("M6-Genid".to_string(), "7".to_string()),
+        ];
+        let stripped = strip_uncacheable(&headers);
+        assert_eq!(
+            stripped,
+            vec![("Content-Type".to_string(), "text/html".to_string())]
+        );
     }
 
     /// `no-cache` forbids reuse without revalidation. m6-http has no
@@ -1460,6 +1623,7 @@ mod tests {
         let k2 = CacheKey::new("/page", None, "br");
         let k3 = CacheKey::new("/other", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
@@ -1490,6 +1654,7 @@ mod tests {
         // key stored with no query
         let k = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
@@ -1509,6 +1674,7 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/blog/hello", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"cached body"),
@@ -1547,6 +1713,7 @@ mod tests {
             headers.push(("content-encoding".to_string(), enc.to_string()));
         }
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(headers),
             body: bytes::Bytes::from_static(body),
@@ -1684,6 +1851,7 @@ mod tests {
     fn test_evict_path_removes_all_query_variants() {
         let cache = Cache::new();
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
@@ -1809,6 +1977,7 @@ mod method_gate_tests {
         cache.insert(
             CacheKey::new("/page", None, "br"),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(vec![]),
                 body: bytes::Bytes::from_static(b"full GET body"),
@@ -1995,6 +2164,7 @@ mod age_tests {
 
     fn resp(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(
                 headers
@@ -2090,6 +2260,7 @@ mod heuristic_freshness_tests {
 
     fn resp(cc: &str) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"x"),
@@ -2126,7 +2297,7 @@ mod heuristic_freshness_tests {
         let ttl = e
             .expires_at
             .unwrap()
-            .saturating_duration_since(std::time::Instant::now());
+            .saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() <= 60,
             "explicit max-age was overridden: {ttl:?}"
@@ -2141,13 +2312,13 @@ mod heuristic_freshness_tests {
 #[cfg(test)]
 mod expires_tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     fn at(offset_secs: i64) -> String {
         let t = if offset_secs >= 0 {
-            SystemTime::now() + Duration::from_secs(offset_secs as u64)
+            m6_core::platform::wall() + Duration::from_secs(offset_secs as u64)
         } else {
-            SystemTime::now() - Duration::from_secs((-offset_secs) as u64)
+            m6_core::platform::wall() - Duration::from_secs((-offset_secs) as u64)
         };
         httpdate::fmt_http_date(t)
     }
@@ -2157,6 +2328,7 @@ mod expires_tests {
         c.insert(
             CacheKey::new("/e", None, ""),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(headers),
                 body: bytes::Bytes::from_static(b"x"),
@@ -2177,7 +2349,7 @@ mod expires_tests {
             ("expires".into(), at(120)),
         ])
         .expect("stored with a deadline");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() > 60 && ttl.as_secs() <= 120,
             "ttl was {ttl:?}, expected ~120s"
@@ -2196,7 +2368,7 @@ mod expires_tests {
             ("expires".into(), at(3660)),
         ])
         .expect("stored");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() <= 60,
             "skew leaked into the lifetime: {ttl:?}"
@@ -2212,7 +2384,7 @@ mod expires_tests {
             ("expires".into(), at(86400)),
         ])
         .expect("stored");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(ttl.as_secs() <= 30, "Expires overrode max-age: {ttl:?}");
     }
 
@@ -2226,7 +2398,7 @@ mod expires_tests {
         ])
         .expect("stored");
         assert!(
-            e <= std::time::Instant::now() + Duration::from_secs(1),
+            e <= m6_core::platform::now() + Duration::from_secs(1),
             "a past Expires should not produce a live deadline"
         );
     }
@@ -2239,7 +2411,7 @@ mod expires_tests {
             ("expires".into(), "not-a-date".into()),
         ])
         .expect("stored");
-        let ttl = e.saturating_duration_since(std::time::Instant::now());
+        let ttl = e.saturating_duration_since(m6_core::platform::now());
         assert!(
             ttl.as_secs() > 3600,
             "should have fallen back to the heuristic, got {ttl:?}"
@@ -2400,6 +2572,7 @@ mod request_directive_tests {
         let cache = Cache::new();
         let key = CacheKey::new("/p", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"body"),
@@ -2459,6 +2632,7 @@ mod corrected_age_tests {
 
     fn resp_with(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(
                 headers
@@ -2470,7 +2644,7 @@ mod corrected_age_tests {
         }
     }
     fn http_date_ago(secs: u64) -> String {
-        httpdate::fmt_http_date(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        httpdate::fmt_http_date(m6_core::platform::wall() - std::time::Duration::from_secs(secs))
     }
     fn age_of(headers: &[(&str, &str)]) -> u64 {
         let cache = Cache::new();
@@ -2532,7 +2706,7 @@ mod corrected_age_tests {
     #[test]
     fn future_date_does_not_wrap_or_go_negative() {
         let future = httpdate::fmt_http_date(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            m6_core::platform::wall() + std::time::Duration::from_secs(3600),
         );
         let age = age_of(&[
             ("cache-control", "public, max-age=86400"),
@@ -2620,6 +2794,7 @@ mod capacity_tests {
 
     fn resp(body_len: usize) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![(
                 "cache-control".to_string(),
@@ -2715,6 +2890,7 @@ mod capacity_accounting_tests {
 
     fn resp(n: usize) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![(
                 "cache-control".to_string(),
@@ -2801,6 +2977,144 @@ mod capacity_accounting_tests {
         assert!(
             !matches!(cache.lookup(k), Lookup::Miss),
             "cache unusable after cycles"
+        );
+    }
+}
+
+/// The generation swap: the rule, the atomic publish, and what an in-flight
+/// request keeps.
+#[cfg(test)]
+mod generation_swap_tests {
+    use super::*;
+
+    fn resp(genid: u64, body: &[u8]) -> CachedResponse {
+        CachedResponse {
+            genid,
+            status: 200,
+            headers: std::sync::Arc::new(vec![(
+                "cache-control".to_string(),
+                "public, max-age=86400".to_string(),
+            )]),
+            body: bytes::Bytes::copy_from_slice(body),
+        }
+    }
+
+    /// The plan's rule is a full flush, so the new generation holds nothing
+    /// and its accounting starts at zero.
+    ///
+    /// Break: make `swap_generation` a no-op, and every entry is still there.
+    #[test]
+    fn a_generation_swap_keeps_no_entry() {
+        let mut cache = Cache::with_max_bytes(1024 * 1024);
+        for i in 0..8 {
+            cache.insert(
+                CacheKey::new(&format!("/p{i}"), None, "gzip"),
+                resp(5, b"the old generation"),
+            );
+        }
+        let held_before = cache.bytes_held();
+        assert!(held_before > 0);
+
+        let old = cache.swap_generation();
+
+        assert_eq!(cache.len(), 0, "the new generation holds no entry");
+        assert_eq!(cache.bytes_held(), 0, "the new generation starts at zero");
+        assert_eq!(cache.footprint_sum(), 0);
+        assert_eq!(old.len(), 8, "the previous generation is returned whole");
+        assert_eq!(
+            old.bytes_held(),
+            held_before,
+            "the previous generation keeps its own accounting"
+        );
+        for i in 0..8 {
+            let key = CacheKey::new(&format!("/p{i}"), None, "gzip");
+            assert!(
+                matches!(cache.lookup(&key), Lookup::Miss),
+                "entry {i} survived the swap"
+            );
+            assert!(
+                old.get(&key).is_some(),
+                "the returned generation lost entry {i}"
+            );
+        }
+    }
+
+    /// A request in flight holds the response clone its lookup took, so it
+    /// finishes on the generation it started with. A holder of the old
+    /// `Cache` keeps that generation whole until it drops.
+    ///
+    /// Break: implement the swap as `self.clear()`. The live cache is empty
+    /// either way, but the old generation is then emptied under its holders,
+    /// and the assertions on `in_flight` and `old` fail.
+    #[test]
+    fn a_request_holding_the_old_generation_finishes_on_it() {
+        let mut cache = Cache::with_max_bytes(1024 * 1024);
+        let key = CacheKey::new("/held", None, "gzip");
+        cache.insert(key.clone(), resp(41, b"the old generation"));
+
+        // What a request in flight holds: the response clone from its lookup,
+        // and a clone of the cache it began on.
+        let held = cache.get(&key).expect("the entry is fresh");
+        let in_flight = cache.clone();
+
+        let old = cache.swap_generation();
+
+        assert!(
+            matches!(cache.lookup(&key), Lookup::Miss),
+            "the live cache serves the new generation only"
+        );
+        assert_eq!(held.genid, 41, "the held response keeps its generation");
+        assert_eq!(
+            &held.body[..],
+            b"the old generation",
+            "the held response keeps its body"
+        );
+        let still = in_flight
+            .get(&key)
+            .expect("an in-flight holder keeps the generation it began on");
+        assert_eq!(still.genid, 41);
+        assert_eq!(old.get(&key).map(|r| r.genid), Some(41));
+    }
+
+    /// The new generation keeps the old generation's bound, so a swap cannot
+    /// quietly raise a small cache to the default 128 MiB.
+    ///
+    /// Break: build the fresh cache with `Cache::new()`, and the 100 KB entry
+    /// stays in a 64 KB cache.
+    #[test]
+    fn a_swapped_cache_keeps_its_bound() {
+        let mut cache = Cache::with_max_bytes(64 * 1024);
+        cache.insert(CacheKey::new("/before", None, "gzip"), resp(5, b"x"));
+        let _old = cache.swap_generation();
+
+        cache.insert(
+            CacheKey::new("/big", None, "gzip"),
+            resp(6, &vec![0u8; 100 * 1024]),
+        );
+
+        assert!(
+            cache.bytes_held() <= 64 * 1024,
+            "the swapped cache ignored its bound: {} bytes held",
+            cache.bytes_held()
+        );
+        assert_eq!(cache.len(), 0, "the over-bound entry was evicted");
+    }
+
+    /// A swap is the moment held content stops being served, so the fresh
+    /// generation does not inherit the old one's serve-held policy.
+    ///
+    /// Break: copy `serve_held` into the fresh cache, and this fails.
+    #[test]
+    fn a_swapped_cache_does_not_serve_held() {
+        let mut cache = Cache::new();
+        cache.set_serve_held(true);
+        assert!(cache.serve_held());
+
+        let _old = cache.swap_generation();
+
+        assert!(
+            !cache.serve_held(),
+            "the new generation must not serve the old one's held content"
         );
     }
 }

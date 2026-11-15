@@ -25,7 +25,7 @@
 /// Output: one result line per suite; exits non-zero if any threshold exceeded.
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -292,7 +292,7 @@ fn bench_http11_latency_path(
         http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
     }
     for _ in 0..n {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let resp = http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
         let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
         let status = parse_http11_status(&resp);
@@ -313,7 +313,7 @@ fn bench_http11_throughput(
     tls_cfg: Arc<ClientConfig>,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
 
     let handles: Vec<_> = (0..concurrency)
@@ -322,7 +322,7 @@ fn bench_http11_throughput(
             let count = Arc::clone(&count);
             let addr = Arc::clone(&addr);
             std::thread::spawn(move || {
-                while Instant::now() < deadline {
+                while m6_core::platform::now() < deadline {
                     if http11_get(&addr, Arc::clone(&tls_cfg)).is_ok() {
                         count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -330,7 +330,7 @@ fn bench_http11_throughput(
             })
         })
         .collect();
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -489,7 +489,7 @@ impl H2Client {
             .write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
 
         // Drive TLS handshake: alternate writes and blocking reads until established.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
         loop {
             c.flush_write()?;
             if !c.conn.is_handshaking() {
@@ -546,7 +546,7 @@ impl H2Client {
                     break; // got at least one TLS record
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(m6_core::platform::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
                     }
@@ -554,14 +554,10 @@ impl H2Client {
                     // has our request before we block waiting for its response.
                     self.flush_write()?;
                     let timeout_ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, timeout_ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(timeout_ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -615,10 +611,10 @@ impl H2Client {
         self.flush_write()?;
 
         let mut body = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2 response timeout");
             }
 
@@ -694,7 +690,7 @@ fn bench_http2_latency_path(
         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
             client = H2Client::connect(addr, Arc::clone(&tls_cfg))?;
         }
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         client.get(path)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
     }
@@ -708,7 +704,7 @@ fn bench_http2_throughput(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
 
     let handles: Vec<_> = (0..concurrency)
@@ -719,7 +715,7 @@ fn bench_http2_throughput(
                 let tls_cfg = make_client_config_h2(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
                             client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
                         }
@@ -741,7 +737,7 @@ fn bench_http2_throughput(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -758,7 +754,7 @@ fn bench_http11_throughput_path(
     tls_cfg: Arc<ClientConfig>,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
 
@@ -769,7 +765,7 @@ fn bench_http11_throughput_path(
             let addr = Arc::clone(&addr);
             let path = Arc::clone(&path);
             std::thread::spawn(move || {
-                while Instant::now() < deadline {
+                while m6_core::platform::now() < deadline {
                     if http11_get_path(&addr, &path, Arc::clone(&tls_cfg)).is_ok() {
                         count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -778,7 +774,7 @@ fn bench_http11_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -795,7 +791,7 @@ fn bench_http2_throughput_path(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
 
@@ -808,7 +804,7 @@ fn bench_http2_throughput_path(
                 let tls_cfg = make_client_config_h2(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
                             client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
                         }
@@ -830,7 +826,7 @@ fn bench_http2_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -868,10 +864,10 @@ impl H2cClient {
         // Read frames until we receive the server's SETTINGS (non-ACK).
         let mut recv_buf: Vec<u8> = Vec::with_capacity(16_384);
         let mut tmp = [0u8; 8192];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
         let mut got_settings = false;
         while !got_settings {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2C setup timeout");
             }
             let n = (&stream).read(&mut tmp)?;
@@ -930,20 +926,16 @@ impl H2cClient {
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(m6_core::platform::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
                     }
                     self.flush_write()?;
                     let timeout_ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, timeout_ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(timeout_ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -962,10 +954,10 @@ impl H2cClient {
         self.flush_write()?;
 
         let mut body = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2C response timeout");
             }
 
@@ -1029,7 +1021,7 @@ fn bench_h2c_latency_path(addr: &str, path: &str, n: usize) -> anyhow::Result<Ve
         if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
             client = H2cClient::connect(addr)?;
         }
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         client.get(path)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
     }
@@ -1038,7 +1030,7 @@ fn bench_h2c_latency_path(addr: &str, path: &str, n: usize) -> anyhow::Result<Ve
 
 fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
 
     let handles: Vec<_> = (0..concurrency)
@@ -1048,7 +1040,7 @@ fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyh
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2cClient::connect(&addr)?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
                             client = H2cClient::connect(&addr)?;
                         }
@@ -1070,7 +1062,7 @@ fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyh
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1127,10 +1119,10 @@ fn h3_get(
 
     let mut body = Vec::new();
     let mut buf = [0u8; 65535];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
     loop {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             anyhow::bail!("HTTP/3 request timed out");
         }
         conn.on_timeout();
@@ -1200,9 +1192,9 @@ fn h3_connect(
 
     // Handshake loop
     let mut buf = [0u8; 65535];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = m6_core::platform::now() + Duration::from_secs(5);
     loop {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             anyhow::bail!("QUIC handshake timed out");
         }
         conn.on_timeout();
@@ -1271,7 +1263,7 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
             udp = u;
             reqs = 0;
         }
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         h3_get(&mut conn, &mut h3, &udp, b"/")?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
         reqs += 1;
@@ -1288,7 +1280,7 @@ fn bench_http3_throughput(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
 
@@ -1302,7 +1294,7 @@ fn bench_http3_throughput(
                 let result = (|| -> anyhow::Result<()> {
                     let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
                     let mut reqs: usize = 0;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if reqs >= H3_MAX_STREAMS_PER_CONN {
                             let (c, h, u) = h3_connect(&addr, &mut cfg)?;
                             conn = c;
@@ -1328,7 +1320,7 @@ fn bench_http3_throughput(
             })
         })
         .collect();
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1345,7 +1337,7 @@ fn bench_h3_throughput_path(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1361,7 +1353,7 @@ fn bench_h3_throughput_path(
                 let result = (|| -> anyhow::Result<()> {
                     let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
                     let mut reqs: usize = 0;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if reqs >= H3_MAX_STREAMS_PER_CONN {
                             let (c, h, u) = h3_connect(&addr, &mut cfg)?;
                             conn = c;
@@ -1388,7 +1380,7 @@ fn bench_h3_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1404,7 +1396,7 @@ fn bench_h2c_throughput_path(
     concurrency: usize,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
 
@@ -1416,7 +1408,7 @@ fn bench_h2c_throughput_path(
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2cClient::connect(&addr)?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
                             client = H2cClient::connect(&addr)?;
                         }
@@ -1438,7 +1430,7 @@ fn bench_h2c_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1630,7 +1622,7 @@ fn bench_h3_path_latency(
             udp = u;
             reqs = 0;
         }
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         h3_get(&mut conn, &mut h3, &udp, pb)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
         reqs += 1;

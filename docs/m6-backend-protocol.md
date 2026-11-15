@@ -61,14 +61,14 @@ The backend MUST take these steps in this order.
   A group used to admit the proxy MUST contain only users trusted as the proxy is trusted, because every user who can connect can send the proxy-owned fields in §2.5.
   With mode `0666` and a `0755` directory, any local user on the host can connect and bypass the proxy.
   The socket is not reachable from the network.
-  The m6 `App` default is `0660`, which lets the proxy connect when its user is in the socket's group.
+  The m6 service default is `0660`, which lets the proxy connect when its user is in the socket's group.
   A backend that runs as its own user SHOULD set `0666` only when the parent directory limits traversal to the same trusted users.
   A backend that any user outside that set can reach MUST NOT trust the fields in §2.2 and §2.3.
   A socket the proxy cannot connect to serves no traffic at all.
 - **Listen with a backlog of at least 64.**
 
 The service manager can create the parent directory, for example systemd's `RuntimeDirectory=` with `RuntimeDirectoryMode=0750`.
-The m6 `App` creates a missing parent directory before it binds.
+An m6 service creates a missing parent directory before it binds.
 A backend that creates the directory itself SHOULD use mode `0750` and run in the proxy's group, because the proxy lists the directory to find sockets.
 
 ### 1.3. Connection lifetime
@@ -340,12 +340,12 @@ The proxy turns every backend failure into a status the client can act on.
 This section gives the proxy's response to each failure, because a backend author needs to know which failures are survivable.
 
 Table 5 gives the conditions.
-Take from it that every transport-level failure reaches the client as a `502`, whatever its cause.
+Take from it that a transport-level failure the proxy cannot route to another member reaches the client as a `502`, whatever its cause.
 
 | Condition | Proxy behaviour |
 |---|---|
-| Socket does not exist | The member is absent from the pool. Another member serves the request, or the client receives `502` |
-| `connect` refused | `502`, and the member is backed off for 1 to 30 seconds |
+| Socket does not exist | The connect fails, and the next member serves the request. If every member fails, the client receives `502` |
+| `connect` refused | The next member serves the request. If every member fails, the client receives `502` |
 | No response within `backend_timeout_secs` (default **30**) | The connection is dropped and the client receives `502` |
 | Malformed status line or headers | `502` |
 | Framing violation (§3.2) | `502` |
@@ -355,7 +355,8 @@ Take from it that every transport-level failure reaches the client as a `502`, w
 **Table 5: backend conditions and the response the proxy sends.**
 A slow backend and a refused connection produce the same `502`, so a client cannot tell them apart.
 
-The proxy does not retry a request against another member.
+The proxy retries the connect against the next member.
+A request a member accepted is not retried, so a reset in the middle of a response answers `502`.
 A backend SHOULD fail fast, because a prompt `500` reaches the client sooner than a connection held for 30 seconds.
 
 Those are the failures a backend can survive and the ones that end the request.
@@ -400,11 +401,23 @@ This section gives the concurrency model a member needs.
 A backend MUST be able to accept a new connection while it is handling another.
 It MAY use threads, processes or an event loop.
 
-The reference model, given in `m6-architecture.md` §7.1, is a fixed thread pool with a bounded queue.
-A full queue answers `503`, which is how backpressure reaches the proxy.
+The reference model, given in `m6-architecture.md` §7.1, is one process with one event loop, scaling by running more instances.
+A backend at its connection ceiling stops accepting, and clients wait in the kernel's listen backlog. The proxy's own deadline answers a request that waits there too long.
 
 That is the concurrency a member provides.
 Section 8 gives the lifecycle that puts a member in the pool and takes it out.
+
+## Reserved path: `/genid`
+
+`POST /genid` is reserved on every backend that serves a site.
+The backend answers it itself, before routing: it reads the config, `site.toml`, templates and params again, builds a new site beside the one it is serving, and swaps it in with one assignment.
+A load that succeeds answers `204` with `Cache-Control: no-store`.
+A load that fails assigns nothing, the old site keeps serving, and the answer is `500` with `Cache-Control: no-store` and a body naming the cause.
+
+A method other than POST on `/genid` is `405` with `Allow: POST`, and a route whose pattern is exactly `/genid` is refused at startup.
+The socket's directory permissions are the only authentication for this request (§6.1): there is no token and no mTLS.
+The caller compares its own generation identity, which this response does not carry.
+Section 8 gives the lifecycle.
 
 ## 8. Lifecycle
 
@@ -426,7 +439,8 @@ On `SIGTERM` or `SIGINT`, the backend MUST take these steps in order:
 - **Exit with status `0`.**
 
 A second `SIGTERM` or `SIGINT` MUST exit immediately.
-Removing the socket withdraws the member from the pool, and a backend that exits leaving the file behind causes the proxy to keep selecting a member that refuses every connection.
+Removing the socket file does not take the member out of the pool before the proxy restarts.
+A backend that exits leaving the file behind leaves a member whose connect is refused, and each request that lands on it tries the next member.
 
 ### 8.3. Exit codes
 

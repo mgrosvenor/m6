@@ -25,27 +25,16 @@
 //! monitor at `origin.`/`edge-a.`/`edge-b.` and the answer names the node that
 //! produced it.
 //!
-//! # Health means "this node can serve", not "the fleet is fine"
+//! # What `/health` answers for
 //!
-//! The two node roles have genuinely different backend shapes, and conflating
-//! them produces a health check that lies:
+//! `/health` answers for the m6-http process alone. Its socket pools keep no
+//! per-member health state, so a dead member cannot change the answer. A
+//! request that connects to a dead member takes the next member, and that is
+//! where the failure is found.
 //!
-//! - The **origin** has unix-socket pools (m6-html, m6-file, the renderers).
-//!   If every socket in a pool is gone, that pool cannot serve, and the node
-//!   is degraded.
-//! - A **cache node** has one URL backend (the origin over h2c) and *no*
-//!   socket pools at all. `total_active_members()` counts only socket pools,
-//!   so it reads 0 on every cache node permanently.
-//!
-//! A naive "0 members means unhealthy" check would therefore report both edge
-//! nodes as permanently down. Worse, it would be wrong in the other direction
-//! too: a cache node with a warm cache keeps serving correctly while the
-//! origin is unreachable, which is the entire point of having edges. So an
-//! unreachable origin is deliberately *not* this node's health problem.
-//!
-//! What is reported is strictly what this node can answer for: every
-//! configured socket pool has at least one live member. That is checkable
-//! locally, cheaply, and without a network round trip that could itself hang.
+//! A URL backend is outside that answer too. Proving one reachable would put a
+//! network round trip inside the check, and a warm cache keeps serving while
+//! the origin is unreachable.
 //!
 //! # Two endpoints, because they have opposite requirements
 //!
@@ -176,13 +165,17 @@ pub fn metrics_authorised(headers: &[(String, String)], configured_token: Option
         .unwrap_or(false)
 }
 
-/// One socket-backed backend pool's occupancy.
+/// One socket-backed backend pool's size.
+///
+/// A node built before the pool lost its health state sent an `active` field
+/// beside the count. A monitor of that build cannot read a newer node's report,
+/// because the field it requires is gone, so the monitor is upgraded before the
+/// nodes it watches. A newer monitor reads an older node's report unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoolHealth {
     pub name: String,
-    /// Members currently available (not marked failed).
-    pub active: usize,
-    /// Members known to the pool, including temporarily unavailable ones.
+    /// Members the pool holds. The pool keeps no per-member health state, so
+    /// every member stays in rotation.
     pub total: usize,
 }
 
@@ -203,7 +196,8 @@ pub struct PoolHealth {
 /// `/perf` now, which is token-gated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthReport {
-    /// `"ok"` or `"degraded"`.
+    /// `"ok"`. A node running an older m6-http could still send `"degraded"`,
+    /// which the monitor reads as a fault.
     ///
     /// `String` rather than `&'static str` because an aggregator reads this
     /// back off the wire and cannot produce a `'static` one.
@@ -319,29 +313,22 @@ fn executable_md5() -> String {
 impl HealthReport {
     /// Build a report and the HTTP status that should carry it.
     ///
-    /// Degraded when any configured socket pool has no live member. A node
-    /// with no socket pools at all (every cache node) is not degraded by
-    /// that fact alone.
-    /// `pools` decides the verdict and is not reported. The status code still
-    /// carries the whole answer a monitor acts on, and `/perf` has the detail
-    /// for whoever is allowed to see which pool went quiet.
-    pub fn build(node: &str, pools: &[PoolHealth]) -> (u16, HealthReport) {
-        let degraded = pools.iter().any(|p| p.active == 0);
-        let status = if degraded { "degraded" } else { "ok" }.to_string();
-        // 503 is the honest code: the node is up enough to answer, but not
-        // able to serve. A monitor treating any non-2xx as down is then
-        // correct without needing to parse the body.
-        //
-        // Deliberately never derived from performance. A latency spike is a
-        // signal for a human or a dashboard to act on, not grounds for a node
-        // to declare itself down and be pulled from rotation while it is
-        // still serving every request correctly. That is also why the numbers
-        // live on `/perf` and not here.
-        let code = if degraded { 503 } else { 200 };
+    /// The answer is always 200 `ok`. A socket pool keeps no per-member
+    /// health state, so this process cannot judge one degraded, and `config`
+    /// refuses a pool with no members at start. Backend liveness is not part
+    /// of the answer: a dead member is found when a request connects to it,
+    /// and that request takes the next member.
+    ///
+    /// Deliberately never derived from performance. A latency spike is a
+    /// signal for a human or a dashboard to act on, not grounds for a node
+    /// to declare itself down and be pulled from rotation while it is
+    /// still serving every request correctly. That is also why the numbers
+    /// live on `/perf` and not here.
+    pub fn build(node: &str) -> (u16, HealthReport) {
         (
-            code,
+            200,
             HealthReport {
-                status,
+                status: "ok".to_string(),
                 node: node.to_string(),
             },
         )
@@ -357,7 +344,7 @@ impl HealthReport {
             // A serialisation failure here is not a reason to fail the health
             // check with an unparseable body; fall back to something a
             // monitor can still read.
-            .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
+            .unwrap_or_else(|_| br#"{"status":"ok"}"#.to_vec());
         let headers = vec![
             (
                 "Content-Type".to_string(),
@@ -451,7 +438,7 @@ pub struct PerfReport {
     /// the latency figures: a p99 that moved is a different conversation
     /// depending on whether load also moved. Every field is optional, and a
     /// field a platform cannot answer is absent rather than zero.
-    pub host: crate::host::HostSnapshot,
+    pub host: crate::platform::host::HostSnapshot,
 }
 
 /// Outcome of a `/perf` request.
@@ -460,8 +447,9 @@ pub enum PerfOutcome {
     ///
     /// Its own path rather than more fields on `/perf`, for the reason that
     /// split `/health` from `/perf`: the cost profiles differ. `/perf` sorts a
-    /// reservoir in memory. This reads the tail of a log that can run to tens
-    /// of megabytes. Putting the expensive one behind a conditional on the
+    /// reservoir in memory. This builds the report from the window of events
+    /// `m6-http` logged itself, which allocates a record per retained event on
+    /// a cache miss. Putting the expensive one behind a conditional on the
     /// cheaper path leaves the expensive branch one misconfigured header away
     /// from being taken on every request, and splitting the paths is what keeps
     /// each answer's cost a property of the path rather than of the caller.
@@ -469,10 +457,6 @@ pub enum PerfOutcome {
     /// carrying it inline made the whole enum that size even when the outcome
     /// was a one-word error.
     Traffic(Box<TrafficReport>),
-    /// The analytics log could not be read. Said out loud rather than reported
-    /// as a quiet hour, which is a mistake this codebase has made: an absent
-    /// file at the expected path looked exactly like a feature switched off.
-    TrafficError(String),
     /// No token configured: the endpoint is switched off and answers 404, so
     /// it does not advertise a door that cannot be opened.
     Disabled,
@@ -565,7 +549,7 @@ impl PerfReport {
             tls_unreadable: crate::tls::unreadable(),
             logging: Some(LoggingHealth::read()),
             metrics: snapshot(),
-            host: crate::host::snapshot(host_path),
+            host: crate::platform::host::snapshot(host_path),
         }))
     }
 }
@@ -599,14 +583,6 @@ impl PerfOutcome {
                     .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
                 (200, headers, body)
             }
-            // 503, not 500: the node is serving, but its own view of its
-            // traffic is not available. A monitor shows that as a gap rather
-            // than as a quiet hour.
-            PerfOutcome::TrafficError(why) => {
-                let body = serde_json::to_vec(&serde_json::json!({"error": why}))
-                    .unwrap_or_else(|_| br#"{"error":"unreadable"}"#.to_vec());
-                (503, headers, body)
-            }
         }
     }
 }
@@ -616,60 +592,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn pool(name: &str, active: usize, total: usize) -> PoolHealth {
-        PoolHealth {
-            name: name.to_string(),
-            active,
-            total,
-        }
-    }
-
     #[test]
-    fn origin_with_live_pools_is_ok() {
-        let (code, report) =
-            HealthReport::build("origin", &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)]);
+    fn health_is_ok_and_names_the_node() {
+        let (code, report) = HealthReport::build("origin");
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
         assert_eq!(report.node, "origin");
     }
 
-    /// The regression this endpoint most needs to not have.
-    ///
-    /// A cache node has no socket pools at all, so `total_active_members()`
-    /// reads 0 on a cache node at all times. Deriving health from that count alone
-    /// reports every cache node as permanently down.
-    #[test]
-    fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
-        let (code, report) = HealthReport::build("edge-a", &[]);
-        assert_eq!(
-            code, 200,
-            "a cache node has no socket pools and is not degraded for it"
-        );
-        assert_eq!(report.status, "ok");
-    }
-
-    #[test]
-    fn an_empty_pool_degrades_the_node() {
-        let (code, report) = HealthReport::build(
-            "origin",
-            &[pool("m6-html", 1, 1), pool("render-contact", 0, 1)],
-        );
-        assert_eq!(code, 503);
-        assert_eq!(report.status, "degraded");
-    }
-
-    /// A member marked failed still counts in `total`, so a pool that has
-    /// members but none available must degrade. Reading `total` instead of
-    /// `active` would call this healthy.
-    #[test]
-    fn members_present_but_all_failed_is_degraded() {
-        let (code, _) = HealthReport::build("origin", &[pool("m6-html", 0, 3)]);
-        assert_eq!(code, 503);
-    }
-
     #[test]
     fn response_is_never_stored_and_never_indexed() {
-        let (code, report) = HealthReport::build("origin", &[]);
+        let (code, report) = HealthReport::build("origin");
         let (code, headers, body) = report.into_response(code);
         assert_eq!(code, 200);
         let get = |k: &str| {
@@ -1050,7 +983,10 @@ mod tests {
             PerfSubject {
                 node: "origin",
                 uptime_s: 11,
-                pools: vec![pool("m6-html", 1, 1)],
+                pools: vec![PoolHealth {
+                    name: "m6-html".to_string(),
+                    total: 1,
+                }],
                 url_backends: vec!["origin".to_string()],
                 host_path: Path::new("/"),
             },
@@ -1093,7 +1029,7 @@ mod tests {
     /// test whose name says why that is a decision and not a formality.
     #[test]
     fn public_payload_is_exactly_status_and_node() {
-        let (code, report) = HealthReport::build("origin", &[pool("m6-html", 1, 1)]);
+        let (code, report) = HealthReport::build("origin");
         let (_, _, body) = report.into_response(code);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let object = parsed.as_object().expect("object");
@@ -1134,7 +1070,20 @@ mod tests {
 pub struct TrafficReport {
     pub node: String,
     /// The window summarised, in minutes.
+    ///
+    /// A node that keeps its window in memory reports the span that window
+    /// really holds, which is shorter than the window when a full ring
+    /// overwrote events still inside it.
     pub window_minutes: u64,
+    /// Events the window overwrote while they were still inside the window
+    /// this report covers, counted by minute.
+    ///
+    /// Non-zero means the summary is missing those events: the totals are for
+    /// `window_minutes`, not for a full hour. Zero for a report built from a
+    /// log. `serde(default)`, so a node older than the field reads as zero
+    /// drops instead of making the whole report unparseable.
+    #[serde(default)]
+    pub events_dropped: u64,
     pub total_requests: u64,
     pub status: std::collections::BTreeMap<u16, u64>,
     /// Clients worth a human's attention. Already graded: see
@@ -1310,14 +1259,19 @@ pub struct CrawlerReport {
 }
 
 impl TrafficReport {
-    /// Summarise an analytics stream.
+    /// Summarise records that are already parsed.
     ///
-    /// `since` is an RFC 3339 prefix; the timestamps are fixed-width UTC so a
-    /// string compare is a time compare.
-    pub fn build(node: &str, ndjson: &str, since: &str, window_minutes: u64) -> Self {
-        let records: Vec<crate::telemetry::AnalyticsRecord> =
-            crate::telemetry::parse_analytics(ndjson, since).collect();
-        let summary = crate::telemetry::TrafficSummary::from_records(&records);
+    /// `/traffic` keeps its records in memory and never reads the log, so the
+    /// report a window produces and the report the same lines would produce
+    /// from the file run through this one body. A caller with records from a
+    /// file leaves [`events_dropped`](Self::events_dropped) at zero, because a
+    /// log keeps every event in its window.
+    pub fn from_records(
+        node: &str,
+        records: &[crate::telemetry::AnalyticsRecord],
+        window_minutes: u64,
+    ) -> Self {
+        let summary = crate::telemetry::TrafficSummary::from_records(records);
 
         let notable: Vec<NotableClient> = summary
             .clients
@@ -1360,6 +1314,7 @@ impl TrafficReport {
         Self {
             node: node.to_string(),
             window_minutes,
+            events_dropped: 0,
             heavy_hitters,
             total_requests: summary.total_requests,
             status: summary.status.clone(),
@@ -1433,7 +1388,9 @@ mod traffic_tests {
                 "curl/8",
             ));
         }
-        let r = TrafficReport::build("origin", &lines.join("\n"), "", 60);
+        let ndjson = lines.join("\n");
+        let records: Vec<_> = crate::telemetry::parse_analytics(&ndjson, "").collect();
+        let r = TrafficReport::from_records("origin", &records, 60);
 
         assert_eq!(r.total_requests, 6);
         assert_eq!(r.crawlers.len(), 1);

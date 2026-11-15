@@ -6,8 +6,8 @@
 //! slow backend held every connection on the node -- cache hits included -- for
 //! up to `backend_timeout_secs`. The fix drives each socket-backend request as
 //! a non-blocking upstream in the loop, so a cache hit is served while a slow
-//! backend is still thinking, and least-connections now sees real in-flight
-//! counts so concurrent misses spread across the members.
+//! backend is still thinking, and the pool's round-robin turn spreads concurrent
+//! misses across the members.
 //!
 //! Each test stands up a real `m6-http` in front of one or two fake socket
 //! backends. Every wait is on a signal (a backend reporting it received a
@@ -23,7 +23,7 @@ use std::net::{TcpStream, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -46,9 +46,31 @@ type GetFn = fn(u16, &str, Duration) -> Result<(u16, String), String>;
 
 // ── The fake backend ──────────────────────────────────────────────────────────
 
+/// The hold every backend in a fixture shares. A `/slow` reply is held until
+/// `release` is set, or until the backends have seen `after` `/slow` requests
+/// (zero never triggers). A test that needs two requests in flight together
+/// sets `after`, so the replies go out only once both have arrived.
+#[derive(Clone)]
+struct Hold {
+    release: Arc<AtomicBool>,
+    seen: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+}
+
+impl Hold {
+    fn new() -> Hold {
+        Hold {
+            release: Arc::new(AtomicBool::new(false)),
+            seen: Arc::new(AtomicUsize::new(0)),
+            after: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// One fake socket backend. `GET /fast` answers at once with a cacheable body;
-/// `GET /slow` signals `slow_seen` and holds until `release` (or shutdown). A
-/// resetting backend reads the request then closes without replying.
+/// `GET /slow` signals `slow_seen` and holds until the fixture's `Hold`
+/// releases it (or shutdown). A resetting backend reads the request then closes
+/// without replying.
 struct Backend {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -60,9 +82,25 @@ impl Backend {
         path: PathBuf,
         slow_seen: mpsc::Sender<()>,
         large_seen: mpsc::Sender<()>,
+        hold: Hold,
+    ) -> Backend {
+        Self::spawn(path, slow_seen, large_seen, hold, false)
+    }
+
+    /// A backend whose `/slow` replies are held until `release` is set, for a
+    /// test that owns the flag itself rather than a fixture's `Hold`.
+    fn start_with_release(
+        path: PathBuf,
+        slow_seen: mpsc::Sender<()>,
+        large_seen: mpsc::Sender<()>,
         release: Arc<AtomicBool>,
     ) -> Backend {
-        Self::spawn(path, slow_seen, large_seen, release, false)
+        let hold = Hold {
+            release,
+            seen: Arc::new(AtomicUsize::new(0)),
+            after: Arc::new(AtomicUsize::new(0)),
+        };
+        Self::spawn(path, slow_seen, large_seen, hold, false)
     }
 
     /// A backend that accepts a request and closes without replying, the state a
@@ -70,15 +108,14 @@ impl Backend {
     fn start_resetting(path: PathBuf) -> Backend {
         let (slow_seen, _) = mpsc::channel();
         let (large_seen, _) = mpsc::channel();
-        let release = Arc::new(AtomicBool::new(false));
-        Self::spawn(path, slow_seen, large_seen, release, true)
+        Self::spawn(path, slow_seen, large_seen, Hold::new(), true)
     }
 
     fn spawn(
         path: PathBuf,
         slow_seen: mpsc::Sender<()>,
         large_seen: mpsc::Sender<()>,
-        release: Arc<AtomicBool>,
+        hold: Hold,
         reset: bool,
     ) -> Backend {
         let _ = std::fs::remove_file(&path);
@@ -90,7 +127,7 @@ impl Backend {
         let handle = spawn_accept(
             listener,
             Arc::clone(&stop),
-            Arc::clone(&release),
+            hold,
             slow_seen,
             large_seen,
             reset,
@@ -116,7 +153,7 @@ impl Drop for Backend {
 fn spawn_accept(
     listener: UnixListener,
     stop: Arc<AtomicBool>,
-    release: Arc<AtomicBool>,
+    hold: Hold,
     slow_seen: mpsc::Sender<()>,
     large_seen: mpsc::Sender<()>,
     reset: bool,
@@ -126,11 +163,11 @@ fn spawn_accept(
             match listener.accept() {
                 Ok((stream, _)) => {
                     let stop = Arc::clone(&stop);
-                    let release = Arc::clone(&release);
+                    let hold = hold.clone();
                     let slow_seen = slow_seen.clone();
                     let large_seen = large_seen.clone();
                     std::thread::spawn(move || {
-                        serve(stream, &stop, &release, &slow_seen, &large_seen, reset)
+                        serve(stream, &stop, &hold, &slow_seen, &large_seen, reset)
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -149,7 +186,7 @@ fn spawn_accept(
 fn serve(
     mut stream: UnixStream,
     stop: &AtomicBool,
-    release: &AtomicBool,
+    hold: &Hold,
     slow_seen: &mpsc::Sender<()>,
     large_seen: &mpsc::Sender<()>,
     reset: bool,
@@ -177,11 +214,18 @@ fn serve(
     }
     let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
     if head.starts_with("get /slow") {
+        // Count before the report, so a test that sees the report knows this
+        // request is already in the count.
+        let seen = hold.seen.fetch_add(1, Ordering::SeqCst) + 1;
+        let after = hold.after.load(Ordering::SeqCst);
         let _ = slow_seen.send(());
-        while !release.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        if after != 0 && seen >= after {
+            hold.release.store(true, Ordering::SeqCst);
+        }
+        while !hold.release.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
-        if !release.load(Ordering::SeqCst) {
+        if !hold.release.load(Ordering::SeqCst) {
             return; // shutdown while still held
         }
         respond(&mut stream, 200, SLOW_BODY, false);
@@ -467,14 +511,21 @@ fn h3_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
 // ── The m6-http fixture ───────────────────────────────────────────────────────
 
 struct Fixture {
-    _dir: tempfile::TempDir,
-    _claim: PortClaim,
     port: u16,
     service: Service,
     _backends: Vec<Backend>,
     slow_seens: Vec<mpsc::Receiver<()>>,
     large_seens: Vec<mpsc::Receiver<()>>,
     release: Arc<AtomicBool>,
+    /// The `/slow` count at which the backends release every held reply.
+    slow_after: Arc<AtomicUsize>,
+    // Field order is drop order. The service and its backends stop before the
+    // port is released and before the directory they served from is removed.
+    // A claim declared first released the port while m6-http still held it, so
+    // `PortClaim::drop` waited its full five seconds for a bind that could not
+    // succeed.
+    _dir: tempfile::TempDir,
+    _claim: PortClaim,
 }
 
 impl Fixture {
@@ -484,26 +535,18 @@ impl Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let site = dir.path().to_path_buf();
 
-        let ck = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-        ])
-        .expect("certificate");
-        let cert = site.join("cert.pem");
-        let key = site.join("key.pem");
-        std::fs::write(&cert, ck.cert.pem()).expect("cert");
-        std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
-
         let pid = std::process::id();
         let mut backends = Vec::new();
         let mut slow_seens = Vec::new();
         let mut large_seens = Vec::new();
-        let release = Arc::new(AtomicBool::new(false));
+        let hold = Hold::new();
+        let release = Arc::clone(&hold.release);
+        let slow_after = Arc::clone(&hold.after);
         for i in 0..n_backends {
             let path = PathBuf::from(format!("/tmp/m6lnw-{pid}-{tag}-{i}.sock"));
             let (tx, rx) = mpsc::channel();
             let (ltx, lrx) = mpsc::channel();
-            backends.push(Backend::start(path, tx, ltx, Arc::clone(&release)));
+            backends.push(Backend::start(path, tx, ltx, hold.clone()));
             slow_seens.push(rx);
             large_seens.push(lrx);
         }
@@ -511,57 +554,69 @@ impl Fixture {
 
         let claim = claim_port();
         let port = claim.port();
-        std::fs::write(
-            site.join("site.toml"),
-            site_toml(&glob, backend_timeout_secs),
-        )
-        .expect("site.toml");
-        std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
-        std::fs::write(
-            site.join("system.toml"),
-            system_toml(port, &cert, &key, &site.join("metrics.token")),
-        )
-        .expect("system.toml");
+        let system = write_site(&site, &site_toml(&glob, backend_timeout_secs), port);
 
         let service = Service::spawn(
             "m6-http",
             Command::new(binary("m6-http"))
                 .arg(&site)
-                .arg(site.join("system.toml")),
+                .arg(&system)
+                // The accounting tick is a fixed ten seconds in production. This
+                // suite waits on it, so a debug build shortens it through the
+                // test-only variable.
+                .env("M6_TEST_STATS_INTERVAL_SECS", "2"),
         );
         let mut service = service;
         service.wait_for_tcp(port, Duration::from_secs(20));
 
         Fixture {
-            _dir: dir,
-            _claim: claim,
             port,
             service,
             _backends: backends,
             slow_seens,
             large_seens,
             release,
+            slow_after,
+            _dir: dir,
+            _claim: claim,
         }
     }
 
     fn port(&self) -> u16 {
         self.port
     }
+
+    /// Release every held `/slow` reply once the backends have seen `n`
+    /// requests. Set it before the requests it releases, counting the `/slow`
+    /// requests already held.
+    fn release_after(&self, n: usize) {
+        self.slow_after.store(n, Ordering::SeqCst);
+    }
+}
+
+/// The site config every test starts from: quiet logging, no analytics, no
+/// rate limiting, then the given `[server]` keys, backends and routes.
+fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> String {
+    format!(
+        "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
+         [server]\n{server}\n\n\
+         [log]\nlevel = \"{log_level}\"\n\n\
+         [analytics]\nenabled = false\n\n\
+         [rate_limit]\nenabled = false\n\n\
+         {backends}\n\n{routes}\n"
+    )
 }
 
 fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
-    format!(
-        "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
-         [server]\nbackend_timeout_secs = {backend_timeout_secs}\n\n\
-         [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
-         [analytics]\nenabled = false\n\n\
-         [rate_limit]\nenabled = false\n\n\
-         [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\
-         [[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
+    site_with(
+        "info",
+        &format!("backend_timeout_secs = {backend_timeout_secs}"),
+        &format!("[[backend]]\nname = \"app\"\nsockets = \"{glob}\""),
+        "[[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/large\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/echo\"\nbackend = \"app\"\n\n\
-         [[route]]\npath = \"/miss/{{id}}\"\nbackend = \"app\"\n"
+         [[route]]\npath = \"/miss/{id}\"\nbackend = \"app\"",
     )
 }
 
@@ -599,6 +654,25 @@ fn await_slow_seen(rx: &mpsc::Receiver<()>, deadline: Instant) -> bool {
     }
 }
 
+/// The `/slow` requests each member has reported since the last drain.
+fn slow_hits(fx: &Fixture) -> (usize, usize) {
+    let hits = |rx: &mpsc::Receiver<()>| std::iter::from_fn(|| rx.try_recv().ok()).count();
+    (hits(&fx.slow_seens[0]), hits(&fx.slow_seens[1]))
+}
+
+/// Assert the two members took one `/slow` each. Both replies are out, and the
+/// backends release only after both requests arrived, so both were counted
+/// before either answered and the distribution is complete.
+fn assert_one_slow_each(fx: &Fixture) {
+    let (a_hits, b_hits) = slow_hits(fx);
+    assert_eq!(
+        (a_hits, b_hits),
+        (1, 1),
+        "two concurrent /slow requests must land one on each member\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
 /// Wait until `needle` appears in the service's captured log, so a test can
 /// synchronise on a server-observable event rather than sleep for a fixed time.
 fn wait_for_log(service: &Service, needle: &str, deadline: Instant) {
@@ -615,6 +689,41 @@ fn wait_for_log(service: &Service, needle: &str, deadline: Instant) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// The process runs one thread: the loop. A live m6-http has answered a
+/// request, and no other thread exists for logging, signals or a backend.
+#[test]
+fn m6_http_runs_one_thread() {
+    let fx = Fixture::start(1, 30, "one-thread");
+    let (status, body) = h1_get(fx.port(), "/fast", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("GET /fast: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(
+        status,
+        200,
+        "GET /fast: {body}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+
+    let pid = fx.service.pid();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut threads = thread_count(pid);
+    while threads != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        threads = thread_count(pid);
+    }
+    assert_eq!(
+        threads,
+        1,
+        "m6-http (pid {pid}) runs {threads} threads after answering a request, not one\n\
+         --- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// The thread count of `pid`, from the platform layer.
+fn thread_count(pid: u32) -> usize {
+    m6_core::platform::process::thread_count(pid).unwrap_or(0)
+}
 
 /// Run the "a held backend does not delay a cache hit" scenario with one GET
 /// function, shared by the h1, h2 and h3 tests.
@@ -686,38 +795,25 @@ fn a_held_backend_request_does_not_delay_a_cache_hit_over_h3() {
 fn two_held_requests_land_on_two_members() {
     let fx = Fixture::start(2, 30, "two");
 
-    // Two concurrent /slow requests on two h1 connections.
+    // Two /slow on two h1 connections. The backends release both replies once
+    // the second request has arrived, so both are in flight together.
+    fx.release_after(2);
     let a_port = fx.port();
     let a = std::thread::spawn(move || h1_get(a_port, "/slow", Duration::from_secs(20)));
     let b_port = fx.port();
     let b = std::thread::spawn(move || h1_get(b_port, "/slow", Duration::from_secs(20)));
 
-    // Both backends must report a received request within two seconds, before
-    // either is released.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let a_seen = await_slow_seen(&fx.slow_seens[0], deadline);
-    let b_seen = await_slow_seen(&fx.slow_seens[1], deadline);
-    if !(a_seen && b_seen) {
-        fx.release.store(true, Ordering::SeqCst);
-        let _ = a.join();
-        let _ = b.join();
-        panic!(
-            "both members must receive a request (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
-            fx.service.output()
-        );
-    }
-
-    fx.release.store(true, Ordering::SeqCst);
     let (a_status, a_body) = a.join().expect("a thread").expect("/slow a");
     let (b_status, b_body) = b.join().expect("b thread").expect("/slow b");
     assert_eq!(a_status, 200, "/slow a: {a_body}");
     assert_eq!(a_body, SLOW_BODY);
     assert_eq!(b_status, 200, "/slow b: {b_body}");
     assert_eq!(b_body, SLOW_BODY);
+    assert_one_slow_each(&fx);
 }
 
 #[test]
-fn a_backend_past_its_timeout_answers_and_frees_the_member() {
+fn a_backend_past_its_timeout_answers_and_the_member_stays_in_turn() {
     // A one-second deadline: /slow is never released, so it must answer 502.
     let fx = Fixture::start(1, 1, "timeout");
 
@@ -728,8 +824,8 @@ fn a_backend_past_its_timeout_answers_and_frees_the_member() {
         "a backend past its timeout must answer 502: {body}"
     );
 
-    // The member was backed off for one second; once it recovers, a /fast miss
-    // on the same member is served. Poll with a deadline rather than sleep.
+    // One member, so the next /fast miss takes the same member again and is
+    // served. Poll with a deadline rather than sleep.
     let recovered = (|| {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -746,7 +842,7 @@ fn a_backend_past_its_timeout_answers_and_frees_the_member() {
     })();
     assert!(
         recovered,
-        "the member never served /fast after its backoff\n--- m6-http ---\n{}",
+        "the member never served /fast again\n--- m6-http ---\n{}",
         fx.service.output()
     );
 }
@@ -949,7 +1045,7 @@ fn a_request_body_larger_than_the_tls_plaintext_buffer_arrives_whole() {
 }
 
 #[test]
-fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
+fn a_backend_that_resets_mid_response_answers_502_and_the_next_request_is_served() {
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path().to_path_buf();
     let ck =
@@ -970,7 +1066,8 @@ fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
     let (slow_seen, _slow_rx) = mpsc::channel();
     let (large_seen, _large_rx) = mpsc::channel();
     let release = Arc::new(AtomicBool::new(false));
-    let _healthy = Backend::start(healthy_path, slow_seen, large_seen, Arc::clone(&release));
+    let _healthy =
+        Backend::start_with_release(healthy_path, slow_seen, large_seen, Arc::clone(&release));
 
     std::fs::write(site.join("site.toml"), site_toml(&glob, 30)).expect("site.toml");
     std::fs::write(site.join("metrics.token"), "loop-never-waits-token").expect("token");
@@ -991,18 +1088,18 @@ fn a_backend_that_resets_mid_response_is_backed_off_and_the_pool_fails_over() {
     let mut service = service;
     service.wait_for_tcp(port, Duration::from_secs(20));
 
-    // The first request hits the resetting member and answers 502, and the
-    // member is backed off. The overcorrected form (release on every error)
-    // keeps it in rotation, so this assertion pins the backoff.
+    // The first request takes the resetting member and answers 502: the
+    // failure comes after the connect, and only a failed connect moves the
+    // request to the next member.
     let (first, _) = h1_get(port, "/fast", Duration::from_secs(5)).expect("first GET");
     assert_eq!(first, 502, "a resetting backend must answer 502");
 
-    // The next request must be served by the healthy member.
+    // The next request takes the next member in turn, the healthy one.
     let (second, body) = h1_get(port, "/fast", Duration::from_secs(5)).expect("second GET");
     assert_eq!(
         second,
         200,
-        "the pool must fail over to the healthy member, got: {body}\n--- m6-http ---\n{}",
+        "the next request must be served by the healthy member, got: {body}\n--- m6-http ---\n{}",
         service.output()
     );
     assert_eq!(body, FAST_BODY);
@@ -1077,9 +1174,16 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
     );
 }
 
-/// A client that closes while its `/slow` is in flight does not leak the pool
-/// member: when the reply arrives for the gone waiter, the member's in-flight
-/// count returns to 0, so the next two concurrent misses spread across both.
+/// A client that closes while its `/slow` is in flight does not wedge the
+/// server: the held reply for the gone waiter is discarded, and two later
+/// `/slow` requests both answer 200.
+///
+/// Round robin spreads those two requests across both members by construction,
+/// so that spread says nothing about a leaked upstream. What this test still
+/// asserts is that a gone waiter's held reply does not stop later requests from
+/// being dispatched and answered. The backends release every held reply once
+/// the third request has arrived, so the two new requests are in flight
+/// together, the distribution is the sequence, and no duration is asserted.
 #[test]
 fn a_closed_client_does_not_leak_its_upstream() {
     let fx = Fixture::start(2, 30, "leak");
@@ -1106,28 +1210,20 @@ fn a_closed_client_does_not_leak_its_upstream() {
     );
     drop(stream); // the client closes with the request still held by the backend
 
-    // Release member A's held reply; it lands on a gone waiter, so the member
-    // must be released back to the pool.
-    fx.release.store(true, Ordering::SeqCst);
-
-    // Two concurrent /slow must now spread across both members within 2 s.
+    // Two more /slow on fresh connections. The backends release every held
+    // reply once the third request has arrived, so the closed client's reply
+    // lands on its gone waiter and both new requests are in flight together:
+    // the pool's two picks overlap, whatever their order. Both responses
+    // completing is the signal that the spread happened; no duration is
+    // asserted and no deadline can turn a loaded machine into a failure.
+    fx.release_after(3);
     let a = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
     let b = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let a_seen = await_slow_seen(&fx.slow_seens[0], deadline);
-    let b_seen = await_slow_seen(&fx.slow_seens[1], deadline);
-    if !(a_seen && b_seen) {
-        let _ = a.join();
-        let _ = b.join();
-        panic!(
-            "both members must receive a request after the gone waiter released its member (a={a_seen}, b={b_seen})\n--- m6-http ---\n{}",
-            fx.service.output()
-        );
-    }
     let (a_status, a_body) = a.join().expect("a thread").expect("/slow a");
     let (b_status, b_body) = b.join().expect("b thread").expect("/slow b");
     assert_eq!(a_status, 200, "/slow a: {a_body}");
     assert_eq!(b_status, 200, "/slow b: {b_body}");
+    assert_one_slow_each(&fx);
 }
 
 /// A custom error page fetched from a socket backend is non-blocking: while the
@@ -1225,7 +1321,7 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
              [server]\nbackend_timeout_secs = 30\n\n\
-             [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
              [errors]\nmode = \"custom\"\npath = \"/errors\"\n\n\
@@ -1389,7 +1485,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
              [server]\nbackend_timeout_secs = 30\n\n\
-             [log]\nlevel = \"trace\"\nformat = \"text\"\n\n\
+             [log]\nlevel = \"trace\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
              [[backend]]\nname = \"app\"\nsockets = \"{}\"\n\n\
@@ -1523,4 +1619,528 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     stop.store(true, Ordering::SeqCst);
     let _ = backend.join();
     let _ = std::fs::remove_file(&sock);
+}
+
+// ── URL backends and h2 upstreams in the loop ────────────────────────────────
+
+/// `site.toml` for a URL-backend test: the common preamble with the given
+/// `[server]` keys, backends and routes.
+fn url_site(server: &str, backends: &str, routes: &str) -> String {
+    site_with("info", server, backends, routes)
+}
+
+/// Write a site directory with a certificate, a metrics token, `site.toml` and
+/// a `system.toml` bound to `port`. Returns the system config's path.
+fn write_site(dir: &std::path::Path, site_toml: &str, port: u16) -> PathBuf {
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate");
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).expect("cert");
+    std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
+    std::fs::write(dir.join("site.toml"), site_toml).expect("site.toml");
+    let token = dir.join("metrics.token");
+    std::fs::write(&token, "loop-never-waits-token").expect("token");
+    let system = dir.join("system.toml");
+    std::fs::write(&system, system_toml(port, &cert, &key, &token)).expect("system.toml");
+    system
+}
+
+/// One m6-http in front of a URL-backend test's config.
+struct UrlFixture {
+    _dir: tempfile::TempDir,
+    _claim: PortClaim,
+    port: u16,
+    service: Service,
+}
+
+impl UrlFixture {
+    fn start(site_toml: &str, tag: &str) -> UrlFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claim = claim_port();
+        let port = claim.port();
+        let system = write_site(dir.path(), site_toml, port);
+        let service = Service::spawn(
+            tag,
+            Command::new(binary("m6-http")).arg(dir.path()).arg(&system),
+        );
+        let mut service = service;
+        service.wait_for_tcp(port, Duration::from_secs(20));
+        UrlFixture {
+            _dir: dir,
+            _claim: claim,
+            port,
+            service,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// A plain-HTTP test backend that counts its accepted connections and answers
+/// every request on one connection, leaving it open for the next.
+fn spawn_keep_alive_backend(accepts: Arc<AtomicUsize>) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            accepts.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || serve_keep_alive(stream));
+        }
+    });
+    port
+}
+
+fn serve_keep_alive(mut stream: TcpStream) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        head.clear();
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(0) => return,
+                Ok(_) => head.push(byte[0]),
+                Err(_) => return,
+            }
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            FAST_BODY.len(),
+            FAST_BODY
+        );
+        if stream.write_all(resp.as_bytes()).is_err() || stream.flush().is_err() {
+            return;
+        }
+    }
+}
+
+/// Ten sequential requests to one `http://` backend reuse its connection.
+#[test]
+fn url_backend_connections_are_reused() {
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let backend_port = spawn_keep_alive_backend(Arc::clone(&accepts));
+    let fx = UrlFixture::start(
+        &url_site(
+            "backend_timeout_secs = 5",
+            &format!("[[backend]]\nname = \"url\"\nurl = \"http://127.0.0.1:{backend_port}\""),
+            "[[route]]\npath = \"/conn/{id}\"\nbackend = \"url\"",
+        ),
+        "m6-http-url-reuse",
+    );
+    for i in 0..10 {
+        let (status, body) = h1_get(fx.port(), &format!("/conn/{i}"), Duration::from_secs(5))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "GET /conn/{i}: {e}\n--- m6-http ---\n{}",
+                    fx.service.output()
+                )
+            });
+        assert_eq!(status, 200, "GET /conn/{i}: {body}");
+        assert_eq!(body, FAST_BODY);
+    }
+    let connections = accepts.load(Ordering::SeqCst);
+    assert_eq!(
+        connections,
+        1,
+        "the URL backend saw {connections} connections; expected 1\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// A plain-HTTP test backend that answers one request per connection and then
+/// closes it, counting accepted connections.
+fn spawn_closing_backend(accepts: Arc<AtomicUsize>) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            accepts.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || serve_one_and_close(stream));
+        }
+    });
+    port
+}
+
+fn serve_one_and_close(mut stream: TcpStream) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        FAST_BODY.len(),
+        FAST_BODY
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+/// An idle URL connection the backend closes is dropped before the next request
+/// can be handed it.
+///
+/// The bug this catches: the slot stayed on the idle list with its descriptor
+/// deregistered, so the peer's close was invisible and the next request reused
+/// a half-closed socket and answered 502.
+#[test]
+fn an_idle_url_connection_the_backend_closes_is_dropped_before_reuse() {
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let backend_port = spawn_closing_backend(Arc::clone(&accepts));
+    let fx = UrlFixture::start(
+        // Debug logging so the test can wait until the loop has seen the close.
+        &site_with(
+            "debug",
+            "backend_timeout_secs = 5",
+            &format!("[[backend]]\nname = \"url\"\nurl = \"http://127.0.0.1:{backend_port}\""),
+            "[[route]]\npath = \"/conn/{id}\"\nbackend = \"url\"",
+        ),
+        "m6-http-url-idle-close",
+    );
+    let (first_status, first_body) = h1_get(fx.port(), "/conn/0", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("GET /conn/0: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(first_status, 200, "GET /conn/0: {first_body}");
+    assert_eq!(first_body, FAST_BODY);
+
+    // The backend answered and closed. The loop must see the close on the idle
+    // descriptor and drop the slot before the next request takes it.
+    wait_for_log(
+        &fx.service,
+        "idle url connection dropped",
+        Instant::now() + Duration::from_secs(5),
+    );
+
+    let (second_status, second_body) = h1_get(fx.port(), "/conn/1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("GET /conn/1: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(
+        second_status,
+        200,
+        "GET /conn/1: {second_body}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+    assert_eq!(second_body, FAST_BODY);
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "the dropped idle connection must be replaced by a new one"
+    );
+}
+
+/// A TLS test backend: `/fast` answers at once with a cacheable body, `/slow`
+/// reports it arrived and holds until `release`.
+fn spawn_tls_backend(slow_seen: mpsc::Sender<()>, release: Arc<AtomicBool>) -> u16 {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("certificate");
+    let cert = ck.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der())
+        .expect("private key");
+    let mut server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server config");
+    server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server = Arc::new(server);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            let server = Arc::clone(&server);
+            let slow_seen = slow_seen.clone();
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                let conn = rustls::ServerConnection::new(server).expect("server connection");
+                serve_tls(StreamOwned::new(conn, tcp), &slow_seen, &release);
+            });
+        }
+    });
+    port
+}
+
+fn serve_tls<S: Read + Write>(mut stream: S, slow_seen: &mpsc::Sender<()>, release: &AtomicBool) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        head.clear();
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(0) => return,
+                Ok(_) => head.push(byte[0]),
+                Err(_) => return,
+            }
+        }
+        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let resp = if text.starts_with("get /slow") {
+            let _ = slow_seen.send(());
+            while !release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nslow",
+                SLOW_BODY.len()
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: public, max-age=60\r\nContent-Length: {}\r\n\r\n{}",
+                FAST_BODY.len(),
+                FAST_BODY
+            )
+        };
+        if stream.write_all(resp.as_bytes()).is_err() || stream.flush().is_err() {
+            return;
+        }
+    }
+}
+
+/// A held `https://` backend request does not delay a cache hit.
+#[test]
+fn a_slow_https_upstream_does_not_stall_cache_hits() {
+    let (slow_seen, slow_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let backend_port = spawn_tls_backend(slow_seen, Arc::clone(&release));
+    let fx = UrlFixture::start(
+        &url_site(
+            "backend_timeout_secs = 30",
+            &format!(
+                "[[backend]]\nname = \"tls\"\nurl = \"https://127.0.0.1:{backend_port}\"\ntls_skip_verify = true"
+            ),
+            "[[route]]\npath = \"/fast\"\nbackend = \"tls\"\n\n[[route]]\npath = \"/slow\"\nbackend = \"tls\"",
+        ),
+        "m6-http-https-slow",
+    );
+    let (warm_status, warm_body) =
+        h1_get(fx.port(), "/fast", Duration::from_secs(5)).expect("warm /fast");
+    assert_eq!(warm_status, 200, "warm /fast: {warm_body}");
+    assert_eq!(warm_body, FAST_BODY);
+
+    let port = fx.port();
+    let slow = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
+    let seen = await_slow_seen(&slow_rx, Instant::now() + Duration::from_secs(5));
+    assert!(
+        seen,
+        "the https backend never received /slow\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+
+    let hit = h1_get(fx.port(), "/fast", Duration::from_secs(2));
+    let (hit_status, hit_body) = match hit {
+        Ok(r) => r,
+        Err(e) => {
+            release.store(true, Ordering::SeqCst);
+            let _ = slow.join();
+            panic!(
+                "a cache hit stalled behind a held https upstream: {e}\n--- m6-http ---\n{}",
+                fx.service.output()
+            );
+        }
+    };
+    assert_eq!(hit_status, 200, "cache hit: {hit_body}");
+    assert_eq!(hit_body, FAST_BODY);
+
+    release.store(true, Ordering::SeqCst);
+    let (slow_status, slow_body) = slow.join().expect("slow thread").expect("/slow");
+    assert_eq!(slow_status, 200, "/slow: {slow_body}");
+    assert_eq!(slow_body, SLOW_BODY);
+}
+
+/// A silent h2c test backend: it accepts, reads the client preface, sends its
+/// SETTINGS and then never answers a stream.
+fn spawn_silent_h2c_backend() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut preface = [0u8; 24];
+                if stream.read_exact(&mut preface).is_err() {
+                    return;
+                }
+                // An empty SETTINGS frame: type 0x4, stream 0.
+                let settings = [0u8, 0, 0, 0x4, 0, 0, 0, 0, 0];
+                if stream.write_all(&settings).is_err() {
+                    return;
+                }
+                let mut sink = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut sink) {
+                    if n == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// An h2c stream past `backend_timeout_secs` answers instead of hanging.
+#[test]
+fn an_h2c_stream_past_its_deadline_answers() {
+    let backend_port = spawn_silent_h2c_backend();
+    let fx = UrlFixture::start(
+        &url_site(
+            "backend_timeout_secs = 1",
+            &format!("[[backend]]\nname = \"h2\"\nurl = \"h2c://127.0.0.1:{backend_port}\""),
+            "[[route]]\npath = \"/never\"\nbackend = \"h2\"",
+        ),
+        "m6-http-h2-deadline",
+    );
+    let started = Instant::now();
+    let (status, body) = h1_get(fx.port(), "/never", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("/never: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(
+        status,
+        502,
+        "/never: {body}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the stream answered after {:?}",
+        started.elapsed()
+    );
+}
+
+/// An h2c backend whose connect never completes does not stall other requests.
+#[test]
+fn an_unreachable_h2c_upstream_does_not_stall_cache_hits() {
+    // A working socket backend warms the cache; a second backend points at an
+    // address in RFC 5737 space, whose SYN gets no answer.
+    let pid = std::process::id();
+    let sock = PathBuf::from(format!("/tmp/m6lnw-{pid}-h2cdead-0.sock"));
+    let (slow_seen, _slow_rx) = mpsc::channel();
+    let (large_seen, _large_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let _backend = Backend::start_with_release(sock, slow_seen, large_seen, Arc::clone(&release));
+    let glob = format!("/tmp/m6lnw-{pid}-h2cdead-*.sock");
+    let fx = UrlFixture::start(
+        // Debug logging so the test can wait until m6-http has dispatched the
+        // dead request before it asks for the cache hit.
+        &site_with(
+            "debug",
+            "backend_timeout_secs = 1",
+            &format!(
+                "[[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n[[backend]]\nname = \"dead\"\nurl = \"h2c://192.0.2.1:9\""
+            ),
+            "[[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n[[route]]\npath = \"/dead\"\nbackend = \"dead\"",
+        ),
+        "m6-http-h2c-dead",
+    );
+    let (warm_status, warm_body) =
+        h1_get(fx.port(), "/fast", Duration::from_secs(5)).expect("warm /fast");
+    assert_eq!(warm_status, 200, "warm /fast: {warm_body}");
+    assert_eq!(warm_body, FAST_BODY);
+
+    let port = fx.port();
+    let dead = std::thread::spawn(move || h1_get(port, "/dead", Duration::from_secs(10)));
+    // Wait until m6-http has the dead request and is starting its connect, so
+    // the hit below is issued while that connect is outstanding.
+    wait_for_log(
+        &fx.service,
+        "url backend dispatch",
+        Instant::now() + Duration::from_secs(5),
+    );
+    let hit = h1_get(fx.port(), "/fast", Duration::from_secs(2));
+    let (hit_status, hit_body) = match hit {
+        Ok(r) => r,
+        Err(e) => panic!(
+            "a cache hit stalled behind an unreachable h2c upstream: {e}\n--- m6-http ---\n{}",
+            fx.service.output()
+        ),
+    };
+    assert_eq!(hit_status, 200, "cache hit: {hit_body}");
+    assert_eq!(hit_body, FAST_BODY);
+
+    let (dead_status, dead_body) = dead.join().expect("dead thread").expect("/dead");
+    assert_eq!(
+        dead_status,
+        502,
+        "/dead: {dead_body}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// A backend host that does not resolve stops m6-http with exit 2, and
+/// `--dump-config` still validates the same config without a lookup.
+#[test]
+fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().to_path_buf();
+    let site_toml = url_site(
+        "backend_timeout_secs = 30",
+        "[[backend]]\nname = \"dead\"\nurl = \"http://does-not-exist.invalid/\"",
+        "[[route]]\npath = \"/x\"\nbackend = \"dead\"",
+    );
+    let claim = claim_port();
+    let system = write_site(&site, &site_toml, claim.port());
+    let mut service = Service::spawn(
+        "m6-http-unresolvable",
+        Command::new(binary("m6-http")).arg(&site).arg(&system),
+    );
+    let status = service
+        .wait_for_exit(Instant::now() + Duration::from_secs(15))
+        .expect("m6-http must exit when a backend host does not resolve");
+    let output = service.output();
+    assert_eq!(status.code(), Some(2), "exit status: {status}\n{output}");
+    assert!(
+        output.contains("dead"),
+        "the backend must be named: {output}"
+    );
+    assert!(
+        output.contains("does-not-exist.invalid"),
+        "the host must be named: {output}"
+    );
+    assert!(output.contains("does not resolve"), "{output}");
+
+    let dumped = Command::new(binary("m6-http"))
+        .arg(&site)
+        .arg(&system)
+        .arg("--dump-config")
+        .output()
+        .expect("--dump-config");
+    assert!(
+        dumped.status.success(),
+        "--dump-config must exit 0: {:?}\n{}",
+        dumped.status,
+        String::from_utf8_lossy(&dumped.stderr)
+    );
+}
+
+/// An idle m6-http wakes about once a second, not a hundred times.
+///
+/// The report covers the 2 s accounting interval this fixture sets through the
+/// test-only variable, so the plan's mark of two wake-ups a second is four over
+/// a report, and half a second is one. The removed 10 ms cap gave about 100 a
+/// second, 200 over the same report.
+#[test]
+fn an_idle_m6_http_wakes_about_once_a_second() {
+    let fx = Fixture::start(1, 30, "idle");
+    let mut conn = H1KeepAlive::connect(fx.port());
+    // Start at one accounting tick, and read `/perf` after the next: the report
+    // then covers one whole idle window.
+    let lines = periodic_lines(&fx);
+    wait_for_periodic(&fx, lines);
+    let lines = periodic_lines(&fx);
+    wait_for_periodic(&fx, lines);
+    let loops = perf_event_loop(&mut conn);
+    let timeouts = trigger_count(&loops, "timeout");
+    // The report covers a 2 s accounting interval, so two a second is four and
+    // half a second is one. The bounds are the same rate the ten-second report
+    // was asserting: at most two wakes a second, at least one per window.
+    assert!(
+        timeouts <= 4,
+        "an idle m6-http woke {timeouts} times on its timeout trigger over one 2 s report; expected at most 4, two a second (the 10 ms cap gave about 200)\n{loops:?}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+    assert!(
+        timeouts >= 1,
+        "an idle m6-http woke {timeouts} times on its timeout trigger over one 2 s report; the loop must wake on its 1 s accounting tick\n{loops:?}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
 }

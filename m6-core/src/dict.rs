@@ -50,7 +50,7 @@ impl Dict {
         }
     }
 
-    /// A dictionary with no base, for a caller that has no framework state:
+    /// A dictionary with no base, for a caller that has no site state:
     /// tests, and handlers building a context by hand.
     pub fn new() -> Self {
         Self {

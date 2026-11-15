@@ -49,7 +49,7 @@ Take from it that every route is literal, so the service has no route configurat
 The method column is part of the contract.
 A `GET` on login, refresh or logout does not match the route.
 
-The service shares the signing keys, the token lifetimes and the rate limiter between its worker threads, and each worker thread has its own database connection.
+The service owns the signing keys, the token lifetimes, the rate limiter and one database connection, all built at start.
 It does not manage users or groups.
 `m6-auth-cli` (the *CLI*, command-line interface) writes those rows directly, and the service reads them at login and refresh.
 
@@ -73,7 +73,7 @@ Take from it that every flag is optional and the two positional arguments are re
 
 **Table 2: the two positional arguments and the three flags.**
 
-For this binary the dump covers the site directory, the config paths, the socket, the thread pool, the server settings and any routes declared in the config.
+For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
 It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the four routes the service registers.
 It exits 0 before the service validates those sections.
 
@@ -82,8 +82,7 @@ A missing positional argument prints the usage line and exits 2.
 The socket path comes from the config file's stem, so `configs/m6-auth.conf` becomes `/run/m6/m6-auth.sock`.
 The directory `/run/m6` is created at startup, and a stale socket file at that path is removed before the bind.
 
-The service logs to stdout.
-The default format is *JSON* (JavaScript Object Notation), and `[log] format` in `site.toml` can select text.
+The service logs to stdout as *JSON* (JavaScript Object Notation) lines, and `[log] level` in `site.toml` sets how much it writes.
 Logging is core's, so every m6 service writes the same lifecycle lines.
 Section 11.3 lists the lines this service adds.
 
@@ -379,7 +378,7 @@ The edge check is local, so the header it sets carries the result to a backend, 
 
 A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
 The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
-The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.1.
+The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.6.
 
 Token verification, the edge check and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.
@@ -388,13 +387,18 @@ Section 9 covers the database that holds the users the chain begins with.
 
 The service stores users, groups, memberships and refresh tokens in *SQLite*.
 The `m6-auth` library owns the schema, the password hashes and every query.
-The service opens the database once at startup to check it, then each worker thread opens its own connection through `m6_auth::Db::open` on its first request.
-A worker whose open fails answers that request with 500 and tries again on its next request.
+The service opens one connection through `m6_auth::Db::open` at start and keeps it for the life of the process.
+A database that cannot be opened stops the service with exit 2, and the error names the path.
 
 `Db::open` sets *WAL* (write-ahead logging), a 5-second busy timeout and foreign keys.
 WAL lets readers and one writer proceed together.
-A second writer waits up to 5 seconds and then fails.
-Each worker has its own connection, so a login that is checking a password holds no lock another request needs.
+The service sets the busy timeout to zero after that open, because a wait in the one loop holds every connection behind it.
+A statement that meets another process's lock returns `SQLITE_BUSY` at once.
+The loop defers that request and tries it again every 5 ms while it serves the other connections.
+A request that is still locked after one second is answered with 503 and `Retry-After: 1`.
+A retried login does not verify the password twice, because the retry keeps the user the first attempt verified.
+`m6-auth-cli` keeps the 5-second wait, because it serves one command at a time.
+The one connection is used by the one loop, so a login that is checking a password holds the process for its bcrypt verify and every other connection waits for it.
 
 The database path is the `[storage] path` key, an absolute path.
 The service creates the parent directory when it is missing.
@@ -433,7 +437,7 @@ Section 11 covers the process around it.
 
 ## 11. Lifecycle
 
-The service uses the core `App` lifecycle: one process, a bounded worker pool, a Unix socket and a signal handler.
+The service runs one process and one event loop, with a Unix socket and a signal handler.
 This section gives the signals, the exit codes and the log lines, beginning with the signals.
 
 ### 11.1. Signals

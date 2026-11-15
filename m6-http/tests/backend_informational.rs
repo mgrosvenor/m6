@@ -2,7 +2,7 @@
 //! (RFC 9110 15.2). The proxy must skip them and return the final response.
 //!
 //! Each test runs a loopback backend on a Unix socket and fetches from it
-//! through `forward_request`, the call the edge makes for a cache miss.
+//! through `client::Upstream`, the call the edge makes for a cache miss.
 
 #![allow(
     clippy::disallowed_methods,
@@ -40,6 +40,58 @@ fn backend(sock: &Path, informational: usize) -> std::thread::JoinHandle<()> {
     })
 }
 
+/// Drive one request over a Unix socket until it completes, blocking with a
+/// `platform::Poll` (tests may block).
+fn drive_upstream(
+    sock: &Path,
+    req: &HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+) -> std::io::Result<forward::HttpResponse> {
+    use m6_core::platform::{Events, Poll, Token};
+
+    let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
+    forward::encode_request(up.request_buf(), req, client_ip, original_host)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    up.start(
+        &m6_core::client::Addr::Unix(sock.to_path_buf()),
+        None,
+        false,
+        deadline,
+    )?;
+
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(8);
+    let token = Token(0);
+    let mut registered = up.interest();
+    poll.registry().register_fd(up.fd(), token, registered)?;
+    loop {
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))?;
+        if events.iter().any(|ev| ev.token() == token) {
+            if up.drive()? {
+                let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
+                    m6_core::client::MAX_HEADERS] =
+                    [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
+                let reply = up.reply(&mut slots).expect("reply after complete drive");
+                return Ok(forward::HttpResponse::from_reply(&reply));
+            }
+            // Drive first: under epoll edge-triggering, interest registered
+            // before the drive waits for an edge that never comes.
+            let interest = up.interest();
+            if interest != registered {
+                poll.registry().reregister_fd(up.fd(), token, interest)?;
+                registered = interest;
+            }
+        }
+        if std::time::Instant::now() >= up.deadline() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend timed out",
+            ));
+        }
+    }
+}
+
 fn fetch(informational: usize) -> std::io::Result<forward::HttpResponse> {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("backend.sock");
@@ -52,13 +104,7 @@ fn fetch(informational: usize) -> std::io::Result<forward::HttpResponse> {
         headers: vec![("Host".to_string(), "example.com".to_string())],
         body: vec![],
     };
-    let r = forward::forward_request_timeout(
-        &sock,
-        &req,
-        "127.0.0.1",
-        "example.com",
-        Some(std::time::Duration::from_secs(5)),
-    );
+    let r = drive_upstream(&sock, &req, "127.0.0.1", "example.com");
     let _ = handle.join();
     r
 }

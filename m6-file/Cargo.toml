@@ -19,8 +19,6 @@ m6-core     = { path = "../m6-core", default-features = false, features = ["mini
 toml        = "0.8"
 serde       = { version = "1", features = ["derive"] }
 anyhow      = "1"
-tracing     = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json"] }
 mime_guess  = "2"
 httpdate    = "1"
 
@@ -28,6 +26,8 @@ httpdate    = "1"
 m6-core       = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile  = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+# A test sets a 64 KiB receive buffer, which std does not expose.
+socket2   = "0.6"
 
 [[bench]]
 name    = "critical_path"

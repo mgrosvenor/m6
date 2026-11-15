@@ -446,8 +446,9 @@ impl Server {
     ///
     /// The probe requests are real, so they are logged. Every test in this file
     /// counts analytics lines and assumes it starts from an empty log, so the
-    /// log is truncated once the server is ready. The settle is for
-    /// tracing-appender, which writes on its own thread.
+    /// probe line is waited for and then the log is truncated. The line is
+    /// already written when it is readable, so nothing is left to arrive after
+    /// the truncation.
     fn wait_until_serving(&self) {
         let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
             self.get("/public/probe.html", &[]).status == 200
@@ -518,7 +519,6 @@ domain = "localhost"
 
 [log]
 level  = "info"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -662,7 +662,9 @@ fn sigusr1_reopens_the_analytics_log_and_loses_no_line() {
 
     let rotated = srv.analytics_log.with_extension("ndjson.1");
     std::fs::rename(&srv.analytics_log, &rotated).unwrap();
-    srv.http.borrow().signal(libc::SIGUSR1);
+    srv.http
+        .borrow()
+        .request(m6_core::platform::Signal::ReopenLogs);
     let back = m6_core::testkit::wait::until(Duration::from_secs(5), || srv.analytics_log.exists());
     assert!(back, "the live path never reappeared");
 
@@ -691,7 +693,9 @@ fn reopen_signals_never_count_toward_a_forced_shutdown() {
     // One at a time: a standard signal sent while the same one is pending is
     // merged into it, so two sent back to back may be one reopen.
     for want in 1..=2u64 {
-        srv.http.borrow().signal(libc::SIGUSR1);
+        srv.http
+            .borrow()
+            .request(m6_core::platform::Signal::ReopenLogs);
         let reopened = m6_core::testkit::wait::until(Duration::from_secs(5), || {
             srv.perf_json()["logging"]["reopen"]["reopens_total"] == want
         });
@@ -953,7 +957,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "custom"
@@ -1100,7 +1103,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1241,7 +1243,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1318,7 +1319,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1379,7 +1379,7 @@ backend = "origin"
     );
     // The probes are logged like any other request, and this test counts lines.
     // Wait for each node's own 200 probe line, then truncate: that line is the
-    // last the readiness loop enqueued, so nothing is left to leak in after it.
+    // last the readiness loop wrote, so nothing is left to leak in after it.
     wait_until_probe_logged(&origin_analytics_log, "/public/probe.html");
     wait_until_probe_logged(&edge_analytics_log, "/public/probe.html");
     std::fs::write(&origin_analytics_log, b"").expect("truncate origin log");

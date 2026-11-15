@@ -27,11 +27,11 @@ use crate::request::Request;
 /// that are not there. Here they cannot: `as_bytes` returns `None` for a
 /// stream and the transforms have nothing to work on.
 ///
-/// This is what `App` was missing. `m6-file` streams a file straight to the
-/// wire (`send_stream`), and one minified JavaScript bundle of several
+/// A body from a reader is what `m6-file` needs. It streams a file straight to
+/// the wire (`send_stream`), and one minified JavaScript bundle of several
 /// megabytes used to be read into a `Vec` on every cache miss to be copied
-/// straight out again. A migration onto a `Response` that could only hold bytes
-/// would have put that allocation back, on the service that serves every asset
+/// straight out again. A `Response` that could only hold bytes would put that
+/// allocation back, on the service that serves every asset
 /// on the site.
 pub enum Body {
     /// Bytes already in memory.
@@ -142,11 +142,10 @@ pub struct Response {
 impl From<crate::http::RawResponse> for Response {
     /// The low-level response type, lifted into the one handlers return.
     ///
-    /// `RawResponse` is what a service builds when it is writing its own
-    /// status, headers and body with no framework around it; `Response` is
-    /// what an `App` handler returns. They hold the same three things, so a
-    /// service migrating onto `App` does not have to rewrite handlers that
-    /// already produce a correct answer.
+    /// `RawResponse` is what a service builds when it writes its own status,
+    /// headers and body with no site around it; `Response` is what a request
+    /// arm returns. They hold the same three things, so a service does not
+    /// rewrite a handler that already produces a correct answer.
     ///
     /// `verbatim`, because a `RawResponse` was built to be written as-is: the
     /// service that produced it set its own `Content-Type` and length and had
@@ -464,17 +463,9 @@ impl Response {
             ..
         } = self;
 
-        let has = |name: &str| crate::headers::contains(&headers[..], name);
-
-        let etag;
-        let mut hdrs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        if !has("content-type") && !body.is_empty() {
-            hdrs.push(("Content-Type", "text/html; charset=utf-8"));
-        }
+        let etag_hash = default_etag(&headers, &body);
+        let mut hdrs: Vec<(&str, &str)> = head_fields(&headers, body.is_empty()).collect();
+        let etag_value;
 
         match body {
             // Written straight through, and deliberately given no default
@@ -493,15 +484,52 @@ impl Response {
                 // against once this response is cached. A `no-store` response
                 // is never cached, so no cache will revalidate it: hashing its
                 // body is wasted work.
-                if !has("etag") && !bytes.is_empty() && !cache_control_no_store(&headers) {
-                    etag = format!("\"{:x}\"", content_hash(&bytes));
-                    hdrs.push(("ETag", etag.as_str()));
+                if let Some(hash) = etag_hash {
+                    etag_value = format!("\"{hash:x}\"");
+                    hdrs.push(("ETag", etag_value.as_str()));
                 }
                 resp.send(status, &hdrs, &bytes)?;
             }
         }
         Ok(())
     }
+}
+
+/// The response head's fields as borrowed pairs, with the `Content-Type` a
+/// handler left out supplied for a body of bytes.
+///
+/// One rule for every sender: `Response::send` and a connection slot both build
+/// their head from this, so the two cannot default differently.
+pub(crate) fn head_fields<'a>(
+    headers: &'a [(String, String)],
+    body_is_empty: bool,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    let fields = headers.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let content_type = if !crate::headers::contains(headers, "content-type") && !body_is_empty {
+        Some(("Content-Type", "text/html; charset=utf-8"))
+    } else {
+        None
+    };
+    fields.chain(content_type)
+}
+
+/// The default `ETag` for a buffered body: a content hash, unless the response
+/// carries its own tag, has no body, or asks caches not to store it.
+///
+/// A `Body::Stream` has no `ETag` by construction: hashing it would mean
+/// reading it, which is the whole thing streaming avoids. One rule for
+/// `Response::send` and a connection slot, so the tag they emit cannot differ.
+pub(crate) fn default_etag(headers: &[(String, String)], body: &Body) -> Option<u64> {
+    let Body::Bytes(bytes) = body else {
+        return None;
+    };
+    if bytes.is_empty()
+        || crate::headers::contains(headers, "etag")
+        || cache_control_no_store(headers)
+    {
+        return None;
+    }
+    Some(content_hash(bytes))
 }
 
 fn content_hash(body: &[u8]) -> u64 {
@@ -546,14 +574,14 @@ fn is_no_store_name(raw: &str) -> bool {
     name.trim().eq_ignore_ascii_case("no-store")
 }
 
-/// Map an `Error` to a `Response` (status only, body set by framework).
+/// Map an `Error` to a `Response` (status only, body set by `site`).
 pub fn error_to_response(err: &Error) -> Response {
     match err {
         Error::NotFound => Response::not_found(),
         Error::Forbidden => Response::forbidden(),
         Error::BadRequest(_) => Response::bad_request(),
         Error::Other(_) => {
-            tracing::error!("handler error: {err}");
+            crate::log::error!("handler error: {err}");
             Response::status(500)
         }
     }
@@ -578,7 +606,7 @@ mod body_tests {
         (head, out[sep + 4..].to_vec())
     }
 
-    /// The capability `App` was missing: a body written from a reader, with the
+    /// A body written from a reader, with the
     /// length promised up front and never held in memory.
     #[test]
     fn a_streamed_body_reaches_the_wire_with_its_length() {

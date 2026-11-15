@@ -187,8 +187,8 @@ Table 5 gives what the single-threaded, single-process-cache model surrenders.
 
 | given up | why it follows from the design |
 |---|---|
-| multi-core use within one process | one thread cannot occupy several cores. m6 scales by running more instances, or more backend workers, which is why §3.4 makes pool membership automatic |
-| HTTP/1.1 throughput against a mature server | a new connection per request pays a TLS handshake each time, and the h1 path makes a blocking backend call on a miss, which stalls the loop |
+| multi-core use within one process | one thread cannot occupy several cores. m6 scales by running more instances, which is why §3.4 makes pool membership automatic |
+| HTTP/1.1 throughput against a mature server | a new connection per request pays a TLS handshake each time, and one slow answer holds its own process until it finishes |
 | zero-copy file serving | content is copied through userspace buffers, so a server using `sendfile()` pulls ahead as responses grow past a few kilobytes |
 | kernel TLS | pushing encryption into the kernel is a Linux feature not yet in the TLS stack m6 uses, and it is the largest remaining piece of the gap in §1.2 |
 
@@ -202,6 +202,83 @@ So is a deployment that must saturate many cores from one process.
 m6 is for a site where most assets are static, where the common request is a cache hit over HTTP/2 or HTTP/3, and where one stack that understands itself is worth more than the last increment of raw throughput.
 
 Everything in the rest of this document follows from §1.1 and §1.4, starting with the shape they produce.
+
+### 1.10 The event loop
+
+**Every m6 service runs one single-threaded loop in its own `main`, and the loop is the only place runtime work waits.**
+The design is `epoll(7)`'s edge-triggered contract and `listen(2)`'s backlog, which is how nginx, redis and libevent programs run.
+`docs/m6-app-anatomy.md` §2 shows the shape in full, and §7.1 says why each service writes its own.
+
+Twelve rules hold for every loop.
+
+1. Start and stop may block. The loop never does.
+2. Keep things out of the loop. If it can be done at start or at stop, do it there.
+3. One thread per process. More cores means more processes, never more threads.
+4. No thread per request and no hand-off to another thread.
+5. No timer that checks for something a descriptor could signal. The one timer is the accounting tick.
+6. Each service owns its loop. Nothing in m6-core takes it over.
+7. Failures at start are errors (exit 2), never "warn and carry on".
+8. No heap allocation on the hot path, explicit or hidden. Start, stop and the connection table's growth are outside the hot path, so everything the loop uses is allocated at start, and growing a `Vec`, building a `String`, `format!`, `Box::new` and inserting into a `HashMap` are all forbidden in the loop.
+9. No buffers on the stack in the run loop. Read and write through the slot's buffers, because `[0u8; N]` writes N zeros every time it runs and a frame over 4 KiB probes the stack page by page.
+10. No `unsafe` in a service's loop. The crate root says `#![deny(unsafe_code)]`.
+11. The poll is edge-triggered (`m6_core::platform::Poll`, over `mio`, and `m6-core/examples/echo.rs` is the reference loop): a socket is reported once per change, never while data waits, so each turn reads and writes until one side returns `WouldBlock`.
+12. Readiness is re-read after the handler. Drive first, then compare `interest()` with what is registered and reregister only on a change, and reregister once when a test seam fakes a `WouldBlock`, because the kernel never returned `EAGAIN` and only `EPOLL_CTL_MOD` re-reports readiness. A loop change that is green on macOS is unproven until the Linux run.
+
+**A process has three phases, and the loop is only the middle one.**
+Start, from `main` until the loop begins, may block freely: it reads configuration, keys, certificates, templates and site content, opens and migrates databases, and resolves host names with the ordinary blocking lookup.
+Run never blocks, and every wait goes through the loop.
+Stop, after the loop exits on a signal, may block freely: it flushes logs, closes files and removes the socket.
+A failure at start is an error with exit 2, and a change to anything read at start needs a restart.
+
+**m6-core supplies parts, and the service writes the loop.**
+A framework is anything that takes over the run loop, and m6-core never does.
+The service's `main` owns the `Poll`, the token `match` and every descriptor, and it calls plain types with methods: `platform::Poll`, `Events`, `Interest` and `Token`, `platform::Signals`, `event::Timeouts`, `event::Slots`, `event::LoopTrace`, `h1::ServerConn`, `client::Upstream` and `net::listen_unix`.
+`m6-core/examples/echo.rs` is the smallest complete loop, and `docs/m6-core-reference.md` §4.1 names every part.
+
+**`m6_core::platform` is the only place an OS call lives.**
+It owns readiness, the clock, signals, non-blocking sockets, the open-file limit and a child's exit, and no other crate names `mio`, `nix`, `libc` or a `cfg(target_os)` (`docs/m6-platform.md`).
+There is no `m6_core::mio`.
+
+**The handler work in a turn sees one clock reading.**
+`m6_core::platform::now` is the monotonic clock, and a loop reads it after the wait and passes that time to every handler in the turn.
+The wait's own bound comes from `event::Timeouts` on the same clock, and the clock never goes backwards.
+
+**Waiting on another service is an `enum` of steps.**
+The connection's state names the step, the outgoing work gets its own token and deadline, and the loop calls its `drive()` when the reactor reports that token ready.
+A step that is not finished returns to the loop.
+A deadline that passes first answers 504 and drops the outgoing work, which closes its socket.
+A multi-step protocol such as SMTP is the same enum with a `match` inside `drive()`.
+
+**A busy SQLite statement gets a deadline.**
+A statement that answers `SQLITE_BUSY` while the loop is running sets a short deadline on that connection, and the loop tries again when it passes.
+`m6-core/src/sqlite.rs` sets `busy_timeout` to zero after the start-time open for the same reason: a wait in the loop holds every request behind it.
+
+**A regular file is always ready to every poll.**
+A read or write of one in the loop is kept small, and the code that adds it names the reason.
+`docs/m6-log.md` states the same rule for a log sink: a regular file never returns `EAGAIN`, so it is never registered with a loop.
+
+**The queue is the kernel's listen backlog, and the connection table is the process's own limit.**
+The listener accepts until the kernel has no more, and connections beyond the table wait in the backlog, so the process never queues work it cannot finish.
+The table starts with `INITIAL_CONNECTIONS` slots (1024), each with its buffers.
+It doubles when full, with the free list and the timeouts reserved to the new size, never shrinks, and stops at the process's open-file limit, raised to the hard limit at start.
+At that ceiling the loop stops accepting, and new clients wait in the backlog.
+
+**Scaling is more processes.**
+One thread per process means more cores are more instances: one `m6-http` per node and more backends behind it, and §3.4 makes pool membership automatic.
+HTTP says nothing about how a server runs, which is why `docs/m6-backend-protocol.md` lets a backend use threads, processes or an event loop.
+
+**Signals arrive as a descriptor, and `Lifecycle` says what each one means.**
+`m6_core::platform::Signals` is signalfd on Linux and a kqueue filter elsewhere, so a shutdown or a log reopen is readable in the same `match` as every socket.
+`m6_core::signal::Lifecycle` turns each one into the lifecycle line to log and the decision to stop, and `m6_core::signal::block()` is the first statement of `main`, before the logging writer starts.
+
+**Logging in the loop is `m6_core::log`.**
+A line is buffered and written on the accounting tick, and a full stdout is watched for writability under its own token, so the loop never waits on the log.
+`docs/m6-log.md` has the interface.
+
+**The check is the clippy ledger and the counting allocator.**
+`clippy.toml` refuses threads, sleeps, blocking connects and socket timeouts in m6 code, and every non-test use of a refused call carries an `#[expect(clippy::disallowed_methods, reason = "...")]` that names the owner's approval or the job that removes it.
+`m6_core::testkit::alloc_count` counts every heap allocation, so a hot path's claim of none is a test result.
+Two exceptions are named where they apply and neither is generalised: the SQLite WAL switch at open, the one clippy-ledger exception (owner, 2026-11-09), and rustls 0.23's one buffer for each encrypted TLS record sent, which no public API avoids and which is the one allocation exception.
 
 ---
 
@@ -282,8 +359,9 @@ And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 A pool is declared as a socket glob, and membership comes from expanding that glob once at start, so backends must start before m6-http (systemd `After=` on the backend units), and a new instance joins its pool when m6-http restarts.
 An explicit list would mean a config edit to add capacity, which is ceremony in the path of the one operation an operator performs under pressure.
 
-A member whose backend stops is retried into its backoff, and a backend that restarts on the same path serves again on its next connect.
-Requests go to the member holding the fewest connections, which is the only load signal available locally, and a failed member is retried after 1, 2, 4, 8, 16 and then 30 seconds so a restarting backend is not hammered.
+Requests go to the members in turn, so each member takes the same share of the load however long the others take to answer.
+A request whose connect fails tries the next member, so a stopped backend costs one refused connect and does not fail the request.
+A backend that restarts on the same path serves again on its next turn.
 
 ---
 
@@ -313,7 +391,7 @@ That concentration is what makes §4.4 possible: a rule applied once at the edge
 
 **A cache hit is a hash map lookup and a write, and an async runtime adds overhead to that.**
 This is §1.1's four rules as an implementation.
-One thread runs the loop and owns every connection's state, so the request path has no cross-thread synchronisation to contend for, and the header scan on the hit path allocates nothing.
+m6-http runs one `m6_core::platform::Poll` loop, and one thread owns every connection's state, so the request path has no cross-thread synchronisation to contend for, and the header scan on the hit path allocates nothing.
 Network descriptors and backend descriptors sit in one readiness set, so there is nothing to coordinate between.
 
 The trade is stated plainly: a state machine over one loop is harder to write correctly than a thread per request, and far simpler to reason about under load, because there is no interleaving to consider.
@@ -419,7 +497,7 @@ Breadth is the intent and singularity is the rule, and this section says why tho
 
 **A service should be able to build what it needs from one dependency**, which is §1.6 applied to the code rather than to the request path.
 So core holds templating, compression, minification, cookies, multipart bodies, an SMTP client, an outbound HTTP client, host metrics and firewall reporting beside the HTTP layers, and a component a website might want belongs in it.
-The test of whether that is working is that a new service is small: `m6-html` is six lines and renders every HTML page a site serves.
+The test of whether that is working is that a new service is small: `m6-html` is one `main` and a route table, and renders every HTML page a site serves.
 
 Breadth is paid for by feature gates.
 A service names what it wants, so the weight of core is what a binary uses rather than what core contains, which keeps a command line tool such as `m6-md` from acquiring a QUIC stack or a TLS library by depending on it.
@@ -430,7 +508,7 @@ Table 9 gives the sorts of component core holds, in brief.
 |---|---|
 | HTTP semantics | the version-independent rules: conditional requests, content negotiation, repeated header fields, content types with charset |
 | HTTP/1.1 | the one request parser and response writer, and the blocking read adapter over it |
-| Service scaffolding | the socket server, the accept loop, routing, the thread pool, the shutdown sequence |
+| Service scaffolding | the reactor, the signal descriptor, the deadlines, the connection table, routing, the socket helper and the shutdown sequence |
 | Configuration | parsing and validation, and secrets merging |
 | Request and response | what a handler receives and returns, the layered request dictionary, cookie construction, multipart bodies |
 | Content | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam with its template implementation behind it |
@@ -504,21 +582,34 @@ That trade was declined for two tests about how politely a hostile peer is refus
 
 ## 7. Why every service has one shape
 
-Every m6 service except the edge is an `App`: a Unix socket server with a fixed thread pool, a bounded queue, and routes from configuration.
-One shape means one bounded queue, one state model and one shutdown sequence serve all of them.
+Every m6 service except the edge is a `main` with its own event loop, and the loop is the same shape in each.
+One shape means one loop, one state model and one shutdown sequence serve all of them.
 
-### 7.1 Why a fixed pool with a bounded queue
+### 7.1 Why each service writes its own loop
 
-**A bounded queue refuses work in a way the edge can act on.**
-The pool defaults to the CPU count and the queue to eight times the pool, and a full queue answers 503 immediately.
-An unbounded queue would accept work it cannot finish, turning overload into growing latency and eventually memory exhaustion, and a 503 under overload is correct behaviour: it is how backpressure reaches the proxy, which can answer from cache or shed.
+**m6-core supplies parts, and the service writes the loop.**
+The service's `main` owns the poll, the token `match` and every descriptor, so the loop is visible where it runs and a service can be read top to bottom.
+`docs/m6-app-anatomy.md` is that shape in full.
+§1.10 states the loop and its rules once. This section says only why each service writes its own.
 
-Scaling is by starting another instance rather than growing one pool, which is why §3.4 made membership automatic.
+**One thread per process means scale is more processes.**
+A second thread would need its own state and a hand-off, and a hand-off costs a context switch and a cold cache.
+More cores means more instances, which is why §3.4 makes pool membership automatic.
+The `[thread_pool]` key is refused at start, so an operator cannot ask for more threads by accident.
 
-**State comes in two tiers so that sharing costs as little as possible.**
-A value shared across workers sits behind one reference count, so a request pays one atomic increment and no copy.
-A value per worker is owned by its thread and needs no synchronisation, which lets a database connection per worker run in parallel with no lock.
-A service declares which it needs once and the builder's type carries it, so a handler receives its state with the real type rather than casting.
+**The kernel's listen backlog is the queue.**
+The listener accepts until the kernel has no more, and connections beyond the table wait in the backlog.
+A user-space queue would accept work the process cannot finish, which turns overload into growing latency, and the edge's own deadline is the backpressure.
+
+**Start and stop may block, and the loop never does.**
+Configuration, keys, certificates, templates and host names are read at start, and a change means a restart.
+A request that must wait on another service registers that socket under a token and resumes when the reactor reports it ready.
+Shutdown stops accepting, removes the socket and exits without waiting for a request in progress.
+
+**A timer that checks for something a descriptor could signal has no place in the loop.**
+The one timer is the accounting tick.
+A silent peer is the one wait no descriptor reports, and its read deadline is a `Timeouts` entry that the loop checks each turn.
+Failures at start are errors with exit 2, and a failure the design cannot meet at all is a reason to stop and ask the owner.
 
 ### 7.2 Why the request dictionary is layered
 
@@ -534,8 +625,8 @@ A content file that could redefine the request path could make a page lie about 
 
 **A service stops on SIGTERM by refusing new connections, removing its socket and exiting.**
 It does not wait for requests in progress: the supervisor restarts it on a deploy, and a request cut off by a restart is acceptable.
-So the first signal exits 0, the second exits immediately, and the sequence is core's.
-What a service supplies is data: the name in its lifecycle lines, the socket to unlink on every exit path, and a descriptor to wake a parked loop.
+So the first signal exits 0, the second exits immediately, and the sequence is the service's `main`, with m6-core supplying the parts it calls: `signal::block()` first, `Lifecycle` for the lines and the signal meanings, and the socket path that `Lifecycle::complete` unlinks.
+What a service supplies is data: the name in its lifecycle lines and the socket to unlink on every exit path.
 
 **One sequence exists because several diverged.**
 With three ways to install a handler, one service of five unlinked its socket, two logged that they had stopped, and three logged a name that was not their own, and none of that was required by anything the services do.
@@ -610,9 +701,9 @@ Table 11 gives them by area.
 | caching | invalidation is derived from the site's own declarations at startup | the site already says which files a route reads, and a backend that has to announce a change is a backend that can forget to |
 | caching | a rendered page carries a validator derived from its inputs | without one every conditional request returned the whole page, and a rendered page has no file of its own to date |
 | processes | a socket path is derived from the config filename | one convention, so a unit file and a pool glob cannot disagree about where a service listens |
-| processes | two positional arguments, and one environment variable, `M6_SOCKET_OVERRIDE` | the two positional arguments carry the service's configuration, and the named exception relocates only the listening socket and is never set in a deployment (`m6-app-anatomy.md` §4.1). |
+| processes | two positional arguments, and one environment variable, `M6_SOCKET_OVERRIDE` | the two positional arguments carry the service's configuration, and the named exception relocates only the listening socket, is set by a template unit that runs several instances, and is absent otherwise (`m6-app-anatomy.md` §4.1). |
 | processes | a connection serves at most 100 requests before closing | persistent connections are the default, and an unbounded one lets one peer hold a slot indefinitely by pipelining |
-| processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds a pool worker until it disconnects, and a handful of those is the whole pool while the service looks healthy |
+| processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds its connection slot until it disconnects, and enough of those fill the table while the service looks healthy |
 | processes | exit 0 clean, 1 runtime error, 2 configuration or usage error before binding | a supervisor can tell a bad config from a crash, which is what lets a deploy validate a new binary and refuse to install |
 | content | minification runs before compression, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, and a minifier that does not understand a file should pass it through rather than corrupt it |
 | content | inline script minification is off by default | the engine parses scripts as modules, which has different scoping, and it can silently rewrite a valid classic script into a broken one |

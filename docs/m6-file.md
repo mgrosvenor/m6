@@ -1,7 +1,7 @@
 # m6-file
 
 m6-file serves files from disk.
-It is an *App* (a service built on m6-core's application framework) with one handler, registered under the name `files`.
+It is an m6 service built on `m6-core`: one process, one event loop, and one handler registered under the name `files`.
 Every route it answers comes from its own config, not from m6-http's.
 Until now that was readable only in the source.
 This document covers its two route tables, how it resolves a path, what its handler owns, and how to configure it.
@@ -177,23 +177,22 @@ The boundary is the root the process was started with, so that directory should 
 
 ## 6. Configuration
 
-m6-file accepts two arguments, a root and a config path, and reads its thread pool size and routes from the config.
+m6-file accepts two arguments, a root and a config path, serves from one event loop, and reads its routes from the config.
 
 ```toml
-[thread_pool]
-size = 32
-
 [[route]]
 path    = "/assets/{*relpath}"
 handler = "files"
 root    = "assets/"
 ```
 
-Three facts about that config:
+Two facts about that config:
 
-- the pool defaults to the *CPU* (Central Processing Unit) count. A page requesting more assets at once than the pool has threads queues the surplus, which surfaces as "pool empty" backend errors.
 - a route naming a handler the binary does not have is fatal, so the service exits 2 at startup.
 - routes come from config, read once at start, so an asset tree is added by editing the config and restarting.
+
+The process serves every connection from one loop, so more load is more instances, each with its own socket in `site.toml`'s `[[backend]]` glob.
+A `[thread_pool]` table is refused at start for the same reason.
 
 m6-file answers `GET` and `HEAD`, and returns 405 for anything else.
 
@@ -213,6 +212,6 @@ Related reading:
 |---|---|
 | [`m6-site-layout.md`](m6-site-layout.md) | where m6-file's root belongs relative to other apps |
 | [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table, including `[[route_group]]` |
-| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing an App of your own |
+| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing a service of your own |
 
 **Table 5: further reading, and what each document covers.**

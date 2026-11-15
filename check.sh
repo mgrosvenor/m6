@@ -7,7 +7,7 @@
 #   ./check.sh --save-baseline  # run benches and save as the comparison baseline
 #
 # Order of operations:
-#   1. Build (release)
+#   1. Build (dev binaries)
 #   2. Clippy minimum-score check — BLOCKS the push
 #   3. Unit + integration tests
 #   4. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
@@ -75,8 +75,11 @@ info() { echo -e "${YELLOW}----${RESET} $1"; }
 warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
-info "Building (release)..."
-cargo build --workspace --release --quiet
+# The dev profile is the tests' profile. The suites run the binaries cargo built
+# here, and testkit::binary never runs cargo, so this build is what puts them
+# where the tests look for them.
+info "Building (dev)..."
+cargo build --workspace --bins --quiet
 pass "Build"
 
 # ── 2. Clippy ─────────────────────────────────────────────────────────────────
@@ -91,17 +94,15 @@ else
 fi
 
 # ── 3. Correctness: unit + integration tests ──────────────────────────────────
-# --test-threads=1: several integration suites (m6-http's edge_proxy.rs,
-# security_e2e.rs, analytics_e2e.rs) spawn real m6-http/m6-html/m6-file
-# processes bound to fixed loopback ports. Run concurrently with each other,
-# their #[test] fns race for those ports and fail with spurious 502s that
-# have nothing to do with the code under test.
+# The harness claims a free loopback port for each service, so the suite runs on
+# the harness's default threads. A suite that binds a fixed port, or two test
+# runs at once on one host, still races for ports and names.
 info "Running correctness tests..."
 # The test build binds nothing, so it runs before the port lock is taken.
 if ! cargo test --workspace --no-run --quiet 2>&1; then
   fail "Test build failed: the tests do not compile"
 fi
-if with_port_lock cargo test --workspace --quiet -- --test-threads=1 2>&1; then
+if with_port_lock cargo test --workspace --quiet --no-fail-fast 2>&1; then
   pass "Unit + integration tests (HTTP/1.1 ✓  HTTP/3 ✓)"
 else
   fail "Test suite failed — fix correctness issues before performance check"
@@ -153,6 +154,10 @@ fi
 # so. The exit code stays 0 on a laptop, deliberately: a developer's run is still
 # useful and still not a gate.
 INCOMPLETE=""
+# conformance.sh runs target/release directly and refuses to start without a
+# release build, so this step still needs one. The tests above used the dev profile.
+info "Building release binaries for conformance..."
+cargo build --workspace --release --quiet
 info "Running conformance (h1spec / h2spec / h3spec)..."
 CONF_OUT="$(mktemp)"
 if with_port_lock ./tools/conformance.sh --allow-missing-tools 2>&1 | tee "$CONF_OUT"; then

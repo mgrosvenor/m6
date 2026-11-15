@@ -1,183 +1,73 @@
-//! Logging setup, once, for every service.
+//! Logging for every service, over the `m6-log` crate.
+//!
+//! `m6-log` owns the two Sinks, the JSON line format, the macros and the log
+//! heartbeat. This module re-exports them as `m6_core::log`, reads the `[log]`
+//! level from `site.toml` and the service config, and adds [`watch`], the one
+//! piece that needs the reactor.
 //!
 //! Resolution order is fixed and shared: `site.toml`'s `[log]`, then the
-//! service config's `[log]`, then `--log-level`. Each service used to resolve
-//! this itself and they did not agree.
-//!
-//! **The writer thread is why `signal::block()` must come first.**
-//! `tracing_appender`'s non-blocking writer is a thread, it inherits the
-//! signal mask as it was when it started, and if SIGTERM is not blocked by
-//! then the kernel can deliver it there and kill the process at the default
-//! disposition.
-//!
-//! It is also why a line logged after the shutdown flag is set can be lost:
-//! process exit discards whatever is still queued. See the `signal` module.
+//! service config's `[log]`, then `--log-level`. The level is read once, at
+//! start, and a change takes a restart.
 //!
 //! **The analytics file can be reopened.**
-//! A rotation tool renames the file and sends SIGUSR1 (see `signal`), and the signal thread calls [`reopen_log_file`].
-//! The reopen opens the new file while holding the lock the writer takes for every line.
-//! The writer therefore cannot write to the old file once the lock is released, so the live path reappearing proves the renamed file is finished.
-//! If the open fails, the old handle stays in place and the failure is recorded.
+//! A rotation tool renames the file and sends SIGUSR1 (see `signal`), and the
+//! service's loop calls [`reopen`]. That call flushes the buffered lines, then
+//! opens the path again. From then on every line reaches the new file and none
+//! reaches the renamed one.
 
-use anyhow::Result;
+use std::io;
 use std::path::Path;
-use tracing::Level;
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
-use tracing_subscriber::filter::{filter_fn, FilterExt, LevelFilter};
-use tracing_subscriber::layer::Filter;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, Layer, Registry};
+use std::time::{Instant, UNIX_EPOCH};
 
-type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
-type BoxedFilter = Box<dyn Filter<Registry> + Send + Sync + 'static>;
+pub use m6_log::pulse;
+pub use m6_log::{
+    debug, error, flush, info, init, init_with_setting, stop, tick, trace, warn, with_analytics,
+    Level, Line, LogPulse, Sink,
+};
 
-/// Events logged with `target: "analytics"` are routed only to the dedicated
-/// analytics file (see [`init_with_analytics`]) — the main dev/prod log layer
-/// excludes them so per-request traffic logging doesn't drown out ordinary
-/// operational logging.
-const ANALYTICS_TARGET: &str = "analytics";
+/// Watch stdout for writability under `token` while the operational Sink holds
+/// bytes a full destination would not take.
+///
+/// A service's loop calls this after the events of one turn are handled, before
+/// it waits again. The Sink never blocks: a full stdout keeps the bytes and
+/// [`Sink::wants_write`] answers true, which registers the descriptor here.
+/// Edge-triggered readiness reports it once per change, and the loop's `LOG`
+/// arm calls [`flush`], which writes until the destination is empty or would
+/// block again. Once drained, this removes the descriptor from the reactor.
+pub fn watch(
+    registry: &crate::platform::Registry,
+    token: crate::platform::Token,
+) -> io::Result<()> {
+    let wants = m6_log::stdout_wants_write();
+    let watched = STDOUT_WATCHED.with(|w| w.get());
+    if wants && !watched {
+        let Some(fd) = m6_log::stdout_fd() else {
+            return Ok(());
+        };
+        registry.register_fd(fd, token, crate::platform::Interest::WRITABLE)?;
+        STDOUT_WATCHED.with(|w| w.set(true));
+    } else if !wants && watched {
+        if let Some(fd) = m6_log::stdout_fd() {
+            registry.deregister_fd(fd)?;
+        }
+        STDOUT_WATCHED.with(|w| w.set(false));
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// Whether the operational Sink's descriptor is registered with this
+    /// thread's reactor. One loop thread owns one reactor and one Sink.
+    static STDOUT_WATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 // ── Is logging alive ─────────────────────────────────────────────────────────
 
-/// A heartbeat for the main log layer.
+/// When this process last reopened the analytics file, and when a reopen last
+/// failed.
 ///
-/// Detecting a silent log used to mean sshing to each node and counting log
-/// targets out of `journalctl`. It does not have to: the process knows what it
-/// emitted. This counts events **after** the level filter, because the whole
-/// point is to observe what the filter is letting through rather than what the
-/// code tried to log.
-///
-/// Two atomics and no lock. It is incremented once per emitted event, on a
-/// path that is already formatting and writing a log line, and `analytics` is
-/// excluded from the main layer so per-request traffic does not reach it.
-pub struct LogPulse {
-    events: std::sync::atomic::AtomicU64,
-    /// Milliseconds since process start, at the last emitted event.
-    last_ms: std::sync::atomic::AtomicU64,
-}
-
-impl LogPulse {
-    const fn new() -> Self {
-        Self {
-            events: std::sync::atomic::AtomicU64::new(0),
-            last_ms: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn record(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.events.fetch_add(1, Relaxed);
-        self.last_ms.store(elapsed_ms(), Relaxed);
-    }
-
-    /// Events the main layer has emitted since start.
-    pub fn events(&self) -> u64 {
-        self.events.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Seconds since the last emitted event, or `None` if none ever was.
-    ///
-    /// A healthy m6-http emits `periodic stats` every ten seconds, so anything
-    /// past about thirty on a running process means the main layer has gone
-    /// quiet. That is the check, and it needs no log reader.
-    pub fn seconds_since_last(&self) -> Option<u64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.events.load(Relaxed) == 0 {
-            return None;
-        }
-        Some((elapsed_ms().saturating_sub(self.last_ms.load(Relaxed))) / 1000)
-    }
-}
-
-static PULSE: LogPulse = LogPulse::new();
-
-fn process_start() -> std::time::Instant {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    *START.get_or_init(std::time::Instant::now)
-}
-
-fn elapsed_ms() -> u64 {
-    process_start().elapsed().as_millis() as u64
-}
-
-/// The process-wide log heartbeat.
-pub fn pulse() -> &'static LogPulse {
-    &PULSE
-}
-
-// ── Reopening the log file ──
-
-fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-}
-
-/// The log file and the absolute path it was opened at.
-///
-/// The path is made absolute once, so a later change of working directory
-/// cannot redirect a reopen.
-struct ReopenableFile {
-    path: std::path::PathBuf,
-    file: std::sync::Mutex<std::fs::File>,
-}
-
-impl ReopenableFile {
-    fn open(path: &Path) -> std::io::Result<Self> {
-        let path = std::path::absolute(path)?;
-        let file = open_append(&path)?;
-        Ok(Self {
-            path,
-            file: std::sync::Mutex::new(file),
-        })
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, std::fs::File> {
-        self.file
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Open the path afresh and swap it in. On failure the old handle stays.
-    ///
-    /// The open happens under the lock on purpose. While this thread holds
-    /// the lock the writer cannot write to the old file, so once the new file
-    /// exists no further line will reach the renamed one.
-    fn reopen(&self) -> std::io::Result<()> {
-        let mut guard = self.lock();
-        let fresh = open_append(&self.path)?;
-        let old = std::mem::replace(&mut *guard, fresh);
-        drop(guard);
-        drop(old);
-        Ok(())
-    }
-}
-
-/// The writer `tracing_appender` owns for the analytics file.
-#[derive(Clone)]
-struct FileWriter(std::sync::Arc<ReopenableFile>);
-
-impl std::io::Write for FileWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().write(buf)
-    }
-
-    /// `tracing_appender` calls this once per event, so taking the lock once
-    /// here means a swap lands between lines and never inside one.
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0.lock().write_all(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().flush()
-    }
-}
-
-/// When the log file was last reopened, and when a reopen last failed.
-///
-/// Atomics only, like [`LogPulse`]. A count of zero means "never".
+/// Atomics only, like [`LogPulse`]. A count of zero means "never". The node
+/// answers the ages itself, so a reader's clock never matters.
 pub struct ReopenRecord {
     ok: std::sync::atomic::AtomicU64,
     failed: std::sync::atomic::AtomicU64,
@@ -202,11 +92,8 @@ impl ReopenRecord {
 
     fn record_success(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
         self.last_ok_ms.store(elapsed_ms(), Relaxed);
-        self.last_ok_unix.store(unix, Relaxed);
+        self.last_ok_unix.store(unix_now(), Relaxed);
         self.ok.fetch_add(1, Relaxed);
     }
 
@@ -254,39 +141,22 @@ impl ReopenRecord {
     }
 }
 
-static LOG_FILE: std::sync::OnceLock<std::sync::Arc<ReopenableFile>> = std::sync::OnceLock::new();
 static REOPENS: ReopenRecord = ReopenRecord::new();
 
-/// What a reopen request did.
-#[derive(Debug)]
-pub enum Reopened {
-    /// This process writes no log file.
-    NoFile,
-    /// The path was opened afresh.
-    Done(std::path::PathBuf),
-    /// The open failed. The previous file is still being written.
-    Failed(std::path::PathBuf, std::io::Error),
+fn process_start() -> Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(crate::platform::now)
 }
 
-fn reopen_in(slot: Option<&ReopenableFile>, rec: &ReopenRecord) -> Reopened {
-    let Some(f) = slot else {
-        return Reopened::NoFile;
-    };
-    match f.reopen() {
-        Ok(()) => {
-            rec.record_success();
-            Reopened::Done(f.path.clone())
-        }
-        Err(e) => {
-            rec.record_failure();
-            Reopened::Failed(f.path.clone(), e)
-        }
-    }
+fn elapsed_ms() -> u64 {
+    process_start().elapsed().as_millis() as u64
 }
 
-/// Reopen the analytics file at its path. Called on [`crate::signal::REOPEN_SIGNAL`].
-pub fn reopen_log_file() -> Reopened {
-    reopen_in(LOG_FILE.get().map(|a| &**a), &REOPENS)
+fn unix_now() -> u64 {
+    crate::platform::wall()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// When this process last reopened its log file.
@@ -296,45 +166,28 @@ pub fn reopens() -> &'static ReopenRecord {
 
 /// Whether this process writes a log file that can be reopened.
 pub fn writes_log_file() -> bool {
-    LOG_FILE.get().is_some()
+    m6_log::with_analytics(|_| {})
 }
 
-/// The newest rotated sibling of a log file, if there is one.
+/// Flush the analytics file and open its path afresh. Called on
+/// [`crate::platform::Signal::ReopenLogs`].
 ///
-/// A rotation tool that renames the live file with a date extension leaves
-/// `<name>-YYYYmmddHH`, which is what logrotate's `dateext` produces for an
-/// hourly rotation, and compression adds `.gz`.
-/// The highest stamp is the newest.
-/// An uncompressed file is preferred when both exist, because the `.gz` may still be written.
-pub fn newest_rotated(live: &Path) -> Option<std::path::PathBuf> {
-    let dir = live.parent().filter(|d| !d.as_os_str().is_empty());
-    let dir = dir.unwrap_or_else(|| Path::new("."));
-    let name = live.file_name()?.to_str()?;
-    let prefix = format!("{name}-");
-    let mut best: Option<(String, bool, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let file = entry.file_name();
-        let Some(file) = file.to_str() else { continue };
-        let Some(rest) = file.strip_prefix(&prefix) else {
-            continue;
-        };
-        let (stamp, gz) = match rest.strip_suffix(".gz") {
-            Some(stamp) => (stamp, true),
-            None => (rest, false),
-        };
-        if stamp.len() != 10 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let better = match &best {
-            None => true,
-            Some((s, was_gz, _)) => stamp > s.as_str() || (stamp == s.as_str() && *was_gz && !gz),
-        };
-        if better {
-            best = Some((stamp.to_string(), gz, entry.path()));
-        }
+/// A process with no analytics file answers `Ok` and writes nothing. A failed
+/// open leaves the previous file open, so the lines keep reaching the file the
+/// process already had, and the failure is recorded for [`reopens`].
+pub fn reopen() -> io::Result<()> {
+    if !writes_log_file() {
+        return Ok(());
     }
-    best.map(|(_, _, path)| path)
+    let result = m6_log::reopen();
+    match &result {
+        Ok(()) => REOPENS.record_success(),
+        Err(_) => REOPENS.record_failure(),
+    }
+    result
 }
+
+// ── Reopening the log file: the tail reader ──────────────────────────────────
 
 /// Append the last `max_bytes` of a plain or gzip file to `out`.
 ///
@@ -388,301 +241,35 @@ pub fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     Ok(into_text(out))
 }
 
-/// What [`read_recent_counted`] did with the rotated file.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct RecentStats {
-    /// Whether the rotated file was opened.
-    pub rotated_opened: bool,
-    /// Bytes taken from the rotated file: file bytes for a plain file, decoded bytes for a gzip file.
-    pub rotated_bytes: u64,
-}
-
-/// Append the tail of a rotated file, doing a bounded amount of work.
+/// What `site.toml`'s `[log]` says about this process: its level.
 ///
-/// A plain file is read from a seek, so at most `max_bytes` are read.
-/// A gzip file cannot seek, so it is read only when it is cheap.
-/// Its size on disk and the uncompressed size in its trailer (ISIZE, the last four bytes, modulo 2^32) must both be at most `max_bytes`.
-/// The decoder is also stopped one byte past `max_bytes`, and what it produced is discarded, because a damaged or hostile trailer can lie.
-/// A file that is skipped adds nothing, and that is not an error.
-fn append_rotated(
-    path: &Path,
-    max_bytes: usize,
-    out: &mut Vec<u8>,
-    stats: &mut RecentStats,
-) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    stats.rotated_opened = true;
-    let len = file.metadata()?.len();
-    let max = max_bytes as u64;
-    if !path.extension().is_some_and(|e| e == "gz") {
-        if len > max {
-            file.seek(SeekFrom::Start(len - max))?;
-        }
-        let before = out.len();
-        file.take(max).read_to_end(out)?;
-        stats.rotated_bytes = (out.len() - before) as u64;
-        return Ok(());
-    }
-    if len > max || len < 4 {
-        return Ok(());
-    }
-    file.seek(SeekFrom::Start(len - 4))?;
-    let mut isize_bytes = [0u8; 4];
-    file.read_exact(&mut isize_bytes)?;
-    if u64::from(u32::from_le_bytes(isize_bytes)) > max {
-        return Ok(());
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut decoded = Vec::new();
-    let result = flate2::read::GzDecoder::new(file)
-        .take(max + 1)
-        .read_to_end(&mut decoded);
-    stats.rotated_bytes = decoded.len() as u64;
-    if decoded.len() as u64 > max {
-        return Ok(());
-    }
-    // A gzip file cut short yields what decoded before the cut.
-    if let Err(e) = result {
-        if decoded.is_empty() {
-            return Err(e);
-        }
-    }
-    out.extend_from_slice(&decoded);
-    Ok(())
-}
-
-/// The recent end of a log file across its last rotation, as text.
-///
-/// See [`read_recent_counted`].
-pub fn read_recent(
-    live: &Path,
-    max_bytes: usize,
-    since: std::time::SystemTime,
-) -> std::io::Result<String> {
-    read_recent_counted(live, max_bytes, since).map(|(text, _)| text)
-}
-
-/// The recent end of a log file across its last rotation, as text, with what it cost.
-///
-/// The tail of the live file is at most `max_bytes`.
-/// Right after a rotation the live file holds only minutes, so the tail of the newest rotated sibling (see [`newest_rotated`]) comes before it, also at most `max_bytes`.
-/// The rotated file is left alone when it adds nothing the caller can use:
-/// when the live tail already filled `max_bytes`,
-/// when the rotated file was last written before `since`,
-/// or when it is a gzip file too large to decode within the bound.
-/// This runs on its caller's thread, so the work is bounded by `max_bytes` whatever the size of the files.
-/// A `.gz` file is decoded only when its size on disk and the size in its trailer are within `max_bytes`, and decoding stops at `max_bytes`.
-/// A rotated file that cannot be read costs that history and nothing else.
-/// A first line, or the first line after the join, that starts mid-record is expected and is the caller's to skip.
-pub fn read_recent_counted(
-    live: &Path,
-    max_bytes: usize,
-    since: std::time::SystemTime,
-) -> std::io::Result<(String, RecentStats)> {
-    let mut stats = RecentStats::default();
-    let mut live_tail = Vec::new();
-    append_tail(live, max_bytes, &mut live_tail)?;
-    let mut out = Vec::new();
-    if live_tail.len() < max_bytes {
-        if let Some(rotated) = newest_rotated(live) {
-            let recent = std::fs::metadata(&rotated)
-                .and_then(|m| m.modified())
-                .is_ok_and(|mtime| mtime >= since);
-            if recent && append_rotated(&rotated, max_bytes, &mut out, &mut stats).is_err() {
-                out.clear();
-            }
-            // The cut may leave half a record, which would run into the live
-            // file's first line.
-            if out.last().is_some_and(|&b| b != b'\n') {
-                out.push(b'\n');
-            }
-        }
-    }
-    out.extend_from_slice(&live_tail);
-    Ok((into_text(out), stats))
-}
-
-/// A layer that does nothing but count. Composed with the format layer
-/// *inside* the level filter, so both see the same events.
-struct PulseLayer;
-
-impl<S: tracing::Subscriber> Layer<S> for PulseLayer {
-    fn on_event(
-        &self,
-        _event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        PULSE.record();
-    }
-}
-
-/// Handle returned by [`init`] that owns the log writers.
-///
-/// Keep the handle alive for the lifetime of the process. Dropping it flushes
-/// and terminates the logging background thread.
-pub struct LogHandle {
-    // The main stdout writer is created once and lives for the whole process.
-    // Its worker thread stops the moment this guard drops, and any writes
-    // after that are silently discarded.
-    _guard: WorkerGuard,
-    // Same, for the analytics writer; never read again after init.
-    _analytics_guard: Option<WorkerGuard>,
-}
-
-/// The main layer's filter: a level gate, plus the exclusion of
-/// `target: "analytics"` events, which are high-volume, per-request and
-/// machine-read. Routing them here as well would drown out ordinary
-/// operational logging (and double-write them when [`init_with_analytics`]
-/// is in use).
-fn make_filter(level: Level) -> BoxedFilter {
-    Box::new(
-        LevelFilter::from_level(level).and(filter_fn(|meta| meta.target() != ANALYTICS_TARGET)),
-    )
-}
-
-/// Build the main stdout layer around the level filter.
-///
-/// The filter is passed in rather than built here so that the `Filtered`
-/// wrapper this produces is the one registered with the subscriber, and stays
-/// registered.
-fn make_main_layer(format: &str, writer: NonBlocking, filter: BoxedFilter) -> BoxedLayer {
-    // `and_then` puts the counter inside the same `Filtered` wrapper as the
-    // format layer, so it counts exactly what is emitted. A counter outside
-    // the filter would keep ticking while the log was silenced, which is the
-    // one thing it must not do.
-    match format {
-        "json" => Box::new(
-            fmt::layer()
-                .json()
-                .with_writer(writer)
-                .with_current_span(true)
-                .and_then(PulseLayer)
-                .with_filter(filter),
-        ),
-        _ => Box::new(
-            fmt::layer()
-                .with_writer(writer)
-                .and_then(PulseLayer)
-                .with_filter(filter),
-        ),
-    }
-}
-
-/// Build the analytics-only layer: always JSON (machine-read regardless of
-/// the main log's format), always to `path` (append mode, created if
-/// missing), only events tagged `target: "analytics"`.
-fn make_analytics_layer(path: &Path) -> Result<(BoxedLayer, WorkerGuard)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::sync::Arc::new(ReopenableFile::open(path)?);
-    // The subscriber is installed once per process (`try_init`), so only the
-    // first registration is reopenable.
-    let _ = LOG_FILE.set(std::sync::Arc::clone(&file));
-    let (writer, guard) = tracing_appender::non_blocking(FileWriter(file));
-    let filter = filter_fn(|meta| meta.target() == ANALYTICS_TARGET);
-    let layer: BoxedLayer = Box::new(
-        fmt::layer()
-            .json()
-            .with_writer(writer)
-            .with_current_span(false)
-            .with_target(false)
-            .with_filter(filter),
-    );
-    Ok((layer, guard))
-}
-
-/// Initialize the tracing subscriber with a non-blocking stdout writer.
-///
-/// Returns a [`LogHandle`] that must be kept alive for the lifetime of the
-/// process. The level and format are fixed for the life of the process.
-///
-/// `format`:
-///   - `"json"` → JSON output (production)
-///   - anything else → human-readable text (development)
-///
-/// `level`: `"debug"`, `"info"`, `"warn"`, `"error"` (defaults to `"info"`)
-pub fn init(format: &str, level: &str) -> Result<LogHandle> {
-    init_with_analytics(format, level, None)
-}
-
-/// Like [`init`], but also registers a second, always-JSON layer that
-/// captures only `target: "analytics"` events and appends them to
-/// `analytics_path` — independent of the main log's format/level, and never
-/// mixed into it. Pass `None` to behave exactly like [`init`].
-///
-/// `analytics_path` should point outside any directory that gets wiped on
-/// redeploy (e.g. not inside a rendered/generated site tree) — the file is
-/// opened in append mode and grown across restarts. Rotate it by renaming the
-/// file and sending SIGUSR1: the process then reopens the path.
-pub fn init_with_analytics(
-    format: &str,
-    level: &str,
-    analytics_path: Option<&Path>,
-) -> Result<LogHandle> {
-    // Anchor the clock before anything can log, so `seconds_since_last` is
-    // measured from process start rather than from the first call.
-    let _ = process_start();
-    let lvl = parse_level(level)?;
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
-
-    // The level filter is built once and never changes.
-    let filter = make_filter(lvl);
-    let main_layer = make_main_layer(format, writer, filter);
-
-    // Chaining multiple `.with(boxed_layer)` calls changes the subscriber
-    // type at each step (S becomes `Layered<_, Registry>`), which a
-    // `Box<dyn Layer<Registry>>` no longer satisfies. Collecting into a
-    // `Vec<BoxedLayer>` and calling `.with()` once keeps every element's
-    // trait object anchored to plain `Registry`.
-    let mut layers: Vec<BoxedLayer> = vec![main_layer];
-    let mut analytics_guard = None;
-    if let Some(path) = analytics_path {
-        let (l, g) = make_analytics_layer(path)?;
-        layers.push(l);
-        analytics_guard = Some(g);
-    }
-
-    Registry::default()
-        .with(layers)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {}", e))?;
-
-    Ok(LogHandle {
-        _guard: guard,
-        _analytics_guard: analytics_guard,
-    })
-}
-
-/// Read `[log]` from the `site.toml` at `site_toml`. Returns `(level, format)`
-/// on success.
-///
-/// A read or parse failure is an error naming the file, and a `level` or
-/// `format` that is present and not a string is an error naming the key. Absent
-/// keys keep the defaults `"info"` and `"json"`.
-pub fn read_site_log_config(site_toml: &Path) -> anyhow::Result<(String, String)> {
+/// A read or parse failure is an error naming the file, a `level` that is
+/// present and not a string is an error naming the key, and any key other than
+/// `level` is an error naming the setting. An absent key keeps the default
+/// `"info"`. The refusal matches the service config: every m6 log is a JSON
+/// line, so `format` and a misspelled `level` stop the service at start.
+pub fn read_site_log_config(site_toml: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(site_toml)
         .map_err(|e| anyhow::anyhow!("{} cannot be read: {e}", site_toml.display()))?;
     let val: toml::Value = text.parse::<toml::Value>().map_err(|e| {
         anyhow::anyhow!("{} is not valid TOML: {}", site_toml.display(), e.message())
     })?;
-    let log = val.get("log");
-    let level = match log.and_then(|l| l.get("level")) {
-        Some(v) => v
+    let Some(log) = val.get("log") else {
+        return Ok("info".to_string());
+    };
+    let table = log
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[log] must be a table"))?;
+    if let Some(key) = table.keys().find(|k| k.as_str() != "level") {
+        anyhow::bail!("unknown key [log] {key}: known keys are level");
+    }
+    match table.get("level") {
+        Some(v) => Ok(v
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("[log] level must be a string, got {v}"))?
-            .to_string(),
-        None => "info".to_string(),
-    };
-    let format = match log.and_then(|l| l.get("format")) {
-        Some(v) => v
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("[log] format must be a string, got {v}"))?
-            .to_string(),
-        None => "json".to_string(),
-    };
-    Ok((level, format))
+            .to_string()),
+        None => Ok("info".to_string()),
+    }
 }
 
 /// Parse a log level string. Accepts `trace`, `debug`, `info`, `warn` (or
@@ -690,11 +277,11 @@ pub fn read_site_log_config(site_toml: &Path) -> anyhow::Result<(String, String)
 /// value.
 pub fn parse_level(s: &str) -> anyhow::Result<Level> {
     match s.to_ascii_lowercase().as_str() {
-        "trace" => Ok(Level::TRACE),
-        "debug" => Ok(Level::DEBUG),
-        "info" => Ok(Level::INFO),
-        "warn" | "warning" => Ok(Level::WARN),
-        "error" => Ok(Level::ERROR),
+        "trace" => Ok(Level::Trace),
+        "debug" => Ok(Level::Debug),
+        "info" => Ok(Level::Info),
+        "warn" | "warning" => Ok(Level::Warn),
+        "error" => Ok(Level::Error),
         _ => Err(anyhow::anyhow!(
             "unknown log level {s:?}: use trace, debug, info, warn or error"
         )),
@@ -702,21 +289,17 @@ pub fn parse_level(s: &str) -> anyhow::Result<Level> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
-)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_parse_level_known() {
-        assert_eq!(parse_level("debug").unwrap(), Level::DEBUG);
-        assert_eq!(parse_level("INFO").unwrap(), Level::INFO);
-        assert_eq!(parse_level("WARN").unwrap(), Level::WARN);
-        assert_eq!(parse_level("error").unwrap(), Level::ERROR);
-        assert_eq!(parse_level("trace").unwrap(), Level::TRACE);
-        assert_eq!(parse_level("warning").unwrap(), Level::WARN);
+        assert_eq!(parse_level("debug").unwrap(), Level::Debug);
+        assert_eq!(parse_level("INFO").unwrap(), Level::Info);
+        assert_eq!(parse_level("WARN").unwrap(), Level::Warn);
+        assert_eq!(parse_level("error").unwrap(), Level::Error);
+        assert_eq!(parse_level("trace").unwrap(), Level::Trace);
+        assert_eq!(parse_level("warning").unwrap(), Level::Warn);
     }
 
     #[test]
@@ -734,168 +317,45 @@ mod tests {
         std::fs::write(&f, "[log").unwrap();
         assert!(read_site_log_config(&f).is_err());
     }
-}
 
-#[cfg(test)]
-mod pulse_tests {
-    use super::*;
-
-    /// The counter must not tick before anything is logged, and
-    /// `seconds_since_last` must say "never" rather than "zero seconds ago".
-    ///
-    /// Zero would read as perfectly healthy on a process that has never
-    /// emitted a line, which is exactly the state this exists to catch.
     #[test]
-    fn never_logged_is_not_logged_recently() {
-        let p = LogPulse::new();
-        assert_eq!(p.events(), 0);
-        assert_eq!(p.seconds_since_last(), None);
+    fn a_site_toml_level_is_read() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "[log]\nlevel = \"warn\"\n").unwrap();
+        assert_eq!(read_site_log_config(&f).unwrap(), "warn");
+        std::fs::write(&f, "[site]\nname = \"example\"\n").unwrap();
+        assert_eq!(read_site_log_config(&f).unwrap(), "info");
     }
 
     #[test]
-    fn recording_advances_the_count_and_starts_the_clock() {
-        let p = LogPulse::new();
-        p.record();
-        p.record();
-        assert_eq!(p.events(), 2);
-        assert_eq!(p.seconds_since_last(), Some(0));
-    }
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::disallowed_methods,
-    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
-)]
-mod reopen_tests {
-    use super::*;
-    use std::io::Write;
-
-    fn read(p: &Path) -> String {
-        std::fs::read_to_string(p).unwrap()
+    fn a_site_toml_format_key_is_refused_and_named() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "[log]\nlevel = \"warn\"\nformat = \"text\"\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("unknown key [log] format"), "{err}");
+        std::fs::write(&f, "[log]\nlevle = \"warn\"\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("unknown key [log] levle"), "{err}");
     }
 
     #[test]
-    fn a_reopen_after_a_rename_sends_new_lines_to_the_new_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("a.ndjson");
-        let f = std::sync::Arc::new(ReopenableFile::open(&path).unwrap());
-        let mut w = FileWriter(std::sync::Arc::clone(&f));
-        w.write_all(b"a\n").unwrap();
-        let moved = tmp.path().join("a.ndjson.1");
-        std::fs::rename(&path, &moved).unwrap();
-        f.reopen().unwrap();
-        w.write_all(b"b\n").unwrap();
-        assert_eq!(read(&moved), "a\n");
-        assert_eq!(read(&path), "b\n");
+    fn a_site_toml_log_table_that_is_not_a_table_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "log = 3\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("[log] must be a table"), "{err}");
     }
 
     #[test]
-    fn concurrent_reopens_lose_tear_and_duplicate_nothing() {
-        const LINES: usize = 20_000;
-        const REOPENS: usize = 20;
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("a.ndjson");
-        let f = std::sync::Arc::new(ReopenableFile::open(&path).unwrap());
-        let mut w = FileWriter(std::sync::Arc::clone(&f));
-        let writer = std::thread::spawn(move || {
-            for i in 0..LINES {
-                w.write_all(format!("{i:06}\n").as_bytes()).unwrap();
-            }
-        });
-        for k in 0..REOPENS {
-            std::fs::rename(&path, tmp.path().join(format!("a.ndjson.{k}"))).unwrap();
-            f.reopen().unwrap();
-            std::thread::sleep(std::time::Duration::from_micros(200));
-        }
-        writer.join().unwrap();
-        let mut seen = vec![0u8; LINES];
-        for entry in std::fs::read_dir(tmp.path()).unwrap() {
-            let text = read(&entry.unwrap().path());
-            let mut last: Option<usize> = None;
-            for line in text.split_inclusive('\n') {
-                assert_eq!(line.len(), 7, "torn line {line:?}");
-                let n: usize = line.trim_end().parse().expect("a number");
-                assert!(last.is_none_or(|l| n > l), "out of order within a file");
-                last = Some(n);
-                seen[n] += 1;
-            }
-        }
-        assert!(
-            seen.iter().all(|&c| c == 1),
-            "a line was lost or duplicated"
-        );
-    }
-
-    #[test]
-    fn a_failed_reopen_keeps_writing_to_the_old_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sub = tmp.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let path = sub.join("a.ndjson");
-        let f = std::sync::Arc::new(ReopenableFile::open(&path).unwrap());
-        let mut w = FileWriter(std::sync::Arc::clone(&f));
-        w.write_all(b"a\n").unwrap();
-        let moved = tmp.path().join("moved");
-        std::fs::rename(&path, &moved).unwrap();
-        std::fs::remove_dir(&sub).unwrap();
-        assert!(f.reopen().is_err());
-        w.write_all(b"b\n").unwrap();
-        assert_eq!(read(&moved), "a\nb\n");
-    }
-
-    #[test]
-    fn the_record_says_never_until_a_reopen_succeeds() {
-        let rec = ReopenRecord::new();
-        assert_eq!(rec.seconds_since_last_success(), None);
-        assert_eq!(rec.last_success_unix(), None);
-        assert_eq!(rec.successes(), 0);
-        assert_eq!(rec.seconds_since_last_failure(), None);
-        rec.record_success();
-        assert_eq!(rec.seconds_since_last_success(), Some(0));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(now.abs_diff(rec.last_success_unix().unwrap()) <= 5);
-        rec.record_failure();
-        assert_eq!(rec.failures(), 1);
-        assert_eq!(rec.seconds_since_last_failure(), Some(0));
-    }
-
-    #[test]
-    fn reopen_with_no_log_file_says_so() {
-        let rec = ReopenRecord::new();
-        assert!(matches!(reopen_in(None, &rec), Reopened::NoFile));
-        assert_eq!(rec.successes(), 0);
-        assert_eq!(rec.failures(), 0);
-    }
-
-    #[test]
-    fn newest_rotated_picks_the_highest_stamp_and_prefers_the_plain_twin() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        for n in [
-            "a.ndjson",
-            "a.ndjson.1",
-            "a.ndjson-2026102600.gz",
-            "a.ndjson-2026102601.gz",
-            "a.ndjson-2026102601",
-            "a.ndjson-short.gz",
-            "other.ndjson-2026102609.gz",
-        ] {
-            std::fs::write(tmp.path().join(n), b"").unwrap();
-        }
-        assert_eq!(
-            newest_rotated(&live),
-            Some(tmp.path().join("a.ndjson-2026102601"))
-        );
-        std::fs::remove_file(tmp.path().join("a.ndjson-2026102601")).unwrap();
-        assert_eq!(
-            newest_rotated(&live),
-            Some(tmp.path().join("a.ndjson-2026102601.gz"))
-        );
-        assert_eq!(newest_rotated(&tmp.path().join("none.log")), None);
+    fn a_non_string_level_is_an_error_naming_the_key() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("site.toml");
+        std::fs::write(&f, "[log]\nlevel = 3\n").unwrap();
+        let err = read_site_log_config(&f).unwrap_err().to_string();
+        assert!(err.contains("[log] level"), "{err}");
     }
 
     #[test]
@@ -909,6 +369,7 @@ mod reopen_tests {
             std::fs::File::create(&gz).unwrap(),
             flate2::Compression::default(),
         );
+        use std::io::Write;
         enc.write_all(text.as_bytes()).unwrap();
         enc.finish().unwrap();
         assert_eq!(read_tail(&plain, 1 << 20).unwrap(), text);
@@ -920,128 +381,33 @@ mod reopen_tests {
         std::fs::write(&gz, &bytes[..bytes.len() / 2]).unwrap();
         assert!(!read_tail(&gz, 1 << 20).unwrap().is_empty());
     }
+}
 
-    fn gz_bytes(text: &[u8]) -> Vec<u8> {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(text).unwrap();
-        enc.finish().unwrap()
-    }
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
 
-    fn long_ago() -> std::time::SystemTime {
-        std::time::UNIX_EPOCH
+    #[test]
+    fn the_record_says_never_until_a_reopen_succeeds() {
+        let rec = ReopenRecord::new();
+        assert_eq!(rec.seconds_since_last_success(), None);
+        assert_eq!(rec.last_success_unix(), None);
+        assert_eq!(rec.successes(), 0);
+        assert_eq!(rec.seconds_since_last_failure(), None);
+        rec.record_success();
+        assert_eq!(rec.seconds_since_last_success(), Some(0));
+        let now = unix_now();
+        assert!(now.abs_diff(rec.last_success_unix().unwrap()) <= 5);
+        rec.record_failure();
+        assert_eq!(rec.failures(), 1);
+        assert_eq!(rec.seconds_since_last_failure(), Some(0));
     }
 
     #[test]
-    fn read_recent_joins_the_rotated_tail_before_the_live_tail() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "live\n").unwrap();
-        assert_eq!(read_recent(&live, 1 << 20, long_ago()).unwrap(), "live\n");
-        // A rotated file cut mid-record still ends its own line.
-        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\nhal").unwrap();
-        assert_eq!(
-            read_recent(&live, 1 << 20, long_ago()).unwrap(),
-            "old\nhal\nlive\n"
-        );
-        assert_eq!(
-            read_recent(&live, 6, long_ago()).unwrap(),
-            "ld\nhal\nlive\n"
-        );
-    }
-
-    #[test]
-    fn a_full_live_tail_means_the_rotated_file_is_not_opened() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "0123456789\n").unwrap();
-        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\n").unwrap();
-        let (text, stats) = read_recent_counted(&live, 8, long_ago()).unwrap();
-        assert_eq!(text, "3456789\n");
-        assert_eq!(stats, RecentStats::default());
-    }
-
-    #[test]
-    fn an_old_rotated_file_is_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "live\n").unwrap();
-        std::fs::write(tmp.path().join("a.ndjson-2026102601"), "old\n").unwrap();
-        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        let (text, stats) = read_recent_counted(&live, 1 << 20, future).unwrap();
-        assert_eq!(text, "live\n");
-        assert_eq!(stats, RecentStats::default());
-    }
-
-    #[test]
-    fn a_small_recent_rotated_file_is_still_read() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "live\n").unwrap();
-        std::fs::write(
-            tmp.path().join("a.ndjson-2026102601.gz"),
-            gz_bytes(b"old\n"),
-        )
-        .unwrap();
-        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        let (text, stats) = read_recent_counted(&live, 1 << 20, since).unwrap();
-        assert_eq!(text, "old\nlive\n");
-        assert!(stats.rotated_opened);
-        assert_eq!(stats.rotated_bytes, 4);
-    }
-
-    #[test]
-    fn a_gzip_file_whose_isize_is_over_the_bound_is_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "live\n").unwrap();
-        // 200 MB of zeros compresses to about 200 KB.
-        let big = vec![0u8; 200 * 1024 * 1024];
-        let gz = gz_bytes(&big);
-        assert!(gz.len() < 1 << 20);
-        std::fs::write(tmp.path().join("a.ndjson-2026102601.gz"), gz).unwrap();
-        let (text, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
-        assert_eq!(text, "live\n");
-        assert_eq!(stats.rotated_bytes, 0, "nothing was decoded");
-    }
-
-    #[test]
-    fn a_gzip_stream_that_inflates_past_the_bound_stops_at_the_bound() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "live\n").unwrap();
-        // A trailer that understates the size, as a hostile or damaged file can.
-        let mut gz = gz_bytes(&vec![b'x'; 10 * 1024 * 1024]);
-        let n = gz.len();
-        gz[n - 4..].copy_from_slice(&100u32.to_le_bytes());
-        std::fs::write(tmp.path().join("a.ndjson-2026102601.gz"), gz).unwrap();
-        let (text, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
-        assert_eq!(text, "live\n", "an over-long stream is discarded");
-        assert!(stats.rotated_bytes <= (1 << 20) + 1);
-    }
-
-    #[test]
-    fn a_huge_plain_rotated_file_costs_at_most_the_bound() {
-        let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("a.ndjson");
-        std::fs::write(&live, "live\n").unwrap();
-        let f = std::fs::File::create(tmp.path().join("a.ndjson-2026102601")).unwrap();
-        f.set_len(200 * 1024 * 1024).unwrap();
-        let (_, stats) = read_recent_counted(&live, 1 << 20, long_ago()).unwrap();
-        assert_eq!(stats.rotated_bytes, 1 << 20);
-    }
-
-    #[test]
-    fn the_reopen_path_is_absolute() {
-        let tmp = tempfile::tempdir().unwrap();
-        let abs = tmp.path().join("a.ndjson");
-        let f = ReopenableFile::open(&abs).unwrap();
-        assert!(f.path.is_absolute());
-        // A relative path is made absolute against the working directory,
-        // which the test does not change, so use a name that exists nowhere.
-        let rel = Path::new("m6-reopen-test-relative.ndjson");
-        let g = ReopenableFile::open(rel).unwrap();
-        assert!(g.path.is_absolute());
-        drop(g);
-        let _ = std::fs::remove_file(std::env::current_dir().unwrap().join(rel));
+    fn a_reopen_with_no_log_file_is_ok_and_records_nothing() {
+        // No `init` on this thread, which is the one case `reopen` answers
+        // without touching the filesystem.
+        assert!(!writes_log_file());
+        assert!(reopen().is_ok());
     }
 }

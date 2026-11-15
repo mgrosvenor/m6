@@ -1,0 +1,465 @@
+//! One JSON line, built straight into a Sink's buffer.
+//!
+//! [`Line::begin`] opens the line with its timestamp, level and message. Each
+//! field call appends one `"key":value` pair. [`Line::end`] closes the object
+//! and commits the line to the Sink. Every method appends into the Sink's
+//! buffer, so a line costs no allocation.
+
+use std::cell::RefCell;
+use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::sink::Sink;
+
+/// The most bytes a string field writes inside its quotes, the `...` marker
+/// included. A longer value is cut on a character boundary and ends in `...`,
+/// all inside the same 1024 bytes.
+pub const MAX_FIELD: usize = 1024;
+
+/// The severity of a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Level {
+    /// A failure that stops something the operator asked for.
+    Error,
+    /// Something unusual the operator should read.
+    Warn,
+    /// The ordinary record of what the process did.
+    Info,
+    /// Detail a developer turns on.
+    Debug,
+    /// Everything, including the framework's trace.
+    Trace,
+}
+
+impl Level {
+    /// The word written to the line's `level` key.
+    pub fn text(self) -> &'static str {
+        match self {
+            Level::Error => "ERROR",
+            Level::Warn => "WARN",
+            Level::Info => "INFO",
+            Level::Debug => "DEBUG",
+            Level::Trace => "TRACE",
+        }
+    }
+
+    pub(crate) fn enabled(self, configured: Level) -> bool {
+        (self as u8) <= (configured as u8)
+    }
+}
+
+// ── The timestamp cache ─────────────────────────────────────────────────────
+
+/// The date-and-seconds text of one second, and the second it holds.
+struct Clock {
+    second: u64,
+    text: [u8; 20],
+}
+
+impl Clock {
+    const fn new() -> Clock {
+        Clock {
+            second: u64::MAX,
+            text: [0; 20],
+        }
+    }
+
+    /// The microseconds of `now`, refreshing the cached text when the second
+    /// changed.
+    fn refresh(&mut self, now: SystemTime) -> u32 {
+        let since = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        let second = since.as_secs();
+        if second != self.second {
+            self.second = second;
+            format_date(second, &mut self.text);
+        }
+        since.subsec_micros()
+    }
+}
+
+thread_local! {
+    static CLOCK: RefCell<Clock> = const { RefCell::new(Clock::new()) };
+}
+
+/// Append `"YYYY-MM-DDTHH:MM:SS.ffffffZ"`'s contents for `now`.
+fn push_timestamp(sink: &mut Sink, now: SystemTime) -> bool {
+    let (text, micros) = CLOCK.with(|clock| {
+        let mut clock = clock.borrow_mut();
+        let micros = clock.refresh(now);
+        (clock.text, micros)
+    });
+    if !sink.push(&text[..19]) {
+        return false;
+    }
+    let fraction = [
+        b'.',
+        b'0' + (micros / 100_000) as u8,
+        b'0' + (micros / 10_000 % 10) as u8,
+        b'0' + (micros / 1_000 % 10) as u8,
+        b'0' + (micros / 100 % 10) as u8,
+        b'0' + (micros / 10 % 10) as u8,
+        b'0' + (micros % 10) as u8,
+        b'Z',
+    ];
+    sink.push(&fraction)
+}
+
+/// Fill `out` with `YYYY-MM-DDTHH:MM:SS` for a Unix second, UTC.
+fn format_date(secs: u64, out: &mut [u8; 20]) {
+    let days = (secs / 86_400) as i64;
+    let rest = (secs % 86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    let year = year.clamp(0, 9999) as u32;
+    write2(out, 0, year / 100);
+    write2(out, 2, year % 100);
+    out[4] = b'-';
+    write2(out, 5, month);
+    out[7] = b'-';
+    write2(out, 8, day);
+    out[10] = b'T';
+    write2(out, 11, rest / 3_600);
+    out[13] = b':';
+    write2(out, 14, rest % 3_600 / 60);
+    out[16] = b':';
+    write2(out, 17, rest % 60);
+    out[19] = 0;
+}
+
+fn write2(out: &mut [u8; 20], at: usize, value: u32) {
+    out[at] = b'0' + (value / 10) as u8;
+    out[at + 1] = b'0' + (value % 10) as u8;
+}
+
+/// The day `z` days after 1970-01-01, as (year, month, day).
+///
+/// Howard Hinnant's `civil_from_days`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+// ── The line ────────────────────────────────────────────────────────────────
+
+/// Builds one JSON line straight into a [`Sink`]'s buffer.
+pub struct Line<'a> {
+    sink: &'a mut Sink,
+    first: bool,
+    target: Option<&'a str>,
+    failed: bool,
+}
+
+impl<'a> Line<'a> {
+    /// Open a line with its timestamp, level and message.
+    pub fn begin(sink: &'a mut Sink, level: Level, message: &str) -> Line<'a> {
+        Line::open(sink, level, m6_platform::wall()).message_str(message)
+    }
+
+    /// Open a line with its timestamp and level, for a caller that writes the
+    /// message last. The macros use this, because their syntax puts fields
+    /// before the message. JSON does not care about key order.
+    #[doc(hidden)]
+    pub fn empty(sink: &'a mut Sink, level: Level) -> Line<'a> {
+        Line::open(sink, level, m6_platform::wall())
+    }
+
+    fn open(sink: &'a mut Sink, level: Level, now: SystemTime) -> Line<'a> {
+        let mut line = Line {
+            sink,
+            first: true,
+            target: None,
+            failed: false,
+        };
+        line = line.raw(b"{\"timestamp\":\"");
+        if !line.failed && !push_timestamp(line.sink, now) {
+            line.failed = true;
+        }
+        line.raw(b"\",\"level\":\"")
+            .raw(level.text().as_bytes())
+            .raw(b"\",\"fields\":{")
+    }
+
+    /// Write the line's `target`, as the operational log carries. It is written
+    /// after the fields, which JSON readers cannot tell apart from before.
+    pub fn target(mut self, target: &'a str) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Add a string field.
+    pub fn str(self, key: &str, value: &str) -> Self {
+        self.field_head(key).quoted(value)
+    }
+
+    /// Add a string field only when it has a value. An absent value is left out.
+    pub fn opt_str(self, key: &str, value: Option<&str>) -> Self {
+        match value {
+            Some(value) => self.str(key, value),
+            None => self,
+        }
+    }
+
+    /// Add an unsigned integer field.
+    pub fn u64(self, key: &str, value: u64) -> Self {
+        self.number(key, value)
+    }
+
+    /// Add a signed integer field.
+    pub fn i64(self, key: &str, value: i64) -> Self {
+        self.number(key, value)
+    }
+
+    /// Add a boolean field.
+    pub fn bool(self, key: &str, value: bool) -> Self {
+        let word = if value { &b"true"[..] } else { &b"false"[..] };
+        self.field_head(key).raw(word)
+    }
+
+    /// Add a field through `Display`, formatted into the buffer with no
+    /// `String`.
+    pub fn display(self, key: &str, value: &dyn fmt::Display) -> Self {
+        self.field_head(key)
+            .formatted_body(format_args!("{}", value))
+    }
+
+    /// Add a field through `Debug`, formatted into the buffer with no `String`.
+    pub fn debug(self, key: &str, value: &dyn fmt::Debug) -> Self {
+        self.field_head(key)
+            .formatted_body(format_args!("{:?}", value))
+    }
+
+    /// Add a field whose JSON type its Rust type decides. The macros'
+    /// `key = value` form uses this.
+    pub fn field<V: Field>(self, key: &str, value: V) -> Self {
+        value.record(self, key)
+    }
+
+    /// Add the message when it is not known at [`Line::begin`], as the macros
+    /// write it after their fields.
+    pub fn message(self, args: fmt::Arguments<'_>) -> Self {
+        self.field_head("message").formatted_body(args)
+    }
+
+    /// Close the line, commit it to the Sink's buffer, and let the Sink drop it
+    /// if it still does not fit.
+    pub fn end(mut self) {
+        if !self.failed {
+            self = self.raw(b"}");
+            if let Some(target) = self.target {
+                self = self.raw(b",\"target\":\"");
+                if !self.failed && !self.sink.push_escaped(target) {
+                    self.failed = true;
+                }
+                self = self.raw(b"\"");
+            }
+            self = self.raw(b"}\n");
+        }
+        if self.failed {
+            self.sink.rollback_line();
+        } else {
+            self.sink.commit_line();
+        }
+    }
+
+    fn message_str(self, message: &str) -> Self {
+        self.field_head("message").quoted(message)
+    }
+
+    fn field_head(mut self, key: &str) -> Self {
+        if self.failed {
+            return self;
+        }
+        if !self.first {
+            self = self.raw(b",");
+        }
+        self.first = false;
+        self = self.raw(b"\"");
+        if !self.failed && !self.sink.push_escaped(key) {
+            self.failed = true;
+        }
+        self.raw(b"\":")
+    }
+
+    fn quoted(mut self, value: &str) -> Self {
+        if self.failed {
+            return self;
+        }
+        if !self.sink.push(b"\"") {
+            self.failed = true;
+            return self;
+        }
+        let mut left = MAX_FIELD - 3;
+        let cut = match self.sink.push_escaped_limited(value, &mut left) {
+            Ok(true) => false,
+            Ok(false) => true,
+            Err(()) => {
+                self.failed = true;
+                return self;
+            }
+        };
+        if cut && !self.sink.push(b"...") {
+            self.failed = true;
+            return self;
+        }
+        if !self.sink.push(b"\"") {
+            self.failed = true;
+        }
+        self
+    }
+
+    /// Write a string body in quotes, escaped by the adapter and cut at
+    /// [`MAX_FIELD`] bytes, the marker included.
+    fn formatted_body(mut self, args: fmt::Arguments<'_>) -> Self {
+        if self.failed {
+            return self;
+        }
+        if !self.sink.push(b"\"") {
+            self.failed = true;
+            return self;
+        }
+        let (cut, failed) = {
+            let mut adapter = EscapeAdapter {
+                sink: self.sink,
+                left: MAX_FIELD - 3,
+                cut: false,
+                failed: false,
+            };
+            let result = fmt::write(&mut adapter, args);
+            (adapter.cut, adapter.failed || result.is_err())
+        };
+        if failed {
+            self.failed = true;
+            return self;
+        }
+        if cut && !self.sink.push(b"...") {
+            self.failed = true;
+            return self;
+        }
+        if !self.sink.push(b"\"") {
+            self.failed = true;
+        }
+        self
+    }
+
+    fn number<T: itoa::Integer>(mut self, key: &str, value: T) -> Self {
+        self = self.field_head(key);
+        let mut buffer = itoa::Buffer::new();
+        self.raw(buffer.format(value).as_bytes())
+    }
+
+    fn raw(mut self, bytes: &[u8]) -> Self {
+        if !self.failed && !self.sink.push(bytes) {
+            self.failed = true;
+        }
+        self
+    }
+}
+
+/// A `fmt::Write` that escapes into the line's buffer and cuts on a character
+/// boundary at the escaped field limit.
+struct EscapeAdapter<'a> {
+    sink: &'a mut Sink,
+    left: usize,
+    cut: bool,
+    failed: bool,
+}
+
+impl fmt::Write for EscapeAdapter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.failed {
+            return Err(fmt::Error);
+        }
+        if self.cut {
+            return Ok(());
+        }
+        match self.sink.push_escaped_limited(s, &mut self.left) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.cut = true;
+                self.left = 0;
+                Ok(())
+            }
+            Err(()) => {
+                self.failed = true;
+                Err(fmt::Error)
+            }
+        }
+    }
+}
+
+// ── Typed fields for the macros ─────────────────────────────────────────────
+
+/// The JSON type of a `key = value` field. Hidden: it is the macros' dispatch,
+/// not an interface to write against.
+#[doc(hidden)]
+pub trait Field {
+    /// Append the field to `line`.
+    fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a>;
+}
+
+impl Field for &str {
+    fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a> {
+        line.str(key, self)
+    }
+}
+
+impl Field for String {
+    fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a> {
+        line.str(key, &self)
+    }
+}
+
+impl Field for &String {
+    fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a> {
+        line.str(key, self)
+    }
+}
+
+impl Field for bool {
+    fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a> {
+        line.bool(key, self)
+    }
+}
+
+macro_rules! field_integer {
+    ($($t:ty),*) => {
+        $(impl Field for $t {
+            fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a> {
+                line.number(key, self)
+            }
+        })*
+    };
+}
+
+field_integer!(u8, u16, u32, u64, usize, u128, i8, i16, i32, i64, isize, i128);
+
+impl<T: Field> Field for Option<T> {
+    fn record<'a>(self, line: Line<'a>, key: &str) -> Line<'a> {
+        match self {
+            Some(value) => value.record(line, key),
+            None => line,
+        }
+    }
+}
+
+/// Write the line that reports how many lines a full destination lost.
+pub(crate) fn write_dropped_line(sink: &mut Sink, dropped: u64) {
+    Line::begin(sink, Level::Warn, "log lines dropped")
+        .u64("dropped", dropped)
+        .target("m6_log")
+        .end();
+}
+
+/// [`Line::begin`] with the line's time injected, for tests.
+#[doc(hidden)]
+pub fn line_at<'a>(now: SystemTime, sink: &'a mut Sink, level: Level, message: &str) -> Line<'a> {
+    Line::open(sink, level, now).message_str(message)
+}

@@ -9,6 +9,10 @@
 
 [graph]
 all-features = false
+# The three supported targets, so the licences and advisories of the crates
+# only one of them links (sysinfo and libc on macOS, rustix on Linux) are
+# checked by this one Linux run.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [advisories]
 # A known vulnerability in anything we ship fails the build. There is no
@@ -112,11 +116,6 @@ allow = [
     # BSD Zero Clause, the most permissive of the family: no attribution
     # requirement at all. `quoted_printable`, via lettre, uses it.
     "0BSD",
-    "OpenSSL",
-    # The Mozilla root certificate store, shipped as data by webpki-roots. The
-    # Community Data License Agreement is permissive; it governs the data set
-    # rather than code, which is why it is not one of the usual names.
-    "CDLA-Permissive-2.0",
 ]
 
 [bans]

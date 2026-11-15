@@ -1,7 +1,7 @@
-//! Where an App finds `site.toml`.
+//! Where a service finds `site.toml`.
 //!
 //! `docs/m6-site-layout.md` gives each app its own root under `apps/`, with
-//! `site.toml` at the top of the tree. An App used to look only at
+//! `site.toml` at the top of the tree. A service used to look only at
 //! `<site_dir>/site.toml`, so in that layout it read none and the
 //! `[[backend]] compresses` agreement passed without checking. The reserved
 //! config key `site_toml` names the file.
@@ -18,8 +18,9 @@ const ROUTE: &str =
 
 /// A site tree: `site.toml` at the top, the app root at `apps/file`.
 ///
-/// The app root also holds an empty `site.toml`, because every App needs a
-/// readable `<site_dir>/site.toml` even when no key names the one at the top.
+/// The app root also holds an empty `site.toml`, because every service needs
+/// a readable `<site_dir>/site.toml` even when no key names the one at the
+/// top.
 fn tree(site_toml_body: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("apps/file/assets")).unwrap();
@@ -30,7 +31,7 @@ fn tree(site_toml_body: &str) -> tempfile::TempDir {
 
 fn config(app_root: &Path, extra: &str) -> std::path::PathBuf {
     let path = app_root.join("m6-file.conf");
-    std::fs::write(&path, format!("{extra}\n[thread_pool]\nsize = 2\n")).unwrap();
+    std::fs::write(&path, format!("{extra}\n")).unwrap();
     path
 }
 

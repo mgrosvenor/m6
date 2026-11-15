@@ -130,6 +130,25 @@ pub fn internal_error_html(
     }
 }
 
+/// The page title nginx gives an edge refusal of a request head.
+///
+/// A field, or the head, over a limit is a 400 whose page is titled "Request
+/// Header Or Cookie Too Large". A request line over its limit is a 414 titled
+/// "Request-URI Too Large". Both strings are nginx's own, so an operator sees
+/// the page they know from the servers this limit follows.
+pub fn refusal_title(status: u16) -> &'static str {
+    match status {
+        400 => "Request Header Or Cookie Too Large",
+        414 => "Request-URI Too Large",
+        _ => m6_core::h1::status_reason(status),
+    }
+}
+
+/// The service's usual error page, titled as an edge refusal.
+pub fn refusal_body(status: u16) -> Vec<u8> {
+    internal_error_html(status, refusal_title(status), false, "", None)
+}
+
 /// Whether a request to the configured custom error path must be refused.
 ///
 /// The error page is fetched with the status and original path appended to its

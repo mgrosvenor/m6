@@ -1,7 +1,7 @@
 /// Route table and request matching.
 use std::path::Path;
 
-use m6_core::app::{check_route_conflicts, Methods, RouteDecl};
+use m6_core::site::{check_route_conflicts, Methods, RouteDecl};
 use matchit::Router as MatchitRouter;
 
 use crate::config::Config;
@@ -146,7 +146,7 @@ impl RouteTable {
             let paths = match glob::glob(&glob_pattern) {
                 Ok(paths) => paths,
                 Err(e) => {
-                    tracing::warn!(pattern = %glob_pattern, error = %e, "route_group glob error");
+                    m6_core::log::warn!(pattern = %glob_pattern, error = %e, "route_group glob error");
                     continue;
                 }
             };
@@ -155,7 +155,7 @@ impl RouteTable {
                 let file_path = match path_result {
                     Ok(p) => p,
                     Err(e) => {
-                        tracing::warn!(error = %e, "route_group glob entry error");
+                        m6_core::log::warn!(error = %e, "route_group glob entry error");
                         continue;
                     }
                 };
@@ -175,7 +175,7 @@ impl RouteTable {
                 }
 
                 if let Err(e) = router.insert(url_path.clone(), entry.clone()) {
-                    tracing::warn!(path = %url_path, error = %e, "route_group insert error");
+                    m6_core::log::warn!(path = %url_path, error = %e, "route_group insert error");
                     continue;
                 }
                 entries.push(entry);
@@ -278,6 +278,7 @@ mod tests {
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
         Config {
+            genid: None,
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: "test.example.com".to_string(),

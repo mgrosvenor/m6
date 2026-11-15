@@ -3,6 +3,7 @@ pub mod jwt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -67,6 +68,23 @@ pub enum AuthError {
 
 pub type Result<T> = std::result::Result<T, AuthError>;
 
+impl AuthError {
+    /// Whether SQLite refused the statement because a lock is held, which the
+    /// caller can retry once the lock is gone.
+    ///
+    /// SQLite reports a lock as `SQLITE_BUSY` while it is waiting and as
+    /// `SQLITE_LOCKED` when the statement conflicts with one on the same
+    /// connection. Every other failure is not retryable.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            AuthError::Db(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    || e.code == rusqlite::ErrorCode::DatabaseLocked
+        )
+    }
+}
+
 // ── Schema ───────────────────────────────────────────────────────────────────
 
 const SCHEMA: &str = "
@@ -105,6 +123,14 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 ";
 
+/// The cost production hashes at.
+///
+/// A test fixture that needs a user hashes it at bcrypt's lowest cost, 4, through
+/// `user_create_with_cost` or `user_set_password_with_cost`, which only exist
+/// under `cfg(test)` or the `testkit` feature. The production functions pass
+/// this number, and `production_hashes_at_cost_twelve` hashes through
+/// `user_create` and reads the cost out of the stored hash, so a call site
+/// cannot lower the round count a deployed site uses.
 const BCRYPT_COST: u32 = 12;
 
 /// A fixed cost-12 bcrypt hash, verified on the missing-user path so a login
@@ -148,6 +174,18 @@ impl Db {
             .open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
+    }
+
+    /// Stop waiting for another connection's lock, so a statement that meets one
+    /// fails with `SQLITE_BUSY` at once.
+    ///
+    /// A service in an event loop calls this after its start-time open and
+    /// defers a request that gets the error, because a wait here would hold the
+    /// loop and every request behind it. A one-shot tool keeps `Db::open`'s
+    /// five-second wait.
+    pub fn no_busy_wait(&self) -> Result<()> {
+        self.0.busy_timeout(Duration::ZERO)?;
+        Ok(())
     }
 
     /// Close the database, handing the `Connection` back on failure so the
@@ -195,6 +233,37 @@ impl Db {
     // ── User ops ─────────────────────────────────────────────────────────────
 
     pub fn user_create(&self, username: &str, password: &str, roles: &[&str]) -> Result<User> {
+        self.user_create_at_cost(username, password, roles, BCRYPT_COST)
+    }
+
+    /// As [`Db::user_create`], hashing at `cost`.
+    ///
+    /// The cost is a parameter so a test fixture can create users at bcrypt's
+    /// lowest cost, 4, which an unoptimised build hashes in a fraction of the
+    /// time. The production path passes `BCRYPT_COST`, and no site setting
+    /// chooses the round count.
+    ///
+    /// Compiled only for this crate's tests or with the `testkit` feature,
+    /// which the fixture crates enable from their dev-dependencies. A
+    /// production build cannot call this with a cost below [`BCRYPT_COST`].
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn user_create_with_cost(
+        &self,
+        username: &str,
+        password: &str,
+        roles: &[&str],
+        cost: u32,
+    ) -> Result<User> {
+        self.user_create_at_cost(username, password, roles, cost)
+    }
+
+    fn user_create_at_cost(
+        &self,
+        username: &str,
+        password: &str,
+        roles: &[&str],
+        cost: u32,
+    ) -> Result<User> {
         // Check for duplicate username first to give a good error
         let exists: bool = self.0.query_row(
             "SELECT COUNT(*) FROM users WHERE username = ?1",
@@ -206,7 +275,7 @@ impl Db {
         }
 
         let id = Uuid::new_v4().to_string();
-        let hash = bcrypt::hash(password, BCRYPT_COST)?;
+        let hash = bcrypt::hash(password, cost)?;
         let roles_json = serde_json::to_string(&roles).expect("serialising roles cannot fail");
         let created_at = crate::jwt::now_secs();
 
@@ -303,7 +372,26 @@ impl Db {
     }
 
     pub fn user_set_password(&self, username: &str, password: &str) -> Result<()> {
-        let hash = bcrypt::hash(password, BCRYPT_COST)?;
+        self.user_set_password_at_cost(username, password, BCRYPT_COST)
+    }
+
+    /// As [`Db::user_set_password`], hashing at `cost`.
+    ///
+    /// The production path passes `BCRYPT_COST`. A test fixture passes 4, and
+    /// this is compiled only for this crate's tests or with the `testkit`
+    /// feature the fixture crates enable from their dev-dependencies.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn user_set_password_with_cost(
+        &self,
+        username: &str,
+        password: &str,
+        cost: u32,
+    ) -> Result<()> {
+        self.user_set_password_at_cost(username, password, cost)
+    }
+
+    fn user_set_password_at_cost(&self, username: &str, password: &str, cost: u32) -> Result<()> {
+        let hash = bcrypt::hash(password, cost)?;
         let n = self.0.execute(
             "UPDATE users SET password = ?1 WHERE username = ?2",
             params![hash, username],
@@ -344,8 +432,12 @@ impl Db {
 
         match result {
             Ok((id, uname, hash, roles_json, created_at)) => {
+                // Read the whole user, groups included, before the expensive
+                // verify. The verify is then the last step, so a database read
+                // that fails busy leaves no password verified behind it.
+                let user = self.row_to_user(id, uname, roles_json, created_at)?;
                 if verify_bcrypt(password, &hash)? {
-                    Ok(Some(self.row_to_user(id, uname, roles_json, created_at)?))
+                    Ok(Some(user))
                 } else {
                     Ok(None)
                 }
@@ -668,6 +760,64 @@ mod tests {
         (db, f)
     }
 
+    /// The cost a unit test hashes at: bcrypt's lowest, 4.
+    ///
+    /// Production passes `BCRYPT_COST`, and the test below reads that number.
+    const TEST_BCRYPT_COST: u32 = 4;
+
+    /// Create a user at [`TEST_BCRYPT_COST`]. The production `user_create` is
+    /// the same code with `BCRYPT_COST` passed in.
+    trait TestUser {
+        fn user_create_test(&self, username: &str, password: &str, roles: &[&str]) -> Result<User>;
+        fn user_set_password_test(&self, username: &str, password: &str) -> Result<()>;
+    }
+
+    impl TestUser for Db {
+        fn user_create_test(&self, username: &str, password: &str, roles: &[&str]) -> Result<User> {
+            self.user_create_with_cost(username, password, roles, TEST_BCRYPT_COST)
+        }
+
+        fn user_set_password_test(&self, username: &str, password: &str) -> Result<()> {
+            self.user_set_password_with_cost(username, password, TEST_BCRYPT_COST)
+        }
+    }
+
+    // ── The hash cost ────────────────────────────────────────────────────────
+
+    /// Production hashes at cost 12 even though these tests hash at 4.
+    ///
+    /// Reading `BCRYPT_COST` alone would not catch a call site that passed
+    /// some other number to `user_create`. This hashes through `user_create`
+    /// and reads the cost back out of the stored bcrypt hash, so lowering the
+    /// round count anywhere on the production path fails it.
+    #[test]
+    fn production_hashes_at_cost_twelve() {
+        let (db, _f) = tmp_db();
+        db.user_create("cost-check", "hunter2", &["user"])
+            .expect("create a user at production's cost");
+        let hash: String =
+            db.0.query_row(
+                "SELECT password FROM users WHERE username = ?1",
+                ["cost-check"],
+                |row| row.get(0),
+            )
+            .expect("the stored hash");
+        // bcrypt's modular crypt format: $2b$<cost>$<salt><hash>.
+        let cost: u32 = hash
+            .split('$')
+            .nth(2)
+            .and_then(|field| field.parse().ok())
+            .unwrap_or_else(|| panic!("not a bcrypt hash: {hash}"));
+        assert_eq!(
+            cost, 12,
+            "user_create hashed at cost {cost}, so every stored password is weaker than production requires"
+        );
+        assert!(
+            TEST_BCRYPT_COST < cost,
+            "the test cost {TEST_BCRYPT_COST} is not cheaper than production's {cost}"
+        );
+    }
+
     // ── WAL mode ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -685,7 +835,7 @@ mod tests {
     fn test_user_create_and_get() {
         let (db, _f) = tmp_db();
         let u = db
-            .user_create("alice", "hunter2", &["admin", "user"])
+            .user_create_test("alice", "hunter2", &["admin", "user"])
             .expect("create");
         assert_eq!(u.username, "alice");
         assert!(u.roles.contains(&"admin".to_string()));
@@ -699,9 +849,10 @@ mod tests {
     #[test]
     fn test_user_create_duplicate() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "pass1", &[]).expect("first create");
+        db.user_create_test("alice", "pass1", &[])
+            .expect("first create");
         let err = db
-            .user_create("alice", "pass2", &[])
+            .user_create_test("alice", "pass2", &[])
             .expect_err("should fail");
         assert!(matches!(err, AuthError::UserExists(_)));
     }
@@ -716,7 +867,9 @@ mod tests {
     #[test]
     fn test_user_get_by_id() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("bob", "pass", &["user"]).expect("create");
+        let u = db
+            .user_create_test("bob", "pass", &["user"])
+            .expect("create");
         let got = db.user_get_by_id(&u.id).expect("get").expect("some");
         assert_eq!(got.username, "bob");
     }
@@ -724,8 +877,8 @@ mod tests {
     #[test]
     fn test_user_list() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p1", &[]).expect("c1");
-        db.user_create("bob", "p2", &[]).expect("c2");
+        db.user_create_test("alice", "p1", &[]).expect("c1");
+        db.user_create_test("bob", "p2", &[]).expect("c2");
         let list = db.user_list().expect("list");
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|u| u.username == "alice"));
@@ -735,7 +888,8 @@ mod tests {
     #[test]
     fn test_corrupted_roles_is_an_error() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "pass", &["admin"]).expect("create");
+        db.user_create_test("alice", "pass", &["admin"])
+            .expect("create");
         db.0.execute(
             "UPDATE users SET roles = 'not-json' WHERE username = 'alice'",
             [],
@@ -750,7 +904,7 @@ mod tests {
     #[test]
     fn test_user_delete_cascades() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("create");
+        let u = db.user_create_test("alice", "pass", &[]).expect("create");
         let _g = db.group_create("admins").expect("group");
         db.group_member_add("admins", "alice").expect("add member");
         db.refresh_token_store(&u.id, "tok_hash_1", i64::MAX)
@@ -783,8 +937,10 @@ mod tests {
     #[test]
     fn test_user_set_password() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "old_pass", &[]).expect("create");
-        db.user_set_password("alice", "new_pass").expect("set pw");
+        db.user_create_test("alice", "old_pass", &[])
+            .expect("create");
+        db.user_set_password_test("alice", "new_pass")
+            .expect("set pw");
 
         assert!(db
             .user_verify_password("alice", "old_pass")
@@ -799,7 +955,8 @@ mod tests {
     #[test]
     fn test_user_set_roles() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "pass", &["user"]).expect("create");
+        db.user_create_test("alice", "pass", &["user"])
+            .expect("create");
         db.user_set_roles("alice", &["admin", "mod"])
             .expect("set roles");
         let u = db.user_get("alice").expect("get").expect("some");
@@ -813,7 +970,7 @@ mod tests {
     #[test]
     fn test_verify_correct_password() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "correct", &["user"])
+        db.user_create_test("alice", "correct", &["user"])
             .expect("create");
         let u = db
             .user_verify_password("alice", "correct")
@@ -825,7 +982,8 @@ mod tests {
     #[test]
     fn test_verify_wrong_password_returns_none() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "correct", &[]).expect("create");
+        db.user_create_test("alice", "correct", &[])
+            .expect("create");
         let r = db.user_verify_password("alice", "wrong").expect("verify");
         assert!(r.is_none());
     }
@@ -840,7 +998,8 @@ mod tests {
     #[test]
     fn test_verify_runs_one_bcrypt_verify_on_both_paths() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "correct", &[]).expect("create");
+        db.user_create_test("alice", "correct", &[])
+            .expect("create");
 
         BCRYPT_VERIFIES.with(|count| count.set(0));
         let wrong = db.user_verify_password("alice", "wrong").expect("verify");
@@ -911,7 +1070,7 @@ mod tests {
     #[test]
     fn test_group_member_add_remove() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         db.group_create("team").expect("group");
         db.group_member_add("team", "alice").expect("add");
 
@@ -930,7 +1089,7 @@ mod tests {
     #[test]
     fn test_group_member_add_idempotent() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         db.group_create("team").expect("group");
         db.group_member_add("team", "alice").expect("first add");
         db.group_member_add("team", "alice")
@@ -942,7 +1101,7 @@ mod tests {
     #[test]
     fn test_group_member_add_unknown_group() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         let err = db
             .group_member_add("nonexistent", "alice")
             .expect_err("should fail");
@@ -962,7 +1121,7 @@ mod tests {
     #[test]
     fn test_user_groups_populated_on_get() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         db.group_create("alpha").expect("g1");
         db.group_create("beta").expect("g2");
         db.group_member_add("alpha", "alice").expect("add1");
@@ -977,7 +1136,7 @@ mod tests {
     #[test]
     fn test_refresh_token_store_and_verify() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         db.refresh_token_store(&u.id, "hash1", i64::MAX)
             .expect("store");
         let uid = db
@@ -990,7 +1149,7 @@ mod tests {
     #[test]
     fn test_refresh_token_expired() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         // expires_at = 1 (far in the past)
         db.refresh_token_store(&u.id, "hash_exp", 1).expect("store");
         let r = db.refresh_token_verify("hash_exp").expect("verify");
@@ -1000,7 +1159,7 @@ mod tests {
     #[test]
     fn test_refresh_token_revoke() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         db.refresh_token_store(&u.id, "tok", i64::MAX)
             .expect("store");
         db.refresh_token_revoke("tok").expect("revoke");
@@ -1011,7 +1170,7 @@ mod tests {
     #[test]
     fn test_refresh_tokens_revoke_all() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         db.refresh_token_store(&u.id, "tok1", i64::MAX).expect("s1");
         db.refresh_token_store(&u.id, "tok2", i64::MAX).expect("s2");
         db.refresh_tokens_revoke_all(&u.id).expect("revoke all");
@@ -1030,10 +1189,11 @@ mod tests {
         let db2 = Db::open(&path).expect("db2");
 
         // Interleave writes
-        db1.user_create("alice", "pass_a", &["admin"])
+        db1.user_create_test("alice", "pass_a", &["admin"])
             .expect("alice");
-        db2.user_create("bob", "pass_b", &["user"]).expect("bob");
-        db1.user_create("carol", "pass_c", &[]).expect("carol");
+        db2.user_create_test("bob", "pass_b", &["user"])
+            .expect("bob");
+        db1.user_create_test("carol", "pass_c", &[]).expect("carol");
 
         // Both connections see all rows
         let list1 = db1.user_list().expect("list1");
@@ -1047,7 +1207,7 @@ mod tests {
     #[test]
     fn test_api_token_create_and_list() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         let tok = db
             .api_token_create(&u.id, "alice", "ci-deploy", "hash1", i64::MAX)
             .expect("create");
@@ -1064,7 +1224,7 @@ mod tests {
     #[test]
     fn test_api_token_list_multiple() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("bob", "pass", &[]).expect("user");
+        let u = db.user_create_test("bob", "pass", &[]).expect("user");
         db.api_token_create(&u.id, "bob", "token-a", "hash_a", i64::MAX)
             .expect("a");
         db.api_token_create(&u.id, "bob", "token-b", "hash_b", i64::MAX)
@@ -1078,7 +1238,7 @@ mod tests {
     #[test]
     fn test_api_token_list_empty() {
         let (db, _f) = tmp_db();
-        db.user_create("carol", "pass", &[]).expect("user");
+        db.user_create_test("carol", "pass", &[]).expect("user");
         let list = db.api_token_list("carol").expect("list");
         assert!(list.is_empty());
     }
@@ -1093,7 +1253,7 @@ mod tests {
     #[test]
     fn test_api_token_revoke() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         let tok = db
             .api_token_create(&u.id, "alice", "my-token", "hashX", i64::MAX)
             .expect("create");
@@ -1114,7 +1274,7 @@ mod tests {
     #[test]
     fn test_api_token_cascade_on_user_delete() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         db.api_token_create(&u.id, "alice", "tok", "hashY", i64::MAX)
             .expect("create");
         db.user_delete("alice").expect("delete");
@@ -1126,7 +1286,7 @@ mod tests {
     #[test]
     fn test_api_token_hash_unique() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         db.api_token_create(&u.id, "alice", "tok-1", "same_hash", i64::MAX)
             .expect("first");
         // Same hash must fail (UNIQUE constraint on token_hash)
@@ -1134,5 +1294,33 @@ mod tests {
             .api_token_create(&u.id, "alice", "tok-2", "same_hash", i64::MAX)
             .expect_err("duplicate hash");
         assert!(matches!(err, AuthError::Db(_)));
+    }
+
+    /// Only SQLite's two lock codes are retryable. A caller that treats every
+    /// `SqliteFailure` as busy would retry a constraint failure forever.
+    #[test]
+    fn is_busy_is_true_only_for_busy_and_locked() {
+        let failed = |code| {
+            AuthError::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(
+            failed(rusqlite::ffi::SQLITE_BUSY).is_busy(),
+            "SQLITE_BUSY is a lock"
+        );
+        assert!(
+            failed(rusqlite::ffi::SQLITE_LOCKED).is_busy(),
+            "SQLITE_LOCKED is a lock"
+        );
+        assert!(
+            !failed(rusqlite::ffi::SQLITE_CONSTRAINT).is_busy(),
+            "a constraint failure is not a lock"
+        );
+        assert!(
+            !AuthError::UserNotFound("alice".to_string()).is_busy(),
+            "an answered row is not a lock"
+        );
     }
 }

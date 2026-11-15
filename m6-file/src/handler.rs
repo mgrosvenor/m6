@@ -1,8 +1,8 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use m6_core::log::{debug, warn};
 use m6_core::{Request, Response, Result};
-use tracing::{debug, warn};
 
 use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
 
@@ -119,9 +119,9 @@ fn cache_control_for(query: &str) -> &'static str {
 
 /// Serve one static file.
 ///
-/// Registered with `App::handler("files", serve)`; the route that reaches it,
-/// and the directory it serves from, are config. Core routes, validates the
-/// path parameters and applies the route's extra headers; everything from the
+/// Registered in code under the name `files`; the route that reaches it, and
+/// the directory it serves from, are config. Core routes, validates the path
+/// parameters and applies the route's extra headers; everything from the
 /// filesystem down is here.
 ///
 /// **This handler owns its own representation.** It negotiates the content
@@ -828,7 +828,6 @@ mod tests {
 
     /// A symlink pointing outside the site directory is a 404, not a file.
     #[test]
-    #[cfg(unix)]
     fn a_symlink_escaping_the_site_dir_is_404() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();

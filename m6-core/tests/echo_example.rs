@@ -1,5 +1,9 @@
-//! The echo programs, proved over the wire: the nine checks of the echo
-//! prototype's `check.py` in Rust, plus one TLS round-trip check.
+//! The echo programs, the reference loop, proved over the wire: the nine
+//! checks of the echo prototype's `check.py` in Rust, the TLS round trips,
+//! and the cases `OS-1-TESTS.md` section 10 adds (many connections at once, a
+//! client that never reads, a close with a reply owed, a shutdown that drains,
+//! a reload, the loop never waiting). The same suite runs unchanged on every
+//! supported target.
 //!
 //! Each test starts a program as a child process, reads its `listening on`
 //! line for the address, and waits on a signal with a deadline, never a fixed
@@ -21,6 +25,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use m6_core::platform::{self, Signal};
 
 // ── Binaries ──────────────────────────────────────────────────────────────────
 
@@ -51,17 +57,34 @@ impl Server {
         conns: u64,
         max_conns: Option<u64>,
     ) -> Server {
-        let mut cmd = Command::new(bin);
+        Server::start_cmd(Command::new(bin), args, idle_ms, conns, max_conns)
+    }
+
+    /// As `start`, from a command already built (a shell that lowers the
+    /// descriptor limit and execs the program).
+    fn start_cmd(
+        mut cmd: Command,
+        args: &[&str],
+        idle_ms: u64,
+        conns: u64,
+        max_conns: Option<u64>,
+    ) -> Server {
+        static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWEPT.get_or_init(|| {
+            let _ = platform::process::close_inherited_on_exec();
+        });
         cmd.args(args);
         cmd.env("ECHO_IDLE_MS", idle_ms.to_string());
         cmd.env("ECHO_CONNS", conns.to_string());
+        // A shutdown with clients still held open must not hold the tests up.
+        cmd.env("ECHO_DRAIN_MS", "500");
         if let Some(m) = max_conns {
             cmd.env("ECHO_MAX_CONNS", m.to_string());
         }
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
-        let mut child = cmd.spawn().expect("spawn echo");
+        let mut child = platform::process::spawn(&mut cmd).expect("spawn echo");
         let mut stderr = child.stderr.take().expect("stderr");
 
         // The first line carries the bound address.
@@ -120,13 +143,9 @@ impl Server {
         panic!("{needle:?} never appeared:\n{out}");
     }
 
-    /// SIGTERM, wait for exit 0, and return the whole stderr tail.
+    /// A shutdown request, wait for exit 0, and return the whole stderr tail.
     fn tail(mut self) -> String {
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(self.child.id() as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        )
-        .expect("kill SIGTERM");
+        platform::send(self.child.id(), Signal::Shutdown).expect("send shutdown");
         let status = self.child.wait().expect("wait");
         assert_eq!(status.code(), Some(0), "echo exited with {status}");
         if let Some(r) = self.reader.take() {
@@ -389,6 +408,146 @@ fn the_table_grows_two_four_eight_and_keeps_eight() {
     assert_zero_allocations(&tail);
 }
 
+// ── The cases OS-1 adds (E2 to E7, E9) ───────────────────────────────────────
+
+/// E3. 200 connections open at once, one message each, all answered. The test
+/// raises its own descriptor limit through the layer, because a default soft
+/// limit of 256 would not hold 200 sockets and the harness's own.
+#[test]
+fn two_hundred_connections_at_once() {
+    m6_core::platform::process::raise_fd_limit().expect("raise the test's own limit");
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 16, None);
+    let mut clients: Vec<TcpStream> = (0..200)
+        .map(|_| TcpStream::connect(srv.addr).expect("connect"))
+        .collect();
+    for (i, c) in clients.iter_mut().enumerate() {
+        c.write_all(format!("c{i}\n").as_bytes()).expect("send");
+    }
+    for (i, c) in clients.iter_mut().enumerate() {
+        let m = format!("c{i}\n");
+        assert_eq!(
+            recv_exact(c, m.len(), Duration::from_secs(10)),
+            m.as_bytes()
+        );
+    }
+    drop(clients);
+    let tail = srv.tail();
+    assert!(tail.contains("grew from 128 to 256"), "{tail}");
+    assert_zero_allocations(&tail);
+}
+
+/// E4. A client that sends a MiB and never reads its echo does not stop the
+/// others: the server's write to it blocks, the loop moves on.
+#[test]
+fn a_client_that_never_reads_does_not_stop_others() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
+    let mut stuck = TcpStream::connect(srv.addr).expect("connect");
+    stuck.write_all(&vec![b's'; 1 << 20]).expect("send a MiB");
+    let t0 = Instant::now();
+    let mut other = TcpStream::connect(srv.addr).expect("connect");
+    for i in 0..20 {
+        let m = format!("fine {i}\n");
+        other.write_all(m.as_bytes()).expect("send");
+        assert_eq!(
+            recv_exact(&mut other, m.len(), Duration::from_secs(5)),
+            m.as_bytes()
+        );
+    }
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+    drop((stuck, other));
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
+/// E5. A client that closes with a reply still owed frees its slot and the
+/// next client is served. The reset case is `a_reset_client_does_not_take_the_server_down`.
+#[test]
+fn a_client_that_closes_mid_reply_frees_its_slot() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 2, Some(2));
+    let mut early = TcpStream::connect(srv.addr).expect("connect");
+    early.write_all(&vec![b'e'; 300_000]).expect("send");
+    assert_eq!(recv_exact(&mut early, 1, Duration::from_secs(10))[0], b'e');
+    drop(early);
+    for i in 0..3 {
+        let mut next = TcpStream::connect(srv.addr).expect("connect");
+        let m = format!("next {i}\n");
+        next.write_all(m.as_bytes()).expect("send");
+        assert_eq!(
+            recv_exact(&mut next, m.len(), Duration::from_secs(10)),
+            m.as_bytes()
+        );
+    }
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
+/// E6. A shutdown request drains: a client that has sent 16 KiB and half
+/// closed reads the whole echo, the process exits 0 and the port is released.
+#[test]
+fn shutdown_drains_in_flight_replies_and_exits_zero() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
+    let addr = srv.addr;
+    let body = vec![b'd'; 16 * 1024];
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.write_all(&body).expect("send");
+    s.shutdown(std::net::Shutdown::Write).expect("half close");
+    // One byte back proves the server has accepted and started this reply.
+    let first = recv_exact(&mut s, 1, Duration::from_secs(10));
+    platform::send(srv.child.id(), Signal::Shutdown).expect("send shutdown");
+    // `recv_exact` set the 10 s read timeout; it covers the read to EOF.
+    let mut rest = Vec::new();
+    s.read_to_end(&mut rest).expect("read to EOF");
+    assert_eq!(
+        first.len() + rest.len(),
+        body.len(),
+        "the whole reply before EOF"
+    );
+    let tail = srv.tail();
+    assert!(tail.contains("stopping, 0 connection(s) open"), "{tail}");
+    assert_zero_allocations(&tail);
+    assert!(TcpStream::connect(addr).is_err(), "the port is released");
+}
+
+/// E7. A reload request is logged and serving continues.
+#[test]
+fn reload_is_received_and_serving_continues() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
+    platform::send(srv.child.id(), Signal::ReopenLogs).expect("send reload");
+    srv.wait_for("log reopen requested", Duration::from_secs(5));
+    let mut s = TcpStream::connect(srv.addr).expect("connect");
+    s.write_all(b"after\n").expect("send");
+    assert_eq!(recv_exact(&mut s, 6, Duration::from_secs(10)), b"after\n");
+    drop(s);
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
+/// E9. The loop never waits: with one connection held on a reply its client
+/// will not read, a hundred round trips on another each complete within a
+/// bound.
+#[test]
+fn the_loop_never_waits() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
+    let mut held = TcpStream::connect(srv.addr).expect("connect");
+    held.write_all(&vec![b'h'; 1 << 20]).expect("send a MiB");
+    let mut fast = TcpStream::connect(srv.addr).expect("connect");
+    fast.set_nodelay(true).expect("nodelay");
+    let mut slowest = Duration::ZERO;
+    for _ in 0..100 {
+        let t0 = Instant::now();
+        fast.write_all(b"ping\n").expect("send");
+        assert_eq!(recv_exact(&mut fast, 5, Duration::from_secs(5)), b"ping\n");
+        slowest = slowest.max(t0.elapsed());
+    }
+    assert!(
+        slowest < Duration::from_millis(100),
+        "slowest round trip {slowest:?}"
+    );
+    drop((held, fast));
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
 // ── TLS ───────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -424,6 +583,16 @@ fn echo_tls_round_trips_and_stops() {
         let mut b = [0u8; 1];
         tls.read_exact(&mut b).expect("recv");
         assert_eq!(b[0], b'x');
+    }
+    // E2. A MiB over TLS, echoed byte for byte, in chunks the server's
+    // buffer takes whole so one blocking client never deadlocks the echo.
+    let mib: Vec<u8> = (0..1 << 20).map(|i| (i % 251) as u8).collect();
+    let mut back = vec![0u8; 16 * 1024];
+    for chunk in mib.chunks(16 * 1024) {
+        tls.write_all(chunk).expect("send a chunk");
+        tls.read_exact(&mut back[..chunk.len()])
+            .expect("recv a chunk");
+        assert_eq!(&back[..chunk.len()], chunk);
     }
     let tail = srv.tail();
     // The TLS path may allocate per rustls record (ALLOC-1 takes it), so the

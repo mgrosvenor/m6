@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use m6_core::log::{info, warn};
 use serde_json::{json, Map, Value};
-use tracing::{info, warn};
 
 // ── Markdown rendering ────────────────────────────────────────────────────────
 
@@ -92,7 +92,7 @@ fn toml_to_json(v: toml::Value) -> Value {
 fn file_mtime_iso(path: &Path) -> String {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .unwrap_or_else(|_| std::time::SystemTime::now());
+        .unwrap_or_else(|_| m6_core::platform::wall());
     m6_core::util::iso_date_from(mtime)
 }
 
@@ -193,7 +193,7 @@ fn parse_args(args: &[String]) -> Result<Cli> {
     let input_dir = input_dir.ok_or_else(|| anyhow::anyhow!("required: <input-dir>"))?;
     let output = output.ok_or_else(|| anyhow::anyhow!("required: --output <file>"))?;
 
-    tracing_subscriber::EnvFilter::try_new(&log_level)
+    m6_core::log::parse_level(&log_level)
         .map_err(|e| anyhow::anyhow!("--log-level {log_level:?}: {e}"))?;
 
     Ok(Cli {
@@ -221,14 +221,25 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     // Init logging
-    let filter = tracing_subscriber::EnvFilter::new(&cli.log_level);
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .init();
+    let level = match m6_core::log::parse_level(&cli.log_level) {
+        Ok(level) => level,
+        Err(e) => {
+            eprintln!("usage error: --log-level {e}");
+            return 2;
+        }
+    };
+    if let Err(e) = m6_core::log::init(level, None) {
+        eprintln!("logging init error: {e}");
+        return 1;
+    }
 
-    // Run the one pass.
-    if let Err(e) = process(&cli) {
+    // Run the one pass, then write everything buffered before this tool exits.
+    let result = process(&cli);
+    if let Err(e) = m6_core::log::stop() {
+        eprintln!("logging stop error: {e}");
+        return 1;
+    }
+    if let Err(e) = result {
         eprintln!("error: {e:#}");
         return 1;
     }
@@ -350,8 +361,8 @@ mod tests {
     fn an_unknown_log_level_is_a_usage_error() {
         let level = "info,=bad==";
         assert!(
-            tracing_subscriber::EnvFilter::try_new(level).is_err(),
-            "{level:?} should be a directive EnvFilter refuses"
+            m6_core::log::parse_level(level).is_err(),
+            "{level:?} should be a level the logger refuses"
         );
         let err = parse_err(&["m6-md", "in", "--output", "o.json", "--log-level", level]);
         assert!(err.contains("--log-level"), "got: {err}");

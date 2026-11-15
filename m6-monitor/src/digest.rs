@@ -53,10 +53,27 @@ pub struct Thresholds {
     /// default, because analytics logging is on by default and a deployment
     /// that does not rotate would otherwise fault two hours after every start.
     pub log_reopen_age_s: Option<u64>,
+    /// Seconds since a node last answered `/health` with 200 above which the
+    /// check flags it. Read from `[monitor] health_last_ok_max_age_s`, which
+    /// defaults to three poll intervals.
+    ///
+    /// The age itself comes from the history, so a service with no history
+    /// file cannot judge it and shows the absence instead. The digest already
+    /// faults a node that is degraded or unreachable, and the check adds the
+    /// age as its own fault when it passes the limit, so the verdict says how
+    /// long the node has been in that state.
+    pub health_last_ok_age_s: u64,
 }
 
 /// The default for `Thresholds::tunnel_handshake_age_s`, in seconds.
 pub const DEFAULT_TUNNEL_HANDSHAKE_AGE_S: u64 = 600;
+
+/// How many poll intervals a node's last 200 may be old by default.
+///
+/// One number describes the cadence: a deployment that changes
+/// `poll_interval_s` gets a limit that follows it, without a second setting to
+/// keep in step.
+pub const HEALTH_LAST_OK_POLLS: u64 = 3;
 
 impl Default for Thresholds {
     fn default() -> Self {
@@ -68,6 +85,7 @@ impl Default for Thresholds {
             cert_expiry_days: 21,
             tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
             log_reopen_age_s: None,
+            health_last_ok_age_s: crate::DEFAULT_POLL_SECS.saturating_mul(HEALTH_LAST_OK_POLLS),
         }
     }
 }
@@ -85,6 +103,14 @@ pub struct Finding {
     pub node: String,
     pub text: String,
 }
+
+/// Why an older m6-http reports itself degraded.
+///
+/// `/health` no longer carries a pool verdict, because a socket pool keeps no
+/// per-member health state. The monitor still prints this reason when a node
+/// answers degraded, which a node older than the change can. The check prints
+/// it beside the code rather than leaving the reader to look it up.
+pub(crate) const DEGRADED_REASON: &str = "a configured socket pool has no live member";
 
 /// The whole fleet, summarised.
 #[derive(Debug, Clone, Serialize)]
@@ -164,7 +190,8 @@ pub struct NodeDigest {
     /// exactly like a p50 over a thousand.
     pub hit_samples: Option<usize>,
     pub backend_errors: Option<u64>,
-    pub pools: Vec<(String, usize, usize)>,
+    /// Each socket pool and how many members it holds.
+    pub pools: Vec<(String, usize)>,
     pub load_one: Option<f64>,
     pub cpus: Option<usize>,
     pub memory_used: Option<f64>,
@@ -294,8 +321,6 @@ pub enum HandshakeState {
     NoPublicKey,
     /// Tunnels are configured but `wg_handshakes_file` is not set.
     NoHandshakesFile,
-    /// Not read, for a reason reported by another finding.
-    Unknown,
     FileMissing,
     FileError,
     /// The handshakes file is older than the limit, so no age is judged.
@@ -311,7 +336,6 @@ impl HandshakeState {
             Self::PeerAbsent => "peer_absent",
             Self::NoPublicKey => "no_public_key",
             Self::NoHandshakesFile => "no_handshakes_file",
-            Self::Unknown => "unknown",
             Self::FileMissing => "file_missing",
             Self::FileError => "file_error",
             Self::FileStale => "file_stale",
@@ -347,10 +371,6 @@ impl TunnelDigest {
             HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
             HandshakeState::NoPublicKey => "unknown (no public_key)".to_string(),
             HandshakeState::NoHandshakesFile => "unknown (no wg_handshakes_file)".to_string(),
-            HandshakeState::Unknown => format!(
-                "unknown ({})",
-                self.handshake_detail.as_deref().unwrap_or("-")
-            ),
             HandshakeState::FileMissing => "file missing".to_string(),
             HandshakeState::FileError => "file unreadable".to_string(),
             HandshakeState::FileStale => "unknown (handshakes file is stale)".to_string(),
@@ -375,7 +395,6 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
     let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
         Handshake::NoPublicKey => (HandshakeState::NoPublicKey, None, None),
         Handshake::NoHandshakesFile => (HandshakeState::NoHandshakesFile, None, None),
-        Handshake::Unknown(why) => (HandshakeState::Unknown, None, Some((*why).to_string())),
         Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
         Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
         Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
@@ -628,8 +647,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 HandshakeState::NoHandshakesFile
                 | HandshakeState::FileStale
                 | HandshakeState::FileMissing
-                | HandshakeState::FileError
-                | HandshakeState::Unknown => {}
+                | HandshakeState::FileError => {}
             }
         }
 
@@ -647,12 +665,18 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             continue;
         }
 
-        if r.status() == "degraded" {
-            findings.push(Finding {
+        match r.status() {
+            "ok" => {}
+            "degraded" => findings.push(Finding {
                 level: Level::Fault,
                 node: r.name.clone(),
-                text: "reports degraded: a configured socket pool has no live member".to_string(),
-            });
+                text: format!("reports degraded: {DEGRADED_REASON}"),
+            }),
+            other => findings.push(Finding {
+                level: Level::Fault,
+                node: r.name.clone(),
+                text: format!("reports health status {other}"),
+            }),
         }
 
         if let Some(p) = &r.perf {
@@ -732,21 +756,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             d.hit_samples = Some(p.metrics.hit_samples);
             d.hit_p50_ns = sampled.then_some(p.metrics.hit_p50_ns);
             d.hit_p99_ns = sampled.then_some(p.metrics.hit_p99_ns);
-            d.pools = p
-                .pools
-                .iter()
-                .map(|x| (x.name.clone(), x.active, x.total))
-                .collect();
+            d.pools = p.pools.iter().map(|x| (x.name.clone(), x.total)).collect();
 
-            for pool in &p.pools {
-                if pool.active == 0 {
-                    findings.push(Finding {
-                        level: Level::Fault,
-                        node: r.name.clone(),
-                        text: format!("pool {} has 0 of {} members live", pool.name, pool.total),
-                    });
-                }
-            }
             if p.metrics.backend_errors_total > 0 {
                 // NAME the backend. "3 backend errors since start" left the
                 // operator to guess which service, and the guess that matters is
@@ -1170,8 +1181,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
+    use m6_core::platform::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::telemetry::StatsSnapshot;
 
     pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
@@ -1530,34 +1541,6 @@ pub(crate) mod tests {
         let busy = build(&[reading("b", "ok", Some(perf(mk(1), vec![])))], &t, now());
         assert_eq!(busy.level, Level::Warn);
         assert!(busy.findings[0].text.contains("per cpu"));
-    }
-
-    #[test]
-    fn an_empty_pool_is_a_fault_and_so_is_the_degraded_verdict() {
-        let pools = vec![
-            PoolHealth {
-                name: "m6-html".into(),
-                active: 1,
-                total: 1,
-            },
-            PoolHealth {
-                name: "render-contact".into(),
-                active: 0,
-                total: 2,
-            },
-        ];
-        let d = build(
-            &[reading(
-                "origin",
-                "degraded",
-                Some(perf(HostSnapshot::default(), pools)),
-            )],
-            &Thresholds::default(),
-            now(),
-        );
-        assert_eq!(d.level, Level::Fault);
-        assert_eq!(d.findings.len(), 2);
-        assert!(d.findings.iter().any(|f| f.text.contains("render-contact")));
     }
 
     /// Backend errors name the backend, worst first.
@@ -2489,6 +2472,7 @@ pub(crate) mod tests {
         let t = m6_core::monitoring::TrafficReport {
             node: "origin".into(),
             window_minutes: 60,
+            events_dropped: 0,
             total_requests: 0,
             status: Default::default(),
             notable: vec![],
@@ -2564,6 +2548,7 @@ mod history_tests {
             dropped: 3,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         });
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["history"]["state"], "behind");

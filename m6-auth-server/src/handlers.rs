@@ -1,49 +1,60 @@
-use std::sync::Mutex;
+use std::cell::RefCell;
 
-use m6_auth::Db;
+use m6_auth::{AuthError, Db};
 use m6_core::http::{RawRequest, RawResponse};
 // Form parsing, percent coding and cookie lookup are core's. This file had its
 // own of each; `url_decode` in particular was a second copy of the Latin-1
 // defect that reached production through a contact form, and it had to be
 // found and fixed twice. That is the argument for consolidating, so they are
 // gone rather than merely correct.
+use m6_core::log::{info, warn};
 use m6_core::request::{cookie, parse_form_body, url_encode_path};
-use tracing::{info, warn};
 
 use crate::jwt::{hash_token, now_secs, AccessClaims, RefreshClaims};
 use crate::keys::KeyMaterial;
 use crate::rate_limit::RateLimiter;
 
-/// The signing keys, token lifetimes and login throttle that every worker
-/// shares.
-///
-/// Each worker thread opens its own database connection instead, so a login
-/// hashing a password never holds a lock another request needs. See
-/// `main::WorkerDb`.
+/// The signing keys, token lifetimes and login throttle the loop owns.
 pub struct AppState {
     pub keys: KeyMaterial,
     pub access_ttl: u64,
     pub refresh_ttl: u64,
     pub issuer: String,
-    pub db_path: std::path::PathBuf,
-    pub rate_limiter: Mutex<RateLimiter>,
+    /// Borrowed only for the length of one call. The loop is one thread, and no
+    /// borrow is held across a call that returns to it, so a borrow cannot fail
+    /// at run time.
+    pub rate_limiter: RefCell<RateLimiter>,
 }
 
-// The four handlers are reached by route now: `App` matches the path and the
-// method, so the dispatcher that did it here is gone. These wrappers exist so
-// the handler functions themselves stay private and unchanged -- they are the
-// security-carrying part of this service, and a migration is the wrong time to
-// touch them.
+// The four handlers are reached by route: `Site` matches the path and the
+// method, and the loop's one `match` calls the wrapper for the route's index.
+// The wrappers exist so the handler functions themselves stay private and
+// unchanged -- they are the security-carrying part of this service, and a
+// migration is the wrong time to touch them.
 
-pub fn dispatch_login(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> RawResponse {
-    handle_login(req, state, db, peer_ip)
+/// A request the loop must try again once the database's lock is free.
+#[derive(Debug)]
+pub struct Busy {
+    /// The user a login verified before its refresh-token write met the lock,
+    /// so the retry skips bcrypt. Empty on every other route.
+    pub verified: Option<m6_auth::User>,
 }
 
-pub fn dispatch_refresh(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+pub fn dispatch_login(
+    req: &RawRequest,
+    state: &AppState,
+    db: &Db,
+    peer_ip: &str,
+    verified: Option<&m6_auth::User>,
+) -> Result<RawResponse, Busy> {
+    handle_login(req, state, db, peer_ip, verified)
+}
+
+pub fn dispatch_refresh(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawResponse, Busy> {
     handle_refresh(req, state, db)
 }
 
-pub fn dispatch_logout(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+pub fn dispatch_logout(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawResponse, Busy> {
     handle_logout(req, state, db)
 }
 
@@ -53,7 +64,13 @@ pub fn dispatch_public_key(state: &AppState) -> RawResponse {
 
 // ─── POST /auth/login ─────────────────────────────────────────────────────────
 
-fn handle_login(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> RawResponse {
+fn handle_login(
+    req: &RawRequest,
+    state: &AppState,
+    db: &Db,
+    peer_ip: &str,
+    verified: Option<&m6_auth::User>,
+) -> Result<RawResponse, Busy> {
     let ct = req.content_type().unwrap_or("").to_ascii_lowercase();
     let is_form = ct.contains("application/x-www-form-urlencoded");
     let is_json = ct.contains("application/json");
@@ -64,55 +81,40 @@ fn handle_login(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> R
     // password was actually wrong, so a caller that always succeeds is never
     // throttled. See `rate_limit::RateLimiter` for what counting successes cost.
     {
-        let rl = match state.rate_limiter.lock() {
-            Ok(l) => l,
-            Err(_) => return internal_error(),
-        };
+        let rl = state.rate_limiter.borrow();
         if rl.is_blocked(peer_ip) {
             warn!(ip = %peer_ip, "rate limit exceeded on login");
             if is_json {
-                return RawResponse::new(429)
+                return Ok(RawResponse::new(429)
                     .header("Retry-After", "60")
                     .content_type("application/json")
-                    .body(r#"{"error":"rate_limited"}"#);
+                    .body(r#"{"error":"rate_limited"}"#));
             } else {
-                return RawResponse::new(429)
+                return Ok(RawResponse::new(429)
                     .header("Retry-After", "60")
-                    .body("Too Many Requests");
+                    .body("Too Many Requests"));
             }
         }
     }
 
     if is_json {
-        handle_login_json(req, state, db, peer_ip)
+        handle_login_json(req, state, db, peer_ip, verified)
     } else if is_form {
-        handle_login_form(req, state, db, peer_ip)
+        handle_login_form(req, state, db, peer_ip, verified)
     } else {
         // Default to form handling for unknown content types
-        handle_login_form(req, state, db, peer_ip)
+        handle_login_form(req, state, db, peer_ip, verified)
     }
 }
 
 /// Count a wrong password against `peer_ip`'s budget.
-///
-/// A poisoned lock is logged and otherwise ignored: refusing the login because
-/// the throttle's mutex is broken would turn a bookkeeping fault into an outage,
-/// and the alternative failure (one uncounted wrong password) is smaller. It is
-/// logged rather than swallowed, because a silently dead throttle is worse than
-/// a loud one.
 fn note_login_failure(state: &AppState, peer_ip: &str) {
-    match state.rate_limiter.lock() {
-        Ok(mut rl) => rl.record_failure(peer_ip),
-        Err(_) => warn!("rate limiter mutex poisoned; login failure not counted"),
-    }
+    state.rate_limiter.borrow_mut().record_failure(peer_ip);
 }
 
 /// Forget `peer_ip`'s failures after a correct password.
 fn note_login_success(state: &AppState, peer_ip: &str) {
-    match state.rate_limiter.lock() {
-        Ok(mut rl) => rl.clear(peer_ip),
-        Err(_) => warn!("rate limiter mutex poisoned; login success not cleared"),
-    }
+    state.rate_limiter.borrow_mut().clear(peer_ip);
 }
 
 fn form_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -131,51 +133,104 @@ fn validate_next(next: Option<&str>) -> String {
     }
 }
 
-fn handle_login_form(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> RawResponse {
+/// What the login sequence shared by the form and JSON handlers did.
+enum LoginOutcome {
+    /// The password was right and both tokens were issued.
+    Tokens(String, String),
+    /// No user has that password, or the username does not exist.
+    InvalidCredentials,
+    /// The database is locked. The user is the one the attempt verified, so the
+    /// loop's retry skips bcrypt.
+    Busy(Option<m6_auth::User>),
+    /// The answer the sequence built for a failure that is not a lock.
+    Response(RawResponse),
+}
+
+/// Take the user a retry already verified, or verify the password, then finish
+/// the login. The form and JSON handlers keep only their own parse and answer.
+fn verified_login(
+    state: &AppState,
+    db: &Db,
+    username: &str,
+    password: &str,
+    peer_ip: &str,
+    verified: Option<&m6_auth::User>,
+) -> LoginOutcome {
+    // The user a first attempt verified, kept for the loop when the token store
+    // meets a lock. Empty on a retry, which already holds it.
+    let mut verified_here: Option<m6_auth::User> = None;
+    let user: &m6_auth::User = match verified {
+        Some(user) => user,
+        None => match db.user_verify_password(username, password) {
+            Ok(Some(u)) => &*verified_here.insert(u),
+            Ok(None) => {
+                warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
+                note_login_failure(state, peer_ip);
+                return LoginOutcome::InvalidCredentials;
+            }
+            Err(e) if e.is_busy() => return LoginOutcome::Busy(None),
+            Err(e) => {
+                warn!(error = %e, "db error on login");
+                return LoginOutcome::Response(internal_error());
+            }
+        },
+    };
+
+    match finish_login(state, db, user, peer_ip) {
+        Ok((access_jwt, refresh_jwt)) => LoginOutcome::Tokens(access_jwt, refresh_jwt),
+        Err(LoginFailure::Busy) => LoginOutcome::Busy(verified_here),
+        Err(LoginFailure::Response(resp)) => LoginOutcome::Response(resp),
+    }
+}
+
+fn handle_login_form(
+    req: &RawRequest,
+    state: &AppState,
+    db: &Db,
+    peer_ip: &str,
+    verified: Option<&m6_auth::User>,
+) -> Result<RawResponse, Busy> {
     let fields = parse_form_body(&req.body);
     let username = form_field(&fields, "username").unwrap_or("");
     let password = form_field(&fields, "password").unwrap_or("");
     let next_raw = form_field(&fields, "next");
     let next = validate_next(next_raw);
 
-    let user = match db.user_verify_password(username, password) {
-        Ok(Some(u)) => u,
-        Ok(None) => {
-            warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
-            note_login_failure(state, peer_ip);
+    match verified_login(state, db, username, password, peer_ip, verified) {
+        LoginOutcome::Tokens(access_jwt, refresh_jwt) => {
+            let session_cookie = format!(
+                "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+                access_jwt, state.access_ttl
+            );
+            let refresh_cookie = format!(
+                "refresh={}; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age={}",
+                refresh_jwt, state.refresh_ttl
+            );
+
+            Ok(RawResponse::new(302)
+                .header("Location", next)
+                .header("Set-Cookie", session_cookie)
+                .header("Set-Cookie", refresh_cookie))
+        }
+        LoginOutcome::InvalidCredentials => {
             let next_enc = url_encode_path(&next);
-            return RawResponse::new(302).header(
+            Ok(RawResponse::new(302).header(
                 "Location",
                 format!("/login?error=invalid&next={}", next_enc),
-            );
+            ))
         }
-        Err(e) => {
-            warn!(error = %e, "db error on login");
-            return internal_error();
-        }
-    };
-
-    let (access_jwt, refresh_jwt) = match finish_login(state, db, &user, peer_ip) {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-
-    let session_cookie = format!(
-        "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
-        access_jwt, state.access_ttl
-    );
-    let refresh_cookie = format!(
-        "refresh={}; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age={}",
-        refresh_jwt, state.refresh_ttl
-    );
-
-    RawResponse::new(302)
-        .header("Location", next)
-        .header("Set-Cookie", session_cookie)
-        .header("Set-Cookie", refresh_cookie)
+        LoginOutcome::Busy(verified) => Err(Busy { verified }),
+        LoginOutcome::Response(resp) => Ok(resp),
+    }
 }
 
-fn handle_login_json(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str) -> RawResponse {
+fn handle_login_json(
+    req: &RawRequest,
+    state: &AppState,
+    db: &Db,
+    peer_ip: &str,
+    verified: Option<&m6_auth::User>,
+) -> Result<RawResponse, Busy> {
     #[derive(serde::Deserialize)]
     struct LoginReq {
         username: String,
@@ -185,46 +240,35 @@ fn handle_login_json(req: &RawRequest, state: &AppState, db: &Db, peer_ip: &str)
     let body: LoginReq = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
         Err(_) => {
-            return RawResponse::new(400)
+            return Ok(RawResponse::new(400)
                 .content_type("application/json")
-                .body(r#"{"error":"bad_request"}"#)
+                .body(r#"{"error":"bad_request"}"#))
         }
     };
 
-    let user = match db.user_verify_password(&body.username, &body.password) {
-        Ok(Some(u)) => u,
-        Ok(None) => {
-            warn!(ip = %peer_ip, reason = "invalid_credentials", "login failure");
-            note_login_failure(state, peer_ip);
-            return RawResponse::new(401)
+    match verified_login(state, db, &body.username, &body.password, peer_ip, verified) {
+        LoginOutcome::Tokens(access_jwt, refresh_jwt) => {
+            let resp_body = serde_json::json!({
+                "access_token":  access_jwt,
+                "refresh_token": refresh_jwt,
+                "expires_in":    state.access_ttl,
+            });
+
+            Ok(RawResponse::new(200)
                 .content_type("application/json")
-                .body(r#"{"error":"invalid_credentials"}"#);
+                .body(resp_body.to_string()))
         }
-        Err(e) => {
-            warn!(error = %e, "db error on login");
-            return internal_error();
-        }
-    };
-
-    let (access_jwt, refresh_jwt) = match finish_login(state, db, &user, peer_ip) {
-        Ok(pair) => pair,
-        Err(resp) => return resp,
-    };
-
-    let resp_body = serde_json::json!({
-        "access_token":  access_jwt,
-        "refresh_token": refresh_jwt,
-        "expires_in":    state.access_ttl,
-    });
-
-    RawResponse::new(200)
-        .content_type("application/json")
-        .body(resp_body.to_string())
+        LoginOutcome::InvalidCredentials => Ok(RawResponse::new(401)
+            .content_type("application/json")
+            .body(r#"{"error":"invalid_credentials"}"#)),
+        LoginOutcome::Busy(verified) => Err(Busy { verified }),
+        LoginOutcome::Response(resp) => Ok(resp),
+    }
 }
 
 // ─── POST /auth/refresh ───────────────────────────────────────────────────────
 
-fn handle_refresh(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+fn handle_refresh(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawResponse, Busy> {
     let ct = req.content_type().unwrap_or("").to_ascii_lowercase();
     let is_json = ct.contains("application/json");
 
@@ -235,14 +279,18 @@ fn handle_refresh(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
     }
 }
 
-fn handle_refresh_browser(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+fn handle_refresh_browser(
+    req: &RawRequest,
+    state: &AppState,
+    db: &Db,
+) -> Result<RawResponse, Busy> {
     let token = match req
         .header("cookie")
         .and_then(|h| cookie(h, "refresh"))
         .map(|v| v.to_string())
     {
         Some(t) => t,
-        None => return RawResponse::new(302).header("Location", "/login"),
+        None => return Ok(RawResponse::new(302).header("Location", "/login")),
     };
 
     match do_refresh(state, db, &token) {
@@ -258,15 +306,16 @@ fn handle_refresh_browser(req: &RawRequest, state: &AppState, db: &Db) -> RawRes
                 "session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
                 access_jwt, state.access_ttl
             );
-            RawResponse::new(302)
+            Ok(RawResponse::new(302)
                 .header("Location", location)
-                .header("Set-Cookie", session_cookie)
+                .header("Set-Cookie", session_cookie))
         }
-        Err(_) => RawResponse::new(302).header("Location", "/login"),
+        Err(e) if is_busy(&e) => Err(Busy { verified: None }),
+        Err(_) => Ok(RawResponse::new(302).header("Location", "/login")),
     }
 }
 
-fn handle_refresh_json(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+fn handle_refresh_json(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawResponse, Busy> {
     #[derive(serde::Deserialize)]
     struct RefreshReq {
         refresh_token: String,
@@ -275,9 +324,9 @@ fn handle_refresh_json(req: &RawRequest, state: &AppState, db: &Db) -> RawRespon
     let body: RefreshReq = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
         Err(_) => {
-            return RawResponse::new(400)
+            return Ok(RawResponse::new(400)
                 .content_type("application/json")
-                .body(r#"{"error":"bad_request"}"#)
+                .body(r#"{"error":"bad_request"}"#))
         }
     };
 
@@ -288,14 +337,23 @@ fn handle_refresh_json(req: &RawRequest, state: &AppState, db: &Db) -> RawRespon
                 "access_token": access_jwt,
                 "expires_in":   state.access_ttl,
             });
-            RawResponse::new(200)
+            Ok(RawResponse::new(200)
                 .content_type("application/json")
-                .body(resp_body.to_string())
+                .body(resp_body.to_string()))
         }
-        Err(_) => RawResponse::new(401)
+        Err(e) if is_busy(&e) => Err(Busy { verified: None }),
+        Err(_) => Ok(RawResponse::new(401)
             .content_type("application/json")
-            .body(r#"{"error":"invalid_token"}"#),
+            .body(r#"{"error":"invalid_token"}"#)),
     }
+}
+
+/// Whether a refresh's `anyhow` error wraps a locked-database `AuthError`.
+/// `do_refresh`'s `?` passes the `AuthError` through unchanged.
+fn is_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AuthError>()
+        .is_some_and(AuthError::is_busy)
 }
 
 fn do_refresh(state: &AppState, db: &Db, token: &str) -> anyhow::Result<(String, String)> {
@@ -332,7 +390,7 @@ fn do_refresh(state: &AppState, db: &Db, token: &str) -> anyhow::Result<(String,
 
 // ─── POST /auth/logout ────────────────────────────────────────────────────────
 
-fn handle_logout(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+fn handle_logout(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawResponse, Busy> {
     let is_api = req
         .header("authorization")
         .map(|v| v.to_ascii_lowercase().starts_with("bearer "))
@@ -345,27 +403,34 @@ fn handle_logout(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
     }
 }
 
-fn handle_logout_browser(req: &RawRequest, db: &Db) -> RawResponse {
+fn handle_logout_browser(req: &RawRequest, db: &Db) -> Result<RawResponse, Busy> {
     if let Some(token) = req
         .header("cookie")
         .and_then(|h| cookie(h, "refresh"))
         .map(|v| v.to_string())
     {
         let token_hash = hash_token(&token);
-        let _ = db.refresh_token_revoke(&token_hash);
+        // A failed revoke is ignored, as it always was, except for a lock: the
+        // loop tries the request again rather than answering over a database
+        // write that did not happen.
+        if let Err(e) = db.refresh_token_revoke(&token_hash) {
+            if e.is_busy() {
+                return Err(Busy { verified: None });
+            }
+        }
     }
     info!("logout (browser)");
 
     let clear_session = "session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
     let clear_refresh = "refresh=; HttpOnly; Secure; SameSite=Lax; Path=/auth/refresh; Max-Age=0";
 
-    RawResponse::new(302)
+    Ok(RawResponse::new(302)
         .header("Location", "/")
         .header("Set-Cookie", clear_session)
-        .header("Set-Cookie", clear_refresh)
+        .header("Set-Cookie", clear_refresh))
 }
 
-fn handle_logout_api(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+fn handle_logout_api(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawResponse, Busy> {
     // Extract user_id from bearer token, revoke all their refresh tokens
     if let Some(auth) = req.header("authorization") {
         let token = auth
@@ -374,11 +439,15 @@ fn handle_logout_api(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse
         let decode_result = state.keys.jwt.decode_access(token).ok();
         if let Some(data) = decode_result {
             let user_id = &data.claims.sub;
-            let _ = db.refresh_tokens_revoke_all(user_id);
+            if let Err(e) = db.refresh_tokens_revoke_all(user_id) {
+                if e.is_busy() {
+                    return Err(Busy { verified: None });
+                }
+            }
             info!(user_id = %user_id, "logout (api)");
         }
     }
-    RawResponse::new(204)
+    Ok(RawResponse::new(204))
 }
 
 // ─── GET /auth/public-key ─────────────────────────────────────────────────────
@@ -392,6 +461,14 @@ fn handle_public_key(state: &AppState) -> RawResponse {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Why a login whose password was right has not answered.
+enum LoginFailure {
+    /// The refresh-token write met a locked database: the loop tries again.
+    Busy,
+    /// The answer to send.
+    Response(RawResponse),
+}
+
 /// Complete a login whose password was right: clear the IP's failure count,
 /// issue both tokens, store the refresh hash, and log the success. The form and
 /// JSON handlers share this sequence so the two cannot drift apart.
@@ -400,22 +477,26 @@ fn finish_login(
     db: &Db,
     user: &m6_auth::User,
     peer_ip: &str,
-) -> Result<(String, String), RawResponse> {
+) -> Result<(String, String), LoginFailure> {
     note_login_success(state, peer_ip);
 
     let (access_jwt, refresh_jwt) =
         issue_tokens(state, &user.id, &user.username, &user.groups, &user.roles).map_err(|e| {
             warn!(error = %e, "failed to issue tokens");
-            internal_error()
+            LoginFailure::Response(internal_error())
         })?;
 
     let refresh_hash = hash_token(&refresh_jwt);
     let now = now_secs();
-    db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
-        .map_err(|e| {
-            warn!(error = %e, "failed to store refresh token");
-            internal_error()
-        })?;
+    if let Err(e) = db.refresh_token_store(&user.id, &refresh_hash, now + state.refresh_ttl as i64)
+    {
+        // The login keeps the user it verified, so the retry skips bcrypt.
+        if e.is_busy() {
+            return Err(LoginFailure::Busy);
+        }
+        warn!(error = %e, "failed to store refresh token");
+        return Err(LoginFailure::Response(internal_error()));
+    }
 
     info!(username = %user.username, ip = %peer_ip, "login success");
     Ok((access_jwt, refresh_jwt))
@@ -458,4 +539,48 @@ pub fn internal_error() -> RawResponse {
     RawResponse::new(500)
         .content_type("application/json")
         .body(r#"{"error":"internal_error"}"#)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::test_key_material;
+    use crate::rate_limit::RateLimiter;
+
+    /// A retried login carries the user the first attempt verified, so it must
+    /// not run bcrypt again: a request with the wrong password issues tokens,
+    /// which it can do only by skipping the verify.
+    #[test]
+    fn a_retried_login_does_not_verify_the_password_again() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = Db::open(&dir.path().join("auth.db")).expect("open the database");
+        let user = db
+            .user_create("alice", "correct_pass", &["user"])
+            .expect("create the user");
+        let state = AppState {
+            keys: test_key_material(),
+            access_ttl: 900,
+            refresh_ttl: 2592000,
+            issuer: "test.example.com".to_string(),
+            rate_limiter: RefCell::new(RateLimiter::with_limits(5, 900)),
+        };
+        let req = RawRequest {
+            method: "POST".to_string(),
+            path: "/auth/login".to_string(),
+            query: None,
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: br#"{"username":"alice","password":"wrong"}"#.to_vec(),
+        };
+
+        let answer = dispatch_login(&req, &state, &db, "192.0.2.1", Some(&user))
+            .expect("a retry of a verified login is not busy");
+        assert_eq!(
+            answer.status, 200,
+            "the retry skipped the verify and issued tokens"
+        );
+        let body = String::from_utf8_lossy(&answer.body);
+        assert!(body.contains("access_token"), "no access token: {body}");
+        assert!(body.contains("refresh_token"), "no refresh token: {body}");
+    }
 }
