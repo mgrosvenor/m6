@@ -858,7 +858,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             &mut state.traffic,
         )
         .filter(|_| analytics::is_html_response(&cached.headers))
-        .map(|id| analytics::session_cookie_header_value(id));
+        .map(analytics::session_cookie_header_value);
         return Routed::Cached {
             status: cached.status,
             entry: cached,
