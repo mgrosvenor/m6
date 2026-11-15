@@ -21,7 +21,7 @@ use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
 use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::signal::{Action, Lifecycle};
-use m6_core::{Handled, Site, TeraFactory};
+use m6_core::{genid_failed, genid_ok, Handled, Site, TeraFactory};
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load("m6-html", &[], &[], &TeraFactory);
+    let mut site = Site::load("m6-html", &[], &[], &TeraFactory);
     let read_timeout = site.read_timeout();
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
                 Token(k) => {
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &site) {
+                    match turn(conn, &mut site) {
                         Ok(true) => {
                             // Re-register only when the turn changed what the
                             // connection waits for: a kept-alive request that
@@ -229,7 +229,7 @@ fn main() -> Result<()> {
 
 /// One connection's turn: read, answer and write until the socket would
 /// block. Returns whether the connection stays open.
-fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
+fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
     loop {
         // Write what is owed before reading anything. A streamed body is not
         // in the output buffer, so a read here would let the next request's
@@ -252,6 +252,16 @@ fn turn(conn: &mut ServerConn, site: &Site) -> io::Result<bool> {
             Read::Request(head) => {
                 let response = match site.handle(&head) {
                     Handled::Done(response) => response,
+                    // The reserved path: run the start path again and assign
+                    // the new Site in the loop's own binding, or keep serving
+                    // the old one and answer the cause.
+                    Handled::Reload => match site.reload(&[], &[], &TeraFactory) {
+                        Ok(next) => {
+                            *site = next;
+                            genid_ok()
+                        }
+                        Err(e) => genid_failed(&e),
+                    },
                     Handled::Code(..) | Handled::Named(..) => unreachable!(
                         "m6-html passes no code routes and no handler names, so every route \
                          is answered by its template"

@@ -163,6 +163,7 @@ fn serve_one(site: &mut Site, c: &mut Conn) {
                 m6_core::site::Handled::Code(..) | m6_core::site::Handled::Named(..) => {
                     panic!("this site has no service routes")
                 }
+                m6_core::site::Handled::Reload => panic!("this test sends no /genid"),
             },
             Read::More => break,
             Read::Closed => panic!("the client stayed open"),

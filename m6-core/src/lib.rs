@@ -77,7 +77,7 @@ pub use render::{NoTemplates, RenderError, Renderer, RendererFactory};
 pub use request::Request;
 pub use response::{Body, Response};
 pub use server::socket_path_from_config;
-pub use site::{CodeRoute, Handled, Site};
+pub use site::{genid_failed, genid_ok, CodeRoute, Handled, Site, GENID_PATH};
 
 /// Everything a service normally wants, in one line.
 ///

@@ -32,6 +32,7 @@ use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
+use m6_core::{genid_failed, genid_ok};
 
 use config::AuthConfig;
 use handlers::{AppState, Busy};
@@ -159,7 +160,7 @@ fn main() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
+    let mut site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let (state, db) = build_state(&site).unwrap_or_else(|e| fail("building the auth state", e));
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
@@ -296,7 +297,7 @@ fn main() -> Result<()> {
                     }
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &mut retries[k], &site, &state, &db) {
+                    match turn(conn, &mut retries[k], &mut site, &state, &db) {
                         Ok(true) => {
                             touch_retry(&mut busy_timeouts, &retries, k);
                             after_turn(
@@ -362,7 +363,7 @@ fn main() -> Result<()> {
             // makes it writable: a partial flush must re-register the interest.
             let was = conn.interest();
             conn.respond_response(response);
-            match turn(conn, &mut retries[k], &site, &state, &db) {
+            match turn(conn, &mut retries[k], &mut site, &state, &db) {
                 Ok(true) => {
                     touch_retry(&mut busy_timeouts, &retries, k);
                     after_turn(&poll, &mut conns, &mut deadlines, read_timeout, k, was, now)?;
@@ -427,7 +428,7 @@ fn main() -> Result<()> {
 fn turn(
     conn: &mut ServerConn,
     retry: &mut Option<Retry>,
-    site: &Site,
+    site: &mut Site,
     state: &AppState,
     db: &m6_auth::Db,
 ) -> io::Result<bool> {
@@ -471,6 +472,16 @@ fn turn(
                             }
                         }
                     }
+                    // The reserved path: run the start path again and assign
+                    // the new Site in the loop's own binding, or keep serving
+                    // the old one and answer the cause.
+                    Handled::Reload => match site.reload(&ROUTES, &[], &NoTemplates) {
+                        Ok(next) => {
+                            *site = next;
+                            genid_ok()
+                        }
+                        Err(e) => genid_failed(&e),
+                    },
                     Handled::Named(..) => unreachable!(
                         "m6-auth-server registers no named handlers, so every route is in code"
                     ),

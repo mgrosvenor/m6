@@ -289,7 +289,9 @@ It exits 2 on a configuration error and 1 when logging cannot start, and it refu
 `read_timeout`, `socket_mode` and `socket_path` are what the loop binds and applies, and `user_config`, `site_dir`, `config_path` and `site_toml` are the roots a service resolves its own files against.
 
 ```rust
+pub const GENID_PATH: &str;
 pub fn load(name: &str, code: &[CodeRoute], named: &[&str], renderer: &dyn RendererFactory) -> Site;
+pub fn reload(&self, code: &[CodeRoute], named: &[&str], renderer: &dyn RendererFactory) -> Result<Site, String>;
 pub fn socket_path(&self) -> &Path;
 pub fn read_timeout(&self) -> Option<Duration>;
 pub fn socket_mode(&self) -> u32;
@@ -300,11 +302,15 @@ pub fn site_toml(&self) -> &Path;
 pub fn name(&self) -> &str;
 pub fn handle(&self, head: &RequestHead<'_>) -> Handled;
 pub fn finish(&self, req: &Request, resp: Response) -> Response;
+pub fn genid_ok() -> Response;
+pub fn genid_failed(cause: &str) -> Response;
 ```
 
 **Per request.** `handle` routes, builds the dictionary and the owned `Request`, and either answers a template route itself or returns the service's index.
 `Done` is already finished.
 `Code` and `Named` carry the request, and the service calls `finish` on the response its handler returned.
+`Reload` is `POST /genid`: the loop runs the start path again with `reload`, assigns the new `Site` when that is `Ok`, and answers `genid_ok()` or `genid_failed(&e)`.
+A method other than POST on `/genid` is a 405 and a route on `/genid` is refused at start.
 The service's dispatch is a plain `match` on that index.
 
 ```rust
@@ -318,6 +324,13 @@ let resp = match site.handle(&head) {
         let r = handler::serve(&req).unwrap_or_else(|e| error_response(&e));
         site.finish(&req, r)
     }
+    Handled::Reload => match site.reload(ROUTES, &[], &NoTemplates) {
+        Ok(next) => {
+            *site = next;
+            genid_ok()
+        }
+        Err(e) => genid_failed(&e),
+    },
     Handled::Named(..) | Handled::Code(..) => unreachable!("load checked every route and name"),
 };
 ```
