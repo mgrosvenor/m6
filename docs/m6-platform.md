@@ -58,7 +58,7 @@ Three readings have no macOS source without IOKit and are absent there: disk thr
 m6 sets `SO_REUSEPORT` only on a listener a service opens through `net::listen_shared`, which m6-http's `[server] reuse_port` asks for.
 Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and gives every UDP datagram to one socket. macOS spreads neither: the socket bound last to the port receives every connection and every datagram, so there a second process is a takeover rather than a scale-out.
 Nothing may assume an even spread on either target, and on Linux a QUIC client that changes address may land on another process.
-m6-http opens it only for the public 443 port: the TLS listener and its QUIC UDP socket on `[server].bind`. The redirect listener, the internal h2c listener, the health endpoints and the backend sockets never go through it.
+m6-http opens it only for the public 443 port: the TLS listener and its QUIC UDP socket on `[server].bind`. The redirect listener, the internal h2c listener and the backend sockets never go through it. The health endpoints are served on that shared listener.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 Everything in Table 1 is held by the tests in section 6.
 

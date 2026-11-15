@@ -44,6 +44,8 @@ The released versions, newest first:
 
 ### Migration
 
+**The per-IP limit is counted per process, so a node that shares its public port with `[server] reuse_port` allows one client up to N times `requests_per_min` across N processes.** The default is 300 requests per client in 60 seconds, so three processes on the port allow 900. A config that sets `[server] reuse_port = true` and leaves `[rate_limit]` enabled starts without an error. `docs/m6-http.md` and `docs/m6-site-toml.md` §4.13 state the number and the consequence. No configuration change is required. A node that must enforce one number sets `requests_per_min` to the node total divided by the process count, or enforces the limit at the front door.
+
 **`[health] metrics_token_file` is removed, and a config that still names it stops m6-http at start with exit 2.** Switch `/perf` and `/traffic` to `[health] metrics_require = "role:<name>"` or `"group:<name>"` with `[auth] public_key`, and give the monitor a signed API token. A node that used only the legacy bearer file serves neither endpoint until it does. The refusal body on every token-gated route is now `{"error":"unauthorised"}` (401, with `WWW-Authenticate: Bearer`) or `{"error":"forbidden"}` (403); an API client that parsed a route's HTML 401 or 403 page gets JSON. A browser with no credential is still redirected to `/login` or `/auth/refresh`, and a browser with a valid token for the wrong role still gets the site's 403 page; a browser with an invalid or expired token is now redirected to login instead of shown a 401 page.
 
 **An m6-http route can declare the methods it answers, and a request with another method is answered 405 with `Allow` naming the methods it does answer (#174).**

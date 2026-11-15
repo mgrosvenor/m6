@@ -34,7 +34,7 @@ Logs to stdout as structured JSON.
 7. Bind the TLS listener. If `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
 8. Start the event loop
 
-With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_platform::net::listen_shared`, before the TLS configuration is built. The redirect listener on port 80, the internal h2c listener, the health endpoints and every backend socket are not shared.
+With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_platform::net::listen_shared`, before the TLS configuration is built. The redirect listener on port 80, the internal h2c listener and every backend socket are not shared.
 
 ---
 
@@ -106,6 +106,22 @@ The 256 KiB `MAX_HEADER_BLOCK` bound on the compressed header block stays, becau
 HTTP/3 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the pinned quiche enforces it by closing the connection with H3_EXCESSIVE_LOAD.
 A single field over `MAX_HEADER_LINE` and a request line over it are answered on the HTTP/3 stream, as they are on the other two protocols.
 The HTTP/1.1 head limit is separate from the 20 MiB cap on a whole request, and that cap stays.
+
+---
+
+## Rate Limiting
+
+m6-http counts every request from a client address in a fixed 60-second window before the cache and every backend, on HTTP/1.1, HTTP/2 and HTTP/3, and it answers 429 with `Retry-After: 60` and the body `Too Many Requests` when the count passes the limit.
+The keys are in the `[rate_limit]` table in `site.toml`, and the limiter is on by default at 300 requests per client per minute.
+`m6-site-toml.md` §4.13 owns the keys.
+
+The count is keyed by client address and held in the process's memory.
+One process on the public port enforces 300 requests per client per minute for the node.
+With `[server] reuse_port`, N processes on one port each keep a count, so one client can reach up to N times `requests_per_min` across the port: three processes at the default allow 900 requests in a minute.
+An operator who needs the node to enforce one number sets `requests_per_min` to the node total divided by the process count, or enforces the limit at the front door.
+`m6-site-toml.md` §4.13 records a Linux socket-filter design that would make the per-process count exact, as an idea for a later batch.
+
+A monitor reads one process's report per poll, and the next section states what the cache does with the requests that pass.
 
 ---
 
@@ -375,6 +391,10 @@ m6-http answers `/health`, `/perf` and `/traffic` itself, ahead of routing, the 
 A refusal never reaches routing or the cache, so a catch-all route can never answer `/perf` and a built-in path never enters the cache.
 `/health` is public.
 `/perf` and `/traffic` are gated by the `[health]` keys in Table 1.
+
+Each of the three endpoints reports the process that accepted the request.
+With `[server] reuse_port`, the kernel chooses that process, so a monitor polling one address reads one front end of N per poll and the report holds that process's share of the node.
+The rate limiting section states the same split for the request counters.
 
 `/perf` reports three traffic populations and never pools them.
 `http/<version>/external` is a real visitor from a public address on the TLS or QUIC listener, or a loopback client on either.
