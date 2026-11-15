@@ -99,6 +99,12 @@ pub(super) fn thread_count(pid: u32) -> io::Result<usize> {
     Ok(std::fs::read_dir(format!("/proc/{pid}/task"))?.count())
 }
 
+/// Reading the host's certificate store is a file read on this platform, so it
+/// leaves no thread behind.
+pub(super) fn certificate_store_workers() -> (usize, usize) {
+    (0, 0)
+}
+
 /// The entries of `/proc/<pid>/fd`. For this process the listing holds its
 /// own directory handle, which is not one of the process's descriptors once
 /// the count is returned, so it is left out.
