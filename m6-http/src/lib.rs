@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 /// m6-http library: shared modules for testing and integration.
 pub mod analytics;
 pub mod auth;

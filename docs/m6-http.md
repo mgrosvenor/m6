@@ -32,7 +32,7 @@ Logs to stdout as structured JSON.
 5. Expand `[[route_group]]` globs against site directory — builds route table entries and invalidation map
 6. Read renderer configs to build params-file → URL invalidation map entries
 7. Bind the TLS listener. If `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
-8. Start epoll event loop
+8. Start the event loop
 
 ---
 
@@ -434,19 +434,24 @@ The row states what the code does and leaves the fix to the issue.
 *Table 6: the one HTTP/2 limit m6-http does not implement, and the issue that tracks it. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the issue number is the record of the gap.*
 
 The gap is engineering work tracked by the issue.
-Event Loop below describes the single-threaded epoll loop that drives these connections.
+Event Loop below describes the one loop that drives these connections, and `m6-architecture.md` §1.10 states the rules it follows.
 
 ---
 
 ## Event Loop
 
-Single-threaded epoll. No Tokio.
+One thread, one edge-triggered `m6_core::platform::Poll` loop, no async runtime.
+`m6-architecture.md` §1.10 states the rules it follows, and `m6-core/examples/echo.rs` is the reference loop.
 
 - No heap allocation on hot path
 - No `unwrap()` or `expect()`
 - No blocking calls in event loop
-- Cache behind `Arc`, shared read-only once built
 - H2C and H2S client pools driven in the event loop alongside TLS/QUIC listeners
+
+The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
+Every connection and every upstream gets its own `Token(k)` in the `Slots` table.
+A turn matches the token and runs one arm: accept on a listener until it would block, drain the UDP socket for QUIC, read the signal descriptor and hand it to `m6_core::signal::Lifecycle`, flush the log, or drive one connection or upstream.
+The wait is bounded by a 1 s accounting tick, every deadline table and quiche's own timeout.
 
 ---
 
