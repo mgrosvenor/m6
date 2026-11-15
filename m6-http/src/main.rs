@@ -3454,8 +3454,12 @@ fn send_h3_response(
         h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
     }
     if let Some(genid) = genid {
+        // quiche lower-cases a header name when it encodes the field section,
+        // so this spelling is not what made an h3 response valid. Writing the
+        // lower-case constant here means neither serialiser depends on a
+        // library's normalisation for RFC 9114 4.2.
         h3_headers.push(quiche::h3::Header::new(
-            genid::GENID_HEADER.as_bytes(),
+            genid::GENID_HEADER_LOWER.as_bytes(),
             itoa::Buffer::new().format(genid).as_bytes(),
         ));
     }

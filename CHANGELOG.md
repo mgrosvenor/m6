@@ -178,6 +178,14 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**A source node's `M6-Genid` header no longer makes an HTTP/2 response unreadable.**
+The header was serialised with its title-case name in the HPACK block, and RFC 9113 8.2.1 requires lower-case field names.
+A strict client rejected the HEADERS frame as a protocol error and read no body, so a page that HTTP/1.1 served as 2671 bytes arrived as 0 over HTTP/2.
+The HTTP/2 and HTTP/3 serialisers now write the lower-case spelling.
+quiche already lower-cases the names it encodes, so HTTP/3 was correct on the wire, and the change there removes the dependence on that normalisation.
+Verified with `h2_serves_the_same_body_as_h1` and `h3_serves_the_same_body_as_h1`, which fetch the same cached page through a real m6-http process and compare it with HTTP/1.1.
+The h2 test fails on the previous code with a protocol error from a strict h2 client and passes after the fix.
+
 **A service writes its access line at the default log level (#179).**
 `Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
 It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.
