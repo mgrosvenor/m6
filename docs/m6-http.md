@@ -177,6 +177,7 @@ A publisher that is itself a backend of the source drives this POST from its own
 ### The ID on content
 
 Every response the source receives from a backend carries the ID that was current when the request was dispatched, written as `M6-Genid: <decimal>` when the response head is serialised.
+HTTP/2 and HTTP/3 write the name in lower case, which RFC 9113 8.2.1 and RFC 9114 4.2 require.
 A cached response carries the ID stored with it.
 A response whose dispatch ID is no longer current is not stored, so the cache cannot refill from a backend that is one generation behind.
 A locally built answer, such as a health check or an error page, carries no ID.

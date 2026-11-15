@@ -2007,8 +2007,10 @@ impl Http2Conn {
             pairs.push((k.as_bytes(), v.as_bytes()));
         }
         if let Some(genid) = genid {
+            // Lower case: RFC 9113 8.2.1 allows no other spelling, and a client
+            // that enforces it rejects the whole header block.
             pairs.push((
-                crate::genid::GENID_HEADER.as_bytes(),
+                crate::genid::GENID_HEADER_LOWER.as_bytes(),
                 genid_buf.format(genid).as_bytes(),
             ));
         }

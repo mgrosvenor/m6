@@ -24,6 +24,15 @@ use crate::forward::Waiter;
 /// The header that carries a response's generation to a client.
 pub const GENID_HEADER: &str = "M6-Genid";
 
+/// The same header, in the only spelling HTTP/2 and HTTP/3 may put on the wire.
+///
+/// RFC 9113 8.2.1 and RFC 9114 4.2 require field names in lower case, and a
+/// strict client rejects the whole header block when one is not. `GENID_HEADER`
+/// is the HTTP/1.1 spelling (case does not matter there, and it is what the
+/// docs show). An h2 response written with it reached curl as a protocol error
+/// and zero body bytes where HTTP/1.1 read 2671.
+pub const GENID_HEADER_LOWER: &str = "m6-genid";
+
 /// How often a cache node asks its upstream for the ID, unless configured.
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 10;
 
