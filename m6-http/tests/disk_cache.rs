@@ -31,6 +31,14 @@ use rustls::StreamOwned;
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 use m6_http_lib::disk_cache;
 
+/// The body of the load test's page, in bytes. About 400 of these fit one
+/// 4 MiB tick, because a file is the body plus its metadata.
+const LOAD_BODY_LEN: usize = 10_000;
+
+/// Entries the load test queues while it holds the tick: more than one tick's
+/// 4 MiB budget, so the first tick after the hold is a full-budget tick.
+const LOAD_KEYS: usize = 500;
+
 // ── Responses ─────────────────────────────────────────────────────────────────
 
 struct Resp {
@@ -140,6 +148,8 @@ struct Stack {
     source_port: PortClaim,
     cache_port: PortClaim,
     private_pem: String,
+    /// While this file exists, the cache node holds its disk tick.
+    hold_tick: PathBuf,
 }
 
 impl Stack {
@@ -183,13 +193,19 @@ impl Stack {
             "other: {{ title }}",
         )
         .unwrap();
+        std::fs::write(
+            source_site.join("templates/load.html"),
+            "x".repeat(LOAD_BODY_LEN),
+        )
+        .unwrap();
         std::fs::write(source_site.join("data/page.json"), "{\"title\": \"one\"}").unwrap();
         std::fs::write(source_site.join("data/site.json"), "{}").unwrap();
         std::fs::write(
             source_site.join("configs/m6-html.conf"),
             "global_params = [\"data/page.json\"]\n\n\
              [[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\ncache = \"public, max-age=60\"\n\n\
-             [[route]]\npath = \"/other\"\ntemplate = \"templates/other.html\"\ncache = \"public, max-age=60\"\n",
+             [[route]]\npath = \"/other\"\ntemplate = \"templates/other.html\"\ncache = \"public, max-age=60\"\n\n\
+             [[route]]\npath = \"/load\"\ntemplate = \"templates/load.html\"\ncache = \"public, max-age=60\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -203,7 +219,8 @@ impl Stack {
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"m6-html\"\nsockets = \"{}/html-*.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"m6-html\"\n\n\
-                 [[route]]\npath = \"/other\"\nbackend = \"m6-html\"\n",
+                 [[route]]\npath = \"/other\"\nbackend = \"m6-html\"\n\n\
+                 [[route]]\npath = \"/load\"\nbackend = \"m6-html\"\n",
                 d.display()
             ),
         )
@@ -269,6 +286,7 @@ impl Stack {
         )
         .unwrap();
 
+        let hold_tick = d.join("hold-disk-tick");
         Stack {
             html: None,
             source: None,
@@ -282,6 +300,7 @@ impl Stack {
             source_port,
             cache_port,
             private_pem,
+            hold_tick,
         }
     }
 
@@ -351,6 +370,9 @@ impl Stack {
             // interval, so `/perf` has a loop trace to report while a test
             // runs. A release build ignores the variable.
             .env("M6_TEST_STATS_INTERVAL_SECS", "1")
+            // The load test creates this file to hold the disk tick while it
+            // builds a backlog, then removes it for one full-budget tick.
+            .env("M6_TEST_DISK_TICK_HOLD_FILE", &self.hold_tick)
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-cache", &mut cmd);
@@ -496,16 +518,7 @@ impl Stack {
 
     /// The longest loop iteration `/perf` currently reports, in nanoseconds.
     fn longest_loop_work_ns(&self) -> u64 {
-        let body = self.perf().text();
-        body.match_indices("\"work_max_ns\":")
-            .filter_map(|(i, pat)| {
-                body[i + pat.len()..]
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .and_then(|n| n.parse().ok())
-            })
-            .max()
-            .unwrap_or(0)
+        loop_work_max_ns(&self.perf().text())
     }
 
     fn perf_id(&self) -> Option<String> {
@@ -555,6 +568,27 @@ impl Stack {
         files.sort();
         files
     }
+}
+
+/// A JSON number from a `/perf` body, found by its key.
+fn number_after(body: &str, pattern: &str) -> Option<u64> {
+    body.split(pattern)
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok())
+}
+
+/// The longest loop iteration a `/perf` body reports, in nanoseconds.
+fn loop_work_max_ns(body: &str) -> u64 {
+    body.match_indices("\"work_max_ns\":")
+        .filter_map(|(i, pat)| {
+            body[i + pat.len()..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn no_verify_tls() -> Arc<rustls::ClientConfig> {
@@ -686,6 +720,105 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
         "the stored entry carries the generation too"
     );
     assert_eq!(&response.body[..], b"first: one");
+}
+
+/// A tick under load: the 4 MiB write budget and the 512-file removal budget,
+/// and the loop's longest iteration while the writer is busy.
+///
+/// Five hundred entries of 10,000 bytes are queued while the writer's tick is
+/// held, more than the roughly 400 files a tick writes under the 4 MiB budget.
+/// The first tick after the hold therefore reaches the budget. The cache root
+/// starts with 1,000 files under generation `999`, so removal ticks take 512
+/// files each. The report is the loop `work_max_ns` while the writer is busy:
+/// the build host's cache-hit latency A/B runs the same node with the writer
+/// busy and idle.
+///
+/// Break: remove `disk.tick` from the accounting tick, and `dir_bytes` stays 0.
+#[test]
+fn a_full_tick_under_load_reports_its_work_max_ns() {
+    let mut stack = Stack::new();
+    let old = stack.cache_dir.join("999");
+    std::fs::create_dir_all(&old).unwrap();
+    for i in 0..1_000 {
+        std::fs::write(old.join(format!("{i:064x}")), b"old generation file").unwrap();
+    }
+    // Hold the writer's tick while the backlog is queued, so the first tick
+    // after the hold has more than 4 MiB waiting and fills the budget.
+    std::fs::write(&stack.hold_tick, b"hold").unwrap();
+    stack.start();
+    assert!(
+        stack.wait_perf_id("0", Duration::from_secs(10)),
+        "/perf never showed the source's ID:\n{}",
+        stack.cache_output()
+    );
+
+    for i in 0..LOAD_KEYS {
+        let response = stack.get_cache(&format!("/load?k={i}"), &[]);
+        assert_eq!(
+            response.status,
+            200,
+            "{:?} {} source:\n{}",
+            response.header("x-test-error"),
+            response.text(),
+            stack.source_output()
+        );
+        assert_eq!(
+            response.body.len(),
+            LOAD_BODY_LEN,
+            "the load page's body from the source"
+        );
+    }
+
+    std::fs::remove_file(&stack.hold_tick).expect("release the tick");
+    let want_bytes = (LOAD_KEYS * LOAD_BODY_LEN) as u64;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut max_work_ns = 0u64;
+    let mut full_ticks = 0usize;
+    let mut last_written = 0u64;
+    // After a full tick is seen, keep reading until the stats window that
+    // contains it has been emitted (one second) and copied into `/perf`.
+    let mut settle_until: Option<Instant> = None;
+    let mut polls = 0usize;
+    loop {
+        let body = stack.perf().text();
+        polls += 1;
+        let bytes = number_after(&body, "\"dir_bytes\":").unwrap_or(0);
+        let written = number_after(&body, "\"written_bytes_last_tick\":").unwrap_or(0);
+        max_work_ns = max_work_ns.max(loop_work_max_ns(&body));
+        if written >= 4_000_000 && written != last_written {
+            full_ticks += 1;
+            settle_until = Some(Instant::now() + Duration::from_millis(1_500));
+        }
+        last_written = written;
+        let queued = body.contains("\"queued\":0");
+        let drained = bytes + 4_096 >= want_bytes && queued && !old.exists();
+        let now = Instant::now();
+        if drained && settle_until.is_none_or(|until| now >= until) {
+            break;
+        }
+        if now >= deadline {
+            panic!(
+                "the writer did not drain {LOAD_KEYS} files: dir_bytes {bytes} of \
+                 {want_bytes}, {full_ticks} full ticks, queue drained {queued}, old \
+                 directory still there {}:\n{body}",
+                old.exists()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let files = stack.files_for("0");
+    assert_eq!(files.len(), LOAD_KEYS, "every queued entry became one file");
+    println!(
+        "full tick under load: {full_ticks} ticks of at least 4,000,000 bytes, {} files, \
+         dir_bytes {want_bytes}, loop work_max_ns {max_work_ns}, generation dirs {:?}",
+        files.len(),
+        stack.generation_dirs()
+    );
+    assert!(
+        full_ticks > 0,
+        "no single tick wrote a full 4 MiB budget ({polls} polls)"
+    );
+    assert!(max_work_ns > 0, "the loop trace reported no work");
 }
 
 /// The node stops, and the file it left behind still decodes to the response it

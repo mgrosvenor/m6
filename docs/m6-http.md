@@ -234,10 +234,10 @@ A source that sets it is refused at start with `config error: [cache].dir is for
 The layout is `<dir>/<genid decimal>/<64 hex characters>`, the file name being the SHA-256 of the cache key's bytes.
 One subdirectory per generation means a change needs no per-file rewrite, and every other subdirectory is removed over the ticks that follow.
 
-A stored entry pushes its key on the writer's ring once, and nothing is written there.
-The entry's `queued` flag is the dedup, so a second store before the tick adds nothing.
-The ring holds 4,096 keys and never grows.
-A push to a full ring is skipped and counted as `skipped_queue_full` in `/perf`, and a later store of the same key tries again.
+A stored entry is marked with a `queued` flag in the same insert that stores it, and nothing is written there.
+The flag is the dedup, so a second store before the tick adds nothing.
+No key is copied and no queue entry is pushed, so the store allocates nothing for the writer.
+On the tick the writer scans the cache for flagged entries, and an entry the budget cannot reach keeps its flag for the next tick.
 
 On each accounting tick the writer removes up to 512 files from an old generation's directory, then writes current entries until it has written 4 MiB or the queue is empty.
 Removals run first, so their bytes are available to the write bound.
@@ -260,8 +260,10 @@ On a generation change the queue and the size map are cleared, the new subdirect
 Removal takes up to 512 files per tick, then the empty directory.
 While the node has no current ID nothing is written, because nothing is stored in memory then either.
 
-An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `skipped_full` and `skipped_queue_full`.
+An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick` and `skipped_full`.
 `dir_bytes` counts the files in the current generation's directory.
+`queued` counts the entries whose flag is set.
+`written_bytes_last_tick` is the encoded size of the last tick's writes, including a single entry larger than the 4 MiB budget.
 
 ---
 

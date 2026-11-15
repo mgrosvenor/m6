@@ -1,26 +1,24 @@
-//! Queuing a stored entry for the disk writer allocates nothing.
+//! Storing an entry for the disk writer allocates nothing extra.
 //!
 //! `harness = false` means no libtest thread runs in this binary, so the
 //! counting allocator reads only what these checks allocated. `main` forces
 //! `libtest-mimic` onto one thread, and the library is exercised through the
-//! same `DiskWriter::queue` the request path calls. Four thousand keys are made
-//! and stored in a `Cache` before counting, so the flag test and set does real
-//! map work rather than finding nothing. One thousand queued keys after that
-//! cost zero allocations: the key is moved into a ring reserved at start, and
-//! the duplicate check is the entry's `queued` flag, not a second set. A full
-//! ring refuses the push and counts it, also with no allocation.
+//! same `Cache::insert_queued` the request path calls. A thousand keys are made,
+//! stored, and their replacement responses prepared before counting. The
+//! measured loop stores the same thousand keys again with the writer's flag
+//! set: the key already exists in the map, so the insert replaces an entry and
+//! grows nothing. The flag is set in that same insert, which is why the request
+//! path copies no key and pushes nothing.
 //!
-//! Breaks: clone the key into the ring instead of moving it, and the count is
-//! one thousand. Refuse duplicates with a `HashSet` instead of the entry's
-//! flag, and the first push allocates a table. Grow the ring instead of
-//! refusing a full one, and the full-ring check allocates.
+//! Breaks: return `Cache` to cloning the key for a writer ring, and the count
+//! is one thousand. Store the key's bytes a second time in a queue, and it is
+//! one thousand again.
 
 use std::sync::Arc;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::testkit::alloc_count;
 use m6_http_lib::cache::{Cache, CacheKey, CachedResponse};
-use m6_http_lib::disk_cache::{DiskWriter, QUEUE_SLOTS};
 
 #[global_allocator]
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
@@ -31,11 +29,17 @@ fn main() {
     // thread, so the counter reads only the trial's own allocations.
     args.test_threads = Some(1);
     let tests = vec![
-        Trial::test("queueing_allocates_nothing", || {
-            outcome("queueing_allocates_nothing", queueing_allocates_nothing())
+        Trial::test("storing_for_the_writer_allocates_nothing", || {
+            outcome(
+                "storing_for_the_writer_allocates_nothing",
+                storing_for_the_writer_allocates_nothing(),
+            )
         }),
-        Trial::test("a_full_ring_counts_the_skip", || {
-            outcome("a_full_ring_counts_the_skip", a_full_ring_counts_the_skip())
+        Trial::test("a_store_without_a_writer_marks_nothing", || {
+            outcome(
+                "a_store_without_a_writer_marks_nothing",
+                a_store_without_a_writer_marks_nothing(),
+            )
         }),
     ];
     libtest_mimic::run(&args, tests).exit();
@@ -58,57 +62,42 @@ fn response() -> CachedResponse {
     }
 }
 
-/// A cache filled to the plan's 4,096 entries, and the keys this check queues.
-fn filled_cache() -> (Cache, Vec<CacheKey>) {
+fn storing_for_the_writer_allocates_nothing() -> bool {
     let cache = Cache::new();
-    let mut queued = Vec::with_capacity(1_000);
-    for i in 0..4_096 {
-        let key = CacheKey::new(&format!("/p{i}"), None, "");
-        if i < 1_000 {
-            queued.push(key.clone());
-        }
-        cache.insert(key, response());
+    let keys: Vec<CacheKey> = (0..1_000)
+        .map(|i| CacheKey::new(&format!("/p{i}"), None, ""))
+        .collect();
+    // Store each key once, before counting. The measured loop then replaces
+    // the same entries, so no hash table growth lands inside the count.
+    for key in &keys {
+        cache.insert(key.clone(), response());
     }
-    (cache, queued)
-}
-
-fn queueing_allocates_nothing() -> bool {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (mut cache, queued) = filled_cache();
-    let mut writer = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).expect("writer");
-    writer.use_id(7);
-    assert_eq!(cache.len(), 4_096, "the check starts with a full cache");
+    let mut responses: Vec<CachedResponse> = (0..1_000).map(|_| response()).collect();
+    assert_eq!(cache.len(), 1_000, "the check starts with a full set");
 
     let start = alloc_count::now();
-    for key in queued {
-        writer.queue(key, &mut cache);
+    for key in keys {
+        cache.insert_queued(key, responses.pop().expect("one response per key"));
     }
     let n = alloc_count::now() - start;
-    println!("queueing_allocates_nothing: {n} allocation(s) in 1000 queued entries");
-    assert_eq!(writer.queued(), 1_000, "every key was queued");
-    n != 0
-}
-
-fn a_full_ring_counts_the_skip() -> bool {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut cache = Cache::new();
-    let mut writer = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).expect("writer");
-    writer.use_id(7);
-    for i in 0..QUEUE_SLOTS {
-        writer.queue(CacheKey::new(&format!("/full{i}"), None, ""), &mut cache);
-    }
-    assert_eq!(writer.queued(), QUEUE_SLOTS, "the ring is full");
-    let extra = CacheKey::new("/one-more", None, "");
-
-    let start = alloc_count::now();
-    writer.queue(extra, &mut cache);
-    let n = alloc_count::now() - start;
-    println!("a_full_ring_counts_the_skip: {n} allocation(s) for one refused push");
-    assert_eq!(
-        writer.skipped_queue_full(),
-        1,
-        "the refused push is counted"
+    println!(
+        "storing_for_the_writer_allocates_nothing: {n} allocation(s) in 1000 stores marked for the writer"
     );
-    assert_eq!(writer.queued(), QUEUE_SLOTS, "the ring did not grow");
+    assert_eq!(cache.queued(), 1_000, "every entry is marked");
     n != 0
+}
+
+/// A store on a node with no disk writer leaves the flag clear, so the flag
+/// costs nothing on the ordinary path and the counter is not maintained for
+/// nothing.
+fn a_store_without_a_writer_marks_nothing() -> bool {
+    let cache = Cache::new();
+    let key = CacheKey::new("/plain", None, "");
+    cache.insert(key, response());
+    println!(
+        "a_store_without_a_writer_marks_nothing: {} entries queued",
+        cache.queued()
+    );
+    assert_eq!(cache.queued(), 0, "a plain store does not mark");
+    false
 }

@@ -2574,8 +2574,12 @@ fn event_loop(
             // The disk cache's work rides the same tick: a bounded amount of
             // writing and removing, never on the request path. The writer
             // takes the cache by `&mut`, so this is the only place it runs.
-            if let Some(disk) = state.disk.as_mut() {
-                disk.tick(&mut state.cache);
+            // A debug build may hold the disk work through the load test's
+            // file, so a backlog can reach a full 4 MiB tick before it runs.
+            if !disk_tick_held() {
+                if let Some(disk) = state.disk.as_mut() {
+                    disk.tick(&mut state.cache);
+                }
             }
         }
 
@@ -4181,6 +4185,7 @@ fn handle_request_inner(
                             &state.genid,
                             genid_config,
                             state.disk.as_ref(),
+                            state.cache.queued(),
                         ),
                         None => health::PerfOutcome::Ok(report).into_response(),
                     },
@@ -5390,20 +5395,20 @@ fn complete_socket_response(
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
-                    // The ring takes its own copy of the key: the one clone a
-                    // stored entry costs, the same kind the insert makes.
-                    // Nothing is written here, only queued.
-                    state.cache.insert(
-                        key.clone(),
-                        CachedResponse {
-                            genid: stored,
-                            status: http_resp.status,
-                            headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
-                            body: Bytes::from(http_resp.body.clone()),
-                        },
-                    );
-                    if let Some(disk) = state.disk.as_mut() {
-                        disk.queue(key, &mut state.cache);
+                    // On a node with a disk writer the insert sets the entry's
+                    // queued flag in the same map write that stores it, so the
+                    // request path copies no key and pushes nothing. Nothing is
+                    // written here.
+                    let response = CachedResponse {
+                        genid: stored,
+                        status: http_resp.status,
+                        headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                        body: Bytes::from(http_resp.body.clone()),
+                    };
+                    if state.disk.is_some() {
+                        state.cache.insert_queued(key, response);
+                    } else {
+                        state.cache.insert(key, response);
                     }
                 }
                 ReplyRule::Behind => {
@@ -5599,19 +5604,18 @@ fn finalize_url_response_inner(
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
-                    // The same one-clone queue as the synchronous path: the
-                    // disk write itself waits for the tick.
-                    state.cache.insert(
-                        key.clone(),
-                        CachedResponse {
-                            genid: stored,
-                            status: http_resp.status,
-                            headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
-                            body: Bytes::from(http_resp.body.clone()),
-                        },
-                    );
-                    if let Some(disk) = state.disk.as_mut() {
-                        disk.queue(key, &mut state.cache);
+                    // The same store as the synchronous path: the flag rides
+                    // the insert, and the disk write itself waits for the tick.
+                    let response = CachedResponse {
+                        genid: stored,
+                        status: http_resp.status,
+                        headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                        body: Bytes::from(http_resp.body.clone()),
+                    };
+                    if state.disk.is_some() {
+                        state.cache.insert_queued(key, response);
+                    } else {
+                        state.cache.insert(key, response);
                     }
                 }
                 ReplyRule::Behind => {
@@ -6357,6 +6361,24 @@ fn run(args: Vec<String>) -> i32 {
         return 1;
     }
     code
+}
+
+/// Whether the load test is holding the disk writer's tick.
+///
+/// A debug build only. The load test creates the file this names, queues more
+/// entries than one tick's 4 MiB budget, then removes it, so the next tick is
+/// a full-budget tick with a known state. A release build never reads the
+/// variable and always writes on the tick.
+#[cfg(debug_assertions)]
+fn disk_tick_held() -> bool {
+    std::env::var_os("M6_TEST_DISK_TICK_HOLD_FILE")
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+
+/// A release build does not read the test's hold file.
+#[cfg(not(debug_assertions))]
+fn disk_tick_held() -> bool {
+    false
 }
 
 /// The accounting tick for this process.

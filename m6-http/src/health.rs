@@ -648,6 +648,7 @@ pub fn genid_perf_response(
     role: &crate::genid::Role,
     config: &GenidConfig,
     disk: Option<&crate::disk_cache::DiskWriter>,
+    queued: usize,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let mut value = serde_json::to_value(&report)
         .unwrap_or_else(|_| serde_json::json!({"error": "serialisation failed"}));
@@ -658,10 +659,10 @@ pub fn genid_perf_response(
                 "disk_cache".to_string(),
                 serde_json::json!({
                     "dir_bytes": writer.dir_bytes(),
-                    "queued": writer.queued(),
+                    "queued": queued,
                     "written_last_tick": writer.written_last_tick(),
+                    "written_bytes_last_tick": writer.written_bytes_last_tick(),
                     "skipped_full": writer.skipped_full(),
-                    "skipped_queue_full": writer.skipped_queue_full(),
                 }),
             );
         }

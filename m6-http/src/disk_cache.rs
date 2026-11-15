@@ -1,11 +1,13 @@
 //! A cache node's disk copy of its memory cache, written from the loop's tick.
 //!
-//! The request path never touches a file. A stored entry pushes its key on the
-//! writer's ring, once, and the accounting tick does all the disk work: up to
+//! The request path never touches a file. A stored entry carries a `queued`
+//! flag, set in the same insert that stores it, and the accounting tick scans
+//! the cache for flagged entries and does all the disk work: up to
 //! [`WRITE_BUDGET`] bytes of current entries, and up to [`REMOVE_BUDGET`] files
-//! of an old generation's directory. A tick that runs out of budget with more
-//! to write leaves the remaining keys on the ring, still marked queued, so the
-//! next tick continues where it stopped.
+//! of an old generation's directory. A tick that runs out of budget leaves the
+//! remaining entries flagged, so the next tick continues where it stopped.
+//! Nothing is copied or pushed on the request path, so a store for the writer
+//! allocates nothing beyond the store it already made.
 //!
 //! The layout is `<dir>/<genid decimal>/<sha256 of the key>`, one subdirectory
 //! per generation, so an ID change needs no per-file rewrite. A file is written
@@ -22,18 +24,13 @@
 //! [u8; 32] SHA-256 of every byte before it
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::cache::{Cache, CacheKey, CachedResponse};
-
-/// Keys the writer may hold at once. The ring is reserved at start and never
-/// grows: a push to a full ring is refused and counted, and a later store of
-/// the same key tries again.
-pub const QUEUE_SLOTS: usize = 4096;
+use crate::cache::{Cache, CachedResponse};
 
 /// Bytes of files one tick may write. A single entry larger than the budget is
 /// written on its own, because a file is never split.
@@ -81,9 +78,6 @@ pub struct DiskWriter {
     /// The current ID and its subdirectory. `None` means the node has no ID
     /// yet, and nothing is written.
     current: Option<(u64, PathBuf)>,
-    /// Keys to write, each queued once (the entry's `queued` flag is the
-    /// dedup). Reserved to [`QUEUE_SLOTS`] at start.
-    ring: VecDeque<CacheKey>,
     /// One encode buffer for every file, reserved at start. Grown only when an
     /// entry does not fit, which is table growth rather than a per-entry
     /// allocation.
@@ -102,14 +96,14 @@ pub struct DiskWriter {
     full_logged: bool,
     /// Entries skipped because writing one would pass the byte bound.
     skipped_full: u64,
-    /// Pushes refused because the ring was full.
-    skipped_queue_full: u64,
     /// A write failure has been logged since the last successful write. One
     /// line per failure episode, with the path and the error, not one per
     /// entry.
     write_error_logged: bool,
     /// Files written in the last tick.
     written_last_tick: usize,
+    /// Encoded bytes written in the last tick.
+    written_bytes_last_tick: u64,
 }
 
 impl DiskWriter {
@@ -123,7 +117,6 @@ impl DiskWriter {
         Ok(DiskWriter {
             dir,
             current: None,
-            ring: VecDeque::with_capacity(QUEUE_SLOTS),
             buf: Vec::with_capacity(1024 * 1024),
             sizes: HashMap::new(),
             bytes_on_disk: 0,
@@ -131,9 +124,9 @@ impl DiskWriter {
             removals: Vec::new(),
             full_logged: false,
             skipped_full: 0,
-            skipped_queue_full: 0,
             write_error_logged: false,
             written_last_tick: 0,
+            written_bytes_last_tick: 0,
         })
     }
 
@@ -142,12 +135,11 @@ impl DiskWriter {
     ///
     /// Called on the first ID and on a change. On a change the caller has
     /// already swapped the memory cache for an empty one, so no entry's
-    /// queued flag survives on a key this writer still holds.
+    /// queued flag survives and the scan starts from an empty map.
     pub fn use_id(&mut self, id: u64) {
         if self.current.as_ref().is_some_and(|(cur, _)| *cur == id) {
             return;
         }
-        self.ring.clear();
         self.sizes.clear();
         self.bytes_on_disk = 0;
         self.full_logged = false;
@@ -171,60 +163,34 @@ impl DiskWriter {
         }
     }
 
-    /// Queue `key` to be written, once, and allocate nothing.
-    ///
-    /// Called on the request path right after the memory cache stored the
-    /// entry. The key is moved in, so the caller's one clone is the ring's
-    /// copy. A duplicate is refused by the entry's `queued` flag. A full ring
-    /// refuses the push and counts it, and a later store of the same key tries
-    /// again.
-    pub fn queue(&mut self, key: CacheKey, cache: &mut Cache) {
-        if self.current.is_none() {
-            return;
-        }
-        if self.ring.len() >= QUEUE_SLOTS {
-            self.skipped_queue_full += 1;
-            return;
-        }
-        if cache.set_queued(&key, true) {
-            return;
-        }
-        self.ring.push_back(key);
-    }
-
     /// Write and remove a bounded amount of disk work.
     ///
     /// Removals run first, because they free bytes the write bound is checked
-    /// against. Then the writer takes keys from the ring until it has written
-    /// [`WRITE_BUDGET`] bytes or the ring is empty. An entry that would pass
-    /// the bound is skipped and counted. An entry larger than a whole tick's
-    /// budget is written on its own when nothing else was, because a file is
-    /// never split.
+    /// against. Then the writer scans the cache for entries with the `queued`
+    /// flag until it has written [`WRITE_BUDGET`] bytes or none is left. An
+    /// entry that would pass the byte bound is skipped and counted. An entry
+    /// larger than a whole tick's budget is written on its own when nothing
+    /// else was, because a file is never split.
     pub fn tick(&mut self, cache: &mut Cache) -> TickStats {
         let mut stats = TickStats::default();
         self.written_last_tick = 0;
+        self.written_bytes_last_tick = 0;
         let Some((id, dir)) = self.current.clone() else {
             return stats;
         };
         stats.removed = self.remove_old();
         let mut written_bytes = 0u64;
-        while written_bytes < WRITE_BUDGET {
-            let Some(key) = self.ring.pop_front() else {
-                break;
-            };
-            let Some(response) = cache.get_any(&key) else {
-                // Evicted since it was queued. Nothing to write, and the flag
-                // went with the entry.
-                continue;
-            };
-            let key_str: &str = std::borrow::Borrow::borrow(&key);
-            encode_into(&mut self.buf, id, key_str, &response);
+        // The scan visits entries in map order. An entry the budget cannot
+        // take stops the scan and keeps its flag, so the next tick sees it.
+        cache.scan_queued(|key, response| {
+            if written_bytes >= WRITE_BUDGET {
+                return false;
+            }
+            let key_str: &str = std::borrow::Borrow::borrow(key);
+            encode_into(&mut self.buf, id, key_str, response);
             let len = self.buf.len() as u64;
             if written_bytes > 0 && written_bytes.saturating_add(len) > WRITE_BUDGET {
-                // Out of budget with more to write: the key stays at the front
-                // of the ring, still queued, and the next tick writes it.
-                self.ring.push_front(key);
-                break;
+                return false;
             }
             let hash = key_hash(key_str);
             let old_size = self.sizes.get(&hash).copied().unwrap_or(0);
@@ -242,8 +208,7 @@ impl DiskWriter {
                     );
                 }
                 self.skipped_full += 1;
-                let _ = cache.set_queued(&key, false);
-                continue;
+                return true;
             }
             let path = dir.join(hex(&hash));
             if let Err(e) = self.write_file(&path) {
@@ -255,9 +220,10 @@ impl DiskWriter {
                 written_bytes += len;
                 stats.written += 1;
             }
-            let _ = cache.set_queued(&key, false);
-        }
+            true
+        });
         self.written_last_tick = stats.written;
+        self.written_bytes_last_tick = written_bytes;
         stats
     }
 
@@ -266,24 +232,20 @@ impl DiskWriter {
         self.bytes_on_disk
     }
 
-    /// Keys waiting to be written.
-    pub fn queued(&self) -> usize {
-        self.ring.len()
-    }
-
     /// Files written in the last tick.
     pub fn written_last_tick(&self) -> usize {
         self.written_last_tick
     }
 
+    /// Encoded bytes written in the last tick, including a single entry larger
+    /// than the budget.
+    pub fn written_bytes_last_tick(&self) -> u64 {
+        self.written_bytes_last_tick
+    }
+
     /// Entries skipped because the byte bound would be passed.
     pub fn skipped_full(&self) -> u64 {
         self.skipped_full
-    }
-
-    /// Pushes refused because the ring was full.
-    pub fn skipped_queue_full(&self) -> u64 {
-        self.skipped_queue_full
     }
 
     /// Write the encode buffer to `path` through `path.tmp` and a rename.
@@ -500,6 +462,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::cache::CacheKey;
+
     use bytes::Bytes;
 
     /// A response with one header and a body of `body_len` zero bytes.
@@ -521,9 +485,11 @@ mod tests {
         w
     }
 
-    fn stored(cache: &mut Cache, path: &str, body: &[u8]) -> CacheKey {
+    /// The store path on a node with a disk writer: the entry is inserted with
+    /// its queued flag set, in the same map write.
+    fn stored_queued(cache: &mut Cache, path: &str, body: &[u8]) -> CacheKey {
         let key = CacheKey::new(path, None, "");
-        cache.insert(key.clone(), response(7, body));
+        cache.insert_queued(key.clone(), response(7, body));
         key
     }
 
@@ -616,20 +582,19 @@ mod tests {
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
         for i in 0..10 {
-            let key = stored(&mut cache, &format!("/p{i}"), &body);
-            w.queue(key, &mut cache);
+            stored_queued(&mut cache, &format!("/p{i}"), &body);
         }
-        assert_eq!(w.queued(), 10);
+        assert_eq!(cache.queued(), 10);
 
         let first = w.tick(&mut cache);
         assert_eq!(first.written, 4, "the first tick writes four");
-        assert_eq!(w.queued(), 6);
+        assert_eq!(cache.queued(), 6);
         let second = w.tick(&mut cache);
         assert_eq!(second.written, 4, "the second tick writes four");
-        assert_eq!(w.queued(), 2);
+        assert_eq!(cache.queued(), 2);
         let third = w.tick(&mut cache);
         assert_eq!(third.written, 2, "the third tick writes the rest");
-        assert_eq!(w.queued(), 0);
+        assert_eq!(cache.queued(), 0);
         assert_eq!(files(&dir.path().join("7")).len(), 10);
     }
 
@@ -642,13 +607,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        let key = stored(&mut cache, "/changing", b"old");
-        w.queue(key.clone(), &mut cache);
+        let key = stored_queued(&mut cache, "/changing", b"old");
         // Re-store before the tick: the replacement keeps the queued flag, so
         // the key is still queued exactly once.
         cache.insert(key.clone(), response(7, b"new"));
-        w.queue(key.clone(), &mut cache);
-        assert_eq!(w.queued(), 1);
+        assert_eq!(cache.queued(), 1);
 
         assert_eq!(w.tick(&mut cache).written, 1);
         let file = files(&dir.path().join("7")).pop().expect("one file");
@@ -666,11 +629,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        let gone = stored(&mut cache, "/gone", b"gone");
-        let kept = stored(&mut cache, "/kept", b"kept");
-        w.queue(gone, &mut cache);
-        w.queue(kept, &mut cache);
+        stored_queued(&mut cache, "/gone", b"gone");
+        stored_queued(&mut cache, "/kept", b"kept");
         cache.evict_path("/gone");
+        assert_eq!(cache.queued(), 1, "the eviction takes its flag with it");
 
         let stats = w.tick(&mut cache);
         assert_eq!(stats.written, 1);
@@ -691,8 +653,7 @@ mod tests {
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 3 * 1024 * 1024);
         for i in 0..5 {
-            let key = stored(&mut cache, &format!("/b{i}"), &body);
-            w.queue(key, &mut cache);
+            stored_queued(&mut cache, &format!("/b{i}"), &body);
         }
         let stats = w.tick(&mut cache);
         assert_eq!(stats.written, 3, "three files fit the bound");
@@ -733,11 +694,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        let key = stored(&mut cache, "/once", b"first");
-        w.queue(key.clone(), &mut cache);
+        let key = stored_queued(&mut cache, "/once", b"first");
         cache.insert(key.clone(), response(7, b"second"));
-        w.queue(key, &mut cache);
-        assert_eq!(w.queued(), 1);
+        assert_eq!(cache.queued(), 1);
         assert_eq!(w.tick(&mut cache).written, 1);
         assert_eq!(files(&dir.path().join("7")).len(), 1);
     }
@@ -753,8 +712,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        let key = stored(&mut cache, "/restart", b"warm");
-        w.queue(key, &mut cache);
+        stored_queued(&mut cache, "/restart", b"warm");
         assert_eq!(w.tick(&mut cache).written, 1);
         drop(w);
 
@@ -784,8 +742,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).unwrap();
-        let key = stored(&mut cache, "/early", b"body");
-        w.queue(key, &mut cache);
+        stored_queued(&mut cache, "/early", b"body");
         assert_eq!(w.tick(&mut cache).written, 0);
         assert_eq!(files(dir.path()).len(), 0);
     }
@@ -804,12 +761,11 @@ mod tests {
         // second cannot fit beside it.
         let big = vec![0u8; 3 * 1024 * 1024 - 4096];
         for i in 0..2 {
-            let key = stored(&mut cache, &format!("/big{i}"), &big);
-            w.queue(key, &mut cache);
+            stored_queued(&mut cache, &format!("/big{i}"), &big);
         }
         assert_eq!(w.tick(&mut cache).written, 1);
-        assert_eq!(w.queued(), 1, "the second key is still waiting");
+        assert_eq!(cache.queued(), 1, "the second key is still waiting");
         assert_eq!(w.tick(&mut cache).written, 1);
-        assert_eq!(w.queued(), 0);
+        assert_eq!(cache.queued(), 0);
     }
 }
