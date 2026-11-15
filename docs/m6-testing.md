@@ -43,8 +43,8 @@ Take from it that only the last one runs everything.
 
 | command | what it runs |
 |---|---|
-| `cargo test --workspace -- --test-threads=1` | every unit and integration test |
-| `./check.sh` | release build, clippy, tests, formatting, conformance, benchmarks |
+| `cargo test --workspace --no-fail-fast` | every unit and integration test |
+| `./check.sh` | dev build, clippy, tests, formatting, conformance, benchmarks (with the release build conformance needs) |
 | `./check.sh --no-bench` | the same without the benchmarks |
 | `tools/conformance.sh [h1\|h2\|h3\|resume]` | one protocol, or all of them with no argument |
 | `M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh` | all of it, on Linux, with the testers installed |
@@ -54,9 +54,9 @@ Take from it that only the last one runs everything.
 
 Three rules apply to all of them:
 
-- **`--test-threads=1` is not caution.**
-  Three of m6-http's suites (`edge_proxy.rs`, `security_e2e.rs`, `analytics_e2e.rs`) start real processes on fixed loopback ports.
-  Run them concurrently and their test functions race for those ports, then fail with 502s that have nothing to do with the code.
+- **Tests share one machine, not one port.**
+  Every integration suite claims a free loopback port from `testkit::claim_port` and holds it for the service's lifetime, so the suite runs on the harness's default threads.
+  A suite that binds a fixed port, or two test runs at once on one host, reintroduces the 502s and bind failures the claim exists to close.
 - **Run the gate on the build host.**
   The performance check failed its own second run on a laptop because a release build was going at the same time, which moved the readings by half.
   The conformance testers are not installed on a laptop at all.
@@ -67,14 +67,14 @@ Three rules apply to all of them:
 
 ## 3. The shared harness
 
-Every integration suite does the same four things: find a free port, build and find the release binary, start a service and wait for it to be ready, then read a response at the byte level.
+Every integration suite does the same four things: find a free port, find the binary cargo built for this run, start a service and wait for it to be ready, then read a response at the byte level.
 `m6-core::testkit` is the five modules that do them once.
 Table 3 gives them.
 Take from it that a suite doing any of this itself is a suite reintroducing a failure already fixed.
 
 | module | provides | the failure it closes |
 |---|---|---|
-| `paths` | `binary`, `exec_scratch_root` | each suite guessing where the binary is, and a stale release binary run in place of the code under test |
+| `paths` | `binary`, `exec_scratch_root` | each suite guessing where the binary is, and a test that builds a release binary the run does not need |
 | `port` | `claim_port`, `PortClaim` | `TcpListener::bind(":0")` read back after the listener drops, which frees the port before the child claims it |
 | `process` | `Service`, killed on drop, both streams drained | a child that outlogs one pipe buffer blocks in `write`, and a dead child's last words go with the pipe |
 | `wait` | `for_tcp`, `for_path` | a fixed sleep, long enough on an idle laptop and not when a dozen stacks start at once |
@@ -91,12 +91,25 @@ Two rules come with it, and both are quiet when broken:
   Dropping it early reopens the race it exists to close, which is why it is `#[must_use]` and stored beside its `Service`.
 - **`Service` drains stdout as well as stderr**, because m6's services log to stdout.
 
-**`binary` builds what it returns.**
-It runs `cargo build --quiet --release --workspace --bin <name> --target-dir <target>` once per binary name per test process, so a test always runs the binary built from the source in the tree.
-The first test after a change pays the release build, which is minutes for m6-http.
+**`binary` never runs cargo.**
+It returns a binary of the test's own package from `CARGO_BIN_EXE_<name>`, and a binary of another workspace package from the profile directory next to the running test executable, where `cargo build --workspace --bins` puts it.
+A test that shells out to `cargo build --release` makes the whole suite pay a fat-LTO release build, which was 612 s of a 28-minute `cargo test --workspace`.
+The gate builds `cargo build --workspace --bins` in the dev profile before `cargo test`, so every binary a test needs is present.
 The scripts do not use `binary`.
 `tools/conformance.sh` and `tools/perfcheck.sh` run `target/release` directly and refuse to start when it is missing, so run `cargo build --workspace --release` before them.
 `bench.sh` builds the release binaries it needs itself.
+
+### 3.1. The accounting-tick test hook
+
+`m6-http` runs its accounting stats every ten seconds, and `Stats::new()` is the whole production value: no config key chooses it.
+
+Two integration suites, `metrics_access` and `loop_never_waits`, assert on the tick and spawn the real binary, so a `#[cfg(test)]` default cannot reach them.
+
+A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` and uses that many seconds when it parses as a positive integer.
+
+A developer who runs a debug `m6-http` by hand inherits the hook: exporting the variable shortens that process's tick, and every `/perf` trace window with it.
+
+A release build does not read the variable, so a released service always ticks at ten seconds.
 
 ## 4. Conformance: h1spec, h2spec and h3spec
 

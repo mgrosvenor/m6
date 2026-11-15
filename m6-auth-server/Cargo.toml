@@ -27,5 +27,5 @@ m6-core         = { path = "../m6-core", default-features = false, features = ["
 tempfile        = "3"
 jsonwebtoken    = "9"
 serde_json      = "1"
-m6-auth         = { path = "../m6-auth" }
+m6-auth         = { path = "../m6-auth", features = ["testkit"] }
 rusqlite        = { version = "0.41", features = ["bundled"] }

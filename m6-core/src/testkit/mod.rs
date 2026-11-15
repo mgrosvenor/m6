@@ -1,10 +1,11 @@
 //! Test harness shared by every m6 crate.
 //!
 //! Integration tests here all do the same four things: find a port nothing
-//! else will take, build and find the release binary, start a service and wait for it to
-//! actually be ready, then talk to it at the byte level. Every crate had
-//! written its own version of all four, and the versions disagreed in ways
-//! that produced intermittent failures rather than honest ones.
+//! else will take, find the binary cargo built for this run, start a service
+//! and wait for it to actually be ready, then talk to it at the byte level.
+//! Every crate had written its own version of all four, and the versions
+//! disagreed in ways that produced intermittent failures rather than honest
+//! ones.
 //!
 //! # What this fixes, beyond removing copies
 //!

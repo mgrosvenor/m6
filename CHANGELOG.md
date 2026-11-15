@@ -125,6 +125,11 @@ A client that makes more requests than this on one connection reconnects, with a
 
 ### Security
 
+**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
+Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
+A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.
+Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5x` and an empty value with `Connection: close`, and asserts each is answered 400 with the connection closed. On the old parser the `+5` case is answered with nothing inside the read bound, so that case fails.
+
 **SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected; no configuration changes.
 
 **HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
@@ -141,6 +146,11 @@ m6-file now reads `relpath`, `filename` and each `root` placeholder only when th
 Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query_relpath_cannot_choose_a_file_on_a_filename_route`, which send those requests over HTTP. The first fails on the previous code with `200 OK` and the service's config in the body. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
 
 ### Fixed
+
+**A backend's early response is forwarded instead of a 502.**
+When a backend answered before it had read the whole request body (a 413 for an oversized upload, for example) and then closed, m6 treated the failed write as the result and answered 502, and on Linux the reply was lost.
+The client now reads a reply the backend has already sent before it reports a write error, over plain and TLS connections, and the backend's own status reaches the client.
+Verified: the socket and m6-http early-response tests on Linux and macOS (on Linux, 0 of 10 passed before the fix and 10 of 10 after).
 
 **The test kit's scratch directory and port claims work on any host, so the suite has no list of known failures.**
 `m6_core::testkit` chose `/var/tmp` for scratch files whether or not the process could write there, and kept port claims per build, so two builds on one host could claim the same port and one test reached the other's server.

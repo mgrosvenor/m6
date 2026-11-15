@@ -9,6 +9,12 @@ repository.workspace   = true
 [lib]
 name = "m6_auth"
 
+[features]
+# Compiles the cost-taking user constructors that fixtures use to seed at
+# bcrypt's lowest cost. Enabled only from the fixture crates' dev-dependencies,
+# so a production build cannot hash below BCRYPT_COST.
+testkit = []
+
 [dependencies]
 m6-core      = { path = "../m6-core", default-features = false, features = ["sqlite"] }
 rusqlite     = { version = "0.41", features = ["bundled"] }
