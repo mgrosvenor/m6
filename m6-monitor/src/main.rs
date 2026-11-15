@@ -64,6 +64,7 @@ use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
+use m6_core::{genid_failed, genid_ok};
 
 #[cfg(feature = "count-allocations")]
 #[global_allocator]
@@ -174,7 +175,7 @@ fn run_service() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load("m6-monitor", &ROUTES, &[], &NoTemplates);
+    let mut site = Site::load("m6-monitor", &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
         site.user_config().get(k).and_then(|v| v.as_u64())
@@ -373,7 +374,7 @@ fn run_service() -> Result<()> {
                     let before = m6_core::testkit::alloc_count::now();
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    let turn = turn(conn, &site, snapshot.as_ref(), &history, interval);
+                    let turn = turn(conn, &mut site, snapshot.as_ref(), &history, interval);
                     match turn {
                         Ok(true) => {
                             // Re-register only when the turn changed what the
@@ -476,7 +477,7 @@ fn run_service() -> Result<()> {
 /// socket would block. Returns whether the connection stays open.
 fn turn(
     conn: &mut ServerConn,
-    site: &Site,
+    site: &mut Site,
     snapshot: Option<&Snapshot>,
     history: &history::History,
     interval: Duration,
@@ -505,6 +506,19 @@ fn turn(
             Read::Closed => return Ok(false),
         };
         if let Some(reply) = reply {
+            let reply = match reply {
+                // The reserved path: run the start path again and assign the
+                // new Site in the loop's own binding, or keep serving the old
+                // one and answer the cause.
+                Answer::Reload => Answer::Response(match site.reload(&ROUTES, &[], &NoTemplates) {
+                    Ok(next) => {
+                        *site = next;
+                        genid_ok()
+                    }
+                    Err(e) => genid_failed(&e),
+                }),
+                answer => answer,
+            };
             match reply {
                 Answer::Bytes {
                     status,
@@ -512,6 +526,7 @@ fn turn(
                     body,
                 } => conn.respond(status, headers, body),
                 Answer::Response(response) => conn.respond_response(response),
+                Answer::Reload => unreachable!("the reload arm above replaced it"),
             }
         }
         match conn.flush()? {
@@ -533,6 +548,9 @@ enum Answer<'a> {
         body: &'a [u8],
     },
     Response(Response),
+    /// `POST /genid`: the turn runs the start path again and assigns the new
+    /// Site, which only the loop can do.
+    Reload,
 }
 
 /// The answer to one parsed request.
@@ -575,6 +593,7 @@ fn answer<'a>(
             _ => Answer::Response(site.finish(&req, Response::not_found())),
         },
         Handled::Named(..) => unreachable!("m6-monitor registers no named handler"),
+        Handled::Reload => Answer::Reload,
     }
 }
 

@@ -1308,7 +1308,7 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 /// The turn loop a service writes per connection:
 ///
 /// ```no_run
-/// # fn serve(conn: &mut m6_core::h1::ServerConn, site: &m6_core::Site) -> std::io::Result<()> {
+/// # fn serve(conn: &mut m6_core::h1::ServerConn, site: &mut m6_core::Site) -> std::io::Result<()> {
 /// # fn service_route(_: usize, _: &m6_core::Request) -> m6_core::Response {
 /// #     m6_core::Response::text("handler")
 /// # }
@@ -1337,6 +1337,17 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 ///                 m6_core::Handled::Named(index, req) => {
 ///                     let response = service_route(index, &req);
 ///                     site.finish(&req, response)
+///                 }
+///                 // The loop owns the Site. It runs the start path again
+///                 // and assigns the new Site when that is `Ok`.
+///                 m6_core::Handled::Reload => {
+///                     match site.reload(&[], &[], &m6_core::NoTemplates) {
+///                         Ok(next) => {
+///                             *site = next;
+///                             m6_core::genid_ok()
+///                         }
+///                         Err(e) => m6_core::genid_failed(&e),
+///                     }
 ///                 }
 ///             };
 ///             (Some(response), false)

@@ -407,6 +407,18 @@ A backend at its connection ceiling stops accepting, and clients wait in the ker
 That is the concurrency a member provides.
 Section 8 gives the lifecycle that puts a member in the pool and takes it out.
 
+## Reserved path: `/genid`
+
+`POST /genid` is reserved on every backend that serves a site.
+The backend answers it itself, before routing: it reads the config, `site.toml`, templates and params again, builds a new site beside the one it is serving, and swaps it in with one assignment.
+A load that succeeds answers `204` with `Cache-Control: no-store`.
+A load that fails assigns nothing, the old site keeps serving, and the answer is `500` with `Cache-Control: no-store` and a body naming the cause.
+
+A method other than POST on `/genid` is `405` with `Allow: POST`, and a route whose pattern is exactly `/genid` is refused at startup.
+The socket's directory permissions are the only authentication for this request (§6.1): there is no token and no mTLS.
+The caller compares its own generation identity, which this response does not carry.
+Section 8 gives the lifecycle.
+
 ## 8. Lifecycle
 
 A member's lifecycle is three events: startup, shutdown and exit.

@@ -55,7 +55,7 @@ use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
-use m6_core::CodeRoute;
+use m6_core::{genid_failed, genid_ok, CodeRoute};
 
 const LANGUAGE: &str = "Rust (m6-core)";
 const NAME: &str = "m6-example-rust-m6core";
@@ -124,7 +124,7 @@ fn main() -> std::io::Result<()> {
     };
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load(NAME, &ROUTES, &[], &NoTemplates);
+    let mut site = Site::load(NAME, &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
@@ -248,7 +248,7 @@ fn main() -> std::io::Result<()> {
                 Token(k) => {
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &site, &status_body) {
+                    match turn(conn, &mut site, &status_body) {
                         Ok(true) => {
                             // Re-register only when the turn changed what the
                             // connection waits for: a kept-alive request that
@@ -314,7 +314,7 @@ fn main() -> std::io::Result<()> {
 
 /// One connection's turn: read, answer and write until the socket would
 /// block. Returns whether the connection stays open.
-fn turn(conn: &mut ServerConn, site: &Site, status_body: &[u8]) -> io::Result<bool> {
+fn turn(conn: &mut ServerConn, site: &mut Site, status_body: &[u8]) -> io::Result<bool> {
     loop {
         // Write what is owed before reading anything. A streamed body is not
         // in the output buffer, so a read here would let the next request's
@@ -337,6 +337,16 @@ fn turn(conn: &mut ServerConn, site: &Site, status_body: &[u8]) -> io::Result<bo
             Read::Request(head) => {
                 let response = match site.handle(&head) {
                     Handled::Done(response) => response,
+                    // The reserved path: run the start path again and assign
+                    // the new Site in the loop's own binding, or keep serving
+                    // the old one and answer the cause.
+                    Handled::Reload => match site.reload(&ROUTES, &[], &NoTemplates) {
+                        Ok(next) => {
+                            *site = next;
+                            genid_ok()
+                        }
+                        Err(e) => genid_failed(&e),
+                    },
                     // This service's five routes, by the index they were given
                     // to `Site::load` in.
                     Handled::Code(index, req) => {
