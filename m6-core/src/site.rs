@@ -644,6 +644,26 @@ impl Site {
             }
         }
 
+        // Give a successful page a validator while its bytes are final.
+        //
+        // The body is minified and compressed, so an ETag computed here names
+        // the representation that goes on the wire. A page that arrives at the
+        // edge without a tag cannot be revalidated: the browser would have to
+        // take the whole document again, and the edge could not answer
+        // `If-None-Match` from its stored copy. `Response::send` computes the
+        // same hash at serialisation; doing it here means the tag is part of
+        // the response the caller and its cache see, and `default_etag` having
+        // one rule stops a second tag from being added.
+        //
+        // Only successes: an ETag on a 404 or 500 invites a client to keep
+        // revalidating an error as though it were content.
+        if resp.status < 300 && !resp.verbatim && !resp.body.is_empty() {
+            if let Some(hash) = crate::response::default_etag(&resp.headers, &resp.body) {
+                resp.headers
+                    .push(("ETag".to_string(), format!("\"{hash:x}\"")));
+            }
+        }
+
         // One access line per request at the default level. A line at debug is
         // below the default and is an access log nobody enables.
         crate::log::info!(
@@ -2329,8 +2349,8 @@ fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<
     None
 }
 
-/// A renderer that renders nothing: these tests route and finish, they do
-/// not render templates.
+/// The renderer for the test sites: the template engine when the
+/// `templates` feature is on, and the no-op renderer otherwise.
 #[cfg(test)]
 fn test_renderer() -> &'static dyn RendererFactory {
     #[cfg(feature = "templates")]
@@ -2453,6 +2473,38 @@ mod tests {
             FrameworkState::build(config, dir.path().to_path_buf(), &[], test_renderer()).unwrap();
         let site = Site::from_state(state, named.iter().map(|n| (*n).to_string()).collect());
         (site, dir)
+    }
+
+    /// A page's default is the browser-caching pattern, and it carries an
+    /// ETag: the browser revalidates every time, the edge keeps it for a day,
+    /// and either can turn an unchanged page into a 304.
+    #[test]
+    fn a_page_defaults_to_revalidation_and_carries_an_etag() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            &[],
+        );
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut slots) {
+            crate::h1::HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        let response = match site.handle(&head) {
+            Handled::Done(response) => response,
+            _ => panic!("a template route is answered by core"),
+        };
+
+        assert_eq!(
+            crate::headers::get(&response.headers[..], "cache-control"),
+            Some(crate::config::PAGE_CACHE_CONTROL),
+            "the page must send the browser-caching pattern: {:?}",
+            response.headers
+        );
+        assert!(
+            crate::headers::get(&response.headers[..], "etag").is_some(),
+            "the finish path adds the ETag: {:?}",
+            response.headers
+        );
     }
 
     /// A config route naming a handler comes back with that handler's index in
@@ -3263,7 +3315,8 @@ mod config_route_handler_tests {
         (state, site_dir)
     }
 
-    /// What a browser sees: a script labelled `text/javascript` comes back
+    /// What a browser sees: a script route with no `cache` key defaults to
+    /// `no-store`, and the script labelled `text/javascript` still comes back
     /// brotli-compressed under the default config.
     #[test]
     fn a_text_javascript_response_is_brotli_compressed_by_default() {
@@ -3299,6 +3352,10 @@ mod config_route_handler_tests {
         let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase();
         assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(
+            head.contains("cache-control: no-store"),
+            "the route has no `cache` key, so it defaults to no-store: {head}"
+        );
         assert!(head.contains("content-encoding: br"), "{head}");
     }
 
@@ -3384,7 +3441,10 @@ tail = false
         assert_eq!(explicit.routes.routes()[0].cache, "public, max-age=60");
 
         let (template, _d3) = state_from("[[route]]\npath = \"/\"\ntemplate = \"index.html\"\n");
-        assert_eq!(template.routes.routes()[0].cache, "public");
+        assert_eq!(
+            template.routes.routes()[0].cache,
+            crate::config::PAGE_CACHE_CONTROL
+        );
     }
 
     /// `Last-Modified` is derived from templates and params files, so it

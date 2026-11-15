@@ -142,6 +142,8 @@ A run below its floor fails.
 A run above it prints the new number and asks for the floor to be raised by hand, because raising a floor claims an improvement is permanent and belongs in the commit that earned it.
 A target in the scores file that a full run did not measure fails the run.
 
+The script also runs m6's own RFC tests, for the behaviours an external tester cannot see: a backend's header block split across HTTP/2 frames, the field names m6 writes, `Content-Length` as `1*DIGIT`, and an `If-None-Match` 304. Every test names its RFC section, and `tools/conformance.sh rfc` runs that stage alone.
+
 ### 4.2. By hand
 
 Running a tester by hand is for diagnosing a failure the script has already reported.

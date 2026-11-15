@@ -13,7 +13,7 @@
 
 // HashMap removed — headers are stored as Vec for small-N linear-scan performance.
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::{Map, Value};
@@ -266,21 +266,56 @@ impl Request {
 
     // ---------- file I/O helpers ----------
 
-    /// Resolve a site-relative path to absolute, validating against path traversal.
+    /// Join a site-relative path onto the site directory, **without** checking
+    /// it.
+    ///
+    /// Not the validating helper: it does no traversal or symlink check at all,
+    /// and its one caller passes the empty string. A caller that takes the
+    /// value from a request wants [`Request::validated_path`], which resolves
+    /// the path and refuses one that leaves the site.
     pub fn site_path(&self, rel: &str) -> PathBuf {
         self.site_dir.join(rel)
     }
 
     fn validated_path(&self, rel: &str) -> Result<PathBuf> {
-        let abs = self.site_dir.join(rel);
-        // Ensure the canonicalised path stays within site_dir.
-        // We check for `..` components.
-        for comp in Path::new(rel).components() {
-            if comp == Component::ParentDir {
-                return Err(Error::BadRequest("path traversal not allowed".to_string()));
+        // Resolve first, symlinks and all, then check the resolved path. A
+        // lexical check cannot see a symlinked directory in the middle of the
+        // path, and a write through one lands outside the site.
+        crate::path::resolve_within(&self.site_dir, Path::new(rel))
+            .map_err(|e| Error::BadRequest(e.to_string()))
+    }
+
+    /// The temp name beside a resolved path, resolved in its own right.
+    ///
+    /// `<dest>.tmp` is a name the site can already contain as a link, so the
+    /// temp file would be created outside the site through it and the rename
+    /// would then put the link in place. Resolving the temp name costs one
+    /// canonicalise and closes that.
+    fn temp_path(&self, resolved: &Path) -> Result<PathBuf> {
+        let tmp = resolved.with_extension("tmp");
+        let parent = tmp
+            .parent()
+            .ok_or_else(|| Error::BadRequest("a temp file has no parent directory".to_string()))?;
+        let name = tmp
+            .file_name()
+            .ok_or_else(|| Error::BadRequest("a temp file has no name".to_string()))?;
+        // `resolved` starts with the canonical root, which differs from
+        // `site_dir` when the site is reached through a symlinked parent, so
+        // both sides are compared canonical.
+        let root = self
+            .site_dir
+            .canonicalize()
+            .map_err(|e| Error::BadRequest(format!("the site directory is not readable: {e}")))?;
+        let rel = match parent.strip_prefix(&root) {
+            Ok(inner) => inner.join(name),
+            Err(_) => {
+                return Err(Error::BadRequest(
+                    "a temp file would be written outside the site".to_string(),
+                ))
             }
-        }
-        Ok(abs)
+        };
+        crate::path::resolve_within(&self.site_dir, &rel)
+            .map_err(|e| Error::BadRequest(e.to_string()))
     }
 
     /// Read a JSON file relative to site directory.
@@ -323,7 +358,10 @@ impl Request {
             .map_err(Error::Other)?;
 
         // Write to a temp file in the same directory, then rename.
-        let tmp_path = path.with_extension("tmp");
+        // The temp file is a name derived from the resolved path, and a link
+        // planted at that name is the same escape with one more step: resolve
+        // it before creating anything.
+        let tmp_path = self.temp_path(&path)?;
         {
             let mut f = std::fs::File::create(&tmp_path)
                 .with_context(|| format!("creating temp file {}", tmp_path.display()))
@@ -350,7 +388,18 @@ impl Request {
 
         for entry in entries {
             let entry = entry.context("reading dir entry").map_err(Error::Other)?;
-            let ep = entry.path();
+            // Resolve each entry, not only the directory: an entry that is itself
+            // a symlink out of the site is the same escape one level down, and
+            // resolving the directory is what made it look covered.
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // The entry is inside the directory being listed, so the path to
+            // resolve is that directory's, with the name appended.
+            let rel_entry = std::path::Path::new(rel).join(&name);
+            let Ok(ep) = crate::path::resolve_within(&self.site_dir, &rel_entry) else {
+                continue;
+            };
             if ep.extension().and_then(|e| e.to_str()) == Some("json") {
                 let data = std::fs::read(&ep)
                     .with_context(|| format!("reading {}", ep.display()))
@@ -415,7 +464,10 @@ impl Request {
                 .with_context(|| format!("creating dirs for {}", path.display()))
                 .map_err(crate::error::Error::Other)?;
         }
-        let tmp_path = path.with_extension("tmp");
+        // The temp file is a name derived from the resolved path, and a link
+        // planted at that name is the same escape with one more step: resolve
+        // it before creating anything.
+        let tmp_path = self.temp_path(&path)?;
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp_path)
@@ -986,6 +1038,147 @@ mod tests {
             .unwrap();
         let v = req.read_json("test.json").unwrap();
         assert_eq!(v["key"], "value");
+    }
+
+    /// A request whose site directory is `site_dir`.
+    fn request_at(site_dir: &Path) -> Request {
+        Request::new(
+            RawRequest {
+                version: "HTTP/1.1".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                query: None,
+                headers: vec![],
+                body: vec![],
+            },
+            Map::new(),
+            site_dir.to_path_buf(),
+        )
+    }
+
+    /// The break: `validated_path` checked only the string for `..`, so a
+    /// symlinked directory in the middle of the path was followed and
+    /// `read_json` returned the file outside the site. Restore the lexical
+    /// check and this test reads `{"secret":true}`.
+    #[test]
+    fn read_json_refuses_a_symlinked_directory_that_leaves_the_site() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.json"), br#"{"secret":true}"#).unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("data/linked")).unwrap();
+
+        let req = request_at(site.path());
+        let err = req.read_json("data/linked/secret.json").unwrap_err();
+        assert!(
+            matches!(&err, Error::BadRequest(m) if m.contains("escapes")),
+            "expected the escape to be refused by name, got {err:?}"
+        );
+        // The file is there, so the refusal is the check and not a 404.
+        assert!(outside.path().join("secret.json").exists());
+    }
+
+    /// The break: `write_json` called `create_dir_all` on the joined path
+    /// before opening it, so a directory symlink pointing outside let a write
+    /// create `new/dir` and `file.json` outside the site. Restore the lexical
+    /// check and this test finds the file on the outside.
+    #[test]
+    fn write_json_refuses_a_symlinked_directory_before_creating_anything() {
+        let outside = tempfile::tempdir().unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("data/linked")).unwrap();
+
+        let req = request_at(site.path());
+        let err = req
+            .write_json("data/linked/new/dir/file.json", &json!({"secret": true}))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::BadRequest(m) if m.contains("escapes")),
+            "expected the escape to be refused by name, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "the refused write created something outside the site"
+        );
+    }
+
+    /// A symlink that stays inside the site is a normal deployment, for reads
+    /// and for writes into a directory that does not exist yet.
+    /// The same escape one level down: the directory resolves inside, and an
+    /// entry in it is a link out.
+    #[test]
+    fn list_json_ignores_an_entry_that_links_outside_the_site() {
+        let site = tempfile::tempdir().expect("site");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.json"), r#"{"secret":true}"#).unwrap();
+        let dir = site.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("mine.json"), r#"{"mine":true}"#).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.json"), dir.join("link.json"))
+            .unwrap();
+
+        let request = request_at(site.path());
+        let listed = request.list_json("d").expect("the directory lists");
+        assert_eq!(listed.len(), 1, "only the entry that stays inside is read");
+        assert_eq!(listed[0]["mine"], serde_json::json!(true));
+    }
+
+    /// A link planted where the atomic write puts its temp file: the temp name
+    /// is derived, and it has to be resolved like any other path.
+    #[test]
+    fn write_json_atomic_refuses_a_planted_temp_symlink() {
+        let site = tempfile::tempdir().expect("site");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let dir = site.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("x.tmp")).unwrap();
+
+        let request = request_at(site.path());
+        let err = request
+            .write_json_atomic("d/x.json", &serde_json::json!({"a": 1}))
+            .expect_err("a planted temp link must be refused");
+        assert!(
+            matches!(err, Error::BadRequest(_)),
+            "the refusal names the escape, and it is {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"untouched",
+            "nothing outside the site may be written"
+        );
+    }
+
+    #[test]
+    fn in_site_symlinked_directory_still_reads_and_writes() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("static/data")).unwrap();
+        std::os::unix::fs::symlink(site.path().join("static/data"), site.path().join("data"))
+            .unwrap();
+
+        let req = request_at(site.path());
+        req.write_json("data/sub/app.json", &json!({"v": 1}))
+            .unwrap();
+        assert!(site.path().join("static/data/sub/app.json").exists());
+        assert_eq!(req.read_json("data/sub/app.json").unwrap()["v"], 1);
+    }
+
+    /// `..` is still refused before any filesystem work.
+    #[test]
+    fn read_json_still_refuses_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.json"), b"{}").unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+
+        let err = request_at(&site).read_json("../secret.json").unwrap_err();
+        assert!(
+            matches!(&err, Error::BadRequest(m) if m.contains("traversal")),
+            "expected traversal to be refused by name, got {err:?}"
+        );
     }
 
     #[cfg(feature = "multipart")]
