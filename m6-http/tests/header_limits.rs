@@ -31,6 +31,7 @@ use std::net::{TcpStream, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1117,7 +1118,14 @@ impl FileBackend {
         )
         .unwrap();
 
-        let socket = PathBuf::from(format!("/tmp/m6hlf-{}.sock", std::process::id()));
+        // One name per test, not one per process: the six tests that use this
+        // fixture run at once in one test process, so a pid-only name is one
+        // path all six bind, and each unlinks the socket another has bound.
+        // The counter gives every test its own name, and the remove below can
+        // then touch no socket but this test's own.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let socket = PathBuf::from(format!("/tmp/m6hlf-{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&socket);
         let mut file = Service::spawn(
             "m6-file",
