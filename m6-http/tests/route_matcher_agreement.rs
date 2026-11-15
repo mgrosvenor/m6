@@ -38,7 +38,7 @@ fn core_routes(patterns: &[&str]) -> CoreTable {
                     pattern: (*p).to_string(),
                     methods: Methods::ANY,
                     segments,
-                    template: Some("t.html".to_string()),
+                    template: Some("t.html".into()),
                     params_files: vec![],
                     status: 200,
                     cache: "public".to_string(),

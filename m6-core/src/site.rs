@@ -476,12 +476,12 @@ impl Site {
         head: &RequestHead<'_>,
         route: &CompiledRoute,
         params: &PathParams,
-        template: &str,
+        template: &Arc<str>,
     ) -> Handled {
         let started = crate::platform::now();
         let resp = match self.state.build_dict(head, route, params) {
             Ok(dict) => {
-                let resp = Response::render_request_dict(template, route.status);
+                let resp = Response::render_request_dict(Arc::clone(template), route.status);
                 self.finish_raw(head, Some(&dict), Some(route), started, resp)
             }
             Err(e) => {
@@ -569,7 +569,7 @@ impl Site {
         }
 
         if let Some(template) = &route.template {
-            let resp = Response::render_request_dict(template, route.status);
+            let resp = Response::render_request_dict(Arc::clone(template), route.status);
             let resp = self.finish_raw(req.raw(), Some(req.dict()), Some(route), started, resp);
             return Handled::Done(resp);
         }
@@ -959,7 +959,7 @@ pub struct CompiledRoute {
     pub pattern: String,
     pub methods: Methods,
     pub segments: Vec<Segment>,
-    pub template: Option<String>,
+    pub template: Option<Arc<str>>,
     pub params_files: Vec<String>,
     pub status: u16,
     pub cache: String,
@@ -1514,7 +1514,7 @@ impl FrameworkState {
                 pattern: rc.path.clone(),
                 methods: config_route_methods(rc, i)?,
                 segments: segs,
-                template: rc.template.clone(),
+                template: rc.template.as_deref().map(Arc::<str>::from),
                 params_files: rc.params.clone(),
                 status: rc.status,
                 cache: rc.cache.clone(),
@@ -1579,7 +1579,7 @@ impl FrameworkState {
         let template_paths: Vec<String> = config
             .routes
             .iter()
-            .filter_map(|r| r.template.clone())
+            .filter_map(|r| r.template.as_deref().map(str::to_string))
             .collect();
 
         // Build the renderer. A template syntax error surfaces as an `Err`
@@ -1818,7 +1818,7 @@ impl FrameworkState {
                 dict.insert(k, Value::String(v));
             }
         }
-        dict.insert("query".to_string(), Value::Object(query_map));
+        dict.insert("query", Value::Object(query_map));
 
         // 6. POST form fields.
         //
@@ -1860,18 +1860,15 @@ impl FrameworkState {
         } else {
             Map::new()
         };
-        dict.insert("cookies".to_string(), Value::Object(cookies_map));
+        dict.insert("cookies", Value::Object(cookies_map));
 
         // 8. Built-in keys (set after params files — cannot be overridden by them).
         // The reading comes from the layer and chrono only formats it.
         let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
         let (datetime, year) = Self::builtin_dates(now);
-        dict.insert(
-            "request_path".to_string(),
-            Value::String(raw.path().to_string()),
-        );
-        dict.insert("datetime".to_string(), Value::String(datetime));
-        dict.insert("year".to_string(), Value::String(year));
+        dict.insert("request_path", Value::String(raw.path().to_string()));
+        dict.insert("datetime", Value::String(datetime));
+        dict.insert("year", Value::String(year));
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -1895,7 +1892,7 @@ impl FrameworkState {
                 .and_then(|v| v.as_str())
                 .and_then(|flash_cookie| verify_flash_cookie(flash_cookie, &self.flash_secret));
             if let Some(msg) = message {
-                dict.insert("flash".to_string(), Value::String(msg));
+                dict.insert("flash", Value::String(msg));
             }
         }
 
@@ -1920,7 +1917,7 @@ impl FrameworkState {
             } else {
                 generate_csrf_token()
             };
-            dict.insert("csrf_token".to_string(), Value::String(token));
+            dict.insert("csrf_token", Value::String(token));
         }
 
         Ok(dict)
@@ -1965,7 +1962,7 @@ impl FrameworkState {
                 Some(supplied) => supplied,
                 None => dict,
             };
-            let html = renderer.render(&template_name, ctx)?;
+            let html = renderer.render(template_name.as_ref(), ctx)?;
             resp.body = crate::response::Body::Bytes(html.into_bytes());
             resp.headers.push((
                 "Content-Type".to_string(),
@@ -4097,7 +4094,7 @@ mod copy_audit {
                 median(N, || {
                     let mut tctx = tera::Context::new();
                     for (k, v) in dict.iter() {
-                        tctx.insert(k.as_str(), v);
+                        tctx.insert(k, v);
                     }
                     std::hint::black_box(tctx);
                 }),
@@ -4116,14 +4113,14 @@ mod copy_audit {
         let ctx_build = median(N, || {
             let mut tctx = tera::Context::new();
             for (k, v) in dict.iter() {
-                tctx.insert(k.as_str(), v);
+                tctx.insert(k, v);
             }
             std::hint::black_box(tctx);
         });
         let build_and_render = median(N, || {
             let mut tctx = tera::Context::new();
             for (k, v) in dict.iter() {
-                tctx.insert(k.as_str(), v);
+                tctx.insert(k, v);
             }
             std::hint::black_box(tera.render("t.html", &tctx).unwrap());
         });

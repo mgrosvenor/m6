@@ -771,7 +771,7 @@ impl crate::render::Renderer for TeraRenderer {
     ) -> std::result::Result<String, crate::render::RenderError> {
         let mut tctx = tera::Context::new();
         for (k, v) in ctx.iter() {
-            tctx.insert(k.as_str(), v);
+            tctx.insert(k, v);
         }
         self.tera.render(template, &tctx).map_err(|e| {
             // `{{ not_found() }}` fails the render with a sentinel, because a

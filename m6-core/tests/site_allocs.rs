@@ -38,11 +38,14 @@ const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 ///
 /// 71 when ALLOC-RENDER attributed it, on a tree that predates the four RS-2
 /// removals and does not carry CACHE-HDR's `ETag`; 67 on integration 6bb7a2f
-/// plus RS-2. The rendered-page job (I-177) removed the owned request and the
-/// compression candidate `Vec`, took half of the `ETag` pair and cached
-/// `Last-Modified`: 56 here. The target is zero; a change that raises this is
+/// plus RS-2. The rendered-page job (I-177) removed the owned request, the
+/// compression candidate `Vec` and two of the `ETag`'s four, cached
+/// `Last-Modified`, made the dictionary's built-in keys borrow their
+/// `&'static str` and made the template name an `Arc<str>`: 50 here. The
+/// target is zero, and the remaining 13 are listed in
+/// `work-queue/out/ALLOC-RENDER-ZERO.md`; a change that raises this is
 /// refused, and one that lowers it records the new number in that commit.
-const PAGE_BUDGET: usize = 56;
+const PAGE_BUDGET: usize = 50;
 
 fn main() {
     let mut args = Arguments::from_args();

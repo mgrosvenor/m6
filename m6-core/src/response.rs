@@ -13,6 +13,8 @@
 //! `send` takes `self` by value, because a stream owns its reader and a
 //! response goes on the wire once.
 
+use std::sync::Arc;
+
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -129,7 +131,7 @@ pub struct Response {
     /// both fields once it has rendered. A `pub(crate)` field would only work
     /// while the renderer lived in the same crate as the type, which is the
     /// arrangement this migration is undoing.
-    pub template_name: Option<String>,
+    pub template_name: Option<Arc<str>>,
     /// The context to render with, when the caller supplied one.
     ///
     /// `None` means "the request's own dictionary", which is what the service
@@ -203,13 +205,17 @@ impl Response {
     /// The `Dict` form of `render_dict`, and what the service loop and
     /// `render_with` use, because handing over a `Dict` shares its base rather
     /// than copying it.
-    pub fn render_context(template: &str, dict: crate::dict::Dict, status: u16) -> Result<Self> {
+    pub fn render_context(
+        template: impl Into<Arc<str>>,
+        dict: crate::dict::Dict,
+        status: u16,
+    ) -> Result<Self> {
         Ok(Self {
             status,
             headers: vec![],
             body: Body::empty(),
             verbatim: false,
-            template_name: Some(template.to_string()),
+            template_name: Some(template.into()),
             template_dict: Some(dict),
         })
     }
@@ -219,13 +225,13 @@ impl Response {
     /// Carries no context: the service loop already has the request dict and
     /// uses it when none was supplied. This is the common path, and it used to
     /// store a full copy of that dict only to merge it back into itself.
-    pub fn render_request_dict(template: &str, status: u16) -> Self {
+    pub fn render_request_dict(template: impl Into<Arc<str>>, status: u16) -> Self {
         Self {
             status,
             headers: vec![],
             body: Body::empty(),
             verbatim: false,
-            template_name: Some(template.to_string()),
+            template_name: Some(template.into()),
             template_dict: None,
         }
     }

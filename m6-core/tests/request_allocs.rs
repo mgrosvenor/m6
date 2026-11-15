@@ -38,7 +38,7 @@ const BASE_IDENTITY_DIFFERENCE: usize = 1;
 /// ever be lowered: a change that raises it is refused rather than priced in.
 /// A dependency update that moves it down records the new number, with the
 /// reason, in that commit.
-const HANDLER_BUDGET: usize = 28;
+const HANDLER_BUDGET: usize = 23;
 
 /// The allocations one `/page` request makes with every removal in place.
 ///
@@ -53,10 +53,11 @@ const HANDLER_BUDGET: usize = 28;
 /// allocations). The page's own validator is the integration's behaviour, not
 /// an allocation coming back, so the budget took that integer. The
 /// rendered-page job then removed the owned request (9), the compression
-/// candidate `Vec` (1) and two of the ETag's four (the pre-sized value), and
-/// took the cached `Last-Modified` (1): 42. Those four are gone; what remains
-/// in the tag is the pair of owned header `String`s the response stores.
-const TEMPLATE_BUDGET: usize = 42;
+/// candidate `Vec` (1) and two of the ETag's four (the pre-sized value), took
+/// the cached `Last-Modified` (1), borrowed the dictionary's built-in keys (5)
+/// and shared the template name (1): 36. What remains is listed in
+/// `work-queue/out/ALLOC-RENDER-ZERO.md`.
+const TEMPLATE_BUDGET: usize = 36;
 
 const BIG: &[u8] = b"GET /big HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
 const RAW: &[u8] = b"GET /raw HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
