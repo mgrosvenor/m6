@@ -39,8 +39,8 @@ use crate::response::Response;
 ///
 /// A service never routes this path. [`Site::handle`] answers it itself with
 /// [`Handled::Reload`] so the loop that owns the `Site` can run the start path
-/// again and assign the result. `check_routes` refuses a code or config route
-/// with exactly this pattern.
+/// again, assign the result and log the reload through [`finish_reload`].
+/// `check_routes` refuses a code or config route with exactly this pattern.
 pub const GENID_PATH: &str = "/genid";
 
 /// A route a service answers in its own code, bound by pattern and method.
@@ -62,9 +62,39 @@ pub enum Handled {
     Named(usize, Request),
     /// `POST /genid`: run the start path again with [`Site::reload`], assign
     /// the new `Site` if it loaded, and answer [`genid_ok`] or
-    /// [`genid_failed`]. Payload-less because only the loop can assign the
-    /// site it owns.
-    Reload,
+    /// [`genid_failed`]. The loop that owns the site passes the carried facts
+    /// to [`finish_reload`] after it has answered, so the refresh writes the
+    /// one access line every other request writes.
+    Reload(Reload),
+}
+
+/// The facts a `POST /genid` needs after the reload: the request's method and
+/// path, and when it arrived, so [`finish_reload`] can write its access line.
+///
+/// Only a reload allocates these two strings. Every other request is logged
+/// from the borrowed head it already has.
+#[derive(Debug, Clone)]
+pub struct Reload {
+    pub method: String,
+    pub path: String,
+    pub started: std::time::Instant,
+}
+
+/// Write the access line for a finished `POST /genid`, then return the answer.
+///
+/// The refresh answer is built outside [`Site::finish_raw`] (it has no route,
+/// nothing to render and nothing to compress), and with this it is not silent:
+/// one line per reload, in the shape every other request logs, so an operator
+/// reading the log sees publishes and their status.
+pub fn finish_reload(reload: &Reload, resp: Response) -> Response {
+    crate::log::info!(
+        path = %reload.path,
+        method = %reload.method,
+        status = resp.status,
+        latency_us = reload.started.elapsed().as_micros(),
+        "request complete"
+    );
+    resp
 }
 
 /// A loaded site: everything the request path needs, read at start.
@@ -364,7 +394,11 @@ impl Site {
         // fall through to routing, where no route answers them.
         if raw.path() == GENID_PATH {
             if raw.method() == "POST" && raw.query().is_empty() {
-                return Handled::Reload;
+                return Handled::Reload(Reload {
+                    method: raw.method().to_string(),
+                    path: raw.path().to_string(),
+                    started,
+                });
             }
             if raw.method() != "POST" {
                 let resp = Response::status(405)
@@ -2341,7 +2375,7 @@ mod tests {
             Handled::Named(index, _) => panic!("unexpected named index {index}"),
             Handled::Done(_) => panic!("the handler wins over the template"),
             Handled::Code(..) => panic!("a config route names no code route"),
-            Handled::Reload => panic!("this request is a GET on /both"),
+            Handled::Reload(_) => panic!("this request is a GET on /both"),
         }
     }
 

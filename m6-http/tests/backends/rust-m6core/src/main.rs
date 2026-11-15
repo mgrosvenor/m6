@@ -340,13 +340,16 @@ fn turn(conn: &mut ServerConn, site: &mut Site, status_body: &[u8]) -> io::Resul
                     // The reserved path: run the start path again and assign
                     // the new Site in the loop's own binding, or keep serving
                     // the old one and answer the cause.
-                    Handled::Reload => match site.reload(&ROUTES, &[], &NoTemplates) {
-                        Ok(next) => {
-                            *site = next;
-                            genid_ok()
-                        }
-                        Err(e) => genid_failed(&e),
-                    },
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&ROUTES, &[], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        m6_core::site::finish_reload(&reload, response)
+                    }
                     // This service's five routes, by the index they were given
                     // to `Site::load` in.
                     Handled::Code(index, req) => {

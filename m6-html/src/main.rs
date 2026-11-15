@@ -255,13 +255,16 @@ fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
                     // The reserved path: run the start path again and assign
                     // the new Site in the loop's own binding, or keep serving
                     // the old one and answer the cause.
-                    Handled::Reload => match site.reload(&[], &[], &TeraFactory) {
-                        Ok(next) => {
-                            *site = next;
-                            genid_ok()
-                        }
-                        Err(e) => genid_failed(&e),
-                    },
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&[], &[], &TeraFactory) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        m6_core::site::finish_reload(&reload, response)
+                    }
                     Handled::Code(..) | Handled::Named(..) => unreachable!(
                         "m6-html passes no code routes and no handler names, so every route \
                          is answered by its template"

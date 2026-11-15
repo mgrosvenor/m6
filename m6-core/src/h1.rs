@@ -1340,14 +1340,15 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 ///                 }
 ///                 // The loop owns the Site. It runs the start path again
 ///                 // and assigns the new Site when that is `Ok`.
-///                 m6_core::Handled::Reload => {
-///                     match site.reload(&[], &[], &m6_core::NoTemplates) {
+///                 m6_core::Handled::Reload(reload) => {
+///                     let response = match site.reload(&[], &[], &m6_core::NoTemplates) {
 ///                         Ok(next) => {
 ///                             *site = next;
 ///                             m6_core::genid_ok()
 ///                         }
 ///                         Err(e) => m6_core::genid_failed(&e),
-///                     }
+///                     };
+///                     m6_core::site::finish_reload(&reload, response)
 ///                 }
 ///             };
 ///             (Some(response), false)

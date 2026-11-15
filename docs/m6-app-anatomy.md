@@ -238,13 +238,16 @@ fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
                     Handled::Done(response) => response,
                     Handled::Code(0, req) => site.finish(&req, Response::text("ok")),
                     // `POST /genid`: the start path again, then one assignment.
-                    Handled::Reload => match site.reload(&[], &[], &NoTemplates) {
-                        Ok(next) => {
-                            *site = next;
-                            genid_ok()
-                        }
-                        Err(e) => genid_failed(&e),
-                    },
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&[], &[], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        finish_reload(&reload, response)
+                    }
                     Handled::Code(..) | Handled::Named(..) => unreachable!(),
                 };
                 (Some(response), false)
@@ -437,13 +440,16 @@ let response = match site.handle(&head) {
     Handled::Code(2, req) => item(&req),
     Handled::Code(index, _) => unreachable!("route {index} is not in this match"),
     Handled::Named(index, req) => named(index, &req),
-    Handled::Reload => match site.reload(ROUTES, &[], &NoTemplates) {
-        Ok(next) => {
-            *site = next;
-            genid_ok()
-        }
-        Err(e) => genid_failed(&e),
-    },
+    Handled::Reload(reload) => {
+        let response = match site.reload(ROUTES, &[], &NoTemplates) {
+            Ok(next) => {
+                *site = next;
+                genid_ok()
+            }
+            Err(e) => genid_failed(&e),
+        };
+        finish_reload(&reload, response)
+    }
 };
 ```
 
