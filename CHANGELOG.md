@@ -147,6 +147,16 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**A service writes its access line at the default log level (#179).**
+`Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
+It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.
+Verified with `an_access_line_is_logged_at_the_default_level`, which finds no line on the previous code and an INFO line after it.
+
+**A split body-less HTTP/2 backend response is forwarded instead of a 502 (#315).**
+A backend that put END_STREAM on a HEADERS frame and finished the header block in CONTINUATION frames had its stream completed before the block ended, so the reply was failed as "stream ended without headers" and the edge answered 502.
+The client now completes a stream only when the header block ends and END_STREAM has been seen, as RFC 9113 sections 4.3 and 6.2 require, in the shared h2c and h2s path.
+Verified with `a_split_bodyless_response_is_forwarded`, which sees a 502 on the previous code and the backend's 200 after it.
+
 **A backend's early response is forwarded instead of a 502.**
 When a backend answered before it had read the whole request body (a 413 for an oversized upload, for example) and then closed, m6 treated the failed write as the result and answered 502, and on Linux the reply was lost.
 The client now reads a reply the backend has already sent before it reports a write error, over plain and TLS connections, and the backend's own status reaches the client.

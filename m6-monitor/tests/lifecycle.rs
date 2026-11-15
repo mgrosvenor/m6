@@ -274,19 +274,23 @@ fn a_trailing_or_doubled_slash_still_answers() {
 ///
 /// The counts are read once they have settled, through the platform layer.
 /// Reading the host's certificate store (`client::system_roots`, which the
-/// monitor does at start) leaves the platform's own idle workers behind on
-/// some hosts (three or four on macOS, none on Linux), so the test reads the
-/// store itself and counts them in this process. Their number swings by one
-/// between processes, so each claim allows that one thread and no more: a
-/// thread per node (two more for three nodes) or a poll thread still fails.
+/// monitor does at start) leaves idle workers behind: the platform reports how
+/// many (three or four on macOS, from the Security framework, and none on
+/// Linux). They are the only threads above the loop, so
+/// `assert_single_loop` adds the platform's range instead of measuring it in
+/// this process. Measuring it here is what used to fail: the workers are
+/// transient in the test process and the harness runs other tests beside this
+/// one, so the delta read 0 while the monitor had three. On macOS a single
+/// extra thread fits inside the workers' one-thread swing, so the exact count
+/// on Linux, where the store adds no thread, is what proves m6's own count. A
+/// thread per node is not hidden: three nodes add three and fail the bound.
 #[test]
 fn the_monitor_runs_one_thread() {
-    let workers = platform_workers();
     let (dir, config, sock) = setup(CONFIG);
     let svc = spawn(dir.path(), &config, &sock);
     let one = settled_threads(svc.pid(), &svc);
     drop(svc);
-    assert_single_loop("one node", one, workers);
+    assert_single_loop("one node", one);
 
     // The same three-node fleet twice, so a history writer shows as the one
     // difference between two otherwise identical runs.
@@ -308,7 +312,7 @@ fn the_monitor_runs_one_thread() {
     let svc2 = spawn(dir2.path(), &config2, &sock2);
     let plain = settled_threads(svc2.pid(), &svc2);
     drop(svc2);
-    assert_single_loop("three nodes with tunnels", plain, workers);
+    assert_single_loop("three nodes with tunnels", plain);
     // One process, three nodes: a thread per node would add two to this count
     // relative to the one-node run, beyond the platform workers' swing.
     assert!(
@@ -330,31 +334,21 @@ fn the_monitor_runs_one_thread() {
     assert_history_adds_none(plain, with_history, &output);
 }
 
-/// The loop, exactly, above the platform's own workers.
-fn assert_single_loop(what: &str, count: usize, workers: usize) {
-    // The platform's certificate-store workers are spawned by the service's
-    // own store read and can exit before the probe in THIS process runs, so the
-    // probe can read 0 while the service still holds four (macOS leaves three
-    // or four idle). The bound allows that whole range above the measured
-    // count; the three-node comparison below is what still fails a thread per
-    // node.
-    let expected = 1 + workers;
+/// The loop, above the platform's own workers.
+fn assert_single_loop(what: &str, count: usize) {
+    // LOG-2 removed tracing-appender's writer, so the loop is the only thread
+    // m6 starts. The platform reports its certificate-store worker range, which
+    // is why the bound is a range rather than a count measured in this process.
+    let (workers_low, workers_high) = m6_core::platform::process::certificate_store_workers();
+    let low = 1 + workers_low;
+    let high = 1 + workers_high;
     assert!(
-        (expected.saturating_sub(1)..=expected + 4).contains(&count),
+        (low..=high).contains(&count),
         "{what}: m6-monitor runs {count} threads, not the one loop thread \
-         and the platform's {workers} certificate-store worker(s), up to four \
-         of which can outlive the probe"
+         and the platform's {workers_low} to {workers_high} idle \
+         certificate-store workers: {low} to {high} here, and exactly 1 where \
+         the store adds none"
     );
-}
-
-/// How many threads reading the host's certificate store leaves behind in a
-/// process on this host: measured here, in this process, so the count above
-/// is exact on every target rather than assumed per OS.
-fn platform_workers() -> usize {
-    let me = std::process::id();
-    let before = settled_count(me);
-    let _ = m6_core::client::system_roots().expect("the host certificate store");
-    settled_count(me).saturating_sub(before)
 }
 
 /// The thread count of `pid` once two readings 100 ms apart agree.
