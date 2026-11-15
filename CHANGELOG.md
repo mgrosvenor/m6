@@ -178,6 +178,8 @@ Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query
 
 ### Fixed
 
+**The HTTP conformance gate runs again.** `tools/conformance.sh` still wrote `[log] format`, which is now refused, and started the redirect listener with analytics on and no log directory, which is now refused too, so the gate measured nothing for h1's redirect listener, h2 or h3. It now writes neither, and runs the dev-profile build (`target/debug`, or `M6_BIN_DIR`) like every other gate; CI builds `--bins` for it instead of `--release`. `tools/backend-bench.py` no longer writes `[log] format` either. Verified on Linux: h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49 (the recorded floor), resumption and early data as before.
+
 **A source node's `M6-Genid` header no longer makes an HTTP/2 response unreadable.**
 The header was serialised with its title-case name in the HPACK block, and RFC 9113 8.2.1 requires lower-case field names.
 A strict client rejected the HEADERS frame as a protocol error and read no body, so a page that HTTP/1.1 served as 2671 bytes arrived as 0 over HTTP/2.
