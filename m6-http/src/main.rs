@@ -157,7 +157,7 @@ use m6_http_lib::http11::{
 use m6_http_lib::pool::{self, PoolManager};
 use m6_http_lib::priority;
 use m6_http_lib::router::RouteTable;
-use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
+use m6_http_lib::stats::{CacheOutcome, Channel, Iface, Version as HttpVersion};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -800,11 +800,11 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
         set_date(&mut hdrs);
         return Routed::Ready(504, hdrs, Vec::new(), "cache".to_string());
     }
-    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) {
-        "STALE"
-    } else {
-        "HIT"
-    };
+    // The lookup already answered the validity question, so the outcome is
+    // read from the value that carries it rather than derived again from the
+    // entry's age in the report.
+    let hit_is_valid = looked_up.is_fresh();
+    let cache_state = if hit_is_valid { "HIT" } else { "STALE" };
     if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
             path: path.to_string(),
@@ -830,7 +830,11 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
         let precond = evaluate_preconditions(cached.status, &cached.headers, headers, method);
         state.stats.record(
             elapsed_ns,
-            true,
+            if hit_is_valid {
+                CacheOutcome::ValidHit
+            } else {
+                CacheOutcome::InvalidHit
+            },
             match precond {
                 Precondition::Failed => 412,
                 Precondition::NotModified => 304,
@@ -1096,6 +1100,11 @@ fn on_request_head(
 
 /// The tail every cache miss shares: advertise `alt-svc` and record the miss in
 /// the stats, then return the outcome unchanged.
+///
+/// A `Ready` outcome here is a miss m6-http answered itself, and that is the
+/// case this counter names. Every backend dispatch returns `Pending`, so a
+/// reply that came from a backend is recorded where the backend's answer
+/// arrives, with its status and its latency, and never here.
 fn finish_miss(
     state: &mut ServerState,
     mut outcome: RequestOutcome,
@@ -1108,7 +1117,13 @@ fn finish_miss(
         set_alt_svc(headers, quic_port);
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         let chan = Channel::new(version, iface);
-        state.stats.record(elapsed_ns, false, status, chan, backend);
+        state.stats.record(
+            elapsed_ns,
+            CacheOutcome::AnsweredLocally,
+            status,
+            chan,
+            backend,
+        );
     }
     outcome
 }
@@ -1597,6 +1612,23 @@ fn complete_waiter(
     };
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
+            // A cache miss answered by a backend is counted here, where the
+            // answer arrives: this is the one point every protocol's fetched
+            // response passes through, and the only one where the final status
+            // and the miss latency are both known. A background refresh is not
+            // a visit and is not counted.
+            if !ctx.is_prefetch {
+                if let Some(chan) = waiter_channel(&waiter, cx.state) {
+                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
+                    cx.state.stats.record(
+                        elapsed_ns,
+                        CacheOutcome::FetchedMiss,
+                        status,
+                        chan,
+                        &ctx.backend_name,
+                    );
+                }
+            }
             let priority = if matches!(waiter, Waiter::H3 { .. }) {
                 priority::from_headers(
                     ctx.req
@@ -1612,6 +1644,31 @@ fn complete_waiter(
         Completion::Pending { id, ctx } => {
             park(cx.state, id, ctx, waiter);
         }
+    }
+}
+
+/// The (version, interface) channel a parked request arrived on, read from the
+/// connection its waiter names.
+///
+/// The same lookup `write_waiter` uses to deliver the reply, so the figures are
+/// attributed to the connection that is actually answered. `None` for a waiter
+/// that is not a client request at all: a background refresh, a heartbeat or a
+/// change sequence, none of which is traffic.
+fn waiter_channel(waiter: &Waiter, state: &ServerState) -> Option<Channel> {
+    let (version, iface) = match waiter {
+        Waiter::H1 { conn, .. } => (HttpVersion::Http11, connection_iface(*conn, state)),
+        Waiter::H2 { conn, .. } => (HttpVersion::Http2, connection_iface(*conn, state)),
+        Waiter::H3 { .. } => (HttpVersion::Http3, state.tls_iface),
+        Waiter::Background | Waiter::Heartbeat | Waiter::Genid { .. } => return None,
+    };
+    Some(Channel::new(version, iface))
+}
+
+/// Which interface a client connection's socket was accepted on.
+fn connection_iface(conn: Token, state: &ServerState) -> Iface {
+    match state.sources.get(conn.0) {
+        Source::H2cConn(_) => state.h2c_iface,
+        _ => state.tls_iface,
     }
 }
 
@@ -3449,12 +3506,10 @@ fn handle_h3_request(
     }
     // Serve stale now, refresh behind the request — see the HTTP/1.1 path for
     // the reasoning.
-    // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit.
-    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) {
-        "STALE"
-    } else {
-        "HIT"
-    };
+    // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit,
+    // and the lookup's own variant is the validity this records.
+    let hit_is_valid = looked_up.is_fresh();
+    let cache_state = if hit_is_valid { "HIT" } else { "STALE" };
     if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
             path: path_str.to_string(),
@@ -3484,7 +3539,11 @@ fn handle_h3_request(
         // counted as a 304 and not as the cached 200.
         state.stats.record(
             elapsed_ns,
-            true,
+            if hit_is_valid {
+                CacheOutcome::ValidHit
+            } else {
+                CacheOutcome::InvalidHit
+            },
             match precond {
                 Precondition::Failed => 412,
                 Precondition::NotModified => 304,
@@ -3671,9 +3730,13 @@ fn handle_h3_request(
                 HttpVersion::Http3,
                 health::peer_iface(qconn.client_addr.ip()),
             );
-            state
-                .stats
-                .record(elapsed_ns, false, status, chan, &backend_name);
+            state.stats.record(
+                elapsed_ns,
+                CacheOutcome::AnsweredLocally,
+                status,
+                chan,
+                &backend_name,
+            );
             debug!(
                 path = %path,
                 status,

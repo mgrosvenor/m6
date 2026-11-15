@@ -5,7 +5,7 @@
 use criterion::{black_box, criterion_group, Criterion};
 
 use m6_http_lib::cache::{make_lookup_key, Cache, CacheKey, CachedResponse, HeaderBlock};
-use m6_http_lib::stats::{Channel, Iface, Stats, Version};
+use m6_http_lib::stats::{CacheOutcome, Channel, Iface, Stats, Version};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ fn bench_cache_miss(c: &mut Criterion) {
 }
 
 /// Stats::record — the per-request instrumentation call.
-/// Expected: <5ns (3 integer increments + 1 array write).
+/// Expected: <5ns (4 integer increments + 1 array write).
 /// Uses iter_custom to batch calls — operation is sub-ns and trips zero-time guards otherwise.
 fn bench_stats_record(c: &mut Criterion) {
     let mut stats = Stats::new();
@@ -149,7 +149,7 @@ fn bench_stats_record(c: &mut Criterion) {
             for _ in 0..iters {
                 stats.record(
                     black_box(250),
-                    black_box(true),
+                    black_box(CacheOutcome::ValidHit),
                     black_box(200),
                     black_box(Channel::new(Version::Http2, Iface::External)),
                     black_box("m6-html"),
@@ -509,7 +509,7 @@ fn main() {
         report_percentiles("stats_record", N, || {
             stats.record(
                 black_box(250),
-                black_box(true),
+                black_box(CacheOutcome::ValidHit),
                 black_box(200),
                 black_box(Channel::new(Version::Http2, Iface::External)),
                 black_box("m6-html"),
