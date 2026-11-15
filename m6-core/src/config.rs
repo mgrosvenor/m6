@@ -168,6 +168,14 @@ pub struct RendererConfig {
     /// A relative path resolves against `site_dir`. `None` means
     /// `<site_dir>/site.toml`. See [`RendererConfig::resolve_site_toml`].
     pub site_toml: Option<PathBuf>,
+    /// The document root's size budget in mebibytes, from the top-level
+    /// `site_size_budget_mb` key. m6-file reads it. `None` uses
+    /// `m6_file_lib::site_size::DEFAULT_BUDGET_MB`.
+    ///
+    /// The key is parsed here, rather than in m6-file, so a value that is not a
+    /// positive integer is refused before any service binds a socket. A service
+    /// that serves nothing from disk accepts the key and never reads it.
+    pub site_size_budget_mb: Option<u64>,
 }
 
 impl RendererConfig {
@@ -240,6 +248,7 @@ const FRAMEWORK_KEYS: &[&str] = &[
     "errors",
     "flash_secret",
     "site_toml",
+    "site_size_budget_mb",
 ];
 
 /// Load and merge config + optional secrets file.
@@ -548,6 +557,26 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         }
     }
 
+    // --- site_size_budget_mb ---
+    //
+    // A budget of zero would warn on every root, which reads as a broken
+    // setting rather than a choice. Refuse it here, before a service starts.
+    let site_size_budget_mb = match tv.get("site_size_budget_mb") {
+        None => None,
+        Some(v) => {
+            let n = v.as_integer().ok_or_else(|| {
+                anyhow::anyhow!("site_size_budget_mb must be an integer, got {v}")
+            })?;
+            let n = u64::try_from(n).map_err(|_| {
+                anyhow::anyhow!("site_size_budget_mb must not be negative, got {n}")
+            })?;
+            if n == 0 {
+                anyhow::bail!("site_size_budget_mb must be at least 1, got 0");
+            }
+            Some(n)
+        }
+    };
+
     // --- site_toml ---
     let site_toml = match tv.get("site_toml") {
         None => None,
@@ -571,6 +600,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         minification,
         log,
         site_toml,
+        site_size_budget_mb,
     })
 }
 
@@ -851,6 +881,34 @@ template = "templates/home.html"
             cfg.resolve_site_toml(Path::new("/srv/site")),
             PathBuf::from("/srv/site/site.toml")
         );
+    }
+
+    #[test]
+    fn site_size_budget_is_absent_by_default() {
+        let cfg = load_text("site_name = \"x\"\n").unwrap();
+        assert_eq!(cfg.site_size_budget_mb, None);
+        assert!(!cfg.user_config.contains_key("site_size_budget_mb"));
+    }
+
+    #[test]
+    fn site_size_budget_is_read_and_reserved() {
+        let cfg = load_text("site_size_budget_mb = 256\n").unwrap();
+        assert_eq!(cfg.site_size_budget_mb, Some(256));
+        // The key is a start setting, not a template variable.
+        assert!(!cfg.user_config.contains_key("site_size_budget_mb"));
+    }
+
+    #[test]
+    fn site_size_budget_zero_is_refused() {
+        let err = load_text("site_size_budget_mb = 0\n").unwrap_err();
+        assert!(err.to_string().contains("site_size_budget_mb"), "{err}");
+        assert!(err.to_string().contains("at least 1"), "{err}");
+    }
+
+    #[test]
+    fn site_size_budget_that_is_not_an_integer_is_refused() {
+        let err = load_text("site_size_budget_mb = \"128\"\n").unwrap_err();
+        assert!(err.to_string().contains("site_size_budget_mb"), "{err}");
     }
 
     #[test]

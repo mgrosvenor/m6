@@ -13,8 +13,9 @@ This document covers its two route tables, how it resolves a path, what its hand
 3. [How a path is resolved](#3-how-a-path-is-resolved)
 4. [What the handler owns](#4-what-the-handler-owns)
 5. [Refusing to serve outside its root](#5-refusing-to-serve-outside-its-root)
-6. [Configuration](#6-configuration)
-7. [Summary](#7-summary)
+6. [What a served root may carry](#6-what-a-served-root-may-carry)
+7. [Configuration](#7-configuration)
+8. [Summary](#8-summary)
 
 ## 1. The shape of a request
 
@@ -178,21 +179,69 @@ This is a backstop, not the boundary.
 The boundary is the root the process was started with, so that directory should hold only what this service serves.
 [`m6-site-layout.md`](m6-site-layout.md) covers how to arrange that.
 
-## 6. Configuration
+## 6. What a served root may carry
+
+m6-file walks every route's `root` once at start and reports what is there.
+The walk happens before the socket is bound, so a refused start leaves no listener behind, and a request pays nothing for it.
+It follows the routes, so a renderer's `target/` beside the app root is not examined when no route reaches it.
+
+Table 5 gives the names and the answer.
+
+| entry | answer | why |
+|---|---|---|
+| `.git` (file or directory) | exit 2 | History, hooks and config are never a served asset |
+| `target/`, `node_modules/` | exit 2 | A build tree or a dependency tree is never a served asset |
+| `logs/` | warning, then serve | A log viewer roots a route there on purpose, and a wildcard route over a wider root would publish it by accident |
+| `*~`, `*.swp`, `*.swo`, `*.rs.bk`, `.#*`, `.DS_Store` | warning, then serve | An editor backup or OS metadata leaks source and is never a served asset |
+
+**Table 5: what a served root may carry.** A version-control directory and a build tree stop the start, while a log directory and an editor backup are named and served.
+
+A root that names one file, such as `root = "static/robots.txt"`, makes that file served on purpose, so its name is never a finding.
+A root holding a `{param}` is cut at the first placeholder, because the tree up to that point is the most the route can reach without a request.
+An absolute root and a root that climbs out with `..` are skipped here, and the handler's `resolve_within` refuses them per request.
+
+### 6.1. The size budget
+
+`site_size_budget_mb` is a top-level key in m6-file's config.
+The walk compares the budget with the regular-file bytes every route's root can reach.
+Overlapping roots are counted once, symlinks are not followed, and a file a route names outright counts as one file.
+
+The budget counts bytes, not files.
+Bytes are what fills the disk and what a deploy transfers, and a file count would refuse a legitimate tree of many small thumbnails while one huge video passed.
+The warning also prints the file count so an operator can see a tree that is large in inodes as well as bytes.
+
+The default is 128 MiB.
+The largest tree in m6's own examples is 5.1 MB, so the default leaves two orders of magnitude of room for a legitimate asset tree while still catching a `target/` or a log file that has grown for a year.
+A deployment that serves more raises the key.
+
+The over-budget line names the total, the file count and the setting:
+
+```text
+m6-file: the document root /srv/site holds 131.0 MiB in 1204 files, over site_size_budget_mb = 128: raise site_size_budget_mb in the config, or remove files that should not be deployed
+```
+
+The budget is a warning.
+Content changes without a config edit, and a legitimate large asset must not stop a serving node at 02:00.
+A mistake at start is an error when the mistake is a name that can never be intentional, which is why Table 5 splits the two answers.
+
+## 7. Configuration
 
 m6-file accepts two arguments, a root and a config path, serves from one event loop, and reads its routes from the config.
 
 ```toml
+site_size_budget_mb = 128
+
 [[route]]
 path    = "/assets/{*relpath}"
 handler = "files"
 root    = "assets/"
 ```
 
-Two facts about that config:
+Three facts about that config:
 
 - a route naming a handler the binary does not have is fatal, so the service exits 2 at startup.
 - routes come from config, read once at start, so an asset tree is added by editing the config and restarting.
+- `site_size_budget_mb` is a top-level key, so it goes before the first `[[route]]` table. TOML puts a key written after that header inside the route.
 
 The process serves every connection from one loop, so more load is more instances, each with its own socket in `site.toml`'s `[[backend]]` glob.
 A `[thread_pool]` table is refused at start for the same reason.
@@ -202,12 +251,13 @@ m6-file answers `GET` and `HEAD`, and returns 405 for anything else.
 Those two arguments and this one config are the whole interface.
 The summary below collects what they imply.
 
-## 7. Summary
+## 8. Summary
 
 m6-file is a small service with one handler and its own route table.
 The table is the part to remember, because a static file needs a route in `site.toml` to reach m6-file and a route in `m6-file.conf` to reach the disk.
 Its handler owns the whole response, including the ETag and `Cache-Control`, which no route can currently override.
 Its root bounds what it can serve, which is why the layout document treats that root as a security boundary rather than a convenience.
+Every route's root is walked once at start, and section 6 gives the entries that stop the start and the size budget that warns about a tree grown too large.
 
 Related reading:
 

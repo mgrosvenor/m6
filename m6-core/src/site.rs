@@ -431,6 +431,15 @@ impl Site {
         &self.state.config.user_config
     }
 
+    /// The whole parsed config, for a service's own start checks.
+    ///
+    /// m6-file reads `site_size_budget_mb` here. The keep-it-simple rule puts a
+    /// service's start check in that service's `main`, and this is the one
+    /// accessor that lets it see the value core parsed.
+    pub fn config(&self) -> &crate::config::RendererConfig {
+        &self.state.config
+    }
+
     pub fn site_dir(&self) -> &Path {
         &self.state.site_dir
     }
