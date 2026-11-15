@@ -155,6 +155,13 @@ pub(super) fn prepare_socket(sock: &socket2::Socket) -> io::Result<()> {
     sock.set_nosigpipe(true)
 }
 
+/// macOS has no `TCP_NOTSENT_LOWAT`. The kernel takes what the socket gives it
+/// and its own order stands, so there is nothing to set and nothing to undo:
+/// the caller's frames still leave in the order they were written.
+pub(super) fn limit_send_queue(_fd: RawFd, _bytes: usize) -> io::Result<()> {
+    Ok(())
+}
+
 /// The hard limit reads as unlimited and the kernel enforces
 /// `kern.maxfilesperproc`, so that is the cap.
 pub(super) fn max_open_files() -> io::Result<Option<u64>> {

@@ -324,8 +324,9 @@ pub const INITIAL_CONNECTIONS: usize = 1024;
 /// `bind_tcp_reuseaddr` takes a `SocketAddr` because it has to choose a socket
 /// domain before binding, which `TcpListener::bind`'s `ToSocketAddrs` hides.
 /// The first resolved address wins, which is what `TcpListener::bind` does too
-/// for a single-address host like `127.0.0.1` or `0.0.0.0`.
-fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
+/// for a single-address host like `127.0.0.1` or `0.0.0.0`. `main` resolves
+/// with this too, so a shared node's TLS and QUIC sockets bind one address.
+pub fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     addr.to_socket_addrs()?
         .next()
@@ -353,6 +354,18 @@ impl Http11Listener {
         Self::bind_maybe_tls(addr, None, max_requests, initial, ceiling)
     }
 
+    /// Wrap the TCP half of a pair bound with `SO_REUSEPORT` by
+    /// `m6_core::platform::net::listen_shared`, for `[server] reuse_port`.
+    pub fn from_shared(
+        listener: std::net::TcpListener,
+        tls_config: Arc<rustls::ServerConfig>,
+        max_requests: u32,
+        initial: usize,
+        ceiling: usize,
+    ) -> anyhow::Result<Self> {
+        Self::from_bound(listener, Some(tls_config), max_requests, initial, ceiling)
+    }
+
     fn bind_maybe_tls(
         addr: &str,
         tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -365,6 +378,16 @@ impl Http11Listener {
         // a failed bind as a warning: the process comes up with no listener at
         // all, running and healthy to systemd, serving nobody.
         let listener = m6_core::server::bind_tcp_reuseaddr(resolve_bind(addr)?)?;
+        Self::from_bound(listener, tls_config, max_requests, initial, ceiling)
+    }
+
+    fn from_bound(
+        listener: std::net::TcpListener,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+        max_requests: u32,
+        initial: usize,
+        ceiling: usize,
+    ) -> anyhow::Result<Self> {
         listener.set_nonblocking(true)?;
         Ok(Http11Listener {
             listener,
@@ -2020,9 +2043,9 @@ pub use m6_core::h1::{parse_head, parse_request, HeadError, HeadResult, ParseRes
 /// length.
 ///
 /// The framing is unambiguous without it -- a 304 has no body by definition,
-/// and every protocol here signals end-of-message its own way (H1 closes or
-/// uses the next request boundary, H2/H3 use END_STREAM) -- so omitting it is
-/// both correct and safe. Emitting the *correct* non-zero length would also be
+/// and every protocol here signals end-of-message its own way (H1 uses the
+/// next request boundary, H2/H3 use END_STREAM) -- so omitting it is both
+/// correct and safe. Emitting the *correct* non-zero length would also be
 /// legal, but it would mean carrying the stored body's length through the 304
 /// path for no benefit to any client.
 pub fn status_may_have_content_length(status: u16) -> bool {
@@ -2121,11 +2144,13 @@ fn write_response(
         out.extend_from_slice(itoa::Buffer::new().format(cl).as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    // A response the recipient cannot frame must close, whatever either side
-    // would prefer: without Content-Length the body ends at end-of-connection,
-    // so keeping it open would make the next response unreadable.
-    let framed = status_may_have_content_length(status);
-    if keep_alive && framed {
+    // RFC 9112 6.3 rule 1: a 304 ends at the empty line whatever fields it
+    // carries, and a 204 or 1xx likewise, so a bodyless response is
+    // self-delimiting without Content-Length. Every other status got a
+    // Content-Length above. No response written here can be unframed, so
+    // none needs `close` for framing; announcing one makes every client drop
+    // a usable connection after a 304.
+    if keep_alive {
         out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
     } else {
         out.extend_from_slice(b"connection: close\r\n\r\n");
@@ -2390,7 +2415,7 @@ pub fn write_cached_h1(
         out.extend_from_slice(b"\r\n");
     }
 
-    if keep_alive && status_may_have_content_length(entry.status) {
+    if keep_alive {
         out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
     } else {
         out.extend_from_slice(b"connection: close\r\n\r\n");
@@ -2876,6 +2901,32 @@ mod bodyless_status_tests {
         let head = head_of(304);
         assert!(head.contains("ETag"), "304 lost its ETag:\n{head}");
         assert!(head.starts_with("HTTP/1.1 304 Not Modified"), "{head}");
+    }
+
+    /// RFC 9112 6.3 rule 1: a 304 ends at the empty line whatever its fields
+    /// say, so it is self-delimiting and has no framing reason to close. m6
+    /// advertised `connection: close` on every 304, so a client had to
+    /// reconnect for the next request even though the server stayed open.
+    #[test]
+    fn a_304_does_not_advertise_a_close() {
+        let raw = build_response(
+            304,
+            &[("ETag".to_string(), "\"x\"".to_string())],
+            b"",
+            "GET",
+            true,
+            None,
+        );
+        let head = String::from_utf8_lossy(&raw);
+        let head = head.split("\r\n\r\n").next().unwrap_or("").to_string();
+        assert!(
+            head.contains("connection: keep-alive"),
+            "a 304 must keep the connection:\n{head}"
+        );
+        assert!(
+            !head.contains("connection: close"),
+            "a 304 must not advertise a close:\n{head}"
+        );
     }
 }
 

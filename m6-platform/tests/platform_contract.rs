@@ -879,6 +879,182 @@ mod sockets {
         assert!(ready(&mut poll, &mut events, SOON).iter().any(|e| e.2));
         assert!(stream.take_error().expect("take_error").is_none());
     }
+
+    /// U12. Two listeners on one port, every connection answered, and dropping
+    /// one leaves the port served. Break: the second bind refused because
+    /// `SO_REUSEPORT` was not set before it, a listener that answers nothing,
+    /// or a stop that leaves the port dead.
+    ///
+    /// The test counts the connections answered, never the split between the
+    /// two listeners: Linux hashes the 4-tuple to choose a socket and macOS
+    /// does not, so the split is not even and is not the subject.
+    #[test]
+    fn two_shared_tcp_listeners_share_one_port_and_one_may_stop() {
+        let (mut first, _udp) =
+            net::listen_shared(SocketAddr::from(([127, 0, 0, 1], 0))).expect("first bind");
+        let addr = first.local_addr().expect("addr");
+        let (mut second, _udp2) = net::listen_shared(addr).expect("second bind on the same port");
+
+        fn answer_all(listener: &mut std::net::TcpListener, tag: u8, answered: &mut usize) {
+            loop {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        conn.write_all(&[tag]).expect("answer");
+                        *answered += 1;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        }
+
+        let other = Token(4);
+        let mut poll = Poll::new().expect("poll");
+        let mut events = Events::with_capacity(64);
+        poll.registry()
+            .register_fd(first.as_raw_fd(), T, Interest::READABLE)
+            .expect("register first");
+        poll.registry()
+            .register_fd(second.as_raw_fd(), other, Interest::READABLE)
+            .expect("register second");
+
+        let mut answered = 0;
+        for i in 0..8 {
+            let mut client =
+                std::net::TcpStream::connect(addr).expect("connect to the shared port");
+            client.set_read_timeout(Some(SOON)).expect("read timeout");
+            let waits = ready(&mut poll, &mut events, SOON);
+            assert!(
+                !waits.is_empty(),
+                "connection {i} produced no readable listener"
+            );
+            for (token, readable, _) in waits {
+                assert!(readable);
+                match token {
+                    T => answer_all(&mut first, b'a', &mut answered),
+                    t if t == other => answer_all(&mut second, b'b', &mut answered),
+                    other => panic!("unexpected token {other:?}"),
+                }
+            }
+            let mut tag = [0u8; 1];
+            client
+                .read_exact(&mut tag)
+                .expect("every connection is answered");
+            assert!(tag[0] == b'a' || tag[0] == b'b', "tag {tag:?}");
+        }
+        assert_eq!(answered, 8, "every connection is answered once");
+
+        // Stop one listener. The other still owns the port, so every later
+        // connection is answered.
+        poll.registry()
+            .deregister_fd(first.as_raw_fd())
+            .expect("deregister first");
+        drop(first);
+        for i in 0..8 {
+            let mut client =
+                std::net::TcpStream::connect(addr).expect("connect after one listener stopped");
+            client.set_read_timeout(Some(SOON)).expect("read timeout");
+            let waits = ready(&mut poll, &mut events, SOON);
+            assert!(!waits.is_empty(), "connection {i} after the stop");
+            answer_all(&mut second, b'b', &mut answered);
+            let mut tag = [0u8; 1];
+            client
+                .read_exact(&mut tag)
+                .expect("the remaining listener answers");
+            assert_eq!(tag[0], b'b');
+        }
+        assert_eq!(answered, 16, "the port is served after the stop");
+    }
+
+    /// U13. Two UDP sockets on one port, every datagram delivered exactly
+    /// once, and dropping one leaves the port served. Break: the second bind
+    /// refused, a datagram delivered twice or to neither, or a stop that
+    /// leaves the port dead.
+    ///
+    /// No assertion counts datagrams per socket: a UDP datagram goes to one
+    /// socket on both targets, and neither picks an even split.
+    #[test]
+    fn two_shared_udp_sockets_share_one_port_and_one_may_stop() {
+        let (_tcp, first) =
+            net::listen_shared(SocketAddr::from(([127, 0, 0, 1], 0))).expect("first bind");
+        let addr = first.local_addr().expect("addr");
+        let (_tcp2, second) = net::listen_shared(addr).expect("second bind on the same port");
+
+        let other = Token(4);
+        let mut poll = Poll::new().expect("poll");
+        let mut events = Events::with_capacity(64);
+        poll.registry()
+            .register_fd(first.as_raw_fd(), T, Interest::READABLE)
+            .expect("register first");
+        poll.registry()
+            .register_fd(second.as_raw_fd(), other, Interest::READABLE)
+            .expect("register second");
+
+        fn drain(sock: &std::net::UdpSocket, from: &str, got: &mut Vec<String>) {
+            loop {
+                let mut buf = [0u8; 64];
+                match sock.recv_from(&mut buf) {
+                    Ok((n, _)) => {
+                        got.push(format!("{from}:{}", String::from_utf8_lossy(&buf[..n])))
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                    Err(e) => panic!("recv_from: {e}"),
+                }
+            }
+        }
+
+        let mut got = Vec::new();
+        for i in 0..6 {
+            let client = std::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("client socket");
+            client
+                .send_to(format!("d{i}").as_bytes(), addr)
+                .expect("send to the shared port");
+            let waits = ready(&mut poll, &mut events, SOON);
+            assert!(!waits.is_empty(), "datagram {i} reached neither socket");
+            let before = got.len();
+            for (token, readable, _) in waits {
+                assert!(readable);
+                match token {
+                    T => drain(&first, "first", &mut got),
+                    t if t == other => drain(&second, "second", &mut got),
+                    other => panic!("unexpected token {other:?}"),
+                }
+            }
+            assert_eq!(
+                got.len() - before,
+                1,
+                "datagram {i} is delivered exactly once: {got:?}"
+            );
+        }
+        for i in 0..6 {
+            let (_, payload) = got[i].split_once(':').expect("a sender prefix");
+            assert_eq!(
+                payload,
+                format!("d{i}"),
+                "datagram {i} arrived once: {got:?}"
+            );
+        }
+
+        // Stop one socket. The other still owns the port.
+        poll.registry()
+            .deregister_fd(first.as_raw_fd())
+            .expect("deregister first");
+        drop(first);
+        let client = std::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("client socket");
+        client
+            .send_to(b"after", addr)
+            .expect("send after one socket stopped");
+        let waits = ready(&mut poll, &mut events, SOON);
+        assert!(!waits.is_empty(), "the port is dead after the stop");
+        drain(&second, "second", &mut got);
+        assert_eq!(
+            got.last().map(String::as_str),
+            Some("second:after"),
+            "the remaining socket receives: {got:?}"
+        );
+    }
 }
 
 // ── 5. Clock ─────────────────────────────────────────────────────────────────

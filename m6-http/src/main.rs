@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -32,6 +32,7 @@ use m6_http_lib::forward::{self, UpstreamId, Waiter};
 use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
+use m6_http_lib::http2::SEND_QUEUE_BYTES;
 use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
@@ -148,11 +149,12 @@ use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    make_tls_server_config, ConnDrive, H2cListener, HitHeaders, Http11Listener, ParseResult,
-    RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
+    make_tls_server_config, resolve_bind, ConnDrive, H2cListener, HitHeaders, Http11Listener,
+    ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
     MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::{self, PoolManager};
+use m6_http_lib::priority;
 use m6_http_lib::router::RouteTable;
 use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
 
@@ -240,8 +242,9 @@ struct PendingRequest {
 /// finish it once quiche reports the stream writable again.
 enum PendingH3Response {
     /// The HEADERS frame itself was blocked — nothing has reached the client
-    /// yet, so both header and body still need sending.
-    Headers(Vec<quiche::h3::Header>, Bytes),
+    /// yet, so both header and body still need sending, at the priority the
+    /// request asked for.
+    Headers(Vec<quiche::h3::Header>, Bytes, priority::Priority),
     /// HEADERS already sent; body is blocked at the given offset.
     Body(Bytes, usize),
 }
@@ -798,7 +801,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         let chan = Channel::new(http_version, iface);
-        let precond = evaluate_preconditions(&cached.headers, headers, method);
+        let precond = evaluate_preconditions(cached.status, &cached.headers, headers, method);
         state.stats.record(
             elapsed_ns,
             true,
@@ -1101,6 +1104,24 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
     Some(Token(taken.key))
 }
 
+/// Ask the kernel to report the socket writable only once its unsent data
+/// falls below the send queue's bound. The bounded queue decides which frames
+/// enter the kernel; without this option the kernel takes a whole response
+/// body at once and decides what leaves first, so the order would be lost.
+///
+/// The option is the platform layer's: Linux sets `TCP_NOTSENT_LOWAT` and macOS
+/// has no equivalent, so there the kernel's own order stays in force. A kernel
+/// that will not set it still sends everything, in its own order, so the
+/// failure is a log line rather than a refused connection.
+fn limit_kernel_send_queue(fd: RawFd) {
+    if let Err(e) = m6_core::platform::net::limit_send_queue(fd, SEND_QUEUE_BYTES) {
+        warn!(
+            error = %e,
+            "TCP_NOTSENT_LOWAT: the send queue is bounded, but this kernel will not wait for it"
+        );
+    }
+}
+
 /// Accept TLS connections until the socket would block or the token table is
 /// full. Returns whether the table is at its ceiling.
 fn accept_tls(
@@ -1160,6 +1181,7 @@ fn accept_h2c(
         };
         conn.set_token(token);
         conn.set_interest(Interest::READABLE);
+        limit_kernel_send_queue(conn.raw_fd());
         if let Err(e) = registry.register_fd(conn.raw_fd(), token, Interest::READABLE) {
             warn!(error = %e, "h2c register");
             h.free_slot(owner.key);
@@ -1251,6 +1273,9 @@ fn drive_conn_token(
         if hs.is_h2 {
             state.read_timeouts.clear(token);
             state.h2_idle_timeouts.touch(token, now);
+            if let Some(t) = tcp.as_mut() {
+                limit_kernel_send_queue(t.slot_mut(slot).raw_fd());
+            }
         }
     }
     after_conn_drive(token, &drive, state, tcp, h2c, registry, now);
@@ -1346,12 +1371,14 @@ fn after_conn_drive(
 }
 
 /// Write a finished response straight into the waiting stream, in this turn.
+#[allow(clippy::too_many_arguments)] // one response's fields plus the stream, its priority and the loop's context
 fn write_waiter(
     waiter: Waiter,
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     method: &str,
+    priority: priority::Priority,
     genid: Option<u64>,
     cx: &mut CompletionCtx<'_>,
 ) {
@@ -1406,6 +1433,7 @@ fn write_waiter(
                 send_h3_response(
                     stream,
                     qconn,
+                    priority,
                     status,
                     &headers,
                     Bytes::from(body),
@@ -1519,7 +1547,17 @@ fn complete_waiter(
     };
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
-            write_waiter(waiter, status, headers, body, method, genid, cx);
+            let priority = if matches!(waiter, Waiter::H3 { .. }) {
+                priority::from_headers(
+                    ctx.req
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+                )
+            } else {
+                priority::Priority::default()
+            };
+            write_waiter(waiter, status, headers, body, method, priority, genid, cx);
         }
         Completion::Pending { id, ctx } => {
             park(cx.state, id, ctx, waiter);
@@ -1728,6 +1766,7 @@ fn genid_finish(cx: &mut CompletionCtx<'_>) {
                     headers.clone(),
                     body.clone(),
                     "POST",
+                    priority::Priority::default(),
                     Some(finished.id),
                     cx,
                 ),
@@ -1739,6 +1778,7 @@ fn genid_finish(cx: &mut CompletionCtx<'_>) {
                         headers.clone(),
                         body.into_bytes(),
                         "POST",
+                        priority::Priority::default(),
                         Some(finished.id),
                         cx,
                     );
@@ -2971,6 +3011,11 @@ fn handle_h3_request(
         Some(r) => r,
         None => return,
     };
+    let priority = priority::from_headers(
+        req.headers
+            .iter()
+            .map(|header| (header.name(), header.value())),
+    );
 
     // ── Phase 0: malformed-request check ─────────────────────────────────────
     // RFC 9114 4.1.2: a malformed request MUST be treated as a stream error of
@@ -3025,6 +3070,7 @@ fn handle_h3_request(
         send_h3_response(
             stream_id,
             qconn,
+            priority,
             status,
             &headers,
             Bytes::from(m6_http_lib::error::refusal_body(status)),
@@ -3081,7 +3127,16 @@ fn handle_h3_request(
         // latency, and costs nothing on the reads that make up the page load.
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false, None);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            425,
+            &headers,
+            Bytes::new(),
+            false,
+            None,
+        );
         debug!(
             stream_id,
             method = %String::from_utf8_lossy(method_bytes),
@@ -3112,6 +3167,7 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 status,
                 &headers,
                 Bytes::from(body),
@@ -3138,6 +3194,7 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 301,
                 &www_redirect_headers(location),
                 Bytes::new(),
@@ -3167,7 +3224,16 @@ fn handle_h3_request(
     if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 504, &headers, Bytes::new(), false, None);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            504,
+            &headers,
+            Bytes::new(),
+            false,
+            None,
+        );
         return;
     }
 
@@ -3194,7 +3260,16 @@ fn handle_h3_request(
     if in_early_data && !matches!(looked_up, m6_http_lib::cache::Lookup::Fresh(..)) {
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false, None);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            425,
+            &headers,
+            Bytes::new(),
+            false,
+            None,
+        );
         debug!(
             stream_id,
             path = path_str,
@@ -3225,7 +3300,12 @@ fn handle_h3_request(
         let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
-        let precond = evaluate_preconditions(&cached.headers, &H3Headers(&req.headers), method_str);
+        let precond = evaluate_preconditions(
+            cached.status,
+            &cached.headers,
+            &H3Headers(&req.headers),
+            method_str,
+        );
         // See the h1/h2 paths: recorded after preconditions so a 304 is
         // counted as a 304 and not as the cached 200.
         state.stats.record(
@@ -3243,7 +3323,16 @@ fn handle_h3_request(
             // Same rule as the h1/h2 paths; see the note there.
             let mut headers: Vec<(String, String)> = Vec::new();
             set_date(&mut headers);
-            send_h3_response(stream_id, qconn, 412, &headers, Bytes::new(), false, None);
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                412,
+                &headers,
+                Bytes::new(),
+                false,
+                None,
+            );
             return;
         }
         if precond == Precondition::NotModified {
@@ -3283,7 +3372,16 @@ fn handle_h3_request(
                 cache_hit = true,
                 "request complete"
             );
-            send_h3_response(stream_id, qconn, 304, &headers, Bytes::new(), false, None);
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                304,
+                &headers,
+                Bytes::new(),
+                false,
+                None,
+            );
             return;
         }
 
@@ -3336,6 +3434,7 @@ fn handle_h3_request(
         send_h3_response(
             stream_id,
             qconn,
+            priority,
             cached.status,
             resp_headers,
             cached.body,
@@ -3409,6 +3508,7 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 status,
                 &resp_headers,
                 Bytes::from(body),
@@ -3452,9 +3552,16 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[pos..]
 }
 
+/// The quiche form of a request's RFC 9218 priority.
+fn quiche_priority(priority: priority::Priority) -> quiche::h3::Priority {
+    quiche::h3::Priority::new(priority.urgency, priority.incremental)
+}
+
+#[allow(clippy::too_many_arguments)] // one response's fields plus the stream, its priority and the generation
 fn send_h3_response(
     stream_id: u64,
     qconn: &mut QuicConn,
+    priority: priority::Priority,
     status: u16,
     headers: &[(String, String)],
     body: Bytes,
@@ -3523,7 +3630,13 @@ fn send_h3_response(
     }
 
     let fin = body.is_empty();
-    match h3.send_response(&mut qconn.conn, stream_id, &h3_headers, fin) {
+    match h3.send_response_with_priority(
+        &mut qconn.conn,
+        stream_id,
+        &h3_headers,
+        &quiche_priority(priority),
+        fin,
+    ) {
         Ok(()) => {}
         Err(quiche::h3::Error::StreamBlocked) => {
             // Not an error, just no flow-control credit yet — previously this
@@ -3534,9 +3647,10 @@ fn send_h3_response(
             // this routinely; Chrome's more conservative concurrency mostly
             // didn't. Save it and let drain_writable() retry once this stream
             // reports writable again.
-            qconn
-                .partial_responses
-                .insert(stream_id, PendingH3Response::Headers(h3_headers, body));
+            qconn.partial_responses.insert(
+                stream_id,
+                PendingH3Response::Headers(h3_headers, body, priority),
+            );
             return;
         }
         Err(e) => {
@@ -5818,9 +5932,15 @@ fn drain_writable(qconn: &mut QuicConn) {
             None => continue,
         };
         match pending {
-            PendingH3Response::Headers(headers, body) => {
+            PendingH3Response::Headers(headers, body, priority) => {
                 let fin = body.is_empty();
-                match h3.send_response(&mut qconn.conn, stream_id, &headers, fin) {
+                match h3.send_response_with_priority(
+                    &mut qconn.conn,
+                    stream_id,
+                    &headers,
+                    &quiche_priority(priority),
+                    fin,
+                ) {
                     Ok(()) => {
                         if !body.is_empty() {
                             match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
@@ -5842,9 +5962,10 @@ fn drain_writable(qconn: &mut QuicConn) {
                     }
                     Err(quiche::h3::Error::StreamBlocked) => {
                         // Still no credit — put it back for the next writable report.
-                        qconn
-                            .partial_responses
-                            .insert(stream_id, PendingH3Response::Headers(headers, body));
+                        qconn.partial_responses.insert(
+                            stream_id,
+                            PendingH3Response::Headers(headers, body, priority),
+                        );
                     }
                     Err(e) => warn!("h3 drain_writable send_response error: {}", e),
                 }
@@ -6186,12 +6307,32 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Bind UDP socket
-    let udp = match UdpSocket::bind(&config.server.bind) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("bind error {}: {e}", config.server.bind);
-            return 2;
+    // Bind the QUIC UDP socket. With [server] reuse_port the TLS listener is
+    // bound in the same call, so the two sockets that share the public port
+    // both carry SO_REUSEPORT: the option is set before bind, which is the only
+    // point it takes effect, and a second process must bind both halves.
+    let (shared_tcp, udp) = if config.server.reuse_port {
+        let addr = match resolve_bind(&config.server.bind) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("bind error {}: {e}", config.server.bind);
+                return 2;
+            }
+        };
+        match m6_core::platform::net::listen_shared(addr) {
+            Ok((tcp, udp)) => (Some(tcp), udp),
+            Err(e) => {
+                eprintln!("bind error {}: {e}", config.server.bind);
+                return 2;
+            }
+        }
+    } else {
+        match UdpSocket::bind(&config.server.bind) {
+            Ok(s) => (None, s),
+            Err(e) => {
+                eprintln!("bind error {}: {e}", config.server.bind);
+                return 2;
+            }
         }
     };
     if let Err(e) = udp.set_nonblocking(true) {
@@ -6231,36 +6372,48 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
     let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
-        Ok(tls_cfg) => match Http11Listener::bind(
-            &config.server.bind,
-            tls_cfg,
-            config.server.max_requests_per_connection,
-            INITIAL_CONNECTIONS,
-            ceiling,
-        ) {
-            Ok(l) => {
-                info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
-                Some(l)
+        Ok(tls_cfg) => {
+            let bound = match shared_tcp {
+                Some(listener) => Http11Listener::from_shared(
+                    listener,
+                    tls_cfg,
+                    config.server.max_requests_per_connection,
+                    INITIAL_CONNECTIONS,
+                    ceiling,
+                ),
+                None => Http11Listener::bind(
+                    &config.server.bind,
+                    tls_cfg,
+                    config.server.max_requests_per_connection,
+                    INITIAL_CONNECTIONS,
+                    ceiling,
+                ),
+            };
+            match bound {
+                Ok(l) => {
+                    info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
+                    Some(l)
+                }
+                // FATAL, not a warning. `bind` is configured on every node, so a
+                // failure to bind it is a node that cannot serve: systemd sees a
+                // running process, /health answers on whatever else is listening,
+                // and nothing is on 443. That is the shape this project keeps
+                // meeting -- artefact wrong, process healthy, failure deferred and
+                // invisible -- and `Restart=on-failure` already exists to handle
+                // the honest version.
+                //
+                // The distinction §3d asked for is between a listener that is
+                // configured and failed, and one that was never configured. This
+                // arm is the first. `h2c_bind` below is the second: absent on a
+                // cache node, which is not a failure to bind but an absence of a
+                // bind, and is left alone.
+                Err(e) => {
+                    error!(bind = %config.server.bind, error = %e,
+                           "HTTP/1.1 TCP listener bind failed; refusing to run without it");
+                    return 1;
+                }
             }
-            // FATAL, not a warning. `bind` is configured on every node, so a
-            // failure to bind it is a node that cannot serve: systemd sees a
-            // running process, /health answers on whatever else is listening,
-            // and nothing is on 443. That is the shape this project keeps
-            // meeting -- artefact wrong, process healthy, failure deferred and
-            // invisible -- and `Restart=on-failure` already exists to handle
-            // the honest version.
-            //
-            // The distinction §3d asked for is between a listener that is
-            // configured and failed, and one that was never configured. This
-            // arm is the first. `h2c_bind` below is the second: absent on a
-            // cache node, which is not a failure to bind but an absence of a
-            // bind, and is left alone.
-            Err(e) => {
-                error!(bind = %config.server.bind, error = %e,
-                       "HTTP/1.1 TCP listener bind failed; refusing to run without it");
-                return 1;
-            }
-        },
+        }
         Err(e) => {
             error!(error = %e, "HTTP/1.1 TLS config failed; refusing to run without it");
             return 2;
@@ -6435,6 +6588,7 @@ mod www_redirect_tests {
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
+                reuse_port: false,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
