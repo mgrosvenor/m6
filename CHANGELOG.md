@@ -297,6 +297,8 @@ Comments only.
 
 ### Changed
 
+**A `no-store` response is no longer minified, because no cache repays the work.** A cache keeps what it stores, so minification is paid once per fill and its saving collected on every hit. A response carrying `Cache-Control: no-store` has no second hit, so the cost landed on every request to save a few bytes after compression. `Site::finish` now skips the minifier for those responses through the same `cache_control_no_store` rule the default ETag already uses, so the two agree. Verified with `a_no_store_page_is_sent_unminified`, `a_cacheable_page_is_still_minified` and `a_no_store_json_answer_is_sent_unminified` in `m6-core/src/site.rs`. The two `no-store` tests fail on the previous code and the cacheable one holds the other direction.
+
 **Every m6 service and m6-core log through m6-log, and `tracing` is gone.** The log lines are written into m6-log's buffer inside the event loop and flushed by it, so no service has a logging thread or a `tracing` subscriber any more.
 
 **m6-http's per-request analytics line allocates nothing.** The line is built from borrowed request fields straight into m6-log's buffer. Verified with `analytics_allocs`: 0 allocations in 1000 returning-visitor requests and 0 in 1000 new-session requests, with all 2002 lines written. The one allocation left is the `Set-Cookie` value for a new session, once per visitor rather than once per request.
