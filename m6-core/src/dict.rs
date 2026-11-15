@@ -26,6 +26,8 @@
 //! insertions win, so both halves of the original ordering survive: a params
 //! file still loses to a built-in, whether it was static or dynamic.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -38,7 +40,10 @@ use serde_json::{Map, Value};
 #[derive(Clone, Debug, Default)]
 pub struct Dict {
     base: Option<Arc<Map<String, Value>>>,
-    overlay: Map<String, Value>,
+    /// `Cow` keys so a built-in key (`query`, `cookies`, `request_path`,
+    /// `datetime`, `year`) borrows a `&'static str` instead of allocating a
+    /// `String` on every request.
+    overlay: BTreeMap<Cow<'static, str>, Value>,
 }
 
 impl Dict {
@@ -46,7 +51,7 @@ impl Dict {
     pub fn with_base(base: Arc<Map<String, Value>>) -> Self {
         Self {
             base: Some(base),
-            overlay: Map::new(),
+            overlay: BTreeMap::new(),
         }
     }
 
@@ -55,15 +60,15 @@ impl Dict {
     pub fn new() -> Self {
         Self {
             base: None,
-            overlay: Map::new(),
+            overlay: BTreeMap::new(),
         }
     }
 
     /// Insert into the overlay, where it shadows any base entry of the same
     /// name. This is the only way to write, which is what makes the base
     /// genuinely immutable and shareable.
-    pub fn insert(&mut self, key: String, value: Value) {
-        self.overlay.insert(key, value);
+    pub fn insert(&mut self, key: impl Into<Cow<'static, str>>, value: Value) {
+        self.overlay.insert(key.into(), value);
     }
 
     /// Overlay first, then base.
@@ -81,7 +86,10 @@ impl Dict {
     /// Distinct keys across both layers.
     pub fn len(&self) -> usize {
         let base = match &self.base {
-            Some(b) => b.keys().filter(|k| !self.overlay.contains_key(*k)).count(),
+            Some(b) => b
+                .keys()
+                .filter(|k| !self.overlay.contains_key(k.as_str()))
+                .count(),
             None => 0,
         };
         base + self.overlay.len()
@@ -94,13 +102,15 @@ impl Dict {
     /// Every visible entry, overlay first, then the base entries it does not
     /// shadow. Order between the two layers is not otherwise meaningful, and
     /// no consumer depends on it: the renderer builds a keyed context.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
-        self.overlay.iter().chain(
-            self.base
-                .iter()
-                .flat_map(|b| b.iter())
-                .filter(|(k, _)| !self.overlay.contains_key(*k)),
-        )
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        let overlay = self.overlay.iter().map(|(k, v)| (k.as_ref(), v));
+        let base = self
+            .base
+            .iter()
+            .flat_map(|b| b.iter())
+            .filter(|(k, _)| !self.overlay.contains_key(k.as_str()))
+            .map(|(k, v)| (k.as_str(), v));
+        overlay.chain(base)
     }
 
     /// Flatten into an owned map.
@@ -115,7 +125,7 @@ impl Dict {
             None => Map::new(),
         };
         for (k, v) in &self.overlay {
-            m.insert(k.clone(), v.clone());
+            m.insert(k.to_string(), v.clone());
         }
         m
     }
@@ -127,14 +137,14 @@ impl From<Map<String, Value>> for Dict {
     fn from(m: Map<String, Value>) -> Self {
         Self {
             base: None,
-            overlay: m,
+            overlay: m.into_iter().map(|(k, v)| (Cow::Owned(k), v)).collect(),
         }
     }
 }
 
 impl<'a> IntoIterator for &'a Dict {
-    type Item = (&'a String, &'a Value);
-    type IntoIter = Box<dyn Iterator<Item = (&'a String, &'a Value)> + 'a>;
+    type Item = (&'a str, &'a Value);
+    type IntoIter = Box<dyn Iterator<Item = (&'a str, &'a Value)> + 'a>;
     fn into_iter(self) -> Self::IntoIter {
         Box::new(self.iter())
     }
@@ -156,7 +166,7 @@ mod tests {
     fn the_overlay_shadows_the_base() {
         let mut d = Dict::with_base(base());
         assert_eq!(d.get("year").unwrap(), &json!("1999"));
-        d.insert("year".into(), json!("2026"));
+        d.insert("year", json!("2026"));
         assert_eq!(d.get("year").unwrap(), &json!("2026"));
         // The base is untouched and still shared.
         assert_eq!(base().get("year").unwrap(), &json!("1999"));
@@ -173,9 +183,9 @@ mod tests {
         m.insert("datetime".into(), json!("never"));
         let mut d = Dict::with_base(Arc::new(m));
 
-        d.insert("year".into(), json!("2026"));
-        d.insert("request_path".into(), json!("/right"));
-        d.insert("datetime".into(), json!("2026-09-12T00:00:00Z"));
+        d.insert("year", json!("2026"));
+        d.insert("request_path", json!("/right"));
+        d.insert("datetime", json!("2026-09-12T00:00:00Z"));
 
         assert_eq!(d.get("year").unwrap(), &json!("2026"));
         assert_eq!(d.get("request_path").unwrap(), &json!("/right"));
@@ -185,11 +195,11 @@ mod tests {
     #[test]
     fn iter_yields_every_key_once_with_the_overlay_winning() {
         let mut d = Dict::with_base(base());
-        d.insert("year".into(), json!("2026"));
-        d.insert("extra".into(), json!(1));
+        d.insert("year", json!("2026"));
+        d.insert("extra", json!(1));
 
         let mut seen: Vec<(String, Value)> =
-            d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            d.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         seen.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(
@@ -218,7 +228,7 @@ mod tests {
     #[test]
     fn to_map_flattens_both_layers() {
         let mut d = Dict::with_base(base());
-        d.insert("year".into(), json!("2026"));
+        d.insert("year", json!("2026"));
         let m = d.to_map();
         assert_eq!(m.get("site_name").unwrap(), &json!("example.com"));
         assert_eq!(m.get("year").unwrap(), &json!("2026"));
