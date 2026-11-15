@@ -530,7 +530,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -1108,7 +1107,7 @@ impl FileBackend {
         std::fs::write(site.join("public/index.html"), b"ok").unwrap();
         std::fs::write(
             site.join("site.toml"),
-            "[site]\nname = \"header-limits\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\nformat = \"text\"\n",
+            "[site]\nname = \"header-limits\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\n",
         )
         .unwrap();
         std::fs::write(

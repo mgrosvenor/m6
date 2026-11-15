@@ -421,7 +421,7 @@ impl Backend {
                 std::fs::write(
                     site.join("site.toml"),
                     "[site]\nname = \"backend-example\"\ndomain = \"localhost\"\n\n\
-                     [log]\nlevel = \"warn\"\nformat = \"text\"\n",
+                     [log]\nlevel = \"warn\"\n",
                 )
                 .unwrap();
                 let conf = scratch.path().join("example.toml");

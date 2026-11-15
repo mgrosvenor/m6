@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::log::{error, warn};
 use anyhow::Context;
 use serde_json::{Map, Value};
-use tracing::{error, warn};
 
 use crate::dict::Dict;
 use crate::error::Error;
@@ -67,9 +67,6 @@ pub struct Site {
     /// Index into the named handlers by name. `Handled::Named` is this index,
     /// and the caller's handler vector is in the order `load` was given.
     named_index: HashMap<String, usize>,
-    /// The logging worker, held for the life of the site and never touched
-    /// again. A plain `Option` because `LogHandle` is `Sync`.
-    _log: Option<crate::log::LogHandle>,
 }
 
 impl Site {
@@ -179,16 +176,11 @@ impl Site {
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
 
         // Logging: site.toml base, the service's `[log]`, then `--log-level`.
-        let (format, level) = resolve_log(&site_toml, &config.log, cli_log_level)
+        let level = resolve_log(&site_toml, &config.log, cli_log_level)
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
-        let log = if service {
-            Some(
-                crate::log::init(&format, &level)
-                    .map_err(|e| (format!("logging init error: {e}"), 1))?,
-            )
-        } else {
-            None
-        };
+        if service {
+            crate::log::init(level, None).map_err(|e| (format!("logging init error: {e}"), 1))?;
+        }
 
         let socket_path = crate::socket_path_from_config(&config_path);
 
@@ -237,7 +229,6 @@ impl Site {
             name: name.to_string(),
             code_index,
             named_index,
-            _log: log,
         })
     }
 
@@ -513,7 +504,7 @@ impl Site {
 
         // One access line per request at the default level. A line at debug is
         // below the default and is an access log nobody enables.
-        tracing::info!(
+        crate::log::info!(
             path = raw.path(),
             method = raw.method(),
             status = resp.status,
@@ -554,7 +545,6 @@ impl Site {
             name: "m6-test".to_string(),
             code_index,
             named_index,
-            _log: None,
         }
     }
 }
@@ -2020,8 +2010,8 @@ pub(crate) fn check_compress_declared(
     crate::compress::check_declared_support(site_toml, backend_name, compresses)
 }
 
-/// The log format and level, in order of precedence: the command line, then
-/// the service's `[log]`, then `site.toml`'s `[log]`.
+/// The log level, in order of precedence: the command line, then the
+/// service's `[log]`, then `site.toml`'s `[log]`.
 ///
 /// Read once at start. The resolved level is parsed here, so an unknown level
 /// is a configuration error before anything binds.
@@ -2029,16 +2019,13 @@ pub(crate) fn resolve_log(
     site_toml: &std::path::Path,
     config_log: &crate::config::LogConfig,
     cli_log_level: Option<&str>,
-) -> std::result::Result<(String, String), String> {
-    let (site_level, site_format) =
-        crate::log::read_site_log_config(site_toml).map_err(|e| e.to_string())?;
-    let format = config_log.format.clone().unwrap_or(site_format);
+) -> std::result::Result<crate::log::Level, String> {
+    let site_level = crate::log::read_site_log_config(site_toml).map_err(|e| e.to_string())?;
     let level = cli_log_level
         .map(str::to_string)
         .or_else(|| config_log.level.clone())
         .unwrap_or(site_level);
-    crate::log::parse_level(&level).map_err(|e| e.to_string())?;
-    Ok((format, level))
+    crate::log::parse_level(&level).map_err(|e| e.to_string())
 }
 
 pub(crate) fn unknown_handlers(

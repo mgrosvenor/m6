@@ -9,8 +9,8 @@
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use crate::log::debug;
 use anyhow::Result;
-use tracing::debug;
 
 use crate::http::RawRequest;
 use crate::parse;

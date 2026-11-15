@@ -37,7 +37,6 @@ role = "origin"
 
 [log]
 level  = "info"
-format = "text"
 "#;
 
 fn setup(config: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -268,16 +267,16 @@ fn a_trailing_or_doubled_slash_still_answers() {
     svc.terminate(Duration::from_secs(5));
 }
 
-/// The monitor runs one loop thread, plus the log writer until LOG-2 replaces
-/// it. Three counts test that: one node, the same three-node fleet without a
-/// history, and that fleet with one. A poll thread or a history writer adds a
-/// thread to the same fleet, and a thread per node adds two.
+/// The monitor runs one loop thread. Three counts test that: one node, the
+/// same three-node fleet without a history, and that fleet with one. A poll
+/// thread or a history writer adds a thread to the same fleet, and a thread
+/// per node adds two.
 ///
 /// The counts are read once they have settled, through the platform layer.
 /// Reading the host's certificate store (`client::system_roots`, which the
 /// monitor does at start) leaves idle workers behind: the platform reports how
 /// many (three or four on macOS, from the Security framework, and none on
-/// Linux). They are the only threads above the loop and the log writer, so
+/// Linux). They are the only threads above the loop, so
 /// `assert_single_loop` adds the platform's range instead of measuring it in
 /// this process. Measuring it here is what used to fail: the workers are
 /// transient in the test process and the harness runs other tests beside this
@@ -335,21 +334,20 @@ fn the_monitor_runs_one_thread() {
     assert_history_adds_none(plain, with_history, &output);
 }
 
-/// The loop and the log writer, above the platform's own workers.
+/// The loop, above the platform's own workers.
 fn assert_single_loop(what: &str, count: usize) {
-    // The log writer is a thread even when the log goes to stdout, so the loop
-    // and the writer are two. LOG-2 replaces tracing-appender and this becomes
-    // one.
+    // LOG-2 removed tracing-appender's writer, so the loop is the only thread
+    // m6 starts. The platform reports its certificate-store worker range, which
+    // is why the bound is a range rather than a count measured in this process.
     let (workers_low, workers_high) = m6_core::platform::process::certificate_store_workers();
-    let low = 1 + LOG_WRITER_THREADS + workers_low;
-    let high = 1 + LOG_WRITER_THREADS + workers_high;
+    let low = 1 + workers_low;
+    let high = 1 + workers_high;
     assert!(
         (low..=high).contains(&count),
-        "{what}: m6-monitor runs {count} threads, not the one loop thread, \
-         tracing-appender's writer until LOG-2, and the platform's \
-         {workers_low} to {workers_high} idle certificate-store workers: \
-         {low} to {high} here, and exactly {} where the store adds none",
-        1 + LOG_WRITER_THREADS
+        "{what}: m6-monitor runs {count} threads, not the one loop thread \
+         and the platform's {workers_low} to {workers_high} idle \
+         certificate-store workers: {low} to {high} here, and exactly 1 where \
+         the store adds none"
     );
 }
 
@@ -375,10 +373,6 @@ fn assert_history_adds_none(plain: usize, with_history: usize, output: &str) {
         with_history as isize - plain as isize
     );
 }
-
-/// `LOG_WRITER_THREADS` is 1 until LOG-2 replaces tracing-appender; it becomes
-/// 0 then, and the trusted session updates this constant.
-const LOG_WRITER_THREADS: usize = 1;
 
 /// The thread count once it has settled: two readings 100 ms apart agree, or
 /// the deadline passes. The assertion is the signal and the deadline is the

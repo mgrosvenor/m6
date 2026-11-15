@@ -210,7 +210,6 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
 
 [[backend]]
 name    = "m6-html"
@@ -284,7 +283,6 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
 
 [[backend]]
 name           = "global"

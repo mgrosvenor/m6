@@ -156,7 +156,7 @@ pub struct ServerConfig {
     /// Nothing validated the method before this existed, so every verb --
     /// PUT, DELETE, TRACE, and entirely invented ones like FOO -- was answered
     /// 200 with the cached page. TRACE especially should never be served: it
-    /// is a cross-site tracing vector and a content site has no use for it.
+    /// is a cross-site tracking vector and a content site has no use for it.
     ///
     /// Configurable rather than hard-coded because the CMS routes (currently
     /// disabled) need PUT and DELETE when they come back.
@@ -195,29 +195,23 @@ fn default_max_requests_per_connection() -> u32 {
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
-    #[serde(default = "default_log_format")]
-    pub format: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
-}
-fn default_log_format() -> String {
-    "json".to_string()
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
         LogConfig {
             level: default_log_level(),
-            format: default_log_format(),
         }
     }
 }
 
 /// Per-request traffic logging (session cookie, referrer, UA, cache state,
 /// node identity, ...) — separate from operational `[log]` above. Written to
-/// its own file via `m6_core::log::init_with_analytics`, always JSON.
+/// its own file through `m6_core::log`, always JSON.
 ///
 /// Rotate by renaming the file and sending SIGUSR1: the process reopens the path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2603,6 +2597,7 @@ domain = "test.example.com"
             ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\ntitel = \"x\"\n", sys.to_string(), "titel"),
             ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n\n[[route]]\npath = \"/\"\nbackend = \"b\"\nbakend = \"x\"\n", sys.to_string(), "bakend"),
             ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n", format!("{sys}\n[logs]\nlevel = \"info\"\n"), "logs"),
+            ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[log]\nformat = \"text\"\n", sys.to_string(), "format"),
         ] {
             let dir = make_test_dir();
             write_file(dir.path(), "cert.pem", "");

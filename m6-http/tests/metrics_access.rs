@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -264,7 +264,7 @@ impl Fixture {
 
     /// Run m6-http to its exit, which must come within ten seconds.
     fn run_until_exit(&self) -> (Option<i32>, String) {
-        let mut child: Child = m6_core::platform::process::spawn(
+        let mut child = m6_core::testkit::process::Running::spawn(
             self.command()
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -272,14 +272,13 @@ impl Fixture {
         )
         .expect("spawn m6-http");
         let exited = testkit::wait::until(Duration::from_secs(10), || {
-            child.try_wait().expect("try_wait").is_some()
+            child.child().try_wait().expect("try_wait").is_some()
         });
         if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
+            // The guard kills and reaps it while this panic unwinds.
             panic!("m6-http was still running after 10s; it should have refused to start");
         }
-        let out = child.wait_with_output().expect("output");
+        let out = child.take().wait_with_output().expect("output");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

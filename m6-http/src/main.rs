@@ -13,9 +13,9 @@ use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
+use m6_core::log::{debug, error, info, warn};
 use quiche::h3::NameValue;
 use rand::RngCore;
-use tracing::{debug, error, info, warn};
 
 use m6_core::client::Upstream;
 use m6_http_lib::analytics;
@@ -144,6 +144,9 @@ const TOKEN_UDP: Token = Token(usize::MAX);
 const TOKEN_TLS_LISTENER: Token = Token(usize::MAX - 1);
 const TOKEN_H2C_LISTENER: Token = Token(usize::MAX - 2);
 const TOKEN_SIGNAL: Token = Token(usize::MAX - 3);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const TOKEN_LOG: Token = Token(usize::MAX - 4);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 /// Who owns a per-descriptor token: the owner and the owner's own slot index.
@@ -168,6 +171,9 @@ fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
         Some(TOKEN_UDP) => 3,
         Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) => 0,
         Some(TOKEN_SIGNAL) => 4,
+        // A log drain is the loop's own bookkeeping, named so /perf does not
+        // report it as a timeout that did not happen.
+        Some(TOKEN_LOG) => 6,
         Some(Token(k)) => match sources.get(k) {
             Source::TlsConn(_) | Source::H2cConn(_) => 1,
             Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) => 2,
@@ -1726,8 +1732,11 @@ fn event_loop(
     let mut events = Events::with_capacity(256);
     // Wait time against work time, per kind of event that woke the loop. An
     // iteration with events of several kinds is counted under its first event.
-    let mut trace = LoopTrace::new(&["accept", "conn", "upstream", "udp", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&[
+        "accept", "conn", "upstream", "udp", "signal", "timeout", "log",
+    ]);
     let mut last = m6_core::platform::now();
+    let mut last_log_tick = last;
     let mut accepting = tcp.is_some() || h2c.is_some();
 
     'run: loop {
@@ -1794,6 +1803,7 @@ fn event_loop(
                         break 'run;
                     }
                 }
+                TOKEN_LOG => m6_core::log::flush(),
                 TOKEN_UDP => {
                     drain_udp(
                         &udp,
@@ -1897,6 +1907,12 @@ fn event_loop(
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), TOKEN_LOG) {
+            error!(error = %e, "log descriptor registration failed");
+        }
+
         // Close connections past their read or h2 idle deadline, and socket
         // upstreams past their backend deadline.
         while let Some(token) = state.read_timeouts.expired(m6_core::platform::now()) {
@@ -1963,6 +1979,13 @@ fn event_loop(
 
         // Remove closed/timed-out connections.
         connections.retain(|_, c| !c.conn.is_closed());
+
+        // The accounting tick: flush the log buffers once a second, next to
+        // the loop trace's own accounting.
+        if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
+            m6_core::log::tick(m6_core::platform::wall());
+            last_log_tick = now2;
+        }
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
         // On the emit, copy the loop trace into the snapshot so `/perf` serves it.
@@ -3330,7 +3353,7 @@ fn handle_request_inner(
     // a GET would — but it is method confusion, and on any site where a read
     // path and an action path share a URL that becomes a security problem
     // rather than a correctness one. TRACE is the one worth naming: answering
-    // it at all is a cross-site tracing vector.
+    // it at all is a cross-site tracking vector.
     //
     // The cache is already closed to these verbs at every lookup site (see
     // `cache::method_may_read_cache`); this closes the backend to them too.
@@ -4930,10 +4953,9 @@ fn urlencoded(s: &str) -> String {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
-    // Block SIGTERM and SIGINT before anything else, including logging.
-    // The mask is inherited only by threads created after this point, and
-    // tracing-appender's writer thread would otherwise take the signal at its
-    // default disposition and kill the process. See m6_core::signal.
+    // Block SIGTERM and SIGINT before anything else. The mask is inherited
+    // only by threads created after this point, and the signal descriptor
+    // refuses to open without it. See m6_core::signal.
     m6_core::signal::block();
 
     // rustls requires an explicit CryptoProvider when multiple are available
@@ -4967,32 +4989,23 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // CLI --log-level overrides site.toml [log].level; format always comes from config.
-    if let Some(level) = cli.log_level.as_deref() {
-        if let Err(e) = m6_core::log::parse_level(level) {
+    // The CLI --log-level overrides site.toml [log].level.
+    let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
+    let level = match m6_core::log::parse_level(log_level) {
+        Ok(level) => level,
+        Err(e) => {
             eprintln!("usage error: --log-level: {e}");
             return 2;
         }
-    }
-    let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
+    };
     let analytics_path = config
         .analytics
         .enabled
         .then(|| PathBuf::from(&config.analytics.log_path));
-    let log_handle = match m6_core::log::init_with_analytics(
-        &config.log.format,
-        log_level,
-        analytics_path.as_deref(),
-    ) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("logging init error: {}", e);
-            return 1;
-        }
-    };
-    // Held for the life of the process: dropping the handle flushes and stops
-    // the log writer.
-    let _log_handle = log_handle;
+    if let Err(e) = m6_core::log::init(level, analytics_path.as_deref()) {
+        eprintln!("logging init error: {}", e);
+        return 1;
+    }
 
     // --dump-config
     //
@@ -5001,6 +5014,12 @@ fn run(args: Vec<String>) -> i32 {
     // to it, and a redirect config that started a listener instead of printing
     // would hold :80 on the very node the deploy was still checking.
     if cli.dump_config {
+        // The dump goes through `println!`, so put stdout back to the blocking
+        // flag the process started with before writing it.
+        if let Err(e) = m6_core::log::stop() {
+            eprintln!("logging stop error: {}", e);
+            return 1;
+        }
         // Start refuses a route table that does not build, so the dump does.
         if let Err(e) = RouteTable::from_config(&config) {
             eprintln!("route table error: {}", e);
@@ -5279,6 +5298,11 @@ fn run(args: Vec<String>) -> i32 {
         &mut lifecycle,
     );
     lifecycle.complete();
+    if let Err(e) = m6_core::log::stop() {
+        // `stop` took the Sinks, so this line goes to stderr or nowhere.
+        eprintln!("log stop failed: {e}");
+        return 1;
+    }
     code
 }
 

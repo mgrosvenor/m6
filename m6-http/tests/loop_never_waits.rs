@@ -600,7 +600,7 @@ fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> Str
     format!(
         "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
          [server]\n{server}\n\n\
-         [log]\nlevel = \"{log_level}\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"{log_level}\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
          {backends}\n\n{routes}\n"
@@ -689,6 +689,41 @@ fn wait_for_log(service: &Service, needle: &str, deadline: Instant) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// The process runs one thread: the loop. A live m6-http has answered a
+/// request, and no other thread exists for logging, signals or a backend.
+#[test]
+fn m6_http_runs_one_thread() {
+    let fx = Fixture::start(1, 30, "one-thread");
+    let (status, body) = h1_get(fx.port(), "/fast", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("GET /fast: {e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(
+        status,
+        200,
+        "GET /fast: {body}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+
+    let pid = fx.service.pid();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut threads = thread_count(pid);
+    while threads != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        threads = thread_count(pid);
+    }
+    assert_eq!(
+        threads,
+        1,
+        "m6-http (pid {pid}) runs {threads} threads after answering a request, not one\n\
+         --- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// The thread count of `pid`, from the platform layer.
+fn thread_count(pid: u32) -> usize {
+    m6_core::platform::process::thread_count(pid).unwrap_or(0)
+}
 
 /// Run the "a held backend does not delay a cache hit" scenario with one GET
 /// function, shared by the h1, h2 and h3 tests.
@@ -1286,7 +1321,7 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
              [server]\nbackend_timeout_secs = 30\n\n\
-             [log]\nlevel = \"info\"\nformat = \"text\"\n\n\
+             [log]\nlevel = \"info\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
              [errors]\nmode = \"custom\"\npath = \"/errors\"\n\n\
@@ -1450,7 +1485,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         format!(
             "[site]\nname = \"loop-never-waits\"\ndomain = \"localhost\"\n\n\
              [server]\nbackend_timeout_secs = 30\n\n\
-             [log]\nlevel = \"trace\"\nformat = \"text\"\n\n\
+             [log]\nlevel = \"trace\"\n\n\
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
              [[backend]]\nname = \"app\"\nsockets = \"{}\"\n\n\

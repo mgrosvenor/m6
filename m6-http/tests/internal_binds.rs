@@ -11,7 +11,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use m6_http_lib::forward::HttpRequest;
@@ -71,7 +71,7 @@ fn write_system(
 /// Fails the test, after killing the process, if it is still running after
 /// ten seconds: a refusal must be immediate.
 fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i32>, String) {
-    let mut child: Child = m6_core::platform::process::spawn(
+    let mut child = m6_core::testkit::process::Running::spawn(
         Command::new(testkit::binary("m6-http"))
             .arg(site)
             .arg(config)
@@ -82,14 +82,13 @@ fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i
     )
     .expect("spawn m6-http");
     let exited = testkit::wait::until(Duration::from_secs(10), || {
-        child.try_wait().expect("try_wait").is_some()
+        child.child().try_wait().expect("try_wait").is_some()
     });
     if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+        // The guard kills and reaps it while this panic unwinds.
         panic!("m6-http was still running after 10s; it should have refused to start");
     }
-    let out = child.wait_with_output().expect("output");
+    let out = child.take().wait_with_output().expect("output");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

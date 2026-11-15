@@ -7,8 +7,8 @@ use m6_core::http::{RawRequest, RawResponse};
 // defect that reached production through a contact form, and it had to be
 // found and fixed twice. That is the argument for consolidating, so they are
 // gone rather than merely correct.
+use m6_core::log::{info, warn};
 use m6_core::request::{cookie, parse_form_body, url_encode_path};
-use tracing::{info, warn};
 
 use crate::jwt::{hash_token, now_secs, AccessClaims, RefreshClaims};
 use crate::keys::KeyMaterial;

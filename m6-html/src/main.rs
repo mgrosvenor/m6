@@ -25,6 +25,9 @@ use m6_core::{Handled, Site, TeraFactory};
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -69,7 +72,7 @@ fn main() -> Result<()> {
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout", "log"]);
     let mut accepting = true;
     let mut last = m6_core::platform::now();
     let mut last_report = last;
@@ -93,6 +96,7 @@ fn main() -> Result<()> {
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 2,
+            Some(LOG) => 4,
             Some(_) => 1,
             None => 3,
         };
@@ -156,6 +160,7 @@ fn main() -> Result<()> {
                         break 'run;
                     }
                 }
+                LOG => m6_core::log::flush(),
                 // One connection's turn, then wait for what it still needs,
                 // touch its deadline, or close it.
                 Token(k) => {
@@ -183,6 +188,12 @@ fn main() -> Result<()> {
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
         while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
@@ -202,6 +213,7 @@ fn main() -> Result<()> {
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
             let _ = trace.report();
             last_report = end;
         }
@@ -211,6 +223,7 @@ fn main() -> Result<()> {
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();
+    m6_core::log::stop()?;
     Ok(())
 }
 

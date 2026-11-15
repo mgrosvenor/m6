@@ -116,7 +116,7 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
             std::fs::copy(payload_path(), site.join("status.json")).unwrap();
             std::fs::write(
                 site.join("site.toml"),
-                "[site]\nname = \"be\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\nformat = \"text\"\n",
+                "[site]\nname = \"be\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\n",
             )
             .unwrap();
             let conf = work.join("bexample.toml");
@@ -469,7 +469,6 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
 
 [analytics]
 enabled = false

@@ -129,7 +129,7 @@ fn status(resp: &[u8]) -> u16 {
 fn site_toml(glob: &str) -> String {
     format!(
         "[site]\nname = \"qua017-refusal\"\ndomain = \"localhost\"\n\n\
-         [log]\nlevel = \"warn\"\nformat = \"text\"\n\n\
+         [log]\nlevel = \"warn\"\n\n\
          [errors]\nmode = \"internal\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
