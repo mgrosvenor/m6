@@ -9,6 +9,7 @@
 //! `harness = false` and its own `main`, so the counting allocator is installed
 //! before any thread starts and the count is only this binary's own.
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::h1::{parse_head, HeadResult};
 use m6_core::site::{Handled, Site};
 use m6_core::testkit::alloc_count;
@@ -61,6 +62,16 @@ struct Route {
 }
 
 fn main() {
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test("request_allocations_within_budget", checks)];
+    libtest_mimic::run(&args, tests).exit();
+}
+
+fn checks() -> Result<(), Failed> {
     let (site, _dir) = site();
     let routes = routes();
 
@@ -89,34 +100,31 @@ fn main() {
     println!("handler request: {ok} allocation(s) (budget {HANDLER_BUDGET})");
     println!("template request: {page} allocation(s) (budget {TEMPLATE_BUDGET})");
 
-    let mut failed = false;
     if difference != BASE_IDENTITY_DIFFERENCE - 1 {
-        println!(
-            "FAILED: an identity response costs {difference} more allocations than an \
+        return Err(format!(
+            "an identity response costs {difference} more allocations than an \
              uncompressed type, expected {}: the body is copied for compression that is \
              not applied",
             BASE_IDENTITY_DIFFERENCE - 1
-        );
-        failed = true;
+        )
+        .into());
     }
     if ok != HANDLER_BUDGET {
-        println!(
-            "FAILED: a handler request allocates {ok} times, budget {HANDLER_BUDGET}: a \
+        return Err(format!(
+            "a handler request allocates {ok} times, budget {HANDLER_BUDGET}: a \
              per-request allocation has come back"
-        );
-        failed = true;
+        )
+        .into());
     }
     if page != TEMPLATE_BUDGET {
-        println!(
-            "FAILED: a template request allocates {page} times, budget {TEMPLATE_BUDGET}: a \
+        return Err(format!(
+            "a template request allocates {page} times, budget {TEMPLATE_BUDGET}: a \
              per-request allocation has come back on the render path"
-        );
-        failed = true;
-    }
-    if failed {
-        std::process::exit(1);
+        )
+        .into());
     }
     println!("request allocations: within budget");
+    Ok(())
 }
 
 /// The three counted requests, in the order the checks run.
