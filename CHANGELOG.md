@@ -80,6 +80,14 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**CI fails when a teardown selects its victim by name, port or command-line text.**
+`tools/check-kill-safety.sh` reads the tracked shell and workflow files and prints `file:line` for `pkill`, `killall`, `xargs kill`, `lsof -t` piped into a kill, and a `pgrep` whose result is killed.
+A comment that describes one of those shapes is skipped, and a `pgrep` that only compares or prints a result is not a kill.
+The examples and `m6-run-eg` record a pid and its start time in `examples/own.sh`, and this check enforces that shape on the rest of the tree.
+The m6-examples CI runs the same script from its m6 checkout with `--tree m6-examples`, so the two teardowns there are guarded without a copy.
+It needs no network and no build, and it runs in well under a second.
+Verified on 2026-11-16 on this Mac: it exits 1 naming `.github/workflows/ci.yml:705` and `tools/build-host-tests.sh:581` before the fix, exits 0 over 17 files in m6 and 30 in m6-examples after it, and exits 1 naming `examples/05-cms/dev.sh:151` when a `pkill -f m6-http` line is planted there and reverted.
+
 **A cache node with `[cache] dir` reads its disk cache at start and holds it until its first `/genid` heartbeat.** The same ID installs it, so the node starts warm, and another ID discards it. If the upstream does not answer, the node serves the disk copy until a heartbeat succeeds, then flushes it if the site changed meanwhile. A damaged file is deleted and counted. `/perf` adds `loaded_entries`, `loaded_bad` and `state`. Verified on 2026-11-15 on a macOS sandbox: a full 4 MiB cache of 1,024 files loads 987 entries in 122 to 145 ms in a debug build, inside the 452 ms startup window the writer's measurement reported, and three integration tests start warm, discard a load after a publish, and serve a disk copy with the source stopped.
 
 **The conformance gate now runs m6's own RFC tests, including the HTTP behaviour changes in this batch that no external tester can see.** `tools/conformance.sh` gains an `rfc` stage that runs `m6-http`'s `tests/rfc_conformance.rs`, `tests/backend_h2_split_headers.rs` and `tests/early_response.rs`, and the `m6-file` cache-control and `m6-core` conditional unit tests. Every test names its RFC section: `Content-Length` as `1*DIGIT` on h1 and h2 (RFC 9110 8.6, RFC 9113 8.1.1), a split body-less h2 reply (RFC 9113 6.2, 6.10, 8.1), lower-case h2 and h3 field names (RFC 9113 8.2.1, RFC 9114 4.2), `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5), and a backend's early answer forwarded (RFC 9110, RFC 9112 9.6). The stage fails when a test fails, so CI's `h1, h2, h3 conformance` job fails with it. Verified on 2026-11-15 on a macOS sandbox: 9 of 9 `rfc_conformance` tests pass on this tip, and the content-length, lower-case and split-header tests fail when their fix is reverted.
@@ -220,6 +228,12 @@ A directory symlink that stays inside the site still resolves inside and is serv
 Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
 
 ### Fixed
+
+**The examples job's teardown stops the `dev.sh` it started, by pid and start time, in place of `pgrep -f` on the directory.**
+The run step writes the pid and its `ps` start time to `.ci-dev.pid`, and the `Stop the stack` step compares the start time before signalling, so a pid that now belongs to another process is left alone.
+The build host's example 05 cleanup does the same: it stops the recorded `dev.sh`, reaps the service pids `dev.sh` wrote to `logs/.own-stack.pids` when `examples/own.sh` is present, and waits for the shell in place of killing everything whose command line mentions the directory.
+This removes the last `pgrep -f` teardown from m6's tree.
+Verified on 2026-11-16 on this Mac: `tools/check-kill-safety.sh` names both sites before the change and none after, `bash -n` parses the build-host script, and the workflow parses as YAML.
 
 **The HTTP conformance gate runs again.** `tools/conformance.sh` still wrote `[log] format`, which is now refused, and started the redirect listener with analytics on and no log directory, which is now refused too, so the gate measured nothing for h1's redirect listener, h2 or h3. It now writes neither, and runs the dev-profile build (`target/debug`, or `M6_BIN_DIR`) like every other gate; CI builds `--bins` for it instead of `--release`. `tools/backend-bench.py` no longer writes `[log] format` either. Verified on Linux: h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49 (the recorded floor), resumption and early data as before.
 
