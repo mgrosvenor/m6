@@ -57,7 +57,7 @@ fn a_cached_hit_with_a_generation_allocates_nothing() -> bool {
     let entry = CachedResponse {
         genid: 7,
         status: 200,
-        headers: Arc::new(vec![(
+        headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
             "content-type".to_string(),
             "text/html; charset=utf-8".to_string(),
         )]),

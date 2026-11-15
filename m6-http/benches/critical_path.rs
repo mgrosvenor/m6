@@ -4,7 +4,7 @@
 /// Run with: cargo bench -p m6-http
 use criterion::{black_box, criterion_group, Criterion};
 
-use m6_http_lib::cache::{make_lookup_key, Cache, CacheKey, CachedResponse};
+use m6_http_lib::cache::{make_lookup_key, Cache, CacheKey, CachedResponse, HeaderBlock};
 use m6_http_lib::stats::{Channel, Iface, Stats, Version};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@ fn make_cache_with_entry() -> (Cache, &'static str, &'static str) {
     let resp = CachedResponse {
         status: 200,
         genid: 0,
-        headers: std::sync::Arc::new(vec![
+        headers: HeaderBlock::from_pairs(vec![
             (
                 "content-type".to_string(),
                 "text/html; charset=utf-8".to_string(),

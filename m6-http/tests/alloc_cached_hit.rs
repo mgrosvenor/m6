@@ -59,7 +59,7 @@ struct Fixtures {
 
 fn fixtures() -> Fixtures {
     let cache = Cache::new();
-    let headers: Arc<Vec<(String, String)>> = Arc::new(vec![
+    let headers: Vec<(String, String)> = vec![
         (
             "content-type".to_string(),
             "text/html; charset=utf-8".to_string(),
@@ -80,11 +80,11 @@ fn fixtures() -> Fixtures {
         ("server".to_string(), "m6".to_string()),
         ("x-powered-by".to_string(), "m6".to_string()),
         ("content-language".to_string(), "en".to_string()),
-    ]);
+    ];
     let entry = CachedResponse {
         genid: 0,
         status: 200,
-        headers: headers.clone(),
+        headers: m6_http_lib::cache::HeaderBlock::from_pairs(headers.clone()),
         body: bytes::Bytes::from(vec![b'x'; BODY_LEN]),
     };
     cache.insert(CacheKey::new("/", None, "gzip"), entry.clone());
@@ -204,7 +204,7 @@ fn the_hit_bytes_match_build_response(
 
     // The header set the owned writer produces: the cached headers, then the
     // four headers this writer emits, then content-length and connection.
-    let mut expected: Vec<(String, String)> = entry.headers.iter().cloned().collect();
+    let mut expected: Vec<(String, String)> = entry.headers.to_pairs();
     expected.push(("alt-svc".to_string(), "h3=\":443\"; ma=86400".to_string()));
     expected.push(("vary".to_string(), "Accept-Encoding".to_string()));
     expected.push(("age".to_string(), age.as_secs().to_string()));

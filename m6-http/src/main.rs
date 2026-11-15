@@ -846,7 +846,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             return Routed::Ready(412, hdrs, Vec::new(), "cache".to_string());
         }
         if precond == Precondition::NotModified {
-            let mut hdrs = not_modified_headers(&cached.headers);
+            let mut hdrs = not_modified_headers(&cached.headers.to_pairs());
             set_vary_accept_encoding(&mut hdrs, true);
             set_age(&mut hdrs, age);
             set_date(&mut hdrs);
@@ -3461,7 +3461,7 @@ fn handle_h3_request(
                 &mut state.traffic,
             );
             let html = analytics::is_html_response(&cached.headers);
-            let mut headers = not_modified_headers(&cached.headers);
+            let mut headers = not_modified_headers(&cached.headers.to_pairs());
             // Same as the h1/h2 304 paths: Vary and Date are added post-insert
             // so the stored headers do not have them.
             set_vary_accept_encoding(&mut headers, true);
@@ -3529,7 +3529,7 @@ fn handle_h3_request(
         // already segmented by encoding, so this just documents that to
         // downstream/shared caches), so this always takes the owned-Vec
         // branch rather than reusing `&cached.headers` unmodified.
-        let mut headers_with_links: Vec<(String, String)> = (*cached.headers).clone();
+        let mut headers_with_links: Vec<(String, String)> = cached.headers.to_pairs();
         set_vary_accept_encoding(&mut headers_with_links, true);
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
@@ -5374,7 +5374,7 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compres
     }
     // The merge (including the `Vary: *` passthrough) is shared with the cached
     // hit writer, so the two paths cannot disagree.
-    let merge = VaryMerge::new(headers);
+    let merge = VaryMerge::new(&headers[..]);
     if merge.is_star() {
         return;
     }
@@ -5678,7 +5678,7 @@ fn complete_socket_response(
                     let response = CachedResponse {
                         genid: stored,
                         status: http_resp.status,
-                        headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                        headers: strip_uncacheable(&http_resp.headers),
                         body: Bytes::from(http_resp.body.clone()),
                     };
                     if state.disk.is_some() {
@@ -5885,7 +5885,7 @@ fn finalize_url_response_inner(
                     let response = CachedResponse {
                         genid: stored,
                         status: http_resp.status,
-                        headers: std::sync::Arc::new(strip_uncacheable(&http_resp.headers)),
+                        headers: strip_uncacheable(&http_resp.headers),
                         body: Bytes::from(http_resp.body.clone()),
                     };
                     if state.disk.is_some() {
@@ -5941,7 +5941,7 @@ fn finalize_url_response_inner(
     {
         let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
         if let Some((entry, age)) = state.cache.lookup_held(&key) {
-            let mut headers = (*entry.headers).clone();
+            let mut headers = entry.headers.to_pairs();
             set_age(&mut headers, age);
             headers.push((
                 genid::GENID_HEADER.to_string(),

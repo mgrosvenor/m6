@@ -2219,18 +2219,58 @@ pub struct HitHeaders {
 /// is handled. [`VaryMerge::is_star`] is true when a `Vary: *` is present, which
 /// the caller must replay as-is instead of merging.
 pub struct VaryMerge<'a> {
-    headers: &'a [(String, String)],
+    headers: HeaderList<'a>,
     star: bool,
     next: usize,
     phase: u8,
     has_accept_encoding: bool,
 }
 
+/// The header list a `VaryMerge` scans, whichever shape the caller holds.
+///
+/// A response on its way out is a `HeaderBlock`; a response the cache is
+/// deciding about is still an owned pair list, and the tests build one. The
+/// merge itself is one implementation over both.
+#[derive(Clone, Copy)]
+pub enum HeaderList<'a> {
+    Pairs(&'a [(String, String)]),
+    Block(&'a crate::cache::HeaderBlock),
+}
+
+impl<'a> From<&'a [(String, String)]> for HeaderList<'a> {
+    fn from(v: &'a [(String, String)]) -> Self {
+        HeaderList::Pairs(v)
+    }
+}
+
+impl<'a> From<&'a crate::cache::HeaderBlock> for HeaderList<'a> {
+    fn from(v: &'a crate::cache::HeaderBlock) -> Self {
+        HeaderList::Block(v)
+    }
+}
+
+impl<'a> HeaderList<'a> {
+    /// The header lines, whichever shape the caller holds.
+    fn lines(self) -> HeaderLines<'a> {
+        match self {
+            HeaderList::Pairs(p) => HeaderLines::Pairs(p.iter()),
+            HeaderList::Block(b) => HeaderLines::Block(b.iter()),
+        }
+    }
+
+    fn vary_values(self) -> impl Iterator<Item = &'a str> {
+        self.lines()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("vary"))
+            .map(|(_, v)| v)
+    }
+}
+
 impl<'a> VaryMerge<'a> {
-    pub fn new(headers: &'a [(String, String)]) -> Self {
+    pub fn new(headers: impl Into<HeaderList<'a>>) -> Self {
+        let headers = headers.into();
         let star = headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.split(',').any(|f| f.trim() == "*"));
+            .vary_values()
+            .any(|v| v.split(',').any(|f| f.trim() == "*"));
         VaryMerge {
             headers,
             star,
@@ -2282,13 +2322,28 @@ impl<'a> Iterator for VaryMerge<'a> {
     }
 }
 
-/// The vary field at flattened index `idx`, or `None` past the last one.
-fn vary_field_at(headers: &[(String, String)], idx: usize) -> Option<&str> {
-    let mut i = 0usize;
-    for (k, v) in headers {
-        if !k.eq_ignore_ascii_case("vary") {
-            continue;
+/// Header lines from either container, without boxing: the Vary merge runs on
+/// the response path, where a boxed iterator was one allocation per field.
+enum HeaderLines<'a> {
+    Pairs(std::slice::Iter<'a, (String, String)>),
+    Block(crate::cache::TapeIter<'a>),
+}
+
+impl<'a> Iterator for HeaderLines<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            HeaderLines::Pairs(it) => it.next().map(|(k, v)| (k.as_str(), v.as_str())),
+            HeaderLines::Block(it) => it.next(),
         }
+    }
+}
+
+/// The vary field at flattened index `idx`, or `None` past the last one.
+fn vary_field_at(headers: HeaderList<'_>, idx: usize) -> Option<&str> {
+    let mut i = 0usize;
+    for v in headers.vary_values() {
         for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
             if i == idx {
                 return Some(f);
@@ -2300,12 +2355,9 @@ fn vary_field_at(headers: &[(String, String)], idx: usize) -> Option<&str> {
 }
 
 /// Whether an equal field appears before the vary field at flattened index `upto`.
-fn vary_earlier(headers: &[(String, String)], upto: usize, field: &str) -> bool {
+fn vary_earlier(headers: HeaderList<'_>, upto: usize, field: &str) -> bool {
     let mut i = 0usize;
-    for (k, v) in headers {
-        if !k.eq_ignore_ascii_case("vary") {
-            continue;
-        }
+    for v in headers.vary_values() {
         for g in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
             if i == upto {
                 return false;
@@ -2336,12 +2388,12 @@ pub fn write_cached_h1(
     keep_alive: bool,
 ) {
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    let is_html = crate::analytics::is_html_response(&entry.headers[..]);
+    let is_html = crate::analytics::is_html_response(&entry.headers);
     let write_describedby = extra.describedby.is_some() && is_html;
 
     // Vary is merged (or left alone on `Vary: *`) exactly as
     // `set_vary_accept_encoding(.., true)` does, so the two writers agree.
-    let vary = VaryMerge::new(&entry.headers[..]);
+    let vary = VaryMerge::new(&entry.headers);
     let vary_star = vary.is_star();
 
     out.extend_from_slice(b"HTTP/1.1 ");
@@ -2405,7 +2457,7 @@ pub fn write_cached_h1(
         out.extend_from_slice(b"\r\n");
     }
 
-    crate::security::write_h1_headers(out, &entry.headers[..]);
+    crate::security::write_h1_headers(out, &entry.headers);
 
     write_genid_header(out, entry.genid);
 
@@ -3065,7 +3117,9 @@ mod vary_merge_tests {
     }
 
     fn merged(vary: &[&str]) -> Vec<String> {
-        VaryMerge::new(&hdrs(vary)).map(str::to_string).collect()
+        VaryMerge::new(&hdrs(vary)[..])
+            .map(str::to_string)
+            .collect()
     }
 
     /// The merge deduplicates case-insensitively, keeps field order, and appends
@@ -3105,7 +3159,7 @@ mod vary_merge_tests {
     #[test]
     fn star_is_replayed_as_is() {
         let h = hdrs(&["*", "Accept-Encoding"]);
-        let merge = VaryMerge::new(&h);
+        let merge = VaryMerge::new(&h[..]);
         assert!(merge.is_star());
         assert_eq!(merge.collect::<Vec<_>>(), Vec::<&str>::new());
     }

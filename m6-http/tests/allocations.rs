@@ -56,17 +56,14 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // above its budget is the defect the guard exists for.
 //
 // The integers the code makes are 2 for h1_tls_hit and 3 for h2_tls_hit (all
-// of them rustls; see below), 58 for h1_tls_miss_insert. The miss row is 91
-// less the seventeen per-header `format!` calls and the twelve copies the
-// `Cache-Control` directive parse made. The budgets are the fixes' ceilings:
-// 2,200, 3,001 and 58,207. The h2 budget is the integer Linux's 2N run
+// of them rustls; see below), and 47 for h1_tls_miss_insert. The h1 hit is
+// 2,000 (the response writer and the request read buffer are the connection's
+// own), read 2.000 to 2.003 over the runs, so its budget is 2,003, the top of
+// that spread with nothing added. The h2 budget is the integer Linux's 2N run
 // measured: the fourth call is rustls growing its received-plaintext chunk
 // queue (`vecbuf::ChunkVecBuffer::append` from
 // `CommonState::take_received_plaintext`, count 1 in the 2N dhat profile), a
-// rustls buffer and not ours. The new-connection row is a measure, not a
-// budget: a full handshake per connection read 122.859 to 123.849 per
-// connection across the same runs, so a per-connection ceiling would flake. It
-// is reported.
+// rustls buffer and not ours.
 //
 // The 3 left on h2's cached hit are rustls's, and nothing of ours:
 // two `rustls::msgs::base::Payload::into_vec` calls per decrypted request
@@ -78,11 +75,21 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // connection's read buffer, and the decoded field list is reused across
 // streams, so a cached hit allocates none of them.
 //
-// A path that allocates one more time per request adds 1,000 and fails the
-// three budgeted rows, which is the break.
-const H1_TLS_HIT_CALLS: u64 = 2_200;
+// ALLOC-H1's second phase took h1_tls_miss_insert to 58,004 by removing the
+// per-header `format!` and the `String` per `Cache-Control` directive.
+// ALLOC-H1M took it to 47,004: a cache entry stores its header names and
+// values in one byte arena with `Range<u32>` pairs, so `strip_uncacheable`'s
+// twelve clones per insert became one arena build.
+//
+// The new-connection row is a measure, not a budget: a full handshake per
+// connection read 122.859 to 123.849 per connection across the same runs, so a
+// per-connection ceiling would flake. It is reported.
+//
+// A path that allocates one more time per request adds 1,000 and fails every
+// budgeted row, which is the break.
+const H1_TLS_HIT_CALLS: u64 = 2_003;
 const H2_TLS_HIT_CALLS: u64 = 3_001;
-const H1_TLS_MISS_INSERT_CALLS: u64 = 58_207;
+const H1_TLS_MISS_INSERT_CALLS: u64 = 47_004;
 
 /// The number of requests in the short run. The budgets are per 1,000 of the
 /// row's unit, which is this many.

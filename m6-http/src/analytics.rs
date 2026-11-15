@@ -266,10 +266,10 @@ pub fn record(
 /// gating on this keeps `_m6sid` off the vast majority of responses a page
 /// load generates (every static asset it references) instead of writing a
 /// fresh `Set-Cookie` on each one.
-pub fn is_html_response(resp_headers: &[(String, String)]) -> bool {
+pub fn is_html_response(resp_headers: &(impl m6_core::http::HeaderSource + ?Sized)) -> bool {
     // Case-insensitive prefix check with no allocation: `to_ascii_lowercase`
     // built a `String` on the cached-hit hot path.
-    m6_core::headers::get(resp_headers, "content-type").is_some_and(|v| {
+    resp_headers.find("content-type").is_some_and(|v| {
         v.as_bytes()
             .get(..9)
             .is_some_and(|p| p.eq_ignore_ascii_case(b"text/html"))

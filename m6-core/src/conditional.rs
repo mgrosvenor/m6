@@ -104,7 +104,7 @@ fn etag_list_contains(list: &str, tag: &str, strong: bool) -> bool {
 /// refused storage upstream (F057).
 pub fn evaluate_preconditions(
     stored_status: u16,
-    cached_headers: &[(String, String)],
+    cached_headers: &(impl HeaderSource + ?Sized),
     req_headers: &(impl HeaderSource + ?Sized),
     method: &str,
 ) -> Precondition {
@@ -115,7 +115,7 @@ pub fn evaluate_preconditions(
     let current = stored_status == 200 || stored_status == 206;
     let find = |name: &str| {
         if current {
-            crate::headers::get(cached_headers, name)
+            cached_headers.find(name)
         } else {
             None
         }

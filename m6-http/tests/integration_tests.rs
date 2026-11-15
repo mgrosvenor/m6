@@ -301,7 +301,7 @@ mod phase11 {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(headers.clone()),
+            headers: m6_http_lib::cache::HeaderBlock::from_pairs(headers.clone()),
             body: bytes::Bytes::from_static(b"cached"),
         };
         cache.insert(key.clone(), resp);
@@ -315,7 +315,10 @@ mod phase11 {
         let resp = CachedResponse {
             genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
+            headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
+                "cache-control".to_string(),
+                "public".to_string(),
+            )]),
             body: bytes::Bytes::from_static(b"body"),
         };
         cache.insert(key.clone(), resp);
@@ -349,7 +352,7 @@ mod phase11 {
             CachedResponse {
                 genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![(
+                headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                     "content-encoding".to_string(),
                     "gzip".to_string(),
                 )]),
@@ -365,7 +368,7 @@ mod phase11 {
             CachedResponse {
                 genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![(
+                headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                     "content-encoding".to_string(),
                     "br".to_string(),
                 )]),
@@ -404,7 +407,7 @@ mod phase11 {
             CachedResponse {
                 genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![(
+                headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                     "cache-control".to_string(),
                     "public".to_string(),
                 )]),
