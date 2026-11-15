@@ -13,6 +13,9 @@ pub struct CachedResponse {
     pub status: u16,
     pub headers: std::sync::Arc<Vec<(String, String)>>,
     pub body: bytes::Bytes,
+    /// The source's site generation when the response was dispatched. Written
+    /// as `M6-Genid` on a hit, so a client can tell which generation it saw.
+    pub genid: u64,
 }
 // Conditional requests and preconditions live in `m6_core::conditional`.
 // They are version-independent semantics with two consumers, and the second
@@ -1258,6 +1261,7 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/hello", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::from_static(b"world"),
@@ -1284,6 +1288,7 @@ mod tests {
             vec![("cache-control".to_string(), cc.to_string())]
         };
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(headers),
             body: bytes::Bytes::from_static(b"world"),
@@ -1460,6 +1465,7 @@ mod tests {
         let k2 = CacheKey::new("/page", None, "br");
         let k3 = CacheKey::new("/other", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
@@ -1490,6 +1496,7 @@ mod tests {
         // key stored with no query
         let k = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
@@ -1509,6 +1516,7 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/blog/hello", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"cached body"),
@@ -1547,6 +1555,7 @@ mod tests {
             headers.push(("content-encoding".to_string(), enc.to_string()));
         }
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(headers),
             body: bytes::Bytes::from_static(body),
@@ -1684,6 +1693,7 @@ mod tests {
     fn test_evict_path_removes_all_query_variants() {
         let cache = Cache::new();
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![]),
             body: bytes::Bytes::new(),
@@ -1809,6 +1819,7 @@ mod method_gate_tests {
         cache.insert(
             CacheKey::new("/page", None, "br"),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(vec![]),
                 body: bytes::Bytes::from_static(b"full GET body"),
@@ -1995,6 +2006,7 @@ mod age_tests {
 
     fn resp(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(
                 headers
@@ -2090,6 +2102,7 @@ mod heuristic_freshness_tests {
 
     fn resp(cc: &str) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"x"),
@@ -2157,6 +2170,7 @@ mod expires_tests {
         c.insert(
             CacheKey::new("/e", None, ""),
             CachedResponse {
+                genid: 0,
                 status: 200,
                 headers: std::sync::Arc::new(headers),
                 body: bytes::Bytes::from_static(b"x"),
@@ -2400,6 +2414,7 @@ mod request_directive_tests {
         let cache = Cache::new();
         let key = CacheKey::new("/p", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"body"),
@@ -2459,6 +2474,7 @@ mod corrected_age_tests {
 
     fn resp_with(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(
                 headers
@@ -2620,6 +2636,7 @@ mod capacity_tests {
 
     fn resp(body_len: usize) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![(
                 "cache-control".to_string(),
@@ -2715,6 +2732,7 @@ mod capacity_accounting_tests {
 
     fn resp(n: usize) -> CachedResponse {
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![(
                 "cache-control".to_string(),

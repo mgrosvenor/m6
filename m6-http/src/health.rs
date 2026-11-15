@@ -13,7 +13,7 @@
 use std::net::IpAddr;
 
 use crate::auth::{self, PublicKey, Refusal};
-use crate::config::HealthConfig;
+use crate::config::{GenidConfig, HealthConfig};
 
 pub use m6_core::monitoring::{
     metrics_authorised, HealthReport, PerfAccess, PerfOutcome, PerfReport, PerfSubject, PoolHealth,
@@ -23,6 +23,8 @@ pub use m6_core::monitoring::{
 pub const HEALTH_BACKEND: &str = "health";
 /// Backend name tagged onto a `/perf` response.
 pub const PERF_BACKEND: &str = "perf";
+/// Backend name tagged onto a `/genid` response, for stats and analytics.
+pub const GENID_BACKEND: &str = "genid";
 
 /// Whether a completed response came from the monitoring endpoints.
 ///
@@ -583,6 +585,91 @@ pub fn metrics_gate(
     }
 }
 
+/// Decide whether a `GET` or `POST /genid` may be served to this request.
+///
+/// Two rules, in this order, the shape [`metrics_gate`] uses:
+///
+/// 1. The peer is loopback, or the request arrived on an internal listener.
+///    Anyone else gets the 404 an unknown path gives, before a token is read.
+///    Neither claim set is the same 404: the endpoint does not exist.
+/// 2. The token passes `read_require` for a `GET` or `write_require` for a
+///    `POST` (`Unauthorised` for none or a bad one, `Forbidden` for the wrong
+///    claim).
+pub fn genid_gate(
+    g: &GenidConfig,
+    key: Option<&PublicKey>,
+    headers: &[(String, String)],
+    client_ip: &str,
+    from_internal: bool,
+    write: bool,
+) -> Gate {
+    let loopback = client_ip
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    if !from_internal && !loopback {
+        return Gate::Refused(PerfOutcome::Disabled);
+    }
+    let require = if write {
+        g.write_require.as_deref()
+    } else {
+        g.read_require.as_deref()
+    };
+    let Some(require) = require else {
+        return Gate::Refused(PerfOutcome::Disabled);
+    };
+    let Some(key) = key else {
+        return Gate::Refused(PerfOutcome::Unauthorised);
+    };
+    match auth::authorise(key, headers, require) {
+        Ok(_) => Gate::Open,
+        Err(Refusal::Insufficient) => Gate::Refused(PerfOutcome::Forbidden),
+        Err(Refusal::NoToken | Refusal::Invalid(_)) => Gate::Refused(PerfOutcome::Unauthorised),
+    }
+}
+
+/// The authorised `/perf` answer with the source's generation block added.
+///
+/// The block is inserted into the report this node already built, so `m6-core`
+/// keeps no notion of a generation: it hands over the monitoring payload and
+/// m6-http adds the one field that is this binary's.
+pub fn genid_perf_response(
+    report: PerfReport,
+    genid: &crate::genid::Genid,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut value = serde_json::to_value(&report)
+        .unwrap_or_else(|_| serde_json::json!({"error": "serialisation failed"}));
+    let peers: Vec<serde_json::Value> = genid
+        .peers(m6_core::platform::now())
+        .into_iter()
+        .map(|(ip, last_get_s)| serde_json::json!({"addr": ip.to_string(), "last_get_s": last_get_s}))
+        .collect();
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "genid".to_string(),
+            serde_json::json!({
+                "role": "source",
+                "id": genid.current().to_string(),
+                "sequence_running": genid.sequence_running(),
+                "peers": peers,
+            }),
+        );
+    }
+    let body = serde_json::to_vec(&value)
+        .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
+    (
+        200,
+        vec![
+            (
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
+            ("Cache-Control".to_string(), "no-store".to_string()),
+            ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+        ],
+        body,
+    )
+}
+
 #[cfg(test)]
 mod traffic_endpoint_tests {
     use super::*;
@@ -923,6 +1010,43 @@ mod traffic_endpoint_tests {
             "a cut user agent is probe-shaped"
         );
         assert_eq!(report.forgers, vec!["192.0.2.2".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod genid_gate_tests {
+    use super::*;
+
+    /// Address first, token never read: a public peer sees the 404 an unknown
+    /// path gives, whether or not it carries a valid token. `None` for the key
+    /// is the proof: a gate that looked at a token would have to answer 401.
+    #[test]
+    fn an_external_peer_is_refused_before_any_token() {
+        let g = GenidConfig {
+            read_require: Some("role:reader".to_string()),
+            write_require: Some("role:writer".to_string()),
+        };
+        let Gate::Refused(out) = genid_gate(&g, None, &[], "192.0.2.10", false, false) else {
+            panic!("a public peer must be refused");
+        };
+        assert_eq!(out.into_response().0, 404);
+        let Gate::Refused(out) = genid_gate(&g, None, &[], "::ffff:192.0.2.10", false, true) else {
+            panic!("a canonical public peer must be refused");
+        };
+        assert_eq!(out.into_response().0, 404);
+        // The same gate opens the address check for a loopback caller, which
+        // then has no token, so it is refused as unauthorised rather than as
+        // the nonexistent endpoint.
+        let Gate::Refused(out) = genid_gate(&g, None, &[], "127.0.0.1", false, false) else {
+            panic!("no token must be refused");
+        };
+        assert_eq!(out.into_response().0, 401);
+        // Neither claim set is the endpoint not existing, to everyone.
+        let none = GenidConfig::default();
+        let Gate::Refused(out) = genid_gate(&none, None, &[], "127.0.0.1", false, false) else {
+            panic!("no claims must be refused");
+        };
+        assert_eq!(out.into_response().0, 404);
     }
 }
 

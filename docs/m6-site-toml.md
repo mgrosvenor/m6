@@ -585,7 +585,36 @@ Take from it that each variable is filled from the file the glob matched.
 **Table 12: the four `[[route_group]]` path variables.**
 Every relative path is measured from the part of the glob before its first wildcard.
 
-The key reference ends with the variables that turn a file name into a URL.
+### 4.11. `[genid]`
+
+The `[genid]` table makes this node the source of its site's generation ID and opens the endpoint that reads and advances it.
+Table 13 gives its keys.
+Take from it that both claims are required together and that the table belongs to the system config.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `read_require` | string | none | `"role:<name>"` or `"group:<name>"`. A `GET /genid` needs a token with this claim |
+| `write_require` | string | none | The same, for `POST /genid`, which advances the generation |
+
+**Table 13: the `[genid]` keys.**
+Both keys are set or neither is.
+A table with only one, a value that names no role or group, or either key without `[auth] public_key` stops the start with exit 2.
+Both absent leaves `/genid` answering 404 to everyone.
+
+`[genid]` belongs to the system config, because who may publish a site is one node's authority and not state every node shares.
+A source also needs `StateDirectory=` in its unit, because the ID is written to `$STATE_DIRECTORY/genid`.
+A node with `[genid]` and no `StateDirectory=` exits 2, and `--dump-config` still prints and exits 0.
+
+```toml
+[auth]
+public_key = "/etc/m6/api-auth.pub"
+
+[genid]
+read_require  = "role:monitor"
+write_require = "role:editor"
+```
+
+The key reference ends with the generation endpoint, one node's own authority.
 Section 5 states which route answers a request.
 
 ## 5. Route matching
@@ -724,7 +753,7 @@ The page gives the two files m6-http reads.
 The system config holds one node's state: the node name, the bind address, the certificate and the credential paths.
 A key in the other file stops the start with exit 2, so a key has one owner.
 
-Table 13 gives the pages that own the behaviour behind these keys.
+Table 14 gives the pages that own the behaviour behind these keys.
 Take from it that the server's internals, the renderer's own keys and the site layout each have a page of their own.
 
 | document | covers |
@@ -735,6 +764,6 @@ Take from it that the server's internals, the renderer's own keys and the site l
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) | The renderer config, which is the process config of a service |
 | [`m6-site-layout.md`](m6-site-layout.md) | One root per app, which a `[[route_group]]` glob has to account for |
 
-**Table 13: further reading, and what each document covers.**
+**Table 14: further reading, and what each document covers.**
 
 A site that runs with these two files and the keys in the tables is a site whose configuration m6-http has read and accepted.

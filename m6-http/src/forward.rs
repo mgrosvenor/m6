@@ -685,6 +685,10 @@ pub enum UpstreamId {
     H2c { conn: Token, stream: u32 },
     /// An h2s pool stream, by the connection token and the outbound stream id.
     H2s { conn: Token, stream: u32 },
+    /// A `POST /genid` parked on the source's change sequence, which owns its
+    /// completion. Nothing is dispatched for it yet, and no upstream slot is
+    /// taken until the sequence starts.
+    Genid,
 }
 
 /// Who is waiting for an upstream reply, so a completion can be written
@@ -708,6 +712,12 @@ pub enum Waiter {
     },
     /// A background fetch has no connection; the reply only fills the cache.
     Background,
+    /// One member's `POST /genid` during a change sequence, by the member's
+    /// index in the sequence. The source logs a failure against that member's
+    /// socket path and advances when the last one answers.
+    Genid {
+        member: u32,
+    },
 }
 
 /// One request the loop dispatched and parked, reported by a connection turn so
@@ -759,6 +769,40 @@ pub struct PendingUrlContext {
     /// `WWW-Authenticate` for a 401 or `Retry-After` for a 503. Empty for every
     /// ordinary dispatch.
     pub extra_headers: Vec<(String, String)>,
+    /// The source's site generation when this request was dispatched. A reply
+    /// carries it as `M6-Genid`, and it is stored only while it still equals
+    /// the current ID, so a cache cannot refill from a backend that is one
+    /// generation behind.
+    pub genid: u64,
+}
+
+impl PendingUrlContext {
+    /// The context a `POST /genid` parks with. The change sequence completes
+    /// the waiter itself, so no field here is read: it exists because
+    /// `Pending` carries one context for every parked request.
+    pub fn for_genid() -> Box<PendingUrlContext> {
+        Box::new(PendingUrlContext {
+            req: HttpRequest {
+                method: "POST".to_string(),
+                path: m6_core::site::GENID_PATH.to_string(),
+                query: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            client_ip: String::new(),
+            enc: String::new(),
+            backend_name: "genid".to_string(),
+            kind: PendingKind::Socket,
+            route_path: None,
+            cacheable: false,
+            is_prefetch: false,
+            start: m6_core::platform::now(),
+            error_status_override: None,
+            extra_headers: Vec::new(),
+            genid: 0,
+        })
+    }
 }
 
 /// Build a simple HTTP response buffer (kept for tests).

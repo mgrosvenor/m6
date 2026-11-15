@@ -124,6 +124,68 @@ m6-http never caches responses with status 4xx or 5xx, regardless of `Cache-Cont
 
 ---
 
+## Site generation ID
+
+A source node holds a site generation ID.
+The ID is a `u64` counter that names the content the backends are serving at one moment.
+m6-http owns it, backend services never see it, and no other configuration shares it.
+A node is a source because its system config carries a `[genid]` table.
+A node with no `[genid]` has no endpoint at `/genid` and answers that path as it answers any other unknown path.
+
+The endpoint answers two methods.
+
+| Method | Claim | Answer |
+|---|---|---|
+| `GET` | `[genid] read_require` | `200` with `{"genid":"<decimal>"}` and `M6-Genid: <decimal>` |
+| `POST` | `[genid] write_require` | runs the change sequence, then `200` with the same shape for the new ID |
+
+Both methods require a loopback peer or an internal listener, checked before any token is read.
+Anyone else gets the 404 an unknown path gets.
+Both claims absent is also a 404, so the endpoint advertises no door it cannot open.
+The `[genid]` keys are system config only, and the table needs the unit's `StateDirectory=`.
+
+### The change sequence
+
+A `POST /genid` runs four steps in the source's loop.
+
+1. Send `POST /genid` with an empty body to every member of every socket pool, on that member's own socket, outside the pool's member choice.
+   Each member gets its own upstream slot and the `backend_timeout_secs` deadline.
+2. Wait for every member.
+   A 204 is done.
+   A 404 or 405 is a backend with nothing to refresh and is logged at debug.
+   Any other status, a connect failure or the deadline is logged at error with the member's socket path and the reason.
+   A failed member does not stop the sequence, and it is not treated as refreshed.
+3. In one step, rebuild the route table from the config loaded at start, clear the cache, clear the held error pages, advance the ID and write it.
+   A route-table build error keeps the old table and is logged.
+   The route table is built from `site.toml` as loaded at start, so a publish that adds a file a `[[route_group]]` glob matches gains its route, and a `site.toml` edit needs a restart.
+   This tree keeps no data-file-to-path invalidation map, so the cache clear is the whole invalidation.
+4. Answer every covered POST with the new ID.
+
+The order matters.
+The ID must not change before every backend has the new content, because a cache could otherwise refill from a backend still serving the old bytes under the new number.
+A POST that arrives while a sequence runs is parked, and the sequence that answers it started after it arrived.
+
+The ID advances only in step 3 of a POST, never at start.
+It lives in `$STATE_DIRECTORY/genid` as the decimal ID and a newline, written to `genid.tmp` and renamed over the file before the POST is answered.
+A restart reads that file, so a generation survives a restart.
+A source with `[genid]` and no `STATE_DIRECTORY`, or a state file that cannot be read or does not hold a `u64`, stops the start with exit 2.
+`--dump-config` prints and exits 0 without one, because a dump is not about to serve.
+
+A publisher that is itself a backend of the source drives this POST from its own event loop, never as a blocking call, so its loop stays free to answer the source's refresh.
+
+### The ID on content
+
+Every response the source receives from a backend carries the ID that was current when the request was dispatched, written as `M6-Genid: <decimal>` when the response head is serialised.
+A cached response carries the ID stored with it.
+A response whose dispatch ID is no longer current is not stored, so the cache cannot refill from a backend that is one generation behind.
+A locally built answer, such as a health check or an error page, carries no ID.
+
+The generation is also reported by an authorised `/perf`, under a `genid` object with `role`, `id`, `sequence_running` and the peers that read it.
+An operator watching a publish sees one `genid advanced` line at info with `genid`, `members`, `failed` and `elapsed_ms`, and one `member refresh failed` line at error naming the socket path of each member that did not refresh.
+The POST still answers 200 when a member failed, and the `failed` count is what says the generation is not uniform.
+
+---
+
 ## Error Handling
 
 ### Error flow

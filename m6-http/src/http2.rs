@@ -240,6 +240,9 @@ struct H2Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The source's site generation, written as `M6-Genid`. `None` for an
+    /// answer this node generated itself.
+    genid: Option<u64>,
 }
 
 struct H2Stream {
@@ -1709,7 +1712,7 @@ impl Http2Conn {
         .to_string();
 
         match on_request(state, &req, &client_ip) {
-            RequestOutcome::Ready(status, resp_headers, resp_body, _) => {
+            RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
                 let method = req.method.clone();
                 self.dispatch_h2_response(
                     stream_id,
@@ -1717,6 +1720,7 @@ impl Http2Conn {
                         status,
                         headers: resp_headers,
                         body: resp_body,
+                        genid,
                     },
                     &method,
                 );
@@ -1747,6 +1751,7 @@ impl Http2Conn {
             status,
             headers: resp_headers,
             body: resp_body,
+            genid,
         } = resp;
         // ── No server push, and no 103 Early Hints ───────────────────────
         //
@@ -1794,7 +1799,8 @@ impl Http2Conn {
         } else {
             resp_body
         };
-        let header_block = self.encode_response_headers(status, &resp_headers, advertised_len);
+        let header_block =
+            self.encode_response_headers(status, &resp_headers, advertised_len, genid);
         self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &header_block);
 
         // Store response body for flow-controlled delivery. An empty body sends
@@ -1812,6 +1818,7 @@ impl Http2Conn {
     /// connection now, so the reply starts leaving in this turn. A stream that
     /// is gone (reset by the client) is a no-op, so a stale completion drops
     /// its result rather than writing to a closed stream.
+    #[allow(clippy::too_many_arguments)] // one response's five fields plus the writer's
     pub fn complete_stream(
         &mut self,
         io: &mut H2Io<'_>,
@@ -1820,6 +1827,7 @@ impl Http2Conn {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
         method: &str,
+        genid: Option<u64>,
     ) {
         if !self.streams.get(&stream_id).is_some_and(|s| s.pending) {
             return;
@@ -1833,6 +1841,7 @@ impl Http2Conn {
                 status,
                 headers,
                 body,
+                genid,
             },
             method,
         );
@@ -1966,11 +1975,16 @@ impl Http2Conn {
         status: u16,
         headers: &[(String, String)],
         body_len: usize,
+        genid: Option<u64>,
     ) -> Vec<u8> {
         let status_str = status.to_string();
         let bodylen_str = body_len.to_string();
+        // Lives until `encode` copies the bytes out, so the decimal form costs
+        // no `String`.
+        let mut genid_buf = itoa::Buffer::new();
 
-        let mut pairs: Vec<(&[u8], &[u8])> = vec![(b":status", status_str.as_bytes())];
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(3 + headers.len());
+        pairs.push((b":status", status_str.as_bytes()));
         // RFC 9110 8.6: a 1xx/204 must not carry Content-Length, and a 304 must
         // not unless it equals the 200's. m6 sent `content-length: 0` on every
         // 304 -- the one value that actively misinforms, since it claims the
@@ -1991,6 +2005,12 @@ impl Http2Conn {
             .collect();
         for (k, v) in &filtered {
             pairs.push((k.as_bytes(), v.as_bytes()));
+        }
+        if let Some(genid) = genid {
+            pairs.push((
+                crate::genid::GENID_HEADER.as_bytes(),
+                genid_buf.format(genid).as_bytes(),
+            ));
         }
         // Applied at serialisation so every response carries them regardless
         // of which path produced it (cache hit, backend, error page). The
@@ -2054,6 +2074,7 @@ impl Http2Conn {
                 status,
                 headers,
                 body,
+                genid: None,
             },
             method,
         );
@@ -2458,7 +2479,7 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
@@ -2544,7 +2565,7 @@ mod frame_validation_tests {
         frames.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, body));
         c.recv_buf.extend_from_slice(&frames);
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         let result = loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
@@ -2667,7 +2688,7 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], vec![], "t".to_string())
+            RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), None)
         };
         let _ = c.process_frame(&mut (), &mut on_request, "127.0.0.1");
 
@@ -2855,7 +2876,7 @@ mod stream_state_tests {
     fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
         c.recv_buf.extend_from_slice(bytes);
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
@@ -3146,7 +3167,7 @@ mod stream_state_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&f);
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1") {}
         assert_eq!(
@@ -3164,7 +3185,7 @@ mod stream_state_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
 
         // Open the stream first, then deliver a 16 KiB DATA frame in two reads.
@@ -3254,7 +3275,7 @@ mod f005_regression {
 
     fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
@@ -3667,7 +3688,7 @@ mod hpack_table_size_setting_tests {
         c.recv_buf
             .extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {
@@ -3737,7 +3758,7 @@ mod forwarded_client_ip_tests {
                     .iter()
                     .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"));
                 *seen.borrow_mut() = (ip.to_string(), survived);
-                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
             };
             while let Ok(true) = c.process_frame(&mut (), &mut on_request, peer_ip) {}
         }
@@ -4124,6 +4145,7 @@ mod server_push_tests {
                 status: 200,
                 headers: vec![],
                 body: vec![b'x'; ASSET],
+                genid: None,
             },
             "GET",
         );
@@ -4280,7 +4302,7 @@ mod header_list_size_tests {
         let mut reached = false;
         let mut on_request = |_: &mut (), _: &HttpRequest, _: &str| -> RequestOutcome {
             reached = true;
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1") {

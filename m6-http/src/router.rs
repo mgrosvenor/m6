@@ -278,6 +278,7 @@ mod tests {
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
         Config {
+            genid: None,
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: "test.example.com".to_string(),
