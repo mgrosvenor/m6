@@ -56,8 +56,7 @@ name   = "My Blog"
 domain = "example.com"
 
 [log]
-level  = "info"     # "debug" | "info" | "warn" | "error"
-format = "json"     # "json" | "text"
+level = "info"     # "debug" | "info" | "warn" | "error"
 
 [errors]
 mode = "status"     # "status" | "custom" | "internal"
@@ -259,7 +258,7 @@ password = "mail-password"
 
 The rule is that `site.toml` holds the state every node shares, and the process config holds the state of one node.
 Table 1 maps each key to its file and names the reason.
-Take from it that App `[log]` is the one key with two homes, and every other key has one.
+Take from it that the service `[log]` is the one key with two homes, and every other key has one.
 
 | Setting | File it belongs in | Reason |
 |---|---|---|
@@ -273,9 +272,9 @@ Take from it that App `[log]` is the one key with two homes, and every other key
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
-| App `[thread_pool]`, `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | App config | The app's own state |
-| App `[log]` | Both | `site.toml` sets the site default and the app config overrides it |
-| App `site_toml` | App config | Names where `site.toml` is |
+| Service `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | Service config | The service's own state |
+| Service `[log]` | Both | `site.toml` sets the site default and the service config overrides it |
+| Service `site_toml` | Service config | Names where `site.toml` is |
 | Mail credentials | `secrets_file` | Secret, held outside the repo |
 
 **Table 1: which file owns each key.**
@@ -382,19 +381,18 @@ internal_peers = ["10.0.0.2", "10.0.0.3"]
 
 ### 4.3. `[log]`
 
-Table 4 gives the two `[log]` keys.
-Take from it that both have a default, so an absent section leaves the process on JSON at `info`.
+Table 4 gives the one `[log]` key.
+Take from it that the key has a default, so an absent section leaves the process at `info`.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `level` | string | `"info"` | `"trace"`, `"debug"`, `"info"`, `"warn"` or `"error"` |
-| `format` | string | `"json"` | `"json"` or `"text"` |
 
-**Table 4: the `[log]` keys.**
+**Table 4: the `[log]` key.**
 The level names are case-insensitive.
 
-All processes log to stdout, and `format` applies to every process that reads this config.
-A `format` outside `"json"` writes text.
+All processes log to stdout as JSON lines.
+A `format` key is an unknown key, so the start is refused with exit 2 and the message names it.
 
 ### 4.4. `[errors]`
 
@@ -462,7 +460,7 @@ Take from it that the endpoint layout is site-wide and the three access keys bel
 | `enabled` | bool | `true` | Turns all three endpoints off |
 | `path` | string | `"/health"` | Always public |
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
-| `traffic_path` | string | `"/traffic"` | A summary of the last hour of the analytics log |
+| `traffic_path` | string | `"/traffic"` | A summary of the last hour this process served, from memory. See [`m6-http.md`](m6-http.md) |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
 | `metrics_token_file` | string | none | The legacy gate, a file holding a bearer string. An absolute path. A file that is missing, unreadable or empty, or the key set together with `metrics_require`, stops the start with exit 2 |
 | `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`, and it comes from the Authorization header or the session cookie as a route `require` reads it |
@@ -523,9 +521,9 @@ A backend uses `sockets` or `url` for its upstream, and a route names the backen
 m6-http expands the glob once at start and adds every matching socket to the backend's pool.
 A glob that matches no socket stops the start with exit 2, before any listener binds.
 A new or removed socket needs a restart of m6-http.
-The pool sends a request to the member with the fewest connections in flight.
-A connection that fails takes that member out of rotation for 1 second, then 2, 4, 8, 16 and 30 seconds as failures repeat, so a restarting backend is not hammered.
-A completed exchange clears the count.
+The pool sends each request to the next member in turn, so `N * k` requests put exactly `k` on each of `N` members.
+A request whose connect fails tries the next member, and a client receives 502 only when every member has failed.
+A backend that stops and restarts on the same path serves again on its next turn.
 
 **URL backend.**
 A URL backend names one remote upstream, so it has no socket pool and no load balancing.
@@ -587,7 +585,59 @@ Take from it that each variable is filled from the file the glob matched.
 **Table 12: the four `[[route_group]]` path variables.**
 Every relative path is measured from the part of the glob before its first wildcard.
 
-The key reference ends with the variables that turn a file name into a URL.
+### 4.11. `[genid]`
+
+The `[genid]` table gives a node one of two roles.
+With the two claims it is the source of its site's generation ID, and it opens the endpoint that reads and advances that ID.
+With `upstream` it is a cache node, and it follows the source's ID.
+Table 13 gives its keys.
+Take from it that the two shapes do not mix and that the table belongs to the system config.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `read_require` | string | none | `"role:<name>"` or `"group:<name>"`. A `GET /genid` needs a token with this claim. Source only |
+| `write_require` | string | none | The same, for `POST /genid`, which advances the generation. Source only |
+| `upstream` | string | none | A `[[backend]]` name whose entry has a `url`. Present makes this node a cache node. Cache node only |
+| `token_file` | string | none | Absolute path to a token with the source's read claim. The heartbeat and a forwarded `/genid` send it. Cache node only |
+| `heartbeat_secs` | integer | 10 | Seconds between heartbeats. Cache node only |
+
+**Table 13: the `[genid]` keys.**
+A source sets both claims or neither, and needs `[auth] public_key` for either.
+A cache node sets `upstream` and `token_file`, and needs `[auth]` for nothing, because the source authorises the caller.
+
+The start is refused with exit 2 for any of these.
+A table with only one claim, a claim that names no role or group, or a claim without `[auth] public_key`.
+`upstream` that names no `[[backend]]` with a `url`, or that is set without `token_file`.
+`token_file` that is relative, unreadable or empty.
+`heartbeat_secs = 0`.
+`read_require` or `write_require` beside `upstream`.
+`token_file` or `heartbeat_secs` without `upstream`.
+
+`[genid]` belongs to the system config, because who may publish a site, and which node follows which, is one node's state and not something every node shares.
+A source also needs `StateDirectory=` in its unit, because the ID is written to `$STATE_DIRECTORY/genid`.
+A source with `[genid]` and no `StateDirectory=` exits 2, and `--dump-config` still prints and exits 0.
+A cache node holds no file and needs no `StateDirectory=`.
+
+```toml
+[auth]
+public_key = "/etc/m6/api-auth.pub"
+
+[genid]
+read_require  = "role:monitor"
+write_require = "role:editor"
+```
+
+A cache node's table names the origin and the token it reads with.
+The token file is a credential, delivered like every other one, for example `/run/credentials/<unit>/genid-read` from `LoadCredential=`.
+
+```toml
+[genid]
+upstream       = "origin"
+token_file     = "/run/credentials/m6-http.service/genid-read"
+heartbeat_secs = 10
+```
+
+The key reference ends with the generation endpoint, one node's own authority.
 Section 5 states which route answers a request.
 
 ## 5. Route matching
@@ -726,7 +776,7 @@ The page gives the two files m6-http reads.
 The system config holds one node's state: the node name, the bind address, the certificate and the credential paths.
 A key in the other file stops the start with exit 2, so a key has one owner.
 
-Table 13 gives the pages that own the behaviour behind these keys.
+Table 14 gives the pages that own the behaviour behind these keys.
 Take from it that the server's internals, the renderer's own keys and the site layout each have a page of their own.
 
 | document | covers |
@@ -737,6 +787,6 @@ Take from it that the server's internals, the renderer's own keys and the site l
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) | The renderer config, which is the process config of a service |
 | [`m6-site-layout.md`](m6-site-layout.md) | One root per app, which a `[[route_group]]` glob has to account for |
 
-**Table 13: further reading, and what each document covers.**
+**Table 14: further reading, and what each document covers.**
 
 A site that runs with these two files and the keys in the tables is a site whose configuration m6-http has read and accepted.

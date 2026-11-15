@@ -188,6 +188,96 @@ fn an_unknown_log_level_exits_2_before_binding() {
     );
 }
 
+/// A `site.toml` key other than `level` is a start error naming the setting:
+/// the documented refusal applies to every core service, not only to m6-http
+/// and to service configs.
+#[test]
+fn a_site_toml_log_format_exits_2_and_names_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir(&site).expect("the site directory");
+    for entry in std::fs::read_dir(fixtures_dir()).expect("the fixtures") {
+        let entry = entry.expect("a fixture");
+        if entry.file_name() == "site.toml" {
+            continue;
+        }
+        std::os::unix::fs::symlink(entry.path(), site.join(entry.file_name()))
+            .expect("a fixture link");
+    }
+    std::fs::write(
+        site.join("site.toml"),
+        "[site]\nname = \"Test Site\"\ndomain = \"localhost\"\n\n[log]\nformat = \"text\"\n",
+    )
+    .expect("the site file");
+    let socket_path = dir.path().join("format.sock");
+
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(&site)
+            .arg(site.join("configs").join("m6-html.conf"))
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .expect("m6-html should exit on a [log] format key");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("unknown key [log] format"),
+        "--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket should never have been bound: {}",
+        socket_path.display()
+    );
+}
+
+/// A line logged after start reaches the process's stdout within one
+/// accounting tick. Only the loop can write it: the Sink holds it until the
+/// tick flushes, and the process is alive and idle.
+///
+/// Break: remove the `tick` call from m6-html's loop, and the line sits in the
+/// 16 KiB buffer until the process stops. The Sink does not register stdout
+/// here: a line waiting for the tick is not a full destination.
+#[test]
+fn a_quiet_service_flushes_within_a_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("tick.sock");
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .arg("--log-level")
+            .arg("debug")
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    let response = http_request(
+        &socket_path,
+        "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.contains("200 OK"),
+        "the request was not served: {response}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if svc.output().contains("\"message\":\"request complete\"") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "no request line in the captured stdout within 3 s\n--- output ---\n{}",
+        svc.output()
+    );
+}
+
 /// secrets_file pointing at a non-existent path is silently ignored.
 #[test]
 fn l1_secrets_file_absent_still_starts() {
@@ -244,10 +334,6 @@ fn l1_sigterm_exits_zero() {
 // L1b — One loop thread
 // ---------------------------------------------------------------------------
 
-/// The writer `tracing-appender` starts for the log: one thread per process
-/// until LOG-2 logs in process. LOG-2 changes this constant to 0.
-const LOG_WRITER_THREADS: usize = 1;
-
 /// An answered request was served on the thread that accepted it, not on a
 /// worker of its own. Nine connections are answered and left open while the
 /// count is taken: a thread per connection would still be blocked in its next
@@ -278,20 +364,19 @@ fn a_request_is_served_on_the_accepting_thread() {
     }
     let pid = server.svc.pid();
 
-    // The writer is started by logging before the socket exists, so it is
-    // already there. The wait is for the count to settle, never a fixed sleep:
-    // the assertion below is the signal and the deadline is the bound.
+    // The wait is for the count to settle, never a fixed sleep: the assertion
+    // below is the signal and the deadline is the bound.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut threads = thread_count(pid);
-    while threads != 1 + LOG_WRITER_THREADS && Instant::now() < deadline {
+    while threads != 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
         threads = thread_count(pid);
     }
     assert_eq!(
         threads,
-        1 + LOG_WRITER_THREADS,
+        1,
         "m6-html (pid {pid}) runs {threads} threads with {} keep-alive connections open: \
-         one loop thread and tracing-appender's writer until LOG-2\n--- output ---\n{}",
+         one loop thread and no logging thread\n--- output ---\n{}",
         clients.len(),
         server.svc.output()
     );
@@ -391,49 +476,10 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
     );
 }
 
-/// The thread count of a running process.
-///
-/// Linux lists `/proc/<pid>/task`. macOS has no `/proc`: `libproc` answers the
-/// same question with one 64-bit thread id per thread, which is what `ps -M`
-/// prints, without spawning a tool.
-#[cfg(target_os = "linux")]
+/// The thread count of a running process, through the platform layer, which
+/// answers the same question on every target.
 fn thread_count(pid: u32) -> usize {
-    std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map(|entries| entries.count())
-        .unwrap_or(0)
-}
-
-#[cfg(target_os = "macos")]
-fn thread_count(pid: u32) -> usize {
-    /// `PROC_PIDLISTTHREADS` from `<sys/proc_info.h>`.
-    const PROC_PIDLISTTHREADS: libc::c_int = 6;
-
-    let mut ids = [0u64; 256];
-    // SAFETY: `ids` is a live buffer of exactly the length passed, and
-    // `proc_pidinfo` writes at most that many bytes into it.
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDLISTTHREADS,
-            0,
-            ids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&ids) as libc::c_int,
-        )
-    };
-    (bytes.max(0) as usize) / std::mem::size_of::<u64>()
-}
-
-/// The BSDs list a process's threads with `ps -H`, one line each.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn thread_count(pid: u32) -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-H", "-p", &pid.to_string()])
-        .output()
-        .expect("ps must run to count a process's threads");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .count()
-        .saturating_sub(1)
+    m6_core::platform::process::thread_count(pid).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,58 @@
+[package]
+name    = "m6-platform"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+# The only crate in the workspace that knows which operating system it runs
+# on, and the only one that names `mio`, `nix`, `rustix` or `libc`: the gate
+# test `tests/platform_gate.rs` holds that. m6-core re-exports it as
+# `m6_core::platform`, so a service links m6-core alone and names nothing here
+# by its crate name.
+
+[lib]
+name = "m6_platform"
+
+[dependencies]
+# The reactor behind `Poll`: epoll on Linux, kqueue on macOS.
+mio     = { version = "1", features = ["os-poll", "os-ext", "net"] }
+# Safe system calls: signal masks, signalfd and kqueue, poll, statvfs,
+# rlimits, if_nametoindex, waitpid, dup and fcntl.
+nix     = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net", "process", "user"] }
+# Socket construction with the options every m6 socket needs. `all` for
+# `SO_NOSIGPIPE` on macOS.
+socket2 = { version = "0.6", features = ["all"] }
+# The host readings are published as JSON by a monitoring service.
+serde   = { version = "1", features = ["derive"] }
+
+# Per OS family, so the Linux build links no `sysinfo` and the macOS build no
+# `rustix` process code. These two tables are the one place outside `src/`
+# that names a `target_os`, and the gate test allows them.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `pidfd_open`, which `nix` does not wrap.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Host readings (memory, load, uptime, interface counters) where there is no
+# /proc: Linux reads /proc and /sys directly, today's code, and links none of
+# this. Default features off: `multithread` would start a rayon pool.
+sysinfo = { version = "0.31", default-features = false, features = ["system", "network"] }
+# A process's threads and open descriptors (`proc_pidinfo`), safely.
+libproc = "0.14"
+# `kern.maxfilesperproc`, safely.
+sysctl  = "0.6"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile   = "3"
+# The custom-harness tests speak libtest's protocol (`--list --format terse`,
+# `--exact <name>`), which is what `nextest` lists and runs.
+libtest-mimic = "0.8"
+
+# The signal contract. Its own `main` so the signals are blocked before any
+# thread exists.
+[[test]]
+name    = "platform_signals"
+harness = false

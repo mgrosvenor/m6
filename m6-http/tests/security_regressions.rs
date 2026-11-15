@@ -82,11 +82,10 @@ fn forward_and_capture(req: &HttpRequest, client_ip: &str) -> String {
 }
 
 /// Drive one request over a Unix socket until it completes, blocking with a
-/// `mio::Poll` (tests may block). The reply is discarded: the caller wants the
+/// `platform::Poll` (tests may block). The reply is discarded: the caller wants the
 /// request bytes the backend captured.
 fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
-    use m6_core::mio::unix::SourceFd;
-    use m6_core::mio::{Events, Poll, Token};
+    use m6_core::platform::{Events, Poll, Token};
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
     forward::encode_request(up.request_buf(), req, client_ip, "example.com").expect("encode");
@@ -104,7 +103,7 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
     let token = Token(0);
     let mut registered = up.interest();
     poll.registry()
-        .register(&mut SourceFd(&up.fd()), token, registered)
+        .register_fd(up.fd(), token, registered)
         .expect("register");
     loop {
         poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))
@@ -118,7 +117,7 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
             let interest = up.interest();
             if interest != registered {
                 poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, interest)
+                    .reregister_fd(up.fd(), token, interest)
                     .expect("reregister");
                 registered = interest;
             }
@@ -265,6 +264,7 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
     cache.insert(
         CacheKey::new("/search", Some("q=attacker"), ""),
         CachedResponse {
+            genid: 0,
             status: 200,
             headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
             body: bytes::Bytes::from_static(b"ATTACKER CONTROLLED"),
@@ -389,7 +389,7 @@ fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
         assert!(
             matches!(
                 http11::parse_request(raw.as_bytes()),
-                http11::ParseResult::Error
+                http11::ParseResult::Error(_)
             ),
             "{label}: should be rejected, but parsed"
         );

@@ -32,7 +32,7 @@ Logs to stdout as structured JSON.
 5. Expand `[[route_group]]` globs against site directory — builds route table entries and invalidation map
 6. Read renderer configs to build params-file → URL invalidation map entries
 7. Bind the TLS listener. If `h2c_bind` is set, bind H2C (plain-TCP HTTP/2) listener on that address, which is internal when `internal_binds` names it and then accepts only the peers in `internal_peers`
-8. Start epoll event loop
+8. Start the event loop
 
 ---
 
@@ -43,16 +43,18 @@ Each `[[backend]]` with `sockets` is a pool. m6-http finds pool members once at 
 **Pool management:**
 - Members are the sockets the glob matches when m6-http starts
 - A pool whose glob matches no socket at start exits 2
-- Failed connection → member backed off, retried after 1s, 2s, 4s, max 30s
-- A backend that restarts on the same socket path serves again after its backoff
+- A request that fails to connect tries the next member, and the client receives 502 only when every member has failed
+- A backend that stops and restarts on the same socket path serves again on its next turn
 
-**Load balancing:** least-connections across active pool members.
+**Load balancing:** plain round robin. Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members.
 
-**URL backends** (`http://`, `https://`) are not pooled — one HTTP/1.1 connection per request, run on a dedicated I/O thread.
+**URL backends** (`http://`, `https://`) are not a member pool: each request takes one HTTP/1.1 connection, kept open for later requests in a per-backend idle set of up to eight, driven by the event loop through a `client::Upstream` slot with no dedicated I/O thread.
 
 **H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://origin.example.com:8080"`). The connection is maintained persistently by an event-loop-driven `H2cClientPool` — no thread is spawned. Intended for inter-node requests over a private backbone, where TLS at the application layer is redundant.
 
 **H2S backends** use the `h2s://` scheme (e.g. `url = "h2s://api.example.com:443"`). Like H2C but over TLS — ALPN negotiates `h2` during the handshake; startup fails if the server does not support it. The connection is maintained persistently by an event-loop-driven `H2sTlsClientPool`. Intended for HTTP/2 forwarding to external TLS-terminating upstreams.
+
+A backend that answers before it has read the whole request and then refuses the write has that answer forwarded to the client, and its connection is never reused. A request that was written in full and answered early is a different case: the connection can still carry another request if the reply's framing says it can, so it rejoins the idle set like any other.
 
 ---
 
@@ -74,6 +76,26 @@ Complete request forwarded — method, path, query string, all headers, body.
 **Added:** `X-Forwarded-For`, `X-Forwarded-Proto: https`, `X-Forwarded-Host`
 
 **Removed:** `Connection`, `Upgrade`, `Keep-Alive`, `Transfer-Encoding`
+
+---
+
+## Request Header Limits
+
+A request head is bounded before routing, the cache lookup and every backend, so an over-limit request is answered by the edge and no backend sees it.
+Two limits apply, and both follow the numbers the mainstream servers use: nginx's `large_client_header_buffers 4 8k`, Varnish's `http_req_hdr_len 8k` and `http_req_size 32k`, and Apache's `LimitRequestFieldSize 8190`.
+`MAX_HEADER_LINE` is 8 KiB for one field, counted as its name plus its value.
+`MAX_REQUEST_HEAD` is 32 KiB for the request line plus every field.
+HTTP/2 and HTTP/3 count a decoded head as RFC 9113 6.5.2 defines it for `SETTINGS_MAX_HEADER_LIST_SIZE`: name plus value plus 32 bytes per field.
+
+A field over `MAX_HEADER_LINE`, or a head over `MAX_REQUEST_HEAD`, is answered 400 with the error page titled "Request Header Or Cookie Too Large", which is nginx's own text for this refusal.
+A request line over `MAX_HEADER_LINE` is answered 414 Request-URI Too Large, counting the method, target and version on HTTP/1.1 and `:method` plus `:path` on HTTP/2 and HTTP/3.
+Both limits are defined once in m6-core as `m6_core::headers::MAX_HEADER_LINE` and `m6_core::headers::MAX_REQUEST_HEAD`, and the HTTP/1.1 parser, both backends and the edge read those definitions.
+
+HTTP/2 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_HEADER_LIST_SIZE` and enforces it while decoding.
+The 256 KiB `MAX_HEADER_BLOCK` bound on the compressed header block stays, because it is the defence against HPACK expansion.
+HTTP/3 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the pinned quiche enforces it by closing the connection with H3_EXCESSIVE_LOAD.
+A single field over `MAX_HEADER_LINE` and a request line over it are answered on the HTTP/3 stream, as they are on the other two protocols.
+The HTTP/1.1 head limit is separate from the 20 MiB cap on a whole request, and that cap stays.
 
 ---
 
@@ -99,6 +121,108 @@ The params-file-to-route mapping requires m6-http to read renderer configs at st
 ### 4xx and 5xx responses are never cached
 
 m6-http never caches responses with status 4xx or 5xx, regardless of `Cache-Control` headers.
+
+---
+
+## Site generation ID
+
+A source node holds a site generation ID.
+The ID is a `u64` counter that names the content the backends are serving at one moment.
+m6-http owns it, backend services never see it, and no other configuration shares it.
+A node is a source because its system config carries a `[genid]` table.
+A node with no `[genid]` has no endpoint at `/genid` and answers that path as it answers any other unknown path.
+
+The endpoint answers two methods.
+
+| Method | Claim | Answer |
+|---|---|---|
+| `GET` | `[genid] read_require` | `200` with `{"genid":"<decimal>"}` and `M6-Genid: <decimal>` |
+| `POST` | `[genid] write_require` | runs the change sequence, then `200` with the same shape for the new ID |
+
+Both methods require a loopback peer or an internal listener, checked before any token is read.
+Anyone else gets the 404 an unknown path gets.
+Both claims absent is also a 404, so the endpoint advertises no door it cannot open.
+The `[genid]` keys are system config only, and the table needs the unit's `StateDirectory=`.
+
+### The change sequence
+
+A `POST /genid` runs four steps in the source's loop.
+
+1. Send `POST /genid` with an empty body to every member of every socket pool, on that member's own socket, outside the pool's member choice.
+   Each member gets its own upstream slot and the `backend_timeout_secs` deadline.
+2. Wait for every member.
+   A 204 is done.
+   A 404 or 405 is a backend with nothing to refresh and is logged at debug.
+   Any other status, a connect failure or the deadline is logged at error with the member's socket path and the reason.
+   A failed member does not stop the sequence, and it is not treated as refreshed.
+3. In one step, rebuild the route table from the config loaded at start, swap the cache and the held error pages for empty ones, advance the ID and write it.
+   Each swap is one assignment, so a request sees the old generation or the new one, and a request already holding an entry finishes on the content it took.
+   A route-table build error keeps the old table and is logged.
+   The route table is built from `site.toml` as loaded at start, so a publish that adds a file a `[[route_group]]` glob matches gains its route, and a `site.toml` edit needs a restart.
+   This tree keeps no data-file-to-path invalidation map, so the cache swap is the whole invalidation.
+4. Answer every covered POST with the new ID.
+
+The order matters.
+The ID must not change before every backend has the new content, because a cache could otherwise refill from a backend still serving the old bytes under the new number.
+A POST that arrives while a sequence runs is parked, and the sequence that answers it started after it arrived.
+
+The ID advances only in step 3 of a POST, never at start.
+It lives in `$STATE_DIRECTORY/genid` as the decimal ID and a newline, written to `genid.tmp` and renamed over the file before the POST is answered.
+A restart reads that file, so a generation survives a restart.
+A source with `[genid]` and no `STATE_DIRECTORY`, or a state file that cannot be read or does not hold a `u64`, stops the start with exit 2.
+`--dump-config` prints and exits 0 without one, because a dump is not about to serve.
+
+A publisher that is itself a backend of the source drives this POST from its own event loop, never as a blocking call, so its loop stays free to answer the source's refresh.
+
+### The ID on content
+
+Every response the source receives from a backend carries the ID that was current when the request was dispatched, written as `M6-Genid: <decimal>` when the response head is serialised.
+A cached response carries the ID stored with it.
+A response whose dispatch ID is no longer current is not stored, so the cache cannot refill from a backend that is one generation behind.
+A locally built answer, such as a health check or an error page, carries no ID.
+
+The generation is also reported by an authorised `/perf`, under a `genid` object with `role`, `id`, `sequence_running` and the peers that read it.
+An operator watching a publish sees one `genid advanced` line at info with `genid`, `members`, `failed` and `elapsed_ms`, and one `member refresh failed` line at error naming the socket path of each member that did not refresh.
+The POST still answers 200 when a member failed, and the `failed` count is what says the generation is not uniform.
+
+### A cache node follows the source
+
+A node whose `[genid]` sets `upstream` is a cache node.
+It names a `[[backend]]` with a `url`, holds no state file, and needs no `StateDirectory=`.
+It asks that upstream for the ID and follows it.
+
+1. **Heartbeat.**
+   At start, and then once `heartbeat_secs` (default 10) have passed since the last one finished, the node sends `GET /genid` to the upstream with `Authorization: Bearer <token from token_file>`.
+   One heartbeat is in flight at most, on the accounting tick, under the backend's `backend_timeout_secs` deadline.
+   The address is the one resolved at start, so an address change needs a restart.
+2. **A new ID is a full flush.**
+   The node rebuilds the route table from the config loaded at start, swaps the cache and the held error pages for empty ones in one assignment each, and logs `genid changed` at info with `from` and `to`.
+   No entry survives into the new generation. One assignment publishes each replacement, so a request sees the old generation or the new one and never a half-emptied cache, and a request already holding an entry finishes on the content it took.
+   The cache refills on demand.
+   A first answer sets the ID with no flush, because the node held nothing the new ID makes old.
+   This is the whole invalidation: there is no reseed and no per-path map, so it is simple and always correct.
+3. **The store rule.**
+   A response from any URL backend enters the cache only when its `M6-Genid` parses and equals the ID the node holds, and the entry carries that ID.
+   A response with no header, no current ID, or another ID is sent to the client unchanged and not stored.
+   Another ID also makes the next heartbeat due at once, so a node that learns of a publish from a response follows it without waiting out the interval.
+   On a cache node the ID reaches a client from the upstream's own header on a miss, and from the cached entry on a hit.
+4. **Serving while the upstream is down.**
+   While the upstream does not answer, an entry past its freshness and stale windows is served as `STALE` with its `Age`, rather than as a miss.
+   A forward that ends in 502, 503 or 504 answers with the held entry for its key when there is one, at any age.
+   The operator sees one `genid: upstream down` line at warn on the transition, and `/perf` reports `upstream_down: true`.
+   The first answer after an outage logs `genid: upstream up` at info and clears the flag.
+   Old pages keep working while the source is unreachable, and that is better than an error page.
+5. **Background fetches wait.**
+   Prefetch, warm-on-start and stale-while-revalidate fetches are not drained while the node has no ID or the upstream is down.
+   The queue keeps its cap of 256 and drains once the upstream answers.
+6. **`/genid` is forwarded.**
+   `GET`, `HEAD` and `POST /genid` reach the upstream backend after the loopback or internal-listener address check, with the request's own headers, bypassing routing and the cache.
+   The cache node checks no token: the source authorises the caller.
+   A forwarded POST waits under `backend_timeout_secs` and is answered 504 if the deadline passes while the source is still completing the publish.
+   `GET /genid` then shows whether the advance happened.
+
+A cache node reports its own `genid` object from an authorised `/perf`: `role` is `cache`, `id` is the ID it holds or `null`, and `upstream`, `upstream_down`, `upstream_rtt_ms` and `last_ok_s` describe the node it follows.
+A source restart keeps its ID, so a cache node sees no change when it comes back.
 
 ---
 
@@ -194,7 +318,16 @@ Rotate the analytics file by renaming it and sending `SIGUSR1`.
 The process creates the file at its path again, and the path reappearing means the renamed file is finished.
 If the reopen fails, the process keeps writing to the previous file and logs an error.
 `/perf` reports the last reopen under `logging.reopen`.
-`/traffic` also reads the newest rotated file next to the log (`<name>-YYYYmmddHH`, plain or `.gz`), so its window spans a rotation.
+`/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
+The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
+It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
+When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
+A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the analytics log keeps them whole.
+The notable-client sample is then cut at 160 characters, marked the same way.
+In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
+Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
+The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
+The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
 ---
 
@@ -259,6 +392,9 @@ name = "api-dev"
 url              = "h2s://dev.example.com:443"
 tls_skip_verify  = true   # dev/test only
 ```
+
+An `https://` or `h2s://` backend is verified against the host's certificate authorities.
+A host with none stops m6-http at start with exit 2, naming the backend.
 
 m6-http performs TLS negotiation with ALPN `h2` at startup of the first request. If the server does not accept `h2` in ALPN, the connection attempt fails with a 502. The connection is maintained persistently by `H2sTlsClientPool`, event-loop driven — identical to `H2cClientPool` but with a TLS record layer. Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
 
@@ -400,19 +536,24 @@ The row states what the code does and leaves the fix to the issue.
 *Table 6: the one HTTP/2 limit m6-http does not implement, and the issue that tracks it. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the issue number is the record of the gap.*
 
 The gap is engineering work tracked by the issue.
-Event Loop below describes the single-threaded epoll loop that drives these connections.
+Event Loop below describes the one loop that drives these connections, and `m6-architecture.md` §1.10 states the rules it follows.
 
 ---
 
 ## Event Loop
 
-Single-threaded epoll. No Tokio.
+One thread, one edge-triggered `m6_core::platform::Poll` loop, no async runtime.
+`m6-architecture.md` §1.10 states the rules it follows, and `m6-core/examples/echo.rs` is the reference loop.
 
 - No heap allocation on hot path
 - No `unwrap()` or `expect()`
 - No blocking calls in event loop
-- Cache behind `Arc`, shared read-only once built
 - H2C and H2S client pools driven in the event loop alongside TLS/QUIC listeners
+
+The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
+Every connection and every upstream gets its own `Token(k)` in the `Slots` table.
+A turn matches the token and runs one arm: accept on a listener until it would block, drain the UDP socket for QUIC, read the signal descriptor and hand it to `m6_core::signal::Lifecycle`, flush the log, or drive one connection or upstream.
+The wait is bounded by a 1 s accounting tick, every deadline table and quiche's own timeout.
 
 ---
 
@@ -423,6 +564,7 @@ Structured JSON to stdout. journald captures via systemd.
 Emitted events: startup, request complete (path, status, backend, latency_us, cache_hit), auth failure (warn), pool change (info), cache eviction (debug).
 
 Periodic stats: `requests`, `rps_avg`, `rps_peak`, `latency_p50_us`, `latency_p99_us`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`.
+`pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
 
 ---
 

@@ -96,39 +96,7 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
     let src = backends_dir().join(lang);
     match lang {
         "c" | "cpp" | "go" => {
-            let bin = work.join("ex");
-            match lang {
-                "c" => run_ok(
-                    "cc",
-                    &[
-                        "-std=c11",
-                        "-O2",
-                        "-pthread",
-                        "-o",
-                        bin.to_str().unwrap(),
-                        src.join("main.c").to_str().unwrap(),
-                    ],
-                    None,
-                ),
-                "cpp" => run_ok(
-                    "c++",
-                    &[
-                        "-std=c++17",
-                        "-O2",
-                        "-pthread",
-                        "-o",
-                        bin.to_str().unwrap(),
-                        src.join("main.cpp").to_str().unwrap(),
-                    ],
-                    None,
-                ),
-                _ => run_ok(
-                    "go",
-                    &["build", "-o", bin.to_str().unwrap(), "."],
-                    Some((&src, work.join("gocache"))),
-                ),
-            }
-            let mut c = Command::new(bin);
+            let mut c = Command::new(compiled(lang));
             c.arg(sock).arg(payload_path());
             c
         }
@@ -148,7 +116,7 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
             std::fs::copy(payload_path(), site.join("status.json")).unwrap();
             std::fs::write(
                 site.join("site.toml"),
-                "[site]\nname = \"be\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\nformat = \"text\"\n",
+                "[site]\nname = \"be\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\n",
             )
             .unwrap();
             let conf = work.join("bexample.toml");
@@ -165,6 +133,103 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
         }
         other => panic!("unknown language {other}"),
     }
+}
+
+/// Compile a C, C++ or Go example once for the whole test binary.
+///
+/// [`backend_command`] is called once per test, and each call used to compile
+/// into that test's own scratch directory. Seven tests then compiled three
+/// languages each, and every Go build started from an empty `GOCACHE` and
+/// rebuilt the standard library, which was most of the 110 seconds this file
+/// took on the build host. The compiled binary does not depend on which test
+/// asked for it, so it is built once and cached here.
+fn compiled(lang: &str) -> PathBuf {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // The lock is held across the compile: two tests starting the same language
+    // at once would otherwise both write the same output path, and the second
+    // link would truncate the binary the first had already started running.
+    let mut guard = cache.lock().expect("backend build cache");
+    if let Some(p) = guard.get(lang) {
+        return p.clone();
+    }
+
+    let src = backends_dir().join(lang);
+    let bin = build_dir().join(lang);
+    match lang {
+        "c" => run_ok(
+            "cc",
+            &[
+                "-std=c11",
+                "-O2",
+                "-pthread",
+                "-o",
+                bin.to_str().unwrap(),
+                src.join("main.c").to_str().unwrap(),
+            ],
+            None,
+        ),
+        "cpp" => run_ok(
+            "c++",
+            &[
+                "-std=c++17",
+                "-O2",
+                "-pthread",
+                "-o",
+                bin.to_str().unwrap(),
+                src.join("main.cpp").to_str().unwrap(),
+            ],
+            None,
+        ),
+        "go" => run_ok(
+            "go",
+            &["build", "-o", bin.to_str().unwrap(), "."],
+            Some((&src, go_cache())),
+        ),
+        other => panic!("{other} is not compiled"),
+    }
+    assert!(
+        bin.is_file(),
+        "{lang} built but {} does not exist",
+        bin.display()
+    );
+    guard.insert(lang.to_string(), bin.clone());
+    bin
+}
+
+/// Where the compiled examples for THIS run go.
+///
+/// Not the per-test scratch directory, which is dropped when that test ends.
+/// Named by process id so two concurrent runs cannot share an output path, and
+/// under the exec-capable root because these binaries are spawned.
+fn build_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = m6_core::testkit::exec_scratch_root()
+            .join(format!("m6px-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("backend build directory");
+        dir
+    })
+    .clone()
+}
+
+/// The Go build cache, shared by every run on this machine.
+///
+/// A per-run `GOCACHE` makes `go build` recompile the standard library, which
+/// costs tens of seconds. The cache is content-addressed and safe for
+/// concurrent use, so one copy under the scratch root serves every run.
+fn go_cache() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = m6_core::testkit::exec_scratch_root().join("m6-go-build-cache");
+        std::fs::create_dir_all(&dir).expect("go build cache directory");
+        dir
+    })
+    .clone()
 }
 
 fn run_ok(tool: &str, args: &[&str], cwd_env: Option<(&Path, PathBuf)>) {
@@ -404,7 +469,6 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
 
 [analytics]
 enabled = false
@@ -451,11 +515,12 @@ backend = "example"
         // this moment, so a failure in the edge path below still reaps it.
         let mut backend = BackendGuard {
             child: Some(
-                backend_command(lang, base, &sock)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
+                m6_core::platform::process::spawn(
+                    backend_command(lang, base, &sock)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped()),
+                )
+                .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
             ),
         };
         *backend_pid = backend.child.as_ref().map(|c| c.id());
@@ -711,12 +776,7 @@ fn a_failed_start_leaves_no_backend_process_behind() {
     }));
     assert!(failed.is_err(), "the edge should fail to start");
     let pid = backend_pid.expect("the backend was spawned before the edge failed");
-    let alive = Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let alive = m6_core::platform::process::is_alive(pid);
     assert!(
         !alive,
         "the backend process should have been reaped after the failed edge start"

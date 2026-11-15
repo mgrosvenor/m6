@@ -27,11 +27,11 @@ use crate::request::Request;
 /// that are not there. Here they cannot: `as_bytes` returns `None` for a
 /// stream and the transforms have nothing to work on.
 ///
-/// This is what `App` was missing. `m6-file` streams a file straight to the
-/// wire (`send_stream`), and one minified JavaScript bundle of several
+/// A body from a reader is what `m6-file` needs. It streams a file straight to
+/// the wire (`send_stream`), and one minified JavaScript bundle of several
 /// megabytes used to be read into a `Vec` on every cache miss to be copied
-/// straight out again. A migration onto a `Response` that could only hold bytes
-/// would have put that allocation back, on the service that serves every asset
+/// straight out again. A `Response` that could only hold bytes would put that
+/// allocation back, on the service that serves every asset
 /// on the site.
 pub enum Body {
     /// Bytes already in memory.
@@ -142,11 +142,10 @@ pub struct Response {
 impl From<crate::http::RawResponse> for Response {
     /// The low-level response type, lifted into the one handlers return.
     ///
-    /// `RawResponse` is what a service builds when it is writing its own
-    /// status, headers and body with no framework around it; `Response` is
-    /// what an `App` handler returns. They hold the same three things, so a
-    /// service migrating onto `App` does not have to rewrite handlers that
-    /// already produce a correct answer.
+    /// `RawResponse` is what a service builds when it writes its own status,
+    /// headers and body with no site around it; `Response` is what a request
+    /// arm returns. They hold the same three things, so a service does not
+    /// rewrite a handler that already produces a correct answer.
     ///
     /// `verbatim`, because a `RawResponse` was built to be written as-is: the
     /// service that produced it set its own `Content-Type` and length and had
@@ -575,14 +574,14 @@ fn is_no_store_name(raw: &str) -> bool {
     name.trim().eq_ignore_ascii_case("no-store")
 }
 
-/// Map an `Error` to a `Response` (status only, body set by framework).
+/// Map an `Error` to a `Response` (status only, body set by `site`).
 pub fn error_to_response(err: &Error) -> Response {
     match err {
         Error::NotFound => Response::not_found(),
         Error::Forbidden => Response::forbidden(),
         Error::BadRequest(_) => Response::bad_request(),
         Error::Other(_) => {
-            tracing::error!("handler error: {err}");
+            crate::log::error!("handler error: {err}");
             Response::status(500)
         }
     }
@@ -607,7 +606,7 @@ mod body_tests {
         (head, out[sep + 4..].to_vec())
     }
 
-    /// The capability `App` was missing: a body written from a reader, with the
+    /// A body written from a reader, with the
     /// length promised up front and never held in memory.
     #[test]
     fn a_streamed_body_reaches_the_wire_with_its_length() {

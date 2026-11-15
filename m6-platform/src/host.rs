@@ -8,9 +8,9 @@
 //! the number is.
 //!
 //! Core wants these for itself too, not only to report them. The service loop
-//! already sheds load with a 503 when its queue is full; admission that is
-//! aware of load average, and a cache sized against the memory limit that
-//! actually applies, are runtime concerns rather than reporting ones.
+//! already stops accepting at its connection ceiling; admission that is aware
+//! of load average, and a cache sized against the memory limit that actually
+//! applies, are runtime concerns rather than reporting ones.
 //!
 //! # Why this is not three lines of `std::fs::read_to_string`
 //!
@@ -33,13 +33,16 @@
 //! # Structure
 //!
 //! Parsing is separated from reading. `parse_*` are pure functions over the
-//! text these files contain and are tested on any platform; the readers are
-//! thin and platform-gated. A VPS frequently has no thermal zone at all, so
+//! text these files contain and are tested on any platform. The readers live
+//! in the layer's two OS files (`platform/linux.rs` reads `/proc` and `/sys`,
+//! `platform/macos.rs` asks `sysinfo` and the kernel), selected by OS family. A VPS frequently has no thermal zone at all, so
 //! "no reading" is an ordinary answer and is `None`, not an error.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use super::os;
 
 // ── Load ─────────────────────────────────────────────────────────────────────
 
@@ -200,32 +203,22 @@ impl Disk {
     }
 }
 
-/// Space on the filesystem containing `path`.
+/// Space on the filesystem containing `path`, through `statvfs`, which every
+/// supported target has. `None` for a path that does not exist.
 pub fn disk(path: &Path) -> Option<Disk> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `statvfs` writes into a zeroed struct we own, and `c` is a valid
-    // NUL-terminated path for the duration of the call.
-    unsafe {
-        let mut st: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
-            return None;
-        }
-        // f_frsize is the fragment size and is the unit f_blocks and f_bavail
-        // are counted in. f_bsize is the preferred I/O block size and is not
-        // the same thing, though they usually match.
-        let unit = if st.f_frsize > 0 {
-            st.f_frsize
-        } else {
-            st.f_bsize
-        } as u64;
-        Some(Disk {
-            total_bytes: st.f_blocks as u64 * unit,
-            available_bytes: st.f_bavail as u64 * unit,
-        })
-    }
+    let st = nix::sys::statvfs::statvfs(path).ok()?;
+    // f_frsize is the fragment size and is the unit f_blocks and f_bavail
+    // are counted in. f_bsize is the preferred I/O block size and is not
+    // the same thing, though they usually match.
+    let unit = if st.fragment_size() > 0 {
+        st.fragment_size()
+    } else {
+        st.block_size()
+    } as u64;
+    Some(Disk {
+        total_bytes: st.blocks() as u64 * unit,
+        available_bytes: st.blocks_available() as u64 * unit,
+    })
 }
 
 // ── Temperature ──────────────────────────────────────────────────────────────
@@ -515,29 +508,6 @@ impl FileDescriptors {
     }
 }
 
-/// Parse the `Max open files` row of `/proc/self/limits`.
-pub fn parse_fd_limits(s: &str) -> Option<(u64, u64)> {
-    for line in s.lines() {
-        if !line.starts_with("Max open files") {
-            continue;
-        }
-        let rest = line.trim_start_matches("Max open files").trim();
-        let f: Vec<&str> = rest.split_whitespace().collect();
-        let parse = |v: &str| -> u64 {
-            if v == "unlimited" {
-                u64::MAX
-            } else {
-                v.parse().unwrap_or(0)
-            }
-        };
-        return Some((
-            parse(f.first().copied().unwrap_or("0")),
-            parse(f.get(1).copied().unwrap_or("0")),
-        ));
-    }
-    None
-}
-
 // ── Readers ──────────────────────────────────────────────────────────────────
 
 /// A snapshot of the host, with every field optional because every field can
@@ -555,10 +525,10 @@ pub struct HostSnapshot {
     pub disk: Option<Disk>,
     pub thermal: Vec<ThermalZone>,
     pub uptime_s: Option<u64>,
-    /// Interface counters. Empty off Linux.
+    /// Interface counters.
     #[serde(default)]
     pub net: Vec<NetDevice>,
-    /// Block device throughput. Empty off Linux.
+    /// Block device throughput. Empty where the host has no reading.
     #[serde(default)]
     pub disks: Vec<DiskIo>,
     /// Pressure stall, per resource. Absent on kernels without PSI.
@@ -596,58 +566,36 @@ pub fn snapshot(disk_path: &Path) -> HostSnapshot {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Interface counters. On Linux from `/proc/net/dev`. On macOS from the
+/// kernel's interface table through `sysinfo`, whose rows carry no drop
+/// counters, so `rx_drop` and `tx_drop` read 0 there.
 pub fn net_devices() -> Vec<NetDevice> {
-    std::fs::read_to_string("/proc/net/dev")
-        .map(|s| parse_net_dev(&s))
-        .unwrap_or_default()
+    os::net_devices()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn net_devices() -> Vec<NetDevice> {
-    Vec::new()
-}
-
-#[cfg(target_os = "linux")]
+/// Block device throughput. On Linux from `/proc/diskstats`. Absent on macOS,
+/// which has no reading without IOKit.
 pub fn disk_io() -> Vec<DiskIo> {
-    std::fs::read_to_string("/proc/diskstats")
-        .map(|s| parse_diskstats(&s))
-        .unwrap_or_default()
+    os::disk_io()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn disk_io() -> Vec<DiskIo> {
-    Vec::new()
-}
-
-#[cfg(target_os = "linux")]
+/// Pressure stall averages for `cpu`, `io` or `memory`. On Linux from
+/// `/proc/pressure`, `None` on a kernel without PSI. Absent on macOS.
 pub fn pressure(resource: &str) -> Option<Pressure> {
-    parse_pressure(&std::fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?)
+    os::pressure(resource)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn pressure(_resource: &str) -> Option<Pressure> {
-    None
-}
-
-#[cfg(target_os = "linux")]
+/// TCP health counters. On Linux from `/proc/net/netstat` and `sockstat`.
+/// Absent on macOS.
 pub fn tcp_health() -> Option<TcpHealth> {
-    let mut t = parse_netstat(&std::fs::read_to_string("/proc/net/netstat").ok()?);
-    if let Ok(s) = std::fs::read_to_string("/proc/net/sockstat") {
-        parse_sockstat_into(&s, &mut t);
-    }
-    Some(t)
+    os::tcp_health()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn tcp_health() -> Option<TcpHealth> {
-    None
-}
-
-#[cfg(target_os = "linux")]
+/// This process's open descriptors against its limits, through
+/// [`super::process`]: the same on every target.
 pub fn file_descriptors() -> Option<FileDescriptors> {
-    let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
-    let (soft, hard) = parse_fd_limits(&std::fs::read_to_string("/proc/self/limits").ok()?)?;
+    let open = super::process::open_descriptors(std::process::id()).ok()? as u64;
+    let (soft, hard) = super::process::fd_limits().ok()?;
     Some(FileDescriptors {
         open,
         soft_limit: soft,
@@ -655,100 +603,28 @@ pub fn file_descriptors() -> Option<FileDescriptors> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn file_descriptors() -> Option<FileDescriptors> {
-    None
-}
-
-#[cfg(target_os = "linux")]
+/// The kernel's load averages. On Linux from `/proc/loadavg`, with the
+/// runnable and total task counts. On macOS from `getloadavg` through
+/// `sysinfo`, which carries no task counts, so `running` and `total` are 0.
 pub fn load_average() -> Option<LoadAverage> {
-    parse_loadavg(&std::fs::read_to_string("/proc/loadavg").ok()?)
+    os::load_average()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn load_average() -> Option<LoadAverage> {
-    // SAFETY: getloadavg writes at most 3 doubles into a buffer we own.
-    unsafe {
-        let mut avg = [0f64; 3];
-        if libc::getloadavg(avg.as_mut_ptr(), 3) != 3 {
-            return None;
-        }
-        Some(LoadAverage {
-            one: avg[0],
-            five: avg[1],
-            fifteen: avg[2],
-            running: 0,
-            total: 0,
-        })
-    }
-}
-
-/// Memory, preferring the limit that actually applies to this process.
-#[cfg(target_os = "linux")]
+/// Memory, preferring the limit that actually applies to this process. On
+/// Linux the cgroup v2 limit when one applies, else `/proc/meminfo`. On macOS
+/// the machine's memory through `sysinfo`, available as total less used.
 pub fn memory() -> Option<Memory> {
-    if let (Ok(max), Ok(cur)) = (
-        std::fs::read_to_string("/sys/fs/cgroup/memory.max"),
-        std::fs::read_to_string("/sys/fs/cgroup/memory.current"),
-    ) {
-        if let Some(m) = parse_cgroup_memory(&max, &cur) {
-            return Some(m);
-        }
-    }
-    parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    os::memory()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn memory() -> Option<Memory> {
-    None
-}
-
-#[cfg(target_os = "linux")]
+/// Thermal zones. On Linux from `/sys/class/thermal`. Absent on macOS.
 pub fn thermal_zones() -> Vec<ThermalZone> {
-    let mut out = Vec::new();
-    let dir = match std::fs::read_dir("/sys/class/thermal") {
-        Ok(d) => d,
-        Err(_) => return out,
-    };
-    for entry in dir.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // cooling_device* live here too and have no `temp`; a VPS often has
-        // those and no thermal_zone at all.
-        if !name.starts_with("thermal_zone") {
-            continue;
-        }
-        let celsius = match std::fs::read_to_string(path.join("temp"))
-            .ok()
-            .and_then(|s| parse_thermal_millidegrees(&s))
-        {
-            Some(c) => c,
-            None => continue,
-        };
-        let label = std::fs::read_to_string(path.join("type"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| name.clone());
-        out.push(ThermalZone {
-            name: label,
-            celsius,
-        });
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    os::thermal_zones()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn thermal_zones() -> Vec<ThermalZone> {
-    Vec::new()
-}
-
-#[cfg(target_os = "linux")]
+/// Time since boot. On Linux from `/proc/uptime`, on macOS through `sysinfo`.
 pub fn uptime() -> Option<std::time::Duration> {
-    parse_uptime(&std::fs::read_to_string("/proc/uptime").ok()?)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn uptime() -> Option<std::time::Duration> {
-    None
+    os::uptime()
 }
 
 #[cfg(test)]
@@ -982,38 +858,6 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
         assert_eq!(t.sockets_used, 229);
         assert_eq!(t.tcp_inuse, 9);
         assert_eq!(t.tcp_time_wait, 0);
-    }
-
-    /// A limits row with a 1024 soft limit against a 524288 hard one. The soft
-    /// limit is what `accept` fails against.
-    #[test]
-    fn parses_fd_limits_and_keeps_soft_and_hard_apart() {
-        let s = "Limit                     Soft Limit           Hard Limit           Units\n\
-                 Max open files            1024                 524288               files\n";
-        let (soft, hard) = parse_fd_limits(s).unwrap();
-        assert_eq!(soft, 1024);
-        assert_eq!(hard, 524288);
-
-        let f = FileDescriptors {
-            open: 512,
-            soft_limit: soft,
-            hard_limit: hard,
-        };
-        assert!(
-            (f.used_fraction() - 0.5).abs() < 1e-9,
-            "headroom is against the SOFT limit"
-        );
-    }
-
-    #[test]
-    fn unlimited_fds_do_not_parse_as_zero() {
-        let s = "Max open files            unlimited            unlimited            files\n";
-        let (soft, _) = parse_fd_limits(s).unwrap();
-        assert_eq!(soft, u64::MAX);
-        assert_eq!(
-            parse_fd_limits("Max locked memory 8388608 8388608 bytes\n"),
-            None
-        );
     }
 
     /// Everything is optional and a snapshot on a machine missing any of it

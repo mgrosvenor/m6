@@ -7,8 +7,8 @@
 //! one file and relied on in another.
 //!
 //! `RawResponse` is the low-level answer, for code writing its own status,
-//! headers and body with no framework around it. `Response` is what an `App`
-//! handler returns, and a `RawResponse` lifts into one.
+//! headers and body with no site around it. `Response` is what a request arm
+//! returns, and a `RawResponse` lifts into one.
 
 /// HTTP method constants.
 #[derive(Debug, Clone, PartialEq, Eq)]

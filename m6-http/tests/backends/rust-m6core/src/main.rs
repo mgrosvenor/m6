@@ -44,23 +44,27 @@
 #![deny(unsafe_code)]
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use m6_core::app::RouteMethod;
-use m6_core::event::{raise_open_file_limit, LoopTrace, Signals, Slots, Timeouts};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
 use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
-use m6_core::CodeRoute;
+use m6_core::site::RouteMethod;
+use m6_core::{genid_failed, genid_ok, CodeRoute};
 
 const LANGUAGE: &str = "Rust (m6-core)";
 const NAME: &str = "m6-example-rust-m6core";
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -120,10 +124,9 @@ fn main() -> std::io::Result<()> {
     };
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let site = Site::load(NAME, &ROUTES, &[], &NoTemplates);
+    let mut site = Site::load(NAME, &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
-    let ceiling =
-        raise_open_file_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");
     }
@@ -138,11 +141,7 @@ fn main() -> std::io::Result<()> {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
     poll.registry()
-        .register(
-            &mut SourceFd(&signals.raw_fd()),
-            SIGNALS,
-            Interest::READABLE,
-        )
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
 
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
@@ -155,27 +154,31 @@ fn main() -> std::io::Result<()> {
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(EVENTS);
-    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout"]);
+    let mut trace = LoopTrace::new(&["accept", "conn", "signal", "timeout", "log"]);
     let mut accepting = true;
-    let mut last = Instant::now();
+    let mut last = m6_core::platform::now();
     let mut last_report = last;
 
     // ── run: nothing blocks ──────────────────────────────────────────────
     'run: loop {
         // An interrupted wait is not an error: wait again. mio passes EINTR
         // up rather than retrying.
-        match poll.poll(&mut events, Some(deadlines.timeout(Instant::now(), TICK))) {
+        match poll.poll(
+            &mut events,
+            Some(deadlines.timeout(m6_core::platform::now(), TICK)),
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         trace.waited(now - last);
         // One sample per iteration, under the kind of its first event, as
         // m6-http reports the trace.
         let trigger = match events.iter().next().map(|ev| ev.token()) {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 2,
+            Some(LOG) => 4,
             Some(_) => 1,
             None => 3,
         };
@@ -191,23 +194,25 @@ fn main() -> std::io::Result<()> {
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // No connection was pending after all: give
-                                // the slot back rather than leaking it.
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                // A failure here sheds this accept pass and
-                                // not the service: give the slot back, say so
-                                // once, and wait for the next listener event.
-                                // The budget leaves room for every connection
-                                // and every file it streams, so this is a
-                                // transient error outside the table.
-                                conns.free(taken.key);
-                                eprintln!("m6-example-rust-m6core: accept error: {e}");
-                                break;
-                            }
+                            // No connection was pending after all: give
+                            // the slot back rather than leaking it.
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Any other error: say so once, give the slot back and stop
+                                // accepting for this turn.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    eprintln!("m6-example-rust-m6core: accept error: {e}");
+                                    break;
+                                }
+                            },
                         };
                         poll.registry().register(
                             &mut stream,
@@ -237,12 +242,13 @@ fn main() -> std::io::Result<()> {
                         break 'run;
                     }
                 }
+                LOG => m6_core::log::flush(),
                 // One connection's turn, then wait for what it still needs,
                 // touch its deadline, or close it.
                 Token(k) => {
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
-                    match turn(conn, &site, &status_body) {
+                    match turn(conn, &mut site, &status_body) {
                         Ok(true) => {
                             // Re-register only when the turn changed what the
                             // connection waits for: a kept-alive request that
@@ -264,9 +270,18 @@ fn main() -> std::io::Result<()> {
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        //
+        // These logger calls are live: `Site::load` above initialises the
+        // operational Sink, and `lifecycle.started()` has written to it.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
-        while let Some(Token(k)) = deadlines.expired(Instant::now()) {
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
         }
         // A slot came free while the table was full: accept again.
@@ -279,10 +294,11 @@ fn main() -> std::io::Result<()> {
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. These services serve no metrics page, so the report is the
         // tick's own accounting rather than a served number.
-        let end = Instant::now();
+        let end = m6_core::platform::now();
         trace.worked(trigger, end - now);
         last = end;
         if end - last_report >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
             let _ = trace.report();
             last_report = end;
         }
@@ -292,12 +308,13 @@ fn main() -> std::io::Result<()> {
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();
+    m6_core::log::stop()?;
     Ok(())
 }
 
 /// One connection's turn: read, answer and write until the socket would
 /// block. Returns whether the connection stays open.
-fn turn(conn: &mut ServerConn, site: &Site, status_body: &[u8]) -> io::Result<bool> {
+fn turn(conn: &mut ServerConn, site: &mut Site, status_body: &[u8]) -> io::Result<bool> {
     loop {
         // Write what is owed before reading anything. A streamed body is not
         // in the output buffer, so a read here would let the next request's
@@ -320,6 +337,19 @@ fn turn(conn: &mut ServerConn, site: &Site, status_body: &[u8]) -> io::Result<bo
             Read::Request(head) => {
                 let response = match site.handle(&head) {
                     Handled::Done(response) => response,
+                    // The reserved path: run the start path again and assign
+                    // the new Site in the loop's own binding, or keep serving
+                    // the old one and answer the cause.
+                    Handled::Reload(reload) => {
+                        let response = match site.reload(&ROUTES, &[], &NoTemplates) {
+                            Ok(next) => {
+                                *site = next;
+                                genid_ok()
+                            }
+                            Err(e) => genid_failed(&e),
+                        };
+                        m6_core::site::finish_reload(&reload, response)
+                    }
                     // This service's five routes, by the index they were given
                     // to `Site::load` in.
                     Handled::Code(index, req) => {

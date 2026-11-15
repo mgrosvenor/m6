@@ -1,0 +1,111 @@
+# The platform layer
+
+`m6-platform` is the one crate in m6 that knows which operating system it runs on.
+m6-core re-exports it as `m6_core::platform`, so a service links m6-core alone.
+This page states each contract the layer makes, how Linux and macOS meet it, what is normalised, how a port is added, and which tests hold it all.
+It opens with the rule, then the contracts, then the ports and the tests.
+
+## Contents
+
+1. The rule
+2. The contracts
+3. Service managers
+4. Future ports
+5. Adding a port
+6. The tests
+
+## 1. The rule
+
+Platform-specific code lives in `m6-platform/src/` and nowhere else.
+`src/lib.rs` holds the API and the shared code, `src/linux.rs` and `src/macos.rs` hold the two implementations, selected once by OS family and never by CPU.
+A family with no file fails to build with a message naming the file a port adds.
+The gate test `m6-platform/tests/platform_gate.rs` refuses, in every other `.rs` file and manifest of the workspace, tests included: a `cfg` that names a platform, the crates `mio`, `nix`, `rustix` and `libc`, a direct `Instant::now()` or `SystemTime::now()` outside tests, and a read of a systemd-only variable.
+Supported means built and tested in CI: macOS arm64, Linux x86_64 and Linux arm64.
+The rule is the whole design, and the contracts below are what it protects.
+
+## 2. The contracts
+
+Each item is stated in the service's terms, with the OS mechanism beside it.
+Table 1 lists them.
+
+| item | the contract | Linux | macOS |
+|---|---|---|---|
+| `Poll` | an event for every new readiness edge on a registered interest, one event per token per wait, `reregister` always reaches the kernel so a ready source is reported again, a peer close is readable then EOF, edge-triggered so a turn reads and writes until `WouldBlock` | epoll, edge-triggered, through `mio` | kqueue with `EV_CLEAR`, through `mio` |
+| `now`, `wall` | thin wrappers over the monotonic and wall clocks, read once per loop wake and passed down the turn | `CLOCK_MONOTONIC`, `CLOCK_REALTIME` | `CLOCK_UPTIME_RAW`, `gettimeofday` |
+| `Signals` | SIGTERM and SIGINT are one `Shutdown` request, SIGUSR1 is `ReopenLogs`, each read once, a burst coalesces and none is lost, the signals stay blocked for the life of the process | `signalfd`, whose read dequeues the signal | kqueue `EVFILT_SIGNAL`, which reports and does not dequeue, so the three are also `SIG_IGN` and discarded once reported |
+| `process::spawn` | a child starts with no signal blocked or ignored and inherits no descriptor above stderr, and stays in the parent's process group so a terminal's interrupt reaches it | `pre_exec` clears the mask and restores the three dispositions, every descriptor above stderr is marked close-on-exec first | the same |
+| `net::accept_error` | an accept loop drains to `Drained`, passes over `SkipOne` (a connection gone before it was accepted, an interrupted call) and on `Stop` (any other error) logs it once and stops accepting for the turn | `EAGAIN`, `ECONNABORTED` and `EINTR` | the same |
+| `ChildExit` | a readable descriptor when the child exits, at once when it already has, `reap` never blocks | `pidfd_open` | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
+| `net::connect_unix` | a refused connect is a listener that is gone, a missing file is `NotFound`, and a full queue never connects and never hangs, so the caller tries the next member and answers 503 only when every attempt was a full queue | `EAGAIN` for a full queue: busy, the next member for this request | `ECONNREFUSED` for a full queue too, so a full queue reads the same as a listener that is gone and the caller tries the next member |
+| `net::connect_tcp` | `Connected` or `InProgress`, never `EINPROGRESS` as an error | `WouldBlock` | the raw errno |
+| sockets | every socket the layer makes gives `BrokenPipe` on a write to a closed peer, never a signal | the runtime ignores `SIGPIPE` | the same, and `SO_NOSIGPIPE` on every socket |
+| `MAX_SOCKET_PATH` | a path too long to bind fails at start naming the path and the limit | 108 | 104 |
+| `process::raise_fd_limit` | the soft limit becomes the highest the kernel accepts, the number returned is what connections may use, a second call returns the same | the hard limit | `kern.maxfilesperproc`, because the hard limit reads as unlimited |
+| `host` | memory, load, uptime, disk space and interface counters are real values, an unreadable source is `None` or an empty list, never a row of zeros | `/proc` and `/sys` | `sysinfo` with its default features off, so no thread starts |
+| `process` facts | thread count, open descriptors, alive, listening on TCP, root, and the worker range reading the host's certificate store leaves | `/proc/<pid>`; the store is a file read and leaves no thread | `proc_pidinfo`, `lsof`; the Security framework leaves three or four |
+| directories | `runtime_dir` is `/run/m6`, `temp_dir` honours `TMPDIR` and takes a socket, `scratch_dir` permits exec, `create_private` gives 0700 and 0600 | the same | the same |
+
+Table 1: each item of the layer, its contract, and the mechanism behind it on each OS.
+
+Three things are stated and not normalised.
+A writable report may repeat on macOS after the peer acknowledges data, because kqueue re-arms the filter and epoll does not. A loop that writes until `WouldBlock` pays one failed write for it.
+On macOS a stale socket file and a full queue are the same `ECONNREFUSED`, and the kernel's answer is passed through, so a full queue there costs the request one connect and it moves to the next member.
+Both monotonic clocks stop while the machine sleeps, so a deadline set before a laptop sleeps fires after it wakes, late by the sleep's length.
+Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives. m6 does not handle descriptor exhaustion.
+Known limitation: a full listen queue is reported differently by the two kernels. macOS refuses the next connection at once, so the client sees `ECONNREFUSED` and can retry or give up. Linux leaves the connection pending, so the client waits for a timeout it did not choose. The macOS answer is the better one, and m6 does not equalise the two, because equalising would mean accepting connections it cannot serve. At this scale the queue does not fill: the accept loop drains it every turn, and a slow process still drains it, so a full queue means the process is not running.
+Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
+The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
+Everything in Table 1 is held by the tests in section 6.
+
+## 3. Service managers
+
+An m6 service needs six things from whatever starts it, and both systemd and launchd give all six.
+Table 2 lists them.
+
+| need | systemd | launchd |
+|---|---|---|
+| start, stop, restart | `ExecStart`, `KillSignal=SIGTERM`, `Restart=` | `ProgramArguments`, `KeepAlive`, SIGTERM on unload |
+| shutdown and reload requests | `systemctl stop`, `kill -USR1` | `launchctl unload`, `kill -USR1` |
+| secrets by absolute path | a path in the config, mode 0600 | the same |
+| runtime and state directories | paths in the config, created by the unit or the operator | paths in the config, created by the plist or the operator |
+| several instances | `M6_SOCKET_OVERRIDE` per unit | `M6_SOCKET_OVERRIDE` per plist |
+| logs | stdout to the journal, or a file with `SIGUSR1` reopen | stdout to `StandardOutPath`, or a file with `SIGUSR1` reopen |
+
+Table 2: what a service needs from its manager and how each one provides it.
+
+m6 never talks to a service manager and never relies on one to create anything.
+No binary reads `CREDENTIALS_DIRECTORY`, `NOTIFY_SOCKET`, `LISTEN_FDS`, `WATCHDOG_USEC`, `INVOCATION_ID`, `JOURNAL_STREAM`, `STATE_DIRECTORY` or `RUNTIME_DIRECTORY`, and the gate refuses a read of any of them.
+A path a service needs comes from its config, and the rule above is what makes the same binary run under either manager.
+
+## 4. Future ports
+
+Each port is one file beside `linux.rs` and `macos.rs`.
+What would map and what would not, in a few lines each:
+
+- **FreeBSD and OpenBSD.** The macOS file, nearly as it is: kqueue for `Poll`, `Signals` and `ChildExit`, `SO_NOSIGPIPE`, `sun_path` of 104. `sysinfo` supports FreeBSD and not OpenBSD, which would take a small `sysctl` reader for memory and load. `listens_on_tcp` needs `sysctl` in place of `lsof`.
+- **Linux on arm64 and macOS on x86_64.** Nothing changes: selection is by family and no file reads the CPU. CI builds and tests Linux arm64.
+- **Windows.** `mio`'s backend polls sockets only, and the layer would keep its own ready set to give edge semantics. `Signals` would be a console control handler written into a socket pair, with no `ReopenLogs`. `ChildExit` would be a process handle waited on by a helper and written into a socket pair. Unix socket paths, file modes, `raise_fd_limit` and the load average have no equivalent, and `host` would come from `sysinfo`, which supports Windows.
+
+## 5. Adding a port
+
+Copy `m6-platform/src/macos.rs` to `m6-platform/src/<family>.rs`, implement every `pub(super)` item it lists, and select the file at the top of `m6-platform/src/lib.rs`.
+The gate's `the_two_arms_define_the_same_items` test compares the item lists, so a missing item fails on every target.
+Then add the target to CI beside the three jobs, and run the suites in section 6 on it.
+A port that passes them is supported.
+
+## 6. The tests
+
+Every test of the layer is written once against its public API and runs unchanged on every supported target, with no `cfg` and no per-OS branch.
+Table 3 maps them.
+
+| suite | file | holds |
+|---|---|---|
+| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), what a spawned child inherits and an interrupted harness (2), sockets (9), clock (2), limits (2), host and process facts (13), directories (5) |
+| signals | `m6-platform/tests/platform_signals.rs` | the 8 signal cases, in its own `main` so the mask is set before any thread |
+| the gate | `m6-platform/tests/platform_gate.rs` | the rule in section 1 |
+| the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with 17 behavioural checks including zero allocations, a shutdown that drains and queued clients served once descriptors free |
+
+Table 3: where each contract is held.
+
+Each test names, in a comment, the wrong implementation that must fail it, and every existing service suite passes unchanged on every target above them.
+The layer is small because the tests, and the gate, are what keep it that way.

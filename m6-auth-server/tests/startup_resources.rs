@@ -1,13 +1,17 @@
 //! Startup behaviour when a resource the config names is missing.
 //!
-//! Two scenarios, each named after the wrong outcome it catches:
+//! Three scenarios, each named after the wrong outcome it catches:
 //!
 //! - a missing `[keys] private_key` must stop the service before the socket
 //!   appears, with the missing file named in the error. The wrong outcome is a
 //!   service that starts and binds its socket without a signing key.
-//! - a missing `[storage]` directory must be created on demand, with the
-//!   database file, and the service must accept a connection. The wrong outcome
-//!   is a config that points into a directory that does not exist being refused.
+//! - a missing `[storage]` directory must stop the service with exit 2, naming
+//!   the setting, the directory and the remedy, and must not create it. The
+//!   wrong outcome is a config that points into a directory that does not exist
+//!   starting anyway, so the database lands somewhere the operator did not
+//!   choose.
+//! - a `[storage]` directory that exists must start and serve. The wrong
+//!   outcome is refusing a correctly configured service.
 //!
 //! The fixtures mirror `integration.rs`. They live here rather than behind a
 //! shared module because the integration test crate's helpers are private to
@@ -86,10 +90,6 @@ access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "test.example.com"
 
-[thread_pool]
-size = 4
-queue_size = 32
-
 [keys]
 private_key = "{}"
 public_key  = "{}"
@@ -159,12 +159,14 @@ fn missing_private_key_exits_nonzero_names_the_file_and_binds_no_socket() {
 }
 
 /// A config whose `[storage] path` sits in a directory that does not exist must
-/// start, create the directory and the database file, and accept a connection.
+/// stop at start with exit 2, naming the setting, the directory and the remedy,
+/// and must not create the directory or bind the socket.
 ///
-/// The wrong outcome this catches: the service refuses a config that points into
-/// a directory it could have created, so an operator must pre-create it by hand.
+/// The wrong outcome this catches: the service creates the directory and starts,
+/// so a typo in `[storage] path` puts the database somewhere the operator did
+/// not choose and looks healthy.
 #[test]
-fn missing_storage_directory_is_created_and_the_socket_accepts_a_connection() {
+fn a_missing_storage_directory_exits_2_and_names_the_setting_and_path() {
     let site = TestSite::new("missing-db-dir");
     let (private_pem, public_pem) = generate_test_rsa_keys();
     let private = site.key_dir.path().join("auth.pem");
@@ -172,13 +174,73 @@ fn missing_storage_directory_is_created_and_the_socket_accepts_a_connection() {
     std::fs::write(&private, &private_pem).unwrap();
     std::fs::write(&public, &public_pem).unwrap();
 
-    // Two directory levels that do not exist yet.
-    let db_rel = site.site_dir.join("missing/deep/auth.db");
-    site.write_config(&private, &public, &db_rel.display().to_string());
+    // Two directory levels that do not exist.
+    let db_path = site.site_dir.join("missing/deep/auth.db");
+    let db_dir = db_path.parent().unwrap().to_path_buf();
+    site.write_config(&private, &public, &db_path.display().to_string());
 
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
-    // Readiness is a successful connection, not the socket file appearing.
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-auth-server did not exit for a missing [storage] directory\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+
+    let output = svc.output();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "exit code should be 2\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("[storage] path"),
+        "the error did not name [storage] path\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains(&db_dir.display().to_string()),
+        "the error did not name the missing directory {}\n--- output ---\n{output}",
+        db_dir.display()
+    );
+    assert!(
+        output.contains("create it, owned by") && output.contains("fix [storage] path"),
+        "the error did not say what to do\n--- output ---\n{output}"
+    );
+    assert!(
+        !db_dir.exists(),
+        "the service created the missing storage directory {}\n--- output ---\n{output}",
+        db_dir.display()
+    );
+    assert!(
+        !site.socket_path.exists(),
+        "the socket appeared despite a missing [storage] directory"
+    );
+}
+
+/// A `[storage] path` whose directory exists starts, creates the database file
+/// and accepts a connection.
+///
+/// The wrong outcome this catches: refusing a correctly configured service, so
+/// an operator cannot run m6-auth-server at all.
+#[test]
+fn a_present_storage_directory_starts_and_accepts_a_connection() {
+    let site = TestSite::new("present-db-dir");
+    let (private_pem, public_pem) = generate_test_rsa_keys();
+    let private = site.key_dir.path().join("auth.pem");
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&private, &private_pem).unwrap();
+    std::fs::write(&public, &public_pem).unwrap();
+
+    let data = site.site_dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db_path = data.join("auth.db");
+    site.write_config(&private, &public, &db_path.display().to_string());
+
+    let mut cmd = site.command();
+    let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     svc.wait_for_path(&site.socket_path, Duration::from_secs(10));
     assert!(
         wait::for_unix(&site.socket_path, Duration::from_secs(10)),
@@ -186,18 +248,17 @@ fn missing_storage_directory_is_created_and_the_socket_accepts_a_connection() {
         site.socket_path.display(),
         svc.output()
     );
-
-    let db_path = db_rel.clone();
-    assert!(
-        db_path.parent().unwrap().is_dir(),
-        "the storage directory {} was not created\n--- output ---\n{}",
-        db_path.parent().unwrap().display(),
-        svc.output()
-    );
     assert!(
         db_path.is_file(),
         "the database file {} was not created\n--- output ---\n{}",
         db_path.display(),
+        svc.output()
+    );
+
+    let status = svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "m6-auth-server should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
         svc.output()
     );
 }

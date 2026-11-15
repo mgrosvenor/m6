@@ -41,12 +41,9 @@ struct RateLimitConfig {
 }
 
 /// Parsed and validated auth server configuration.
-/// `[log]` is deliberately absent.
-///
-/// It used to be parsed here as well, into a `LogConfig` this service then
-/// resolved against `site.toml` by hand. `m6_core::app` does that for every
-/// service, from the same file, with the same precedence: site.toml, then the
-/// service config's `[log]`, then `--log-level`. Two parsers for one section
+/// `[log]` is deliberately absent: `m6_core::site` resolves it for every
+/// service, from the same file, with the same precedence (site.toml, then the
+/// service config's `[log]`, then `--log-level`). Two parsers for one section
 /// is how they drift.
 pub struct AuthConfig {
     /// Absolute: see m6_core::config::secret_path.

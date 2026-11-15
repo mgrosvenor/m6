@@ -1,9 +1,9 @@
 //! Tera, behind the renderer seam.
 //!
 //! Core does not depend on a template engine at the type level, only at the
-//! default: `App::new()` gives you this one, and `.renderer(NoTemplates)` opts
-//! out. What lives here is the engine setup and the site filters, `| asset`
-//! and `img_dims()` among them.
+//! default: `Site::load` takes this one through `TeraFactory`, and a service
+//! that renders nothing passes `NoTemplates`. What lives here is the engine
+//! setup and the site filters, `| asset` and `img_dims()` among them.
 //!
 //! **The engine copies the context into itself.** `tera::Context::insert`
 //! serialises each value into its own map, so the cost scales with the size of

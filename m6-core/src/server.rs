@@ -1,28 +1,18 @@
 //! The parts of a service that are not its handlers.
 //!
-//! Binding and owning a unix socket, applying its mode, applying a read
-//! timeout to an accepted connection, waiting on the listener, and serving one
-//! connection until it ends.
-//!
-//! **`serve_connection` is the shared answer to four questions** each service
-//! used to answer for itself and differently: the keep-alive decision, what to
-//! say to a request that did not parse, whether a body goes out on a HEAD, and
-//! whether the connection is reused at all. Before it, every 404, 405, 400 and
-//! 412 answering a HEAD went out with a body on at least one service, and no
-//! connection was ever reused.
-//!
-//! It hands the request to its handler rather than lending it, because it has
-//! no use for it afterwards and lending it cost every service a full copy.
+//! Deriving the unix socket path from the config path, binding a TCP listener
+//! the way a server should, applying a socket mode, and the blocking stand-ins
+//! that benchmarks and tests still drive: one HTTP/1.1 request off a Unix
+//! stream and one response written to it. A service's loop uses
+//! [`crate::h1::ServerConn`] for both.
 
-use std::io::Write;
-/// Unix socket server for m6 inter-process communication.
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use crate::log::debug;
 use anyhow::Result;
-use tracing::{debug, error, warn};
 
-use crate::http::{RawRequest, RawResponse};
+use crate::http::RawRequest;
 use crate::parse;
 
 /// Derive the Unix socket path from a config file path.
@@ -47,15 +37,10 @@ use crate::parse;
 /// };
 /// ```
 ///
-/// Three byte-identical copies of that, in `app.rs`, `m6-file` and
-/// `m6-auth-server`, wrapping this function rather than living in it. A fourth
-/// copy of the *derivation* sat in `m6-file/src/config.rs`, which is what
-/// m6-file actually called, and it differed: its fallback stem was `m6-file`
-/// where this one is `m6-default`. Harmless, and exactly the shape that is not
-/// harmless next time.
-///
-/// It lives here so the contract is one thing an app inherits rather than four
-/// things an app remembers.
+/// It lives here so the contract is one thing a service calls rather than a
+/// rule each service rediscovers. A second copy of the derivation used a
+/// different fallback stem, which is harmless today and exactly the shape that
+/// is not harmless next time.
 ///
 /// This exception is documented in `docs/m6-architecture.md`.
 pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
@@ -71,31 +56,10 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
 
 /// Default read timeout for an accepted connection, in seconds.
 ///
-/// Not a fresh guess: `m6-file` and `m6-auth-server` had each hand-written
+/// Not a fresh guess: `m6-file` and `m6-auth-server` each hand-wrote
 /// `set_read_timeout(Some(Duration::from_secs(30)))` into their own accept
-/// path, so 30 is the value already in service. The five services built on
-/// [`crate::app::App`] had no timeout at all.
+/// path, so 30 is the value already in service.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
-
-/// Wait for a connection, or until the timeout elapses.
-///
-/// Returns true when the listener is readable. The timeout is what makes an
-/// idle service still notice a shutdown promptly, so it is the caller's to
-/// choose rather than baked in here.
-pub fn poll_listener(listener_fd: std::os::fd::RawFd, timeout_ms: u16) -> bool {
-    use nix::poll::{poll, PollFd, PollFlags};
-    use std::os::fd::BorrowedFd;
-
-    // Safety: the fd is owned by the caller and outlives this call. It is
-    // borrowed rather than owned precisely so that returning does not close it.
-    let borrowed_listener = unsafe { BorrowedFd::borrow_raw(listener_fd) };
-    let mut pfd_listener = PollFd::new(borrowed_listener, PollFlags::POLLIN);
-    let timeout = nix::poll::PollTimeout::from(timeout_ms);
-    let _ = poll(std::slice::from_mut(&mut pfd_listener), timeout);
-    pfd_listener
-        .revents()
-        .is_some_and(|f| f.contains(PollFlags::POLLIN))
-}
 
 /// Default mode for a service's unix socket.
 ///
@@ -113,9 +77,9 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 
 /// Apply the socket mode after bind, in one place.
 ///
-/// `App` set no mode at all, so its five services took whatever the umask gave
-/// them, typically `0o755`. That worked for the same reason `0o666` worked:
-/// the directory was doing the enforcing. Neither is a decision anybody made.
+/// Without it a socket takes whatever the umask gives, typically `0o755`, and
+/// that works only while the directory is doing the enforcing. Neither is a
+/// decision anybody made.
 ///
 /// A socket whose mode cannot be set is a start failure: a mode nobody chose is
 /// a socket nobody can reason about, so the caller stops rather than serve on
@@ -123,104 +87,6 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o660;
 pub fn apply_socket_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-/// Apply the per-connection read timeout, in one place.
-///
-/// A silent peer is the whole reason this exists. `serve_connection` blocks in
-/// `read` waiting for a request line, so a peer that connects and never speaks
-/// holds its worker until it goes away. With a bounded thread pool, a handful
-/// of such peers is the entire pool, and the service answers 503 while looking
-/// perfectly healthy: no error, no panic, no log line.
-///
-/// Failure to set the option is logged and tolerated rather than fatal. The
-/// connection still works; it merely lacks a deadline, which is exactly where
-/// every one of these services was before. Refusing to serve it would turn a
-/// missing safety net into an outage.
-pub fn apply_read_timeout(stream: &UnixStream, timeout: Option<std::time::Duration>) {
-    let Some(dur) = timeout else { return };
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the App read timeout; removed by EL-6"
-    )]
-    if let Err(e) = stream.set_read_timeout(Some(dur)) {
-        warn!(error = %e, "failed to set read timeout on accepted connection");
-    }
-}
-
-/// A running Unix socket server.
-///
-/// Accepts connections, calls handler for each, sends response.
-pub struct UnixServer {
-    path: PathBuf,
-    listener: UnixListener,
-}
-
-impl UnixServer {
-    /// Bind to the given socket path.  Removes a stale socket file first.
-    pub fn bind(socket_path: PathBuf) -> Result<Self> {
-        // Remove stale socket file if it exists.
-        if socket_path.exists() {
-            warn!(path = %socket_path.display(), "removing stale socket file");
-            std::fs::remove_file(&socket_path)?;
-        }
-
-        // Ensure the directory exists.
-        if let Some(parent) = socket_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        let listener = UnixListener::bind(&socket_path)?;
-        debug!(path = %socket_path.display(), "listening on Unix socket");
-
-        Ok(UnixServer {
-            path: socket_path,
-            listener,
-        })
-    }
-
-    /// Returns the socket path for logging.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Accept one connection, read request, call handler, write response.
-    pub fn accept_one<F>(&self, handler: F) -> Result<()>
-    where
-        F: FnOnce(RawRequest) -> RawResponse,
-    {
-        let (mut stream, _addr) = self.listener.accept()?;
-        handle_connection(&mut stream, handler);
-        Ok(())
-    }
-
-    /// Returns the raw UnixListener for use in poll/select/epoll.
-    pub fn listener(&self) -> &UnixListener {
-        &self.listener
-    }
-}
-
-fn handle_connection<F>(stream: &mut UnixStream, handler: F)
-where
-    F: FnOnce(RawRequest) -> RawResponse,
-{
-    let req = match parse::parse_request(stream) {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, "failed to parse request");
-            let resp = RawResponse::new(e.status()).body(format!("{}: {}", e.reason(), e));
-            let _ = stream.write_all(&resp.to_bytes());
-            return;
-        }
-    };
-
-    let resp = handler(req);
-    let mut out = crate::h1::Responder::new(stream, "", false);
-    if let Err(e) = resp.send(&mut out) {
-        error!(error = %e, "failed to write response");
-    }
 }
 
 /// Most requests one connection may serve before it is closed.
@@ -232,13 +98,11 @@ pub const MAX_REQUESTS_PER_CONN: u32 = 100;
 
 /// Serve HTTP/1.1 on one accepted connection until it ends.
 ///
-/// **This is the one backend connection loop.** m6-file, m6-html and
-/// m6-auth-server each had their own, and each of the three answered exactly
-/// one request and closed -- legal (RFC 9112 9.3 allows a server to close at
-/// any time) and expensive, because m6-http speaks HTTP/1.1 to its backends
-/// over unix sockets, so every cache miss paid a fresh connect and a fresh
-/// accept. Measured by h1spec as "Keep-alive default (HTTP/1.1)" failing on
-/// all three.
+/// **This is the blocking reference loop the benchmarks and tests drive.**
+/// Every service frames requests with [`crate::h1::ServerConn`]; this
+/// function stays for the two benchmarks and the one test that read a socket
+/// directly. It keeps the keep-alive rules one place, so a stand-in cannot
+/// measure a different connection lifetime from the one the contract states.
 ///
 /// The handler is given a [`crate::h1::Responder`] rather than the stream, so
 /// the two rules that must hold for every response -- no body on a HEAD, and
@@ -253,9 +117,9 @@ where
     S: std::io::Read + std::io::Write,
     E: From<std::io::Error>,
     // Takes the request by value: this loop has no use for it after the
-    // handler returns, and handing it over saves every `App` service a full
-    // clone of the method, path, query, every header and the body, once per
-    // request, purely so a `Request` could own one.
+    // handler returns, and handing it over saves the handler a full clone of
+    // the method, path, query, every header and the body, once per request,
+    // purely so a `Request` could own one.
     F: FnMut(RawRequest, &mut crate::h1::Responder<'_, S>) -> Result<(), E>,
 {
     let mut served = 0u32;
@@ -285,14 +149,8 @@ where
     }
 }
 
-impl Drop for UnixServer {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Framework-facing helpers, moved from m6-render in Phase 5.
+// Blocking stand-ins
 // ---------------------------------------------------------------------------
 
 /// Parse an HTTP/1.1 request from a Unix stream.
@@ -321,20 +179,6 @@ pub fn write_response<W: std::io::Write>(
     response.send(resp)
 }
 
-/// A minimal error response, for the paths that have no `Response` to send:
-/// a full thread pool, or a request that never parsed.
-pub fn write_error_response<W: std::io::Write>(
-    stream: &mut W,
-    status: u16,
-    _body: &str,
-) -> anyhow::Result<()> {
-    // Not a persistent connection: these are the paths where the server is
-    // giving up on the connection, not serving it.
-    let mut resp = crate::h1::Responder::new(stream, "", false);
-    resp.error(status)?;
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(
     clippy::disallowed_methods,
@@ -342,6 +186,8 @@ pub fn write_error_response<W: std::io::Write>(
 )]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn test_socket_path_from_config_relative() {
@@ -451,8 +297,7 @@ mod tests {
 ///
 /// `SO_REUSEADDR` is the right tool and not a blunt one: it permits binding
 /// over `TIME_WAIT`, and still refuses a port that has a **live** listener, so
-/// a genuine "something else is already running here" is still an error. That
-/// is `SO_REUSEPORT`, which this deliberately does not set.
+/// a genuine "something else is already running here" is still an error.
 pub fn bind_tcp_reuseaddr(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let domain = match addr {
         std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
@@ -499,8 +344,7 @@ mod bind_tests {
 
     /// And it is not a blunt instrument. A port with a **live** listener is
     /// still refused, so "something else is already running here" stays an
-    /// error rather than two servers silently sharing a port. That would be
-    /// `SO_REUSEPORT`, which this deliberately does not set.
+    /// error rather than two servers silently sharing a port.
     #[test]
     fn a_live_listener_still_refuses_a_second_bind() {
         let held = bind_tcp_reuseaddr(loopback(0)).expect("first bind");

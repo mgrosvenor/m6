@@ -15,13 +15,12 @@
 //! moving anything onto it is what caught that; the survivor is the parser the
 //! edge already used, because it is the only one that has been attacked.
 //!
-//! **`parse.rs` still exists, and is on the production path of every socket
-//! backend** through [`crate::server::serve_connection`]. What was deleted is
-//! the parser that used to be *inside* it: it is now a stream adapter that
-//! reads bytes into a buffer and asks [`parse_request`] whether the message is
-//! complete, with no framing logic of its own. Reading that table as "the file
-//! is gone" costs whoever does it a detour through
-//! `server::serve_connection` looking for a second parser that is not there.
+//! **`parse.rs` remains for the benchmarks and tests that still drive a
+//! blocking socket.** It is a stream adapter that reads bytes into a buffer and
+//! asks [`parse_request`] whether the message is complete, with no framing
+//! logic of its own. A service's loop frames requests with [`ServerConn`],
+//! which reads into its slot's buffer and frames through the same parser
+//! (`parse_head_uninit`).
 //!
 //! **This function is pure.** The edge's version stripped proxy-owned headers
 //! (`X-Forwarded-For` and friends) inline while parsing, which is ingress
@@ -30,8 +29,9 @@
 //! exactly this, and a backend has no proxy headers to strip.
 
 use crate::event::{Slots, Timeouts};
+use crate::headers::{field_over_limit, MAX_HEADER_LINE, MAX_REQUEST_HEAD};
 use crate::http::RawRequest;
-use crate::parse::{MAX_BODY_BYTES, MAX_HEADER_BYTES};
+use crate::parse::MAX_BODY_BYTES;
 use crate::response::{Body, Response};
 use crate::server::MAX_REQUESTS_PER_CONN;
 use std::io;
@@ -203,6 +203,14 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
     b
 }
 
+/// RFC 9110 5.6.3 optional whitespace: SP and HTAB, and nothing else.
+///
+/// `str::trim` also strips VT, FF and Unicode whitespace, so `Content-Length:
+/// \x0B5` was read as 5 even though the field grammar is `1*DIGIT` with OWS.
+fn trim_ows(value: &str) -> &str {
+    value.trim_matches([' ', '\t'])
+}
+
 /// Largest decoded chunked body accepted, matching the Content-Length cap.
 const MAX_CHUNKED_BODY: usize = 16 * 1024 * 1024;
 
@@ -288,19 +296,19 @@ fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), ChunkSizeError>
     // The scan is bounded too: a partial line is never looked at past the cap,
     // so one long extension cannot be re-read on every read.
     let available = &buf[i..];
-    let window = &available[..available.len().min(MAX_HEADER_BYTES + 2)];
+    let window = &available[..available.len().min(MAX_HEADER_LINE + 2)];
     #[cfg(test)]
     count_scan(window.len());
     let Some(eol) = find_crlf(window) else {
         // A valid line of exactly the cap ends its CR at index MAX and its LF
         // one past it, so one byte past the cap is still the same line to come.
-        return if available.len() > MAX_HEADER_BYTES + 1 {
+        return if available.len() > MAX_HEADER_LINE + 1 {
             Err(ChunkSizeError::Bad)
         } else {
             Err(ChunkSizeError::Incomplete)
         };
     };
-    if eol > MAX_HEADER_BYTES {
+    if eol > MAX_HEADER_LINE {
         return Err(ChunkSizeError::Bad);
     }
     let Some(line_end) = i.checked_add(eol) else {
@@ -337,11 +345,11 @@ fn chunk_size_at(buf: &[u8], i: usize) -> Result<(usize, usize), ChunkSizeError>
 fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize, mut trailer_bytes: usize) -> Chunked {
     loop {
         let available = &buf[i..];
-        let window = &available[..available.len().min(MAX_HEADER_BYTES + 2)];
+        let window = &available[..available.len().min(MAX_HEADER_LINE + 2)];
         #[cfg(test)]
         count_scan(window.len());
         let Some(eol) = find_crlf(window) else {
-            return if available.len() > MAX_HEADER_BYTES + 1 || trailer_bytes > MAX_HEADER_BYTES {
+            return if available.len() > MAX_HEADER_LINE + 1 || trailer_bytes > MAX_REQUEST_HEAD {
                 Chunked::Bad
             } else {
                 Chunked::More(ChunkProgress {
@@ -352,11 +360,11 @@ fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize, mut trailer_bytes:
                 })
             };
         };
-        if eol > MAX_HEADER_BYTES {
+        if eol > MAX_HEADER_LINE {
             return Chunked::Bad;
         }
         trailer_bytes = match trailer_bytes.checked_add(eol + 2) {
-            Some(v) if v <= MAX_HEADER_BYTES => v,
+            Some(v) if v <= MAX_REQUEST_HEAD => v,
             _ => return Chunked::Bad,
         };
         i = match i.checked_add(eol).and_then(|v| v.checked_add(2)) {
@@ -511,11 +519,41 @@ fn strip_absolute_form(target: &str) -> &str {
     }
 }
 
+/// Why a request head was refused.
+///
+/// The status is not the whole answer at the edge: a head over a limit carries
+/// nginx's own error page title, while malformed framing keeps the ordinary
+/// text. The two cases share one status code for fields and the head, so the
+/// reason has to travel with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadError {
+    /// The request line, a field's syntax or the framing is malformed.
+    Malformed,
+    /// A field's name plus value is over [`MAX_HEADER_LINE`].
+    FieldTooLarge,
+    /// The request line is over [`MAX_HEADER_LINE`].
+    RequestLineTooLong,
+    /// The head is over [`MAX_REQUEST_HEAD`].
+    HeadTooLarge,
+}
+
+impl HeadError {
+    /// The status to answer a head refused this way.
+    ///
+    /// 414 is only ever the request line. A field or the head answers 400.
+    pub fn status(self) -> u16 {
+        match self {
+            HeadError::RequestLineTooLong => 414,
+            HeadError::Malformed | HeadError::FieldTooLarge | HeadError::HeadTooLarge => 400,
+        }
+    }
+}
+
 /// Outcome of parsing a client request. Public so security tests can assert on
 /// what the ingress boundary accepts, rejects, and strips.
 pub enum ParseResult {
     Incomplete,
-    Error,
+    Error(HeadError),
     Complete(RawRequest),
 }
 
@@ -559,11 +597,49 @@ impl<'a> RequestHead<'a> {
     }
 }
 
+/// The refusal a partly received head has already earned, if any.
+///
+/// A head is refused as soon as its request line passes [`MAX_HEADER_LINE`] or
+/// the bytes that have arrived pass [`MAX_REQUEST_HEAD`], without waiting for
+/// the blank line that would complete it. The request line is decided first,
+/// because its refusal is 414 and a long line must not be reported as the 400 a
+/// long head earns.
+pub fn incomplete_head_status(buf: &[u8]) -> Option<HeadError> {
+    let buf_all = buf;
+    let buf = &buf[request_line_start(buf)..];
+    match buf.windows(2).position(|w| w == b"\r\n") {
+        None => (buf.len() > MAX_HEADER_LINE).then_some(HeadError::RequestLineTooLong),
+        Some(line_end) => {
+            if line_end > MAX_HEADER_LINE {
+                Some(HeadError::RequestLineTooLong)
+            } else if buf_all.len() > MAX_REQUEST_HEAD {
+                Some(HeadError::HeadTooLarge)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Offset of the request line: past the empty lines httparse skips before it
+/// (RFC 9112 section 2.2), CRLF or bare LF, so the length checked is the length
+/// parsed.
+fn request_line_start(buf: &[u8]) -> usize {
+    let mut i = 0;
+    loop {
+        match buf[i..] {
+            [b'\r', b'\n', ..] => i += 2,
+            [b'\n', ..] => i += 1,
+            _ => return i,
+        }
+    }
+}
+
 /// Outcome of parsing a request head. Mirrors [`ParseResult`] for the borrowed
 /// head: `Complete` carries no body, only its length.
 pub enum HeadResult<'a> {
     Incomplete,
-    Error,
+    Error(HeadError),
     Complete(RequestHead<'a>),
 }
 
@@ -580,7 +656,7 @@ pub fn parse_head<'a>(
     let body_offset = match req.parse(buf) {
         Ok(httparse::Status::Partial) => return HeadResult::Incomplete,
         Ok(httparse::Status::Complete(n)) => n,
-        Err(_) => return HeadResult::Error,
+        Err(_) => return HeadResult::Error(HeadError::Malformed),
     };
     finish_head(req, buf, body_offset)
 }
@@ -603,7 +679,7 @@ pub fn parse_head_uninit<'a>(
     ) {
         Ok(httparse::Status::Partial) => return HeadResult::Incomplete,
         Ok(httparse::Status::Complete(n)) => n,
-        Err(_) => return HeadResult::Error,
+        Err(_) => return HeadResult::Error(HeadError::Malformed),
     };
     finish_head(req, buf, body_offset)
 }
@@ -614,6 +690,22 @@ fn finish_head<'a>(
     buf: &'a [u8],
     body_offset: usize,
 ) -> HeadResult<'a> {
+    // Bound the framed head before anything can act on it. The request line
+    // has its own limit, and a head over it is a 414 rather than the 400 a
+    // field or the whole head earns. `body_offset` is the byte after the
+    // closing blank line, so it is the head's length.
+    let line_start = request_line_start(buf);
+    let line_len = buf[line_start..body_offset]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(body_offset);
+    if line_len > MAX_HEADER_LINE {
+        return HeadResult::Error(HeadError::RequestLineTooLong);
+    }
+    if body_offset > MAX_REQUEST_HEAD {
+        return HeadResult::Error(HeadError::HeadTooLarge);
+    }
+
     // Reject a bare LF anywhere in the header block. (See `parse_request`'s
     // original note: the split it permits is the smuggling primitive.)
     {
@@ -622,7 +714,7 @@ fn finish_head<'a>(
         while let Some(off) = head[i..].iter().position(|&c| c == b'\n') {
             let at = i + off;
             if at == 0 || head[at - 1] != b'\r' {
-                return HeadResult::Error;
+                return HeadResult::Error(HeadError::Malformed);
             }
             i = at + 1;
         }
@@ -649,27 +741,30 @@ fn finish_head<'a>(
     let mut saw_te = false;
 
     for h in &req.headers[..nheaders] {
+        if field_over_limit(h.name.as_bytes(), h.value) {
+            return HeadResult::Error(HeadError::FieldTooLarge);
+        }
         if h.name.eq_ignore_ascii_case("transfer-encoding") {
             let Ok(v) = std::str::from_utf8(h.value) else {
-                return HeadResult::Error;
+                return HeadResult::Error(HeadError::Malformed);
             };
             let last = v.rsplit(',').next().unwrap_or("").trim();
             if !last.eq_ignore_ascii_case("chunked") {
-                return HeadResult::Error;
+                return HeadResult::Error(HeadError::Malformed);
             }
             if v.split(',').count() > 1 {
-                return HeadResult::Error;
+                return HeadResult::Error(HeadError::Malformed);
             }
             saw_te = true;
             continue;
         }
         if h.name.eq_ignore_ascii_case("content-length") {
             let Ok(value) = std::str::from_utf8(h.value) else {
-                return HeadResult::Error;
+                return HeadResult::Error(HeadError::Malformed);
             };
-            let value = value.trim();
+            let value = trim_ows(value);
             match first_cl {
-                Some(prev) if prev != value => return HeadResult::Error,
+                Some(prev) if prev != value => return HeadResult::Error(HeadError::Malformed),
                 Some(_) => {}
                 None => first_cl = Some(value),
             }
@@ -680,7 +775,7 @@ fn finish_head<'a>(
             match std::str::from_utf8(h.value).map(str::trim) {
                 Ok(v) if !v.is_empty() => {
                     if !host_is_valid(v) {
-                        return HeadResult::Error;
+                        return HeadResult::Error(HeadError::Malformed);
                     }
                 }
                 _ => host_empty = true,
@@ -689,25 +784,35 @@ fn finish_head<'a>(
     }
 
     if host_count > 1 {
-        return HeadResult::Error;
+        return HeadResult::Error(HeadError::Malformed);
     }
     let is_http11 = req.version == Some(1);
     if is_http11 && (host_count == 0 || host_empty) {
-        return HeadResult::Error;
+        return HeadResult::Error(HeadError::Malformed);
     }
     if saw_te && !is_http11 {
-        return HeadResult::Error;
+        return HeadResult::Error(HeadError::Malformed);
     }
     if saw_te && saw_cl {
-        return HeadResult::Error;
+        return HeadResult::Error(HeadError::Malformed);
     }
 
     let body_len: usize = match first_cl {
-        Some(v) => match v.parse() {
-            Ok(n) => n,
-            Err(_) => return HeadResult::Error,
-        },
-        None if saw_cl => return HeadResult::Error,
+        Some(v) => {
+            // RFC 9110 8.6: `Content-Length = 1*DIGIT`. Rust's integer parser
+            // also accepts a leading `+`, so `+5` was read as 5 and the server
+            // then waited for a body the peer never sent: a ten-second stall
+            // here, and a framing disagreement anywhere that trims or rewrites
+            // the field. Refuse anything that is not digits.
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return HeadResult::Error(HeadError::Malformed);
+            }
+            match v.parse() {
+                Ok(n) => n,
+                Err(_) => return HeadResult::Error(HeadError::Malformed),
+            }
+        }
+        None if saw_cl => return HeadResult::Error(HeadError::Malformed),
         None => 0,
     };
 
@@ -745,7 +850,7 @@ pub fn parse_request(buf: &[u8]) -> ParseResult {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let head = match parse_head(buf, &mut headers) {
         HeadResult::Incomplete => return ParseResult::Incomplete,
-        HeadResult::Error => return ParseResult::Error,
+        HeadResult::Error(why) => return ParseResult::Error(why),
         HeadResult::Complete(h) => h,
     };
     materialize(&head, buf)
@@ -768,7 +873,7 @@ pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
         let mut body = buf[head.head_len..].to_vec();
         match decode_chunked(&mut body, ChunkProgress::START) {
             Chunked::More(_) => return ParseResult::Incomplete,
-            Chunked::Bad => return ParseResult::Error,
+            Chunked::Bad => return ParseResult::Error(HeadError::Malformed),
             Chunked::Done { decoded, .. } => {
                 body.truncate(decoded);
                 body
@@ -843,6 +948,7 @@ pub fn status_reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         412 => "Precondition Failed",
         413 => "Payload Too Large",
+        414 => "Request-URI Too Large",
         417 => "Expectation Failed",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
@@ -934,8 +1040,7 @@ pub struct Responder<'a, W: std::io::Write> {
     /// Stored as the decision rather than as the method string, which is the
     /// only thing it was ever used for (`eq_ignore_ascii_case("HEAD")`).
     /// Holding a `&'a str` tied the responder's lifetime to the request that
-    /// produced it, which is why `serve_connection` could not hand the request
-    /// to its handler and every `App` service cloned one per request instead.
+    /// produced it, so it is a decision copied out of the head.
     is_head: bool,
     /// Decided by the connection from the request, before the handler runs.
     keep_alive: bool,
@@ -1014,8 +1119,8 @@ impl<'a, W: std::io::Write> Responder<'a, W> {
     /// has been told exactly how many are coming. That makes a short read a
     /// framing fault and not a small disappointment: whatever is written next
     /// on a reused connection would be read as the tail of this body. So a
-    /// reader that ends early returns `UnexpectedEof` here, and
-    /// `serve_connection` closes the connection rather than continuing on it.
+    /// reader that ends early returns `UnexpectedEof` here, and `ServerConn`
+    /// closes the connection rather than continuing on it.
     /// The peer then sees fewer bytes than promised followed by EOF, which it
     /// must discard. That is the honest failure; silently sending fewer bytes
     /// than the header claims is the smuggling primitive this codebase rejects
@@ -1203,12 +1308,12 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 /// The turn loop a service writes per connection:
 ///
 /// ```no_run
-/// # fn serve(conn: &mut m6_core::h1::ServerConn, site: &m6_core::Site) -> std::io::Result<()> {
+/// # fn serve(conn: &mut m6_core::h1::ServerConn, site: &mut m6_core::Site) -> std::io::Result<()> {
 /// # fn service_route(_: usize, _: &m6_core::Request) -> m6_core::Response {
 /// #     m6_core::Response::text("handler")
 /// # }
 /// use m6_core::h1::{Flush, Read};
-/// use m6_core::mio::{Interest, Token};
+/// use m6_core::platform::{Interest, Token};
 /// # fn reregister(_: &mut m6_core::h1::ServerConn, _: Interest, _: Token) {}
 ///
 /// loop {
@@ -1232,6 +1337,18 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 ///                 m6_core::Handled::Named(index, req) => {
 ///                     let response = service_route(index, &req);
 ///                     site.finish(&req, response)
+///                 }
+///                 // The loop owns the Site. It runs the start path again
+///                 // and assigns the new Site when that is `Ok`.
+///                 m6_core::Handled::Reload(reload) => {
+///                     let response = match site.reload(&[], &[], &m6_core::NoTemplates) {
+///                         Ok(next) => {
+///                             *site = next;
+///                             m6_core::genid_ok()
+///                         }
+///                         Err(e) => m6_core::genid_failed(&e),
+///                     };
+///                     m6_core::site::finish_reload(&reload, response)
 ///                 }
 ///             };
 ///             (Some(response), false)
@@ -1266,7 +1383,7 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 /// # }
 /// ```
 pub struct ServerConn {
-    stream: Option<mio::net::UnixStream>,
+    stream: Option<crate::platform::net::UnixStream>,
     /// Input: `in_buf[..in_len]` is valid, `in_buf.len()` is how much room the
     /// slot has. The buffer is filled directly, so no zeroing per read.
     in_buf: Vec<u8>,
@@ -1321,29 +1438,29 @@ impl ServerConn {
     }
 
     /// Attach an accepted stream. Resets what the previous connection left.
-    pub fn attach(&mut self, stream: mio::net::UnixStream) {
+    pub fn attach(&mut self, stream: crate::platform::net::UnixStream) {
         self.reset();
         self.stream = Some(stream);
     }
 
     /// Detach the stream, if any, and reset the slot for its next connection.
-    pub fn detach(&mut self) -> Option<mio::net::UnixStream> {
+    pub fn detach(&mut self) -> Option<crate::platform::net::UnixStream> {
         let stream = self.stream.take();
         self.reset();
         stream
     }
 
-    /// The attached stream, for `mio`'s register and reregister.
-    pub fn stream(&mut self) -> Option<&mut mio::net::UnixStream> {
+    /// The attached stream, for the poll's register and reregister.
+    pub fn stream(&mut self) -> Option<&mut crate::platform::net::UnixStream> {
         self.stream.as_mut()
     }
 
     /// `READABLE`, or `WRITABLE` while an answer is owed.
-    pub fn interest(&self) -> mio::Interest {
+    pub fn interest(&self) -> crate::platform::Interest {
         if self.out_pos < self.out_len || self.body.is_some() {
-            mio::Interest::WRITABLE
+            crate::platform::Interest::WRITABLE
         } else {
-            mio::Interest::READABLE
+            crate::platform::Interest::READABLE
         }
     }
 
@@ -1423,7 +1540,7 @@ impl ServerConn {
             // allocate before its contents do. A declared length over the cap
             // was refused by `inspect`.
             if self.in_len == self.in_buf.len() {
-                let cap = MAX_HEADER_BYTES + MAX_BODY_BYTES;
+                let cap = MAX_REQUEST_HEAD + MAX_BODY_BYTES;
                 if self.in_buf.len() >= cap {
                     self.queue_error(413);
                     return Ok(Read::More);
@@ -1749,12 +1866,12 @@ impl ServerConn {
 /// is about to be handed out again, then detach, deregister and free. Shared
 /// with the services so the order cannot drift between their loops.
 pub fn close_conn(
-    poll: &mio::Poll,
+    poll: &crate::platform::Poll,
     conns: &mut Slots<ServerConn>,
     deadlines: &mut Timeouts,
     token: usize,
 ) -> io::Result<()> {
-    deadlines.clear(mio::Token(token));
+    deadlines.clear(crate::platform::Token(token));
     if let Some(mut stream) = conns.get_mut(token).detach() {
         poll.registry().deregister(&mut stream)?;
         conns.free(token);
@@ -1793,14 +1910,13 @@ enum Next {
 fn inspect(in_buf: &[u8]) -> Next {
     let mut slots = head_slots();
     match parse_head_uninit(in_buf, &mut slots) {
-        HeadResult::Error => Next::Error(400),
+        HeadResult::Error(why) => Next::Error(why.status()),
         HeadResult::Incomplete => {
             // Until the blank line arrives, an unbounded head is how a peer
             // makes the process buffer forever.
-            if in_buf.len() > MAX_HEADER_BYTES {
-                Next::Error(413)
-            } else {
-                Next::Read
+            match incomplete_head_status(in_buf) {
+                Some(why) => Next::Error(why.status()),
+                None => Next::Read,
             }
         }
         HeadResult::Complete(head) => {
@@ -1907,7 +2023,7 @@ mod framing_overflow_tests {
     fn a_sixteen_digit_chunk_size_is_malformed() {
         let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
                     1\r\na\r\nffffffffffffffff\r\n";
-        assert!(matches!(parse_request(raw), ParseResult::Error));
+        assert!(matches!(parse_request(raw), ParseResult::Error(_)));
     }
 
     /// A long partial chunk-size line is refused at the head cap instead of
@@ -1925,7 +2041,7 @@ mod framing_overflow_tests {
         let longest = CHUNK_SCAN_MAX.with(|max| max.get());
         assert!(refused, "a long chunk extension must be refused");
         assert!(
-            longest <= MAX_HEADER_BYTES + 2,
+            longest <= MAX_HEADER_LINE + 2,
             "one scan looked at {longest} bytes of the extension"
         );
         assert_refusal(&mut client);
@@ -1945,7 +2061,7 @@ mod framing_overflow_tests {
         let longest = CHUNK_SCAN_MAX.with(|max| max.get());
         assert!(refused, "a long trailer field must be refused");
         assert!(
-            longest <= MAX_HEADER_BYTES + 2,
+            longest <= MAX_HEADER_LINE + 2,
             "one scan looked at {longest} bytes of the trailer"
         );
         assert_refusal(&mut client);
@@ -1956,9 +2072,9 @@ mod framing_overflow_tests {
     /// line the cap allows.
     #[test]
     fn a_chunk_line_at_the_cap_with_a_split_crlf_is_served() {
-        // `1;` plus 8190 bytes is exactly MAX_HEADER_BYTES of line content, so
-        // its CR sits at index MAX_HEADER_BYTES and its LF one past it.
-        let extension = "a".repeat(MAX_HEADER_BYTES - 2);
+        // `1;` plus 8190 bytes is exactly MAX_HEADER_LINE of line content, so
+        // its CR sits at index MAX_HEADER_LINE and its LF one past it.
+        let extension = "a".repeat(MAX_HEADER_LINE - 2);
         let head = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
         let mut raw = head.to_vec();
         raw.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
@@ -1966,7 +2082,7 @@ mod framing_overflow_tests {
         // Everything through the chunk-size line's CR, with no LF yet: the
         // prefix is pending, not an error. Cutting at any other CR (for example
         // the chunk data's) would not test the cap.
-        let through_line_cr = head.len() + 2 + (MAX_HEADER_BYTES - 2) + 1;
+        let through_line_cr = head.len() + 2 + (MAX_HEADER_LINE - 2) + 1;
         assert_eq!(raw[through_line_cr - 1], b'\r');
         assert_eq!(raw[through_line_cr], b'\n');
         assert!(matches!(
@@ -1983,20 +2099,20 @@ mod framing_overflow_tests {
     /// at the cap, not a longer line.
     #[test]
     fn a_chunk_line_one_past_the_cap_is_refused() {
-        // One byte more than the cap: content MAX_HEADER_BYTES + 1, extension
-        // MAX_HEADER_BYTES - 1, and the CR split from its LF.
-        let extension = "a".repeat(MAX_HEADER_BYTES - 1);
+        // One byte more than the cap: content MAX_HEADER_LINE + 1, extension
+        // MAX_HEADER_LINE - 1, and the CR split from its LF.
+        let extension = "a".repeat(MAX_HEADER_LINE - 1);
         let head = b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
         let mut raw = head.to_vec();
         raw.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
         raw.extend_from_slice(b"a\r\n0\r\n\r\n");
-        let through_line_cr = head.len() + 2 + (MAX_HEADER_BYTES - 1) + 1;
+        let through_line_cr = head.len() + 2 + (MAX_HEADER_LINE - 1) + 1;
         assert_eq!(raw[through_line_cr - 1], b'\r');
         assert!(matches!(
             parse_request(&raw[..through_line_cr]),
-            ParseResult::Error
+            ParseResult::Error(_)
         ));
-        assert!(matches!(parse_request(&raw), ParseResult::Error));
+        assert!(matches!(parse_request(&raw), ParseResult::Error(_)));
     }
 
     /// A connection with a chunked request's head already sent. Both ends are
@@ -2013,7 +2129,7 @@ mod framing_overflow_tests {
             .set_nonblocking(true)
             .expect("a non-blocking client end");
         let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
-        conn.attach(mio::net::UnixStream::from_std(server));
+        conn.attach(crate::platform::net::UnixStream::from_std(server));
         client
             .write_all(b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
             .expect("the head");
@@ -2076,7 +2192,7 @@ mod framing_overflow_tests {
                 .set_nonblocking(true)
                 .expect("a non-blocking server end");
             let mut conn = ServerConn::new(16 * 1024, 64 * 1024);
-            conn.attach(mio::net::UnixStream::from_std(server));
+            conn.attach(crate::platform::net::UnixStream::from_std(server));
             client
                 .write_all(b"POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .expect("the head");
@@ -2196,11 +2312,11 @@ mod chunked_tests {
         match parse_request(raw) {
             ParseResult::Complete(r) => r,
             ParseResult::Incomplete => panic!("expected Complete, got Incomplete"),
-            ParseResult::Error => panic!("expected Complete, got Error"),
+            ParseResult::Error(_) => panic!("expected Complete, got Error"),
         }
     }
     fn is_error(raw: &[u8]) -> bool {
-        matches!(parse_request(raw), ParseResult::Error)
+        matches!(parse_request(raw), ParseResult::Error(_))
     }
     fn is_incomplete(raw: &[u8]) -> bool {
         matches!(parse_request(raw), ParseResult::Incomplete)
@@ -2308,7 +2424,7 @@ mod host_tests {
     use super::*;
 
     fn is_error(raw: &[u8]) -> bool {
-        matches!(parse_request(raw), ParseResult::Error)
+        matches!(parse_request(raw), ParseResult::Error(_))
     }
     fn is_ok(raw: &[u8]) -> bool {
         matches!(parse_request(raw), ParseResult::Complete(_))
@@ -2462,7 +2578,7 @@ mod parse_head_tests {
 
     fn is_error(raw: &[u8]) -> bool {
         let mut headers = [httparse::EMPTY_HEADER; 64];
-        matches!(parse_head(raw, &mut headers), HeadResult::Error)
+        matches!(parse_head(raw, &mut headers), HeadResult::Error(_))
     }
 
     /// The borrowed parser rejects exactly what the owned parser rejects, so the
@@ -2491,6 +2607,143 @@ mod parse_head_tests {
         assert!(is_error(raw.as_bytes()), "more than 64 headers");
     }
 
+    /// RFC 9110 8.6 and 5.6.3: `Content-Length` is `1*DIGIT` with SP and HTAB
+    /// allowed around it. `str::trim` also strips VT, FF and Unicode
+    /// whitespace, so `Content-Length: \x0B5` was read as 5.
+    #[test]
+    fn content_length_trims_sp_and_htab_only() {
+        fn with(value: &[u8]) -> Vec<u8> {
+            let mut raw = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ".to_vec();
+            raw.extend_from_slice(value);
+            raw.extend_from_slice(b"\r\n\r\n");
+            raw
+        }
+        for ok in [&b"5"[..], b" 5", b"5 ", b"\t5\t"] {
+            assert!(!is_error(&with(ok)), "SP and HTAB are OWS: {ok:?}");
+        }
+        // VT, FF and NBSP are whitespace to `str::trim` and not to HTTP.
+        for bad in [&b"\x0b5"[..], b"5\x0c", b"\xc2\xa05", b"5\xc2\xa0"] {
+            assert!(
+                is_error(&with(bad)),
+                "non-OWS whitespace around the value: {bad:?}"
+            );
+        }
+    }
+
+    /// The two limits, each felt at its boundary: what is exactly at the limit
+    /// parses and one byte more is the matching refusal.
+    #[test]
+    fn the_head_limits_are_inclusive_at_the_limit() {
+        let mut at = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        at.extend_from_slice(format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LINE - 5)).as_bytes());
+        at.extend_from_slice(b"\r\n");
+        assert!(!is_error(&at), "one field at the limit is allowed");
+        let mut over = at.clone();
+        // Before the field's CRLF, so it lengthens the value by one byte.
+        over.insert(over.len() - 4, b'a');
+        assert!(matches!(
+            parse_head(&over, &mut [httparse::EMPTY_HEADER; 64]),
+            HeadResult::Error(HeadError::FieldTooLarge)
+        ));
+
+        let target = MAX_HEADER_LINE - "GET ".len() - " HTTP/1.1".len();
+        let line_at = format!(
+            "GET /{} HTTP/1.1\r\nHost: x\r\n\r\n",
+            "a".repeat(target - 1)
+        );
+        assert!(
+            !is_error(line_at.as_bytes()),
+            "a line at the limit is allowed"
+        );
+        let line_over = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(target));
+        assert!(matches!(
+            parse_head(line_over.as_bytes(), &mut [httparse::EMPTY_HEADER; 64]),
+            HeadResult::Error(HeadError::RequestLineTooLong)
+        ));
+    }
+
+    /// Empty lines before the request line are skipped by the parser, so they
+    /// are skipped by the length check too.
+    #[test]
+    fn leading_empty_lines_do_not_hide_a_long_request_line() {
+        let target = MAX_HEADER_LINE - "GET ".len() - " HTTP/1.1".len();
+        for lead in ["\r\n", "\r\n\r\n", "\n", "\r\n\n"] {
+            let at = format!(
+                "{lead}GET /{} HTTP/1.1\r\nHost: x\r\n\r\n",
+                "a".repeat(target - 1)
+            );
+            // A bare LF is refused later as malformed, but never as too long.
+            assert!(
+                !matches!(
+                    parse_head(at.as_bytes(), &mut [httparse::EMPTY_HEADER; 64]),
+                    HeadResult::Error(HeadError::RequestLineTooLong)
+                ),
+                "at the limit after {lead:?}"
+            );
+            let over = format!(
+                "{lead}GET /{} HTTP/1.1\r\nHost: x\r\n\r\n",
+                "a".repeat(target)
+            );
+            assert!(
+                matches!(
+                    parse_head(over.as_bytes(), &mut [httparse::EMPTY_HEADER; 64]),
+                    HeadResult::Error(HeadError::RequestLineTooLong)
+                ),
+                "over the limit after {lead:?}"
+            );
+            assert_eq!(
+                incomplete_head_status(&over.as_bytes()[..over.len() - 13]),
+                Some(HeadError::RequestLineTooLong)
+            );
+            assert_eq!(
+                incomplete_head_status(&at.as_bytes()[..at.len() - 13]),
+                None
+            );
+        }
+    }
+
+    /// A head over `MAX_REQUEST_HEAD` is the head refusal, which answers 400.
+    #[test]
+    fn a_head_over_the_limit_is_a_400() {
+        // Four fields at the line limit, not hundreds of small ones: the
+        // parser holds 64 header slots and this must reach the head check.
+        let mut over = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        let mut n = 0usize;
+        while over.len() + 2 <= MAX_REQUEST_HEAD {
+            let mut line = format!("x-pad{n}: ");
+            line.push_str(&"a".repeat(MAX_HEADER_LINE - 1 - line.len()));
+            line.push_str("\r\n");
+            over.extend_from_slice(line.as_bytes());
+            n += 1;
+        }
+        over.extend_from_slice(b"\r\n");
+        assert!(over.len() > MAX_REQUEST_HEAD);
+        assert!(matches!(
+            parse_head(&over, &mut [httparse::EMPTY_HEADER; 64]),
+            HeadResult::Error(HeadError::HeadTooLarge)
+        ));
+        assert_eq!(HeadError::HeadTooLarge.status(), 400);
+    }
+
+    /// The refusal a partly received head earns, before its blank line arrives.
+    #[test]
+    fn an_unfinished_head_is_refused_once_it_passes_a_limit() {
+        assert_eq!(
+            incomplete_head_status(b"GET / HTTP/1.1\r\nHost: x\r\n"),
+            None
+        );
+        let mut line = b"GET /".to_vec();
+        line.extend(std::iter::repeat_n(b'a', MAX_HEADER_LINE));
+        assert_eq!(
+            incomplete_head_status(&line),
+            Some(HeadError::RequestLineTooLong)
+        );
+        let mut head = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        head.extend_from_slice(b"X-Pad: ");
+        head.extend(std::iter::repeat_n(b'a', MAX_REQUEST_HEAD));
+        assert_eq!(incomplete_head_status(&head), Some(HeadError::HeadTooLarge));
+    }
+
     /// The borrowed head points into the request buffer and reads nothing owned.
     #[test]
     fn parse_head_borrows_without_copying() {
@@ -2499,7 +2752,7 @@ mod parse_head_tests {
         let h = match parse_head(raw, &mut headers) {
             HeadResult::Complete(h) => h,
             HeadResult::Incomplete => panic!("expected Complete, got Incomplete"),
-            HeadResult::Error => panic!("expected Complete, got Error"),
+            HeadResult::Error(_) => panic!("expected Complete, got Error"),
         };
         assert_eq!(h.method, "GET");
         assert_eq!(h.path, "/a/b");

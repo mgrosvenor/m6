@@ -98,35 +98,21 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
 
 // ── Listeners ───────────────────────────────────────────────────────────────
 
-/// A non-blocking unix listener, ready for `mio`. Start only.
-///
-/// Removes a stale socket file left by a previous process, creates the parent
-/// directory, binds and sets `mode`. Every failure is an `Err` the caller turns
-/// into exit 2: a socket with a mode nobody chose is a socket nobody can reason
-/// about, so the same rule that made [`crate::server::apply_socket_mode`] a
-/// start failure applies here.
-pub fn listen_unix(path: &std::path::Path, mode: u32) -> std::io::Result<mio::net::UnixListener> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let listener = std::os::unix::net::UnixListener::bind(path)?;
-    listener.set_nonblocking(true)?;
-    crate::server::apply_socket_mode(path, mode)?;
-    Ok(mio::net::UnixListener::from_std(listener))
+/// A non-blocking unix listener. Start only. [`crate::platform::net::bind_unix`]
+/// under the name every service calls: a stale socket file is replaced, the
+/// parent directory is created, `mode` is set, and a path over the platform's
+/// limit fails here with the path and the limit in the message.
+pub fn listen_unix(
+    path: &std::path::Path,
+    mode: u32,
+) -> std::io::Result<crate::platform::net::UnixListener> {
+    crate::platform::net::bind_unix(path, mode)
 }
 
 /// A non-blocking TCP listener with `SO_REUSEADDR`. Start only.
-///
-/// `SO_REUSEADDR` is what lets a restart rebind a port whose connections are in
-/// `TIME_WAIT`; a live listener on the port is still refused. See
-/// [`crate::server::bind_tcp_reuseaddr`].
-pub fn listen_tcp(addr: SocketAddr) -> std::io::Result<mio::net::TcpListener> {
-    let listener = crate::server::bind_tcp_reuseaddr(addr)?;
-    listener.set_nonblocking(true)?;
-    Ok(mio::net::TcpListener::from_std(listener))
+/// [`crate::platform::net::listen_tcp`] under the name every service calls.
+pub fn listen_tcp(addr: SocketAddr) -> std::io::Result<crate::platform::net::TcpListener> {
+    crate::platform::net::listen_tcp(addr)
 }
 
 #[cfg(test)]

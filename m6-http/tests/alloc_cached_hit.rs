@@ -4,10 +4,12 @@
 //! counting allocator reads only what the two checks here allocated. The first
 //! check runs `parse_head`, a cache lookup and `write_cached_h1` one thousand
 //! times and requires zero allocations; the second checks the bytes against the
-//! owned writer's header set.
+//! owned writer's header set. The harness speaks libtest's protocol through
+//! `libtest-mimic`, forced onto one thread so it runs in this `main` thread.
 
 use std::sync::Arc;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::h1::{parse_head, HeadResult};
 use m6_core::testkit::alloc_count;
 use m6_http_lib::cache::{
@@ -22,10 +24,40 @@ static ALLOC: alloc_count::Counting = alloc_count::Counting;
 const BODY_LEN: usize = 20 * 1024;
 
 fn main() {
-    let mut failed = false;
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs every trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![
+        Trial::test("a_cached_h1_hit_allocates_nothing", || {
+            let f = fixtures();
+            outcome(
+                "a_cached_h1_hit_allocates_nothing",
+                a_cached_h1_hit_allocates_nothing(&f.cache, &f.entry, &f.hit, f.request),
+            )
+        }),
+        Trial::test("the_hit_bytes_match_build_response", || {
+            let f = fixtures();
+            outcome(
+                "the_hit_bytes_match_build_response",
+                the_hit_bytes_match_build_response(&f.cache, &f.entry, &f.hit, f.request),
+            )
+        }),
+    ];
+    libtest_mimic::run(&args, tests).exit();
+}
 
-    // Build the cache, the request and the writer once, outside the counted
-    // loop, so the count is the hit path's own.
+/// A cache with one fresh entry, the hit headers and the request, built
+/// outside every counted region.
+struct Fixtures {
+    cache: Cache,
+    entry: CachedResponse,
+    hit: HitHeaders,
+    request: &'static [u8],
+}
+
+fn fixtures() -> Fixtures {
     let cache = Cache::new();
     let headers: Arc<Vec<(String, String)>> = Arc::new(vec![
         (
@@ -50,6 +82,7 @@ fn main() {
         ("content-language".to_string(), "en".to_string()),
     ]);
     let entry = CachedResponse {
+        genid: 0,
         status: 200,
         headers: headers.clone(),
         body: bytes::Bytes::from(vec![b'x'; BODY_LEN]),
@@ -72,10 +105,20 @@ Accept-Language: en\r\n\
 Cookie: _m6sid=abc123\r\n\
 \r\n";
 
-    failed |= a_cached_h1_hit_allocates_nothing(&cache, &entry, &hit, request);
-    failed |= the_hit_bytes_match_build_response(&cache, &entry, &hit, request);
+    Fixtures {
+        cache,
+        entry,
+        hit,
+        request,
+    }
+}
 
-    std::process::exit(if failed { 1 } else { 0 });
+fn outcome(name: &str, failed: bool) -> Result<(), Failed> {
+    if failed {
+        Err(format!("{name}: failed").into())
+    } else {
+        Ok(())
+    }
 }
 
 fn a_cached_h1_hit_allocates_nothing(
@@ -169,6 +212,7 @@ fn the_hit_bytes_match_build_response(
         "link".to_string(),
         "</llms.txt>; rel=\"describedby\"".to_string(),
     ));
+    expected.push(("m6-genid".to_string(), entry.genid.to_string()));
     if status_may_have_content_length(200) {
         expected.push(("content-length".to_string(), entry.body.len().to_string()));
     }

@@ -12,7 +12,7 @@
 
 use std::net::TcpStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const POLL: Duration = Duration::from_millis(25);
 
@@ -60,12 +60,12 @@ pub fn until(timeout: Duration, ready: impl FnMut() -> bool) -> bool {
 }
 
 fn poll_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
+    let deadline = crate::platform::now() + timeout;
     loop {
         if ready() {
             return true;
         }
-        if Instant::now() >= deadline {
+        if crate::platform::now() >= deadline {
             return false;
         }
         std::thread::sleep(POLL);

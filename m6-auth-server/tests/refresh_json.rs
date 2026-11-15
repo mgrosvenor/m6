@@ -81,10 +81,6 @@ access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "test.example.com"
 
-[thread_pool]
-size = 4
-queue_size = 32
-
 [keys]
 private_key = "{}"
 public_key  = "{}"
@@ -132,11 +128,14 @@ fn spawn_server(env: &TestEnv) -> Service {
 
 /// Create a test user in the database before the server starts, returning it so
 /// a test can mint a token for that user.
+///
+/// Cost 4 is bcrypt's lowest: a fixture needs a user, not production's round
+/// count, and an unoptimised cost-12 hash costs seconds per test.
 fn seed_user(env: &TestEnv, username: &str, password: &str) -> m6_auth::User {
     let db_path = env.site_dir.join("data/auth.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = m6_auth::Db::open(&db_path).expect("open db");
-    db.user_create(username, password, &["user"])
+    db.user_create_with_cost(username, password, &["user"], 4)
         .expect("create user")
 }
 

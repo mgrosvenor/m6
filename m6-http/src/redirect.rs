@@ -33,15 +33,19 @@
 //! the redirect is what it should always have been: a response code.
 use crate::forward::HttpRequest;
 use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
-use m6_core::event::{raise_open_file_limit, Signals, Timeouts};
-use m6_core::mio::unix::SourceFd;
-use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::event::Timeouts;
+use m6_core::log::{info, warn};
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
-use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use std::time::Duration;
 
 const TOKEN_LISTENER: Token = Token(usize::MAX);
 const TOKEN_SIGNAL: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const TOKEN_LOG: Token = Token(usize::MAX - 2);
 const POLL_TIMEOUT_MS: u64 = 1_000;
 
 /// Percent-safe: the request target is echoed back into `Location` verbatim,
@@ -62,7 +66,7 @@ fn host_is_safe(h: &str) -> bool {
 const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
-    RequestOutcome::Ready(status, headers, Vec::new(), String::new())
+    RequestOutcome::Ready(status, headers, Vec::new(), String::new(), None)
 }
 
 /// The whole of the redirect: one status, one header.
@@ -150,7 +154,7 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
     lifecycle.started();
 
-    let ceiling = raise_open_file_limit()?;
+    let ceiling = raise_fd_limit()?;
     let mut listener = Http11Listener::bind_plain(
         bind,
         crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN,
@@ -159,16 +163,10 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
     )?;
     let mut signals = Signals::new()?;
     let mut poll = Poll::new()?;
-    poll.registry().register(
-        &mut SourceFd(&listener.raw_fd()),
-        TOKEN_LISTENER,
-        Interest::READABLE,
-    )?;
-    poll.registry().register(
-        &mut SourceFd(&signals.raw_fd()),
-        TOKEN_SIGNAL,
-        Interest::READABLE,
-    )?;
+    poll.registry()
+        .register_fd(listener.raw_fd(), TOKEN_LISTENER, Interest::READABLE)?;
+    poll.registry()
+        .register_fd(signals.raw_fd(), TOKEN_SIGNAL, Interest::READABLE)?;
 
     // The read timeout, as a deadline rather than a per-pass sweep. The
     // one-second poll cap only bounds the wait until the earliest deadline.
@@ -189,8 +187,9 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
 
     let mut events = Events::with_capacity(64);
     let mut accepting = true;
+    let mut last_log_tick = m6_core::platform::now();
     loop {
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         match poll.poll(
             &mut events,
             Some(read_timeouts.timeout(now, Duration::from_millis(POLL_TIMEOUT_MS))),
@@ -202,15 +201,13 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                 continue;
             }
         }
-        let now = Instant::now();
+        let now = m6_core::platform::now();
 
         for ev in &events {
             match ev.token() {
                 TOKEN_LISTENER => loop {
                     let Some(taken) = listener.take_slot() else {
-                        poll.registry()
-                            .deregister(&mut SourceFd(&listener.raw_fd()))
-                            .ok();
+                        poll.registry().deregister_fd(listener.raw_fd()).ok();
                         accepting = false;
                         break;
                     };
@@ -224,11 +221,10 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                     };
                     conn.set_token(Token(key));
                     conn.set_interest(Interest::READABLE);
-                    if let Err(e) = poll.registry().register(
-                        &mut SourceFd(&conn.raw_fd()),
-                        Token(key),
-                        Interest::READABLE,
-                    ) {
+                    if let Err(e) =
+                        poll.registry()
+                            .register_fd(conn.raw_fd(), Token(key), Interest::READABLE)
+                    {
                         warn!(error = %e, "redirect: register connection");
                         listener.free_slot(key);
                         continue;
@@ -245,9 +241,17 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
                     }
                     if stop {
                         lifecycle.complete();
+                        // `stop` takes both Sinks before it finishes, so its
+                        // own failure has to be written to stderr here: the
+                        // caller's error line has no destination left.
+                        if let Err(e) = m6_core::log::stop() {
+                            eprintln!("log stop failed: {e}");
+                            return Err(e.into());
+                        }
                         return Ok(());
                     }
                 }
+                TOKEN_LOG => m6_core::log::flush(),
                 Token(k) => {
                     let drive = listener.drive_one(
                         k,
@@ -268,17 +272,26 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
             }
         }
 
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), TOKEN_LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
+        // The accounting tick: flush the log buffers once a second.
+        if now.duration_since(last_log_tick) >= Duration::from_secs(1) {
+            m6_core::log::tick(m6_core::platform::wall());
+            last_log_tick = now;
+        }
+
         // Close connections idle past the read deadline.
-        while let Some(Token(k)) = read_timeouts.expired(Instant::now()) {
+        while let Some(Token(k)) = read_timeouts.expired(m6_core::platform::now()) {
             listener.close_one(k, poll.registry());
         }
         // A slot came free while the table was full: accept again.
         if !accepting && !listener.is_full() {
-            poll.registry().register(
-                &mut SourceFd(&listener.raw_fd()),
-                TOKEN_LISTENER,
-                Interest::READABLE,
-            )?;
+            poll.registry()
+                .register_fd(listener.raw_fd(), TOKEN_LISTENER, Interest::READABLE)?;
             accepting = true;
         }
     }

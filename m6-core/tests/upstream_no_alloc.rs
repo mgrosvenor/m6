@@ -6,7 +6,9 @@
 //! request check is a guard: a thousand requests must allocate nothing. The TLS
 //! check is a recorded measurement for ALLOC-1 and runs only when the binary is
 //! started with `--tls` (a rustls server thread allocates in the same process
-//! while it counts, so it asserts nothing).
+//! while it counts, so it asserts nothing). The test speaks libtest's protocol
+//! through `libtest-mimic`; the checks are forced onto one thread so the count
+//! is this `main` thread's own.
 
 #![allow(
     clippy::disallowed_methods,
@@ -18,6 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use libtest_mimic::{Arguments, Trial};
 use m6_core::client::{Addr, Upstream};
 use m6_core::testkit::alloc_count;
 
@@ -27,13 +30,30 @@ static ALLOC: alloc_count::Counting = alloc_count::Counting;
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 fn main() {
+    // The ALLOC-1 measurement, not a test: started by hand, never listed.
     if std::env::args().nth(1).as_deref() == Some("--tls") {
         tls_requests_report_their_allocations();
         return;
     }
-    let allocated = a_thousand_plain_requests_allocate_nothing();
-    println!("a_thousand_plain_requests_allocate_nothing: {allocated} allocation(s)");
-    std::process::exit(if allocated == 0 { 0 } else { 1 });
+
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs the trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![Trial::test(
+        "a_thousand_plain_requests_allocate_nothing",
+        || {
+            let allocated = a_thousand_plain_requests_allocate_nothing();
+            println!("a_thousand_plain_requests_allocate_nothing: {allocated} allocation(s)");
+            if allocated == 0 {
+                Ok(())
+            } else {
+                Err(format!("{allocated} allocation(s) in 1000 requests").into())
+            }
+        },
+    )];
+    libtest_mimic::run(&args, tests).exit();
 }
 
 fn a_thousand_plain_requests_allocate_nothing() -> usize {
@@ -146,10 +166,10 @@ fn tls_requests_report_their_allocations() {
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut up = Upstream::new(64 * 1024, 16 * 1024);
-    let mut poll = m6_core::mio::Poll::new().expect("poll");
-    let mut events = m6_core::mio::Events::with_capacity(8);
-    let token = m6_core::mio::Token(0);
-    let mut registered: Option<m6_core::mio::Interest> = None;
+    let mut poll = m6_core::platform::Poll::new().expect("poll");
+    let mut events = m6_core::platform::Events::with_capacity(8);
+    let token = m6_core::platform::Token(0);
+    let mut registered: Option<m6_core::platform::Interest> = None;
 
     // One warm-up request, so the connect and handshake are out of count.
     tls_request(
@@ -185,15 +205,14 @@ fn tls_requests_report_their_allocations() {
 #[allow(clippy::too_many_arguments)]
 fn tls_request(
     up: &mut Upstream,
-    poll: &mut m6_core::mio::Poll,
-    events: &mut m6_core::mio::Events,
-    token: m6_core::mio::Token,
-    registered: &mut Option<m6_core::mio::Interest>,
+    poll: &mut m6_core::platform::Poll,
+    events: &mut m6_core::platform::Events,
+    token: m6_core::platform::Token,
+    registered: &mut Option<m6_core::platform::Interest>,
     tls: &m6_core::client::TlsClient,
     addr: std::net::SocketAddr,
     deadline: Instant,
 ) {
-    use m6_core::mio::unix::SourceFd;
     up.request_buf()
         .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     up.start(&Addr::Tcp(addr), Some(tls), false, deadline)
@@ -202,11 +221,11 @@ fn tls_request(
     if *registered != Some(interest) {
         if registered.is_some() {
             poll.registry()
-                .reregister(&mut SourceFd(&up.fd()), token, interest)
+                .reregister_fd(up.fd(), token, interest)
                 .expect("reregister");
         } else {
             poll.registry()
-                .register(&mut SourceFd(&up.fd()), token, interest)
+                .register_fd(up.fd(), token, interest)
                 .expect("register");
         }
         *registered = Some(interest);
@@ -228,7 +247,7 @@ fn tls_request(
             let next = up.interest();
             if next != interest {
                 poll.registry()
-                    .reregister(&mut SourceFd(&up.fd()), token, next)
+                    .reregister_fd(up.fd(), token, next)
                     .expect("reregister");
                 interest = next;
                 *registered = Some(next);

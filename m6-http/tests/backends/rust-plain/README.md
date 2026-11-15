@@ -17,11 +17,11 @@ It is also the honest control for the platform. If writing this were much harder
 than `../go/main.go`, the contract would have drifted toward Rust and the problem
 would be the platform, not the example. It is about the same length.
 
-**It uses protocol §7's reference model**: a fixed thread pool with a bounded
-queue, 503 when the queue is full. The first version spawned a thread per
-connection, which the protocol permits, and it made the comparison with its pair
-meaningless: the measured difference was pooling against thread-per-connection
-rather than library against no library. Fixing it took this example from 17,608
+**It uses a fixed thread pool with a bounded queue**, 503 when the queue is
+full, one of the models protocol §7 permits. The first version spawned a thread
+per connection, which the protocol also permits, and it made the comparison
+with its pair meaningless: the measured difference was pooling against
+thread-per-connection rather than library against no library. Fixing it took this example from 17,608
 to 46,826 rps and inverted the sign of the answer. See `docs/BENCHMARKS.md`.
 
 Built size: about 555KB. On the build host: 28,954 rps, p50 63.7us.

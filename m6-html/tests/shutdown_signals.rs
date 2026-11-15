@@ -105,7 +105,8 @@ fn http_request(socket: &Path, request: &str) -> Option<String> {
 /// the loop holds one accepted connection that is waiting for the rest. That
 /// connection is accepted work when shutdown starts, and the loop drops it
 /// without waiting: there is no pool and no wake connection.
-fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &str) {
+fn exits_promptly_with_a_request_in_flight(id: &str) {
+    let name = "a shutdown request";
     let (mut server, socket_path) = spawn(id);
 
     let mut held = UnixStream::connect(&socket_path).expect("connect the held request");
@@ -115,7 +116,7 @@ fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &st
     )
     .expect("send the head of the held request");
 
-    server.svc.signal(sig);
+    server.svc.request(m6_core::platform::Signal::Shutdown);
     let status = server
         .svc
         .wait_for_exit(Instant::now() + Duration::from_secs(5))
@@ -140,17 +141,59 @@ fn exits_promptly_with_a_request_in_flight(id: &str, sig: libc::c_int, name: &st
     drop(held);
 }
 
-/// SIGTERM with a request in flight exits at once. The wrong outcome: the
-/// service waits for the request, so a stalled client holds up every deploy.
+/// A shutdown request with a request in flight exits at once. The wrong
+/// outcome: the service waits for the request, so a stalled client holds up
+/// every deploy. SIGINT takes the same path, which the platform layer's own
+/// suite proves (`platform_signals`, S2).
 #[test]
-fn sigterm_exits_zero_and_removes_the_socket_with_a_request_in_flight() {
-    exits_promptly_with_a_request_in_flight("term-inflight", libc::SIGTERM, "SIGTERM");
+fn shutdown_exits_zero_and_removes_the_socket_with_a_request_in_flight() {
+    exits_promptly_with_a_request_in_flight("term-inflight");
 }
 
-/// SIGINT takes the same path as SIGTERM. The wrong outcome: SIGINT kills the
-/// process at the default disposition, leaving the socket behind and a
-/// non-zero status.
+/// SIGUSR1 asks for a log reopen and is not a shutdown. This is the only
+/// end-to-end run of a core service's `Signal::ReopenLogs` arm: the service
+/// writes the reopen line at once, keeps its socket, and answers the next
+/// request. m6-html writes no analytics file, so the line says so.
 #[test]
-fn sigint_exits_zero_and_removes_the_socket_with_a_request_in_flight() {
-    exits_promptly_with_a_request_in_flight("sigint-inflight", libc::SIGINT, "SIGINT");
+fn a_log_reopen_signal_is_not_a_shutdown() {
+    let (mut server, socket_path) = spawn("usr1");
+    server.svc.request(m6_core::platform::Signal::ReopenLogs);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if server.svc.output().contains("log reopen requested") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reopen line never appeared\n--- output ---\n{}",
+            server.svc.output()
+        );
+        server.svc.assert_alive("waiting for the reopen line");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        server
+            .svc
+            .output()
+            .contains("log reopen requested; this process writes no log file"),
+        "--- output ---\n{}",
+        server.svc.output()
+    );
+    assert!(
+        socket_path.exists(),
+        "the socket at {} went away on SIGUSR1",
+        socket_path.display()
+    );
+    let response = http_request(
+        &socket_path,
+        "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .expect("the service still answers after SIGUSR1");
+    assert!(
+        response.contains("200 OK"),
+        "the service stopped serving after SIGUSR1: {response}\n--- output ---\n{}",
+        server.svc.output()
+    );
+    server.svc.terminate(Duration::from_secs(5));
 }

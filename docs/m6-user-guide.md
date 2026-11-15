@@ -102,8 +102,7 @@ mode             = "internal"
 verbose_fallback = true
 
 [log]
-level  = "info"
-format = "text"
+level = "info"
 
 [[backend]]
 name    = "m6-html"
@@ -354,7 +353,7 @@ It repeats the date descending sort that m6-md already applied, so the page keep
 ```
 
 [`m6-md.md`](m6-md.md) owns the frontmatter rules, the command line, the output format and `not_found()`.
-[`m6-core-reference.md`](m6-core-reference.md) owns the template engine and its m6 filters at §4.5, and the built-in keys at §4.1.
+[`m6-core-reference.md`](m6-core-reference.md) owns the template engine and its m6 filters at §4.5, and the built-in keys at §4.6.
 The `sort`, `reverse`, `filter`, `length` and `first` filters are Tera's standard filters.
 
 Example 02 adds a content pipeline in front of the same three processes.
@@ -377,8 +376,8 @@ cd examples/03-contact
 ### 4.1. `render-contact/Cargo.toml`
 
 `render-contact` is a Rust crate in the m6-examples workspace.
-Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that re-exports the *SMTP* transport.
-`lettre` supplies the transport itself, and `anyhow` and `serde_json` handle errors and JSON.
+Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that supplies the *SMTP* client a service's loop drives.
+`anyhow` and `serde_json` handle errors and JSON.
 
 ```toml
 [package]
@@ -388,7 +387,6 @@ edition = "2021"
 
 [dependencies]
 m6-core    = { path = "../../../../m6/m6-core", features = ["email"] }
-lettre     = { version = "0.11", features = ["smtp-transport", "native-tls"] }
 anyhow     = "1"
 serde_json = "1"
 ```
@@ -398,22 +396,26 @@ The relative path is why the m6 and m6-examples checkouts must sit side by side.
 ### 4.2. `render-contact/src/main.rs`
 
 `main.rs` has two functions plus `main`.
-`init_global` builds the *SMTP* transport from the config.
-`handle_post` reads the form and sends the message.
-`main` registers both and runs the service.
+`load_state` builds the relay and its certificate store from the config.
+`message` builds one `Message`.
+`main` loads the site, calls `load_state` at start, and runs the loop with one `Smtp` slot per connection slot.
 
 ```rust
-use lettre::transport::smtp::authentication::Credentials;
+use std::sync::Arc;
+use std::time::Duration;
+
+use m6_core::email::{lettre, Relay, RelayConfig, Smtp};
 use m6_core::prelude::*;
+use m6_core::rustls::ClientConfig;
 
 struct Global {
-    mailer: SmtpTransport,
-    from:   String,
-    to:     String,
+    relay: Relay,
+    from:  String,
+    to:    String,
 }
 
-fn init_global(ctx: &AppContext) -> Result<Global> {
-    let config = ctx.config;
+fn load_state(site: &Site) -> Result<Global> {
+    let config = site.user_config();
     let host = config["smtp"]["host"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.host missing")))?;
     let port = config["smtp"]["port"].as_u64()
@@ -422,53 +424,57 @@ fn init_global(ctx: &AppContext) -> Result<Global> {
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.username missing")))?;
     let password = config["smtp"]["password"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.password missing")))?;
+    let starttls = config["smtp"]["starttls"].as_bool().unwrap_or(true);
     let from = config["smtp"]["from"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.from missing")))?.to_string();
     let to = config["smtp"]["to"].as_str()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("smtp.to missing")))?.to_string();
 
-    let creds = Credentials::new(username.to_string(), password.to_string());
-    let mailer = SmtpTransport::relay(host)
-        .map_err(|e| Error::Other(e.into()))?
-        .port(port)
-        .credentials(creds)
-        .build();
+    let tls = if starttls {
+        Some(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(client::system_roots()
+                    .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?)
+                .with_no_client_auth(),
+        ))
+    } else {
+        None
+    };
+    let credentials = (!username.is_empty())
+        .then(|| (username.to_string(), password.to_string()));
+    let relay = Relay::new(&RelayConfig {
+        host: host.to_string(),
+        port,
+        starttls: tls,
+        credentials,
+        timeout: Duration::from_secs(20),
+    }).map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?;
 
-    Ok(Global { mailer, from, to })
+    Ok(Global { relay, from, to })
 }
 
-fn handle_post(req: &Request, global: &Global) -> Result<Response> {
-    let name    = req.field("name")?;
-    let email   = req.field("email")?;
-    let message = req.field("message")?;
-
+fn message(global: &Global, name: &str, email: &str, text: &str) -> Result<Message> {
     let from_addr: lettre::Address = global.from.parse()
         .map_err(|e: lettre::address::AddressError| Error::Other(anyhow::anyhow!("{e}")))?;
     let to_addr: lettre::Address = global.to.parse()
         .map_err(|e: lettre::address::AddressError| Error::Other(anyhow::anyhow!("{e}")))?;
 
-    let msg = Message::builder()
+    Message::builder()
         .from(lettre::message::Mailbox::new(None, from_addr))
         .to(lettre::message::Mailbox::new(None, to_addr))
         .subject(format!("Contact from {}", name))
-        .body(format!("From: {} <{}>\n\n{}", name, email, message))
-        .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))?;
-
-    global.mailer.send(&msg).map_err(|e| Error::Other(e.into()))?;
-
-    Response::render_with("templates/contact.html", req, json!({"sent": true, "name": name}))
-}
-
-fn main() -> Result<()> {
-    App::with_global(init_global)
-        .route_post("/contact", handle_post)
-        .run()
+        .body(format!("From: {} <{}>\n\n{}", name, email, text))
+        .map_err(|e| Error::Other(anyhow::anyhow!("{e}")))
 }
 ```
 
-`init_global` runs once at startup, and `App::with_global` shares its result across requests.
-`handle_post` reads three fields, `name`, `email` and `message`, sends them, then renders the template again with `sent` set.
-The route's template in the config serves a GET to `/contact`, so the form appears on first visit.
+`load_state` runs once at startup, and the loop passes its value to each request arm.
+The POST arm builds one message and calls `smtp.start(&state.relay, &msg)` on its connection's slot.
+The connection's state becomes `Sending`, and the loop registers `smtp.fd()` with `smtp.interest()` under the outgoing token and puts `smtp.deadline()` in the outgoing `Timeouts`.
+The client's own token stays `READABLE` while it waits.
+When the outgoing token fires, `smtp.drive()` returns `Ok(None)` and the loop reregisters, or `Ok(Some(()))` and the handler renders `templates/contact.html` with `sent: true`, or `Err` and the handler answers with the cause.
+The outgoing deadline passing first answers 504.
+A client that closes while `Sending` frees its slot, which closes the relay connection.
 
 ### 4.3. `configs/render-contact.conf`
 
@@ -488,6 +494,8 @@ cache    = "no-store"
 [smtp]
 host     = "localhost"
 port     = 1025
+# The local development relay on localhost speaks plain SMTP. Production relays take STARTTLS on port 587: delete this line.
+starttls = false
 username = ""
 password = ""
 from     = "noreply@example.com"
@@ -495,7 +503,8 @@ to       = "owner@example.com"
 ```
 
 The `[smtp]` values are development defaults.
-In production they move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
+`starttls = false` is what lets the example talk to the local plain relay: m6-core refuses plain SMTP to any host but `localhost`, `127.0.0.1` or `::1`, so delete the line for a relay elsewhere.
+In production the values move to the file named by `secrets_file`, and the `[smtp]` section is removed from this file.
 
 A key set in both files is refused at startup, and a missing secrets file is ignored, so the example runs with no setup.
 In production, deliver the secrets file with `LoadCredential=secrets.toml:/etc/m6/render-contact.toml` and set `secrets_file = "/run/credentials/render-contact.service/secrets.toml"`.
@@ -565,7 +574,7 @@ M6_SOCKET_OVERRIDE=/tmp/m6/render-contact.sock \
 `$EXAMPLES` is the m6-examples checkout root.
 
 [`m6-app-anatomy.md`](m6-app-anatomy.md) owns the custom renderer guide.
-[`m6-app-anatomy.md`](m6-app-anatomy.md) §4 owns the renderer config keys, §5.3 owns `init_global`, and [`m6-site-toml.md`](m6-site-toml.md) §3.2 owns `secrets_file`.
+[`m6-app-anatomy.md`](m6-app-anatomy.md) §4 owns the renderer config keys, §5.3 owns where state lives (a plain value in `main`), and [`m6-site-toml.md`](m6-site-toml.md) §3.2 owns `secrets_file`.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[backend]]` and `[[route]]` keys.
 
 Example 03 adds one custom renderer and one form route.
@@ -849,27 +858,30 @@ base64     = "0.22"
 
 ### 6.4. `render-cms/src/main.rs`
 
-`main` registers the CMS routes as code handlers, and `configs/render-cms.conf` marks the routes it lists `cache = "no-store"`.
+The routes are `CodeRoute` values, and `configs/render-cms.conf` marks the routes it lists `cache = "no-store"`.
 The renderer also owns the `/contact` form.
 
 ```rust
-fn main() -> Result<()> {
-    App::new()
-        .route_get("/contact",               handle_contact_get)
-        .route_post("/contact",              handle_contact_post)
-        .route_get("/cms",                   handle_dashboard)
-        .route_get("/cms/new",               handle_new)
-        .route_get("/cms/edit/{stem}",       handle_edit)
-        .route_post("/api/drafts",           handle_create_draft)
-        .route_patch("/api/drafts/{stem}",   handle_update_draft)
-        .route_post("/api/publish/{stem}",   handle_publish)
-        .route_post("/api/unpublish/{stem}", handle_unpublish)
-        .route_delete("/api/drafts/{stem}",  handle_delete_draft)
-        .route_delete("/api/posts/{stem}",   handle_delete_post)
-        .run()
-}
+const ROUTES: &[CodeRoute] = &[
+    CodeRoute { pattern: "/contact",               method: RouteMethod::Get },
+    CodeRoute { pattern: "/contact",               method: RouteMethod::Post },
+    CodeRoute { pattern: "/cms",                   method: RouteMethod::Get },
+    CodeRoute { pattern: "/cms/new",               method: RouteMethod::Get },
+    CodeRoute { pattern: "/cms/edit/{stem}",       method: RouteMethod::Get },
+    CodeRoute { pattern: "/api/drafts",            method: RouteMethod::Post },
+    CodeRoute { pattern: "/api/drafts/{stem}",     method: RouteMethod::Patch },
+    CodeRoute { pattern: "/api/publish/{stem}",    method: RouteMethod::Post },
+    CodeRoute { pattern: "/api/unpublish/{stem}",  method: RouteMethod::Post },
+    CodeRoute { pattern: "/api/drafts/{stem}",     method: RouteMethod::Delete },
+    CodeRoute { pattern: "/api/posts/{stem}",      method: RouteMethod::Delete },
+];
+
+// Part E's `main` runs the loop from `m6-app-anatomy.md` section 2, with one
+// `Handled::Code` arm per route above, in the same order. Its start:
+let site = Site::load("render-cms", ROUTES, &[], &TeraFactory);
 ```
 
+The snippet stops at start: part E adds the loop and its `match` arms.
 The handlers use the file helpers m6-core puts on `Request`.
 `handle_create_draft` writes `content/drafts/{stem}.json`.
 `handle_publish` reads that draft, renders its Markdown body to HTML, writes `content/posts/{stem}.json`, rebuilds the index and deletes the draft.
@@ -905,7 +917,7 @@ The stack is m6-html, m6-file, m6-auth-server, render-cms and m6-http.
 It has 15 sections, numbered 0 to 14, and every check has one expected answer.
 The summary line prints the pass count, the fail count and the total, and the script deletes its own draft before it ends.
 
-[`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `App` route methods.
+[`m6-core-reference.md`](m6-core-reference.md) owns the `Request` file helpers and the `CodeRoute` values a service passes to `Site::load`.
 [`m6-md.md`](m6-md.md) owns the Markdown conversion.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[route]]`, `require` and `allowed_methods` keys.
 [`m6-http.md`](m6-http.md) owns the cache and its clearing rules.
@@ -1104,6 +1116,51 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 [Install]
 WantedBy=multi-user.target
 ```
+
+For more than one m6-html instance, use a template unit instead of one copy per instance.
+The instance number becomes `%i`, and `M6_SOCKET_OVERRIDE` names a socket the pool glob matches.
+
+`/etc/systemd/system/m6-html@.service`:
+
+```ini
+[Unit]
+Description=m6-html renderer (instance %i)
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+Environment=M6_SOCKET_OVERRIDE=/run/m6/m6-html-%i.sock
+
+ExecStart=/usr/local/bin/m6-html \
+    /var/www/my-blog \
+    /var/www/my-blog/configs/m6-html.conf
+
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m6-html-%i
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6
+ReadOnlyPaths=/var/www/my-blog /etc/m6
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The `[[backend]]` entry in the production `site.toml` (§7.3) names `sockets = "/run/m6/m6-html*.sock"`, which matches the instance sockets too, because `m6-html@1` writes `/run/m6/m6-html-1.sock`.
+A deployment that runs only the template unit can narrow the glob to `/run/m6/m6-html-*.sock`.
 
 `/etc/systemd/system/m6-file.service`:
 
@@ -1339,8 +1396,7 @@ journalctl -u m6-http -p err
 journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 ```
 
-The `-o cat | jq .` form only parses when `site.toml` sets `format = "json"`.
-Example 05 sets `format = "text"`, so change it to `json` for structured log processing.
+Every m6 log line is JSON, so `journalctl -u m6-http -o cat | jq .` parses every one.
 
 ### 7.8. Rotating the analytics log
 
@@ -1394,8 +1450,9 @@ When the reopen fails, the wait times out and `postrotate` fails.
 Setting `[monitor] log_reopen_max_age_s` makes it a fault when a node's last reopen is older than that many seconds.
 A limit of twice the rotation interval suits an hourly rotation, so 7200 seconds with the schedule above.
 The limit is only as true as the schedule, so set it after logrotate runs hourly.
-`/traffic` reads the newest rotated file next to the log when the live file does not cover its window, so its sixty minute window does not shrink just after a rotation.
-It skips a rotated file last written before the window, and a `.gz` file larger than the 24 MB read budget on disk or once decoded.
+`/traffic` answers from a window in memory and reads no log file, so rotation leaves its figures alone.
+The window covers the last 60 minutes this process served, starts empty after a restart, and `window_minutes` says how much of the hour it holds.
+The `/traffic` paragraph in [`m6-http.md`](m6-http.md) gives the field caps and the count of events a full window dropped.
 
 ### 7.9. Monitor history
 
@@ -1420,6 +1477,10 @@ On Unix the monitor creates the directory with mode 0700 and the file with mode 
 A write that fails is a warning on node `monitor` and never stops polling.
 A prune that fails, or a cap that deleting every earlier poll cannot meet, is its own warning, and the poll is still stored.
 To start fresh, stop the service, delete the file and start it again.
+
+The `/check` report starts with a HEALTH section, one line per node, showing this poll's `/health` answer and the age of the node's last 200 from this history.
+`[monitor] health_last_ok_max_age_s` sets the age above which the line is flagged, and it defaults to three `poll_interval_s` values.
+A node is ok only when `/health` answers 200 and the body status is `ok`. Every other node is a fault on its line and in the verdict: a 503 whatever its body says, a 200 with any other status, and no answer at all. The last 200 is read from an index that holds only the 200 rows, so reading it does not slow as the history grows.
 
 `GET /history` and `GET /crawlers` answer on the service's Unix socket and nowhere else.
 Both take `from` and `to` as *RFC 3339* UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.
@@ -1486,41 +1547,30 @@ certbot renew
 
 ### 7.11. Horizontal scaling
 
-Add a second m6-html instance to handle more traffic, then restart m6-http so it reads the pool again:
+The template unit replaces the plain one: the plain unit's `/run/m6/m6-html.sock` matches the same `/run/m6/m6-html*.sock` pool glob, so leaving it running beside `m6-html@1` and `m6-html@2` puts three processes behind one pool.
+Add two m6-html instances with it, then restart m6-http so it reads the pool again:
 
 ```bash
-cp /var/www/my-blog/configs/m6-html.conf \
-   /var/www/my-blog/configs/m6-html-2.conf
-
-cp /etc/systemd/system/m6-html.service \
-   /etc/systemd/system/m6-html-2.service
-
-sed -i \
-  -e 's/Description=m6-html renderer/Description=m6-html renderer (instance 2)/' \
-  -e 's/m6-html.conf/m6-html-2.conf/' \
-  -e 's/SyslogIdentifier=m6-html/SyslogIdentifier=m6-html-2/' \
-  /etc/systemd/system/m6-html-2.service
-
-systemctl daemon-reload
-systemctl enable m6-html-2
-systemctl start m6-html-2
+systemctl disable --now m6-html.service
+systemctl enable --now m6-html@1 m6-html@2
+systemctl restart m6-http
 ```
 
-The socket name follows the config stem, so `m6-html-2.conf` writes `/run/m6/m6-html-2.sock`.
+The instance number sets the socket, so `m6-html@2` writes `/run/m6/m6-html-2.sock` and the pool glob in `site.toml` matches both.
 m6-http reads the pool once at start, so restart it to add the instance, then it load-balances traffic across both.
 
 To scale back down:
 
 ```bash
-systemctl stop m6-html-2
+systemctl disable --now m6-html@2
 ```
 
-The socket disappears and m6-http backs the member off, and it serves again once a listener is bound there.
+The socket disappears and m6-http keeps the member in its rotation. Each request that lands on it tries the next member, and the instance serves again on its next turn once a listener is bound there.
 
 ### 7.12. Crash recovery
 
 systemd restarts a failed unit with `Restart=on-failure` and `RestartSec=2`.
-During the brief restart window, m6-http's pool backoff handles the missing socket and answers the affected routes with a 502 until the socket reappears.
+During the brief restart window, a request that lands on the missing socket tries the next member and is served. If every member of the pool is down, the affected routes answer 502 until one is back.
 
 ```bash
 systemctl kill -s KILL m6-html
@@ -1530,7 +1580,7 @@ journalctl -u m6-html -f
 # ... m6-html started, listening on /run/m6/m6-html.sock
 ```
 
-m6-http serves again once a listener is bound there.
+m6-http serves from the pool again on the next turn once a listener is bound there.
 
 Example 06 shows the same site running as five supervised units.
 Example 07 makes the development and production split explicit, with one `site.toml` and a system config per environment.
@@ -1560,8 +1610,7 @@ mode             = "internal"
 verbose_fallback = true
 
 [log]
-level  = "info"
-format = "text"
+level = "info"
 
 [[backend]]
 name    = "m6-html"
@@ -1768,7 +1817,7 @@ Example 08 adds a log viewer that tails the JSON logs in the browser.
 
 Example 08 adds a real-time log viewer to the site.
 m6-http writes JSON logs, m6-file serves them from a byte offset, and a browser page polls and renders the new lines.
-The example demonstrates `format = "json"` logging and m6-file's tail mode.
+The example demonstrates JSON logging and m6-file's tail mode.
 
 ```bash
 cd examples/08-logviewer
@@ -1779,7 +1828,7 @@ cd examples/08-logviewer
 The stack is three processes: m6-http, m6-html and m6-file.
 `dev.sh` redirects each process's output to its own file under `logs/`, so the viewer has one file per process.
 
-`site.toml` sets `format = "json"` and `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
+`site.toml` sets `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
 The route is direct, so m6-http forwards the request without requiring the log files to exist at startup.
 The example leaves the tail route unauthenticated, and `level = "debug"` logs can carry request detail.
 A production deployment protects the route with `require = "role:..."`, the way section 7.9 protects the monitor history.
@@ -1919,7 +1968,7 @@ The checks cover public access, a 401 without a token, token create, list and re
 ## 12. Example 11, admin dashboard API
 
 Example 11 is a self-hosting management API and dashboard for an m6 site.
-It is a custom renderer, `render-admin`, built on `App::with_global`.
+It is a custom renderer, `render-admin`, with its own loop and plain state in `main`.
 Every `/api/admin/*` route is protected by `require = "role:admin"`.
 
 ```bash
@@ -1928,6 +1977,9 @@ cd examples/11-admin-dashboard
 ./dev.sh
 # open https://localhost:8444/
 ```
+
+Example 11 runs on Linux.
+On macOS, `render-admin` exits 2 at start because the shipped config sets `bench_bin` and the bench child is reaped from a pidfd, which only Linux provides.
 
 The dashboard is served by m6-file at `https://localhost:8444/` and refreshes every 10 seconds.
 It has six tabs: Perf, System, Bench, Logs, Routes and Config.

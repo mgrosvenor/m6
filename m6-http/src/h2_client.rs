@@ -18,7 +18,7 @@ use crate::forward::{
 };
 use m6_core::client::TlsClient;
 use m6_core::event::Timeouts;
-use m6_core::mio::{Interest, Registry, Token};
+use m6_core::platform::{Interest, Registry, Token};
 
 // ── Frame constants ───────────────────────────────────────────────────────────
 
@@ -98,6 +98,10 @@ struct H2Stream {
     resp_headers: Vec<(String, String)>,
     resp_body: Vec<u8>,
     headers_done: bool,
+    /// END_STREAM has arrived. A header block split across HEADERS and
+    /// CONTINUATION frames is one block (RFC 9113 6.2), so the reply is
+    /// complete only when the block ends too.
+    end_stream: bool,
     /// Informational (1xx) header blocks seen so far on this stream.
     informational: usize,
     /// Who waits for this stream's reply, stored here by the loop's owner once
@@ -226,14 +230,14 @@ impl<T: Transport> H2Client<T> {
     /// convenience constructors use this so their callers keep the blocking
     /// contract they were written against.
     pub(crate) fn wait_until_open(&mut self) -> io::Result<()> {
-        let mut poll = m6_core::mio::Poll::new()?;
-        poll.registry().register(
-            &mut m6_core::mio::unix::SourceFd(&self.raw_fd()),
+        let mut poll = m6_core::platform::Poll::new()?;
+        poll.registry().register_fd(
+            self.raw_fd(),
             Token(0),
             Interest::READABLE | Interest::WRITABLE,
         )?;
-        let mut events = m6_core::mio::Events::with_capacity(8);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut events = m6_core::platform::Events::with_capacity(8);
+        let deadline = m6_core::platform::now() + Duration::from_secs(10);
         loop {
             self.drive();
             if self.is_open() {
@@ -245,7 +249,7 @@ impl<T: Transport> H2Client<T> {
                     format!("{}: connection failed", T::prefix()),
                 ));
             }
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(m6_core::platform::now());
             if left.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -428,6 +432,7 @@ impl<T: Transport> H2Client<T> {
                 resp_headers: vec![],
                 resp_body: vec![],
                 headers_done: false,
+                end_stream: false,
                 informational: 0,
                 waiter: None,
                 ctx: None,
@@ -690,15 +695,26 @@ impl<T: Transport> H2Client<T> {
                     }
 
                     if flags & FLAG_END_STREAM != 0 {
-                        self.complete_stream(stream_id);
+                        if flags & FLAG_END_HEADERS != 0 {
+                            self.complete_stream(stream_id);
+                        } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                            // The header block continues in CONTINUATION
+                            // frames, so the reply ends when the block ends.
+                            s.end_stream = true;
+                        }
                     }
                 }
 
                 TYPE_CONTINUATION if stream_id > 0 => {
                     self.header_block_acc.extend_from_slice(payload);
 
-                    if flags & FLAG_END_HEADERS != 0 && !self.finish_header_block(stream_id) {
-                        return;
+                    if flags & FLAG_END_HEADERS != 0 {
+                        if !self.finish_header_block(stream_id) {
+                            return;
+                        }
+                        if self.streams.get(&stream_id).is_some_and(|s| s.end_stream) {
+                            self.complete_stream(stream_id);
+                        }
                     }
                 }
 
@@ -1081,7 +1097,7 @@ impl<T: Transport> Pool<T> {
             Self::register_interest(conn, registry);
             (conn.token(), stream_id)
         };
-        let slot = self.take_deadline_slot(token, stream_id, Instant::now());
+        let slot = self.take_deadline_slot(token, stream_id, m6_core::platform::now());
         if let Some(stream) = self
             .connections
             .get_mut(base_url)
@@ -1102,11 +1118,7 @@ impl<T: Transport> Pool<T> {
         let interest = conn.phase_interest();
         if interest != conn.registered_interest {
             registry
-                .reregister(
-                    &mut m6_core::mio::unix::SourceFd(&conn.raw_fd()),
-                    conn.token(),
-                    interest,
-                )
+                .reregister_fd(conn.raw_fd(), conn.token(), interest)
                 .ok();
             conn.registered_interest = interest;
         }
@@ -1219,33 +1231,17 @@ impl<T: Transport> Pool<T> {
             .map(|(k, _)| k.clone());
         if let Some(url) = url {
             if let Some(conn) = self.connections.remove(&url) {
-                registry
-                    .deregister(&mut m6_core::mio::unix::SourceFd(&conn.raw_fd()))
-                    .ok();
+                registry.deregister_fd(conn.raw_fd()).ok();
             }
         }
     }
 }
 
-/// Start a non-blocking TCP connect. `EINPROGRESS` is success: the caller waits
+/// Start a non-blocking TCP connect. In progress is success: the caller waits
 /// for writability and then checks the socket's error.
 pub(crate) fn nonblocking_tcp_connect(addr: SocketAddr) -> io::Result<TcpStream> {
-    let domain = if addr.is_ipv4() {
-        socket2::Domain::IPV4
-    } else {
-        socket2::Domain::IPV6
-    };
-    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-    sock.set_nonblocking(true)?;
-    sock.set_tcp_nodelay(true)?;
-    match sock.connect(&socket2::SockAddr::from(addr)) {
-        Ok(()) => {}
-        Err(e)
-            if e.kind() == io::ErrorKind::WouldBlock
-                || e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        Err(e) => return Err(e),
-    }
-    Ok(TcpStream::from(std::os::fd::OwnedFd::from(sock)))
+    let (stream, _) = m6_core::platform::net::connect_tcp(addr)?;
+    Ok(stream)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

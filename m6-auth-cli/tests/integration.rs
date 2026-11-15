@@ -98,6 +98,18 @@ impl TestEnv {
         cmd.output().expect("run binary")
     }
 
+    /// Create a user directly at bcrypt's lowest cost, 4.
+    ///
+    /// `user add` is production code and hashes at cost 12, which an
+    /// unoptimised build pays seconds for. A test that only needs the user
+    /// seeds it here. The tests whose subject is `user add` or `user passwd`
+    /// still run the command.
+    fn seed(&self, username: &str, password: &str, roles: &[&str]) {
+        let db = m6_auth::Db::open(&self.dir.path().join("data/auth.db")).expect("open db");
+        db.user_create_with_cost(username, password, roles, 4)
+            .expect("seed user");
+    }
+
     /// Run a setup command and assert that it exited 0.
     ///
     /// A setup command that fails silently makes the test fail far from the
@@ -143,16 +155,6 @@ fn test_bootstrap_user_add() {
 #[test]
 fn test_bootstrap_group_add() {
     let env = TestEnv::new();
-    // Need a user first for group member add
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
     let out = env.run(&["group", "add", "editors"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -160,15 +162,7 @@ fn test_bootstrap_group_add() {
 #[test]
 fn test_bootstrap_group_member_add() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
+    env.seed("admin", "secret", &["admin"]);
     env.run_ok(&["group", "add", "editors"]);
     let out = env.run(&["group", "member", "add", "editors", "admin"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -177,15 +171,7 @@ fn test_bootstrap_group_member_add() {
 #[test]
 fn test_bootstrap_user_ls_json_contains_admin() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
+    env.seed("admin", "secret", &["admin"]);
     env.run_ok(&["group", "add", "editors"]);
     env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
@@ -207,15 +193,7 @@ fn test_bootstrap_user_ls_json_contains_admin() {
 #[test]
 fn test_bootstrap_group_member_ls_shows_admin() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
+    env.seed("admin", "secret", &["admin"]);
     env.run_ok(&["group", "add", "editors"]);
     env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
@@ -265,7 +243,7 @@ fn test_full_bootstrap_sequence() {
 #[test]
 fn test_user_add_duplicate_exits_1() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "pass1"]);
+    env.seed("alice", "pass1", &[]);
     let out = env.run(&["user", "add", "alice", "--password", "pass2"]);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
     let err = stderr(&out);
@@ -324,8 +302,8 @@ fn test_no_arguments_exits_2() {
 #[test]
 fn test_user_ls_json_is_valid_array() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
-    env.run_ok(&["user", "add", "bob", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
+    env.seed("bob", "pw", &[]);
 
     let out = env.run(&["user", "ls", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -356,17 +334,7 @@ fn test_group_ls_json_is_valid_array() {
 #[test]
 fn test_user_ls_table_format() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "alice",
-        "--role",
-        "admin",
-        "--role",
-        "user",
-        "--password",
-        "pw",
-    ]);
+    env.seed("alice", "pw", &["admin", "user"]);
 
     let out = env.run(&["user", "ls"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -392,7 +360,7 @@ fn test_group_ls_table_format() {
 #[test]
 fn test_user_passwd() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "old"]);
+    env.seed("alice", "old", &[]);
     let out = env.run(&["user", "passwd", "alice", "--password", "newpass"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -402,7 +370,7 @@ fn test_user_passwd() {
 #[test]
 fn test_user_roles_set_unset() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--role", "user", "--password", "pw"]);
+    env.seed("alice", "pw", &["user"]);
 
     // Add admin role
     let out = env.run(&["user", "roles", "alice", "--set", "admin"]);
@@ -459,7 +427,7 @@ fn test_group_del() {
 #[test]
 fn test_user_del() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "tmp", "--password", "pw"]);
+    env.seed("tmp", "pw", &[]);
     let out = env.run(&["user", "del", "tmp"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
@@ -474,7 +442,7 @@ fn test_user_del() {
 fn test_token_create_prints_jwt() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
 
     let out = env.run(&["token", "create", "alice", "--name", "ci"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -500,7 +468,7 @@ fn test_token_create_unknown_user_exits_1() {
 fn test_token_create_missing_keys_exits_1() {
     let env = TestEnv::new();
     // No setup_keys() call — keys dir doesn't exist
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
 
     let out = env.run(&["token", "create", "alice"]);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
@@ -516,7 +484,7 @@ fn test_token_create_missing_keys_exits_1() {
 fn test_token_ls_shows_created_token() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["token", "create", "alice", "--name", "mytoken"]);
 
     let out = env.run(&["token", "ls", "alice"]);
@@ -529,7 +497,7 @@ fn test_token_ls_shows_created_token() {
 fn test_token_ls_json_is_valid_array() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["token", "create", "alice", "--name", "t1"]);
     env.run_ok(&["token", "create", "alice", "--name", "t2"]);
 
@@ -548,7 +516,7 @@ fn test_token_ls_json_is_valid_array() {
 fn test_token_revoke_removes_token() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["token", "create", "alice", "--name", "todel"]);
 
     // Get the token ID from JSON listing
@@ -586,7 +554,7 @@ fn test_token_revoke_unknown_exits_1() {
 #[test]
 fn test_group_member_del() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["group", "add", "team"]);
     env.run_ok(&["group", "member", "add", "team", "alice"]);
 

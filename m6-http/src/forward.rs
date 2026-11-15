@@ -4,7 +4,7 @@ use std::io;
 
 pub use m6_core::client::too_many_informational;
 use m6_core::client::{is_skipped_informational, MAX_INFORMATIONAL};
-use m6_core::mio::Token;
+use m6_core::platform::Token;
 
 /// Hop-by-hop headers to remove before forwarding.
 pub const HOP_BY_HOP: &[&str] = &[
@@ -364,26 +364,6 @@ pub fn request_target_is_safe(target: &[u8]) -> bool {
     !target.iter().any(|&b| b <= b' ' || b == 0x7f)
 }
 
-/// A request m6-http refuses to send to a backend, as the error inside the
-/// `io::Error` a forward returns. A refusal is about the request, not the
-/// backend, so a caller must not count it as a backend failure; its own type
-/// keeps it apart from an `InvalidInput` the operating system raises.
-#[derive(Debug)]
-pub struct Refused(pub String);
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Refused {}
-
-/// True when a forward's error is m6-http's own refusal (see [`Refused`]).
-pub fn is_refusal(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<Refused>())
-}
-
 /// Everything this proxy is about to write into a request line or header block.
 ///
 /// Checked in one place, and checked for *every* ingress protocol rather than
@@ -503,9 +483,7 @@ fn encode_forwarded(
     if let Err(what) = check_forwardable(req, client_ip, original_host) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            Refused(format!(
-                "refusing to forward: unsafe {what} would inject HTTP/1.1 framing"
-            )),
+            format!("refusing to forward: unsafe {what} would inject HTTP/1.1 framing"),
         ));
     }
 
@@ -707,6 +685,10 @@ pub enum UpstreamId {
     H2c { conn: Token, stream: u32 },
     /// An h2s pool stream, by the connection token and the outbound stream id.
     H2s { conn: Token, stream: u32 },
+    /// A `POST /genid` parked on the source's change sequence, which owns its
+    /// completion. Nothing is dispatched for it yet, and no upstream slot is
+    /// taken until the sequence starts.
+    Genid,
 }
 
 /// Who is waiting for an upstream reply, so a completion can be written
@@ -730,6 +712,15 @@ pub enum Waiter {
     },
     /// A background fetch has no connection; the reply only fills the cache.
     Background,
+    /// A cache node's `GET /genid` heartbeat. The reply is the ID and a round
+    /// trip, never a client response, so it is intercepted before finalising.
+    Heartbeat,
+    /// One member's `POST /genid` during a change sequence, by the member's
+    /// index in the sequence. The source logs a failure against that member's
+    /// socket path and advances when the last one answers.
+    Genid {
+        member: u32,
+    },
 }
 
 /// One request the loop dispatched and parked, reported by a connection turn so
@@ -781,6 +772,73 @@ pub struct PendingUrlContext {
     /// `WWW-Authenticate` for a 401 or `Retry-After` for a 503. Empty for every
     /// ordinary dispatch.
     pub extra_headers: Vec<(String, String)>,
+    /// The source's site generation when this request was dispatched. A reply
+    /// carries it as `M6-Genid`, and it is stored only while it still equals
+    /// the current ID, so a cache cannot refill from a backend that is one
+    /// generation behind.
+    pub genid: u64,
+    /// This dispatch forwards the caller's `GET`, `HEAD` or `POST /genid` to a
+    /// cache node's upstream. A deadline is answered as gateway timeout, since
+    /// the source may still be completing the publish.
+    pub genid_forward: bool,
+}
+
+impl PendingUrlContext {
+    /// The context a `POST /genid` parks with. The change sequence completes
+    /// the waiter itself, so no field here is read: it exists because
+    /// `Pending` carries one context for every parked request.
+    pub fn for_genid() -> Box<PendingUrlContext> {
+        Box::new(PendingUrlContext {
+            req: HttpRequest {
+                method: "POST".to_string(),
+                path: m6_core::site::GENID_PATH.to_string(),
+                query: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            client_ip: String::new(),
+            enc: String::new(),
+            backend_name: "genid".to_string(),
+            kind: PendingKind::Socket,
+            route_path: None,
+            cacheable: false,
+            is_prefetch: false,
+            start: m6_core::platform::now(),
+            error_status_override: None,
+            extra_headers: Vec::new(),
+            genid: 0,
+            genid_forward: false,
+        })
+    }
+
+    /// The context a cache node's heartbeat parks with. No field is read: the
+    /// reply is an ID and a round trip, and `Waiter::Heartbeat` is intercepted
+    /// before any response is finalised.
+    pub fn for_heartbeat() -> Box<PendingUrlContext> {
+        Box::new(PendingUrlContext {
+            req: HttpRequest {
+                method: "GET".to_string(),
+                path: m6_core::site::GENID_PATH.to_string(),
+                query: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+            client_ip: String::new(),
+            enc: String::new(),
+            backend_name: "genid".to_string(),
+            kind: PendingKind::Url,
+            route_path: None,
+            cacheable: false,
+            is_prefetch: true,
+            start: m6_core::platform::now(),
+            error_status_override: None,
+            extra_headers: Vec::new(),
+            genid: 0,
+            genid_forward: false,
+        })
+    }
 }
 
 /// Build a simple HTTP response buffer (kept for tests).
@@ -934,19 +992,6 @@ mod smuggling_tests {
                 "value {a:?} must be refused"
             );
         }
-    }
-
-    /// Only m6-http's own refusal is a refusal. The wrong outcome: an
-    /// `InvalidInput` the operating system raises (a zero read timeout, a
-    /// socket path too long) passes for one, so a misconfigured backend is
-    /// never backed off.
-    #[test]
-    fn only_a_refusal_is_a_refusal() {
-        let refused = io::Error::new(io::ErrorKind::InvalidInput, Refused("x".into()));
-        assert!(is_refusal(&refused));
-        let os = io::Error::new(io::ErrorKind::InvalidInput, "path too long");
-        assert!(!is_refusal(&os));
-        assert!(!is_refusal(&io::Error::from(io::ErrorKind::InvalidInput)));
     }
 
     /// A header the proxy strips can never reach the backend, so refusing on it

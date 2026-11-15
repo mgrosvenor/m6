@@ -12,16 +12,19 @@
 //! as the blocking path does today.
 //!
 //! `harness = false`: its own `main`, and the counting allocator is installed
-//! before any thread starts, so the count is only this binary's own.
+//! before any thread starts, so the count is only this binary's own. The
+//! harness speaks libtest's protocol through `libtest-mimic`, and the checks
+//! are forced onto one thread so each runs in this `main` thread.
 
 use std::io::Read as _;
 use std::io::Write;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::h1::{self, Flush, Read, ServerConn};
-use m6_core::mio;
-use m6_core::mio::{Events, Interest, Poll, Token};
+use m6_core::platform;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
@@ -39,46 +42,81 @@ const RESPONSE_LEN: usize = 90;
 const RESPONSE_LEN_CLOSE: usize = RESPONSE_LEN - 5;
 
 fn main() {
-    let mut failed = false;
-    failed |= check(
-        "a_conn_serves_keep_alive_requests_without_allocating",
-        a_conn_serves_keep_alive_requests_without_allocating,
-    );
-    failed |= check(
-        "a_pipelined_pair_is_served_from_one_read",
-        a_pipelined_pair_is_served_from_one_read,
-    );
-    failed |= check(
-        "a_large_upload_grows_and_returns_the_buffer",
-        a_large_upload_grows_and_returns_the_buffer,
-    );
-    failed |= check(
-        "a_stream_body_is_pumped_per_writable_turn",
-        a_stream_body_is_pumped_per_writable_turn,
-    );
-    failed |= check(
-        "keep_alive_and_the_request_cap",
-        keep_alive_and_the_request_cap,
-    );
-    failed |= check("parse_errors_answer_as_today", parse_errors_answer_as_today);
-    failed |= check(
-        "a_chunked_body_split_across_reads_is_one_request",
-        a_chunked_body_split_across_reads_is_one_request,
-    );
-    failed |= check(
-        "a_declared_body_does_not_allocate_before_it_arrives",
-        a_declared_body_does_not_allocate_before_it_arrives,
-    );
-    failed |= check("a_response_allocates_nothing", a_response_allocates_nothing);
-    std::process::exit(if failed { 1 } else { 0 });
+    let mut args = Arguments::from_args();
+    // One thread: `libtest-mimic` then runs every trial in this (the main)
+    // thread, so the counting allocator reads only the trial's own
+    // allocations and no other thread's.
+    args.test_threads = Some(1);
+    let tests = vec![
+        Trial::test(
+            "a_conn_serves_keep_alive_requests_without_allocating",
+            || {
+                check(
+                    "a_conn_serves_keep_alive_requests_without_allocating",
+                    a_conn_serves_keep_alive_requests_without_allocating,
+                )
+            },
+        ),
+        Trial::test("a_pipelined_pair_is_served_from_one_read", || {
+            check(
+                "a_pipelined_pair_is_served_from_one_read",
+                a_pipelined_pair_is_served_from_one_read,
+            )
+        }),
+        Trial::test("a_large_upload_grows_and_returns_the_buffer", || {
+            check(
+                "a_large_upload_grows_and_returns_the_buffer",
+                a_large_upload_grows_and_returns_the_buffer,
+            )
+        }),
+        Trial::test("a_stream_body_is_pumped_per_writable_turn", || {
+            check(
+                "a_stream_body_is_pumped_per_writable_turn",
+                a_stream_body_is_pumped_per_writable_turn,
+            )
+        }),
+        Trial::test("keep_alive_and_the_request_cap", || {
+            check(
+                "keep_alive_and_the_request_cap",
+                keep_alive_and_the_request_cap,
+            )
+        }),
+        Trial::test("parse_errors_answer_as_today", || {
+            check("parse_errors_answer_as_today", parse_errors_answer_as_today)
+        }),
+        Trial::test("a_chunked_body_split_across_reads_is_one_request", || {
+            check(
+                "a_chunked_body_split_across_reads_is_one_request",
+                a_chunked_body_split_across_reads_is_one_request,
+            )
+        }),
+        Trial::test(
+            "a_declared_body_does_not_allocate_before_it_arrives",
+            || {
+                check(
+                    "a_declared_body_does_not_allocate_before_it_arrives",
+                    a_declared_body_does_not_allocate_before_it_arrives,
+                )
+            },
+        ),
+        Trial::test("a_response_allocates_nothing", || {
+            check("a_response_allocates_nothing", a_response_allocates_nothing)
+        }),
+    ];
+    libtest_mimic::run(&args, tests).exit();
 }
 
-fn check(name: &str, run: fn() -> bool) -> bool {
+/// Run one check and report its outcome as a libtest trial.
+fn check(name: &str, run: fn() -> bool) -> Result<(), Failed> {
     println!("running {name}");
     std::io::stdout().flush().expect("flush");
     let ok = run();
     println!("{name}: {}", if ok { "ok" } else { "FAILED" });
-    !ok
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{name}: FAILED").into())
+    }
 }
 
 /// A slot with an attached server end, the client end of the same pair, and
@@ -103,10 +141,10 @@ fn harness() -> Harness {
     client
         .set_write_timeout(Some(DEADLINE))
         .expect("a write deadline");
-    harness_with((client, mio::net::UnixStream::from_std(server)))
+    harness_with((client, platform::net::UnixStream::from_std(server)))
 }
 
-fn harness_with(pair: (StdUnixStream, mio::net::UnixStream)) -> Harness {
+fn harness_with(pair: (StdUnixStream, platform::net::UnixStream)) -> Harness {
     let (client, server) = pair;
     let poll = Poll::new().expect("a poll");
     let mut conn = ServerConn::new(READ_CAP, WRITE_CAP);
@@ -176,7 +214,7 @@ impl Harness {
     }
 
     /// Swap in the next connection's ends: deregister the old, attach the new.
-    fn next_connection(&mut self, client: StdUnixStream, server: mio::net::UnixStream) {
+    fn next_connection(&mut self, client: StdUnixStream, server: platform::net::UnixStream) {
         if let Some(mut old) = self.conn.detach() {
             self.poll
                 .registry()
@@ -267,7 +305,7 @@ fn a_conn_serves_keep_alive_requests_without_allocating() -> bool {
     // count starts: attaching one allocates nothing.
     const CONNECTIONS: usize = 10;
     const PER_CONNECTION: usize = 100;
-    let mut pairs: Vec<(StdUnixStream, mio::net::UnixStream)> = (0..CONNECTIONS)
+    let mut pairs: Vec<(StdUnixStream, platform::net::UnixStream)> = (0..CONNECTIONS)
         .map(|_| {
             let (client, server) = StdUnixStream::pair().expect("a socket pair");
             server
@@ -279,7 +317,7 @@ fn a_conn_serves_keep_alive_requests_without_allocating() -> bool {
             client
                 .set_write_timeout(Some(DEADLINE))
                 .expect("a write deadline");
-            (client, mio::net::UnixStream::from_std(server))
+            (client, platform::net::UnixStream::from_std(server))
         })
         .collect();
 
@@ -603,15 +641,16 @@ fn keep_alive_and_the_request_cap() -> bool {
 }
 
 fn parse_errors_answer_as_today() -> bool {
-    // Header too large: 413, as `parse.rs` answers a head over its cap.
+    // Header too large: 400, the same answer the edge gives. 413 means the
+    // body, and a head over its limit is not the body.
     {
         let mut h = harness();
-        // A complete head over the cap is accepted today (the cap is on an
-        // unfinished head), so this one never sends the blank line.
+        // An unfinished head over the 32 KiB cap: the refusal arrives before
+        // the blank line does, which is the bound the process needs.
         let mut request = b"GET /x HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        // Over the 8 KiB head cap and under the 64 header slots, so the
+        // Over the 32 KiB head cap and under the 64 header slots, so the
         // refusal is the size cap rather than the header count.
-        for i in 0..12 {
+        for i in 0..45 {
             request.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "a".repeat(800)).as_bytes());
         }
         let mut writer = h.client.try_clone().expect("a client clone");
@@ -638,7 +677,7 @@ fn parse_errors_answer_as_today() -> bool {
         let mut response = [0u8; 4096];
         let n = h.client.read(&mut response).expect("read the refusal");
         let text = String::from_utf8_lossy(&response[..n]).to_string();
-        if flush != Flush::Close || !text.starts_with("HTTP/1.1 413 Payload Too Large\r\n") {
+        if flush != Flush::Close || !text.starts_with("HTTP/1.1 400 Bad Request\r\n") {
             println!("  header too large: {flush:?} {text:?}");
             return false;
         }

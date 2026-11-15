@@ -3,7 +3,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -95,6 +95,52 @@ fn l1_valid_config_starts_and_socket_appears() {
     );
 }
 
+/// A config that still asks for a thread pool is refused at start: the
+/// operator hears about it with exit 2, and no socket is left behind.
+#[test]
+fn a_thread_pool_section_is_refused_at_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("site.toml"), "").unwrap();
+    let config = dir.path().join("m6-file.conf");
+    std::fs::write(&config, "[thread_pool]\nsize = 4\n").unwrap();
+    let socket = dir.path().join("refused.sock");
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(dir.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+    );
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-file did not refuse [thread_pool]\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    let output = svc.output();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "m6-file should exit 2 for [thread_pool]\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("[thread_pool]"),
+        "the error must name the table\n{output}"
+    );
+    assert!(
+        output.contains("run more instances"),
+        "the error must say what to do instead\n--- output ---\n{output}"
+    );
+    assert!(
+        !socket.exists(),
+        "a refused start must not leave a socket at {}",
+        socket.display()
+    );
+}
+
 #[test]
 fn l1_sigterm_exits_zero() {
     let (guard, socket_path) = spawn_server("l1-sigterm");
@@ -121,6 +167,28 @@ fn l1_sigterm_exits_zero() {
         socket_path.display()
     );
     m6_core::testkit::assert_lifecycle_logged("m6-file", &guard.svc.output());
+}
+
+/// A request writes an access line at the default level, so a service that has
+/// not raised its level still has an access log.
+#[test]
+fn an_access_line_is_logged_at_the_default_level() {
+    let (guard, socket_path) = spawn_server("l2-access-log");
+
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let resp = http_request(&socket_path, req);
+    assert!(resp.contains("200 OK"), "expected 200, got:\n{resp}");
+
+    let logged = wait::until(Duration::from_secs(5), || {
+        let output = guard.svc.output();
+        output.contains(r#""level":"INFO""#) && output.contains(r#""message":"request complete""#)
+    });
+    assert!(
+        logged,
+        "no access line at the default level\n--- output ---\n{}",
+        guard.svc.output()
+    );
 }
 
 // ─── L2 Path Resolution ───────────────────────────────────────────────────────
@@ -189,8 +257,8 @@ fn l2_query_relpath_cannot_replace_the_path_parameter() {
                Host: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
     assert!(
-        !resp.contains("[thread_pool]"),
-        "a query relpath served a file outside the root: {}",
+        !resp.contains("[compression]"),
+        "a query relpath served the service's config: {}",
         &resp[..resp.len().min(300)]
     );
     assert!(
@@ -732,150 +800,6 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
     more.clear();
 }
 
-/// The accept arm is reached and survives when inherited descriptors, not the
-/// table, exhaust the limit.
-///
-/// The launcher opens 40 descriptors before the exec, so a hard limit of 64
-/// leaves only a few free although the table is 24. Clients are connected one
-/// at a time: after each one the test waits for that client's first response
-/// byte or for an accept error before connecting the next, and stops at the
-/// first error. That discovers the free descriptor count instead of assuming
-/// it, and the failed pass is the last listener event. The arm must log exactly
-/// one line, not repeat it over a stability window, keep the service alive and
-/// leave an accepted connection answered.
-#[test]
-fn a_descriptor_shortage_from_outside_the_table_sheds_one_accept_pass() {
-    const HARD: u64 = 64;
-    /// Opened by the launcher before the exec. stdio, the listener, the signal
-    /// descriptor and the poll take about 46, so accept runs out well before
-    /// the 24-slot table fills.
-    const INHERITED: usize = 40;
-    /// Enough for any plausible free count. Reaching it means the inherited
-    /// descriptors did not bring the service near its limit.
-    const MAX_CLIENTS: usize = 40;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let site = dir.path();
-    std::fs::create_dir_all(site.join("assets")).unwrap();
-    std::fs::write(site.join("site.toml"), "").unwrap();
-    // Larger than any socket buffer, so a served request keeps its file
-    // descriptor until the client reads.
-    let big: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
-    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
-    let config = site.join("m6-file.conf");
-    std::fs::write(&config, ASSETS_ROUTE).unwrap();
-
-    let socket_path = dir.path().join("pressure.sock");
-    let mut command =
-        m6_core::testkit::lowered_fd_limit_command(HARD, INHERITED, binary("m6-file"));
-    command
-        .arg(site)
-        .arg(&config)
-        .env("M6_SOCKET_OVERRIDE", &socket_path);
-    let mut svc = Service::spawn("m6-file", &mut command);
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
-        "m6-file never accepted a connection"
-    );
-
-    fn accept_errors(output: &str) -> usize {
-        output.matches("accept error").count()
-    }
-    fn answered(client: &UnixStream) -> bool {
-        let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
-        matches!(socket2::SockRef::from(client).peek(&mut byte), Ok(n) if n > 0)
-    }
-
-    let mut clients: Vec<UnixStream> = Vec::new();
-    loop {
-        assert!(
-            clients.len() < MAX_CLIENTS,
-            "{} inherited descriptors never brought accept to its limit at the table's ceiling\n\
-             --- output ---\n{}",
-            INHERITED,
-            svc.output()
-        );
-        let mut client = UnixStream::connect(&socket_path).expect("connect");
-        client.set_nonblocking(true).expect("non-blocking client");
-        let sent = client.write_all(
-            b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
-        );
-        match sent {
-            Ok(()) => {}
-            // The kernel aborted the connection because its accept failed for
-            // want of a descriptor. The accept line is the outcome; wait for
-            // it below.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-                ) => {}
-            Err(e) => panic!(
-                "connection {} could not send its request: {e}\n--- output ---\n{}",
-                clients.len(),
-                svc.output()
-            ),
-        }
-        // Wait for this client's outcome before the next connection exists,
-        // so the failed pass is the last listener event.
-        let settled = wait::until(Duration::from_secs(10), || {
-            accept_errors(&svc.output()) >= 1 || answered(&client)
-        });
-        assert!(
-            settled,
-            "connection {} was neither answered nor refused within 10 s\n--- output ---\n{}",
-            clients.len(),
-            svc.output()
-        );
-        clients.push(client);
-        if accept_errors(&svc.output()) >= 1 {
-            break;
-        }
-    }
-
-    assert_eq!(
-        accept_errors(&svc.output()),
-        1,
-        "the accept arm logged one line per pass, not one\n--- output ---\n{}",
-        svc.output()
-    );
-
-    // No growth over a stability window: no connection arrives after the
-    // failed pass, so no listener event can start another one.
-    assert!(
-        !wait::until(Duration::from_millis(750), || accept_errors(&svc.output())
-            > 1),
-        "the accept error repeated\n--- output ---\n{}",
-        svc.output()
-    );
-    svc.assert_alive("after an accept error from inherited descriptors");
-
-    // An accepted connection is still answered. The streamed file may or may
-    // not open, depending on how many connections were accepted before the
-    // limit; either status proves the loop came back and served it.
-    let mut first = clients.remove(0);
-    first.set_nonblocking(false).expect("blocking client");
-    first
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .expect("timeout");
-    let response = m6_core::testkit::read_one(&mut first, "GET")
-        .expect("an accepted connection was not answered");
-    let status = String::from_utf8_lossy(&response[..response.len().min(32)]).to_string();
-    assert!(
-        status.contains("200") || status.contains("404"),
-        "the accepted connection was answered with {status}"
-    );
-
-    assert_eq!(
-        accept_errors(&svc.output()),
-        1,
-        "a second accept-error line appeared\n--- output ---\n{}",
-        svc.output()
-    );
-    svc.assert_alive("after answering on an accepted connection");
-}
-
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.
@@ -1240,7 +1164,7 @@ fn site_with_two_trees() -> tempfile::TempDir {
 }
 
 fn write_config(path: &Path, routes: &str) {
-    std::fs::write(path, format!("[thread_pool]\nsize = 4\n\n{routes}")).unwrap();
+    std::fs::write(path, routes).unwrap();
 }
 
 /// The lifecycle contract, which m6-file gets from the same
