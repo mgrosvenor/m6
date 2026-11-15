@@ -336,17 +336,23 @@ Take from it that the bind, the certificate and the key are required, and every 
 | `internal_binds` | list of strings | when `h2c_bind` is set | Set to `h2c_bind`, an `"ip:port"` in a local range, to make the h2c listener internal. `[]` means none |
 | `internal_peers` | list of strings | when `internal_binds` is not empty | IP addresses in a local range. The only peers the internal h2c listener accepts, and a connection from any other address is closed |
 | `max_requests_per_connection` | integer | no | Default `100`, and `0` is a config error. The most requests one HTTP/1.1 connection serves before m6-http closes it, so a client that makes more than this many HTTP/1.1 requests reconnects, with a new TLS handshake. System config only, read at start |
-| `reuse_port` | boolean | no | Default `false`. When `true`, only the public 443 port is shared: its TLS listener and QUIC UDP socket on `bind` are bound with `SO_REUSEPORT` in one call, so several m6-http processes serve that port. The redirect port 80, the internal h2c socket, the health endpoints and every backend socket are not shared. Linux spreads a new connection by a hash and macOS does not, so the split is not even. System config only, read at start |
+| `reuse_port` | boolean | no | Default `false`. When `true`, only the public 443 port is shared: its TLS listener and QUIC UDP socket on `bind` are bound with `SO_REUSEPORT` in one call, so several m6-http processes serve that port. The redirect port 80, the internal h2c socket and every backend socket are not shared. Linux spreads a new connection by a hash and macOS does not, so the split is not even. System config only, read at start |
 
 **Table 3: the `[server]` keys.**
 The bind addresses and the internal lists choose where the process listens and whom it trusts, and the certificate and key choose what it presents.
 
 `reuse_port` is off by default, so an accidental second m6-http on a node's public port fails at bind and an existing config binds exactly as before.
 Set it to `true` on every process that should serve the public 443 port: only its TLS listener and its QUIC UDP socket on `bind` are bound in one call, so a request is answered by one of the processes.
-That is the whole scope. No other socket is shared: the redirect listener on `redirect_bind` (port 80), the internal h2c listener on `h2c_bind`, the health endpoints and every backend socket keep the binding they had.
+That is the whole scope. No other socket is shared: the redirect listener on `redirect_bind` (port 80), the internal h2c listener on `h2c_bind` and every backend socket keep the binding they had.
+The health endpoints are served on the shared listener, so a probe reaches one process.
 A redirector binds one plain-HTTP listener on `redirect_bind` and has no TLS or QUIC listener to share.
 Linux spreads a new TCP connection by a hash of its 4-tuple and macOS does not, so the split is not even and no process is guaranteed traffic.
 A QUIC client that changes address may land on another process.
+
+The per-IP limit in `[rate_limit]` is counted in each process's memory, and §4.13 states it.
+With the default `requests_per_min = 300`, one process on the public port allows one client 300 requests in a 60-second window.
+With `reuse_port`, three processes on that port allow one client up to 900 requests in the same window, because each process keeps its own count.
+An operator who needs the node to enforce one number sets `requests_per_min` to the node total divided by the process count, or enforces the limit at the front door.
 
 The certificate and key files are read once at start.
 A renewal writes both and restarts m6-http, which then serves the new pair on HTTP/1.1, HTTP/2 and HTTP/3.
@@ -683,6 +689,35 @@ dir = "/var/cache/m6-http"
 
 The unit's `CacheDirectory=m6-http` creates `/var/cache/m6-http` and owns it.
 Section 4.11 states how the generation directory is chosen.
+
+### 4.13. `[rate_limit]`
+
+m6-http counts requests from each client address in a fixed 60-second window, and it answers 429 with `Retry-After: 60` when the count passes the limit.
+The table lives in `site.toml`, because every process of a site enforces the same limit.
+Table 15 gives the keys.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | boolean | `true` | `false` turns the limiter off |
+| `requests_per_min` | integer | `300` | Requests allowed from one client address in a 60-second window. `0` refuses every request |
+
+**Table 15: the `[rate_limit]` keys.**
+Take from it that the limiter is on by default at 300 requests per client in 60 seconds.
+
+The count is keyed by client address and kept in one process's memory.
+One process on the public port enforces 300 requests per client per minute for the node.
+With `[server] reuse_port`, N processes on one port keep N counts, so one client can reach up to N times `requests_per_min` across the port: three processes at the default allow 900 requests in a minute.
+An operator who needs the node to enforce one number sets `requests_per_min` to the node total divided by N, or enforces the limit at the front door.
+
+```toml
+[rate_limit]
+enabled = true
+requests_per_min = 300
+```
+
+An idea for a later batch on Linux is a *reuseport socket filter* (*BPF*, Berkeley Packet Filter) attached to the shared listener, which hashes each client address to one process.
+Every connection from one address then lands on the same process, and the per-process count equals the per-client count.
+The filter is a new mechanism on the connection path, and this batch's rule is latency first with no new mechanisms, so the idea waits for a later batch.
 
 ## 5. Route matching
 

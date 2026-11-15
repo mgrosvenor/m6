@@ -165,8 +165,9 @@ pub struct ServerConfig {
     /// True routes both sockets through `m6_platform::net::listen_shared`, so
     /// they are bound in one call and always share the public 443 port. No
     /// other socket is shared: the redirect listener on port 80, the internal
-    /// h2c listener, the health endpoints and every backend socket keep their
-    /// own binding. Linux spreads a new connection across the sockets by a
+    /// h2c listener and every backend socket keep their own binding. The
+    /// health endpoints are served on that shared listener, so a probe reaches
+    /// one process. Linux spreads a new connection across the sockets by a
     /// hash of its 4-tuple and macOS does not, so the split is not even and no
     /// process is guaranteed traffic. A QUIC client that changes address may
     /// land on another process. Read at start, and a change needs a restart.
