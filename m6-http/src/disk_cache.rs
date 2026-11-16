@@ -1199,6 +1199,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
+        // The two writes are three MiB each, so the byte budget is what splits
+        // them. Pin the loop-time budget so a loaded host cannot end the tick
+        // before the first file, as the other byte-budget tests do.
+        w.time_budget = Duration::from_secs(60);
         // Three MiB, then three again: the first fills most of a tick and the
         // second cannot fit beside it.
         let big = vec![0u8; 3 * 1024 * 1024 - 4096];
