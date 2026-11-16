@@ -438,6 +438,20 @@ mod tests {
         );
     }
 
+    /// A port of 0 gives the TCP listener and the UDP socket one port. The
+    /// steering tests below depend on it: two UDP sockets on different ports
+    /// are not a reuseport group, and every datagram goes to the one bound to
+    /// the port it is sent to. Break: bind the UDP socket to `addr` as it was
+    /// asked for, and the first member's UDP port differs from its TCP port.
+    #[test]
+    fn a_port_of_zero_gives_both_halves_one_port() {
+        let first = listen_shared(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("first");
+        assert_eq!(
+            first.0.local_addr().expect("tcp addr").port(),
+            first.1.local_addr().expect("udp addr").port()
+        );
+    }
+
     /// The same for UDP, which is what QUIC runs on. Break: as above.
     #[test]
     fn udp_datagrams_from_one_address_reach_one_socket() {

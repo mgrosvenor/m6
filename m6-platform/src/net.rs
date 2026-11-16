@@ -106,6 +106,8 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
 
 /// A non-blocking TCP listener and UDP socket bound to one address with
 /// `SO_REUSEPORT`, so several processes serve the same public port. Start only.
+/// With a port of 0 the kernel picks one for the TCP listener, and the UDP
+/// socket is bound to that same port.
 ///
 /// The option is set on each socket before its `bind`, which is the only point
 /// where it has an effect. Left alone, Linux spreads a new TCP connection
@@ -156,6 +158,13 @@ pub fn listen_shared(
     tcp.set_reuse_address(true)?;
     tcp.set_reuse_port(true)?;
     tcp.bind(&addr.into())?;
+    // A port of 0 asks the kernel for one. The UDP socket takes the TCP
+    // listener's port, not a port of its own: sockets only share a reuseport
+    // group on one address, and the two halves are one public port.
+    let addr = tcp
+        .local_addr()?
+        .as_socket()
+        .unwrap_or(addr);
     tcp.listen(128)?;
     tcp.set_nonblocking(true)?;
     if let Some(n) = group_size {
