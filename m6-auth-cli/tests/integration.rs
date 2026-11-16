@@ -98,6 +98,12 @@ impl TestEnv {
         cmd.output().expect("run binary")
     }
 
+    /// The database this test's config names, for a fixture that writes it
+    /// through `m6_auth` rather than through the CLI.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.dir.path().join("data/auth.db")
+    }
+
     /// Create a user directly at bcrypt's lowest cost, 4.
     ///
     /// `user add` is production code and hashes at cost 12, which an
@@ -105,7 +111,7 @@ impl TestEnv {
     /// seeds it here. The tests whose subject is `user add` or `user passwd`
     /// still run the command.
     fn seed(&self, username: &str, password: &str, roles: &[&str]) {
-        let db = m6_auth::Db::open(&self.dir.path().join("data/auth.db")).expect("open db");
+        let db = m6_auth::Db::open(&self.db_path()).expect("open db");
         db.user_create_with_cost(username, password, roles, 4)
             .expect("seed user");
     }
@@ -496,20 +502,94 @@ fn test_token_ls_shows_created_token() {
 #[test]
 fn test_token_ls_json_is_valid_array() {
     let env = TestEnv::new();
-    env.setup_keys();
     env.seed("alice", "pw", &[]);
-    env.run_ok(&["token", "create", "alice", "--name", "t1"]);
-    env.run_ok(&["token", "create", "alice", "--name", "t2"]);
+
+    // The two rows this test lists are written here, in this process, and the
+    // connection is closed before the CLI runs. The subject is the shape of
+    // `token ls --json`, not whether two earlier `token create` processes
+    // became visible, so the fixture does not ask the listing to prove another
+    // command's durability. The create-then-list behaviour has its own test,
+    // `test_token_ls_lists_the_token_the_previous_command_created`.
+    let db = m6_auth::Db::open(&env.db_path()).expect("open db");
+    let alice = db
+        .user_get("alice")
+        .expect("read alice")
+        .expect("alice exists");
+    db.api_token_create(&alice.id, "alice", "t1", "hash-of-t1", 2_000_000_000)
+        .expect("write t1");
+    db.api_token_create(&alice.id, "alice", "t2", "hash-of-t2", 2_000_000_000)
+        .expect("write t2");
+    if let Err(e) = db.close() {
+        let (_, err) = *e;
+        panic!("closing the database before the CLI opens it: {err}");
+    }
 
     let out = env.run(&["token", "ls", "alice", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}, stdout: {}",
+        stderr(&out),
+        stdout(&out)
+    );
     let body = stdout(&out);
-    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(parsed.is_array(), "expected array, got: {}", body);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "token ls --json did not parse ({e}); stdout was {body:?}, stderr was {:?}",
+            stderr(&out)
+        )
+    });
+    assert!(parsed.is_array(), "expected array, got: {body}");
     let arr = parsed.as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    assert!(arr.iter().any(|t| t["name"] == "t1"), "t1 not found");
-    assert!(arr.iter().any(|t| t["name"] == "t2"), "t2 not found");
+    assert_eq!(arr.len(), 2, "expected two tokens, got: {body}");
+    assert!(
+        arr.iter().any(|t| t["name"] == "t1"),
+        "t1 not found in {body}"
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "t2"),
+        "t2 not found in {body}"
+    );
+}
+
+/// The record from m6 issue 327: a `token create` that exits 0 must be listed
+/// by the very next command. No retry and no sleep: the create's exit is the
+/// event, and the listing is the assertion, so a create that reports success
+/// without its row being visible fails here with both commands' output.
+#[test]
+fn test_token_ls_lists_the_token_the_previous_command_created() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.seed("alice", "pw", &[]);
+    env.run_ok(&["token", "create", "alice", "--name", "after-create"]);
+
+    let out = env.run(&["token", "ls", "alice", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}, stdout: {}",
+        stderr(&out),
+        stdout(&out)
+    );
+    let body = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "token ls --json did not parse ({e}); stdout was {body:?}, stderr was {:?}",
+            stderr(&out)
+        )
+    });
+    let arr = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array, got {body:?}"));
+    assert_eq!(
+        arr.len(),
+        1,
+        "the token the previous command created is not listed: {body}"
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "after-create"),
+        "the created token is not listed: {body}"
+    );
 }
 
 #[test]
