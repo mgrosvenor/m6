@@ -79,6 +79,7 @@ m6-http starts in this order, before it serves a request.
 9. Start the event loop.
 
 With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_core::platform::net::listen_shared`, before the TLS configuration is built.
+With `reuse_port_processes` set, Linux also attaches a socket filter to both that picks the process from the client's source address, so one client always reaches one process.
 The redirect listener on port 80, the internal h2c listener and every backend socket are not shared.
 `/health`, `/perf` and `/traffic` are answered on the shared port, so the process the kernel picks answers them.
 
@@ -140,9 +141,11 @@ A process restart clears the count.
 The limit applies on HTTP/1.1, HTTP/2 and HTTP/3 alike, and `m6-site-toml.md` §4.13 owns the keys.
 
 One process on the public port enforces `requests_per_min` for the node.
-With `[server] reuse_port`, N processes on one port each keep a count, so one client can reach up to N times `requests_per_min` across the port: three processes at the default allow 900 requests in a minute.
-An operator who needs the node to enforce one number sets `requests_per_min` to the node total divided by the process count, or enforces the limit at the front door.
-`m6-site-toml.md` §4.13 records a Linux socket-filter design that would make the per-process count exact, as an idea for a later batch.
+With `[server] reuse_port` and `reuse_port_processes = N` on Linux, the kernel sends every connection and every QUIC datagram from one client address to the same process, so the limit is exact per client: 300 requests per minute per client across the port, whatever N is.
+On macOS, and on Linux with `reuse_port_processes` unset, each of N processes keeps its own count, so one client can reach up to N times `requests_per_min` across the port: three processes at the default allow 900 requests in a minute.
+An operator who needs one number there sets `requests_per_min` to the node total divided by the process count, or enforces the limit at the front door.
+A process that stops or starts moves some clients to another process until the group is whole again, and a client that moves starts a fresh count there.
+While the group is short of N, a client whose place has no socket is chosen by the kernel's own hash, so a stopped process drops no traffic.
 
 The steps after the limit decide which route and backend serve a request, and the next section states exactly what that backend receives.
 
@@ -505,7 +508,13 @@ In two-file mode all four are node state and live in the system config.
 In one-file mode they live in that one file.
 
 Each of the three endpoints reports the process that accepted the request.
-With `[server] reuse_port`, the kernel chooses that process, so a monitor polling one address reads one front end of N per poll and the report holds that process's share of the node.
+With `[server] reuse_port`, the kernel chooses that process on the shared port, so a monitor polling that address reads one front end of N per poll and the report holds that process's share of the node.
+To read every process, set `[server] process_index` and `status_bind` on each: the process then also answers these three paths on a TLS listener of its own at the `status_bind` port plus its index, and nothing else (any other path is 404).
+The listener is another socket in the same event loop and runs the same handler, under the same `[health]` gate, so the request path of the shared port is unchanged and a process allocates nothing more per request.
+`/health` and `/perf` carry `process_index` when it is set.
+In m6-monitor, `processes = N` on a node polls process `i` at `tunnel.address` with its port raised by `i`, over the tunnel, and reports it as `<node>/<i>`, with one `PROCESSES` line in `/check` and `process_groups` in `/digest` adding the node's processes together.
+A process that is down refuses its own port, so the monitor names that index as a fault.
+`processes = 1` or no `processes` polls the node as one address, as before.
 Section 4.1 states the same split for the request counters.
 
 `/perf` reports three traffic populations and never pools them.

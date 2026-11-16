@@ -147,10 +147,10 @@ fn site_toml(glob: &str) -> String {
     )
 }
 
-fn system_toml(site: &Path, port: u16, node: &str, reuse_port: bool) -> String {
+fn system_toml(site: &Path, port: u16, node: &str, reuse_port: bool, extra: &str) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n\
-         reuse_port = {reuse_port}\n\n[node]\nname = \"scale-{node}\"\n",
+         reuse_port = {reuse_port}\n{extra}\n\n[node]\nname = \"scale-{node}\"\n",
         site.join("cert.pem").display(),
         site.join("key.pem").display(),
     )
@@ -163,8 +163,19 @@ fn system_toml(site: &Path, port: u16, node: &str, reuse_port: bool) -> String {
 /// failed to bind exits before the line, which `assert_alive` reports with its
 /// output.
 fn start_front_end(site: &Path, node: &str, port: u16, reuse_port: bool) -> Service {
+    start_front_end_with(site, node, port, reuse_port, "")
+}
+
+/// [`start_front_end`] with more `[server]` lines.
+fn start_front_end_with(
+    site: &Path,
+    node: &str,
+    port: u16,
+    reuse_port: bool,
+    extra: &str,
+) -> Service {
     let system = site.join(format!("system-{node}.toml"));
-    std::fs::write(&system, system_toml(site, port, node, reuse_port)).expect("system.toml");
+    std::fs::write(&system, system_toml(site, port, node, reuse_port, extra)).expect("system.toml");
     let mut service = Service::spawn(
         "m6-http",
         Command::new(binary("m6-http")).arg(site).arg(&system),
@@ -292,4 +303,83 @@ fn two_front_ends_on_separate_ports_share_one_backend_set() {
         "the stopped front end still accepts connections"
     );
     every_request_is_200(second.port(), 12, "the survivor on its own port");
+}
+
+/// Three consecutive free ports, claimed, for a base port plus an index.
+fn claim_three_in_a_row() -> Vec<m6_core::testkit::PortClaim> {
+    // The claims are handed out in turn, so a run of three is the usual
+    // answer. Strays are held until the end so the next try gets new ports.
+    let mut held = Vec::new();
+    for _ in 0..20 {
+        held.push(claim_port());
+        let mut ports: Vec<u16> = held.iter().map(|c| c.port()).collect();
+        ports.sort_unstable();
+        if let Some(base) = ports
+            .windows(3)
+            .find(|w| w[1] == w[0] + 1 && w[2] == w[1] + 1)
+        {
+            let keep = *base.first().expect("three");
+            held.retain(|c| (keep..keep + 3).contains(&c.port()));
+            held.sort_by_key(|c| c.port());
+            return held;
+        }
+    }
+    panic!("no three consecutive free ports in 20 claims");
+}
+
+/// Each of three processes on one shared port also answers `/health` on its own
+/// status port, base plus its index, with that index in the body. Any other
+/// path on a status port is 404, stopping one process refuses only its own
+/// port, and the others keep answering for themselves. Break: a status port
+/// that serves the site, an index that is not reported, a port shared between
+/// processes, or a stop that takes the neighbours' ports with it.
+#[test]
+fn each_front_end_answers_health_on_its_own_status_port() {
+    let site = Site::start(1);
+    let claim = claim_port();
+    let port = claim.port();
+    let status_ports = claim_three_in_a_row();
+    let base = status_ports[0].port();
+
+    let mut front_ends: Vec<Service> = (0..3u16)
+        .map(|i| {
+            start_front_end_with(
+                site.path(),
+                &format!("p{i}"),
+                port,
+                true,
+                &format!(
+                    "reuse_port_processes = 3\nprocess_index = {i}\n\
+                     status_bind = \"127.0.0.1:{base}\"\n"
+                ),
+            )
+        })
+        .collect();
+
+    for i in 0..3u16 {
+        let (status, body) = get(base + i, "/health").expect("status port answers");
+        assert_eq!(status, 200, "process {i}: {body}");
+        assert!(
+            body.contains(&format!("\"process_index\":{i}")),
+            "process {i} reported another index: {body}"
+        );
+        let (status, _) = get(base + i, "/").expect("status port answers /");
+        assert_eq!(
+            status, 404,
+            "process {i}: a status port must not serve the site"
+        );
+    }
+
+    let status = front_ends[1].terminate(Duration::from_secs(10));
+    assert!(status.success(), "process 1 did not shut down cleanly");
+    assert!(
+        TcpStream::connect(("127.0.0.1", base + 1)).is_err(),
+        "the stopped process still accepts on its status port"
+    );
+    for i in [0u16, 2] {
+        let (status, body) = get(base + i, "/health").expect("survivor answers");
+        assert_eq!(status, 200);
+        assert!(body.contains(&format!("\"process_index\":{i}")), "{body}");
+    }
+    every_request_is_200(port, 6, "the shared port with two processes left");
 }

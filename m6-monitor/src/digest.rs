@@ -152,6 +152,75 @@ pub struct Digest {
     pub handshake_file_age_s: Option<u64>,
     /// The state of the poll history. `None` under `--check`, which keeps none.
     pub history: Option<crate::history::HistoryDigest>,
+    /// One entry per node polled as several processes (`processes` in the
+    /// fleet config), empty otherwise and then absent from the JSON.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub process_groups: Vec<ProcessGroup>,
+}
+
+/// One node's processes added together: the node's real traffic, where one
+/// process's reading is only its share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessGroup {
+    pub node: String,
+    /// How many processes the config lists.
+    pub processes: usize,
+    /// Those that answered `/health` as their own index.
+    pub up: usize,
+    /// The names of the ones that did not, as `<node>/<index>`.
+    pub down: Vec<String>,
+    /// How many of the processes returned a `/perf`, which the sums cover.
+    pub reporting: usize,
+    pub requests_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+}
+
+/// A reading's node name and process index, when its name is `<node>/<index>`.
+fn process_of(name: &str) -> Option<(&str, u32)> {
+    let (node, index) = name.rsplit_once('/')?;
+    Some((node, index.parse().ok()?))
+}
+
+/// Add each multi-process node's readings together. Nodes keep the order they
+/// first appear in, and a node polled as one address makes no group.
+pub fn process_groups(readings: &[NodeReading]) -> Vec<ProcessGroup> {
+    let mut groups: Vec<ProcessGroup> = Vec::new();
+    for r in readings {
+        let Some((node, _)) = process_of(&r.name) else {
+            continue;
+        };
+        let at = match groups.iter().position(|g| g.node == node) {
+            Some(i) => i,
+            None => {
+                groups.push(ProcessGroup {
+                    node: node.to_string(),
+                    processes: 0,
+                    up: 0,
+                    down: Vec::new(),
+                    reporting: 0,
+                    requests_total: 0,
+                    cache_hits_total: 0,
+                    cache_misses_total: 0,
+                });
+                groups.len() - 1
+            }
+        };
+        let g = &mut groups[at];
+        g.processes += 1;
+        if r.is_up() {
+            g.up += 1;
+        } else {
+            g.down.push(r.name.clone());
+        }
+        if let Some(p) = &r.perf {
+            g.reporting += 1;
+            g.requests_total += p.metrics.requests_total;
+            g.cache_hits_total += p.metrics.cache_hits_total;
+            g.cache_misses_total += p.metrics.cache_misses_total;
+        }
+    }
+    groups
 }
 
 impl Digest {
@@ -1588,6 +1657,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             .filter_map(|r| r.tunnel.as_ref()?.file_age_s)
             .next(),
         history: None,
+        process_groups: process_groups(readings),
     }
 }
 
@@ -1600,6 +1670,7 @@ pub(crate) mod tests {
 
     pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
+            process_index: None,
             logging: None,
             node: "origin".into(),
             build: m6_core::monitoring::BuildId {
@@ -1683,6 +1754,7 @@ pub(crate) mod tests {
             role: "origin".into(),
             url: "http://origin.example.com".into(),
             health: Some(HealthReport {
+                process_index: None,
                 status: status.into(),
                 node: "origin".into(),
             }),
@@ -1696,6 +1768,57 @@ pub(crate) mod tests {
             unreachable: None,
             tunnel: None,
         }
+    }
+
+    /// A node polled as processes is added up, and the one that is down is
+    /// named. Break: the sum counts one process, or the group hides the
+    /// missing index.
+    #[test]
+    fn process_readings_add_up_to_their_node_and_name_the_one_that_is_down() {
+        let mut a = perf(m6_core::platform::host::HostSnapshot::default(), vec![]);
+        a.metrics.requests_total = 10;
+        a.metrics.cache_hits_total = 6;
+        a.metrics.cache_misses_total = 4;
+        let mut b = a.clone();
+        b.metrics.requests_total = 5;
+        b.metrics.cache_hits_total = 5;
+        b.metrics.cache_misses_total = 0;
+        let mut down = reading("edge/2", "unreachable", None);
+        down.unreachable = Some("refused".into());
+        let readings = vec![
+            reading("edge/0", "ok", Some(a)),
+            reading("edge/1", "ok", Some(b)),
+            down,
+            reading("origin", "ok", None),
+        ];
+        let groups = process_groups(&readings);
+        assert_eq!(
+            groups,
+            [ProcessGroup {
+                node: "edge".into(),
+                processes: 3,
+                up: 2,
+                down: vec!["edge/2".into()],
+                reporting: 2,
+                requests_total: 15,
+                cache_hits_total: 11,
+                cache_misses_total: 4,
+            }]
+        );
+    }
+
+    /// A fleet with no processes has no groups, and the JSON has no such key,
+    /// so a node polled as one address reads as it always did.
+    #[test]
+    fn a_fleet_without_processes_has_no_group_in_the_digest() {
+        let d = build(
+            &[reading("origin", "ok", None), reading("edge-a", "ok", None)],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(d.process_groups.is_empty());
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("process_groups"), "{json}");
     }
 
     fn now() -> String {

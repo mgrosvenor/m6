@@ -162,6 +162,13 @@ pub(super) fn limit_send_queue(_fd: RawFd, _bytes: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// macOS has no reuseport socket filter. The socket bound last to a port gets
+/// every connection and datagram, so there is nothing to attach and one client
+/// already reaches one process.
+pub(super) fn steer_reuseport(_fd: RawFd, _group_size: u32) -> io::Result<()> {
+    Ok(())
+}
+
 /// The hard limit reads as unlimited and the kernel enforces
 /// `kern.maxfilesperproc`, so that is the cap.
 pub(super) fn max_open_files() -> io::Result<Option<u64>> {

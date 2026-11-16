@@ -63,6 +63,7 @@ fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
 
     let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
         !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty()

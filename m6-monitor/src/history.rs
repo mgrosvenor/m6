@@ -2124,6 +2124,7 @@ mod tests {
             role: "origin".into(),
             url: "http://x".into(),
             health: Some(m6_core::monitoring::HealthReport {
+                process_index: None,
                 status: "ok".into(),
                 node: name.into(),
             }),
@@ -2917,6 +2918,7 @@ mod tests {
         let mut h = history(cfg(dir.path(), 64));
         let mut r = reading("origin");
         r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
             status: "ok".into(),
             node: "origin".into(),
         });
@@ -2947,12 +2949,14 @@ mod tests {
         let mut h = history(cfg(dir.path(), 64));
         let mut r = reading("origin");
         r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
             status: "ok".into(),
             node: "origin".into(),
         });
         r.health_status = Some(200);
         h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
         r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
             status: "degraded".into(),
             node: "origin".into(),
         });

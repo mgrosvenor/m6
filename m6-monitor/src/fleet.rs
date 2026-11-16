@@ -68,6 +68,19 @@ pub struct Node {
     /// supported way to keep them off the public interface.
     #[serde(default)]
     pub metrics_over_tunnel: bool,
+    /// How many m6-http processes this node runs on its shared port, each with
+    /// `[server] process_index` and `status_bind` set. Absent means the node is
+    /// polled as one address, as always. Present, the node is polled as that
+    /// many processes: process `i` at `tunnel.address` with its port raised by
+    /// `i`, over the tunnel, and reported as `<name>/<i>`. `tunnel.address`
+    /// is then the base, the status port of process 0. `1` is the same as
+    /// absent.
+    #[serde(default)]
+    pub processes: Option<u32>,
+    /// Set by `Fleet::from_config` on each entry a `processes` node expands to:
+    /// the process index that entry polls. Never read from the file.
+    #[serde(skip)]
+    pub process: Option<u32>,
 }
 
 /// A WireGuard tunnel from the monitor host to one node.
@@ -278,6 +291,70 @@ fn default_timeout_ms() -> u64 {
     5_000
 }
 
+/// Replace each node that sets `processes = N` with N entries, one per
+/// process, so the poller and every report treat a process as a node. Entry
+/// `i` is named `<name>/<i>` and polls `tunnel.address` with its port raised by
+/// `i`. A node without `processes`, or with `processes = 1`, passes through
+/// as it is, which is today's single-address polling.
+fn expand_processes(nodes: Vec<Node>) -> anyhow::Result<Vec<Node>> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let Some(count) = n.processes else {
+            out.push(n);
+            continue;
+        };
+        if count == 0 {
+            anyhow::bail!("node {:?}: processes must be at least 1", n.name);
+        }
+        // One process is the node as it always was: the one address, no suffix.
+        if count == 1 {
+            out.push(Node {
+                processes: None,
+                ..n
+            });
+            continue;
+        }
+        if n.name.contains('/') {
+            anyhow::bail!(
+                "node {:?}: a node with processes cannot have '/' in its name, which separates the process index",
+                n.name
+            );
+        }
+        let Some(tunnel) = &n.tunnel else {
+            anyhow::bail!(
+                "node {:?}: processes needs tunnel.address, the status port of process 0 on the node's tunnel address",
+                n.name
+            );
+        };
+        let base: SocketAddr = tunnel.address.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "node {:?}: tunnel.address {:?} is not an IP address and port, for example 192.0.2.2:9440",
+                n.name,
+                tunnel.address
+            )
+        })?;
+        for i in 0..count {
+            let port = u16::try_from(u32::from(base.port()) + i).map_err(|_| {
+                anyhow::anyhow!(
+                    "node {:?}: tunnel.address port {} plus process {i} is past 65535",
+                    n.name,
+                    base.port()
+                )
+            })?;
+            let mut entry = n.clone();
+            entry.name = format!("{}/{i}", n.name);
+            entry.processes = None;
+            entry.process = Some(i);
+            entry.metrics_over_tunnel = true;
+            if let Some(t) = entry.tunnel.as_mut() {
+                t.address = SocketAddr::new(base.ip(), port).to_string();
+            }
+            out.push(entry);
+        }
+    }
+    Ok(out)
+}
+
 impl Fleet {
     /// Load from the service's own config file.
     ///
@@ -320,6 +397,7 @@ impl Fleet {
                 fleet.timeout_ms
             );
         }
+        fleet.nodes = expand_processes(std::mem::take(&mut fleet.nodes))?;
         for n in &fleet.nodes {
             if let Some(p) = &n.perf_token_file {
                 m6_core::config::secret_path(&format!("node {:?}: perf_token_file", n.name), p)?;
@@ -371,6 +449,12 @@ pub struct ResolvedNode {
     pub addr: SocketAddr,
     /// The tunnel, when one is configured.
     pub tunnel: Option<ResolvedTunnel>,
+    /// The process index this entry polls, when the node was expanded from
+    /// `processes`.
+    pub process: Option<u32>,
+    /// Where every step but a header check goes for a process entry: its
+    /// status port. `None` for an ordinary node.
+    pub status_addr: Option<SocketAddr>,
     /// Whether `/perf` and `/traffic` go over the tunnel.
     pub metrics_over_tunnel: bool,
     /// The TLS client for an `https` URL. The name is the URL's host in both
@@ -453,6 +537,8 @@ impl Fleet {
                 role: n.role.clone(),
                 url: n.url.clone(),
                 addr,
+                process: n.process,
+                status_addr: n.process.and(tunnel.as_ref()).map(|t| t.addr),
                 tunnel,
                 metrics_over_tunnel: n.metrics_over_tunnel,
                 tls: tls_client,
@@ -592,6 +678,8 @@ role = "cache"
             perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
             tunnel: None,
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         assert_eq!(
             n.perf_token(Some("fleet-token")).as_deref(),
@@ -605,6 +693,8 @@ role = "cache"
             perf_token_file: None,
             tunnel: None,
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         assert_eq!(
             bare.perf_token(Some("fleet-token")).as_deref(),
@@ -886,5 +976,84 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         assert!(resolved[0].tls.is_none());
         assert_eq!(resolved[0].metrics_addr(), want);
         assert_eq!(resolved[0].name, "a");
+    }
+
+    fn fleet_from(text: &str) -> anyhow::Result<Fleet> {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{text}").unwrap();
+        Fleet::from_config(f.path())
+    }
+
+    const THREE: &str =
+        "[monitor]\n\n[[monitor.nodes]]\nname = \"edge-a\"\nurl = \"http://127.0.0.1:1\"\n\
+         role = \"cache\"\nprocesses = 3\ntunnel = { address = \"192.0.2.2:9440\" }\n";
+
+    #[test]
+    fn a_node_with_processes_expands_to_one_entry_per_process() {
+        let fleet = fleet_from(THREE).unwrap();
+        let seen: Vec<(String, String, Option<u32>)> = fleet
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.tunnel.as_ref().unwrap().address.clone(),
+                    n.process,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "edge-a/0".to_string(),
+                    "192.0.2.2:9440".to_string(),
+                    Some(0)
+                ),
+                (
+                    "edge-a/1".to_string(),
+                    "192.0.2.2:9441".to_string(),
+                    Some(1)
+                ),
+                (
+                    "edge-a/2".to_string(),
+                    "192.0.2.2:9442".to_string(),
+                    Some(2)
+                ),
+            ]
+        );
+        assert!(fleet.nodes.iter().all(|n| n.metrics_over_tunnel));
+    }
+
+    /// One process is the node as it always was: same name, same address.
+    #[test]
+    fn processes_one_or_absent_leaves_the_node_as_it_is() {
+        for line in ["processes = 1\n", ""] {
+            let text = THREE.replace("processes = 3\n", line);
+            let fleet = fleet_from(&text).unwrap();
+            assert_eq!(fleet.nodes.len(), 1);
+            let n = &fleet.nodes[0];
+            assert_eq!(n.name, "edge-a");
+            assert_eq!(n.tunnel.as_ref().unwrap().address, "192.0.2.2:9440");
+            assert_eq!((n.processes, n.process), (None, None));
+            assert!(!n.metrics_over_tunnel);
+        }
+    }
+
+    #[test]
+    fn processes_without_a_tunnel_a_slash_or_room_for_the_ports_is_refused() {
+        let no_tunnel = THREE.replace("tunnel = { address = \"192.0.2.2:9440\" }\n", "");
+        let slash = THREE.replace("edge-a", "edge/a");
+        let overflow = THREE.replace("9440", "65535");
+        let zero = THREE.replace("processes = 3", "processes = 0");
+        for (text, needle) in [
+            (no_tunnel, "needs tunnel.address"),
+            (slash, "'/' in its name"),
+            (overflow, "past 65535"),
+            (zero, "at least 1"),
+        ] {
+            let err = fleet_from(&text).unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
     }
 }

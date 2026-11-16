@@ -131,6 +131,9 @@ pub struct Conn {
     token: Token,
     /// What the poll currently waits for, so `reregister` runs only on change.
     registered_interest: Interest,
+    /// Accepted on the status listener, so the loop answers only the
+    /// monitoring paths on it.
+    status: bool,
 }
 
 /// What one connection's turn reports to the loop that owns the timeouts and
@@ -176,6 +179,7 @@ impl Conn {
             },
             token: Token(usize::MAX),
             registered_interest: Interest::READABLE,
+            status: false,
         }
     }
 
@@ -284,6 +288,9 @@ pub const H2_IDLE_TIMEOUT_SECS: u64 = 300;
 
 pub struct Http11Listener {
     listener: TcpListener,
+    /// `[server] status_bind`: a second listening socket whose connections
+    /// share this table, marked [`Conn::is_status`].
+    status: Option<TcpListener>,
     /// `None` binds a plaintext listener. Only HTTP/1.1 is reachable then:
     /// h2 needs ALPN, which needs TLS, and h3 needs QUIC, which mandates it.
     /// A browser following an `http://` link speaks HTTP/1.1 and nothing else.
@@ -371,6 +378,7 @@ impl Http11Listener {
         listener.set_nonblocking(true)?;
         Ok(Http11Listener {
             listener,
+            status: None,
             tls_config,
             conns: Slots::new(initial, ceiling, Conn::empty),
             max_requests,
@@ -380,6 +388,29 @@ impl Http11Listener {
 
     pub fn raw_fd(&self) -> RawFd {
         self.listener.as_raw_fd()
+    }
+
+    /// Add the status listener, bound by the caller. Start only.
+    pub fn with_status(mut self, listener: TcpListener) -> anyhow::Result<Self> {
+        listener.set_nonblocking(true)?;
+        self.status = Some(listener);
+        Ok(self)
+    }
+
+    /// The status listener's descriptor, when there is one.
+    pub fn status_fd(&self) -> Option<RawFd> {
+        self.status.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// Whether the connection in `key` came in on the status listener.
+    pub fn is_status(&self, key: usize) -> bool {
+        self.conns.get(key).status
+    }
+
+    /// [`Self::accept_one`] for the status listener.
+    pub fn accept_status(&mut self) -> Option<Conn> {
+        let listener = self.status.as_ref()?;
+        self.accept_on(listener, true)
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -416,8 +447,12 @@ impl Http11Listener {
     /// slot, sets `conn.token` and `conn.registered_interest`, registers the descriptor,
     /// and stores the `Conn` back into the slot.
     pub fn accept_one(&mut self) -> Option<Conn> {
+        self.accept_on(&self.listener, false)
+    }
+
+    fn accept_on(&self, listener: &TcpListener, status: bool) -> Option<Conn> {
         loop {
-            match self.listener.accept() {
+            match listener.accept() {
                 Ok((stream, peer)) => {
                     if let Err(e) = stream.set_nonblocking(true) {
                         warn!("tcp set_nonblocking: {e}");
@@ -476,6 +511,7 @@ impl Http11Listener {
                         kind,
                         token: Token(usize::MAX),
                         registered_interest: Interest::READABLE,
+                        status,
                     });
                 }
                 Err(e) => match m6_core::platform::net::accept_error(&e) {

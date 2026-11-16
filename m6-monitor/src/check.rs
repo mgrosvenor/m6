@@ -227,6 +227,40 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         let _ = writeln!(o, "  {:<5} {:<7} {}, {}", r.name, label, l.status, l.age);
     }
 
+    // ── PROCESSES ────────────────────────────────────────────────────────────
+    //
+    // Only for a node polled as several processes. Each process has its own
+    // line above and below as `<node>/<index>`; this adds them up, because one
+    // process's counters are its share of the node and not the node.
+    if !d.process_groups.is_empty() {
+        let _ = writeln!(
+            o,
+            "\nPROCESSES  (each node's processes added together; every process is also listed \
+             as <node>/<index>)"
+        );
+        for g in &d.process_groups {
+            let label = if g.down.is_empty() { "ok" } else { "FAULT" };
+            let _ = write!(
+                o,
+                "  {:<5} {:<7} {} of {} processes up, {} request(s), {} hit(s), {} miss(es)",
+                g.node,
+                label,
+                g.up,
+                g.processes,
+                g.requests_total,
+                g.cache_hits_total,
+                g.cache_misses_total
+            );
+            if g.reporting < g.processes {
+                let _ = write!(o, " (from {} of {} reports)", g.reporting, g.processes);
+            }
+            if !g.down.is_empty() {
+                let _ = write!(o, "; not answering: {}", g.down.join(", "));
+            }
+            let _ = writeln!(o);
+        }
+    }
+
     // ── A. logging ───────────────────────────────────────────────────────────
     let _ = writeln!(o, "\nA. LOGGING");
     for r in readings {
@@ -1295,6 +1329,7 @@ mod tests {
             role: "origin".into(),
             url: "https://origin.example.com".into(),
             health: Some(m6_core::monitoring::HealthReport {
+                process_index: None,
                 status: "ok".into(),
                 node: name.into(),
             }),
@@ -1327,6 +1362,34 @@ mod tests {
 
     pub(super) fn digest() -> Digest {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
+    }
+
+    /// The PROCESSES section exists only for a node polled as processes, and
+    /// names the one that is down. A plain fleet prints no such section, which
+    /// is what keeps its output as it was.
+    #[test]
+    fn the_processes_section_appears_only_for_processes() {
+        let plain = crate::digest::build(
+            &[reading("origin", None)],
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        assert!(!render(&plain, &[reading("origin", None)]).contains("PROCESSES"));
+
+        let mut down = reading("edge/1", None);
+        down.unreachable = Some("refused".into());
+        let readings = vec![reading("edge/0", None), down];
+        let d = crate::digest::build(
+            &readings,
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        let text = render(&d, &readings);
+        assert!(text.contains("PROCESSES"), "{text}");
+        assert!(
+            text.contains("1 of 2 processes up") && text.contains("not answering: edge/1"),
+            "{text}"
+        );
     }
 
     /// A node up minutes, not a whole hour, must read "42m" in the check rather
@@ -2106,6 +2169,7 @@ mod tunnel_tests {
     fn reopen_reading(uptime_s: u64, reopen: Option<LogReopenHealth>) -> NodeReading {
         let mut r = reading("origin", None);
         r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
             status: "ok".into(),
             node: "origin".into(),
         });
@@ -2342,6 +2406,7 @@ mod health_tests {
     fn degraded(name: &str) -> NodeReading {
         let mut r = reading(name, None);
         r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
             status: "degraded".into(),
             node: name.into(),
         });
@@ -2527,6 +2592,7 @@ mod health_tests {
     fn answering(name: &str, code: u16, body: &str) -> NodeReading {
         let mut r = reading(name, None);
         r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
             status: body.into(),
             node: name.into(),
         });

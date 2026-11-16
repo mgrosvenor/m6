@@ -63,6 +63,7 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
 
     let mut ready = false;
     for _ in 0..200 {
@@ -256,6 +257,7 @@ fn a_quiet_service_flushes_within_a_tick() {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     let response = http_request(
         &socket_path,
         "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -401,6 +403,7 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
         .env("M6_SOCKET_OVERRIDE", &socket_path);
     let mut svc = Service::spawn("m6-html", &mut command);
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
         !http_request(
             &socket_path,
