@@ -55,6 +55,7 @@ fn main() -> Result<()> {
     // ── start: blocking and allocation are fine ──────────────────────────
     let mut site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
     let read_timeout = site.read_timeout();
+    handler::set_tail_limit(site.limits().get(&m6_core::limits::TAIL_READ));
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is
     // being written, so the table takes half of what the limit leaves: one
