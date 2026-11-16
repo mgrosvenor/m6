@@ -50,6 +50,9 @@ pub struct RouteConfig {
     pub status: u16,
     /// A `Cache-Control` value, or empty when the route sets none.
     pub cache: String,
+    /// The config named `cache`, so the value replaces a `Cache-Control` the
+    /// handler set. False when `cache` is only the default for the route's kind.
+    pub cache_explicit: bool,
     pub methods: Option<Vec<String>>,
     /// Extra response headers as `[[key, value]]` pairs.
     pub headers: Vec<(String, String)>,
@@ -705,6 +708,7 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
         // revalidates every time, and the shared cache keeps it for a day. The
         // ETag that makes the 304 possible is added by the finish path from
         // the final body bytes.
+        let cache_explicit = item.get("cache").is_some();
         let cache = item
             .get("cache")
             .and_then(|v| v.as_str())
@@ -761,6 +765,7 @@ fn parse_routes(val: Option<&toml::Value>) -> anyhow::Result<Vec<RouteConfig>> {
             params,
             status,
             cache,
+            cache_explicit,
             methods,
             headers,
             handler,

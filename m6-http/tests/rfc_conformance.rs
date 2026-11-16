@@ -12,7 +12,9 @@
 //! - a backend that closes its HTTP/1.1 connection, so every reply carries
 //!   `Connection: close`, which h3 must drop and h1 must keep;
 //! - `Content-Length` as `1*DIGIT` on h1 and h2 (RFC 9110 8.6, 5.6.3);
-//! - `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5).
+//! - `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5);
+//! - a route's `cache` replacing the `Cache-Control` the backend set, on h1, h2
+//!   and h3 (RFC 9111 5.2).
 //!
 //! This file is that coverage. Every test names the RFC section it pins, and
 //! `tools/conformance.sh` fails the gate when one of them fails.
@@ -138,7 +140,8 @@ impl Fixture {
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
-                 [[route]]\npath = \"/submit\"\nbackend = \"b\"\nmethods = [\"POST\"]\n",
+                 [[route]]\npath = \"/submit\"\nbackend = \"b\"\nmethods = [\"POST\"]\n\n\
+                 [[route]]\npath = \"/override\"\nbackend = \"b\"\ncache = \"no-store\"\n",
                 d.join("b-*.sock").display()
             ),
         )
@@ -1041,6 +1044,121 @@ fn rfc9110_13_1_2_if_none_match_304_h3() {
         field_value(&fields, "content-length").is_none(),
         "RFC 9110 15.4.5 and 8.6: a 304 carries no content-length it cannot justify"
     );
+}
+
+// ── A route's `cache` replaces the backend's Cache-Control (RFC 9111 5.2) ─────
+
+/// Every `Cache-Control` value in an h1 head, in order.
+fn h1_cache_controls(head: &str) -> Vec<String> {
+    head.lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("cache-control"))
+        .map(|(_, v)| v.trim().to_string())
+        .collect()
+}
+
+/// Every `Cache-Control` value in an h2 or h3 field list, in order.
+fn field_cache_controls(fields: &Fields) -> Vec<String> {
+    fields
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+/// What the route `/override` must send. The backend answers every path with
+/// `Cache-Control: public, max-age=60`, which a shared cache may store (RFC 9111
+/// 5.2.2.5 does not forbid it), so the only way the client sees `no-store` is
+/// the route's `cache` replacing it. One field, not two: a second
+/// `Cache-Control` is two answers to one question (RFC 9110 5.3).
+fn assert_route_cache_won(controls: &[String], age: Option<String>, what: &str) {
+    assert_eq!(
+        controls,
+        ["no-store"],
+        "{what}: the route's `cache` must replace the backend's Cache-Control, leaving one field"
+    );
+    assert!(
+        age.is_none(),
+        "{what}: `no-store` must stop the reply entering the cache, so the second GET is no hit"
+    );
+}
+
+#[test]
+fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h1() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+    let _ = warm_h1(&fixture);
+
+    let request = format!(
+        "GET /override HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        fixture.port()
+    );
+    let (status, _, _) = h1_request(fixture.port(), &fixture.cert_der, &request);
+    assert_eq!(status, 200);
+    let (status, head, _) = h1_request(fixture.port(), &fixture.cert_der, &request);
+    assert_eq!(status, 200);
+    assert_route_cache_won(&h1_cache_controls(&head), h1_header(&head, "age"), "h1");
+
+    // A route with no `cache` leaves the backend's own header alone.
+    let (_, head, _) = h1_request(
+        fixture.port(),
+        &fixture.cert_der,
+        &format!(
+            "GET / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            fixture.port()
+        ),
+    );
+    assert_eq!(h1_cache_controls(&head), ["public, max-age=60"]);
+}
+
+#[test]
+fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h2() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+    let _ = warm_h1(&fixture);
+
+    let get = |path: &str| {
+        h2_get(fixture.port(), &fixture.cert_der, path, &[])
+            .unwrap_or_else(|e| panic!("HTTP/2 fetch failed: {e}"))
+    };
+    let (status, _, _) = get("/override");
+    assert_eq!(status, 200);
+    let (status, fields, _) = get("/override");
+    assert_eq!(status, 200);
+    assert_route_cache_won(
+        &field_cache_controls(&fields),
+        field_value(&fields, "age"),
+        "h2",
+    );
+
+    let (_, fields, _) = get("/");
+    assert_eq!(field_cache_controls(&fields), ["public, max-age=60"]);
+}
+
+#[test]
+fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h3() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+    let _ = warm_h1(&fixture);
+
+    let get = |path: &str| {
+        h3_get(fixture.port(), path, &[]).unwrap_or_else(|e| panic!("HTTP/3 fetch failed: {e}"))
+    };
+    let (status, _, _) = get("/override");
+    assert_eq!(status, 200);
+    let (status, fields, _) = get("/override");
+    assert_eq!(status, 200);
+    assert_route_cache_won(
+        &field_cache_controls(&fields),
+        field_value(&fields, "age"),
+        "h3",
+    );
+
+    let (_, fields, _) = get("/");
+    assert_eq!(field_cache_controls(&fields), ["public, max-age=60"]);
 }
 
 // ── Bodies longer than the send queue ────────────────────────────────────────

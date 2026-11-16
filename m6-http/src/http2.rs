@@ -5585,9 +5585,7 @@ mod tests {
             c.send_buf.is_empty() && !c.more_to_flush(),
             "the socket took it all, so nothing may be left: {} bytes queued, {:?}",
             c.send_buf.len(),
-            c.streams
-                .get(&1)
-                .map(|s| (s.resp_sent, s.end_stream_sent))
+            c.streams.get(&1).map(|s| (s.resp_sent, s.end_stream_sent))
         );
     }
 

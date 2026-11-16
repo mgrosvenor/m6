@@ -557,7 +557,7 @@ Table 7 gives the keys a `[[route]]` may carry.
 | `template` | a template to render, which needs no code at all |
 | `params` | JSON files merged into this route's request dictionary. A path holding `{placeholder}` resolves per request |
 | `status` | the status a template route answers with, default 200 |
-| `cache` | a `Cache-Control` value. A handler route defaults to `no-store` and a template route to `public, max-age=0, must-revalidate, s-maxage=86400` (`m6_core::PAGE_CACHE_CONTROL`) |
+| `cache` | a `Cache-Control` value. Named, it replaces any `Cache-Control` the handler set. Not named, a handler route defaults to `no-store` and a template route to `public, max-age=0, must-revalidate, s-maxage=86400` (`m6_core::PAGE_CACHE_CONTROL`), and a handler's own value wins over the default |
 | `methods` | exactly the methods this route answers, `GET` also answering `HEAD`. Omitted, it answers every method. An unknown name fails the load |
 | `headers` | extra response headers, as `[[key, value]]` pairs |
 | anything else | kept verbatim and read by the handler through `Request::route_setting` |

@@ -153,6 +153,9 @@ A request with another method is refused at the edge with 405 and `Allow` naming
 An unknown or empty `methods` list stops the start with exit 2.
 `m6-site-toml.md` §4.8 and §4.9 own the key.
 
+A `[[route]]` or `[[route_group]]` may name `cache`, a `Cache-Control` value that replaces the backend's own on every reply the route gets.
+It is applied before the reply is stored, so `no-store` keeps it out of the cache, and the stored copy and the client's reply carry the same one field (RFC 9111 5.2).
+
 ---
 
 ## 5. Request Forwarding

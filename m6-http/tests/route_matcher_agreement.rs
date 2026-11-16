@@ -42,6 +42,7 @@ fn core_routes(patterns: &[&str]) -> CoreTable {
                     params_files: vec![],
                     status: 200,
                     cache: "public".to_string(),
+                    cache_explicit: false,
                     headers: vec![],
                     last_modified: None,
                     last_modified_http: None,

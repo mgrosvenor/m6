@@ -151,22 +151,25 @@ For everything else the two audiences are split deliberately:
 The handler sends an `ETag` on every file, so that browser validation is a 304 with no body.
 The edge also answers the conditional request from its own copy (RFC 9111 section 4.3.2), without reading the file or contacting m6-file.
 
-No route can currently override this, and three things that look like they would do not work:
+A route overrides this by naming `cache`, as nginx does per location.
+The route's value replaces the header the handler set, and the reply carries one `Cache-Control`.
 
-Table 4 lists the three ways to override the header and why each fails. Take from it that no route input reaches the decision.
+Table 4 lists where a route can say so and what each does.
+Take from it that `cache` is the one input, and that `headers` does not replace.
 
-| attempt | result |
+| where | result |
 |---|---|
-| `cache` on the m6-file route | not read for this |
-| `cache` on a `[[route_group]]` in `site.toml` | ignored, with a warning |
-| `headers` on the route | appended, so two `Cache-Control` headers |
+| `cache` on the m6-file route in `m6-file.conf` | replaces the handler's value |
+| `cache` on a `[[route]]` or `[[route_group]]` in `site.toml` | replaces it on the edge, before the edge stores the reply |
+| `headers` on the route | appended, so two `Cache-Control` headers. Use `cache` |
 
-**Table 4: three ways to override `Cache-Control` per route, none of which work.** The handler computes the header itself, and no route input reaches that decision.
+**Table 4: where a route sets `Cache-Control`.** Without `cache` the handler's value stands.
 
-That gap matters for anything short-lived served from disk, such as a one-time download or an *ACME* (Automatic Certificate Management Environment) challenge token.
+An ACME challenge path, a one-time download or a health file takes `cache = "no-store"` on its route.
+Set it in both configs when the file is served through the edge: the edge stops storing the reply, and m6-file stops advertising a day to anything else in front of it.
 It is tracked as issue #126.
 
-So the handler decides the bytes, the encoding, the validator and the caching, and a route decides none of them.
+So the handler decides the bytes, the encoding and the validator, and a route can override the caching.
 What a route does bound is which files can be reached at all, which is the next section.
 
 ## 5. Refusing to serve outside its root
