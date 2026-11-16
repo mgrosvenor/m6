@@ -420,6 +420,10 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 ### Docs
 
+**The docs now state the four cache counts, the HTTP/2 send loop and m6-file's tail mode, and drop five claims the code no longer meets.**
+The README's 8 KiB stack header buffer and its two out-of-scope items (per-address rate limiting, shared-port scaling), the m6-file page's "no route can set `Cache-Control`" and "tracked as #126", and the head-limit refusal named 431 where the code sends 400 and 414.
+Verified by loading each configuration example with `--dump-config` of the matching binary.
+
 **The README, `docs/m6-http.md`, `docs/m6-site-toml.md`, `docs/m6-testing.md`, `docs/m6-user-guide.md` and one changelog count now match the code.**
 The renderer library is `m6-core`, because `m6-render` was deleted.
 The monitor population excludes loopback, and a public address is monitor only on `/health`, `/perf` and `/traffic`.

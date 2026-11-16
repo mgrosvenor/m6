@@ -186,9 +186,9 @@ Take from it that a claim about a behaviour in the selection can be traced to th
 | crate | integration suites |
 |---|---|
 | m6-core | `pre_push_hook.rs`, `version_flag.rs` |
-| m6-http | `integration.rs`, `integration_tests.rs`, `security_e2e.rs`, `security_regressions.rs`, `robustness.rs`, `edge_proxy.rs`, `analytics_e2e.rs`, `backbone_flow_control.rs`, `backends_contract.rs`, `backends_through_proxy.rs`, `redirect_lifecycle.rs`, `tls_resumption.rs` |
+| m6-http | `integration.rs`, `integration_tests.rs`, `security_e2e.rs`, `security_regressions.rs`, `robustness.rs`, `edge_proxy.rs`, `analytics_e2e.rs`, `backbone_flow_control.rs`, `cache_accounting.rs`, `scale_reuse_port.rs`, `backends_contract.rs`, `backends_through_proxy.rs`, `redirect_lifecycle.rs`, `tls_resumption.rs` |
 | m6-html | `integration.rs`, `read_timeout.rs`, `socket_mode.rs` |
-| m6-file | `integration.rs`, `two_files.rs`, `woff2.rs`, `security_regressions.rs` |
+| m6-file | `integration.rs`, `two_files.rs`, `woff2.rs`, `security_regressions.rs`, `site_size.rs` |
 | m6-auth-server | `integration.rs`, `security_regressions.rs` |
 | m6-auth-cli | `integration.rs` |
 | m6-monitor | `lifecycle.rs`, `tunnel.rs`, `history.rs` |

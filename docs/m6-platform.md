@@ -58,8 +58,9 @@ Known limitation: a full listen queue is reported differently by the two kernels
 Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
 m6 sets `SO_REUSEPORT` only on a listener a service opens through `net::listen_shared`, which m6-http's `[server] reuse_port` asks for.
 Linux spreads a new TCP connection across the sockets that share a port by a hash of its 4-tuple and gives every UDP datagram to one socket. With a group size, `listen_shared` attaches a classic BPF program to both sockets that returns (a hash of the client's source address) mod the group size, so one address always reaches one socket; it reads the address with the `SKF_NET_OFF` offsets and allocates nothing. macOS spreads neither and attaches nothing: the socket bound last to the port receives every connection and every datagram, so there a second process is a takeover rather than a scale-out.
+A port of 0 gives the TCP listener and the UDP socket one kernel-chosen port, so a test can bind both halves without naming one.
 Nothing may assume an even spread on either target, and on Linux a QUIC client that changes address may land on another process.
-m6-http opens it only for the public 443 port: the TLS listener and its QUIC UDP socket on `[server].bind`. The redirect listener, the internal h2c listener and the backend sockets never go through it. The health endpoints are served on that shared listener.
+m6-http opens it only for the public 443 port: the TLS listener and its QUIC UDP socket on `[server].bind`. The redirect listener, the internal h2c listener and the backend sockets never go through it. The health endpoints are served on that shared listener, and with `[server] status_bind` each process also serves them on a plain TLS listener of its own, which never goes through `listen_shared`.
 The default socket buffers differ (about 128 KiB on macOS, about 208 KiB on Linux), so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 Everything in Table 1 is held by the tests in section 6.
 
