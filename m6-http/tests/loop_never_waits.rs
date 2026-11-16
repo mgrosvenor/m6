@@ -914,21 +914,25 @@ fn a_socket_backend_miss_advertises_alt_svc() {
 
 /// One keep-alive HTTP/1.1-over-TLS connection, reused across requests.
 struct H1KeepAlive {
-    stream: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    /// Taken for the length of one request so the blocking read can run on its
+    /// own thread, then put back with the answer. `None` only while a request is
+    /// in flight.
+    stream: Option<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
 }
 
 impl H1KeepAlive {
     fn connect(port: u16) -> H1KeepAlive {
         probe::install_crypto();
         let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
+        // No socket read timeout. Each response is waited for as an event under
+        // one generous bound: a read timeout fires on a loaded host while the
+        // service is healthy, and the test reports a missing response.
         let name =
             rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("server name");
         let conn = rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name)
             .expect("client conn");
         H1KeepAlive {
-            stream: rustls::StreamOwned::new(conn, tcp),
+            stream: Some(rustls::StreamOwned::new(conn, tcp)),
         }
     }
 
@@ -938,9 +942,17 @@ impl H1KeepAlive {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
         req.push_str("\r\n");
-        self.stream.write_all(req.as_bytes()).expect("write");
-        self.stream.flush().expect("flush");
-        let raw = read_one(&mut self.stream, "GET").expect("read one response");
+        let stream = self.stream.take().expect("one request at a time");
+        let (stream, raw) =
+            m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+                let mut stream = stream;
+                stream.write_all(req.as_bytes()).expect("write");
+                stream.flush().expect("flush");
+                let raw = read_one(&mut stream, "GET").expect("read one response");
+                (stream, raw)
+            })
+            .expect("one response on the keep-alive connection");
+        self.stream = Some(stream);
         parse_h1(&raw).expect("parse response")
     }
 }

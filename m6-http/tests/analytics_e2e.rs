@@ -130,9 +130,10 @@ fn https_exchange(
     extra: &[(&str, &str)],
     tls: Arc<rustls::ClientConfig>,
 ) -> HttpResponse {
-    if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(10))) {
-        return no_response(format!("set_read_timeout: {e}"));
-    }
+    // No socket read timeout: the read below waits on the response event under
+    // one generous outer bound. A timeout here fires while the service is
+    // healthy on a loaded host, and the test then reports a response that never
+    // came when it was only slow.
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
     let conn = match rustls::ClientConnection::new(tls, name) {
         Ok(c) => c,
@@ -154,12 +155,20 @@ fn https_exchange(
         return no_response(format!("flush request: {e}"));
     }
 
-    let mut raw = Vec::new();
-    match stream.read_to_end(&mut raw) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+    let raw = match m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+        let mut stream = stream;
+        let mut raw = Vec::new();
+        match stream.read_to_end(&mut raw) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(format!("tls read: {e}")),
+        }
+        Ok(raw)
+    }) {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(e)) => return no_response(e),
         Err(e) => return no_response(format!("tls read: {e}")),
-    }
+    };
 
     let text = String::from_utf8_lossy(&raw);
 
@@ -219,7 +228,11 @@ fn h3_get(port: u16, path: &str, cookie: Option<&str>) -> Result<(u16, Vec<Strin
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| e.to_string())?;
-    config.set_max_idle_timeout(10_000);
+    // The transport's idle timeout is a safety net for a peer that goes
+    // silent, so it is the same generous bound the rest of the wait uses. Ten
+    // seconds was a wall-clock deadline: under CPU load the handshake and the
+    // response take longer, and the connection closed with nothing wrong.
+    config.set_max_idle_timeout(m6_core::testkit::RESPONSE_BOUND.as_millis() as u64);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -241,7 +254,7 @@ fn h3_get(port: u16, path: &str, cookie: Option<&str>) -> Result<(u16, Vec<Strin
     let mut status: Option<u16> = None;
     let mut set_cookies: Vec<String> = Vec::new();
     let mut done = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::RESPONSE_BOUND;
 
     loop {
         if Instant::now() > deadline {

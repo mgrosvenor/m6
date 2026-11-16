@@ -45,12 +45,6 @@ const LOAD_KEYS: usize = 500;
 /// removal work a generation change leaves behind.
 const LOAD_OLD_FILES: usize = 1_000;
 
-/// The most the median write tick may take. The 1 ms budget plus the one file
-/// that was in progress when it ran out puts the usual tick at 1.0 to 1.6 ms;
-/// this catches a regression to a full queue's half-second tick while leaving
-/// the filesystem's own stalls in the reported tail rather than the gate.
-const TICK_WORK_MEDIAN_MAX_NS: u64 = 2_000_000;
-
 // ── Responses ─────────────────────────────────────────────────────────────────
 
 struct Resp {
@@ -423,9 +417,9 @@ impl Stack {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
         };
-        tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        tcp.set_write_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
+        // No socket read or write timeout. The response is waited for as an
+        // event under one generous bound: a timeout that fires while the
+        // service is healthy turns CPU contention into a missing answer.
         let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
         let conn = rustls::ClientConnection::new(no_verify_tls(), name).unwrap();
         let mut stream = StreamOwned::new(conn, tcp);
@@ -440,12 +434,21 @@ impl Stack {
         {
             return no_response(format!("write: {e}"));
         }
-        let mut raw = Vec::new();
-        match stream.read_to_end(&mut raw) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return no_response(format!("read: {e}")),
-        }
+        let raw =
+            match m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+                let mut stream = stream;
+                let mut raw = Vec::new();
+                match stream.read_to_end(&mut raw) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(format!("read: {e}")),
+                }
+                Ok(raw)
+            }) {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => return no_response(e),
+                Err(e) => return no_response(format!("read: {e}")),
+            };
         parse_h1(&raw)
     }
 
@@ -454,9 +457,9 @@ impl Stack {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
         };
-        tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        tcp.set_write_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
+        // No socket read or write timeout. The response is waited for as an
+        // event under one generous bound: a timeout that fires while the
+        // service is healthy turns CPU contention into a missing answer.
         let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
         let conn = rustls::ClientConnection::new(no_verify_tls(), name).unwrap();
         let mut stream = StreamOwned::new(conn, tcp);
@@ -472,12 +475,21 @@ impl Stack {
         {
             return no_response(format!("write: {e}"));
         }
-        let mut raw = Vec::new();
-        match stream.read_to_end(&mut raw) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return no_response(format!("read: {e}")),
-        }
+        let raw =
+            match m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+                let mut stream = stream;
+                let mut raw = Vec::new();
+                match stream.read_to_end(&mut raw) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(format!("read: {e}")),
+                }
+                Ok(raw)
+            }) {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => return no_response(e),
+                Err(e) => return no_response(format!("read: {e}")),
+            };
         parse_h1(&raw)
     }
 
@@ -691,7 +703,7 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
     let mut stack = Stack::new();
     stack.start();
     assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the source's ID:\n{}",
         stack.cache_output()
     );
@@ -759,8 +771,9 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
     assert_eq!(&response.body[..], b"first: one");
 }
 
-/// A slice under load: the 1 ms loop-time budget bounds one slice's disk work
-/// and the queue drains over the slices that follow.
+/// A slice stops when its loop-time budget is used up and the next one resumes:
+/// one entry is always attempted first, and a zero budget then stops the slice
+/// after exactly one unit of work.
 ///
 /// The slice is [`disk_cache::DiskWriter::tick`], so this test calls it
 /// directly and never waits for a real accounting tick. It builds the writer,
@@ -768,15 +781,14 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
 /// `999`, then ticks until the queue and the old directory are empty. Each call
 /// is the same slice the loop runs on an idle turn while the writer has work.
 ///
-/// `work_max_ns` is the loop's own per-window maximum, so it is observable only
-/// from the live loop; the measurement this test makes in its place is
-/// [`disk_cache::DiskWriter::tick_last_ns`], the loop time the writer spent in
-/// each slice, which `/perf` reports as `tick_last_ns` beside it. The live
-/// `a_cache_node_writes_what_it_serves_to_disk` asserts that `/perf` reports
-/// `work_max_ns` while the writer works.
+/// The budget is zero rather than the production 1 ms because a wall-clock
+/// assertion cannot hold on a loaded host: the old median assertion failed
+/// under 16 CPU burners on 2026-11-16. What is asserted here is the behaviour
+/// the budget promises, and how long a slice takes is left to the perf gate.
 ///
 /// Break: drop the time check from `tick`, and the first slice writes the whole
-/// queue in one call.
+/// queue in one call. Break the one-unit guarantee, and a zero budget writes
+/// nothing on any slice and the queue never drains.
 #[test]
 fn a_full_tick_under_load_stops_at_the_time_budget() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -804,19 +816,24 @@ fn a_full_tick_under_load_stops_at_the_time_budget() {
     }
     assert_eq!(cache.queued(), LOAD_KEYS);
 
-    let started = Instant::now();
-    // One sample per slice: the files it wrote, the loop time it spent, and
+    // A zero loop-time budget makes the guarantee exact: one unit of work per
+    // slice, then the budget stops it and the next slice resumes. A wall-clock
+    // budget cannot promise a number of files on a loaded host, which is what
+    // made this test's median assertion fail under 16 CPU burners on
+    // 2026-11-16. Timing belongs to the perf gate.
+    writer.set_time_budget(Duration::ZERO);
+
+    // One sample per slice: the files it wrote, the old files it removed, and
     // how many entries it left flagged for the slices that follow.
-    let mut samples: Vec<(usize, u64, usize)> = Vec::new();
+    let mut samples: Vec<(usize, usize, usize)> = Vec::new();
     while cache.queued() > 0 || old.exists() {
         assert!(
             samples.len() < 10_000,
             "the queue did not drain in 10,000 slices"
         );
         let stats = writer.tick(&mut cache);
-        samples.push((stats.written, writer.tick_last_ns(), cache.queued()));
+        samples.push((stats.written, stats.removed, cache.queued()));
     }
-    let drain = started.elapsed();
     assert_eq!(writer.ticks() as usize, samples.len());
 
     let files = files_in(&root.join("0"));
@@ -829,71 +846,52 @@ fn a_full_tick_under_load_stops_at_the_time_budget() {
         writer.dir_bytes()
     );
 
-    // The first slice that wrote anything stopped with entries still flagged:
-    // the flag on an entry the budget could not reach is what the next slice
-    // finds. It is the writable claim, so it is asserted rather than printed.
-    let first_write = samples
-        .iter()
-        .position(|(written, ..)| *written > 0)
-        .expect("no slice wrote a file");
-    let (first_written, first_ns, queued_after) = samples[first_write];
-    assert!(first_written < LOAD_KEYS, "one slice wrote the whole queue");
-    assert!(
-        queued_after > 0,
-        "the slice cleared the flag of every entry it did not write"
+    let total_written: usize = samples.iter().map(|(written, ..)| written).sum();
+    assert_eq!(
+        total_written, LOAD_KEYS,
+        "every queued entry was written exactly once"
+    );
+    let total_removed: usize = samples.iter().map(|(_, removed, _)| removed).sum();
+    assert_eq!(
+        total_removed, LOAD_OLD_FILES,
+        "every file of the old generation was removed exactly once"
+    );
+
+    // The first slice that wrote anything stopped with the other entries still
+    // flagged: the flag on an entry the budget could not reach is what the next
+    // slice finds. A zero budget makes that exact, so it is asserted rather
+    // than printed.
+    let (first_written, _, queued_after) = *samples.first().expect("at least one slice");
+    assert_eq!(
+        first_written, 1,
+        "a zero budget must write one unit of work, not {first_written}"
     );
     assert_eq!(
         queued_after,
-        LOAD_KEYS - first_written,
-        "a slice clears only the flags of the entries it wrote"
+        LOAD_KEYS - 1,
+        "a slice clears only the flag of the entry it wrote"
     );
 
-    let mut write_files: Vec<usize> = samples
-        .iter()
-        .map(|(written, ..)| *written)
-        .filter(|written| *written > 0)
-        .collect();
-    let write_ticks = write_files.len();
-    write_files.sort_unstable();
-    let max_written = write_files.last().copied().unwrap_or(0);
-    let mut write_ns: Vec<u64> = samples
-        .iter()
-        .filter(|(written, ..)| *written > 0)
-        .map(|(_, ns, ..)| *ns)
-        .collect();
-    write_ns.sort_unstable();
-    let p = |v: &[u64], q: usize| v[(v.len() - 1) * q / 100];
-    println!(
-        "time budget under load: {} slices to drain {LOAD_KEYS} files ({write_ticks} write \
-         slices, {} removal slices) in {drain:?}, files per write slice {}..={max_written}, \
-         write slice tick_last_ns min {} p50 {} p90 {} p99 {} max {}, \
-         first write slice wrote {first_written} in {first_ns} ns and left \
-         {queued_after} flagged",
-        samples.len(),
-        samples.len() - write_ticks,
-        write_files.first().copied().unwrap_or(0),
-        write_ns.first().copied().unwrap_or(0),
-        p(&write_ns, 50),
-        p(&write_ns, 90),
-        p(&write_ns, 99),
-        write_ns.last().copied().unwrap_or(0),
-    );
+    let write_ticks = samples.iter().filter(|(written, ..)| *written > 0).count();
     assert!(
         write_ticks > LOAD_KEYS / 8,
-        "500 files took only {write_ticks} write slices; the time budget must spread them"
+        "500 files took only {write_ticks} write slices; the budget must spread them"
     );
-    assert!(
-        max_written <= 8,
-        "one slice wrote {max_written} files; the time budget must stop it between files"
-    );
-    // The median is the claim: one file's write fits the budget and the slice
-    // stops before starting another. The tail is the sandbox, which has
-    // recorded multi-second filesystem stalls, so the percentiles and maximum
-    // are printed above and only the body of the distribution is asserted.
-    assert!(
-        p(&write_ns, 50) <= TICK_WORK_MEDIAN_MAX_NS,
-        "the median write slice took {} ns",
-        p(&write_ns, 50)
+    for (written, removed, _) in &samples {
+        assert!(
+            *written <= 1,
+            "one slice wrote {written} files; the budget must stop it after one unit"
+        );
+        assert!(
+            *removed <= 1,
+            "one slice removed {removed} files; the budget must stop it after one unit"
+        );
+    }
+    println!(
+        "zero-budget slices: {} ticks wrote {total_written} files and removed \
+         {total_removed}, {write_ticks} of them wrote, and the first left \
+         {queued_after} entries flagged",
+        samples.len(),
     );
 }
 
@@ -921,7 +919,7 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
 fn a_restart_reads_the_file_the_node_wrote() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     let served = stack.get_cache("/", &[]);
     assert_eq!(served.text(), "first: one");
     assert!(
@@ -949,7 +947,7 @@ fn a_restart_reads_the_file_the_node_wrote() {
 fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
@@ -971,7 +969,7 @@ fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     assert_eq!(posted.genid(), "1");
 
     assert!(
-        stack.wait_perf_id("1", Duration::from_secs(10)),
+        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
         "the cache never followed the publish:\n{}",
         stack.cache_output()
     );
@@ -1013,7 +1011,7 @@ fn a_restart_with_the_same_id_starts_warm() {
     let mut stack = Stack::new();
     stack.start();
     assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the source's ID:\n{}",
         stack.cache_output()
     );
@@ -1072,7 +1070,10 @@ fn a_restart_with_the_same_id_starts_warm() {
 
 /// A restart after a publish starts cold: the ID moved while the node was
 /// down, so the loaded copy is dropped, the first GET reaches the source and
-/// the old generation's directory is removed.
+/// the old generation's directory is removed. A first heartbeat that times out
+/// cannot name the change, so the node serves the copy unverified until an
+/// answer names the new ID and drops it then. Both are cold starts, and both
+/// are asserted.
 ///
 /// Break: keep the load on every first answer, and the first GET serves
 /// `first: one` from a generation the site has left.
@@ -1080,7 +1081,7 @@ fn a_restart_with_the_same_id_starts_warm() {
 fn a_restart_after_a_publish_starts_cold() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
@@ -1113,12 +1114,20 @@ fn a_restart_after_a_publish_starts_cold() {
         stack.disk_block(),
         stack.cache_output()
     );
+    // Two designed paths end in `discarded`, and which one runs is not the
+    // test's to choose. When the first heartbeat answers, the copy is dropped
+    // for the reason this test is named after. When that heartbeat times out on
+    // a loaded host, the node installs the copy unverified and says so, then
+    // drops it on the next answer that names the new ID. Both reasons are
+    // logged and both end cold, so either line satisfies this. Requiring the
+    // first one made a healthy host under load fail on the heartbeat's own
+    // timeout, which is the fixed deadline this branch exists to remove.
     assert!(
-        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
-            .cache_output()
-            .contains(
-                "disk cache discarded: the site changed while this node was down"
-            )),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || {
+            let out = stack.cache_output();
+            out.contains("disk cache discarded: the site changed while this node was down")
+                || out.contains("disk cache served unverified: the upstream did not answer")
+        }),
         "the reason is logged:\n{}",
         stack.cache_output()
     );
@@ -1150,7 +1159,7 @@ fn a_restart_after_a_publish_starts_cold() {
 fn a_restart_with_the_source_down_serves_the_disk_copy() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
@@ -1223,7 +1232,7 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
     assert_eq!(posted.status, 200, "{}", posted.text());
     assert_eq!(posted.genid(), "1");
     assert!(
-        stack.wait_perf_id("1", Duration::from_secs(10)),
+        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
         "the cache never followed the publish:\n{}",
         stack.cache_output()
     );

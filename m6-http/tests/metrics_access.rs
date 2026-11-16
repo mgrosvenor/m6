@@ -320,12 +320,15 @@ fn get_req(path: &str, extra: &[(&str, &str)], version: &str) -> HttpRequest {
     }
 }
 
-/// Drive a client connection until `poll` answers, or ten seconds pass.
+/// Drive a client connection until `poll` answers, under one generous bound.
+///
+/// The bound is a safety net for a peer that stays silent, not an expected
+/// wait: ten seconds here turned CPU contention into "h2 wait: timed out".
 fn await_resp(
     label: &str,
     mut poll: impl FnMut() -> Option<std::io::Result<HttpResponse>>,
 ) -> Resp {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + testkit::RESPONSE_BOUND;
     loop {
         match poll() {
             Some(Ok(r)) => {
@@ -417,9 +420,9 @@ impl Running {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
         };
-        if let Err(e) = tcp.set_read_timeout(Some(Duration::from_secs(10))) {
-            return no_response(format!("set_read_timeout: {e}"));
-        }
+        // No socket read timeout. The response is waited for as an event under
+        // one generous outer bound: a read timeout fires on a loaded host while
+        // the service is healthy, and the caller sees status 0.
         let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
         let conn = match rustls::ClientConnection::new(tls_config(&self.fx.cert_der, &[]), name) {
             Ok(c) => c,
@@ -437,12 +440,20 @@ impl Running {
         {
             return no_response(format!("write request: {e}"));
         }
-        let mut raw = Vec::new();
-        match stream.read_to_end(&mut raw) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        let raw = match testkit::wait_for_event(testkit::RESPONSE_BOUND, move || {
+            let mut stream = stream;
+            let mut raw = Vec::new();
+            match stream.read_to_end(&mut raw) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(format!("tls read: {e}")),
+            }
+            Ok(raw)
+        }) {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => return no_response(e),
             Err(e) => return no_response(format!("tls read: {e}")),
-        }
+        };
         let text = String::from_utf8_lossy(&raw).into_owned();
         let end = text.find("\r\n\r\n").unwrap_or(raw.len());
         let mut lines = text[..end].split("\r\n");
@@ -529,7 +540,10 @@ fn h3_get(port: u16, path: &str, extra: &[(&str, &str)]) -> Result<Resp, String>
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| e.to_string())?;
-    config.set_max_idle_timeout(10_000);
+    // A safety net for a peer that goes silent, not a deadline for the
+    // response: ten seconds closed the connection on a loaded host while the
+    // server was answering.
+    config.set_max_idle_timeout(testkit::RESPONSE_BOUND.as_millis() as u64);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -552,7 +566,7 @@ fn h3_get(port: u16, path: &str, extra: &[(&str, &str)]) -> Result<Resp, String>
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut body: Vec<u8> = Vec::new();
     let mut done = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + testkit::RESPONSE_BOUND;
 
     loop {
         if Instant::now() > deadline {
@@ -739,8 +753,8 @@ fn perf_reports_the_event_loop() {
         assert_eq!(run.h1("/health", &[]).status, 200, "health answers");
     }
     // The trace is copied on the accounting tick, once per EMIT_INTERVAL_SECS.
-    // Wait for the field to be non-empty, with a deadline.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Wait for the field to be non-empty, under one generous bound.
+    let deadline = Instant::now() + testkit::RESPONSE_BOUND;
     let mut event_loop = None;
     while Instant::now() < deadline {
         let r = run.h1("/perf", &[("Authorization", &auth)]);

@@ -381,9 +381,9 @@ impl Stack {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
         };
-        tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        tcp.set_write_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
+        // No socket read or write timeout. The response is waited for as an
+        // event under one generous bound: a timeout that fires while the
+        // service is healthy turns CPU contention into a missing answer.
         let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
         let conn = rustls::ClientConnection::new(no_verify_tls(), name).unwrap();
         let mut stream = StreamOwned::new(conn, tcp);
@@ -398,12 +398,21 @@ impl Stack {
         {
             return no_response(format!("write: {e}"));
         }
-        let mut raw = Vec::new();
-        match stream.read_to_end(&mut raw) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return no_response(format!("read: {e}")),
-        }
+        let raw =
+            match m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+                let mut stream = stream;
+                let mut raw = Vec::new();
+                match stream.read_to_end(&mut raw) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(format!("read: {e}")),
+                }
+                Ok(raw)
+            }) {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => return no_response(e),
+                Err(e) => return no_response(format!("read: {e}")),
+            };
         parse_h1(&raw)
     }
 
@@ -412,9 +421,9 @@ impl Stack {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
         };
-        tcp.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        tcp.set_write_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
+        // No socket read or write timeout. The response is waited for as an
+        // event under one generous bound: a timeout that fires while the
+        // service is healthy turns CPU contention into a missing answer.
         let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
         let conn = rustls::ClientConnection::new(no_verify_tls(), name).unwrap();
         let mut stream = StreamOwned::new(conn, tcp);
@@ -430,12 +439,21 @@ impl Stack {
         {
             return no_response(format!("write: {e}"));
         }
-        let mut raw = Vec::new();
-        match stream.read_to_end(&mut raw) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return no_response(format!("read: {e}")),
-        }
+        let raw =
+            match m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+                let mut stream = stream;
+                let mut raw = Vec::new();
+                match stream.read_to_end(&mut raw) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                    Err(e) => return Err(format!("read: {e}")),
+                }
+                Ok(raw)
+            }) {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => return no_response(e),
+                Err(e) => return no_response(format!("read: {e}")),
+            };
         parse_h1(&raw)
     }
 
@@ -582,7 +600,7 @@ fn the_cache_learns_the_id_at_start() {
     stack.start_cache();
 
     assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the source's ID:\n{}",
         stack.cache_output()
     );
@@ -607,7 +625,7 @@ fn a_publish_through_the_cache_node_reaches_it() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
 
     let first = stack.get_cache("/", &[]);
     assert_eq!(first.status, 200, "{}", first.text());
@@ -630,7 +648,7 @@ fn a_publish_through_the_cache_node_reaches_it() {
     assert_eq!(posted.genid(), "1", "the source's new ID comes back");
 
     assert!(
-        stack.wait_perf_id("1", Duration::from_secs(10)),
+        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
         "the cache never followed the publish:\n{}",
         stack.cache_output()
     );
@@ -651,7 +669,7 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
 
@@ -674,8 +692,8 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
         "the reply carries the source's new ID"
     );
     assert!(
-        stack.wait_perf_id("1", Duration::from_secs(5)),
-        "only behind() can make a 3600s heartbeat due inside 5s; elapsed {:?}:\n{}",
+        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
+        "only behind() can make a 3600s heartbeat due this soon; elapsed {:?}:\n{}",
         started.elapsed(),
         stack.cache_output()
     );
@@ -700,14 +718,14 @@ fn the_cache_serves_what_it_holds_while_the_source_is_down() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     let held = stack.get_cache("/", &[]);
     assert_eq!(held.status, 200, "{}", held.text());
     assert_eq!(held.text(), "first: one");
 
     stack.stop_source();
     assert!(
-        stack.wait_upstream_down(true, Duration::from_secs(10)),
+        stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND),
         "/perf never reported the upstream down:\n{}",
         stack.cache_output()
     );
@@ -724,7 +742,7 @@ fn the_cache_serves_what_it_holds_while_the_source_is_down() {
         stack.cache_output()
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + m6_core::testkit::RESPONSE_BOUND;
     loop {
         let r = stack.get_cache("/", &[]);
         assert_eq!(
@@ -774,14 +792,14 @@ fn the_cache_recovers_when_the_source_returns() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
 
     stack.stop_source();
-    assert!(stack.wait_upstream_down(true, Duration::from_secs(10)));
+    assert!(stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND));
 
     stack.start_source();
     assert!(
-        stack.wait_upstream_down(false, Duration::from_secs(10)),
+        stack.wait_upstream_down(false, m6_core::testkit::RESPONSE_BOUND),
         "/perf never reported the upstream up:\n{}",
         stack.cache_output()
     );
@@ -807,7 +825,7 @@ fn the_cache_recovers_when_the_source_returns() {
     .unwrap();
     let token = stack.write_token();
     assert_eq!(stack.post_source("/genid", Some(&token)).status, 200);
-    assert!(stack.wait_perf_id("1", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND));
     let after = stack.get_cache("/", &[]);
     assert_eq!(after.status, 200);
     assert_eq!(after.text(), "first: two");
@@ -822,7 +840,7 @@ fn genid_through_the_cache_is_authorised_by_the_source() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
 
     let none = stack.get_cache("/genid", &[]);
     assert_eq!(
@@ -860,7 +878,7 @@ fn background_fetches_wait_for_the_id() {
     );
 
     stack.start_source();
-    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
     // The queue holds one fetch per warmable route per encoding; `/` and the
     // three encodings are the three. Their only trace before a client arrives
     // is the dispatch, because a background fetch has no response to write.
@@ -874,7 +892,7 @@ fn background_fetches_wait_for_the_id() {
 
     // A warmed route is a hit: its entry is fresh, so the answer carries Age
     // and reaches no backend.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + m6_core::testkit::RESPONSE_BOUND;
     loop {
         let r = stack.get_cache("/", &[]);
         assert_eq!(r.status, 200, "{}", r.text());
@@ -909,7 +927,7 @@ fn a_cache_with_a_live_origin_is_ready() {
     stack.start_source();
     stack.start_cache();
     assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the source's ID:\n{}",
         stack.cache_output()
     );
@@ -947,21 +965,21 @@ fn an_edge_with_a_dead_origin_past_the_window_reports_ready() {
     stack.start_source();
     stack.start_cache();
     assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the source's ID:\n{}",
         stack.cache_output()
     );
 
     stack.stop_source();
     assert!(
-        stack.wait_upstream_down(true, Duration::from_secs(10)),
+        stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the upstream down:\n{}",
         stack.cache_output()
     );
     // Past the window: two heartbeats with no answer. `last_ok_s` is state the
     // node already keeps, so this poll asks the origin nothing.
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
             stack.last_ok_s().is_some_and(|s| s > 2 * heartbeat_s)
         }),
         "the origin state never left the window:\n{}",
@@ -1038,7 +1056,7 @@ fn health_answers_process_only_in_all_three_states() {
 
     stack.start_cache();
     assert!(
-        stack.wait_perf_id("0", Duration::from_secs(10)),
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the source's ID:\n{}",
         stack.cache_output()
     );
@@ -1053,12 +1071,12 @@ fn health_answers_process_only_in_all_three_states() {
 
     stack.stop_source();
     assert!(
-        stack.wait_upstream_down(true, Duration::from_secs(10)),
+        stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND),
         "/perf never showed the upstream down:\n{}",
         stack.cache_output()
     );
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
             stack.last_ok_s().is_some_and(|s| s > 2 * heartbeat_s)
         }),
         "the origin state never left the window:\n{}",

@@ -86,6 +86,6 @@ pub use process::{
     Service,
 };
 #[cfg(feature = "testkit")]
-pub use response::{read_one, read_response, read_response_event, RESPONSE_BOUND};
+pub use response::{read_one, read_response, read_response_event, wait_for_event, RESPONSE_BOUND};
 #[cfg(feature = "testkit")]
 pub use wait::{for_path, for_tcp};

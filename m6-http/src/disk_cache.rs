@@ -126,9 +126,8 @@ pub struct DiskWriter {
     written_last_tick: usize,
     /// Encoded bytes written in the last tick.
     written_bytes_last_tick: u64,
-    /// Loop time one tick may spend, [`TIME_BUDGET`] in a built binary. The
-    /// unit tests set it directly to test the byte and removal budgets on
-    /// their own.
+    /// Loop time one tick may spend, [`TIME_BUDGET`] in a built binary. A test
+    /// sets it through [`DiskWriter::set_time_budget`] to make a budget exact.
     time_budget: Duration,
     /// Ticks taken since the writer was created.
     ticks: u64,
@@ -161,6 +160,15 @@ impl DiskWriter {
             ticks: 0,
             tick_last_ns: 0,
         })
+    }
+
+    /// Set the loop time one tick may spend.
+    ///
+    /// [`TIME_BUDGET`] is what a built binary uses. Only a test sets another
+    /// value: zero makes the budget exact, so a slice must stop after one unit
+    /// of work whatever the host's speed.
+    pub fn set_time_budget(&mut self, budget: Duration) {
+        self.time_budget = budget;
     }
 
     /// Follow `id`: a new subdirectory from the next write, and every other
@@ -234,15 +242,22 @@ impl DiskWriter {
         stats.removed = self.remove_old(started);
         let budget = self.time_budget;
         let mut written_bytes = 0u64;
+        // One entry is attempted before the budget is checked, the same
+        // guarantee `remove_old` makes: a host that deschedules the process
+        // inside the budget would otherwise write nothing on every tick and the
+        // queue would never drain. The attempt advances the scan by one entry,
+        // whether it wrote, skipped a full cache, or failed.
+        let mut attempted = false;
         // The scan visits entries in map order. An entry the budget cannot
         // take stops the scan and keeps its flag, so the next tick sees it.
         cache.scan_queued(|key, response| {
             if written_bytes >= WRITE_BUDGET {
                 return false;
             }
-            if over_budget(started, budget) {
+            if attempted && over_budget(started, budget) {
                 return false;
             }
+            attempted = true;
             let key_str: &str = std::borrow::Borrow::borrow(key);
             encode_into(&mut self.buf, id, key_str, response);
             let len = self.buf.len() as u64;

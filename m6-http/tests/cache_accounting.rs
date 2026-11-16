@@ -208,8 +208,9 @@ impl Stack {
     fn get_with(&self, path: &str, extra: &[(&str, &str)]) -> (u16, String) {
         probe::install_crypto();
         let tcp = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
+        // No socket read timeout: the read is waited for as an event under one
+        // generous bound. A read timeout fires on a loaded host while the
+        // service is healthy, and the test reports a missing answer.
         let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
         let conn =
             rustls::ClientConnection::new(probe::tls_config(b"http/1.1"), name).expect("tls");
@@ -224,7 +225,16 @@ impl Stack {
         req.push_str("\r\n");
         stream.write_all(req.as_bytes()).expect("write");
         stream.flush().expect("flush");
-        let raw = read_one(&mut stream, "GET").expect("read");
+        let raw =
+            match m6_core::testkit::wait_for_event(m6_core::testkit::RESPONSE_BOUND, move || {
+                let mut stream = stream;
+                let raw = read_one(&mut stream, "GET")?;
+                Ok::<_, std::io::Error>(raw)
+            }) {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => panic!("read: {e}"),
+                Err(e) => panic!("read: {e}"),
+            };
         let text = String::from_utf8_lossy(&raw).to_string();
         let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
         let status = head

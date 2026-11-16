@@ -115,6 +115,36 @@ pub fn read_response_event<R: Read + Send + 'static>(
     }
 }
 
+/// Run a blocking exchange on its own thread and wait for it to finish.
+///
+/// The event is the exchange returning, so this returns the moment the answer
+/// arrives. `within` is a safety net for a peer that stays silent, not a read
+/// deadline: a socket read timeout is the wrong tool for that, because on a
+/// loaded host it fires while the service is healthy and the test reports a
+/// response that never came when it was only slow.
+///
+/// A stream that has to be kept can be moved into `exchange` and moved back out
+/// with the result, which is how a keep-alive client waits on one response
+/// without surrendering its connection.
+pub fn wait_for_event<T: Send + 'static>(
+    within: Duration,
+    exchange: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(exchange());
+    });
+    match rx.recv_timeout(within) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("the exchange did not finish within {within:?}"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the exchange ended without a result".to_string())
+        }
+    }
+}
+
 /// Wait for one response, or for `svc` to exit, under `within`.
 ///
 /// A reader thread blocks on `stream` and sends the response back, while the
