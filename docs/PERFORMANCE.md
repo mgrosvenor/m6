@@ -201,7 +201,7 @@ That takes four settings, all made in code at start and none through an environm
 |---|---|---|
 | purge delay -1 | mimalloc never hands freed memory back, so the heap grows and does not shrink | `m6_core::alloc::never_return`, first line of `main` |
 | `[limits.heap_reserve]` | one committed reservation taken from the OS at start, on explicit huge pages when mimalloc finds a pool and otherwise advised `MADV_HUGEPAGE` for transparent ones (the common `madvise` mode only backs an advised range); m6-http defaults it to `cache_bytes` plus 64 MiB so the cache lives in it | `m6_core::alloc::reserve` |
-| `[server] lock_memory` | `mlockall`, so the reservation is resident and a hot page is never a page fault | m6-http, after the reservation and before serving |
+| `[server] lock_memory` | `mlockall(MCL_CURRENT \| MCL_FUTURE \| MCL_ONFAULT)`: a page is pinned as the load first touches it, so a hot page is never a page fault and memory that is reserved and unused is not resident | m6-http, after the reservation and before serving |
 | growth past the reservation | allowed, never a failure, logged once | `m6_core::alloc::note_growth`, on each service's one-second accounting tick |
 
 **Table: the settings that keep a warm service out of the kernel.**

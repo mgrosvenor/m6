@@ -7027,6 +7027,7 @@ fn run(args: Vec<String>) -> i32 {
 
     // Pin the heap, after it is reserved and before the first request. Asked
     // for and refused is a stop, not a quiet unpinned run.
+    let resident_before = m6_core::platform::process::resident_bytes();
     if state.config.server.lock_memory {
         if let Err(e) = m6_core::platform::process::lock_memory() {
             eprintln!("m6-http: [server] lock_memory: {e}");
@@ -7044,6 +7045,23 @@ fn run(args: Vec<String>) -> i32 {
             ", memory not pinned"
         }
     );
+    // What pinning did, in the two numbers that tell a pin of the pages a
+    // process holds from a pin of every mapping it has: the resident set, and
+    // the address space it sits in. Linux only, where /proc reports both.
+    if let (Some(mapped), Some(resident)) = (
+        m6_core::platform::process::virtual_bytes(),
+        m6_core::platform::process::resident_bytes(),
+    ) {
+        info!(
+            mapped_bytes = mapped,
+            resident_bytes = resident,
+            resident_before_pinning = resident_before,
+            "memory: {} MiB resident of {} MiB mapped ({} MiB resident before pinning)",
+            resident / (1024 * 1024),
+            mapped / (1024 * 1024),
+            resident_before.map_or(0, |bytes| bytes / (1024 * 1024)),
+        );
+    }
 
     let code = event_loop(
         EventLoopIo {

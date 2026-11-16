@@ -200,25 +200,100 @@ pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     Ok(None)
 }
 
-/// Pin all current and future pages. `ENOMEM` and `EPERM` are the memlock
-/// limit, and are the cases an operator can fix.
+/// The error a refused pin returns: it names the limit and both ways to fix it.
+fn lock_memory_refused(reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{reason}: RLIMIT_MEMLOCK is below what this process holds. \
+             Raise it: under systemd set LimitMEMLOCK=infinity in the unit, otherwise \
+             `ulimit -l unlimited` as root. Or set [server] lock_memory = false to run unpinned"
+        ),
+    )
+}
+
+/// Pin every page this process has faulted, and every page it faults later:
+/// `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`.
+///
+/// `MCL_ONFAULT` is the difference between pinning the pages a process holds and
+/// pinning every page it has a mapping for. Without it, `MCL_CURRENT` faults in
+/// every current VMA and `MCL_FUTURE` marks each mapping made later as one to be
+/// populated. mimalloc reserves 1 GiB of address space by default
+/// (`MI_DEFAULT_ARENA_RESERVE`, 1024*1024 KiB, in its `arena.c`), and a service's
+/// own `[limits.heap_reserve]` is another 192 MiB, so a process that had mapped
+/// 1.2 GiB and touched 96 MB of it became 1.2 GiB resident, on transparent huge
+/// pages, in one `mlockall` call: the pages were touched by the lock, not by the
+/// program. With `MCL_ONFAULT` a VMA is locked and not populated, and each page
+/// is pulled in and locked when the program first touches it, so memory that is
+/// reserved and never used is never resident, and after warm-up the hot path is
+/// resident and locked and takes no fault (the same zero it took before).
+///
+/// `MCL_ONFAULT` is Linux 4.4 (2016), and availability is checked by asking the
+/// kernel: a kernel that does not know the flag fails the call with `EINVAL`,
+/// which is answered here as an error naming the version and the fix, and never
+/// by falling back to pinning every mapping. The value is `libc`'s, and nix's
+/// `MlockAllFlags` has no constant for it, so the call is made through `libc`.
+///
+/// The limit must be unlimited. With `MCL_ONFAULT` the kernel no longer tests
+/// `RLIMIT_MEMLOCK` against the current mappings here, because it does not have
+/// to populate them, so a finite limit would let this call succeed and let a
+/// later `mmap` (mimalloc's next 1 GiB arena) be made unlocked once the limit is
+/// short: a service that carries on half pinned. `LimitMEMLOCK=infinity` is what
+/// the unit sets and what the error names, so a limit that cannot honour the
+/// request is refused here, at start, with the same error as one the kernel
+/// refuses.
 pub(super) fn lock_memory() -> io::Result<()> {
-    use nix::errno::Errno;
-    use nix::sys::mman::{mlockall, MlockAllFlags};
-    mlockall(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE).map_err(|errno| {
-        if matches!(errno, Errno::ENOMEM | Errno::EPERM) {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "mlockall failed ({errno}): RLIMIT_MEMLOCK is below what this process holds. \
-                     Raise it: under systemd set LimitMEMLOCK=infinity in the unit, otherwise \
-                     `ulimit -l unlimited` as root. Or set [server] lock_memory = false to run unpinned"
-                ),
-            )
-        } else {
-            io::Error::from(errno)
+    use nix::sys::resource::{getrlimit, Resource};
+    let (_, hard) = getrlimit(Resource::RLIMIT_MEMLOCK)?;
+    if hard != nix::libc::RLIM_INFINITY {
+        return Err(lock_memory_refused(&format!(
+            "pinning pages as they are faulted needs RLIMIT_MEMLOCK unlimited, and it is {hard} bytes"
+        )));
+    }
+    const FLAGS: nix::libc::c_int =
+        nix::libc::MCL_CURRENT | nix::libc::MCL_FUTURE | nix::libc::MCL_ONFAULT;
+    // SAFETY: `mlockall` takes no pointers, reads no memory of the caller's, and
+    // changes only how this process's own pages are backed. Every flag is a
+    // constant from the platform's headers.
+    let rc = unsafe { nix::libc::mlockall(FLAGS) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let errno = io::Error::last_os_error();
+    match errno.raw_os_error() {
+        Some(nix::libc::EINVAL) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mlockall with MCL_ONFAULT failed (EINVAL): locking pages as they are touched is \
+             Linux 4.4 or newer, and this kernel does not know the flag. Set [server] \
+             lock_memory = false to run unpinned on this kernel",
+        )),
+        Some(nix::libc::ENOMEM) | Some(nix::libc::EPERM) => {
+            Err(lock_memory_refused(&format!("mlockall failed ({errno})")))
         }
-    })
+        _ => Err(errno),
+    }
+}
+
+/// `/proc/self/status`'s `field`, in bytes. `None` where the file or the line is
+/// missing, so a caller logs nothing rather than a wrong number.
+fn status_bytes(field: &str) -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix(field))?
+        .split_whitespace()
+        .next()?;
+    value.parse::<usize>().ok().map(|kib| kib * 1024)
+}
+
+/// The size of this process's address space, from `/proc/self/status` (`VmSize`).
+pub(super) fn virtual_bytes() -> Option<usize> {
+    status_bytes("VmSize:")
+}
+
+/// This process's resident set, from `/proc/self/status` (`VmRSS`).
+pub(super) fn resident_bytes() -> Option<usize> {
+    status_bytes("VmRSS:")
 }
 
 /// `madvise(MADV_HUGEPAGE)` on the range.

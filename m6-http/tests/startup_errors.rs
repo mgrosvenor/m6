@@ -740,6 +740,13 @@ fn an_unknown_route_method_name_exits_2_and_names_it() {
 /// too low. Wrong outcome: m6-http starts unpinned without a word, or stops
 /// without naming the limit and the fix. The limit is lowered with `ulimit -l 0`
 /// in the shell that execs m6-http. Linux only: macOS has nothing to pin.
+///
+/// The shell prints the limit it set before the exec, and the test checks it is
+/// 0. `ulimit -S -H -l 0` was the command here, and on Ubuntu `sh` is dash,
+/// which rejects it with `ulimit: error setting limit (Invalid argument)` and
+/// leaves the limit unchanged, so this test's own assertion that the limit was
+/// lowered never ran. A refusal test that never refused is the defect, so the
+/// shell's answer is checked before m6-http's.
 #[test]
 fn lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix() {
     if std::env::consts::OS != "linux" {
@@ -764,14 +771,24 @@ fn lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix() {
     )
     .expect("system config");
 
+    // `ulimit -l 0` sets both limits and dash accepts it. `ulimit -l` prints the
+    // result, so the shell that has lowered the limit is the shell the assertion
+    // below relies on. A shell that rejects the command exits before the exec,
+    // and a shell that accepted it without lowering the limit prints something
+    // else, and both fail here instead of passing a test that measured nothing.
     let out = Command::new("sh")
-        .args(["-c", "ulimit -S -H -l 0 && exec \"$0\" \"$@\""])
+        .args(["-c", "ulimit -l 0 && ulimit -l && exec \"$0\" \"$@\""])
         .arg(testkit::binary("m6-http"))
         .arg(&site)
         .arg(&system)
         .output()
         .expect("run m6-http under sh");
     let err = stderr_of(&out);
+    assert_eq!(
+        stdout_of(&out).trim(),
+        "0",
+        "the shell did not lower RLIMIT_MEMLOCK to 0, so the refusal below was never put to the test. stderr: {err}"
+    );
     assert_eq!(exit_code(&out), 2, "stderr: {err}");
     assert!(err.contains("RLIMIT_MEMLOCK"), "{err}");
     assert!(err.contains("LimitMEMLOCK=infinity"), "{err}");

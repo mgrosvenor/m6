@@ -46,15 +46,19 @@ pub fn page_size() -> usize {
     }
 }
 
-/// Pin every page this process holds, and every page it maps later, in RAM, so
-/// the kernel never swaps one out and a hot page is never a page fault. Start
-/// only, after the heap is reserved and before serving.
+/// Pin every page this process has faulted, and every page it faults later, in
+/// RAM, so the kernel never swaps one out and a hot page is never a page fault.
+/// Start only, after the heap is reserved and before serving.
 ///
-/// Where memory cannot be pinned the error names the limit and the fix. On
-/// macOS there is nothing to ask for and the call does nothing: it returns
-/// `Ok`, and the process's memory is as the kernel manages it.
+/// Pages are pinned as they are touched and not before: memory a service has
+/// reserved and not used is not resident, and a page is locked the first time it
+/// is faulted, so the hot path still takes no fault once it is warm. Where
+/// memory cannot be pinned the error names the limit and the fix. On macOS
+/// there is nothing to ask for and the call does nothing: it returns `Ok`, and
+/// the process's memory is as the kernel manages it.
 ///
-/// Linux: `mlockall(MCL_CURRENT | MCL_FUTURE)`, bounded by `RLIMIT_MEMLOCK`.
+/// Linux: `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`, which needs
+/// `RLIMIT_MEMLOCK` unlimited and a kernel of 4.4 or newer.
 pub fn lock_memory() -> io::Result<()> {
     os::lock_memory()
 }
@@ -77,6 +81,20 @@ pub fn advise_huge_pages(start: *mut u8, len: usize) -> io::Result<()> {
 /// kind of page it got.
 pub fn huge_page_bytes() -> usize {
     os::huge_page_bytes()
+}
+
+/// The size of this process's address space, in bytes, or `None` where the
+/// platform keeps no such report (macOS). Read with [`resident_bytes`] at start:
+/// the gap between the two is memory that is mapped and not touched, which is
+/// what a reservation is.
+pub fn virtual_bytes() -> Option<usize> {
+    os::virtual_bytes()
+}
+
+/// This process's resident set, in bytes: the pages the kernel has in RAM for
+/// it. `None` where the platform keeps no such report (macOS).
+pub fn resident_bytes() -> Option<usize> {
+    os::resident_bytes()
 }
 
 /// The soft and hard open-file limits of this process.

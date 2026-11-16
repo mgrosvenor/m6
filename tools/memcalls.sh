@@ -14,8 +14,12 @@
 #   3. attach `strace -c -f` to every thread of the service,
 #   4. send --requests more,
 #   5. detach (SIGTERM to strace, which prints its table; SIGINT is ignored in a script's background job) and read the table.
-# The minor page faults come from /proc/PID/stat over the same window, and the
-# RSS from /proc/PID/status after it.
+# The minor page faults come from /proc/PID/stat over the same window, and four
+# figures are read after it: the resident set (`VmRSS`) and the address space it
+# sits in (`VmSize`), the memory the pin holds (`VmLck`), and the part on
+# transparent huge pages (`AnonHugePages`). A process that is resident to its
+# whole address space shows `rss` at `mapped`, which is what a pin that populates
+# every reserved mapping looks like.
 #
 # Targets:
 #   m6-http cache hit    m6-http over TLS HTTP/1.1, one cacheable page, every
@@ -105,6 +109,9 @@ measure() {
   printf '  %-10s %s\n' "TOTAL" "$total"
   printf '  %-10s %s\n' "minor-flt" "$((faults_after - faults_before))"
   printf '  %-10s %s KiB\n' "rss" "$(rss_kb "$pid")"
+  printf '  %-10s %s KiB\n' "mapped" "$(mapped_kb "$pid")"
+  printf '  %-10s %s KiB\n' "locked" "$(locked_kb "$pid")"
+  printf '  %-10s %s KiB\n' "anon-huge" "$(huge_kb "$pid")"
 }
 
 run_arm() {

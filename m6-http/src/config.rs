@@ -255,16 +255,20 @@ pub struct ServerConfig {
     /// cannot stampede: it is the same mechanism that refreshes stale entries.
     #[serde(default)]
     pub warm_on_start: bool,
-    /// Pin every page of the process in RAM at start, after the heap is
-    /// reserved and before serving (`mlockall`), so a hot page is never a page
-    /// fault and the kernel never swaps the cache out. Default true. It needs
-    /// `RLIMIT_MEMLOCK` to cover the process, which an ordinary account's 8 MiB
-    /// does not: production sets `LimitMEMLOCK=infinity` in the systemd unit,
-    /// and a developer on Linux raises the limit for the account
-    /// (`docs/m6-testing.md`). When the kernel refuses, m6-http stops at start
-    /// with exit 2 and an error that names the limit and the fix; it never
-    /// carries on unpinned when pinning was asked for. Set false to run
-    /// unpinned. A no-op on macOS. Read at start, and a change needs a restart.
+    /// Pin every page of the process in RAM as it is faulted, after the heap is
+    /// reserved and before serving (`mlockall` with `MCL_ONFAULT`), so a hot
+    /// page is never a page fault and the kernel never swaps the cache out.
+    /// Default true. Memory the process has reserved and not touched is not
+    /// resident and not pinned: the pin follows the pages the load touches, so
+    /// a warm process holds what its cache holds rather than every mapping
+    /// mimalloc has reserved. It needs `RLIMIT_MEMLOCK` unlimited, which an
+    /// ordinary account's 8 MiB is not: production sets
+    /// `LimitMEMLOCK=infinity` in the systemd unit, and a developer on Linux
+    /// raises the limit for the account (`docs/m6-testing.md`). When the limit
+    /// or the kernel refuses, m6-http stops at start with exit 2 and an error
+    /// that names the limit and the fix; it never carries on unpinned when
+    /// pinning was asked for. Set false to run unpinned. A no-op on macOS. Read
+    /// at start, and a change needs a restart.
     pub lock_memory: bool,
     /// Request methods this server will serve. Anything else is answered 405
     /// with an `Allow` header, before routing, cache lookup or backend

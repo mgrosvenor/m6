@@ -39,7 +39,11 @@ wait_for() { # wait_for <test...>: up to 10 s
 }
 
 minflt() { awk '{ print $10 }' "/proc/$1/stat"; }
-rss_kb() { awk '/^VmRSS:/ { print $2 }' "/proc/$1/status"; }
+status_kb() { awk -v key="$2" '$1 == key { print $2 }' "/proc/$1/status"; }
+rss_kb() { status_kb "$1" "VmRSS:"; }
+mapped_kb() { status_kb "$1" "VmSize:"; }
+locked_kb() { status_kb "$1" "VmLck:"; }
+huge_kb() { awk '/^AnonHugePages:/ { print $2 }' "/proc/$1/smaps_rollup"; }
 
 # make_site <fill-mib>: the site, with that many MiB of static files for the
 # cache to hold. Zero still makes one small file.
@@ -61,6 +65,12 @@ domain = "localhost"
 
 [errors]
 mode = "internal"
+
+# The load is thousands of requests from one address in a minute, and m6-http's
+# default rate limit is 300: with it on, the warm-up and every request after it
+# is answered 429 and the counters measure the refusal path, not the hit path.
+[rate_limit]
+enabled = false
 
 [log]
 level = "error"

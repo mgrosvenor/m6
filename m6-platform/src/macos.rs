@@ -193,6 +193,17 @@ pub(super) fn lock_memory() -> io::Result<()> {
     Ok(())
 }
 
+/// macOS has no `/proc`, so this process's address space and resident set are
+/// not read here. `None` says so rather than reporting a number from elsewhere.
+pub(super) fn virtual_bytes() -> Option<usize> {
+    None
+}
+
+/// macOS has no `/proc`, so this process's resident set is not read here.
+pub(super) fn resident_bytes() -> Option<usize> {
+    None
+}
+
 /// macOS has no transparent huge pages to ask for.
 pub(super) fn advise_huge_pages(_start: *mut u8, _len: usize) -> io::Result<()> {
     Ok(())
