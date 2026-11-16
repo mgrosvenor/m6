@@ -344,7 +344,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[compression]` | core | brotli and gzip levels per MIME type |
 | `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 11 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info` |
-| `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 |
+| `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 and Table 6 |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |
 | `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash. An absolute path, and a relative one is exit 2 |
@@ -409,16 +409,40 @@ The route table is the part of that configuration a service writes code against,
 
 ### 4.2 Limits
 
-**Every bounded buffer and queue in a service has a named limit with a `start` and a `max`, and both are config keys.**
-Table 6 lists the limits that exist, with the defaults a config that says nothing gets.
-A key under `[limits]` that is not in the table stops the service at start with exit 2.
+**Every bounded buffer and queue has a named limit with a `start` and a `max`, and both are config keys.**
+Table 6 lists every limit with the defaults a config that says nothing gets, the process that reads it, and what happens past the maximum.
+A key under `[limits]` that is not in the table stops the process at start with exit 2.
+m6-http reads its keys from the `[limits]` table of its system config, and every other service reads them from its own configuration file.
 
-| limit | start | max | what it bounds | past `max` |
-|---|---|---|---|---|
-| `render_page` | 512 KiB | 4 MiB | the working area one rendered page is written into, one per service | the page is refused, the client gets 500 and the log names the page, the size needed and the key |
+| limit | unit | start | max | read by | what it bounds | past `max` |
+|---|---|---|---|---|---|---|
+| `render_page` | bytes | 512 KiB | 4 MiB | m6-html and any `Site` | the area one rendered page is written into | the page is refused with a 500 |
+| `request_body` | bytes | 16 KiB | 16 MiB | services | one connection's read buffer, so the largest request body | 413 |
+| `response_buffer` | bytes | 64 KiB | 64 MiB | services | one connection's write buffer, so the largest response held in memory | 500 |
+| `upstream_read` | bytes | 64 KiB | 128 MiB | services, m6-monitor | the buffer one backend response is read into | the fetch fails |
+| `upstream_request` | bytes | 16 KiB | 32 MiB | services, m6-monitor | the buffer one backend request is built in | the fetch fails |
+| `connections` | slots | 1024 | 1048576 | services, m6-http | the connection table, lowered by the open-file limit | the kernel backlog holds the connection |
+| `compress_output` | bytes | 64 KiB | 128 MiB | services | the response a compressor reads | 500 |
+| `minify_output` | bytes | 64 KiB | 128 MiB | services | the response a minifier reads | 500 |
+| `smtp_reply` | bytes | 512 B | 128 KiB | services with mail | one relay reply | the send fails |
+| `ndjson_page` | bytes | 4 MiB | 64 MiB | m6-monitor | the default page and the largest row of an ndjson stream | the row is refused |
+| `tail_read` | bytes | 64 KiB | 512 KiB | m6-file | one tail response | 413 |
+| `log_buffer` | bytes | 16 KiB | 1 MiB | every process | one log destination's buffer | the line is refused |
+| `log_field` | bytes | 8 KiB | 8 KiB | every process | one string field of a log line | the line is refused |
+| `history_queue` | polls | 8 | 1024 | m6-monitor | polls held while the history file is locked | the new poll is refused |
+| `edge_request` | bytes | 4 KiB | 32 MiB | m6-http | one HTTP/1.1 connection's read buffer, so the largest request | 413 |
+| `edge_response` | bytes | 512 B | 128 MiB | m6-http | one HTTP/1.1 connection's write buffer, so the largest response held | 500 |
+| `h2_recv` | bytes | 16 KiB | 4 MiB | m6-http | one HTTP/2 connection's read buffer | the connection closes |
+| `h2_header_block` | bytes | 16 KiB | 256 KiB | m6-http | one HTTP/2 header block before decoding | GOAWAY, ENHANCE_YOUR_CALM |
+| `h2_stream_body` | bytes | 4 KiB | 32 MiB | m6-http | one HTTP/2 request body | the stream is reset |
+| `refresh_queue` | entries | 16 | 4096 | m6-http | stale cache entries waiting for a background fetch | the refresh is refused |
+| `rate_limit_addresses` | entries | 1024 | 50000 | m6-http | client addresses the request counter tracks | a new address is answered 429 |
+| `cache_bytes` | bytes | 128 MiB | 128 MiB | m6-http | the response cache, which evicts the least recently read entry | the cache evicts |
 
-**Table 6: the named limits, their defaults, and what happens past the maximum.**
-Take from it that a service allocates `start` once, and that `render_page` is the only limit so far.
+**Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
+Take from it that every limit is one `start` and one `max`, and that a limit past its maximum refuses the work with an error naming the key, except the cache, which evicts by design.
+
+The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 431, and the HTTP/2 reset memory of 128 streams must stay above the concurrency cap, so neither has a key.
 
 ```toml
 [limits.render_page]
@@ -426,7 +450,8 @@ start = "512KiB"
 max   = "4MiB"
 ```
 
-A size is a whole number of bytes, or a number followed by `B`, `KiB`, `MiB` or `GiB`.
+A byte size is a whole number of bytes, or a number followed by `B`, `KiB`, `MiB` or `GiB`.
+A count is a whole number.
 Either key may be left out, and the default for that name applies.
 
 The same rule holds for every limit:
@@ -435,9 +460,11 @@ The same rule holds for every limit:
 2. It grows only when a write does not fit, by doubling, and the last step is clamped to `max`.
 3. It keeps the grown size and never shrinks.
 4. Each growth writes one log line that names the limit and the new size, so an operator can raise `start` until growth stops.
-5. A write that needs more than `max` is refused with one error line, for example: `m6-html: page /blog/x needs at least 5 MiB, over [limits.render_page] max = 4 MiB in /etc/m6/m6-html.toml; raise max to fix this`.
+5. A write that needs more than `max` is refused outright with one error line, for example: `m6-html: page /blog/x needs at least 5 MiB, over [limits.render_page] max = 4 MiB in /etc/m6/m6-html.toml; raise max to fix this`.
+   The request gets its error status, or the queue item is refused. Nothing is cut, dropped without an error or sent in part.
 
-Sizes are whole multiples of the operating system's page, `page * 2^k`, where the page comes from `m6-platform`: 4 KiB on Linux x86_64 and 16 KiB on macOS arm64.
+A large area is a whole multiple of the operating system's page, `page * 2^k`, where the page comes from `m6-platform`: 4 KiB on Linux x86_64 and 16 KiB on macOS arm64.
+A small buffer is a power of two, and a count is used as written.
 A value of another size is rounded up to the next one, and the service writes one warning to stderr per value, naming the key, the file, the value set and the value used:
 `m6-html: [limits.render_page] start = 500KiB in /etc/m6/m6-html.toml is not a power-of-two multiple of the 16 KiB page; using 512 KiB. Set it to 512KiB to silence this.`
 A value that cannot work stops the start with exit 2: a `max` below its `start`, a zero, a unit that is not a size, an unknown limit or an unknown key.

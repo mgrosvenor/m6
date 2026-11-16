@@ -267,6 +267,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, max_requests_per_connection, reuse_port | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
+| `[limits.<name>]` | System config | The start and maximum of this node's buffers and queues, memory a node owns |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
@@ -721,6 +722,22 @@ An idea for a later batch on Linux is a *reuseport socket filter* (*BPF*, Berkel
 Every connection from one address then lands on the same process, and the per-process count equals the per-client count.
 The filter is a new mechanism on the connection path, and this batch's rule is latency first with no new mechanisms, so the idea waits for a later batch.
 
+### 4.14. `[limits]`
+
+m6-http sizes its buffers and queues from named limits, each with a `start` and a `max`.
+The table lives in the system config, because memory is a property of the node.
+A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
+The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer` and `log_field`.
+[`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
+
+```toml
+[limits.edge_request]
+start = "4KiB"
+max   = "32MiB"
+```
+
+Take from the example that a limit is two sizes, and that a request past `max` is refused with an error that names `[limits.edge_request] max` and the file to raise it in.
+
 ## 5. Route matching
 
 m6-http answers a request from the cache first, and a cache hit is answered without selecting a route or contacting a backend.
@@ -778,6 +795,7 @@ Exit 2 on:
 - `[auth]` in `site.toml`, in a two-file config
 - A system config with no `[node]`
 - `[log] level` unrecognised
+- `[limits]` with an unknown limit, an unknown key, a value that is not a size, a zero, or a `max` below its `start`
 - Any route missing `path` or `backend`
 - Any route `backend` value not declared in `[[backend]]`
 - A `[[backend]]` `sockets` glob that matches no socket

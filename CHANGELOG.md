@@ -44,6 +44,14 @@ The released versions, newest first:
 
 ### Migration
 
+**Past a limit's maximum, work is now refused with an error that names the key, where four places used to cut, drop or carry on.**
+A log line with a string field over `[limits.log_field] max` (8 KiB) is refused whole, where the field was cut at 1024 bytes and ended in `...`.
+A tail request that would read past `[limits.tail_read] max` (512 KiB) is answered 413, where `m6-file` returned the first 512 KiB and an `X-Log-End` to page on, so a client that is more than 512 KiB behind raises the key or polls sooner.
+A monitor poll that finds the history hold past `[limits.history_queue] max` (1024 polls) is refused and counted, where the oldest poll was dropped.
+A background refresh past `[limits.refresh_queue] max` (4096) is refused with an error line, where it was dropped without one, and a new client address past `[limits.rate_limit_addresses] max` (50,000) is answered 429, where the table grew without a bound.
+m6-http's largest HTTP/1.1 request is now 32 MiB (`[limits.edge_request] max`), the next power of two above the 20 MiB it was, and its largest HTTP/2 body is 32 MiB (`[limits.h2_stream_body] max`), above the 20 MiB it was.
+A size that is not a power of two is rounded up with one warning on stderr, so 20 MiB cannot be set and `"16MiB"` is the way to the old HTTP/1.1 behaviour.
+
 **The `Renderer` trait writes into a page area instead of returning a `String`.**
 `Renderer::render(&self, template, ctx, out: &mut BoundedBuf)` replaces `render(&self, template, ctx) -> Result<String, RenderError>`, and `RenderError` gains `TooLarge(usize)`.
 A service that links `m6-core` and uses `TeraFactory` or `NoTemplates` changes nothing.
@@ -285,6 +293,21 @@ A directory symlink that stays inside the site still resolves inside and is serv
 Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
 
 ### Fixed
+
+**Every buffer and queue the audit found unbounded, shrinking, or silently dropping is on a named limit with a `start`, a `max` and one rule.**
+The rule is: allocate `start`, grow by doubling only when a write does not fit, clamp at `max`, keep the size, log one line on each growth, and refuse past `max` with an error that names the limit, the size needed, what was refused and the key and file to raise.
+Twenty-two limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from `[limits.<name>]` in a service's config and in m6-http's system config.
+- m6-core: the HTTP/1.1 slot's read buffer (`request_body`) and write buffer (`response_buffer`) no longer shrink after a large request, a request past the maximum is 413 and a response past it is 500.
+  The upstream client's read buffer (`upstream_read`) and request buffer (`upstream_request`, which had no bound) refuse past their maximums.
+  The compressor's and minifier's input (`compress_output`, `minify_output`) and the SMTP reply buffer (`smtp_reply`, a fixed buffer that failed when full) follow limits, and so do the connection table (`connections`) and the ndjson page (`ndjson_page`).
+- m6-http: `edge_request`, `edge_response` (which had no bound), `h2_recv` (no bound), `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes` and `connections`.
+- m6-log: `log_buffer` grows from 16 KiB to 1 MiB where it was fixed and dropped lines, and `log_field` replaces the 1024-byte cut.
+- m6-monitor: `history_queue`, and its node requests follow `upstream_read` and `upstream_request`.
+- m6-file: `tail_read`.
+Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory of 128 streams, which must stay above the concurrency cap to hold against Rapid Reset, and the idle URL connection pool, which closes a spare connection and loses no work.
+Verified by a test per limit that fills it past its maximum and reads the refusal: `m6-core/tests/server_conn.rs`, `m6-core/src/limits.rs`, `m6-core/src/client.rs`, `m6-core/src/email.rs`, `m6-core/src/site.rs`, `m6-log/tests/limits_refuse.rs`, `m6-log/tests/escaping.rs`, `m6-http/src/http11.rs`, `m6-http/src/http2.rs`, `m6-http/src/rate_limit.rs`, `m6-monitor/src/history.rs` and `m6-file/src/handler.rs`.
+The hot cache hit still allocates nothing (`m6-http --features count-allocations --test allocations`), and the page-path budgets in `site_allocs` and `request_allocs` are unchanged.
+m6-http conformance (h1spec, h2spec, h3spec) was not run on macOS and must be run on Linux.
 
 **A monitor poll on any path is counted as monitor traffic, not as a visitor (#107).** The channel table had two interfaces, so a header check on `/capabilities`, a `/health` poll, or any other monitoring request arrived in `http/*/external` and moved the visitor hit rate while no visitor had moved. `/perf` now reports `http/*/monitor` beside `http/*/external` and `http/*/internal`. The three monitoring endpoints are identified by their backend name, and every other path by the peer's address class. A monitor runs on the private network, so its poll arrives from a private address, while a real visitor's address is public after NAT. The class comes from the listener socket and the peer address the connection proved, so it reads no header and needs no configuration key. Three tests pin the three populations. `a_monitor_poll_on_another_path_is_not_external_traffic` fails as external traffic when the private-peer class is removed, `a_real_external_request_stays_external` fails as monitor when the class is over-broad, and `an_internal_backbone_request_stays_internal` fails as external when the internal socket is classified by its forwarded peer address instead.
 
