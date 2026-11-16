@@ -245,7 +245,8 @@ impl Db {
     ///
     /// Compiled only for this crate's tests or with the `testkit` feature,
     /// which the fixture crates enable from their dev-dependencies. A
-    /// production build cannot call this with a cost below [`BCRYPT_COST`].
+    /// production build cannot call this with a cost below `BCRYPT_COST`
+    /// (private, so named here in backticks).
     #[cfg(any(test, feature = "testkit"))]
     pub fn user_create_with_cost(
         &self,

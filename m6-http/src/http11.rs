@@ -2222,8 +2222,9 @@ pub fn status_may_have_content_length(status: u16) -> bool {
 ///
 /// Public so the generation check can count what the miss path allocates with
 /// and without an ID. The writer itself is the production one. The production
-/// request path does not call this: it hands [`write_response`] the connection's
-/// own output buffer, which is why a response no longer allocates its bytes.
+/// request path does not call this: it hands `write_response` (private, so
+/// named here in backticks) the connection's own output buffer, which is why a
+/// response no longer allocates its bytes.
 pub fn build_response(
     status: u16,
     headers: &[(String, String)],

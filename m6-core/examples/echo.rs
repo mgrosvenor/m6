@@ -1,6 +1,6 @@
 //! A TCP echo server: the reference loop every m6 service follows.
 //!
-//! Usage: echo [ADDR] (default 127.0.0.1:7000). ECHO_IDLE_MS sets the idle
+//! Usage: `echo [ADDR]` (default 127.0.0.1:7000). ECHO_IDLE_MS sets the idle
 //! timeout (default 10000) and ECHO_DRAIN_MS how long a shutdown waits for
 //! open connections to finish (default 1000). The connection table starts
 //! with ECHO_CONNS slots (default 1024), doubles when full, never shrinks, and

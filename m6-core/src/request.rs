@@ -271,8 +271,8 @@ impl Request {
     ///
     /// Not the validating helper: it does no traversal or symlink check at all,
     /// and its one caller passes the empty string. A caller that takes the
-    /// value from a request wants [`Request::validated_path`], which resolves
-    /// the path and refuses one that leaves the site.
+    /// value from a request wants [`crate::path::resolve_within`], which
+    /// resolves the path and refuses one that leaves the site.
     pub fn site_path(&self, rel: &str) -> PathBuf {
         self.site_dir.join(rel)
     }

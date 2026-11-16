@@ -91,7 +91,8 @@ pub fn read_one<R: Read>(r: &mut R, method: &str) -> io::Result<Vec<u8>> {
 /// Wait for one response, or for `svc` to exit, under `within`.
 ///
 /// A reader thread blocks on `stream` and sends the response back, while the
-/// test thread checks the child every [`RESPONSE_POLL`]. A complete response
+/// test thread checks the child every `RESPONSE_POLL` (private, so named here
+/// in backticks). A complete response
 /// wins as soon as it arrives; a child that exits wins when it happens first
 /// and fails with its output. A partial response, including the empty read at
 /// end of file, is reported as the child's death when the child has exited;

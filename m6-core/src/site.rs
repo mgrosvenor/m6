@@ -155,7 +155,7 @@ pub struct Reload {
 
 /// Write the access line for a finished `POST /genid`, then return the answer.
 ///
-/// The refresh answer is built outside [`Site::finish_raw`] (it has no route,
+/// The refresh answer is built outside [`Site::finish`] (it has no route,
 /// nothing to render and nothing to compress), and with this it is not silent:
 /// one line per reload, in the shape every other request logs, so an operator
 /// reading the log sees publishes and their status.

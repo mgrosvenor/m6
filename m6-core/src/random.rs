@@ -7,6 +7,9 @@
 //! examples to copy and no shared function, and a copy reaching for
 //! `rand::random()` or a non-cryptographic generator would look identical at a
 //! glance.
+//!
+//! `MAX_TOKEN_BYTES` is private, and rustdoc documents public items only, so it
+//! appears in backticks below.
 
 use rand::RngCore;
 
@@ -22,7 +25,7 @@ const MAX_TOKEN_BYTES: usize = 32;
 /// The zero-allocation form of [`random_hex_token`], for a caller on a request
 /// path that keeps `[u8; 32]` on the stack and reads the id back as a `&str`
 /// over it. `out` is exactly two hex characters per random byte, so it must be
-/// even and at most twice [`MAX_TOKEN_BYTES`]. The returned `&str` borrows
+/// even and at most twice `MAX_TOKEN_BYTES`. The returned `&str` borrows
 /// `out`.
 pub fn random_hex_token_into(out: &mut [u8]) -> &str {
     assert!(
@@ -46,7 +49,7 @@ pub fn random_hex_token_into(out: &mut [u8]) -> &str {
 /// A cryptographically random token of `N` bytes, hex encoded.
 ///
 /// The returned string is `2 * N` characters. `N` is at most
-/// [`MAX_TOKEN_BYTES`], the longest token any caller here makes.
+/// `MAX_TOKEN_BYTES`, the longest token any caller here makes.
 ///
 /// **One allocation.** Both versions this replaces built the string with
 /// `bytes.iter().map(|b| format!("{:02x}", b)).collect()`, which allocates a
@@ -62,7 +65,7 @@ pub fn random_hex_token_into(out: &mut [u8]) -> &str {
 ///
 /// # Panics
 ///
-/// `N` must be at most [`MAX_TOKEN_BYTES`], because the scratch buffer holds
+/// `N` must be at most `MAX_TOKEN_BYTES`, because the scratch buffer holds
 /// exactly that many random bytes. A larger `N` slices the buffer out of
 /// bounds and panics, so a caller with a const-generic size it does not
 /// control checks the bound rather than passing one through.

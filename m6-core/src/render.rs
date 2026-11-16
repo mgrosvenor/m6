@@ -51,7 +51,8 @@ impl std::fmt::Display for RenderError {
 /// file I/O and compression. The page is written into `out`, the service's one
 /// reusable page area, which the caller empties before the call. A renderer
 /// that finds `out` full past its maximum stops and returns
-/// [`RenderError::TooLarge`] with [`BoundedBuf::overflow`].
+/// [`RenderError::TooLarge`] with
+/// [`crate::limits::BoundedBuf::overflow`].
 pub trait Renderer: Send + Sync + 'static {
     fn render(
         &self,
