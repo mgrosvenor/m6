@@ -67,16 +67,22 @@ m6-http starts in this order, before it serves a request.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
 4. If `[auth]` is declared, load the public key for local JWT verification.
-   `backend` is optional.
+   `backend` is optional and names the socket backend that answers `/check`.
 5. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
 6. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
 7. Resolve every URL backend host once.
    A name that does not resolve is exit 2.
-8. Bind the TLS and QUIC sockets on `[server].bind`.
+8. Probe every member of the `[auth] backend` pool, when that key is set.
+   The probe sends one `POST /check` with no credential.
+   A 401 or 503 passes, because a checker that refuses or is busy is there.
+   A 404 is exit 2, naming the setting, the backend and the socket, because that address is not an auth server.
+   A connect failure or a timeout warns and the start continues, so a node can start while its checker is replaced.
+   When every member answered something other than 401, 503 or 404, the start is exit 2 and names the backend.
+9. Bind the TLS and QUIC sockets on `[server].bind`.
    If `h2c_bind` is set, bind the H2C (plain-TCP HTTP/2) listener on that address.
    The listener is internal when `internal_binds` names it, and then accepts only the peers in `internal_peers`.
-9. Start the event loop.
+10. Start the event loop.
 
 With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_core::platform::net::listen_shared`, before the TLS configuration is built.
 With `reuse_port_processes` set, Linux also attaches a socket filter to both that picks the process from the client's source address, so one client always reaches one process.
@@ -486,6 +492,11 @@ If a route declares `require`, m6-http enforces it before forwarding:
 One function, `auth::check`, does steps 1 to 4 for route `require`, `/perf`, `/traffic` and `/genid`, once per request, so all four accept the same tokens and refuse the same ways.
 It decides `Allow(claims)`, `NoCredential` (401) or `Deny` (403). `m6_core::http::token_refusal` is the one definition of the refusal, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
 A missing `[auth] public_key` fails closed as 401. Config validation refuses `require` without `[auth]`, so a running node does not reach that state.
+
+`[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
+Its `sockets` glob must match at least one socket, and a `url` backend is refused by name.
+The members are probed once at start (section 2 step 8).
+Nothing on a request path calls `/check` yet, so `public_key` alone verifies a token.
 
 Valid requests are forwarded with the verified token intact.
 Renderers may perform additional fine-grained checks using the auth claims available in the request dictionary.

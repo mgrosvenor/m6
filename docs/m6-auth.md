@@ -397,11 +397,16 @@ This section gives the one configuration that points m6-http at this service, an
 
 ```toml
 [auth]
+backend    = "m6-auth-check"
 public_key = "/etc/m6/auth.pub" # the file m6-http reads at startup
 
 [[backend]]
 name = "m6-auth"
 sockets = "/run/m6/m6-auth*.sock"
+
+[[backend]]
+name = "m6-auth-check"
+sockets = "/run/m6/check-m6-auth*.sock"
 
 [[route]]
 path = "/auth/login"
@@ -416,10 +421,12 @@ path = "/auth/refresh"
 backend = "m6-auth"
 ```
 
-The glob matches the primary socket and never the check socket, because the check socket's name begins with `check-`.
-A deployment can keep this backend unchanged while it splits the service into two processes.
+The login glob matches the primary socket and never the check socket, because the check socket's name begins with `check-`.
+A deployment can keep the login backend unchanged while it splits the service into two processes.
 
-The `[auth] public_key` file is the public key that matches the service's private key.
+`[auth] backend` names the check backend.
+m6-http probes each member once at start: 401 or 503 passes, 404 stops the start, and a refused connection warns.
+Nothing on a request path calls `/check` yet, so `public_key` alone verifies a token.
 The token sources, the `require` forms and the five outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
 The edge check is local, so the header it sets carries the result to a backend, and section 8 shows what a backend does with it.
 

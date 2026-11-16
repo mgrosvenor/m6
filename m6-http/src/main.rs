@@ -6511,6 +6511,122 @@ fn urlencoded(s: &str) -> String {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// How long one `[auth] backend` member has to answer the start probe.
+const AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Probe every member of the `[auth] backend` pool, once, before a listener
+/// binds.
+///
+/// A member that answers 401 or 503 serves checks, so the node may start. A
+/// member that answers 404 is something else behind the socket, and every
+/// protected request would be refused by it, so that stops the start. A member
+/// that cannot be reached or times out is a warning: a check process
+/// mid-restart is transient, and a node that carries public traffic must not
+/// fail to start because its checker is being replaced.
+///
+/// `Err` is a message for `main` to print on stderr and exit 2 with.
+fn probe_auth_backend(pool: &m6_http_lib::pool::BackendPool) -> Result<(), String> {
+    let mut any_checker = false;
+    let mut answered_other: Vec<(String, u16)> = Vec::new();
+    for member in pool.members() {
+        match probe_check_member(member) {
+            Ok(401 | 503) => {
+                info!(backend = %pool.name, socket = %member.display(), "auth backend member answers checks");
+                any_checker = true;
+            }
+            Ok(404) => {
+                return Err(format!(
+                    "m6-http: [auth] backend \"{}\": {} answered 404 to POST /check; that socket is not an m6-auth-server, and [auth] backend must name the backend that answers /check",
+                    pool.name,
+                    member.display()
+                ));
+            }
+            Ok(status) => {
+                eprintln!(
+                    "m6-http: [auth] backend \"{}\": {} answered {status} to POST /check, which is not 401 or 503; ignoring this member",
+                    pool.name,
+                    member.display()
+                );
+                answered_other.push((member.display().to_string(), status));
+            }
+            Err(e) => {
+                eprintln!(
+                    "m6-http: [auth] backend \"{}\": {} is not reachable at start ({e}); starting anyway, a check process mid-restart is transient",
+                    pool.name,
+                    member.display()
+                );
+            }
+        }
+    }
+    if any_checker {
+        return Ok(());
+    }
+    if answered_other.is_empty() {
+        // Every member refused the connection or timed out. Each is already
+        // warned about, and the node starts before its checker.
+        return Ok(());
+    }
+    let statuses: Vec<String> = answered_other
+        .iter()
+        .map(|(socket, status)| format!("{socket} answered {status}"))
+        .collect();
+    Err(format!(
+        "m6-http: [auth] backend \"{}\": no member answered 401 or 503 to POST /check ({}); [auth] backend must name the m6-auth-server that answers /check",
+        pool.name,
+        statuses.join(", ")
+    ))
+}
+
+/// One probe request to one socket, returning its status.
+///
+/// Start only, so a blocking connect and a socket deadline are the point. The
+/// request path never calls this: it uses the reactor.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "start-only probe: a blocking connect and a socket deadline are deliberate here"
+)]
+fn probe_check_member(member: &std::path::Path) -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+
+    let mut stream = m6_core::platform::net::connect_unix(member)?;
+    // `connect_unix` is the reactor's non-blocking connect. This probe reads
+    // one answer and exits, so it needs the blocking mode for the socket
+    // timeouts to mean anything.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(AUTH_PROBE_TIMEOUT))?;
+    stream.set_write_timeout(Some(AUTH_PROBE_TIMEOUT))?;
+    let mut request = Vec::with_capacity(128);
+    auth::encode_check_request(&mut request, None);
+    stream.write_all(&request)?;
+
+    let mut head = Vec::with_capacity(256);
+    let mut buf = [0u8; 256];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > 8192 {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(e),
+        }
+    }
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    let mut parts = line
+        .split(|byte| *byte == b' ')
+        .filter(|part| !part.is_empty());
+    let _version = parts.next();
+    let status = parts
+        .next()
+        .and_then(|status| std::str::from_utf8(status).ok()?.parse().ok());
+    status.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "no HTTP status in {:?}",
+            String::from_utf8_lossy(&head)
+        ))
+    })
+}
+
 fn main() {
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
@@ -6733,6 +6849,25 @@ fn run(args: Vec<String>) -> i32 {
     if let Err(e) = pool_manager.resolve() {
         eprintln!("config error: {e}");
         return 2;
+    }
+
+    // Probe the auth backend before any listener binds. A socket that is not a
+    // checker would make every protected request a 503, so a 404 stops the
+    // start. A member that is down only warns, so a node can start while its
+    // check process is being replaced.
+    if let Some(ref auth_cfg) = config.auth {
+        if let Some(ref backend) = auth_cfg.backend {
+            let Some(pool) = pool_manager.get_pool(backend) else {
+                eprintln!(
+                    "m6-http: [auth] backend \"{backend}\" names no socket backend; [auth] backend must name a [[backend]] with `sockets`"
+                );
+                return 2;
+            };
+            if let Err(message) = probe_auth_backend(pool) {
+                eprintln!("{message}");
+                return 2;
+            }
+        }
     }
 
     // A cache node's heartbeat: the backend it asks, and the request bytes it

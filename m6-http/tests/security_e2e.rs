@@ -679,7 +679,9 @@ tls_key  = "{key}"
 name = "test-node"
 
 [auth]
-backend    = "m6-file"
+# No backend here: this test exercises local verification, and no request path
+# calls /check yet. Naming the content backend would fail the start probe with
+# 404, which is the probe doing its job.
 public_key = "{pubkey}"
 "#,
             cert = site.join("cert.pem").display(),

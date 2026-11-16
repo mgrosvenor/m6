@@ -22,9 +22,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// How long `serve_one` waits for the service's check connection.
+const SERVE_BOUND: Duration = Duration::from_secs(10);
 
 use crate::auth::Identity;
 
@@ -53,6 +57,9 @@ pub struct CheckServer {
     path: PathBuf,
     listener: Option<UnixListener>,
     answers: HashMap<String, Reply>,
+    /// What an unlisted token gets. A 404 here lets a test make the start probe
+    /// see a socket that is not an auth server.
+    unknown: Reply,
     calls: usize,
 }
 
@@ -63,10 +70,12 @@ impl CheckServer {
         // A previous server at this path may have left a stale socket.
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
         Ok(Self {
             path,
             listener: Some(listener),
             answers: HashMap::new(),
+            unknown: Reply::Unauthorised,
             calls: 0,
         })
     }
@@ -86,6 +95,12 @@ impl CheckServer {
         self.answers.remove(token);
     }
 
+    /// Set what an unlisted token gets. The start probe sends no credential, so
+    /// this is the answer it sees.
+    pub fn unknown_answer(&mut self, reply: Reply) {
+        self.unknown = reply;
+    }
+
     /// How many `POST /check` requests this server has served.
     pub fn calls(&self) -> usize {
         self.calls
@@ -94,8 +109,9 @@ impl CheckServer {
     /// Accept and answer one connection. Returns after the answer is written
     /// and the connection closed.
     ///
-    /// A test sends its request to the edge first, then calls this, so the
-    /// edge's check connection is already queued in the listener's backlog.
+    /// A test spawns the service first, then calls this, so the service's check
+    /// connection is already queued or about to arrive. The wait is bounded at
+    /// ten seconds so a config error fails the test instead of hanging it.
     pub fn serve_one(&mut self) -> std::io::Result<()> {
         let stream = {
             let listener = self.listener.as_ref().ok_or_else(|| {
@@ -104,7 +120,31 @@ impl CheckServer {
                     "the check server is closed",
                 )
             })?;
-            listener.accept()?.0
+            let mut poll = crate::platform::Poll::new()?;
+            poll.registry().register_fd(
+                listener.as_raw_fd(),
+                crate::platform::Token(0),
+                crate::platform::Interest::READABLE,
+            )?;
+            let deadline = crate::platform::now() + SERVE_BOUND;
+            let mut events = crate::platform::Events::with_capacity(1);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        let now = crate::platform::now();
+                        if now >= deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "no /check connection arrived within 10s",
+                            ));
+                        }
+                        poll.poll(&mut events, Some(deadline - now))?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
         };
         self.serve(stream)
     }
@@ -116,6 +156,9 @@ impl CheckServer {
     }
 
     fn serve(&mut self, mut stream: UnixStream) -> std::io::Result<()> {
+        // An accepted stream can inherit the listener's non-blocking flag on
+        // some hosts.
+        stream.set_nonblocking(false)?;
         let mut head = Vec::new();
         let mut buf = [0u8; 1024];
         while !head.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -149,7 +192,7 @@ impl CheckServer {
         self.calls += 1;
         let reply = token
             .and_then(|token| self.answers.get(token).cloned())
-            .unwrap_or(Reply::Unauthorised);
+            .unwrap_or_else(|| self.unknown.clone());
         write_reply(&mut stream, &reply)
     }
 }
@@ -361,5 +404,16 @@ mod tests {
         assert_eq!(status(&ask(&mut server, &check_request("token"))), 401);
         server.forget("token");
         assert_eq!(status(&ask(&mut server, &check_request("token"))), 401);
+    }
+
+    #[test]
+    fn the_unknown_answer_is_what_the_start_probe_sees() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
+        server.unknown_answer(Reply::Status(404));
+        assert_eq!(
+            status(&ask(&mut server, &check_request("no-credential"))),
+            404
+        );
     }
 }

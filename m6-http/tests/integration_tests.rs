@@ -264,6 +264,33 @@ sockets = "/run/m6/*.sock"
     }
 
     #[test]
+    fn validation_auth_backend_is_a_url_backend_exits_2() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        write_file(dir.path(), "auth.pub", "dummy-key");
+        write_file(
+            dir.path(),
+            "site.toml",
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"remote\"\nurl = \"https://example.com\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"remote\"\npublic_key = \"{DIR}/auth.pub\"\n",
+        );
+        let err = load(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("URL backend"),
+            "the error must say the auth backend is a URL backend: {err}"
+        );
+        assert!(
+            err.contains("remote"),
+            "the error must name the backend: {err}"
+        );
+    }
+
+    #[test]
     fn bind_comes_from_the_system_config() {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");

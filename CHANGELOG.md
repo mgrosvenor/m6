@@ -542,6 +542,14 @@ Comments only.
 
 ### Changed
 
+**`[auth] backend` now names the backend whose members answer `POST /check`, and every member is probed at start.**
+The key keeps its name and stays optional.
+It must name a `[[backend]]` with `sockets`, and a `url` backend is refused by name.
+The probe sends one `POST /check` with no credential: 401 or 503 passes, 404 stops the start and names the setting, the backend and the socket, and a refused connection or timeout warns and the node starts.
+When every member answered something other than 401, 503 or 404, the start stops and names the backend.
+Nothing on a request path calls `/check` yet, so `public_key` alone still verifies a token.
+A config that named a content backend, such as `backend = "m6-file"`, now stops at start with exit 2, which is the probe doing its job.
+
 **Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
 `m6_core::alloc::M6Alloc` wraps mimalloc and is the one allocator type: m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor declare it in `main.rs`, and every allocation-counting test and example declares the same type, so counts are taken against the allocator production runs. Under `alloc-count` (the `testkit` and `count-allocations` features) it counts exactly as `testkit::alloc_count::Counting` did, and without them the counting is not compiled. `Counting` is removed. A library crate declares no allocator. m6-auth-cli is a one-shot command and keeps the system allocator.
 Each service sets mimalloc's options in code at the top of `main`: freed memory is never returned to the OS (purge delay -1; the option's number is counted from the bundled `mimalloc.h` by `m6-core/build.rs`, because the binding does not export it), so the heap grows and does not shrink. It then reserves `[limits.heap_reserve]` bytes from the OS once, committed and on huge pages where the kernel offers them, and logs once when the heap later grows past it; growth is never a failure.

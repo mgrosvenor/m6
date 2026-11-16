@@ -210,6 +210,22 @@ pub fn encode_claims_header(claims: &Claims) -> String {
     base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
 }
 
+/// The bytes of one `POST /check`, written into `buf`.
+///
+/// Hand-built: a check is one small request on the socket-backend dispatch, so
+/// it costs no `HttpRequest` and no allocation once `buf` has capacity. No
+/// credential sends no `Authorization`, which is the start probe's request.
+pub fn encode_check_request(buf: &mut Vec<u8>, credential: Option<&str>) {
+    buf.clear();
+    buf.extend_from_slice(b"POST /check HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(credential) = credential {
+        buf.extend_from_slice(b"Authorization: Bearer ");
+        buf.extend_from_slice(credential.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
 /// Check if Accept header indicates a browser (text/html).
 pub fn is_browser_request(accept: Option<&str>) -> bool {
     accept.map(|a| a.contains("text/html")).unwrap_or(false)

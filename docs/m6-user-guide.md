@@ -648,16 +648,20 @@ The `[auth]` block lives in `configs/system-dev.toml`, the system config `m6-htt
 
 ```toml
 [auth]
-backend    = "m6-auth"
+backend    = "m6-auth-check"
 public_key = "/tmp/m6/dev/auth.pub"
 ```
 
-The backend and routes live in `site.toml`:
+The backends and routes live in `site.toml`:
 
 ```toml
 [[backend]]
 name    = "m6-auth"
 sockets = "/tmp/m6/m6-auth*.sock"
+
+[[backend]]
+name    = "m6-auth-check"
+sockets = "/tmp/m6/check-m6-auth*.sock"
 
 [[route]]
 path    = "/login"
@@ -832,7 +836,7 @@ tls_cert = "/tmp/m6/dev/dev.pem"
 tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [auth]
-backend    = "m6-auth"
+backend    = "m6-auth-check"
 public_key = "/tmp/m6/dev/auth.pub"
 
 [node]
@@ -1691,6 +1695,10 @@ name    = "m6-auth"
 sockets = "/tmp/m6/m6-auth*.sock"
 
 [[backend]]
+name    = "m6-auth-check"
+sockets = "/tmp/m6/check-m6-auth*.sock"
+
+[[backend]]
 name    = "render-cms"
 sockets = "/tmp/m6/render-cms-prod*.sock"
 
@@ -1706,7 +1714,7 @@ tls_cert = "/tmp/m6/dev/dev.pem"
 tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [auth]
-backend    = "m6-auth"
+backend    = "m6-auth-check"
 public_key = "/tmp/m6/dev/auth.pub"
 
 [node]
@@ -1769,7 +1777,7 @@ tls_cert = "/run/credentials/m6-http.service/tls-cert.pem"
 tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 
 [auth]
-backend    = "m6-auth"
+backend    = "m6-auth-check"
 public_key = "/run/credentials/m6-http.service/auth.pub"
 
 [node]
