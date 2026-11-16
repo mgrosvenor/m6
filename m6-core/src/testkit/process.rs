@@ -293,6 +293,38 @@ impl Service {
         }
     }
 
+    /// Wait until the service has logged its own `<name> started` line, or
+    /// fail with a real reason.
+    ///
+    /// The line is logged after the service's signal handling is in place, so
+    /// it is what to wait on before sending a signal. The socket file
+    /// appearing is earlier: a SIGTERM sent on seeing it can arrive before the
+    /// signals are routed, and on macOS it is then lost and the service never
+    /// stops.
+    pub fn wait_for_started(&mut self, timeout: Duration) {
+        let line = format!("{} started", self.name);
+        let deadline = crate::platform::now() + timeout;
+        loop {
+            if self.output().contains(&line) {
+                return;
+            }
+            if let Some(status) = self.exited() {
+                panic!(
+                    "{}",
+                    self.death_report(&format!("waiting for {line:?}"), status)
+                );
+            }
+            if crate::platform::now() >= deadline {
+                panic!(
+                    "{} never logged {line:?} within {timeout:?}\n--- output ---\n{}",
+                    self.name,
+                    tail(&self.output(), 40)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn death_report(&self, context: &str, status: ExitStatus) -> String {
         let out = self.output();
         format!(
@@ -546,6 +578,7 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
 pub fn assert_app_lifecycle(name: &str, cmd: &mut Command, socket_path: &Path) {
     let mut svc = Service::spawn(name, cmd);
     svc.wait_for_path(socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
 
     let status = svc.terminate(Duration::from_secs(5));
     assert!(

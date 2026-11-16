@@ -47,6 +47,7 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
 
     let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
         get_root(&socket_path, Duration::from_secs(5)).is_some()

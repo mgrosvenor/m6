@@ -124,6 +124,7 @@ fn spawn_server(env: &TestEnv) -> Service {
 /// socket file and `listen` comes after, so the file appearing proves nothing.
 fn wait_until_serving(svc: &mut Service, socket: &Path) {
     svc.wait_for_path(socket, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(socket, Duration::from_secs(10)),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",

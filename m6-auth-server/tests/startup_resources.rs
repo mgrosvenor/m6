@@ -242,6 +242,7 @@ fn a_present_storage_directory_starts_and_accepts_a_connection() {
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     svc.wait_for_path(&site.socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&site.socket_path, Duration::from_secs(10)),
         "m6-auth-server never accepted a connection on {}\n--- output ---\n{}",

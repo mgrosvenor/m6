@@ -59,6 +59,7 @@ fn spawn(dir: &Path, config: &Path, sock: &Path) -> Service {
             .env("M6_SOCKET_OVERRIDE", sock),
     );
     svc.wait_for_path(sock, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     svc
 }
 

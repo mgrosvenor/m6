@@ -67,6 +67,7 @@ impl Setup {
     fn start(&self) -> Service {
         let mut svc = Service::spawn("m6-monitor", &mut self.command());
         svc.wait_for_path(&self.sock, Duration::from_secs(10));
+        svc.wait_for_started(Duration::from_secs(10));
         svc
     }
 }

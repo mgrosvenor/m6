@@ -58,6 +58,7 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&socket_path, Duration::from_secs(10)),
         "m6-file created {} but never accepted a connection",
@@ -531,6 +532,7 @@ fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&socket_path, Duration::from_secs(10)),
         "m6-file never accepted a connection"
@@ -645,6 +647,7 @@ fn a_request_pipelined_behind_a_streamed_body_waits_for_the_body() {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&socket_path, Duration::from_secs(10)),
         "m6-file never accepted a connection"
@@ -729,6 +732,7 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
         .env("M6_SOCKET_OVERRIDE", &socket_path);
     let mut svc = Service::spawn("m6-file", &mut command);
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&socket_path, Duration::from_secs(10)),
         "m6-file never accepted a connection"
@@ -1077,6 +1081,7 @@ fn a_head_on_an_unreadable_file_still_answers() {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&socket_path, Duration::from_secs(10)),
         "never accepted"

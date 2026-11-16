@@ -49,6 +49,7 @@ fn socket_mode_for(id: &str, server_section: &str) -> u32 {
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
     svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
 
     let mode = std::fs::metadata(&socket_path)
         .expect("socket metadata")

@@ -117,6 +117,7 @@ fn spawn_server(env: &TestEnv) -> Service {
             .env("M6_SOCKET_OVERRIDE", &env.socket_path),
     );
     svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&env.socket_path, Duration::from_secs(10)),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
