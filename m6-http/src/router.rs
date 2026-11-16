@@ -356,6 +356,8 @@ mod tests {
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
                 redirect_bind: None,
+                served_hosts: Vec::new(),
+                redirect_unmatched_to: None,
                 warm_on_start: false,
                 lock_memory: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],

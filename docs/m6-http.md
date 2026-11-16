@@ -122,12 +122,16 @@ A request that was written in full and answered early is a different case: the c
 m6-http decides a request's path through a fixed order, and each step can answer before the next one runs.
 
 1. **Rate limit:** a request over the per-IP limit is answered 429 before the cache, the redirect, routing or any backend.
-2. **Method check:** a route that names `methods` answers only those, and another method is refused 405 with `Allow` before the cache is looked up or a backend is contacted.
-3. **www redirect:** with `[site] redirect_www` set (the default), a `www.` host is answered 301 on the apex host.
-4. **Cache lookup:** a route with no `require` and a method that may read the cache is served from memory on a fresh hit, with no backend contact.
-5. **Route lookup:** a path that matches no route is answered 404 per `[errors] mode`.
-6. **Auth check:** when the route declares `require`, the JWT is verified locally, with 401 when it is absent and 403 when the claims are insufficient.
-7. **Forward:** the request is forwarded to the backend pool.
+2. **www redirect:** with `[site] redirect_www` set (the default), a `www.` host is answered 301 on the apex host.
+3. **Unmatched-host redirect:** with `[server] redirect_unmatched_to` set, a Host outside `[server] served_hosts`, including no Host at all, is answered 301 to `https://<redirect_unmatched_to><path>`. The internal h2c listener is excluded.
+4. **Method check:** a route that names `methods` answers only those, and another method is refused 405 with `Allow` before the cache is looked up or a backend is contacted.
+5. **Cache lookup:** a route with no `require` and a method that may read the cache is served from memory on a fresh hit, with no backend contact.
+6. **Route lookup:** a path that matches no route is answered 404 per `[errors] mode`.
+7. **Auth check:** when the route declares `require`, the JWT is verified locally, with 401 when it is absent and 403 when the claims are insufficient.
+8. **Forward:** the request is forwarded to the backend pool.
+
+The two host redirects sit before the cache on purpose: the cache key is `(path, query, encoding)` with no host component, so a warm entry for a served name would otherwise answer a request for a name the node does not own.
+A redirector on `[server] redirect_bind` makes the same unmatched-host decision: a served name keeps its 301 to the HTTPS form of itself, and every other name goes to the canonical target.
 
 Route matching: a fixed route (every segment a literal) beats a pattern route (any `{param}` or `{*rest}`).
 Two fixed routes on one path, and two patterns that can both match some path, are a configuration error at load, and `--dump-config` fails the same way (see `m6-site-toml.md`, Route Matching).

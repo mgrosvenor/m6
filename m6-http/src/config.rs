@@ -229,9 +229,38 @@ pub struct ServerConfig {
     /// failure domain — a slow client on :80 cannot stall TLS serving because
     /// it is not sharing that process's event loop. In this mode nothing else
     /// in the config is read: no TLS, no QUIC, no backends, no routes, no
-    /// cache, so `tls_cert`/`tls_key` may point nowhere.
+    /// cache, so `tls_cert`/`tls_key` may point nowhere. The unmatched-host
+    /// policy is the one exception, because a redirector has to know which
+    /// names it serves and where the rest go.
     #[serde(default)]
     pub redirect_bind: Option<String>,
+    /// The host names this node serves. Empty by default.
+    ///
+    /// Matched against a request's `Host` (or HTTP/2 and HTTP/3 `:authority`)
+    /// with any port stripped and ASCII case ignored. The list is node state:
+    /// a node of a fleet can serve a different name from its neighbour, and a
+    /// site's `[site] domain` is shared by every node and is not enough.
+    ///
+    /// The list alone changes nothing. It takes effect with
+    /// `redirect_unmatched_to`.
+    #[serde(default)]
+    pub served_hosts: Vec<String>,
+    /// Where a request goes when its Host is not in `served_hosts`: a bare
+    /// host name, for example `example.com`. Unset by default, which turns the
+    /// policy off.
+    ///
+    /// When set, a request outside `served_hosts`, including one with no Host,
+    /// is answered 301 to `https://<redirect_unmatched_to><path>`, with the
+    /// query kept, before the cache lookup and before routing. That position
+    /// matters: the cache key has no host component, so a warm entry for a
+    /// served name would otherwise answer a request for a name the node does
+    /// not own. The internal h2c listener is excluded.
+    ///
+    /// Refused at load when `served_hosts` is empty. The combination would
+    /// redirect every request, including the node's own name, which would take
+    /// the deploy's checks and the fleet monitor off the node.
+    #[serde(default)]
+    pub redirect_unmatched_to: Option<String>,
     /// Warm this node's own cache when it starts.
     ///
     /// The server knows its route table, so it can fill its own cache instead of
@@ -301,6 +330,45 @@ impl ServerConfig {
             .iter()
             .any(|e| e.parse::<std::net::SocketAddr>().is_ok_and(|a| a == l))
     }
+
+    /// True when this node serves `host`, comparing with any port stripped and
+    /// ASCII case ignored. An empty Host is never served.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let host = host.split(':').next().unwrap_or(host);
+        !host.is_empty()
+            && self
+                .served_hosts
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(host))
+    }
+
+    /// The 301 target for a request outside `served_hosts`, or `None` when the
+    /// policy is off, the Host is served, or the path or query cannot be
+    /// written into a `Location`.
+    ///
+    /// The target is built from the configured name, never from the request's
+    /// Host. Echoing a request's own bytes back into `Location` is how open
+    /// redirects and header injection get built.
+    pub fn unmatched_host_redirect(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        query: Option<&str>,
+    ) -> Option<String> {
+        let target = self.redirect_unmatched_to.as_deref()?;
+        if host.is_some_and(|h| self.serves_host(h)) {
+            return None;
+        }
+        let unsafe_byte = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+        if unsafe_byte(path) {
+            return None;
+        }
+        match query {
+            Some(q) if unsafe_byte(q) => None,
+            Some(q) => Some(format!("https://{target}{path}?{q}")),
+            None => Some(format!("https://{target}{path}")),
+        }
+    }
 }
 
 fn default_allowed_methods() -> Vec<String> {
@@ -309,6 +377,62 @@ fn default_allowed_methods() -> Vec<String> {
 
 fn default_backend_timeout_secs() -> u64 {
     30
+}
+
+/// A string a `Host` header can plausibly carry as a bare name.
+///
+/// It is deliberately a syntax check, not a DNS check: a name is compared with
+/// a request's Host, which never resolves here. The characters refused are the
+/// ones that cannot match a Host or cannot be written into a `Location`.
+fn is_host_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && !s
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        && !s.contains(['/', '\\', ':', '*', '@'])
+}
+
+/// `[server] served_hosts`: lowercase every entry once, so the stored list
+/// is canonical, and refuse anything that could not match a Host.
+fn validate_served_hosts(hosts: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let host = host.trim().to_ascii_lowercase();
+        if !is_host_name(&host) {
+            anyhow::bail!(
+                "config error: [server].served_hosts entry {host:?} is not a bare host name. Drop any scheme, port, path, whitespace, control byte or wildcard"
+            );
+        }
+        out.push(host);
+    }
+    Ok(out)
+}
+
+/// `[server] redirect_unmatched_to`: a bare host name, lowercased. An address
+/// is refused because the target is the second hop of the redirect, and no
+/// public certificate authority issues for an address.
+fn validate_redirect_unmatched_to(target: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let target = target.trim().to_ascii_lowercase();
+    if target.is_empty() {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to is empty. Give the canonical host name, for example example.com"
+        );
+    }
+    if !is_host_name(&target) {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to {target:?} is not a bare host name. It is written into a Location header, so it may not carry a scheme, a port, a path, whitespace, a control byte or a wildcard"
+        );
+    }
+    if target.parse::<std::net::IpAddr>().is_ok() {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to {target:?} is an IP address. No public certificate authority issues for an address, so the canonical target is a host name"
+        );
+    }
+    Ok(Some(target))
 }
 
 /// The address a process's status listener binds: `status_bind`'s address with
@@ -909,6 +1033,8 @@ struct RawServerSection {
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
     redirect_bind: Option<String>,
+    served_hosts: Option<Vec<String>>,
+    redirect_unmatched_to: Option<String>,
     allowed_methods: Option<Vec<String>>,
 }
 
@@ -1191,6 +1317,16 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
     let redirect_bind = node_server.redirect_bind;
+    // The unmatched-host policy is node state: a node serves its own names, so
+    // both keys are read from the system config even when site.toml carries a
+    // [server] table.
+    let served_hosts = validate_served_hosts(node_server.served_hosts.unwrap_or_default())?;
+    let redirect_unmatched_to = validate_redirect_unmatched_to(node_server.redirect_unmatched_to)?;
+    if redirect_unmatched_to.is_some() && served_hosts.is_empty() {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to is set but [server].served_hosts is empty. Every request would be redirected, including this node's own name, so the deploy's checks and the monitor could not reach it. List the host names this node serves"
+        );
+    }
     // Warming is a property of the node, not of the site it serves.
     let warm_on_start = node_server.warm_on_start.unwrap_or(false);
     let lock_memory = node_server.lock_memory.unwrap_or(true);
@@ -1300,6 +1436,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         warm_on_start,
         lock_memory,
         redirect_bind: redirect_bind.clone(),
+        served_hosts,
+        redirect_unmatched_to,
         // Uppercased once at load so the hot-path check is a plain comparison
         // rather than a case-insensitive one per request.
         allowed_methods: site_server
@@ -1636,6 +1774,8 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "reuse_port_processes",
     "process_index",
     "status_bind",
+    "served_hosts",
+    "redirect_unmatched_to",
 ];
 /// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_require", "metrics_peers"];
@@ -2114,6 +2254,104 @@ sockets = "/run/m6/*.sock"
             .unwrap_err()
             .to_string();
         assert!(err.contains("tls_cert"), "unexpected error: {err}");
+    }
+
+    // ── [server] served_hosts and redirect_unmatched_to ─────────────────────
+
+    /// The combination that would lock an operator out of their own node: a
+    /// target with no served names answers every request with a redirect,
+    /// including the node's own name. `load` must refuse it, naming the empty
+    /// list, so a typo cannot take the deploy's checks and the monitor off the
+    /// node.
+    #[test]
+    fn a_canonical_target_with_no_served_hosts_refuses_to_start() {
+        let e = load_error("redirect_unmatched_to = \"example.com\"\n");
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("[server].served_hosts is empty"), "{e}");
+        assert!(e.contains("Every request would be redirected"), "{e}");
+        assert!(e.contains("this node's own name"), "{e}");
+    }
+
+    #[test]
+    fn a_served_host_is_matched_without_its_port_or_case() {
+        let cfg = load_with_system_server(
+            "served_hosts = [\"Edge-A.Example.COM\"]\nredirect_unmatched_to = \"Example.COM\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.served_hosts,
+            vec!["edge-a.example.com".to_string()]
+        );
+        assert_eq!(
+            cfg.server.redirect_unmatched_to.as_deref(),
+            Some("example.com")
+        );
+        assert!(cfg
+            .server
+            .unmatched_host_redirect(Some("edge-a.example.com:8443"), "/x", None)
+            .is_none());
+        assert_eq!(
+            cfg.server
+                .unmatched_host_redirect(Some("other.example.com"), "/x", Some("a=1")),
+            Some("https://example.com/x?a=1".to_string())
+        );
+        // An absent Host is outside the list, so a redirector sends it to the
+        // canonical name instead of answering 400.
+        assert_eq!(
+            cfg.server.unmatched_host_redirect(None, "/", None),
+            Some("https://example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn a_served_list_without_a_target_changes_nothing() {
+        let cfg = load_with_system_server("served_hosts = [\"edge-a.example.com\"]\n").unwrap();
+        assert!(cfg
+            .server
+            .unmatched_host_redirect(Some("other.example.com"), "/", None)
+            .is_none());
+    }
+
+    #[test]
+    fn a_target_that_is_an_address_or_carries_a_path_is_refused() {
+        let e = load_error(
+            "served_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"203.0.113.7\"\n",
+        );
+        assert!(e.contains("IP address"), "{e}");
+        let e = load_error(
+            "served_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"example.com/x\"\n",
+        );
+        assert!(e.contains("not a bare host name"), "{e}");
+        let e =
+            load_error("served_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"\"\n");
+        assert!(e.contains("is empty"), "{e}");
+    }
+
+    #[test]
+    fn a_served_entry_with_a_port_or_wildcard_is_refused() {
+        let e = load_error(
+            "served_hosts = [\"edge-a.example.com:8443\"]\nredirect_unmatched_to = \"example.com\"\n",
+        );
+        assert!(e.contains("[server].served_hosts entry"), "{e}");
+        let e = load_error(
+            "served_hosts = [\"*.example.com\"]\nredirect_unmatched_to = \"example.com\"\n",
+        );
+        assert!(e.contains("[server].served_hosts entry"), "{e}");
+    }
+
+    /// The policy is node state, so site.toml must not carry it. `misplaced_keys`
+    /// is one list, and this is the pair of keys that joined it.
+    #[test]
+    fn misplaced_keys_names_the_host_policy_in_site_toml() {
+        let m = misplaced(
+            "[server]\nserved_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"example.com\"\n",
+            "",
+        );
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().any(|x| x.contains("[server].served_hosts")));
+        assert!(m
+            .iter()
+            .any(|x| x.contains("[server].redirect_unmatched_to")));
     }
 
     #[test]
@@ -3279,8 +3517,10 @@ domain = "test.example.com"
                 "max_requests_per_connection",
                 "process_index",
                 "redirect_bind",
+                "redirect_unmatched_to",
                 "reuse_port",
                 "reuse_port_processes",
+                "served_hosts",
                 "status_bind",
                 "tls_cert",
                 "tls_key",
@@ -3291,7 +3531,11 @@ domain = "test.example.com"
         health.sort_unstable();
         assert_eq!(health, ["metrics_peers", "metrics_require"]);
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "limits", "node"]);
-        assert_eq!(all.len(), 16 + 2 + 5);
+        // 13 base [server] keys + lock_memory (the mimalloc pin) + served_hosts
+        // and redirect_unmatched_to (the unmatched-host policy) = 16, plus the
+        // two site-wide [server] keys, the two [health] keys and the five
+        // node sections.
+        assert_eq!(all.len(), 18 + 2 + 5);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
