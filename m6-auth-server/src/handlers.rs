@@ -26,8 +26,8 @@ pub struct AppState {
     pub rate_limiter: RefCell<RateLimiter>,
 }
 
-// The four handlers are reached by route: `Site` matches the path and the
-// method, and the loop's one `match` calls the wrapper for the route's index.
+// The handlers are reached by route: `Site` matches the path and the method,
+// and the loop's one `match` calls the wrapper for the route's index.
 // The wrappers exist so the handler functions themselves stay private and
 // unchanged -- they are the security-carrying part of this service, and a
 // migration is the wrong time to touch them.
@@ -60,6 +60,10 @@ pub fn dispatch_logout(req: &RawRequest, state: &AppState, db: &Db) -> Result<Ra
 
 pub fn dispatch_public_key(state: &AppState) -> RawResponse {
     handle_public_key(state)
+}
+
+pub fn dispatch_check(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+    handle_check(req, state, db)
 }
 
 // ─── POST /auth/login ─────────────────────────────────────────────────────────
@@ -459,6 +463,88 @@ fn handle_public_key(state: &AppState) -> RawResponse {
         .body(pem)
 }
 
+// ─── POST /check ─────────────────────────────────────────────────────────────
+
+/// Answer the current identity for an access token.
+///
+/// The token proves which user is asking. The roles and groups come from the
+/// database, so a role change is visible without a new token, which is the
+/// reason this route exists. The answer is the decision for this request only:
+/// it carries no cache hint, because nothing caches a decision, so a revocation
+/// or a role change counts from the next request.
+///
+/// A locked database is 503 at once. The edge has its own 50 ms deadline and
+/// will have given up long before this service's one-second deferral would
+/// answer, so deferring here would only waste the connection. A 503 is also not
+/// a 401: the credential may be valid, and the edge must not cache a refusal
+/// the authority did not make.
+fn handle_check(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
+    let Some(token) = bearer_token(req) else {
+        return unauthorised();
+    };
+    // Verifies the signature, the issuer and the expiry. Only `sub` is read
+    // from the claims; the identity itself is the database's.
+    let Ok(data) = state.keys.jwt.decode_access(token) else {
+        return unauthorised();
+    };
+    let user = match db.user_get_by_id(&data.claims.sub) {
+        Ok(Some(user)) => user,
+        // A deleted user is a revoked user. An empty role list would describe
+        // an identity the database no longer holds, so it is refused.
+        Ok(None) => return unauthorised(),
+        Err(e) => return db_failure(e),
+    };
+    let groups = match db.user_groups(&user.username) {
+        Ok(groups) => groups,
+        Err(e) => return db_failure(e),
+    };
+
+    let body = serde_json::json!({
+        "sub":      user.id,
+        "username": user.username,
+        "roles":    user.roles,
+        "groups":   groups,
+    });
+    RawResponse::new(200)
+        .header("Cache-Control", "no-store")
+        .content_type("application/json")
+        .body(body.to_string())
+}
+
+/// The bearer token from `Authorization`, or `None`.
+fn bearer_token(req: &RawRequest) -> Option<&str> {
+    let (scheme, token) = req.header("authorization")?.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Map a database failure to an answer.
+///
+/// A lock is transient and the credential may be valid, so it is 503 and never
+/// a 401: a 401 would refuse a credential this service did not judge.
+fn db_failure(error: AuthError) -> RawResponse {
+    if error.is_busy() {
+        return unavailable();
+    }
+    warn!(error = %error, "db error on check");
+    internal_error()
+}
+
+fn unauthorised() -> RawResponse {
+    RawResponse::new(401)
+        .content_type("application/json")
+        .body(r#"{"error":"unauthorised"}"#)
+}
+
+fn unavailable() -> RawResponse {
+    RawResponse::new(503)
+        .content_type("application/json")
+        .body(r#"{"error":"unavailable"}"#)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Why a login whose password was right has not answered.
@@ -582,5 +668,23 @@ mod tests {
         let body = String::from_utf8_lossy(&answer.body);
         assert!(body.contains("access_token"), "no access token: {body}");
         assert!(body.contains("refresh_token"), "no refresh token: {body}");
+    }
+
+    /// A lock is transient and the credential may be valid, so `/check` must
+    /// answer 503 and not a 401 that refuses a credential it did not judge.
+    ///
+    /// A real lock cannot reach this branch over the wire: every connection is
+    /// in WAL mode, where a writer never blocks a reader. The classification
+    /// is tested here, and the route's 401 for a dead credential over the wire.
+    #[test]
+    fn a_busy_database_error_is_503_not_401() {
+        let busy = AuthError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5),
+            Some("database is locked".to_string()),
+        ));
+        assert_eq!(db_failure(busy).status, 503);
+
+        let other = AuthError::Db(rusqlite::Error::InvalidQuery);
+        assert_eq!(db_failure(other).status, 500);
     }
 }

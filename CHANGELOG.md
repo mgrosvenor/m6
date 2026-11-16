@@ -139,6 +139,16 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`m6-auth-server` gains a fifth route, `POST /check`, which answers the current identity for an access token.**
+It takes `Authorization: Bearer <access token>` and answers 200 with `sub`, `username`, `roles` and `groups`, all read from the database at that request.
+The token proves which user is asking, and the database supplies what that user may do, so a role change is visible to the next request without a new token.
+The answer is the decision for this request only, and it carries no cache hint, because nothing caches a decision and a revocation counts from the next request.
+A missing, invalid or expired token is 401 `{"error":"unauthorised"}`.
+A user who is not in the database, including a deleted user, is the same 401, and the route never answers 200 with an empty role list.
+A locked database is 503 `{"error":"unavailable"}` at once, because the caller's deadline is shorter than this service's one-second deferral.
+The route is additive: no m6-http route calls it yet, so no deployment's request path changes and local token verification still decides a request.
+Verified on 2026-11-17 on a macOS sandbox: four tests in `m6-auth-server/tests/check.rs` spawn the real service over its Unix socket and prove the database's role change, the 401s for an unknown subject, a deleted user and a missing credential, and a handler unit test proves a busy database is 503.
+
 **Every bounded buffer has a named limit with a `start` and a `max` read from one config table, and the rendered page is the first buffer on it.**
 `[limits.render_page]` takes `start` and `max`, as bytes or as `"512KiB"` and `"4MiB"`, and an absent table gives the defaults: 512 KiB at start, 4 MiB at most (`docs/m6-app-anatomy.md` §4.2).
 The new `m6_core::limits` module owns one rule: allocate `start` at start, grow only when a write does not fit, by doubling and clamped at `max`, keep the size and never shrink, and log one line naming the limit and the new size on each growth.

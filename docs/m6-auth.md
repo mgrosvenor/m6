@@ -33,7 +33,7 @@ Section 2 begins with what the service owns.
 
 ## 2. The service
 
-`m6-auth-server` owns four routes on a Unix socket: login, refresh, logout and the public key.
+`m6-auth-server` owns five routes on a Unix socket: login, refresh, logout, the public key and check.
 Table 1 gives them.
 Take from it that every route is literal, so the service has no route configuration of its own.
 
@@ -43,8 +43,9 @@ Take from it that every route is literal, so the service has no route configurat
 | `POST` | `/auth/refresh` | issues a new access token from a refresh token | 302 with a session cookie for a form client, 200 with JSON for a JSON client |
 | `POST` | `/auth/logout` | clears the browser's cookies, and revokes refresh tokens on the bearer path | 302 for the browser path, 204 for the bearer path |
 | `GET` | `/auth/public-key` | returns the current public key | 200 with a PEM body |
+| `POST` | `/check` | reads the current identity for an access token from the database | 200 with identity JSON |
 
-**Table 1: the four routes, what each does, and what success returns.**
+**Table 1: the five routes, what each does, and what success returns.**
 
 The method column is part of the contract.
 A `GET` on login, refresh or logout does not match the route.
@@ -74,7 +75,7 @@ Take from it that every flag is optional and the two positional arguments are re
 **Table 2: the two positional arguments and the three flags.**
 
 For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
-It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the four routes the service registers.
+It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the five routes the service registers.
 It exits 0 before the service validates those sections.
 
 A missing positional argument prints the usage line and exits 2.
@@ -204,8 +205,8 @@ Section 5 turns to the HTTP API, where those keys produce tokens.
 
 ## 5. HTTP API
 
-The service exposes four routes over *HTTP* (Hypertext Transfer Protocol), and the content type decides the response shape.
-The four routes form the service's *API* (application programming interface).
+The service exposes five routes over *HTTP* (Hypertext Transfer Protocol), and the content type decides the response shape.
+The five routes form the service's *API* (application programming interface).
 This section gives each route's request and response, beginning with login.
 
 ### 5.1. Login
@@ -304,7 +305,19 @@ The route is unauthenticated, and it serves the key that is loaded, so a rotatio
 m6-http reads the public key from the file named by `[auth] public_key`.
 It does not call this route, and the route exists for any other client that needs the key without filesystem access.
 
-Login, refresh, logout and the public key are the whole HTTP surface.
+### 5.5. Check
+
+`POST /check` answers the current identity for an access token.
+It takes `Authorization: Bearer <access token>` and returns `sub`, `username`, `roles` and `groups` read from the database.
+The answer is the decision for this request only, with no cache hint: nothing caches a decision, so a revocation counts from the next request.
+The route is additive: no m6-http route calls it yet, and local verification is still what decides a request.
+
+A missing, invalid or expired token is 401 `{"error":"unauthorised"}`.
+A user who is not in the database, including a deleted user, is the same 401 rather than an empty role list.
+A locked database is 503 `{"error":"unavailable"}` at once, because the caller's deadline is shorter than this service's one-second deferral.
+The 401 and 503 are distinct: the 401 refuses this request, and the 503 reports a database the service could not read.
+
+Login, refresh, logout, the public key and check are the whole HTTP surface.
 Section 6 gives the token contents those routes produce, and section 7 gives the m6-http checks that consume them.
 
 ## 6. Tokens
@@ -512,7 +525,7 @@ The six items above are the scope, and section 13 collects the documents that ow
 ## 13. Summary and further reading
 
 `m6-auth-server` turns a password into a short-lived access token and a refresh token, and m6-http verifies the access token without a network call.
-The service has four routes, one config file and one SQLite database.
+The service has five routes, one config file and one SQLite database.
 The rotation steps and the two path rules are in section 4.
 
 Table 11 gives the documents that own what this page leaves out.
