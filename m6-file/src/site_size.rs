@@ -247,6 +247,7 @@ mod tests {
             params: Vec::new(),
             status: 200,
             cache: String::new(),
+            cache_explicit: false,
             methods: None,
             headers: Vec::new(),
             handler: Some("files".to_string()),
