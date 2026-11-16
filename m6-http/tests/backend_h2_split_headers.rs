@@ -181,7 +181,6 @@ fn site_toml(backend_port: u16) -> String {
 
 /// Send one GET through the edge and return the response bytes.
 fn get(port: u16) -> Vec<u8> {
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect m6-http");
     tcp.set_read_timeout(Some(Duration::from_secs(20)))
         .expect("read timeout");

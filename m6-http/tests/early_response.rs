@@ -253,7 +253,6 @@ impl Drop for TlsBackend {
 }
 
 fn spawn_tls_backend(mode: Refusal) -> TlsBackend {
-    probe::install_crypto();
     let ck =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .expect("certificate");
@@ -366,7 +365,6 @@ fn site_toml(backends: &str) -> String {
 /// return the response bytes, or an empty vector when the server closed without
 /// answering.
 fn send(port: u16, path: &str) -> Vec<u8> {
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect m6-http");
     tcp.set_read_timeout(Some(Duration::from_secs(20)))
         .expect("read timeout");

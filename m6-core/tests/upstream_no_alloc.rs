@@ -120,7 +120,7 @@ fn tls_requests_report_their_allocations() {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let cert = ck.cert.der().clone();
     let key = rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let server = Arc::new(
         rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()

@@ -311,9 +311,8 @@ fn send_response(send_buf: &mut Vec<u8>, enc: &mut hpack::Encoder, sid: u32) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // Exactly one rustls provider feature is enabled (aws-lc-rs), so the first
+    // config builder resolves and installs it.
     let args = parse_args();
 
     let tls_config = if args.proto == "https" || args.proto == "h2s" {

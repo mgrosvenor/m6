@@ -152,7 +152,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1964,27 +1964,19 @@ fn write_boxwhisker_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io:
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // m6-http is built with rustls `default-features = false`, so there is NO
-    // automatic process-level CryptoProvider. Without this, the first
-    // `ClientConfig::builder()` below panics:
+    // Exactly one rustls provider feature is enabled (aws-lc-rs), so the first
+    // `ClientConfig::builder()` below resolves and installs it.
     //
-    //   Could not automatically determine the process-level CryptoProvider
-    //
-    // which is what this binary did, from its first TLS protocol onward, before
-    // 2026-09-15. `default_provider()` appears further up in
-    // `supported_verify_schemes`, but that builds a provider and drops it; the
-    // builder needs the INSTALLED one. m6-http's own main, m6-bench,
-    // the cold-start bench and bench-url-backend all install it here and this
-    // one was simply missed.
-    //
-    // The consequence was worse than a broken tool. With our own client
-    // panicking, handshake timing got measured with h3spec instead -- a
-    // conformance tester that deliberately opens stalled and malformed
-    // connections -- and it reported an h3 handshake p50 of 113ms on loopback
-    // for an engine that answers requests in microseconds. A broken measuring
-    // tool does not leave you with no number, it leaves you with a wrong one.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
+    // That used to need an explicit install: m6-http builds rustls with
+    // `default-features = false`, and before 2026-09-15 this binary missed it,
+    // so its first TLS protocol panicked with "Could not automatically
+    // determine the process-level CryptoProvider". The consequence was worse
+    // than a broken tool. With our own client panicking, handshake timing got
+    // measured with h3spec instead -- a conformance tester that deliberately
+    // opens stalled and malformed connections -- and it reported an h3
+    // handshake p50 of 113ms on loopback for an engine that answers requests in
+    // microseconds. A broken measuring tool does not leave you with no number,
+    // it leaves you with a wrong one.
     let args = Args::parse();
 
     // Create the chart directory before measuring. Without this every chart

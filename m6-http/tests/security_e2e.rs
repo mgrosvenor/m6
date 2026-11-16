@@ -83,7 +83,7 @@ fn mint_jwt(private_pem: &str, sub: &str, groups: &[&str]) -> String {
 // ── HTTP/1.1 client ───────────────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -944,7 +944,7 @@ fn hpack_literal(static_index: u8, value: &str) -> Vec<u8> {
 }
 
 fn tls_client_config_h2(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -1161,7 +1161,6 @@ fn cache_hit_answers_if_none_match_with_304_on_h2() {
 
     srv.kill_backend();
 
-    probe::install_crypto();
     let mut conn = H2sTlsClientConn::connect("127.0.0.1", srv.port, probe::tls_config(b"h2"))
         .expect("connect HTTP/2");
 

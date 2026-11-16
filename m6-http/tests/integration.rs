@@ -62,7 +62,7 @@ fn write_pem_files(tc: &TestCert) -> (tempfile::NamedTempFile, tempfile::NamedTe
 
 /// Build a rustls ClientConfig that trusts the given DER certificate.
 fn make_test_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -96,7 +96,7 @@ fn start_http11_server_limited<F>(
 where
     F: Fn(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String) + Send + 'static,
 {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
@@ -420,7 +420,7 @@ fn http11_version_field_is_http11() {
 
 /// Build a rustls ClientConfig that trusts the given DER cert and advertises h2.
 fn make_h2_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());

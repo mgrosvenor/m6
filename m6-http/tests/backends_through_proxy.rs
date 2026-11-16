@@ -420,7 +420,7 @@ impl Stack {
         broken_tls_key: bool,
         backend_pid: &mut Option<u32>,
     ) -> Option<Stack> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
         let base = tmp.path();

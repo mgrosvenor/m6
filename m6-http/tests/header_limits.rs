@@ -242,7 +242,6 @@ fn h2_send(
     headers: Vec<(String, String)>,
     timeout: Duration,
 ) -> Result<Reply, String> {
-    probe::install_crypto();
     let cfg = probe::tls_config(b"h2");
     let mut conn = H2sTlsClientConn::connect("127.0.0.1", port, cfg).map_err(|e| e.to_string())?;
     let req = HttpRequest {
@@ -495,7 +494,7 @@ struct Stack {
 
 impl Stack {
     fn start() -> Stack {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 

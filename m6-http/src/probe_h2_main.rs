@@ -39,7 +39,6 @@
 use m6_http_lib::probe;
 
 fn main() {
-    probe::install_crypto();
     let (addr, n) = probe::args("127.0.0.1:443", 100);
     // A flag rather than a second binary: the two runs differ by one line and
     // both belong to the same measurement.

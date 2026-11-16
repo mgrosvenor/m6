@@ -107,7 +107,6 @@ fn serve(mut stream: UnixStream) {
 /// Send `raw` on a fresh HTTP/1.1-over-TLS connection and return the response
 /// bytes, or an empty vector when the server closed without answering.
 fn send(port: u16, raw: &[u8]) -> Vec<u8> {
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect m6-http");
     tcp.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");

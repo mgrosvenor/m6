@@ -103,7 +103,7 @@ fn skip_verify_client_config() -> Arc<rustls::ClientConfig> {
             Ok(HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }
@@ -336,7 +336,7 @@ struct EdgeStack {
 
 impl EdgeStack {
     fn start() -> Self {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
