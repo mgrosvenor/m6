@@ -161,10 +161,7 @@ pub fn listen_shared(
     // A port of 0 asks the kernel for one. The UDP socket takes the TCP
     // listener's port, not a port of its own: sockets only share a reuseport
     // group on one address, and the two halves are one public port.
-    let addr = tcp
-        .local_addr()?
-        .as_socket()
-        .unwrap_or(addr);
+    let addr = tcp.local_addr()?.as_socket().unwrap_or(addr);
     tcp.listen(128)?;
     tcp.set_nonblocking(true)?;
     if let Some(n) = group_size {
