@@ -154,11 +154,12 @@ const HPACK_MAX_TABLE_SIZE: usize = 4096;
 
 /// How many recently-reset stream ids to remember. See `recently_reset`.
 ///
-/// Deliberately above `MAX_CONCURRENT`, because these entries are also what
-/// makes the concurrency cap bind against Rapid Reset (see `RESET_DECAY`). At
-/// or below the cap, a peer could evict its own reset records by resetting
-/// enough streams and win back the slots that way.
-const RESET_MEMORY: usize = 128;
+/// Twice `MAX_CONCURRENT`, derived from it so the memory stays above the
+/// concurrency cap whatever the cap is. These entries are also what makes the
+/// cap bind against Rapid Reset (see `RESET_DECAY`). At or below the cap, a
+/// peer could evict its own reset records by resetting enough streams and win
+/// back the slots that way.
+const RESET_MEMORY: usize = 2 * MAX_CONCURRENT as usize;
 
 /// How long a stream terminated by RST_STREAM keeps occupying a concurrency
 /// slot. Rapid Reset, CVE-2023-44487.

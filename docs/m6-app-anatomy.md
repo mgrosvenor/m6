@@ -426,7 +426,7 @@ m6-http reads its keys from the `[limits]` table of its system config, and every
 | `minify_output` | bytes | 64 KiB | 128 MiB | services | the response a minifier reads | 500 |
 | `smtp_reply` | bytes | 512 B | 128 KiB | services with mail | one relay reply | the send fails |
 | `ndjson_page` | bytes | 4 MiB | 64 MiB | m6-monitor | the default page and the largest row of an ndjson stream | the row is refused |
-| `tail_read` | bytes | 64 KiB | 512 KiB | m6-file | one tail response | 413 |
+| `tail_read` | bytes | 64 KiB | 512 KiB | m6-file | one page of a tail response, and the window a last-N-lines request scans | a client further behind reads the next page from `X-Log-End`, and N lines that do not fit in a page are 413 |
 | `log_buffer` | bytes | 16 KiB | 1 MiB | every process | one log destination's buffer | the line is refused |
 | `log_field` | bytes | 8 KiB | 8 KiB | every process | one string field of a log line | the line is refused |
 | `history_queue` | polls | 8 | 1024 | m6-monitor | polls held while the history file is locked | the new poll is refused |
@@ -442,7 +442,7 @@ m6-http reads its keys from the `[limits]` table of its system config, and every
 **Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
 Take from it that every limit is one `start` and one `max`, and that a limit past its maximum refuses the work with an error naming the key, except the cache, which evicts by design.
 
-The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 431, and the HTTP/2 reset memory of 128 streams must stay above the concurrency cap, so neither has a key.
+The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 431, and the HTTP/2 reset memory is derived as twice the concurrency cap (200 streams at the cap of 100), so it stays above the cap whatever the cap is and has no key of its own.
 
 ```toml
 [limits.render_page]
