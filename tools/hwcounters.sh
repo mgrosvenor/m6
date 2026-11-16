@@ -12,7 +12,9 @@
 #      which is when the TLB reach matters), then warm up with --warmup hits,
 #   3. `perf stat` attached to m6-http while --requests hot hits go through one
 #      keep-alive connection,
-#   4. divide each counter by the requests and print one row per event.
+#   4. divide each counter by the requests and print one row per event, then the
+#      RSS and the AnonHugePages and Hugetlb rows of /proc/PID/smaps_rollup, the
+#      kernel's own count of how much of m6-http is on huge pages.
 #
 # THE HOST. The build host is a VM, and a VM may expose no hardware counters.
 # The script runs `perf stat -e cycles true` first. When that gives no count it
@@ -117,6 +119,8 @@ run_arm() {
     || { echo "hwcounters: perf stat failed, see $WORK/load-$label.log" >&2; return 1; }
   report "$label" "$out" "$REQUESTS"
   printf '  %-22s %s KiB\n' "rss" "$(rss_kb "$HTTP_PID")"
+  # Measured, not only logged: what the kernel says sits on huge pages now.
+  awk '/^(AnonHugePages|Hugetlb):/ { printf "  %-22s %s KiB\n", $1, $2 }' "/proc/$HTTP_PID/smaps_rollup"
   stop_all
 }
 

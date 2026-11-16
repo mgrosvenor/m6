@@ -701,7 +701,7 @@ tools/hwcounters.sh base=$HOME/build/base/target/release cand=$HOME/build/cand/t
 ```
 
 The script says "hardware counters not available on this host" and reports the software events alone when the VM exposes no counters.
-`dTLB-load-misses` per request is the number huge pages should bring close to zero.
+`dTLB-load-misses` per request is the number huge pages should bring close to zero. The script also prints `AnonHugePages` and `Hugetlb` from `/proc/<pid>/smaps_rollup` for m6-http, so huge pages are measured and not only logged.
 
 **Render latency**, interleaved and pinned, from the candidate checkout:
 
@@ -710,7 +710,7 @@ tools/perfcheck.sh --base-bin $HOME/build/base/target/release/m6-html \
   --cand-bin $HOME/build/cand/target/release/m6-html
 ```
 
-**Cache-hit latency end to end**: `./bench.sh --latency-n 20000` in each checkout, alternating base and candidate for five rounds, and compare the HTTP/1.1 and HTTP/2 cache-hit rows.
+**Cache-hit latency end to end**: `./bench.sh --latency-n 20000` in each checkout (it makes its own certificate and builds the release binaries), alternating base and candidate for five rounds, and compare the HTTP/1.1 and HTTP/2 cache-hit rows.
 `tools/paired_bench.sh cache_hit` is not an allocator measurement: that bench runs in-process and installs no allocator of its own.
 
 **RSS after warm-up** is the `rss` row of both scripts above.

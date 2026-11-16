@@ -36,10 +36,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use libmimalloc_sys as mi;
 use mimalloc::MiMalloc;
 
-/// mimalloc's `mi_option_purge_delay`, the same number in its v2 and v3
-/// headers, and not among the constants the Rust binding exports. A test reads
-/// the option back, so a header that moves it fails the build.
-const PURGE_DELAY: mi::mi_option_t = 15;
+/// mimalloc's `mi_option_purge_delay`. The Rust binding does not export it, so
+/// `build.rs` counts it from the `mimalloc.h` bundled with `libmimalloc-sys`:
+/// the number always belongs to the library that is linked.
+const PURGE_DELAY: mi::mi_option_t = include!(concat!(env!("OUT_DIR"), "/purge_delay.in"));
 
 /// mimalloc, counting under the `alloc-count` feature.
 pub struct M6Alloc;
@@ -150,13 +150,12 @@ mod tests {
 
     /// `never_return` makes the purge delay -1, which is "never purge". The
     /// default is a delay of zero or more milliseconds, and it differs by
-    /// platform. The strace procedure in `tools/memcalls.sh` is the end-to-end
-    /// proof that option 15 is the right one.
+    /// platform. `tools/memcalls.sh` is the end-to-end proof on Linux.
     #[test]
     fn never_return_sets_the_purge_delay() {
         #[allow(unsafe_code)]
         let read = || unsafe { mi::mi_option_get(PURGE_DELAY) };
-        assert!(read() >= 0, "option 15 starts as a delay, not as never");
+        assert!(read() >= 0, "purge_delay starts as a delay, not as never");
         never_return();
         assert_eq!(read(), -1);
     }
