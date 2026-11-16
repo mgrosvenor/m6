@@ -416,10 +416,17 @@ fn t04_login_rate_limited_429() {
     seed_user(&env.site_dir, "mallory", "right");
     let _guard = spawn_server(&env);
 
-    let body = r#"{"username":"mallory","password":"bad"}"#;
+    // The first attempt is an unknown user, so a failure that never reached
+    // credential verification still counts. The rest name the seeded user,
+    // whose wrong password verifies at the fixture's cost 4: the cost-12 dummy
+    // hash behind the unknown-user path costs seconds per attempt in this
+    // profile, and the limiter is what this test measures.
+    let unknown = r#"{"username":"nobody","password":"bad"}"#;
+    let known = r#"{"username":"mallory","password":"bad"}"#;
 
     // First 5 attempts (fail with 401)
-    for _ in 0..5 {
+    for attempt in 0..5 {
+        let body = if attempt == 0 { unknown } else { known };
         let resp = http_request_with_body(
             &env.socket_path,
             "POST",
@@ -447,7 +454,7 @@ fn t04_login_rate_limited_429() {
         "POST",
         "/auth/login",
         "application/json",
-        body,
+        known,
     );
     assert_eq!(
         parse_status(&resp),
@@ -477,6 +484,11 @@ fn limit_failures_to(env: &TestEnv, n: u32) {
 /// Send one wrong JSON login carrying the extra header lines in `forwarded`,
 /// and return its status. `forwarded` is each header line ending in `\r\n`, or
 /// an empty string for none.
+///
+/// The user is seeded at the fixture's cost 4. An unknown name would take the
+/// cost-12 dummy hash path, seconds per attempt in this profile, and the
+/// limiter tests measure the bucket and not that path. The unknown-user path
+/// has its own test in `login_failures.rs`.
 fn failed_login(socket: &Path, forwarded: &str) -> u16 {
     let body = r#"{"username":"mallory","password":"bad"}"#;
     let req = format!(
