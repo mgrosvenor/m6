@@ -6636,7 +6636,7 @@ fn run(args: Vec<String>) -> i32 {
                 return 2;
             }
         };
-        match m6_core::platform::net::listen_shared(addr) {
+        match m6_core::platform::net::listen_shared(addr, config.server.reuse_port_processes) {
             Ok((tcp, udp)) => (Some(tcp), udp),
             Err(e) => {
                 eprintln!("bind error {}: {e}", config.server.bind);
@@ -6948,6 +6948,7 @@ mod www_redirect_tests {
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
                 reuse_port: false,
+                reuse_port_processes: None,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

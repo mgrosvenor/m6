@@ -173,6 +173,18 @@ pub struct ServerConfig {
     /// land on another process. Read at start, and a change needs a restart.
     #[serde(default)]
     pub reuse_port: bool,
+    /// How many m6-http processes share the port, with `reuse_port`. On Linux
+    /// it makes each client address always reach the same process: the kernel
+    /// is given a socket filter that sends (a hash of the client's source
+    /// address) mod this number to one socket, for TCP and for QUIC, so the
+    /// per-client rate limit is exact. Every process on the port must set the
+    /// same number. Unset, Linux chooses by a hash of the whole connection and
+    /// one client can reach several processes. While a process is stopped,
+    /// some clients move to another until it returns. macOS has no such
+    /// filter, ignores the number, and always gives the last-bound process
+    /// every client. Read at start, and a change needs a restart.
+    #[serde(default)]
+    pub reuse_port_processes: Option<std::num::NonZeroU32>,
     /// Optional H2C (HTTP/2 cleartext) listener address.
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
@@ -792,6 +804,7 @@ struct RawServerSection {
     backend_timeout_secs: Option<u64>,
     max_requests_per_connection: Option<u32>,
     reuse_port: Option<bool>,
+    reuse_port_processes: Option<std::num::NonZeroU32>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
@@ -1157,6 +1170,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         backend_timeout_secs,
         max_requests_per_connection,
         reuse_port: node_server.reuse_port.unwrap_or(false),
+        reuse_port_processes: node_server.reuse_port_processes,
         h2c_bind,
         internal_binds,
         internal_peers,
@@ -1503,6 +1517,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "warm_on_start",
     "max_requests_per_connection",
     "reuse_port",
+    "reuse_port_processes",
 ];
 /// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_require", "metrics_peers"];
@@ -2038,6 +2053,24 @@ sockets = "/run/m6/*.sock"
     fn reuse_port_is_read_from_the_system_config() {
         let cfg = load_with_system_server_line("reuse_port = true").unwrap();
         assert!(cfg.server.reuse_port);
+    }
+
+    #[test]
+    fn reuse_port_processes_is_unset_by_default_and_read_when_set() {
+        let cfg = load_with_system_server_line("reuse_port = true").unwrap();
+        assert_eq!(cfg.server.reuse_port_processes, None);
+        let cfg =
+            load_with_system_server_line("reuse_port = true\nreuse_port_processes = 3").unwrap();
+        assert_eq!(cfg.server.reuse_port_processes.map(|n| n.get()), Some(3));
+    }
+
+    /// A zero would be a modulus of zero in the kernel filter.
+    #[test]
+    fn reuse_port_processes_zero_is_rejected() {
+        let err = load_with_system_server_line("reuse_port = true\nreuse_port_processes = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reuse_port_processes"), "error: {err}");
     }
 
     #[test]
@@ -3057,6 +3090,7 @@ domain = "test.example.com"
                 "max_requests_per_connection",
                 "redirect_bind",
                 "reuse_port",
+                "reuse_port_processes",
                 "tls_cert",
                 "tls_key",
                 "warm_on_start",
@@ -3066,7 +3100,7 @@ domain = "test.example.com"
         health.sort_unstable();
         assert_eq!(health, ["metrics_peers", "metrics_require"]);
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "node"]);
-        assert_eq!(all.len(), 12 + 2 + 4);
+        assert_eq!(all.len(), 13 + 2 + 4);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),

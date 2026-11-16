@@ -5,7 +5,8 @@
 //! peer is an error and never a signal. On Linux there is no such option and
 //! none is needed: the Rust runtime ignores `SIGPIPE` in every binary, so the
 //! same write is `BrokenPipe` on both. `SO_REUSEPORT` is set only by
-//! [`listen_shared`], which is what lets several processes serve one port.
+//! [`listen_shared`], which is what lets several processes serve one port and,
+//! on Linux, keeps each client address on one of them.
 //!
 //! The default socket buffer sizes differ (about 128 KiB on macOS, about
 //! 208 KiB on Linux, both tunable by the host). A test that depends on a size
@@ -13,7 +14,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, OwnedFd, RawFd};
+use std::num::NonZeroU32;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 pub use mio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
@@ -106,13 +108,33 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
 /// `SO_REUSEPORT`, so several processes serve the same public port. Start only.
 ///
 /// The option is set on each socket before its `bind`, which is the only point
-/// where it has an effect. Linux spreads a new TCP connection across the
-/// sockets that share a port by a hash of its 4-tuple and gives every UDP
-/// datagram to one socket. macOS spreads neither: the socket bound last to the
-/// port receives every connection and every datagram, so a second process there
-/// is a takeover rather than a scale-out. Nothing may assume an even spread on
-/// either target, and on Linux a QUIC client that changes address can land on
-/// another process.
+/// where it has an effect. Left alone, Linux spreads a new TCP connection
+/// across the sockets that share a port by a hash of its 4-tuple and gives
+/// every UDP datagram to one socket by a hash of its addresses and ports, so
+/// one client's connections and a client that changes port can land on
+/// different processes. macOS spreads neither: the socket bound last to the
+/// port receives every connection and every datagram, so a second process
+/// there is a takeover rather than a scale-out, and one client always reaches
+/// one process. Nothing may assume an even spread on either target.
+///
+/// `group_size` is how many processes share the port. With `Some(n)` on Linux,
+/// a classic BPF program (`SO_ATTACH_REUSEPORT_CBPF`) is attached to both
+/// sockets so that a client's source address alone picks the socket: (a hash of
+/// the address) mod `n`. Every TCP connection and every QUIC datagram from one
+/// address, IPv4 or IPv6, then reaches one process whatever its source port.
+/// The program reads the address with the `SKF_NET_OFF` offsets and costs the
+/// accept path no allocation. On macOS `group_size` has no effect, because
+/// there is nothing to steer. With `None` nothing is attached on either target.
+///
+/// The index is the socket's place in the kernel's group, and `n` is what the
+/// caller says the group will hold, not what it holds now. While fewer than `n`
+/// sockets are in the group, a client whose index has no socket is placed by
+/// the kernel's own hash. When a process stops or starts, sockets leave or
+/// join the group and the kernel moves one to fill a vacated place, so some
+/// clients change process until the group is whole again. Clients on a
+/// surviving process are not all kept on it. A connection already accepted
+/// stays where it is, and a QUIC client that moves process loses its
+/// connection and handshakes again.
 ///
 /// m6-http opens it only for the public 443 port's TLS listener and its QUIC
 /// UDP socket, and for no other socket.
@@ -121,7 +143,10 @@ pub fn listen_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
 /// restart rebinds a port whose connections are in `TIME_WAIT`. The returned
 /// pair are `std` sockets because the service's loop registers their
 /// descriptors itself.
-pub fn listen_shared(addr: SocketAddr) -> io::Result<(std::net::TcpListener, std::net::UdpSocket)> {
+pub fn listen_shared(
+    addr: SocketAddr,
+    group_size: Option<NonZeroU32>,
+) -> io::Result<(std::net::TcpListener, std::net::UdpSocket)> {
     let tcp = socket2::Socket::new(
         domain_of(addr),
         socket2::Type::STREAM,
@@ -133,6 +158,10 @@ pub fn listen_shared(addr: SocketAddr) -> io::Result<(std::net::TcpListener, std
     tcp.bind(&addr.into())?;
     tcp.listen(128)?;
     tcp.set_nonblocking(true)?;
+    if let Some(n) = group_size {
+        // After `listen`, which is when a TCP socket joins the group.
+        os::steer_reuseport(tcp.as_raw_fd(), n.get())?;
+    }
 
     let udp = socket2::Socket::new(
         domain_of(addr),
@@ -143,6 +172,9 @@ pub fn listen_shared(addr: SocketAddr) -> io::Result<(std::net::TcpListener, std
     udp.set_reuse_port(true)?;
     udp.bind(&addr.into())?;
     udp.set_nonblocking(true)?;
+    if let Some(n) = group_size {
+        os::steer_reuseport(udp.as_raw_fd(), n.get())?;
+    }
 
     Ok((
         std::net::TcpListener::from(OwnedFd::from(tcp)),

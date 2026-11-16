@@ -342,6 +342,7 @@ mod tests {
                 backend_timeout_secs: 30,
                 max_requests_per_connection: 100,
                 reuse_port: false,
+                reuse_port_processes: None,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

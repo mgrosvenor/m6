@@ -891,9 +891,10 @@ mod sockets {
     #[test]
     fn two_shared_tcp_listeners_share_one_port_and_one_may_stop() {
         let (mut first, _udp) =
-            net::listen_shared(SocketAddr::from(([127, 0, 0, 1], 0))).expect("first bind");
+            net::listen_shared(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("first bind");
         let addr = first.local_addr().expect("addr");
-        let (mut second, _udp2) = net::listen_shared(addr).expect("second bind on the same port");
+        let (mut second, _udp2) =
+            net::listen_shared(addr, None).expect("second bind on the same port");
 
         fn answer_all(listener: &mut std::net::TcpListener, tag: u8, answered: &mut usize) {
             loop {
@@ -976,9 +977,9 @@ mod sockets {
     #[test]
     fn two_shared_udp_sockets_share_one_port_and_one_may_stop() {
         let (_tcp, first) =
-            net::listen_shared(SocketAddr::from(([127, 0, 0, 1], 0))).expect("first bind");
+            net::listen_shared(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("first bind");
         let addr = first.local_addr().expect("addr");
-        let (_tcp2, second) = net::listen_shared(addr).expect("second bind on the same port");
+        let (_tcp2, second) = net::listen_shared(addr, None).expect("second bind on the same port");
 
         let other = Token(4);
         let mut poll = Poll::new().expect("poll");

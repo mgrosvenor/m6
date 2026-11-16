@@ -110,6 +110,91 @@ pub(super) fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// The classic BPF program [`steer_reuseport`] attaches: 20 instructions.
+///
+/// It reads one thing, the client's source address, from the packet the
+/// kernel is choosing a socket for, and returns (a hash of that address) mod
+/// `group_size`, the index of the socket in the reuseport group. The packet is
+/// a TCP SYN or a UDP datagram, and the program does not care which: it reads
+/// from the start of the IP header through the `SKF_NET_OFF` negative offsets,
+/// which the kernel resolves against the packet's network header whatever
+/// transport header follows. The top nibble of byte 0 says IPv4 (version 4:
+/// the source is the word at byte 12) or IPv6 (the source is the four words at
+/// bytes 8, 12, 16 and 20, XORed into one). The word is then folded
+/// (`a ^ (a >> 16)`) so the low bits, which the modulus keeps, see the whole
+/// address. The same address gives the same index every time, so every
+/// connection and every datagram from one client reaches one socket.
+///
+/// An index at or past the number of sockets in the group is ignored by the
+/// kernel, which then picks by its own hash.
+fn steer_program(group_size: u32) -> [nix::libc::sock_filter; 20] {
+    // Offsets from the start of the network header.
+    const NET: u32 = 0xfff0_0000; // SKF_NET_OFF, -0x100000 as the u32 the kernel reads
+    const LD_B: u16 = 0x30; // BPF_LD | BPF_B | BPF_ABS
+    const LD_W: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    const RSH: u16 = 0x74; // BPF_ALU | BPF_RSH | BPF_K
+    const XOR_X: u16 = 0xac; // BPF_ALU | BPF_XOR | BPF_X
+    const MOD: u16 = 0x94; // BPF_ALU | BPF_MOD | BPF_K
+    const JEQ: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    const JA: u16 = 0x05; // BPF_JMP | BPF_JA
+    const TAX: u16 = 0x07; // BPF_MISC | BPF_TAX
+    const RET_A: u16 = 0x16; // BPF_RET | BPF_A
+    let i = |code, jt, jf, k| nix::libc::sock_filter { code, jt, jf, k };
+    [
+        i(LD_B, 0, 0, NET),       // 0: A = first byte of the IP header
+        i(RSH, 0, 0, 4),          // 1: A = IP version
+        i(JEQ, 0, 2, 4),          // 2: version 4 falls through, else go to 5
+        i(LD_W, 0, 0, NET + 12),  // 3: IPv4 source address
+        i(JA, 0, 0, 10),          // 4: go to 15
+        i(LD_W, 0, 0, NET + 8),   // 5: IPv6 source, word 0
+        i(TAX, 0, 0, 0),          // 6
+        i(LD_W, 0, 0, NET + 12),  // 7: word 1
+        i(XOR_X, 0, 0, 0),        // 8
+        i(TAX, 0, 0, 0),          // 9
+        i(LD_W, 0, 0, NET + 16),  // 10: word 2
+        i(XOR_X, 0, 0, 0),        // 11
+        i(TAX, 0, 0, 0),          // 12
+        i(LD_W, 0, 0, NET + 20),  // 13: word 3
+        i(XOR_X, 0, 0, 0),        // 14
+        i(TAX, 0, 0, 0),          // 15: fold the word into its low bits
+        i(RSH, 0, 0, 16),         // 16
+        i(XOR_X, 0, 0, 0),        // 17
+        i(MOD, 0, 0, group_size), // 18: index = hash mod the group size
+        i(RET_A, 0, 0, 0),        // 19
+    ]
+}
+
+/// Make every connection and datagram from one client address reach one socket
+/// of the reuseport group `fd` is in, by attaching [`steer_program`]
+/// (`SO_ATTACH_REUSEPORT_CBPF`). The program belongs to the group, so one
+/// attach by any member covers all of them, and each process that joins
+/// attaches the same program again. `fd` must already be bound (UDP) or
+/// listening (TCP), which is when it joins the group. The program lives on the
+/// stack: nothing is allocated.
+pub(super) fn steer_reuseport(fd: RawFd, group_size: u32) -> io::Result<()> {
+    let mut program = steer_program(group_size);
+    let fprog = nix::libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: `fd` is the caller's live socket, and the option reads the one
+    // `sock_fprog` it is given, whose `filter` points at `len` instructions
+    // that outlive the call. The kernel copies them.
+    let rc = unsafe {
+        nix::libc::setsockopt(
+            fd,
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_ATTACH_REUSEPORT_CBPF,
+            std::ptr::from_ref(&fprog).cast(),
+            std::mem::size_of::<nix::libc::sock_fprog>() as nix::libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The kernel enforces the hard limit as read, so there is no cap below it.
 pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     Ok(None)
@@ -243,4 +328,164 @@ pub(super) fn thermal_zones() -> Vec<ThermalZone> {
 
 pub(super) fn uptime() -> Option<std::time::Duration> {
     parse_uptime(&std::fs::read_to_string("/proc/uptime").ok()?)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The reuseport steering, on real sockets. Linux only: this module is part
+    //! of the Linux arm, so on macOS it is not compiled.
+
+    use std::io;
+    use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::num::NonZeroU32;
+
+    use crate::net::listen_shared;
+
+    const GROUP: Option<NonZeroU32> = NonZeroU32::new(2);
+    /// More connections than two sockets would split evenly by chance: with
+    /// the kernel's own 4-tuple hash, 64 from one address reach both sockets.
+    const MANY: usize = 64;
+
+    /// Two members of one group on a loopback port, in join order: the first
+    /// socket is index 0 and the second index 1.
+    fn pair(group: Option<NonZeroU32>) -> (SocketAddr, [(TcpListener, UdpSocket); 2]) {
+        let first = listen_shared(SocketAddr::from(([127, 0, 0, 1], 0)), group).expect("first");
+        let addr = first.0.local_addr().expect("addr");
+        let second = listen_shared(addr, group).expect("second");
+        (addr, [first, second])
+    }
+
+    /// Which listener took the connection a client just made: loopback queues
+    /// it before `connect` returns.
+    fn tcp_owner(members: &[(TcpListener, UdpSocket); 2]) -> usize {
+        let hits: Vec<usize> = (0..2)
+            .filter(|&i| match members[i].0.accept() {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                Err(e) => panic!("accept: {e}"),
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "one connection reaches exactly one listener");
+        hits[0]
+    }
+
+    /// The socket that holds the datagram a client just sent.
+    fn udp_owner(members: &[(TcpListener, UdpSocket); 2]) -> usize {
+        let mut buf = [0u8; 8];
+        let hits: Vec<usize> = (0..2)
+            .filter(|&i| match members[i].1.recv_from(&mut buf) {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                Err(e) => panic!("recv: {e}"),
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "one datagram reaches exactly one socket");
+        hits[0]
+    }
+
+    /// `MANY` connections, each from a new source port of `src`, and the set of
+    /// listeners that took them.
+    fn tcp_owners(
+        addr: SocketAddr,
+        src: IpAddr,
+        members: &[(TcpListener, UdpSocket); 2],
+    ) -> [bool; 2] {
+        let mut seen = [false; 2];
+        for _ in 0..MANY {
+            let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                .expect("client socket");
+            sock.bind(&SocketAddr::new(src, 0).into())
+                .expect("bind the client address");
+            sock.connect(&addr.into()).expect("connect");
+            let _client = TcpStream::from(std::os::fd::OwnedFd::from(sock));
+            seen[tcp_owner(members)] = true;
+        }
+        seen
+    }
+
+    /// `MANY` datagrams, each from a new source port of `src`.
+    fn udp_owners(
+        addr: SocketAddr,
+        src: IpAddr,
+        members: &[(TcpListener, UdpSocket); 2],
+    ) -> [bool; 2] {
+        let mut seen = [false; 2];
+        for _ in 0..MANY {
+            let client = UdpSocket::bind(SocketAddr::new(src, 0)).expect("bind the client address");
+            client.send_to(b"x", addr).expect("send");
+            seen[udp_owner(members)] = true;
+        }
+        seen
+    }
+
+    /// Many TCP connections from one address, each from its own source port,
+    /// all reach one listener, and another address reaches the other. Break:
+    /// no filter attached, so the kernel hashes the 4-tuple and one address
+    /// reaches both listeners.
+    ///
+    /// The indices are exact: the hash of 127.0.0.1 is odd and of 127.0.0.2 is
+    /// even, and the second listener to join is index 1.
+    #[test]
+    fn tcp_connections_from_one_address_reach_one_listener() {
+        let (addr, members) = pair(GROUP);
+        assert_eq!(
+            tcp_owners(addr, [127, 0, 0, 1].into(), &members),
+            [false, true]
+        );
+        assert_eq!(
+            tcp_owners(addr, [127, 0, 0, 2].into(), &members),
+            [true, false]
+        );
+    }
+
+    /// The same for UDP, which is what QUIC runs on. Break: as above.
+    #[test]
+    fn udp_datagrams_from_one_address_reach_one_socket() {
+        let (addr, members) = pair(GROUP);
+        assert_eq!(
+            udp_owners(addr, [127, 0, 0, 1].into(), &members),
+            [false, true]
+        );
+        assert_eq!(
+            udp_owners(addr, [127, 0, 0, 2].into(), &members),
+            [true, false]
+        );
+    }
+
+    /// IPv6 takes the other branch of the program. `::1` is the one local
+    /// address a host has, its four words XOR to 1, and 1 mod 2 is index 1.
+    /// A host with no IPv6 loopback has nothing to test and says so.
+    #[test]
+    fn ipv6_datagrams_from_one_address_reach_one_socket() {
+        let first = match listen_shared(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0)), GROUP) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::AddrNotAvailable => {
+                eprintln!("no IPv6 loopback on this host: {e}");
+                return;
+            }
+            Err(e) => panic!("bind: {e}"),
+        };
+        let addr = first.1.local_addr().expect("addr");
+        let second = listen_shared(addr, GROUP).expect("second");
+        let members = [first, second];
+        let mut seen = [false; 2];
+        for _ in 0..MANY {
+            let client = UdpSocket::bind("[::1]:0").expect("bind the client address");
+            client.send_to(b"x", addr).expect("send");
+            seen[udp_owner(&members)] = true;
+        }
+        assert_eq!(seen, [false, true]);
+    }
+
+    /// With no group size nothing is attached, and the kernel spreads one
+    /// address's connections over both listeners by its own hash. This is what
+    /// the other tests would see without the filter.
+    #[test]
+    fn without_a_group_size_one_address_reaches_both_listeners() {
+        let (addr, members) = pair(None);
+        assert_eq!(
+            tcp_owners(addr, [127, 0, 0, 1].into(), &members),
+            [true, true]
+        );
+    }
 }
