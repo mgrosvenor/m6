@@ -410,10 +410,12 @@ fn t03b_login_json_wrong_password_401() {
 #[test]
 fn t04_login_rate_limited_429() {
     let env = setup_test_env("t04");
-    // No user needed — rate limit checked before credential verification
+    // A real user with a cost-4 hash: a missing user costs a cost-12 verify,
+    // CPU work that a loaded host stretches past the read deadline.
+    seed_user(&env.site_dir, "mallory", "right");
     let _guard = spawn_server(&env);
 
-    let body = r#"{"username":"nobody","password":"bad"}"#;
+    let body = r#"{"username":"mallory","password":"bad"}"#;
 
     // First 5 attempts (fail with 401)
     for _ in 0..5 {
@@ -475,7 +477,7 @@ fn limit_failures_to(env: &TestEnv, n: u32) {
 /// and return its status. `forwarded` is each header line ending in `\r\n`, or
 /// an empty string for none.
 fn failed_login(socket: &Path, forwarded: &str) -> u16 {
-    let body = r#"{"username":"nobody","password":"bad"}"#;
+    let body = r#"{"username":"mallory","password":"bad"}"#;
     let req = format!(
         "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
         forwarded,
@@ -496,6 +498,7 @@ fn failed_login(socket: &Path, forwarded: &str) -> u16 {
 fn forwarded_addresses_select_the_rate_limit_bucket() {
     let env = setup_test_env("rate-limit-bucket");
     limit_failures_to(&env, 2);
+    seed_user(&env.site_dir, "mallory", "right");
     let _guard = spawn_server(&env);
     let socket = &env.socket_path;
 
@@ -554,6 +557,7 @@ fn forwarded_addresses_select_the_rate_limit_bucket() {
 fn requests_without_a_forwarded_address_share_one_bucket() {
     let env = setup_test_env("rate-limit-unix-bucket");
     limit_failures_to(&env, 2);
+    seed_user(&env.site_dir, "mallory", "right");
     let _guard = spawn_server(&env);
     let socket = &env.socket_path;
 
@@ -587,6 +591,7 @@ fn requests_without_a_forwarded_address_share_one_bucket() {
 fn a_restart_forgets_the_failure_counts() {
     let env = setup_test_env("rate-limit-restart");
     limit_failures_to(&env, 2);
+    seed_user(&env.site_dir, "mallory", "right");
     let mut svc = spawn_server(&env);
     let socket = &env.socket_path;
 
