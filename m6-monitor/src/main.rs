@@ -78,11 +78,6 @@ const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
-/// Slots and buffers made at start, before any connection exists.
-const INITIAL_CONNECTIONS: usize = 1024;
-const READ_CAP: usize = 16 * 1024;
-const WRITE_CAP: usize = 64 * 1024;
-
 /// The five routes, in the order the service answers them. A code route's
 /// index in this slice is what `Handled::Code` carries. The first three are
 /// answered from the loop's own stored bytes; the last two read the history.
@@ -204,12 +199,16 @@ fn run_service() -> Result<()> {
             .map(|n| n.perf_token(fallback.as_deref()))
             .collect::<Vec<_>>()
     };
+    m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
     let nameserver = m6_core::dns::nameserver()
         .unwrap_or_else(|e| fail("reading the resolver configuration", e));
     let history_config = history::config_from(site.user_config().get("monitor"), site.site_dir())
         .unwrap_or_else(|e| fail("reading the history config", format!("{e:#}")));
-    let mut history = history::start(history_config)
-        .unwrap_or_else(|e| fail("opening the history file", format!("{e:#}")));
+    let mut history = history::start(
+        history_config,
+        site.limits().get(&m6_core::limits::HISTORY_QUEUE),
+    )
+    .unwrap_or_else(|e| fail("opening the history file", format!("{e:#}")));
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
         log_reopen_age_s: fleet.log_reopen_max_age_s,
@@ -226,6 +225,11 @@ fn run_service() -> Result<()> {
         wg_file: fleet.wg_handshakes_file.clone(),
         wg_max_age_s: fleet.tunnel_handshake_max_age_s,
         lookup_cap: check::MAX_LOOKUPS_PER_POLL,
+        upstream_read: site.limits().get(&m6_core::limits::UPSTREAM_READ).clone(),
+        upstream_request: site
+            .limits()
+            .get(&m6_core::limits::UPSTREAM_REQUEST)
+            .clone(),
     });
 
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
@@ -234,7 +238,11 @@ fn run_service() -> Result<()> {
     }
     // A table larger than the descriptors the limit allows could never report
     // itself full: `Slots::is_full` would stay false past the kernel's limit.
-    let initial = INITIAL_CONNECTIONS.min(ceiling);
+    // The connection table follows the `connections` limit, and the open-file
+    // limit can lower its maximum.
+    let table = site.limits().get(&m6_core::limits::CONNECTIONS);
+    let ceiling = ceiling.min(table.max());
+    let initial = table.start().min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
@@ -250,7 +258,11 @@ fn run_service() -> Result<()> {
 
     // The whole connection table, every buffer in it, the deadlines, the
     // outgoing slots and the events: made here, never grown except by `Slots`.
-    let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
+    let read_limit = site.limits().get(&m6_core::limits::REQUEST_BODY).clone();
+    let write_limit = site.limits().get(&m6_core::limits::RESPONSE_BUFFER).clone();
+    let mut conns = Slots::new(initial, ceiling, move || {
+        ServerConn::with_limits(&read_limit, &write_limit)
+    });
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));

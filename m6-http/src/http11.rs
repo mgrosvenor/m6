@@ -25,7 +25,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Instant;
 
-use m6_core::log::warn;
+use m6_core::log::{error, warn};
 use rustls::ServerConnection;
 
 use crate::cache::CachedResponse;
@@ -263,21 +263,6 @@ struct H1Conn {
     expect_handled: bool,
 }
 
-/// The request buffer's starting capacity: one read chunk.
-///
-/// The buffer is allocated once when the connection is created rather than
-/// grown by the first request, so what a request pays is the request's own work
-/// and not the allocation of a buffer the connection keeps.
-const READ_BUF_BYTES: usize = 4096;
-
-/// The response buffer's starting capacity: a status line, the headers a
-/// response usually carries and the generation line fit without a growth.
-///
-/// Sized once for the same reason as the read buffer. A body larger than this
-/// grows it once per connection, and every later response on that connection
-/// reuses that capacity.
-const OUT_BUF_BYTES: usize = 512;
-
 /// Idle timeout for an HTTP/1.1 connection, measured from the start of the
 /// current request rather than from when the connection opened.
 pub const READ_TIMEOUT_SECS: u64 = 30;
@@ -295,11 +280,6 @@ pub const READ_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_REQUESTS_PER_CONN: u32 = 100;
 /// Idle timeout for HTTP/2 connections (reused across many requests).
 pub const H2_IDLE_TIMEOUT_SECS: u64 = 300;
-/// 20 MiB — above m6-render's own 16 MiB multipart body cap, so oversized
-/// uploads get a clean rejection from the backend (which has read full,
-/// valid HTTP framing) rather than a mid-stream connection drop here.
-const MAX_REQUEST_BYTES: usize = 20 * 1024 * 1024;
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 pub struct Http11Listener {
@@ -317,7 +297,7 @@ pub struct Http11Listener {
 }
 
 /// The connection table's starting size, shared by every owner in the process.
-pub const INITIAL_CONNECTIONS: usize = 1024;
+pub const INITIAL_CONNECTIONS: usize = m6_core::limits::CONNECTIONS.start;
 
 /// Resolve a `host:port` bind string to one address.
 ///
@@ -460,7 +440,7 @@ impl Http11Listener {
                             // request bodies land) is a separate, fixed 16 KiB buffer with no
                             // public setter — see the comment on advance_tls's "buffer full"
                             // handling for how that's dealt with instead.
-                            tls.set_buffer_limit(Some(MAX_REQUEST_BYTES));
+                            tls.set_buffer_limit(Some(crate::limits::edge().request.max()));
                             // Eagerly start handshake: ClientHello is already buffered on loopback.
                             let _ = advance_tls(&mut tls, &stream, None);
                             Some(tls)
@@ -477,8 +457,8 @@ impl Http11Listener {
                     } else {
                         ConnKind::Http1(H1Conn {
                             state: H1State::Reading,
-                            read_buf: Vec::with_capacity(READ_BUF_BYTES),
-                            out_buf: Vec::with_capacity(OUT_BUF_BYTES),
+                            read_buf: Vec::with_capacity(crate::limits::edge().request.start()),
+                            out_buf: Vec::with_capacity(crate::limits::edge().response.start()),
                             created: m6_core::platform::now(),
                             keep_alive: false,
                             served: 0,
@@ -605,17 +585,24 @@ impl Http11Listener {
         let ConnKind::Http1(h1) = &mut conn.kind else {
             return drive;
         };
-        h1.out_buf.clear();
-        write_response(
+        if make_out_room(
             &mut h1.out_buf,
-            status,
-            headers,
-            &body,
-            method,
-            keep_alive,
-            genid,
-        );
-        h1.state = H1State::Writing { pos: 0 };
+            &mut h1.state,
+            &mut h1.keep_alive,
+            body.len(),
+        ) {
+            h1.out_buf.clear();
+            write_response(
+                &mut h1.out_buf,
+                status,
+                headers,
+                &body,
+                method,
+                keep_alive,
+                genid,
+            );
+            h1.state = H1State::Writing { pos: 0 };
+        }
         let mut unit = ();
         let mut on_head = |_: &mut (), _: &RequestHead<'_>, _: &[u8], _: &str| -> RequestOutcome {
             unreachable!("a completed h1 connection is not reading a request")
@@ -1386,8 +1373,8 @@ fn drive_conn<S, FH, FO, FR>(
         } else {
             conn.kind = ConnKind::Http1(H1Conn {
                 state: H1State::Reading,
-                read_buf: Vec::with_capacity(READ_BUF_BYTES),
-                out_buf: Vec::with_capacity(OUT_BUF_BYTES),
+                read_buf: Vec::with_capacity(crate::limits::edge().request.start()),
+                out_buf: Vec::with_capacity(crate::limits::edge().response.start()),
                 created,
                 keep_alive: false,
                 served: 0,
@@ -1535,6 +1522,59 @@ fn handle_expect(h1: &mut H1Conn, io: &mut H1Io<'_>) -> bool {
     false
 }
 
+/// Refuse a request that has passed the `edge_request` maximum: one error line
+/// names the limit, the size needed and the key to raise, and the connection
+/// answers 413 and closes.
+fn refuse_oversized_request(h1: &mut H1Conn, needed: usize) {
+    let limit = &crate::limits::edge().request;
+    error!("{}", limit.exceeded(needed, "request"));
+    start_response(
+        h1,
+        b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+}
+
+/// Room kept beside a response body for its status line and headers when the
+/// body is checked against the `edge_response` maximum.
+const RESPONSE_HEAD_ALLOWANCE: usize = 64 * 1024;
+
+/// Make room in the connection's output buffer for a response with a body of
+/// `body_len` bytes, following the `edge_response` limit.
+///
+/// A body past the maximum is refused: one error line names the limit, the size
+/// needed and the key to raise, a 500 is started in its place and the answer is
+/// `false`. A body that does not fit the buffer grows it by doubling, clamped
+/// to the maximum, with one log line, and the buffer keeps the size. A body that
+/// fits changes nothing.
+fn make_out_room(
+    out_buf: &mut Vec<u8>,
+    state: &mut H1State,
+    keep_alive: &mut bool,
+    body_len: usize,
+) -> bool {
+    let limit = &crate::limits::edge().response;
+    let needed = body_len.saturating_add(RESPONSE_HEAD_ALLOWANCE);
+    if needed > limit.max() {
+        error!("{}", limit.exceeded(needed, "response"));
+        *keep_alive = false;
+        out_buf.clear();
+        out_buf.extend_from_slice(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        *state = H1State::Writing { pos: 0 };
+        return false;
+    }
+    let cap = out_buf.capacity();
+    if body_len > cap {
+        if let Some(size) = limit.grown(cap, body_len + 4096) {
+            out_buf.clear();
+            out_buf.reserve_exact(size);
+            limit.log_growth(out_buf.capacity());
+        }
+    }
+    true
+}
+
 /// The response a malformed request keeps: a bare 400 and close.
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -1610,7 +1650,16 @@ fn drive_h1<S, FH, FO, FR>(
                         dry = true;
                     }
                     Ok(n) => {
+                        let limit = &crate::limits::edge().request;
+                        // Past the maximum the request is refused before its
+                        // bytes are kept: nothing grows the buffer past it.
+                        if h1.read_buf.len() + n > limit.max() {
+                            refuse_oversized_request(h1, h1.read_buf.len() + n);
+                            continue;
+                        }
+                        let before = h1.read_buf.capacity();
                         h1.read_buf.extend_from_slice(&tmp[..n]);
+                        crate::limits::log_growth(limit, before, h1.read_buf.capacity());
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         dry = true;
@@ -1620,11 +1669,8 @@ fn drive_h1<S, FH, FO, FR>(
                         return;
                     }
                 }
-                if h1.read_buf.len() > MAX_REQUEST_BYTES {
-                    start_response(
-                        h1,
-                        b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
+                if h1.read_buf.len() > crate::limits::edge().request.max() {
+                    refuse_oversized_request(h1, h1.read_buf.len());
                     continue;
                 }
                 // Parse the head under an immutable borrow of the input buffer.
@@ -1686,17 +1732,24 @@ fn drive_h1<S, FH, FO, FR>(
                                     unreachable!("a head refusal is ready")
                                 };
                                 h1.keep_alive = false;
-                                h1.out_buf.clear();
-                                write_response(
+                                if make_out_room(
                                     &mut h1.out_buf,
-                                    status,
-                                    &headers,
-                                    &body,
-                                    head.method,
-                                    false,
-                                    genid,
-                                );
-                                h1.state = H1State::Writing { pos: 0 };
+                                    &mut h1.state,
+                                    &mut h1.keep_alive,
+                                    body.len(),
+                                ) {
+                                    h1.out_buf.clear();
+                                    write_response(
+                                        &mut h1.out_buf,
+                                        status,
+                                        &headers,
+                                        &body,
+                                        head.method,
+                                        false,
+                                        genid,
+                                    );
+                                    h1.state = H1State::Writing { pos: 0 };
+                                }
                                 continue;
                             }
                             // A body request routes through the owned parser,
@@ -1737,17 +1790,24 @@ fn drive_h1<S, FH, FO, FR>(
                                             _,
                                             genid,
                                         ) => {
-                                            h1.out_buf.clear();
-                                            write_response(
+                                            if make_out_room(
                                                 &mut h1.out_buf,
-                                                status,
-                                                &resp_headers,
-                                                &body,
-                                                &req.method,
-                                                h1.keep_alive,
-                                                genid,
-                                            );
-                                            h1.state = H1State::Writing { pos: 0 };
+                                                &mut h1.state,
+                                                &mut h1.keep_alive,
+                                                body.len(),
+                                            ) {
+                                                h1.out_buf.clear();
+                                                write_response(
+                                                    &mut h1.out_buf,
+                                                    status,
+                                                    &resp_headers,
+                                                    &body,
+                                                    &req.method,
+                                                    h1.keep_alive,
+                                                    genid,
+                                                );
+                                                h1.state = H1State::Writing { pos: 0 };
+                                            }
                                             continue;
                                         }
                                         RequestOutcome::Pending { id, ctx } => {
@@ -1769,17 +1829,24 @@ fn drive_h1<S, FH, FO, FR>(
                                             // bytes, the same as the bodyless
                                             // fast path.
                                             let hit = hit.expect("cached hit carries hit headers");
-                                            h1.out_buf.clear();
-                                            write_cached_h1(
+                                            if make_out_room(
                                                 &mut h1.out_buf,
-                                                &entry,
-                                                age,
-                                                hit,
-                                                set_cookie.as_deref(),
-                                                &req.method,
-                                                h1.keep_alive,
-                                            );
-                                            h1.state = H1State::Writing { pos: 0 };
+                                                &mut h1.state,
+                                                &mut h1.keep_alive,
+                                                entry.body.len(),
+                                            ) {
+                                                h1.out_buf.clear();
+                                                write_cached_h1(
+                                                    &mut h1.out_buf,
+                                                    &entry,
+                                                    age,
+                                                    hit,
+                                                    set_cookie.as_deref(),
+                                                    &req.method,
+                                                    h1.keep_alive,
+                                                );
+                                                h1.state = H1State::Writing { pos: 0 };
+                                            }
                                             continue;
                                         }
                                     }
@@ -1798,33 +1865,47 @@ fn drive_h1<S, FH, FO, FR>(
                                     ..
                                 } => {
                                     let hit = hit.expect("cached hit carries hit headers");
-                                    h1.out_buf.clear();
-                                    write_cached_h1(
+                                    if make_out_room(
                                         &mut h1.out_buf,
-                                        &entry,
-                                        age,
-                                        hit,
-                                        set_cookie.as_deref(),
-                                        method,
-                                        keep_alive,
-                                    );
-                                    h1.keep_alive = keep_alive;
-                                    h1.state = H1State::Writing { pos: 0 };
+                                        &mut h1.state,
+                                        &mut h1.keep_alive,
+                                        entry.body.len(),
+                                    ) {
+                                        h1.out_buf.clear();
+                                        write_cached_h1(
+                                            &mut h1.out_buf,
+                                            &entry,
+                                            age,
+                                            hit,
+                                            set_cookie.as_deref(),
+                                            method,
+                                            keep_alive,
+                                        );
+                                        h1.keep_alive = keep_alive;
+                                        h1.state = H1State::Writing { pos: 0 };
+                                    }
                                     continue;
                                 }
                                 RequestOutcome::Ready(status, resp_headers, body, _, genid) => {
-                                    h1.out_buf.clear();
-                                    write_response(
+                                    if make_out_room(
                                         &mut h1.out_buf,
-                                        status,
-                                        &resp_headers,
-                                        &body,
-                                        method,
-                                        keep_alive,
-                                        genid,
-                                    );
-                                    h1.keep_alive = keep_alive;
-                                    h1.state = H1State::Writing { pos: 0 };
+                                        &mut h1.state,
+                                        &mut h1.keep_alive,
+                                        body.len(),
+                                    ) {
+                                        h1.out_buf.clear();
+                                        write_response(
+                                            &mut h1.out_buf,
+                                            status,
+                                            &resp_headers,
+                                            &body,
+                                            method,
+                                            keep_alive,
+                                            genid,
+                                        );
+                                        h1.keep_alive = keep_alive;
+                                        h1.state = H1State::Writing { pos: 0 };
+                                    }
                                     continue;
                                 }
                                 RequestOutcome::Pending { id, ctx } => {
@@ -3430,5 +3511,60 @@ mod h2c_admit_tests {
         assert_eq!(l.accept_up_to(5, |_, _| true), 2);
         assert_eq!(l.accept_up_to(5, |_, _| true), 0);
         drop(clients);
+    }
+}
+
+#[cfg(test)]
+mod out_room_tests {
+    use super::*;
+
+    /// A request past the `edge_request` maximum is answered 413 and closed.
+    #[test]
+    fn a_request_past_the_maximum_is_answered_413() {
+        let mut h1 = H1Conn {
+            state: H1State::Reading,
+            read_buf: Vec::new(),
+            out_buf: Vec::new(),
+            created: m6_core::platform::now(),
+            keep_alive: true,
+            served: 0,
+            max_requests: 100,
+            expect_handled: false,
+        };
+        refuse_oversized_request(&mut h1, crate::limits::edge().request.max() + 1);
+        assert!(h1.out_buf.starts_with(b"HTTP/1.1 413 "));
+        assert!(matches!(h1.state, H1State::Writing { pos: 0 }));
+    }
+
+    /// A response body past the `edge_response` maximum is refused with a 500,
+    /// and one that does not fit the buffer grows it by doubling.
+    #[test]
+    fn make_out_room_refuses_past_the_maximum_and_grows_below_it() {
+        let limit = &crate::limits::edge().response;
+        let mut out: Vec<u8> = Vec::with_capacity(limit.start());
+        let mut state = H1State::Reading;
+        let mut keep_alive = true;
+
+        // A 100 KiB body grows a 512-byte buffer to the next power of two.
+        assert!(make_out_room(
+            &mut out,
+            &mut state,
+            &mut keep_alive,
+            100 * 1024
+        ));
+        assert!(out.capacity() >= 128 * 1024, "{}", out.capacity());
+        assert!(keep_alive);
+
+        // A body past the maximum starts a 500 and closes.
+        let too_big = limit.max();
+        assert!(!make_out_room(
+            &mut out,
+            &mut state,
+            &mut keep_alive,
+            too_big
+        ));
+        assert!(out.starts_with(b"HTTP/1.1 500 "));
+        assert!(!keep_alive);
+        assert!(matches!(state, H1State::Writing { pos: 0 }));
     }
 }

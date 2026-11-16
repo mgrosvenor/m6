@@ -184,10 +184,10 @@ A request line over `MAX_HEADER_LINE` is answered 414 Request-URI Too Large, cou
 Both limits are defined once in m6-core as `m6_core::headers::MAX_HEADER_LINE` and `m6_core::headers::MAX_REQUEST_HEAD`, and the HTTP/1.1 parser, both backends and the edge read those definitions.
 
 HTTP/2 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_HEADER_LIST_SIZE` and enforces it while decoding.
-The 256 KiB `MAX_HEADER_BLOCK` bound on the compressed header block stays, because it is the defence against HPACK expansion.
+The 256 KiB bound on the compressed header block stays as the default of `[limits.h2_header_block] max`, because it is the defence against HPACK expansion.
 HTTP/3 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the pinned quiche enforces it by closing the connection with H3_EXCESSIVE_LOAD.
 A single field over `MAX_HEADER_LINE` and a request line over it are answered on the HTTP/3 stream, as they are on the other two protocols.
-The HTTP/1.1 head limit is separate from the 20 MiB cap on a whole request, and that cap stays.
+The HTTP/1.1 head limit is separate from the cap on a whole request, which is `[limits.edge_request] max` and defaults to 32 MiB.
 
 ---
 
@@ -352,7 +352,7 @@ It asks that upstream for the ID and follows it.
    Old pages keep working while the source is unreachable, and that is better than an error page.
 5. **Background fetches wait.**
    Prefetch, warm-on-start and stale-while-revalidate fetches are not drained while the node has no ID or the upstream is down.
-   The queue keeps its cap of 256 and drains once the upstream answers.
+   The queue holds up to `[limits.refresh_queue] max`, 4096 by default, and drains once the upstream answers. A refresh past the maximum is refused with an error that names the key.
 6. **`/genid` is forwarded.**
    `GET`, `HEAD` and `POST /genid` reach the upstream backend after the loopback or internal-listener address check, with the request's own headers, bypassing routing and the cache.
    The cache node checks no token: the source authorises the caller.
@@ -391,7 +391,7 @@ The writer encodes into one buffer reserved at start, writes `<name>.tmp` with o
 There is no `fsync`.
 A crash can leave a short or torn file, and the check value catches it.
 
-The disk copy is bounded by the memory cache's `max_bytes`, 128 MiB by default.
+The disk copy is bounded by the memory cache's size, `[limits.cache_bytes] max`, 128 MiB by default.
 A write that would pass the bound is skipped and logged once per generation at info.
 A write failure is logged once per episode with the path and the error, and the entry is dropped without a retry.
 A failed write never fails a request, because no request waits for one.
@@ -676,7 +676,7 @@ m6-http answers it with a cap on counted streams, a decay window that holds a ca
 *Table 8: the four constants that bound a Rapid Reset flood, all in `m6-http/src/http2.rs`. Take from it that a peer may have at most `MAX_CONCURRENT` streams counted at once whether it finishes them or cancels them, and that a peer that ignores `MAX_REFUSED_STREAK` refusals loses the connection.*
 
 The cap counts started streams, because `active_streams` adds the live `streams` map to the client-initiated ids in `recently_reset` that are younger than `RESET_DECAY`.
-`note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY`.
+`note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY` (128, a constant on purpose: it must stay above the concurrency cap, so it has no config key).
 `active_streams` counts only the client-initiated odd ids in that record.
 The decay window in Table 8 is what makes the cap count cancelled streams, as `active_streams` does.
 `resetting_streams_does_not_free_concurrency_slots` opens `MAX_CONCURRENT` streams, cancels each one, and checks that the count stays at `MAX_CONCURRENT` and that stream `1 + MAX_CONCURRENT * 2` is refused.

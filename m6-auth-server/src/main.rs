@@ -47,10 +47,6 @@ const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
-/// Slots and buffers made at start, before any connection exists.
-const INITIAL_CONNECTIONS: usize = 1024;
-const READ_CAP: usize = 16 * 1024;
-const WRITE_CAP: usize = 64 * 1024;
 /// How soon the loop tries a request whose handler met a database lock. A
 /// retry costs little and the lock usually clears in milliseconds, so the
 /// waiting client barely notices while the loop serves the other connections
@@ -174,7 +170,11 @@ fn main() -> Result<()> {
     }
     // A table larger than the descriptors the limit allows could never report
     // itself full: `Slots::is_full` would stay false past the kernel's limit.
-    let initial = INITIAL_CONNECTIONS.min(ceiling);
+    // The connection table follows the `connections` limit, and the open-file
+    // limit can lower its maximum.
+    let table = site.limits().get(&m6_core::limits::CONNECTIONS);
+    let ceiling = ceiling.min(table.max());
+    let initial = table.start().min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
@@ -191,7 +191,11 @@ fn main() -> Result<()> {
 
     // The whole connection table, every buffer in it, the deadlines and the
     // events: made here, never grown except by `Slots`.
-    let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
+    let read_limit = site.limits().get(&m6_core::limits::REQUEST_BODY).clone();
+    let write_limit = site.limits().get(&m6_core::limits::RESPONSE_BUFFER).clone();
+    let mut conns = Slots::new(initial, ceiling, move || {
+        ServerConn::with_limits(&read_limit, &write_limit)
+    });
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));

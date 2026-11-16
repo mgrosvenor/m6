@@ -43,11 +43,6 @@ use crate::tunnel::{self, TunnelReading};
 /// tokens below it, far above any table the open-file limit allows.
 pub const CLIENT_BASE: usize = 1 << 20;
 
-/// The read buffer each node's slot starts with. A larger answer grows it once
-/// and the capacity stays for every later poll.
-const READ_CAP: usize = 256 * 1024;
-const WRITE_CAP: usize = 4 * 1024;
-
 /// The lookup slots in the outgoing table. A poll due more addresses than this
 /// starts them as the earlier ones finish.
 const DNS_SLOTS: usize = crate::check::MAX_LOOKUPS_PER_POLL;
@@ -265,6 +260,10 @@ pub struct Setup {
     pub wg_max_age_s: u64,
     /// The most lookups one poll makes. `--check` passes the wider cap.
     pub lookup_cap: usize,
+    /// The `upstream_read` limit each node's request slot follows.
+    pub upstream_read: m6_core::limits::Limit,
+    /// The `upstream_request` limit each node's request slot follows.
+    pub upstream_request: m6_core::limits::Limit,
 }
 
 /// Every node's own view, driven by a service's loop.
@@ -280,6 +279,8 @@ pub struct Poller {
     nameserver: SocketAddr,
     wg_file: Option<String>,
     wg_max_age_s: u64,
+    upstream_read: m6_core::limits::Limit,
+    upstream_request: m6_core::limits::Limit,
     running: Running,
     last_start: Option<Instant>,
     /// The deadlines for the outgoing slots, indexed by their table position.
@@ -308,6 +309,8 @@ impl Poller {
             wg_file,
             wg_max_age_s,
             lookup_cap,
+            upstream_read,
+            upstream_request,
         } = setup;
         let readings = nodes
             .iter()
@@ -356,6 +359,8 @@ impl Poller {
             nameserver,
             wg_file,
             wg_max_age_s,
+            upstream_read,
+            upstream_request,
             running,
             last_start: None,
             out_timeouts: Timeouts::new(slots, timeout),
@@ -393,7 +398,7 @@ impl Poller {
             out.push(Out::Node {
                 node: i,
                 step: Step::Done,
-                up: Upstream::new(READ_CAP, WRITE_CAP),
+                up: Upstream::with_limits(&self.upstream_read, &self.upstream_request),
                 fd: None,
             });
         }
@@ -1239,6 +1244,8 @@ pub fn one_shot_poller(
         wg_file: fleet.wg_handshakes_file.clone(),
         wg_max_age_s: fleet.tunnel_handshake_max_age_s,
         lookup_cap,
+        upstream_read: m6_core::limits::Limit::builtin(&m6_core::limits::UPSTREAM_READ),
+        upstream_request: m6_core::limits::Limit::builtin(&m6_core::limits::UPSTREAM_REQUEST),
     }))
 }
 

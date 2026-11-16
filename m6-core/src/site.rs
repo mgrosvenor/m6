@@ -364,6 +364,13 @@ impl Site {
         // sink without flushing it, and m6-log would record the already
         // nonblocking stdout as its own.
         if mode == StartMode::Service {
+            let buffer = config.limits.get(&crate::limits::LOG_BUFFER);
+            crate::log::set_limits(crate::log::LogLimits {
+                buffer_start: buffer.start(),
+                buffer_max: buffer.max(),
+                field_max: config.limits.get(&crate::limits::LOG_FIELD).max(),
+                file: config_path.display().to_string(),
+            });
             crate::log::init(level, None).map_err(|e| (format!("logging init error: {e}"), 1))?;
         }
 
@@ -456,6 +463,11 @@ impl Site {
 
     pub fn site_toml(&self) -> &Path {
         &self.site_toml
+    }
+
+    /// The named limits from this service's `[limits]` table.
+    pub fn limits(&self) -> &crate::limits::Limits {
+        &self.state.config.limits
     }
 
     /// The service's name, for the lifecycle lines and the startup log.
@@ -732,7 +744,15 @@ impl Site {
                         crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
                     let mime = content_type.split(';').next().unwrap_or("").trim();
                     let minification = &self.state.config.minification;
-                    if let Some(m) = minified(mime, bytes, minification) {
+                    let limit = self.state.config.limits.get(&crate::limits::MINIFY_OUTPUT);
+                    if minification.is_enabled(mime) && bytes.len() > limit.max() {
+                        // Past the maximum the response is refused, not
+                        // served unminified.
+                        let refusal =
+                            limit.exceeded(bytes.len(), &format!("response {}", raw.path()));
+                        error!("{}: {refusal}", self.name);
+                        resp = Response::status(500);
+                    } else if let Some(m) = minified(mime, bytes, minification) {
                         resp.body = crate::response::Body::Bytes(m);
                     }
                 }
@@ -744,7 +764,23 @@ impl Site {
             let content_type = crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
             let mime = content_type.split(';').next().unwrap_or("").trim();
             let compression = &self.state.config.compression;
-            if let Some(level) = compression.get(mime) {
+            let limit = self
+                .state
+                .config
+                .limits
+                .get(&crate::limits::COMPRESS_OUTPUT);
+            let oversized = resp
+                .body
+                .as_bytes()
+                .map(<[u8]>::len)
+                .filter(|len| *len > limit.max());
+            if let (Some(len), true) = (oversized, compression.contains_key(mime)) {
+                // Past the maximum the response is refused, not served
+                // uncompressed.
+                let refusal = limit.exceeded(len, &format!("response {}", raw.path()));
+                error!("{}: {refusal}", self.name);
+                resp = Response::status(500);
+            } else if let Some(level) = compression.get(mime) {
                 // Ask the client what it will accept, rather than testing
                 // whether a coding name appears anywhere in the header. A
                 // fixed two-slot array, because there are exactly two codings
@@ -2769,6 +2805,30 @@ mod tests {
         assert_eq!(get_big(&site).status, 500);
         assert_eq!(site.state.page_area.borrow().capacity(), 64 * 1024);
         assert!(site.state.page_area.borrow().overflow().is_some());
+    }
+
+    /// A page past the `minify_output` or `compress_output` maximum is refused
+    /// with a 500, not served unminified or uncompressed.
+    #[test]
+    fn a_page_past_the_minify_or_compress_maximum_is_refused() {
+        let render = "[limits.render_page]\nstart = \"16KiB\"\nmax = \"1MiB\"\n";
+        let config = format!(
+            "{BIG_ROUTE}{render}[limits.minify_output]\nstart = \"16KiB\"\nmax = \"64KiB\"\n"
+        );
+        let (site, _dir) = site_from(&config, &[]);
+        assert_eq!(get_big(&site).status, 500);
+
+        let config = format!(
+            "{BIG_ROUTE}{render}[limits.compress_output]\nstart = \"16KiB\"\nmax = \"64KiB\"\n\
+             [minification]\n\"text/html\" = false\n"
+        );
+        let (site, _dir) = site_from(&config, &[]);
+        assert_eq!(get_big(&site).status, 500);
+
+        // Within both maxima the same page is served.
+        let config = format!("{BIG_ROUTE}{render}");
+        let (site, _dir) = site_from(&config, &[]);
+        assert_eq!(get_big(&site).status, 200);
     }
 
     #[test]

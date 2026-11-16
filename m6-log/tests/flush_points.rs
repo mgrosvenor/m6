@@ -4,7 +4,7 @@
 use std::fs;
 use std::time::SystemTime;
 
-use m6_log::{with_analytics, Level, Line, Sink, BUFFER_BYTES, MAX_FIELD};
+use m6_log::{with_analytics, Level, Line, Sink, BUFFER_BYTES, BUFFER_MAX_BYTES, FIELD_MAX_BYTES};
 
 const LINES: u64 = 200;
 const TAIL: u64 = 10;
@@ -77,15 +77,15 @@ fn complete_lines(path: &std::path::Path) -> u64 {
     }
 }
 
-/// The worst line the known per-request shape can build: every string field at
-/// the cap, holding the byte that escapes to six bytes (0x01). The documented
-/// invariant says a line always fits, so this one must be written whole.
+/// The widest line the known per-request shape can build: every string field
+/// at the cap. It is larger than the buffer's start, so the buffer grows to
+/// take it, and the line is written whole.
 #[test]
 fn a_line_of_maximum_fields_fits_the_buffer() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("widest.jsonl");
     let mut sink = Sink::file(&path).expect("the line file");
-    let worst = "\u{1}".repeat(MAX_FIELD);
+    let worst = "x".repeat(FIELD_MAX_BYTES);
     let keys = [
         "node",
         "path",
@@ -114,18 +114,14 @@ fn a_line_of_maximum_fields_fits_the_buffer() {
         "the widest line was not written whole"
     );
     assert!(
-        text.len() <= BUFFER_BYTES,
-        "the widest line is {} bytes, over the {BUFFER_BYTES}-byte buffer",
+        text.len() > BUFFER_BYTES && text.len() <= BUFFER_MAX_BYTES,
+        "the widest line is {} bytes, not between the start and the maximum",
         text.len()
     );
+    assert!(sink.buffer_size() > BUFFER_BYTES, "the buffer did not grow");
     let value: serde_json::Value = serde_json::from_str(text.trim()).expect("valid JSON");
     for key in keys {
         let field = value["fields"][key].as_str().expect("a string field");
-        assert!(field.ends_with("..."), "{key} was not cut with the marker");
-        assert!(
-            field.len() <= MAX_FIELD,
-            "{key} is {} bytes, over MAX_FIELD",
-            field.len()
-        );
+        assert_eq!(field.len(), FIELD_MAX_BYTES, "{key} was cut");
     }
 }

@@ -43,10 +43,6 @@ const LOG: Token = Token(usize::MAX - 2);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
-/// Slots and buffers made at start, before any connection exists.
-const INITIAL_CONNECTIONS: usize = 1024;
-const READ_CAP: usize = 16 * 1024;
-const WRITE_CAP: usize = 64 * 1024;
 
 /// The handler this service registers, by the name config routes with
 /// `handler = "files"`.
@@ -88,6 +84,7 @@ fn main() -> Result<()> {
     }
 
     let read_timeout = site.read_timeout();
+    handler::set_tail_limit(site.limits().get(&m6_core::limits::TAIL_READ));
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is
     // being written, so the table takes half of what the limit leaves: one
@@ -101,7 +98,11 @@ fn main() -> Result<()> {
             "leaves no connection table and no room for a streamed file",
         );
     }
-    let initial = INITIAL_CONNECTIONS.min(ceiling);
+    // The connection table follows the `connections` limit, and the open-file
+    // limit can lower its maximum.
+    let table = site.limits().get(&m6_core::limits::CONNECTIONS);
+    let ceiling = ceiling.min(table.max());
+    let initial = table.start().min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
@@ -118,7 +119,11 @@ fn main() -> Result<()> {
 
     // The whole connection table, every buffer in it, the deadlines and the
     // events: made here, never grown except by `Slots`.
-    let mut conns = Slots::new(initial, ceiling, || ServerConn::new(READ_CAP, WRITE_CAP));
+    let read_limit = site.limits().get(&m6_core::limits::REQUEST_BODY).clone();
+    let write_limit = site.limits().get(&m6_core::limits::RESPONSE_BUFFER).clone();
+    let mut conns = Slots::new(initial, ceiling, move || {
+        ServerConn::with_limits(&read_limit, &write_limit)
+    });
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));

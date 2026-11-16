@@ -17,8 +17,8 @@ use crate::h1::HeadError;
 use crate::headers::MAX_REQUEST_HEAD;
 use crate::http::RawRequest;
 
-/// Maximum body size (16 MB).
-pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// The default `request_body` maximum, 16 MiB.
+pub(crate) const MAX_BODY_BYTES: usize = crate::limits::REQUEST_BODY.max;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
