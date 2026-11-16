@@ -241,6 +241,28 @@ jobs:
             fi
           done
 
+      # Broken intra-doc links are rustdoc warnings, and the zero-warnings rule
+      # counts pre-existing warnings, so this step holds them at zero. Nothing
+      # ran it until 2026-11-17: a worker ran `cargo doc` by hand on an
+      # unrelated task and found twelve broken links across ten files, because
+      # neither the gate nor this file named the command.
+      #
+      # A step in this job and not a job of its own: `cargo doc` reads the same
+      # source and reuses the same rust-cache as the steps beside it, so the
+      # price of a separate runner is a cold rebuild of every dependency for one
+      # command.
+      #
+      # `--all-features` because `testkit`, m6-core's `sqlite`, `email` and
+      # `multipart` and m6-http's allocation counters are off by default, so the
+      # first line does not compile their docs. Three of the twelve links were
+      # behind those features, which is the same gap the "Opt-in core features"
+      # step above exists for.
+      - name: Rustdoc, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
   # The same build and tests on the other two supported targets. Supported
   # means built and tested here: macOS arm64 and Linux arm64, on GitHub's
   # free runners for a public repository. The steps are the ones above, in
@@ -338,6 +360,28 @@ jobs:
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: ./tools/clippy.sh
 
+      # Broken intra-doc links are rustdoc warnings, and the zero-warnings rule
+      # counts pre-existing warnings, so this step holds them at zero. Nothing
+      # ran it until 2026-11-17: a worker ran `cargo doc` by hand on an
+      # unrelated task and found twelve broken links across ten files, because
+      # neither the gate nor this file named the command.
+      #
+      # A step in this job and not a job of its own: `cargo doc` reads the same
+      # source and reuses the same rust-cache as the steps beside it, so the
+      # price of a separate runner is a cold rebuild of every dependency for one
+      # command.
+      #
+      # `--all-features` because `testkit`, m6-core's `sqlite`, `email` and
+      # `multipart` and m6-http's allocation counters are off by default, so the
+      # first line does not compile their docs. Three of the twelve links were
+      # behind those features, which is the same gap the "Opt-in core features"
+      # step above exists for.
+      - name: Rustdoc, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
   build-and-test-linux-arm64:
     name: Linux arm64 build and tests
     runs-on: ubuntu-24.04-arm
@@ -425,6 +469,28 @@ jobs:
       - name: Clippy, silent
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: ./tools/clippy.sh
+
+      # Broken intra-doc links are rustdoc warnings, and the zero-warnings rule
+      # counts pre-existing warnings, so this step holds them at zero. Nothing
+      # ran it until 2026-11-17: a worker ran `cargo doc` by hand on an
+      # unrelated task and found twelve broken links across ten files, because
+      # neither the gate nor this file named the command.
+      #
+      # A step in this job and not a job of its own: `cargo doc` reads the same
+      # source and reuses the same rust-cache as the steps beside it, so the
+      # price of a separate runner is a cold rebuild of every dependency for one
+      # command.
+      #
+      # `--all-features` because `testkit`, m6-core's `sqlite`, `email` and
+      # `multipart` and m6-http's allocation counters are off by default, so the
+      # first line does not compile their docs. Three of the twelve links were
+      # behind those features, which is the same gap the "Opt-in core features"
+      # step above exists for.
+      - name: Rustdoc, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
   conformance:
     name: h1, h2, h3 conformance

@@ -290,6 +290,17 @@ echo "### clippy"
 echo "CLIPPY_STATUS=$?"
 tail -5 $T/clippy.out
 
+echo "### rustdoc"
+# Broken intra-doc links are rustdoc warnings, and the zero-warnings rule counts
+# pre-existing warnings. `--all-features` as well, because `testkit` and the
+# opt-in core features are off by default and nothing else builds their docs.
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps > $T/rustdoc.out 2>&1
+echo "RUSTDOC_STATUS=$?"
+tail -5 $T/rustdoc.out
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features > $T/rustdoc-all.out 2>&1
+echo "RUSTDOC_ALL_STATUS=$?"
+tail -5 $T/rustdoc-all.out
+
 echo "### cargo-deny"
 # It used to run only in GitHub Actions, and that cost four hours once: a git
 # source changed, deny.toml was not updated to allow it, CI went red on every
@@ -590,6 +601,8 @@ FAILED=$COPY_BACK_FAILED
 rw=$(num_after RELEASE_WARNINGS "$LOG");  rw="${rw:-?}"
 tw=$(num_after TESTBUILD_WARNINGS "$LOG"); tw="${tw:-?}"
 cl=$(num_after CLIPPY_STATUS "$LOG");      cl="${cl:-?}"
+rd=$(num_after RUSTDOC_STATUS "$LOG");     rd="${rd:-?}"
+ra=$(num_after RUSTDOC_ALL_STATUS "$LOG"); ra="${ra:-?}"
 dn=$(num_after DENY_STATUS "$LOG");        dn="${dn:-?}"
 cf=$(num_after CONFORMANCE_STATUS "$LOG"); cf="${cf:-?}"
 read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}' "$LOG")
@@ -598,6 +611,10 @@ read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}
 [[ "$tw" == "0" ]] || { echo "${RED}   $tw test-build warning(s) on Linux${RESET}" >&2; FAILED=1; }
 [[ "$cl" == "0" ]] || { echo "${RED}   clippy is not silent on Linux${RESET}" >&2
                         grep -A6 '^### clippy' "$LOG" >&2; FAILED=1; }
+[[ "$rd" == "0" ]] || { echo "${RED}   rustdoc: a broken intra-doc link (default features)${RESET}" >&2
+                        sed -n '/^### rustdoc/,/^### cargo-deny/p' "$LOG" >&2; FAILED=1; }
+[[ "$ra" == "0" ]] || { echo "${RED}   rustdoc: a broken intra-doc link (--all-features)${RESET}" >&2
+                        sed -n '/^### rustdoc/,/^### cargo-deny/p' "$LOG" >&2; FAILED=1; }
 [[ "$dn" == "0" ]] || { echo "${RED}   cargo-deny failed (advisories/licences/sources)${RESET}" >&2
                         sed -n '/^### cargo-deny/,/^### backend runtimes/p' "$LOG" >&2; FAILED=1; }
 missing=$(sed -n 's/^BACKEND_RUNTIMES_MISSING=//p' "$LOG" | tail -1)
@@ -615,7 +632,7 @@ pf=$(num_after PERF_STATUS "$LOG"); pf="${pf:-?}"
     sed -n '/^### failure detail/,$p' "$LOG" >&2; FAILED=1; }
 
 if [[ $FAILED -eq 0 ]]; then
-    ok "m6: $passed passed, 0 failed, 0 warnings (release + test), clippy silent, cargo-deny ok, h1+h2+h3 ok, performance ok"
+    ok "m6: $passed passed, 0 failed, 0 warnings (release + test), clippy silent, rustdoc silent, cargo-deny ok, h1+h2+h3 ok, performance ok"
 else
     echo
     echo "${RED}m6's own checks FAILED on $BUILD_HOST. Full log: $LOG${RESET}" >&2
