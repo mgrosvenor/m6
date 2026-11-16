@@ -51,13 +51,13 @@ impl std::fmt::Display for RenderError {
 /// file I/O and compression. The page is written into `out`, the service's one
 /// reusable page area, which the caller empties before the call. A renderer
 /// that finds `out` full past its maximum stops and returns
-/// [`RenderError::TooLarge`] with [`BoundedBuf::overflow`].
+/// [`RenderError::TooLarge`] with [`crate::limits::Bounded::overflow`].
 pub trait Renderer: Send + Sync + 'static {
     fn render(
         &self,
         template: &str,
         ctx: &crate::dict::Dict,
-        out: &mut crate::limits::BoundedBuf,
+        out: &mut crate::limits::Bounded<u8>,
     ) -> Result<(), RenderError>;
 }
 
@@ -88,7 +88,7 @@ impl Renderer for NoTemplates {
         &self,
         template: &str,
         _ctx: &crate::dict::Dict,
-        _out: &mut crate::limits::BoundedBuf,
+        _out: &mut crate::limits::Bounded<u8>,
     ) -> Result<(), RenderError> {
         Err(RenderError::Failed(anyhow::anyhow!(
             "route asked for template `{template}`, but this binary links no template engine"

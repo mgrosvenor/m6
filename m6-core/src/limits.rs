@@ -24,14 +24,15 @@
 //! A configured value of another size is rounded up with one warning, and a
 //! value that cannot work refuses to start.
 //!
-//! This is a type, not an allocator: a [`BoundedBuf`] owns one `Vec<u8>`.
+//! This is a type, not an allocator: one [`Bounded`] owns one `Vec` and is both
+//! a page area and a queue.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
 
-use crate::log::info;
+use crate::log::warn;
 
 /// What a limit counts, which decides how its values are rounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +132,10 @@ pub const H2_RECV: LimitSpec = bytes("h2_recv", 16 * KIB, 4 * MIB);
 pub const H2_HEADER_BLOCK: LimitSpec = bytes("h2_header_block", 16 * KIB, 256 * KIB);
 /// The body of one HTTP/2 request stream.
 pub const H2_STREAM_BODY: LimitSpec = bytes("h2_stream_body", 4 * KIB, 32 * MIB);
+/// One HTTP/2 connection's unsent response bytes. The flusher stops framing at
+/// `start` and `max` is the hard ceiling that pacing keeps it below, so a
+/// response is never cut.
+pub const H2_SEND: LimitSpec = bytes("h2_send", 16 * KIB, MIB);
 /// Entries in one request's dictionary overlay: the query, form fields,
 /// path parameters, cookies and built-ins. A request that needs more is
 /// refused with a 400.
@@ -165,6 +170,7 @@ pub const KNOWN: &[LimitSpec] = &[
     H2_RECV,
     H2_HEADER_BLOCK,
     H2_STREAM_BODY,
+    H2_SEND,
     REFRESH_QUEUE,
     REQUEST_DICT,
     RATE_LIMIT_ADDRESSES,
@@ -224,13 +230,33 @@ impl Limit {
         Some(size.min(ceiling))
     }
 
-    /// Log the one line a growth to `size` owes.
-    pub fn log_growth(&self, size: usize) {
-        info!(
+    /// Log the one line a growth from `from` to `to` owes, for `what`.
+    ///
+    /// The line names the page, request or job, the old and new sizes, the
+    /// maximum and the exact key and file to raise, so an operator can see a
+    /// growth and raise `start` until it stops.
+    pub fn log_growth(&self, from: usize, to: usize, what: &str) {
+        if to <= from {
+            return;
+        }
+        let max = SizeText(self, self.max);
+        let file = FileText(&self.file);
+        warn!(
             limit = self.name,
-            "limit {} grew to {}",
+            from = %SizeText(self, from),
+            to = %SizeText(self, to),
+            what = %what,
+            max = %max,
+            key = %KeyText(self.name),
+            file = %file,
+            "limit {} grew from {} to {} for {} (max {}, {} in {})",
             self.name,
-            self.text(size)
+            SizeText(self, from),
+            SizeText(self, to),
+            what,
+            max,
+            KeyText(self.name),
+            file
         );
     }
 
@@ -292,6 +318,43 @@ impl std::fmt::Display for LimitExceeded {
 }
 
 impl std::error::Error for LimitExceeded {}
+
+/// A size in a limit's unit, formatted straight into a log line.
+struct SizeText<'a>(&'a Limit, usize);
+
+impl std::fmt::Display for SizeText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.unit {
+            Unit::Count => write!(f, "{}", self.1),
+            _ => {
+                let (n, unit) = split_unit(self.1);
+                write!(f, "{n} {unit}")
+            }
+        }
+    }
+}
+
+/// `[limits.<name>]`, the config key a message names.
+struct KeyText<'a>(&'a str);
+
+impl std::fmt::Display for KeyText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[limits.{}]", self.0)
+    }
+}
+
+/// A limit's config file, or the phrase a limit built in code gets.
+struct FileText<'a>(&'a Path);
+
+impl std::fmt::Display for FileText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.as_os_str().is_empty() {
+            f.write_str("the config file")
+        } else {
+            write!(f, "{}", self.0.display())
+        }
+    }
+}
 
 /// The `[limits]` table of a config file, after rounding and checks.
 #[derive(Debug, Clone)]
@@ -515,30 +578,39 @@ fn split_unit(bytes: usize) -> (usize, &'static str) {
     }
 }
 
-/// An owned byte area that follows a [`Limit`].
+/// One owned container that follows a [`Limit`]: a page area
+/// (`Bounded<u8>`) or a queue (`Bounded<Refresh>`, `Bounded<Batch>`).
 ///
-/// Made at the limit's `start`. A write that does not fit grows it by
-/// doubling, clamped at `max`, and keeps the new size. A write that needs more
-/// than `max` fails with an `io::Error` and leaves the size needed in
-/// [`BoundedBuf::overflow`], so the caller can build the refusal with
-/// [`Limit::exceeded`] and the name of what it was writing.
+/// Made at the limit's `start`. A write or a push that does not fit grows it
+/// by doubling, clamped at `max`, and keeps the new size. A write that needs
+/// more than `max` fails and leaves the size needed in [`Bounded::overflow`],
+/// so the caller can build the refusal with [`Limit::exceeded`] and the name of
+/// what it was writing. A queue push past `max` hands the item back with that
+/// error. A byte area reads from index 0; a queue reads from `head`.
 #[derive(Debug)]
-pub struct BoundedBuf {
+pub struct Bounded<T> {
     limit: Limit,
-    bytes: Vec<u8>,
-    /// The size the area has grown to. The `Vec` holds at least this much.
-    size: usize,
+    items: Vec<T>,
+    /// The FIFO read index. Always 0 for a byte area.
+    head: usize,
+    /// The logical capacity, never shrunk.
+    cap: usize,
+    /// The size the last refused write or push needed.
     overflow: Option<usize>,
+    /// The page, request or job the growth line names.
+    what: String,
 }
 
-impl BoundedBuf {
-    /// Allocate the area at the limit's `start`. Start only.
+impl<T> Bounded<T> {
+    /// Allocate the container at the limit's `start`. Start only.
     pub fn new(limit: &Limit) -> Self {
         Self {
             limit: limit.clone(),
-            bytes: Vec::with_capacity(limit.start),
-            size: limit.start,
+            items: Vec::with_capacity(limit.start()),
+            head: 0,
+            cap: limit.start(),
             overflow: None,
+            what: String::new(),
         }
     }
 
@@ -546,139 +618,169 @@ impl BoundedBuf {
         &self.limit
     }
 
-    /// The bytes written since the last [`BoundedBuf::clear`].
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+    /// Name the page or request the next growth line is about.
+    pub fn set_what(&mut self, what: &str) {
+        self.what.clear();
+        self.what.push_str(what);
     }
 
-    /// The size the area has grown to, in bytes.
+    /// As [`Bounded::set_what`], with a prefix built separately so a caller
+    /// that runs per request does not make a `String` to throw away.
+    pub fn set_what_parts(&mut self, prefix: &str, what: &str) {
+        self.what.clear();
+        self.what.push_str(prefix);
+        self.what.push_str(what);
+    }
+
+    /// The bytes or entries held.
+    pub fn len(&self) -> usize {
+        self.items.len() - self.head
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The size the container has grown to, in bytes or entries.
     pub fn capacity(&self) -> usize {
-        self.size
+        self.cap
     }
 
-    /// Empty the area for the next use. The capacity stays.
-    pub fn clear(&mut self) {
-        self.bytes.clear();
-        self.overflow = None;
-    }
-
-    /// The size the last refused write needed, if one was refused since
-    /// [`BoundedBuf::clear`].
+    /// The size the last refused write or push needed, if one was refused
+    /// since [`Bounded::clear`].
     pub fn overflow(&self) -> Option<usize> {
         self.overflow
     }
 
-    /// Make room for `needed` bytes in all, or record the refusal.
+    /// Empty the container for the next use. The capacity stays.
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.head = 0;
+        self.overflow = None;
+    }
+
+    /// Drop the first `n` items or bytes and keep the capacity. The byte path's
+    /// send buffer uses this after a partial write.
+    pub fn drain_front(&mut self, n: usize) {
+        let n = n.min(self.items.len());
+        self.items.drain(..n);
+        self.head = 0;
+    }
+
+    /// Make room for `needed` bytes or entries in all, or record the refusal.
+    /// The one place that doubles, clamps at `max`, records `overflow` and
+    /// logs.
     fn reserve_total(&mut self, needed: usize) -> bool {
-        if needed <= self.size {
+        if needed <= self.cap {
             return true;
         }
         if needed > self.limit.max {
             self.overflow = Some(needed);
             return false;
         }
-        let Some(size) = self.limit.grown(self.size, needed) else {
+        let Some(cap) = self.limit.grown(self.cap, needed) else {
             self.overflow = Some(needed);
             return false;
         };
-        self.bytes.reserve_exact(size - self.bytes.len());
-        self.size = size;
-        self.limit.log_growth(size);
+        let from = self.cap;
+        let extra = cap.saturating_sub(self.items.len());
+        self.items.reserve_exact(extra);
+        self.cap = cap;
+        self.limit.log_growth(from, cap, &self.what);
         true
     }
-}
 
-impl io::Write for BoundedBuf {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let needed = self.bytes.len().saturating_add(buf.len());
-        if !self.reserve_total(needed) {
-            return Err(io::Error::other(format!(
-                "limit {} is full at {}",
-                self.limit.name,
-                size_text(self.limit.max)
-            )));
-        }
-        self.bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// A first-in first-out queue that follows a [`Limit`] counted in entries.
-///
-/// Made at the limit's `start`. It grows by doubling when full, clamped at
-/// `max`, keeps its size, and a [`BoundedQueue::push_back`] past `max` is
-/// refused with the error and the item handed back, never dropped silently.
-#[derive(Debug)]
-pub struct BoundedQueue<T> {
-    limit: Limit,
-    items: std::collections::VecDeque<T>,
-    /// The entries the queue has grown to hold.
-    size: usize,
-}
-
-impl<T> BoundedQueue<T> {
-    /// Allocate room for the limit's `start` entries. Start only.
-    pub fn new(limit: &Limit) -> Self {
-        Self {
-            limit: limit.clone(),
-            items: std::collections::VecDeque::with_capacity(limit.start()),
-            size: limit.start(),
-        }
-    }
-
-    pub fn limit(&self) -> &Limit {
-        &self.limit
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// The entries the queue has grown to hold.
-    pub fn capacity(&self) -> usize {
-        self.size
-    }
-
+    /// The oldest item without removing it.
     pub fn front(&self) -> Option<&T> {
-        self.items.front()
+        self.items.get(self.head)
     }
 
+    /// Remove and return the oldest item.
     pub fn pop_front(&mut self) -> Option<T> {
-        self.items.pop_front()
-    }
-
-    pub fn clear(&mut self) {
-        self.items.clear();
+        if self.head >= self.items.len() {
+            return None;
+        }
+        Some(self.items.remove(self.head))
     }
 
     pub fn contains(&self, item: &T) -> bool
     where
         T: PartialEq,
     {
-        self.items.contains(item)
+        self.items[self.head..].contains(item)
     }
 
     /// Add `item` at the back. Past the maximum the queue is unchanged and the
     /// item is returned beside the error, naming `what` was refused.
     pub fn push_back(&mut self, item: T, what: &str) -> Result<(), (T, LimitExceeded)> {
-        let needed = self.items.len() + 1;
-        let Some(size) = self.limit.grown(self.size, needed) else {
-            return Err((item, self.limit.exceeded(needed, what)));
-        };
-        if size > self.size {
-            self.items.reserve_exact(size - self.items.len());
-            self.size = size;
-            self.limit.log_growth(size);
+        let needed = self.len() + 1;
+        if needed > self.cap {
+            // Only a growth line needs the name, so a push that fits copies
+            // nothing.
+            self.set_what(what);
         }
-        self.items.push_back(item);
+        if self.head > 0 {
+            self.items.drain(..self.head);
+            self.head = 0;
+        }
+        if !self.reserve_total(needed) {
+            return Err((item, self.limit.exceeded(needed, what)));
+        }
+        self.items.push(item);
+        Ok(())
+    }
+}
+
+impl<T> std::ops::Deref for Bounded<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.items[self.head..]
+    }
+}
+
+impl<T> std::ops::DerefMut for Bounded<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.items[self.head..]
+    }
+}
+
+impl Bounded<u8> {
+    /// The bytes written since the last [`Bounded::clear`].
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.items[self.head..]
+    }
+
+    /// The written bytes, for a writer that fills them in place.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.items[self.head..]
+    }
+
+    /// Append `bytes`. Returns false, having recorded the size needed, when
+    /// they do not fit below the limit's `max`.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> bool {
+        if !self.reserve_total(self.len() + bytes.len()) {
+            return false;
+        }
+        self.items.extend_from_slice(bytes);
+        true
+    }
+}
+
+impl io::Write for Bounded<u8> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.extend_from_slice(buf) {
+            Ok(buf.len())
+        } else {
+            Err(io::Error::other(format!(
+                "limit {} is full at {}",
+                self.limit.name,
+                size_text(self.limit.max)
+            )))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -798,9 +900,9 @@ mod tests {
         }
     }
 
-    fn buf(start: usize, max: usize) -> BoundedBuf {
+    fn buf(start: usize, max: usize) -> Bounded<u8> {
         let body = format!("[limits.render_page]\nstart = {start}\nmax = {max}\n");
-        BoundedBuf::new(&render_page(&parse(&body, 4096).unwrap()))
+        Bounded::new(&render_page(&parse(&body, 4096).unwrap()))
     }
 
     #[test]
@@ -907,7 +1009,7 @@ mod tests {
     #[test]
     fn a_queue_grows_keeps_its_size_and_refuses_past_max() {
         let limit = Limit::custom(&REFRESH_QUEUE, 2, 4);
-        let mut q = BoundedQueue::new(&limit);
+        let mut q = Bounded::new(&limit);
         assert_eq!(q.capacity(), 2);
         q.push_back(1, "an item").unwrap();
         q.push_back(2, "an item").unwrap();
@@ -922,7 +1024,35 @@ mod tests {
             "a background refresh needs at least 5, over [limits.refresh_queue] max = 4 in the config file; raise max to fix this"
         );
         assert_eq!(q.len(), 4);
+        assert_eq!(q.overflow(), Some(5), "the refused size is kept");
         q.clear();
         assert_eq!(q.capacity(), 4, "the queue never shrinks");
+        assert_eq!(q.overflow(), None);
+    }
+
+    /// The collapse: one `Bounded<T>` is a byte area and a queue. If a second
+    /// container type comes back, the two `Bounded::<..>::new` calls stop
+    /// compiling against one generic function.
+    #[test]
+    fn one_type_is_both_a_byte_area_and_a_queue() {
+        fn capacity_of<T>(b: &Bounded<T>) -> usize {
+            b.capacity()
+        }
+
+        let mut bytes = Bounded::<u8>::new(&Limit::custom(&REQUEST_BODY, 4, 16));
+        bytes.set_what("a request body");
+        assert_eq!(capacity_of(&bytes), 4);
+        assert!(bytes.extend_from_slice(&[1, 2, 3, 4, 5]));
+        assert_eq!(bytes.as_bytes(), &[1, 2, 3, 4, 5]);
+        assert_eq!(capacity_of(&bytes), 8, "one byte past start doubles");
+
+        let mut queue = Bounded::<u32>::new(&Limit::custom(&REFRESH_QUEUE, 2, 4));
+        assert_eq!(capacity_of(&queue), 2);
+        queue.push_back(10, "an item").unwrap();
+        queue.push_back(11, "an item").unwrap();
+        queue.push_back(12, "an item").unwrap();
+        assert_eq!(capacity_of(&queue), 4, "one entry past start doubles");
+        assert_eq!(queue.pop_front(), Some(10));
+        assert_eq!(queue.len(), 2, "the pop is shared with the byte path");
     }
 }

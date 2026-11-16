@@ -7,7 +7,7 @@
 use std::sync::OnceLock;
 
 use m6_core::limits::{
-    Limit, Limits, CACHE_BYTES, EDGE_REQUEST, EDGE_RESPONSE, H2_HEADER_BLOCK, H2_RECV,
+    Limit, Limits, CACHE_BYTES, EDGE_REQUEST, EDGE_RESPONSE, H2_HEADER_BLOCK, H2_RECV, H2_SEND,
     H2_STREAM_BODY, RATE_LIMIT_ADDRESSES, REFRESH_QUEUE,
 };
 
@@ -24,6 +24,8 @@ pub struct EdgeLimits {
     pub h2_header_block: Limit,
     /// The body of one HTTP/2 request stream.
     pub h2_stream_body: Limit,
+    /// One HTTP/2 connection's unsent response bytes.
+    pub h2_send: Limit,
     /// Stale cache entries waiting to be fetched again.
     pub refresh_queue: Limit,
     /// Client addresses the request counter tracks.
@@ -40,6 +42,7 @@ impl EdgeLimits {
             h2_recv: limits.get(&H2_RECV).clone(),
             h2_header_block: limits.get(&H2_HEADER_BLOCK).clone(),
             h2_stream_body: limits.get(&H2_STREAM_BODY).clone(),
+            h2_send: limits.get(&H2_SEND).clone(),
             refresh_queue: limits.get(&REFRESH_QUEUE).clone(),
             rate_limit_addresses: limits.get(&RATE_LIMIT_ADDRESSES).clone(),
             cache_bytes: limits.get(&CACHE_BYTES).clone(),
@@ -62,8 +65,8 @@ pub fn edge() -> &'static EdgeLimits {
 /// Log the one line a `Vec` that grew from `before` to `after` bytes owes, when
 /// it did. A `Vec` doubles itself, so the line is written where the growth
 /// was seen.
-pub fn log_growth(limit: &Limit, before: usize, after: usize) {
+pub fn log_growth(limit: &Limit, before: usize, after: usize, what: &str) {
     if after > before {
-        limit.log_growth(after);
+        limit.log_growth(before, after, what);
     }
 }

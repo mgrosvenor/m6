@@ -431,7 +431,8 @@ impl Sink {
             }
             return false;
         }
-        let mut size = self.buf.len();
+        let from = self.buf.len();
+        let mut size = from;
         while size < needed {
             size = size.saturating_mul(2);
         }
@@ -439,7 +440,13 @@ impl Sink {
         self.buf.resize(size, 0);
         // Not through the log itself: the line would be written into the
         // buffer that is growing.
-        eprintln!("m6-log: limit log_buffer grew to {}", kib(size));
+        eprintln!(
+            "m6-log: limit log_buffer grew from {} to {} for a log line (max {}, [limits.log_buffer] in {})",
+            kib(from),
+            kib(size),
+            kib(max),
+            self.limits.file
+        );
         true
     }
 

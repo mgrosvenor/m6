@@ -812,8 +812,10 @@ impl Upstream {
         else {
             return false;
         };
+        let from = self.read_buf.len();
         self.read_buf.resize(new, 0);
-        self.read_limit.log_growth(new);
+        self.read_limit
+            .log_growth(from, new, "an upstream response");
         true
     }
 

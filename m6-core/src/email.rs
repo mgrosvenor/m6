@@ -562,8 +562,10 @@ impl Smtp {
                         .exceeded(self.in_buf.len() + 1, "the relay's reply");
                     return Err(self.error(&refusal.to_string()));
                 };
+                let from = self.in_buf.len();
                 self.in_buf.resize(grown, 0);
-                self.reply_limit.log_growth(grown);
+                self.reply_limit
+                    .log_growth(from, grown, "the relay's reply");
             }
             match stream.read(&mut self.in_buf[self.in_len..]) {
                 Ok(0) => {
@@ -602,8 +604,10 @@ impl Smtp {
                 .exceeded(self.in_buf.len() + 1, "the relay's reply");
             return Err(self.error(&refusal.to_string()));
         };
+        let from = self.in_buf.len();
         self.in_buf.resize(grown, 0);
-        self.reply_limit.log_growth(grown);
+        self.reply_limit
+            .log_growth(from, grown, "the relay's reply");
         Ok(())
     }
 

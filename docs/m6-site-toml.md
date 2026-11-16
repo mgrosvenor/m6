@@ -736,7 +736,7 @@ requests_per_min = 300
 m6-http sizes its buffers and queues from named limits, each with a `start` and a `max`.
 The table lives in the system config, because memory is a property of the node.
 A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
-The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer` and `log_field`.
+The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `h2_send`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer` and `log_field`.
 [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
 
 ```toml

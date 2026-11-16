@@ -768,7 +768,7 @@ impl crate::render::Renderer for TeraRenderer {
         &self,
         template: &str,
         ctx: &crate::dict::Dict,
-        out: &mut crate::limits::BoundedBuf,
+        out: &mut crate::limits::Bounded<u8>,
     ) -> std::result::Result<(), crate::render::RenderError> {
         let mut tctx = tera::Context::new();
         for (k, v) in ctx.iter() {

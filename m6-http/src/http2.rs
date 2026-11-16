@@ -74,11 +74,10 @@ const DEFAULT_WINDOW: u32 = 65_535;
 const DEFAULT_MAX_FRAME: u32 = 16_384;
 
 /// How many unsent bytes `flush_pending_streams` may leave in `send_buf`
-/// before it stops and waits for the next writable event. On Linux the kernel
-/// is asked to report writability at the same mark (TCP_NOTSENT_LOWAT), so the
-/// frames enter the socket in the order this connection chose and roughly one
-/// queue's worth at a time.
-pub const SEND_QUEUE_BYTES: usize = 16 * 1024;
+/// before it stops and waits for the next writable event: the `h2_send`
+/// limit's `start`. On Linux the kernel is asked to report writability at the
+/// same mark (TCP_NOTSENT_LOWAT), so the frames enter the socket in the order
+/// this connection chose and roughly one queue's worth at a time.
 const MAX_CONCURRENT: u32 = 100;
 
 /// How many retired streams one connection keeps for reuse. A connection only
@@ -535,7 +534,9 @@ enum Phase {
 pub struct Http2Conn {
     phase: Phase,
     recv_buf: Vec<u8>,
-    send_buf: Vec<u8>,
+    /// Unsent response bytes. `start` is the pacing mark and `max` the hard
+    /// ceiling the pacing keeps it below.
+    send_buf: m6_core::limits::Bounded<u8>,
     /// Decoded request fields, appended by `decode_hpack` as the HPACK
     /// callback hands over name and value bytes. Every `H2Field` in a stream
     /// is a range into this buffer. It is cleared only when no stream holds a
@@ -652,7 +653,11 @@ impl Http2Conn {
         Http2Conn {
             phase: Phase::Preface,
             recv_buf: Vec::with_capacity(crate::limits::edge().h2_recv.start()),
-            send_buf: Vec::with_capacity(16_384),
+            send_buf: {
+                let mut buf = m6_core::limits::Bounded::new(&crate::limits::edge().h2_send);
+                buf.set_what("an HTTP/2 response");
+                buf
+            },
             decode_buf: Vec::with_capacity(MAX_REQUEST_HEAD.min(16 * 1024)),
             hdr_scratch: Vec::with_capacity(8 * 1024),
             streams: BTreeMap::new(),
@@ -905,7 +910,7 @@ impl Http2Conn {
                                 break;
                             }
                             Err(e) => {
-                                self.send_buf.drain(..pos);
+                                self.send_buf.drain_front(pos);
                                 return Err(e);
                             }
                         }
@@ -919,7 +924,7 @@ impl Http2Conn {
                         break;
                     }
                 }
-                self.send_buf.drain(..pos);
+                self.send_buf.drain_front(pos);
 
                 // Final drain of any remaining encrypted records.
                 loop {
@@ -943,12 +948,12 @@ impl Http2Conn {
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            self.send_buf.drain(..pos);
+                            self.send_buf.drain_front(pos);
                             return Err(e);
                         }
                     }
                 }
-                self.send_buf.drain(..pos);
+                self.send_buf.drain_front(pos);
                 Ok(())
             }
         }
@@ -2043,7 +2048,12 @@ impl Http2Conn {
                 }
                 let before = s.body.capacity();
                 s.body.extend_from_slice(data);
-                crate::limits::log_growth(limit, before, s.body.capacity());
+                crate::limits::log_growth(
+                    limit,
+                    before,
+                    s.body.capacity(),
+                    "an HTTP/2 request body",
+                );
                 if flags & FLAG_END_STREAM != 0 {
                     s.state = StreamState::HalfClosedRemote;
                 }
@@ -2366,7 +2376,7 @@ impl Http2Conn {
     /// Frame DATA and write it, again and again, until the socket would block
     /// or nothing is left that the windows allow.
     ///
-    /// The send queue is bounded at [SEND_QUEUE_BYTES], so one pass frames one
+    /// The send queue is bounded at the `h2_send` limit's `start`, so one pass frames one
     /// queue's worth and a body of any length needs many. The loop is
     /// edge-triggered: a socket that took everything it was given reports no new
     /// writable edge, because it never stopped being writable, so a pass that
@@ -2387,7 +2397,7 @@ impl Http2Conn {
     }
 
     /// Frame response DATA for the streams that have some, until the send
-    /// queue holds [SEND_QUEUE_BYTES] or nothing is left that the windows
+    /// queue holds the `h2_send` `start` or nothing is left that the windows
     /// allow. Called after dispatching a response, after every WINDOW_UPDATE,
     /// and on every writable event: the bound stops a whole body reaching the
     /// kernel at once, so the next writable event picks up where this one
@@ -2401,7 +2411,7 @@ impl Http2Conn {
     fn flush_pending_streams(&mut self) {
         let max = self.peer_max_frame as usize;
         self.reap_ended_streams();
-        while self.send_buf.len() < SEND_QUEUE_BYTES {
+        while self.send_buf.len() < self.send_buf.limit().start() {
             let Some(stream_id) = self.next_sendable_stream() else {
                 break;
             };
@@ -2461,7 +2471,7 @@ impl Http2Conn {
     /// Frame one stream's response: one DATA frame per iteration, stopping when
     /// its window is spent or the queue is full.
     fn flush_stream(&mut self, stream_id: u32, max: usize) {
-        while self.send_buf.len() < SEND_QUEUE_BYTES
+        while self.send_buf.len() < self.send_buf.limit().start()
             && self
                 .streams
                 .get(&stream_id)
@@ -2820,7 +2830,7 @@ impl Http2Conn {
                         .map(|(name, value)| (name.resolve(scratch), value.resolve(scratch))),
                     send_buf,
                 )
-                .expect("writing to a Vec cannot fail");
+                .expect("an HTTP/2 header block fits under the h2_send maximum");
         }
         let payload_len = self.send_buf.len() - start - FRAME_HDR;
         self.send_buf[start] = (payload_len >> 16) as u8;
@@ -2942,26 +2952,49 @@ fn u24_be(b: &[u8]) -> u32 {
     (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32
 }
 
+/// The bytes a frame is appended to: the server's `h2_send` area or a
+/// client's plain `Vec`.
+pub(crate) trait FrameBytes {
+    fn put(&mut self, bytes: &[u8]) -> bool;
+}
+
+impl FrameBytes for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes);
+        true
+    }
+}
+
+impl FrameBytes for m6_core::limits::Bounded<u8> {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes)
+    }
+}
+
 /// Append a well-formed H2 frame to `send_buf`.
 ///
 /// A free function so a caller can write a frame from a slice borrowed out of
 /// `self.streams` while `send_buf` is borrowed mutably, without the borrow
 /// checker forcing a clone of the payload.
 pub(crate) fn append_frame(
-    send_buf: &mut Vec<u8>,
+    send_buf: &mut impl FrameBytes,
     ftype: u8,
     flags: u8,
     stream_id: u32,
     payload: &[u8],
 ) {
     let len = payload.len();
-    send_buf.push((len >> 16) as u8);
-    send_buf.push((len >> 8) as u8);
-    send_buf.push(len as u8);
-    send_buf.push(ftype);
-    send_buf.push(flags);
-    send_buf.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-    send_buf.extend_from_slice(payload);
+    let mut head = [0u8; FRAME_HDR];
+    head[0] = (len >> 16) as u8;
+    head[1] = (len >> 8) as u8;
+    head[2] = len as u8;
+    head[3] = ftype;
+    head[4] = flags;
+    head[5..9].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    // The `h2_send` maximum is above any frame the flusher can build: the
+    // pacing mark stops it below `start` and `max` is far above one frame.
+    debug_assert!(send_buf.put(&head), "an h2 frame header fits the send area");
+    debug_assert!(send_buf.put(payload), "an h2 frame fits the send area");
 }
 
 fn setting_bytes(buf: &mut Vec<u8>, id: u16, val: u32) {
@@ -5554,14 +5587,55 @@ mod tests {
         c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
         c.send_buf.clear();
         c.flush_pending_streams();
+        let mark = c.send_buf.limit().start();
         assert!(
-            c.send_buf.len() < SEND_QUEUE_BYTES + DEFAULT_MAX_FRAME as usize,
+            c.send_buf.len() < mark + DEFAULT_MAX_FRAME as usize,
             "one flush queued {} unsent bytes",
             c.send_buf.len()
         );
         assert!(
             !sent_frames(&c.send_buf, TYPE_DATA).is_empty(),
             "the flush must still frame the next DATA"
+        );
+    }
+
+    /// `h2_send`'s configured start and max bound a real response send: the
+    /// flusher stops at the start, a frame may grow the area by doubling, and
+    /// the maximum is never reached.
+    #[test]
+    fn the_h2_send_limit_bounds_a_real_send() {
+        use m6_core::limits::{Bounded, Limit, H2_SEND};
+
+        let mut c = request_with_body(1, 1 << 20);
+        c.send_buf = Bounded::new(&Limit::custom(&H2_SEND, 4 * 1024, 64 * 1024));
+        c.send_buf.set_what("an HTTP/2 response");
+        // A peer that has granted room for the whole body: the bound, not the
+        // window, has to stop the flush.
+        c.conn_send_window = 1 << 20;
+        c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
+        c.flush_pending_streams();
+
+        assert!(
+            c.send_buf.len() < 4 * 1024 + DEFAULT_MAX_FRAME as usize + FRAME_HDR,
+            "the configured start did not stop the flush: {} unsent bytes",
+            c.send_buf.len()
+        );
+        assert!(
+            c.send_buf.capacity() <= 64 * 1024,
+            "the configured max did not bound the area: {}",
+            c.send_buf.capacity()
+        );
+        assert!(
+            c.send_buf.capacity() >= 4 * 1024,
+            "the area is below its configured start: {}",
+            c.send_buf.capacity()
+        );
+        let frames = sent_frames(&c.send_buf, TYPE_DATA);
+        assert!(!frames.is_empty(), "the real body was not framed at all");
+        assert_eq!(
+            frames.iter().map(|(_, body)| body.len()).sum::<usize>(),
+            DEFAULT_MAX_FRAME as usize,
+            "one pass frames one frame"
         );
     }
 

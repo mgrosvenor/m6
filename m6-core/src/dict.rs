@@ -120,7 +120,7 @@ impl Overlay {
         if self.entries.len() == cap {
             if let Some(size) = limit.grown(cap, cap + 1) {
                 self.entries.reserve_exact(size - self.entries.len());
-                limit.log_growth(size);
+                limit.log_growth(cap, size, "a request's dictionary");
             }
         }
         true

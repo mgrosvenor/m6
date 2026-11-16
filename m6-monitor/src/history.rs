@@ -1152,7 +1152,7 @@ pub struct History {
     status: Status,
     /// Batches held for a locked file, oldest first, under the
     /// `history_queue` limit.
-    queue: m6_core::limits::BoundedQueue<Batch>,
+    queue: m6_core::limits::Bounded<Batch>,
     /// Polls refused because the hold was past its maximum.
     dropped: u64,
 }
@@ -1389,7 +1389,7 @@ pub fn start(cfg: Option<Config>, queue: &m6_core::limits::Limit) -> anyhow::Res
         cfg: cfg.clone(),
         store: None,
         status: Status::default(),
-        queue: m6_core::limits::BoundedQueue::new(queue),
+        queue: m6_core::limits::Bounded::new(queue),
         dropped: 0,
     };
     let Some(cfg) = cfg else {
@@ -2870,7 +2870,7 @@ mod tests {
             cfg: Some(c),
             store: None,
             status: Status::default(),
-            queue: m6_core::limits::BoundedQueue::new(&queue_limit(2, QUEUE_POLLS)),
+            queue: m6_core::limits::Bounded::new(&queue_limit(2, QUEUE_POLLS)),
             dropped: 0,
         }
     }

@@ -435,6 +435,7 @@ m6-http reads its keys from the `[limits]` table of its system config, and every
 | `h2_recv` | bytes | 16 KiB | 4 MiB | m6-http | one HTTP/2 connection's read buffer | the connection closes |
 | `h2_header_block` | bytes | 16 KiB | 256 KiB | m6-http | one HTTP/2 header block before decoding | GOAWAY, ENHANCE_YOUR_CALM |
 | `h2_stream_body` | bytes | 4 KiB | 32 MiB | m6-http | one HTTP/2 request body | the stream is reset |
+| `h2_send` | bytes | 16 KiB | 1 MiB | m6-http | one HTTP/2 connection's unsent response bytes, where `start` is the pacing mark | never reached: the flusher stops at `start` |
 | `request_dict` | entries | 32 | 4096 | services | the fields of one request: query, form, path parameters, cookies and built-ins | the request is refused with a 400 |
 | `refresh_queue` | entries | 16 | 4096 | m6-http | stale cache entries waiting for a background fetch | the refresh is refused |
 | `rate_limit_addresses` | entries | 1024 | 50000 | m6-http | client addresses the request counter tracks | a new address is answered 429 |
@@ -460,7 +461,7 @@ The same rule holds for every limit:
 1. The area is allocated at `start` when the service starts.
 2. It grows only when a write does not fit, by doubling, and the last step is clamped to `max`.
 3. It keeps the grown size and never shrinks.
-4. Each growth writes one log line that names the limit and the new size, so an operator can raise `start` until growth stops.
+4. Each growth writes one log line that names the limit, the page or request that grew it, the old and new sizes, the maximum and the exact key and file to raise, so an operator can raise `start` until growth stops: `m6-html: limit render_page grew from 512 KiB to 1 MiB for page /blog/x (max 4 MiB, [limits.render_page] in /etc/m6/m6-html.toml)`.
 5. A write that needs more than `max` is refused outright with one error line, for example: `m6-html: page /blog/x needs at least 5 MiB, over [limits.render_page] max = 4 MiB in /etc/m6/m6-html.toml; raise max to fix this`.
    The request gets its error status, or the queue item is refused. Nothing is cut, dropped without an error or sent in part.
 
