@@ -329,6 +329,7 @@ mod tests {
         Config {
             genid: None,
             cache_dir: None,
+            limits: Default::default(),
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: "test.example.com".to_string(),

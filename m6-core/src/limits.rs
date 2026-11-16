@@ -129,19 +129,15 @@ pub const EDGE_RESPONSE: LimitSpec = bytes("edge_response", 512, 128 * MIB);
 pub const H2_RECV: LimitSpec = bytes("h2_recv", 16 * KIB, 4 * MIB);
 /// One HTTP/2 header block, before it is decoded.
 pub const H2_HEADER_BLOCK: LimitSpec = bytes("h2_header_block", 16 * KIB, 256 * KIB);
-/// The field list one HTTP/2 request decodes into.
-pub const H2_HEAD_SCRATCH: LimitSpec = bytes("h2_head_scratch", 8 * KIB, 256 * KIB);
 /// The body of one HTTP/2 request stream.
 pub const H2_STREAM_BODY: LimitSpec = bytes("h2_stream_body", 4 * KIB, 32 * MIB);
-/// Cancelled HTTP/2 streams remembered, so a late frame for one is not a
-/// protocol error.
-pub const H2_RESET_MEMORY: LimitSpec = count("h2_reset_memory", 128, 128);
 /// Stale cache entries waiting to be fetched again.
 pub const REFRESH_QUEUE: LimitSpec = count("refresh_queue", 16, 4096);
 /// Client addresses the per-address request counter tracks.
 pub const RATE_LIMIT_ADDRESSES: LimitSpec = count("rate_limit_addresses", 1024, 50_000);
-/// Idle connections kept per URL backend.
-pub const IDLE_URL_CONNECTIONS: LimitSpec = count("idle_url_connections", 8, 8);
+/// The response cache's memory. A cache holds what fits and evicts the least
+/// recently read entry for the next, so `start` equals `max`.
+pub const CACHE_BYTES: LimitSpec = bytes("cache_bytes", 128 * MIB, 128 * MIB);
 /// Polls the monitor holds in memory while its history file catches up.
 pub const HISTORY_QUEUE: LimitSpec = count("history_queue", 8, 1024);
 
@@ -164,12 +160,10 @@ pub const KNOWN: &[LimitSpec] = &[
     EDGE_RESPONSE,
     H2_RECV,
     H2_HEADER_BLOCK,
-    H2_HEAD_SCRATCH,
     H2_STREAM_BODY,
-    H2_RESET_MEMORY,
     REFRESH_QUEUE,
     RATE_LIMIT_ADDRESSES,
-    IDLE_URL_CONNECTIONS,
+    CACHE_BYTES,
     HISTORY_QUEUE,
 ];
 
@@ -608,6 +602,82 @@ impl io::Write for BoundedBuf {
     }
 }
 
+/// A first-in first-out queue that follows a [`Limit`] counted in entries.
+///
+/// Made at the limit's `start`. It grows by doubling when full, clamped at
+/// `max`, keeps its size, and a [`BoundedQueue::push_back`] past `max` is
+/// refused with the error and the item handed back, never dropped silently.
+#[derive(Debug)]
+pub struct BoundedQueue<T> {
+    limit: Limit,
+    items: std::collections::VecDeque<T>,
+    /// The entries the queue has grown to hold.
+    size: usize,
+}
+
+impl<T> BoundedQueue<T> {
+    /// Allocate room for the limit's `start` entries. Start only.
+    pub fn new(limit: &Limit) -> Self {
+        Self {
+            limit: limit.clone(),
+            items: std::collections::VecDeque::with_capacity(limit.start()),
+            size: limit.start(),
+        }
+    }
+
+    pub fn limit(&self) -> &Limit {
+        &self.limit
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The entries the queue has grown to hold.
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
+
+    pub fn front(&self) -> Option<&T> {
+        self.items.front()
+    }
+
+    pub fn pop_front(&mut self) -> Option<T> {
+        self.items.pop_front()
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    pub fn contains(&self, item: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.items.contains(item)
+    }
+
+    /// Add `item` at the back. Past the maximum the queue is unchanged and the
+    /// item is returned beside the error, naming `what` was refused.
+    pub fn push_back(&mut self, item: T, what: &str) -> Result<(), (T, LimitExceeded)> {
+        let needed = self.items.len() + 1;
+        let Some(size) = self.limit.grown(self.size, needed) else {
+            return Err((item, self.limit.exceeded(needed, what)));
+        };
+        if size > self.size {
+            self.items.reserve_exact(size - self.items.len());
+            self.size = size;
+            self.limit.log_growth(size);
+        }
+        self.items.push_back(item);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,5 +897,27 @@ mod tests {
             msg,
             "request needs at least 8193 B, over [limits.request_body] max = 8 KiB in the config file; raise max to fix this"
         );
+    }
+
+    #[test]
+    fn a_queue_grows_keeps_its_size_and_refuses_past_max() {
+        let limit = Limit::custom(&REFRESH_QUEUE, 2, 4);
+        let mut q = BoundedQueue::new(&limit);
+        assert_eq!(q.capacity(), 2);
+        q.push_back(1, "an item").unwrap();
+        q.push_back(2, "an item").unwrap();
+        assert_eq!(q.capacity(), 2, "within the start nothing grows");
+        q.push_back(3, "an item").unwrap();
+        assert_eq!(q.capacity(), 4, "one past the start doubles");
+        q.push_back(4, "an item").unwrap();
+        let (item, err) = q.push_back(5, "a background refresh").unwrap_err();
+        assert_eq!(item, 5, "the refused item comes back");
+        assert_eq!(
+            err.to_string(),
+            "a background refresh needs at least 5, over [limits.refresh_queue] max = 4 in the config file; raise max to fix this"
+        );
+        assert_eq!(q.len(), 4);
+        q.clear();
+        assert_eq!(q.capacity(), 4, "the queue never shrinks");
     }
 }

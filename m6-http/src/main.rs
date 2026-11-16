@@ -151,7 +151,7 @@ use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
     make_tls_server_config, resolve_bind, ConnDrive, H2cListener, HitHeaders, Http11Listener,
-    ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS, INITIAL_CONNECTIONS,
+    ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS,
     MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::{self, PoolManager};
@@ -328,7 +328,10 @@ struct ServerState {
     generations: Vec<u64>,
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
-    prefetch_queue: std::collections::VecDeque<Refresh>,
+    prefetch_queue: m6_core::limits::BoundedQueue<Refresh>,
+    /// Refreshes refused past the `refresh_queue` maximum, for the sampled
+    /// error line.
+    refresh_refused: u64,
     /// In-flight backend requests, one per slot, driven when their descriptor
     /// fires. Each entry carries the non-blocking upstream, what it belongs to
     /// (a pool member or a URL backend), the backend name, and who waits for
@@ -422,14 +425,6 @@ struct Refresh {
     enc: String,
 }
 
-/// Cap on queued background fetches.
-///
-/// The queue drains one per event-loop iteration, so it only grows when
-/// entries go stale faster than the loop turns. Dropping the excess is right:
-/// a dropped refresh costs one more stale serve, and the next request for that
-/// key queues it again.
-const MAX_REFRESH_QUEUE: usize = 256;
-
 impl ServerState {
     /// Queue a background fetch, skipping one already queued.
     ///
@@ -438,10 +433,19 @@ impl ServerState {
     /// stampede against origin for exactly the case this is meant to shield it
     /// from.
     fn queue_refresh(&mut self, r: Refresh) {
-        if self.prefetch_queue.len() >= MAX_REFRESH_QUEUE || self.prefetch_queue.contains(&r) {
+        if self.prefetch_queue.contains(&r) {
             return;
         }
-        self.prefetch_queue.push_back(r);
+        // The queue grows by doubling and keeps its size. Past the
+        // `refresh_queue` maximum the refresh is refused with an error that
+        // names the key: the entry is served stale once more and the next
+        // request queues it again.
+        if let Err((_, refusal)) = self.prefetch_queue.push_back(r, "a background refresh") {
+            self.refresh_refused += 1;
+            if self.refresh_refused == 1 || self.refresh_refused.is_multiple_of(1024) {
+                error!("{refusal} ({} refused so far)", self.refresh_refused);
+            }
+        }
     }
 }
 
@@ -6385,6 +6389,23 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    // The named limits every buffer and queue below follows, and the log's own,
+    // set before the log opens.
+    m6_http_lib::limits::init(&config.limits);
+    for warning in config.limits.warnings() {
+        eprintln!("m6-http: {warning}");
+    }
+    {
+        use m6_core::limits::{LOG_BUFFER, LOG_FIELD};
+        let buffer = config.limits.get(&LOG_BUFFER);
+        m6_core::log::set_limits(m6_core::log::LogLimits {
+            buffer_start: buffer.start(),
+            buffer_max: buffer.max(),
+            field_max: config.limits.get(&LOG_FIELD).max(),
+            file: config.limits.file().display().to_string(),
+        });
+    }
+
     // The CLI --log-level overrides site.toml [log].level.
     let log_level = cli
         .log_level
@@ -6625,6 +6646,11 @@ fn run(args: Vec<String>) -> i32 {
             return 1;
         }
     };
+    // The connection table follows the `connections` limit, and the open-file
+    // limit can lower its maximum.
+    let table = config.limits.get(&m6_core::limits::CONNECTIONS);
+    let ceiling = ceiling.min(table.max());
+    let initial_connections = table.start().min(ceiling);
     let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
         Ok(tls_cfg) => {
             let bound = match shared_tcp {
@@ -6632,14 +6658,14 @@ fn run(args: Vec<String>) -> i32 {
                     listener,
                     tls_cfg,
                     config.server.max_requests_per_connection,
-                    INITIAL_CONNECTIONS,
+                    initial_connections,
                     ceiling,
                 ),
                 None => Http11Listener::bind(
                     &config.server.bind,
                     tls_cfg,
                     config.server.max_requests_per_connection,
-                    INITIAL_CONNECTIONS,
+                    initial_connections,
                     ceiling,
                 ),
             };
@@ -6679,7 +6705,7 @@ fn run(args: Vec<String>) -> i32 {
             .server
             .is_internal(h2c_bind)
             .then(|| config.server.internal_peers.clone());
-        match H2cListener::bind(h2c_bind, internal_peers, INITIAL_CONNECTIONS, ceiling) {
+        match H2cListener::bind(h2c_bind, internal_peers, initial_connections, ceiling) {
             Ok(l) => {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
@@ -6733,7 +6759,7 @@ fn run(args: Vec<String>) -> i32 {
             format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
         ))
     };
-    let cache = Cache::new();
+    let cache = Cache::with_max_bytes(config.limits.get(&m6_core::limits::CACHE_BYTES).max());
     // The disk writer shares the memory cache's bound, so a disk copy cannot
     // outgrow the memory it shadows. Built at start, where a missing or
     // unwritable directory is already an error.
@@ -6782,20 +6808,23 @@ fn run(args: Vec<String>) -> i32 {
         public_key,
         error_mode,
         stats: initial_stats(),
-        sources: Slots::new(INITIAL_CONNECTIONS, ceiling, || Source::Vacant),
-        generations: vec![0; INITIAL_CONNECTIONS],
-        prefetch_queue: std::collections::VecDeque::new(),
-        upstreams: Slots::new(INITIAL_CONNECTIONS, ceiling, UpstreamEntry::empty),
+        sources: Slots::new(initial_connections, ceiling, || Source::Vacant),
+        generations: vec![0; initial_connections],
+        prefetch_queue: m6_core::limits::BoundedQueue::new(
+            &m6_http_lib::limits::edge().refresh_queue,
+        ),
+        refresh_refused: 0,
+        upstreams: Slots::new(initial_connections, ceiling, UpstreamEntry::empty),
         read_timeouts: Timeouts::new(
-            INITIAL_CONNECTIONS,
+            initial_connections,
             std::time::Duration::from_secs(READ_TIMEOUT_SECS),
         ),
         h2_idle_timeouts: Timeouts::new(
-            INITIAL_CONNECTIONS,
+            initial_connections,
             std::time::Duration::from_secs(H2_IDLE_TIMEOUT_SECS),
         ),
         upstream_timeouts: Timeouts::new(
-            INITIAL_CONNECTIONS,
+            initial_connections,
             std::time::Duration::from_secs(backend_timeout_secs),
         ),
         h2c_pool: H2cClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
@@ -6872,6 +6901,7 @@ mod www_redirect_tests {
         Config {
             genid: None,
             cache_dir: None,
+            limits: Default::default(),
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: domain.to_string(),

@@ -30,6 +30,10 @@ pub struct Config {
     /// A cache node's disk cache directory. `None` means the node keeps its
     /// cache in memory only.
     pub cache_dir: Option<PathBuf>,
+    /// The `[limits]` table: the start and maximum of each buffer and queue.
+    /// Node state, so it is read from the system config in two-file mode.
+    #[serde(skip)]
+    pub limits: m6_core::limits::Limits,
     pub backends: Vec<BackendConfig>,
     pub routes: Vec<RouteConfig>,
     pub route_groups: Vec<RouteGroupConfig>,
@@ -765,6 +769,9 @@ struct RawSiteToml {
     /// The disk cache directory. Node state, so the table is refused in
     /// `site.toml` in two-file mode.
     cache: Option<RawCache>,
+    /// The named limits. Node state, so the table is refused in `site.toml` in
+    /// two-file mode.
+    limits: Option<toml::Value>,
     #[serde(rename = "backend", default)]
     backends: Vec<BackendConfig>,
     #[serde(rename = "route", default)]
@@ -816,6 +823,8 @@ struct RawSystemToml {
     /// The disk cache directory. Node state, so it belongs beside the node's
     /// credentials rather than in the site that ships to every node.
     cache: Option<RawCache>,
+    /// The named limits: each buffer's start and maximum.
+    limits: Option<toml::Value>,
 }
 
 /// The `[cache]` keys. A cache node may point `dir` at a directory it owns.
@@ -1038,7 +1047,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // mode, the one file in one-file mode. The system config is parsed strictly
     // only when it is a second file, so a one-file config is not refused for the
     // site-only keys it necessarily carries.
-    let (node_server, node, auth, node_health, raw_genid, raw_cache) = if one_file {
+    let (node_server, node, auth, node_health, raw_genid, raw_cache, raw_limits) = if one_file {
         (
             site_parsed.server.clone().unwrap_or_default(),
             site_parsed.node,
@@ -1046,6 +1055,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             None,
             site_parsed.genid,
             site_parsed.cache,
+            site_parsed.limits,
         )
     } else {
         let system_parsed: RawSystemToml = toml::from_str(&system_raw)
@@ -1057,8 +1067,20 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             system_parsed.health,
             system_parsed.genid,
             system_parsed.cache,
+            system_parsed.limits,
         )
     };
+    let limits_file = if one_file {
+        &site_toml_path
+    } else {
+        &system_config_path.to_path_buf()
+    };
+    let limits = m6_core::limits::Limits::from_toml(
+        raw_limits.as_ref(),
+        limits_file,
+        m6_core::platform::process::page_size(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
     let site_server = site_parsed.server.unwrap_or_default();
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
@@ -1484,6 +1506,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         auth,
         genid,
         cache_dir,
+        limits,
         backends,
         routes,
         route_groups,
@@ -1510,7 +1533,7 @@ const NODE_HEALTH_KEYS: &[&str] = &["metrics_require", "metrics_peers"];
 ///
 /// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
 /// `[node]` in `site.toml` is named here so `load` refuses it.
-const NODE_SECTIONS: &[&str] = &["auth", "cache", "genid", "node"];
+const NODE_SECTIONS: &[&str] = &["auth", "cache", "genid", "limits", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
 const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
@@ -2675,6 +2698,28 @@ domain = "test.example.com"
         );
     }
 
+    /// `[limits]` is read from the system config, names the system config in
+    /// its refusals, and is refused in `site.toml`.
+    #[test]
+    fn limits_in_the_system_config_load_and_in_site_toml_are_refused() {
+        use m6_core::limits::EDGE_REQUEST;
+        let (_d, r) = load_with("", "\n[limits.edge_request]\nmax = \"8MiB\"\n");
+        let cfg = r.expect("limits load");
+        assert_eq!(cfg.limits.get(&EDGE_REQUEST).max(), 8 << 20);
+
+        let (_d, r) = load_with("", "\n[limits.edge_request]\nmax = \"1KiB\"\n");
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[limits.edge_request] max = 1 KiB is below start = 4 KiB"),
+            "{e}"
+        );
+        assert!(e.contains("system"), "{e}");
+
+        let (_d, r) = load_with("\n[limits.edge_request]\nmax = \"8MiB\"\n", "");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("site.toml sets [limits]"), "{e}");
+    }
+
     #[test]
     fn genid_in_site_toml_is_refused() {
         let (_d, r) = load_with(
@@ -3065,8 +3110,8 @@ domain = "test.example.com"
         let mut health = NODE_HEALTH_KEYS.to_vec();
         health.sort_unstable();
         assert_eq!(health, ["metrics_peers", "metrics_require"]);
-        assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "node"]);
-        assert_eq!(all.len(), 12 + 2 + 4);
+        assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "limits", "node"]);
+        assert_eq!(all.len(), 12 + 2 + 5);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
