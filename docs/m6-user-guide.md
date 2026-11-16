@@ -963,7 +963,9 @@ chmod 600   /etc/m6/auth.pub
 
 systemd reads a credential as root, so both key files stay root's.
 
-Write `/etc/m6/m6-auth.conf`, owned by root and readable by the m6 group:
+Write `/etc/m6/m6-auth.conf` for the login unit and `/etc/m6/check/m6-auth.conf` for the check unit.
+Both are owned by root and readable by the m6 group, and they are identical except for the unit name in the two `[keys]` paths.
+Both files have the stem `m6-auth`, so both derive `/run/m6/m6-auth.sock` as the primary path.
 
 ```bash
 cat > /etc/m6/m6-auth.conf << 'CONF'
@@ -974,14 +976,18 @@ path = "/var/lib/m6-auth/auth.db"
 issuer = "example.com"
 
 [keys]
-private_key = "/run/credentials/m6-auth.service/auth.pem"
-public_key  = "/run/credentials/m6-auth.service/auth.pub"
+private_key = "/run/credentials/m6-auth-login.service/auth.pem"
+public_key  = "/run/credentials/m6-auth-login.service/auth.pub"
 CONF
-chown root:m6 /etc/m6/m6-auth.conf
-chmod 640 /etc/m6/m6-auth.conf
+mkdir -p /etc/m6/check
+sed 's/m6-auth-login\.service/m6-auth-check.service/g' \
+  /etc/m6/m6-auth.conf > /etc/m6/check/m6-auth.conf
+chown root:m6 /etc/m6/m6-auth.conf /etc/m6/check/m6-auth.conf
+chmod 640 /etc/m6/m6-auth.conf /etc/m6/check/m6-auth.conf
 ```
 
-The socket name comes from the file's stem, so it stays `/run/m6/m6-auth.sock`.
+The login unit binds `/run/m6/m6-auth.sock`.
+The check unit derives `/run/m6/check-m6-auth.sock` beside that primary path and binds only the check socket.
 
 Obtain the certificate with certbot.
 It writes `fullchain.pem` and `privkey.pem` under `/etc/letsencrypt/live/example.com/`, the paths the m6-http unit's `LoadCredential` lines deliver.
@@ -1204,11 +1210,11 @@ ReadOnlyPaths=/var/www/my-blog
 WantedBy=multi-user.target
 ```
 
-`/etc/systemd/system/m6-auth.service`:
+`/etc/systemd/system/m6-auth-login.service`, the login side:
 
 ```ini
 [Unit]
-Description=m6-auth service
+Description=m6-auth login service
 After=network.target
 
 [Service]
@@ -1221,7 +1227,8 @@ RuntimeDirectoryPreserve=yes
 
 ExecStart=/usr/local/bin/m6-auth-server \
     /var/www/my-blog \
-    /etc/m6/m6-auth.conf
+    /etc/m6/m6-auth.conf \
+    --login-only
 
 LoadCredential=auth.pem:/etc/m6/auth.pem
 LoadCredential=auth.pub:/etc/m6/auth.pub
@@ -1232,7 +1239,47 @@ Restart=on-failure
 RestartSec=2
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=m6-auth
+SyslogIdentifier=m6-auth-login
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6
+ReadOnlyPaths=/var/www/my-blog /etc/m6
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/m6-auth-check.service`, the check side:
+
+```ini
+[Unit]
+Description=m6-auth check service
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+ExecStart=/usr/local/bin/m6-auth-server \
+    /var/www/my-blog \
+    /etc/m6/check/m6-auth.conf \
+    --check-only
+
+LoadCredential=auth.pem:/etc/m6/auth.pem
+LoadCredential=auth.pub:/etc/m6/auth.pub
+StateDirectory=m6-auth
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m6-auth-check
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -1245,6 +1292,16 @@ WantedBy=multi-user.target
 
 m6-auth's keys come from the two `LoadCredential` lines, and its database lives in `/var/lib/m6-auth`, which `StateDirectory=m6-auth` creates.
 Section 7.2 gives the layout.
+
+The two units run the same binary, the same database and the same keys.
+They take one config each because `LoadCredential` places a unit's keys under `/run/credentials/<unit>/`, and the `[keys]` paths in the config are absolute.
+`/etc/m6/m6-auth.conf` names `/run/credentials/m6-auth-login.service/auth.pem`, and `/etc/m6/check/m6-auth.conf` names `/run/credentials/m6-auth-check.service/auth.pem`.
+The two files are identical apart from those two paths, and both sit at a path with the stem `m6-auth` so the socket derivation agrees.
+
+The login unit binds `/run/m6/m6-auth.sock` and the four login routes.
+The check unit binds `/run/m6/check-m6-auth.sock` and `/check`.
+The `check-` prefix keeps the check socket out of the login backend's `/run/m6/m6-auth*.sock` glob, so the existing m6-http backend and its routes keep dialling the login socket.
+The two processes are what keep a login's bcrypt verify off the check loop. A single unit with no flags binds both sockets in one process, and then a login still delays every `/check` for the length of its verify.
 
 `/etc/systemd/system/render-cms.service`:
 
@@ -1288,7 +1345,7 @@ The render-cms binary lives in `/var/www/my-blog/bin/`, deployed beside the site
 [Unit]
 Description=m6-http reverse proxy and cache
 Documentation=https://github.com/mgrosvenor/m6
-After=network.target m6-html.service m6-file.service m6-auth.service render-cms.service
+After=network.target m6-html.service m6-file.service m6-auth-login.service m6-auth-check.service render-cms.service
 
 [Service]
 Type=simple

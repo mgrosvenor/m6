@@ -139,6 +139,18 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`m6-auth-server` can serve `/check` on its own Unix socket, and a deployment can run the login side as its own process.**
+The check socket is derived beside the primary socket as `<parent>/check-<file name>`, so `/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`, and `M6_CHECK_SOCKET_OVERRIDE` sets it outright.
+The four login routes keep the primary socket, and the new `--login-only` and `--check-only` flags bind one listener each, with neither flag binding both.
+Both flags together stop the start with exit 2.
+The upgrade is additive: the primary path and a deployment's `/run/m6/m6-auth*.sock` glob are unchanged, and the `check-` prefix keeps that glob off the new socket.
+**Two listeners in one process share one event loop and one connection table, so they do not isolate `/check` from a login's bcrypt verify.**
+A `/check` that arrives during a login waits for that login.
+Only a second process removes the tail, because `/auth/login` is absent from the check process's listener.
+`docs/m6-auth.md` and `docs/m6-user-guide.md` give the two units, which use one config each because a unit's credentials live under `/run/credentials/<unit>/`.
+Verified on 2026-11-17 on a macOS sandbox: six tests in `m6-auth-server/tests/listeners.rs` prove the two 404 refusals, the derived path, both single-listener modes and the exit 2, and the four `/check` tests pass on the new socket.
+With a login in flight, `/check` measured p50 1,670 ms and p99 2,820 ms in one process, against p50 5.9 ms and p99 8.6 ms with the login and check sides in two processes (n=7 each, debug build).
+
 **`m6-auth-server` gains a fifth route, `POST /check`, which answers the current identity for an access token.**
 It takes `Authorization: Bearer <access token>` and answers 200 with `sub`, `username`, `roles` and `groups`, all read from the database at that request.
 The token proves which user is asking, and the database supplies what that user may do, so a role change is visible to the next request without a new token.

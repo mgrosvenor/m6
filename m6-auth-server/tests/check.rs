@@ -28,6 +28,7 @@ struct TestEnv {
     site_dir: PathBuf,
     config_path: PathBuf,
     socket_path: PathBuf,
+    check_socket_path: PathBuf,
     db_path: PathBuf,
     private_key_path: PathBuf,
     public_key_path: PathBuf,
@@ -98,12 +99,14 @@ public_key  = "{}"
     std::fs::write(site_dir.join("site.toml"), "").unwrap();
 
     let socket_path = temp.path().join(format!("{id}.sock"));
+    let check_socket_path = temp.path().join(format!("{id}-check.sock"));
 
     TestEnv {
         _temp: temp,
         site_dir,
         config_path,
         socket_path,
+        check_socket_path,
         db_path,
         private_key_path,
         public_key_path,
@@ -117,9 +120,11 @@ fn spawn_server(env: &TestEnv) -> Service {
         Command::new(binary("m6-auth-server"))
             .arg(&env.site_dir)
             .arg(&env.config_path)
-            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
+            .env("M6_SOCKET_OVERRIDE", &env.socket_path)
+            .env("M6_CHECK_SOCKET_OVERRIDE", &env.check_socket_path),
     );
     svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&env.check_socket_path, Duration::from_secs(10));
     svc.wait_for_started(Duration::from_secs(10));
     assert!(
         wait::for_unix(&env.socket_path, Duration::from_secs(10)),
@@ -176,7 +181,7 @@ fn mint(env: &TestEnv, sub: &str, username: &str, exp: i64) -> String {
 
 fn check(env: &TestEnv, token: &str) -> String {
     http_request(
-        &env.socket_path,
+        &env.check_socket_path,
         &format!(
             "POST /check HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
         ),
@@ -299,7 +304,7 @@ fn a_missing_credential_is_401() {
     let _guard = spawn_server(&env);
 
     let resp = http_request(
-        &env.socket_path,
+        &env.check_socket_path,
         "POST /check HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
     );
     assert_eq!(parse_status(&resp), 401, "expected 401\n{resp}");
