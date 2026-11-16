@@ -169,6 +169,14 @@ impl Drop for Server {
 fn recv_exact(s: &mut TcpStream, n: usize, deadline: Duration) -> Vec<u8> {
     s.set_read_timeout(Some(deadline))
         .expect("set_read_timeout");
+    read_exact_now(s, n)
+}
+
+/// Read `n` bytes under the read timeout the caller already set. For a socket
+/// the server may close before the read starts: macOS refuses `setsockopt`
+/// (`EINVAL`) on a socket whose peer has closed, so the timeout must be set
+/// while the socket is still open, never after the server has had time to act.
+fn read_exact_now(s: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut buf = [0u8; 65536];
     while out.len() < n {
@@ -281,12 +289,15 @@ fn data_len() -> usize {
 fn half_close_drains_then_closes() {
     let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
     let mut s = TcpStream::connect(srv.addr).expect("connect");
+    // Set before the half-close: the server closes as soon as it has drained,
+    // and a loaded host can let that happen before this thread's next call.
+    s.set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("set_read_timeout");
     let body = vec![b'x'; 300_000];
     s.write_all(&body).expect("send");
     s.shutdown(std::net::Shutdown::Write)
         .expect("shutdown write");
-    assert_eq!(recv_exact(&mut s, 300_000, Duration::from_secs(15)), body);
-    // `recv_exact` already set a 15 s read timeout; use it for the EOF read.
+    assert_eq!(read_exact_now(&mut s, 300_000), body);
     let mut b = [0u8; 1];
     assert_eq!(s.read(&mut b).expect("read eof"), 0, "server must close");
     drop(s);
