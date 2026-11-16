@@ -168,12 +168,25 @@ pub struct PageLimits {
     row_max: usize,
 }
 
+static PAGE_LIMIT: std::sync::OnceLock<crate::limits::Limit> = std::sync::OnceLock::new();
+
+/// Set the `ndjson_page` limit [`PageLimits::default`] follows. Start only,
+/// once: a second call changes nothing.
+pub fn set_page_limit(limit: &crate::limits::Limit) {
+    let _ = PAGE_LIMIT.set(limit.clone());
+}
+
 impl Default for PageLimits {
+    /// The `ndjson_page` limit from [`set_page_limit`], or its built-in
+    /// defaults: 4 MiB a page, no row larger than 64 MiB, 10,000 rows.
     fn default() -> Self {
-        Self {
-            max_bytes: DEFAULT_PAGE_BYTES,
-            max_rows: DEFAULT_PAGE_ROWS,
-            row_max: MAX_PAGE_BYTES,
+        match PAGE_LIMIT.get() {
+            Some(limit) => Self::from_limit(limit, DEFAULT_PAGE_ROWS),
+            None => Self {
+                max_bytes: DEFAULT_PAGE_BYTES,
+                max_rows: DEFAULT_PAGE_ROWS,
+                row_max: MAX_PAGE_BYTES,
+            },
         }
     }
 }
