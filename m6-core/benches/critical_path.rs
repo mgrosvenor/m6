@@ -20,10 +20,8 @@ use tempfile::TempDir;
 // Helper: build an HTML response from outside the crate (template_name is pub(crate)).
 fn html_response(html: String) -> Response {
     let mut r = Response::status(200);
-    r.headers.push((
-        "Content-Type".to_string(),
-        "text/html; charset=utf-8".to_string(),
-    ));
+    r.headers
+        .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
     r.body = m6_core::Body::Bytes(html.into_bytes());
     r
 }
@@ -241,6 +239,7 @@ fn make_routes() -> RouteTable {
                 headers: Vec::new(),
                 last_modified: None,
                 last_modified_http: None,
+                head: Default::default(),
                 handler: None,
                 settings: std::sync::Arc::new(serde_json::Map::new()),
                 base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -332,6 +331,7 @@ fn bench_match_route(c: &mut Criterion) {
         headers: Vec::new(),
         last_modified: None,
         last_modified_http: None,
+        head: Default::default(),
         handler: None,
         settings: std::sync::Arc::new(serde_json::Map::new()),
         base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -412,12 +412,9 @@ fn bench_template_render(c: &mut Criterion) {
 /// meant before -- serialisation only.
 fn response_to_write() -> Response {
     let mut r = Response::status(200);
-    r.headers.push((
-        "Content-Type".to_string(),
-        "text/html; charset=utf-8".to_string(),
-    ));
     r.headers
-        .push(("Cache-Control".to_string(), "public".to_string()));
+        .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
+    r.headers.push(("Cache-Control".into(), "public".into()));
     r.body = m6_core::Body::Bytes(MINIMAL_TEMPLATE.as_bytes().to_vec());
     r
 }
@@ -505,6 +502,7 @@ size = 64
                         headers: Vec::new(),
                         last_modified: None,
                         last_modified_http: None,
+                        head: Default::default(),
                         handler: None,
                         settings: std::sync::Arc::new(serde_json::Map::new()),
                         base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -722,6 +720,7 @@ fn main() {
             headers: Vec::new(),
             last_modified: None,
             last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
             base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -828,6 +827,7 @@ size = 64
                             headers: Vec::new(),
                             last_modified: None,
                             last_modified_http: None,
+                            head: Default::default(),
                             handler: None,
                             settings: std::sync::Arc::new(serde_json::Map::new()),
                             base_dict: std::sync::Arc::new(serde_json::Map::new()),

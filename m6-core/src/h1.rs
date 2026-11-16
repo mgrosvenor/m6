@@ -1451,6 +1451,9 @@ impl ServerConn {
     /// A slot whose input buffer follows the `request_body` limit and whose
     /// output buffer follows the `response_buffer` limit. Start only.
     pub fn with_limits(read: &Limit, write: &Limit) -> ServerConn {
+        // The thread's spare header lists are made here, at start, so the first
+        // response sent allocates nothing for them.
+        crate::headers::warm_spare_lists();
         ServerConn {
             stream: None,
             in_buf: vec![0; read.start()],

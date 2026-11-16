@@ -44,6 +44,11 @@ The released versions, newest first:
 
 ### Migration
 
+**`Response.headers` is `Vec<Header>`, a pair of `HeaderText`, where it was `Vec<(String, String)>`.**
+A `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline or owns a `String`, derefs to `str` and compares equal to a `&str` and a `String`, so a reader of `resp.headers` changes nothing, and `Response::header(name, value)` still takes two `&str`.
+Code that pushes a pair into `resp.headers` writes `(name.into(), value.into())`, or `HeaderText::Static("Name")` to borrow a literal.
+`CompiledRoute` gains a `head` field, `Default::default()` in a literal.
+
 **Past a limit's maximum, work is now refused with an error that names the key, where four places used to cut, drop or carry on.**
 A log line with a string field over `[limits.log_field] max` (8 KiB) is refused whole, where the field was cut at 1024 bytes and ended in `...`.
 A last-N-lines tail request whose N lines do not fit in one `[limits.tail_read] max` page (512 KiB) is answered 413, where `m6-file` returned fewer lines than asked. A client behind a log by more than one page still reads it in pages from `X-Log-End`, as before.
@@ -486,6 +491,20 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**A rendered page makes no allocation of its own: the dictionary overlay, its built-in values and the response's header list are reused from one request to the next (template request 27 to 22 allocations, page path 41 to 36, handler request 21 to 16).**
+The overlay is taken from a spare one on the thread, cleared and not freed, and it keeps only the buffers of `request_path`, `datetime` and `year`; `datetime` and `year` are formatted into stack buffers; a response's header list returns to a spare list when the response is dropped. The 22 that remain on a page are Tera's and minify-html's, and a traced run of `site_allocs` shows all 36 on its path are theirs.
+A new limit, `[limits.request_dict]` (32 entries at start, 4096 at most), bounds the fields of one request, and a request past it is refused with a 400 that names the key.
+**Rollback:** revert the merge commit of `perf/reusable-page-context` (`git log --first-parent --merges --grep reusable-page-context`). The overlay returns to a `BTreeMap`, the built-ins to a `String` each request and the header list to a `Vec` made per response, five allocations on a page, and the budgets go back: `site_allocs` 36 to 41, `request_allocs` template 22 to 27 and handler 16 to 21. The `request_dict` key goes with it. `docs/PERFORMANCE.md` §2.7 records the same.
+Verified by the three budgets, which fail when an allocation comes back, by `a_dictionary_reuses_the_last_ones_built_in_buffers_and_shows_nothing_else` (the built-in's buffer is the last request's and nothing else of it is visible), `a_header_list_is_reused_by_the_next_response`, `an_insert_past_the_maximum_is_refused_and_reported` and `a_request_with_too_many_fields_is_refused_with_a_400`.
+
+**A rendered page's header names and values are borrowed, and the page's copy out of the page area is the minified body (page path 50 to 41 allocations, template request 36 to 27, handler request 23 to 21).**
+A route's `Cache-Control`, `Last-Modified` and extra headers are made once at load as `Arc<str>` texts the route owns, and each response clones the `Arc`, the header names are literals, and the page's `ETag`, 18 bytes, is held inline in its header.
+Of the 27 allocations a rendered page still makes, 22 are Tera's and minify-html's and 5 are ours: the built-in `year` and `datetime` values (2), the dictionary overlay's first node and key insert (2) and the response's header vector (1).
+The wire is unchanged: CACHE-HDR's tests, the cache-hit 304 tests over HTTP/1.1, HTTP/2 and HTTP/3 and `rfc9111_5_2` pass without an edit.
+The `ETag` is still computed in `finish`, not at serialisation, because CACHE-HDR's contract is that the caller and the edge's cache see it in `Response.headers`; held inline it costs no allocation.
+**Rollback:** revert the merge commit of `perf/borrowed-response-head` (`git log --first-parent --merges --grep borrowed-response-head`). `Response.headers` returns to `Vec<(String, String)>`, each header a page sets costs a `String` pair again, and the budgets go back: `site_allocs` 41 to 50, `request_allocs` template 27 to 36 and handler 21 to 23. `docs/PERFORMANCE.md` §2.6 records the same.
+Verified by the three budgets, which fail when a header comes back as a `String`, by `a_rendered_pages_route_headers_are_borrowed_not_made_per_request`, which reads the borrowed text and the inline `ETag` off two requests, by `a_reload_frees_the_old_sites_route_header_texts`, which reloads a route 1,000 times with changing values and finds every old text freed once its response finishes, and by the unit tests of `HeaderText` and `InlineBuf`.
 
 **`docs/m6-http.md` follows the documentation ruleset, and the claims the code no longer supported are corrected (#148).**
 The document had 20 em dashes, no contents list, unnumbered headings, three semicolons and captioned tables out of order. It now has none of the dashes or semicolons, one contents list, numbered headings, sequential table captions and one sentence to a line.

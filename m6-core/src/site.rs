@@ -26,6 +26,7 @@ use serde_json::{Map, Value};
 use crate::dict::Dict;
 use crate::error::Error;
 use crate::h1::RequestHead;
+use crate::headers::HeaderText;
 use crate::http::RawRequest;
 use crate::render::{RenderError, Renderer, RendererFactory};
 use crate::request::{
@@ -360,6 +361,9 @@ impl Site {
         // Logging: site.toml base, the service's `[log]`, then `--log-level`.
         let level = resolve_log(&site_toml, &config.log, cli_log_level)
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
+        crate::dict::set_entry_limit(config.limits.get(&crate::limits::REQUEST_DICT));
+        crate::dict::warm_spare_overlays();
+        crate::headers::warm_spare_lists();
         // A reload must not call `log::init` again: it replaces the running
         // sink without flushing it, and m6-log would record the already
         // nonblocking stdout as its own.
@@ -631,7 +635,11 @@ impl Site {
         started: std::time::Instant,
         mut resp: Response,
     ) -> Response {
-        // Render a template the response names.
+        // Render a template the response names. A page that rendered stays in
+        // the service's page area until the stages below have read it, so a
+        // page that is minified is copied out once, as the minified bytes, and
+        // not twice.
+        let mut in_area = false;
         if resp.template_name.is_some() {
             if let Some(dict) = dict {
                 match FrameworkState::render_response(
@@ -640,7 +648,7 @@ impl Site {
                     &mut resp,
                     dict,
                 ) {
-                    Ok(()) => {}
+                    Ok(rendered) => in_area = rendered,
                     Err(RenderError::TooLarge(needed)) => {
                         let limit = self.state.config.limits.get(&crate::limits::RENDER_PAGE);
                         error!(
@@ -670,23 +678,36 @@ impl Site {
             // told. Without one, `cache` is only a default: a handler that
             // decided its own caching did so per request, and a second
             // `Cache-Control` field would be two answers to one question.
+            let head = route.route_head();
             if route.cache_explicit {
                 resp.headers
                     .retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
-                resp = resp.header("Cache-Control", &route.cache);
+                resp.headers.push((
+                    HeaderText::Static("Cache-Control"),
+                    HeaderText::Shared(Arc::clone(&head.cache)),
+                ));
             } else if !crate::headers::contains(&resp.headers[..], "cache-control") {
-                resp = resp.header("Cache-Control", &route.cache);
+                resp.headers.push((
+                    HeaderText::Static("Cache-Control"),
+                    HeaderText::Shared(Arc::clone(&head.cache)),
+                ));
             }
             // Last-Modified, from the route's own inputs. Only on a success:
             // attaching a validator to a 404 or a 500 invites a client to keep
             // revalidating an error as though it were content.
             if resp.status < 300 {
-                if let Some(lm) = &route.last_modified_http {
-                    resp = resp.header("Last-Modified", lm);
+                if let Some(lm) = &head.last_modified {
+                    resp.headers.push((
+                        HeaderText::Static("Last-Modified"),
+                        HeaderText::Shared(Arc::clone(lm)),
+                    ));
                 }
             }
-            for (k, v) in &route.headers {
-                resp.headers.push((k.clone(), v.clone()));
+            for (k, v) in &head.headers {
+                resp.headers.push((
+                    HeaderText::Shared(Arc::clone(k)),
+                    HeaderText::Shared(Arc::clone(v)),
+                ));
             }
         }
 
@@ -706,13 +727,14 @@ impl Site {
                     .map(str::to_string);
                 let token = from_dict.unwrap_or_else(generate_csrf_token);
                 // No HttpOnly: the page reads the double-submit token back.
-                resp.headers.push(
-                    crate::cookie::Cookie::new("_csrf", token)
+                {
+                    let (name, value) = crate::cookie::Cookie::new("_csrf", token)
                         .path("/")
                         .same_site(crate::cookie::SameSite::Strict)
                         .secure()
-                        .to_header(),
-                );
+                        .to_header();
+                    resp.headers.push((name.into(), value.into()));
+                }
             }
         }
 
@@ -726,12 +748,13 @@ impl Site {
             if had_flash {
                 // Path and HttpOnly must match the cookie being removed or the
                 // browser keeps both.
-                resp.headers.push(
-                    crate::cookie::Cookie::removal("_flash")
+                {
+                    let (name, value) = crate::cookie::Cookie::removal("_flash")
                         .path("/")
                         .http_only()
-                        .to_header(),
-                );
+                        .to_header();
+                    resp.headers.push((name.into(), value.into()));
+                }
             }
         }
 
@@ -745,8 +768,15 @@ impl Site {
         // what rendering the page costs, for a few bytes saved after
         // compression. The default ETag is skipped by the same rule in
         // `response.rs`.
+        let mut minified_here = false;
         if !resp.verbatim && !crate::response::cache_control_no_store(&resp.headers) {
-            if let Some(bytes) = resp.body.as_bytes() {
+            let area = self.state.page_area.borrow();
+            let source = if in_area {
+                Some(area.as_bytes())
+            } else {
+                resp.body.as_bytes()
+            };
+            if let Some(bytes) = source {
                 if !bytes.is_empty() {
                     let content_type =
                         crate::headers::get(&resp.headers[..], "content-type").unwrap_or("");
@@ -760,11 +790,18 @@ impl Site {
                             limit.exceeded(bytes.len(), &format!("response {}", raw.path()));
                         error!("{}: {refusal}", self.name);
                         resp = Response::status(500);
+                        in_area = false;
                     } else if let Some(m) = minified(mime, bytes, minification) {
                         resp.body = crate::response::Body::Bytes(m);
+                        minified_here = true;
                     }
                 }
             }
+        }
+        if in_area && !minified_here {
+            // Not minified, so the page is copied out of the area as it is.
+            resp.body =
+                crate::response::Body::Bytes(self.state.page_area.borrow().as_bytes().to_vec());
         }
 
         let accept_encoding = raw.header("accept-encoding").unwrap_or("");
@@ -829,8 +866,11 @@ impl Site {
                 };
                 if let Some((coding, compressed)) = coded {
                     resp.body = crate::response::Body::Bytes(compressed);
-                    resp.headers
-                        .push(("Content-Encoding".to_string(), coding.to_string()));
+                    // `coding` is "br" or "gzip", a literal either way.
+                    resp.headers.push((
+                        HeaderText::Static("Content-Encoding"),
+                        HeaderText::Static(coding),
+                    ));
                 }
             }
         }
@@ -850,13 +890,13 @@ impl Site {
         // revalidating an error as though it were content.
         if resp.status < 300 && !resp.verbatim && !resp.body.is_empty() {
             if let Some(hash) = crate::response::default_etag(&resp.headers, &resp.body) {
-                // Sized for the quotes and sixteen hex digits. `format!`
-                // grows its String two or three times for the same value,
-                // which is two allocations this header does not need.
+                // The quotes and sixteen hex digits are at most 18 bytes, so
+                // the value is held in the header itself and allocates nothing.
                 use std::fmt::Write as _;
-                let mut value = String::with_capacity(18);
-                write!(value, "\"{hash:x}\"").expect("writing to a String cannot fail");
-                resp.headers.push(("ETag".to_string(), value));
+                let mut value = crate::headers::InlineBuf::new();
+                write!(value, "\"{hash:x}\"").expect("an ETag fits an inline text");
+                resp.headers
+                    .push((HeaderText::Static("ETag"), value.into_text()));
             }
         }
 
@@ -1048,6 +1088,17 @@ impl From<&RouteMethod> for Methods {
     }
 }
 
+/// The header texts a route sets on every response, made once when the site
+/// loads. Each response clones the `Arc`s, which is a count and not an
+/// allocation. The route owns them, so a reload that replaces the site frees
+/// them, and a response still being sent keeps its own until it is done.
+#[derive(Debug, Clone)]
+pub struct RouteHead {
+    cache: Arc<str>,
+    last_modified: Option<Arc<str>>,
+    headers: Vec<(Arc<str>, Arc<str>)>,
+}
+
 /// A compiled route pattern.
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
@@ -1084,6 +1135,13 @@ pub struct CompiledRoute {
     /// route's inputs, and `httpdate::fmt_http_date` allocates a `String` on
     /// every call it is asked to format.
     pub last_modified_http: Option<String>,
+    /// The header texts this route sets on every response, made once.
+    ///
+    /// `Cache-Control`, `Last-Modified` and the route's own `headers` are the
+    /// same for every request on a route, so each is made once, when the
+    /// route is loaded, and a response borrows it. A route built without going
+    /// through load makes them on first use.
+    pub head: std::sync::OnceLock<RouteHead>,
     /// Name of the registered handler this route dispatches to, if any.
     ///
     /// `Some` for a config route carrying `handler = "..."`. `None` for a
@@ -1562,6 +1620,23 @@ pub(crate) struct FrameworkState {
     pub(crate) flash_secret: Vec<u8>,
 }
 
+impl CompiledRoute {
+    /// The route's response header texts, made on first use. `FrameworkState::build`
+    /// calls this once per route after `last_modified_http` is known, so no
+    /// request makes them.
+    pub fn route_head(&self) -> &RouteHead {
+        self.head.get_or_init(|| RouteHead {
+            cache: Arc::from(self.cache.as_str()),
+            last_modified: self.last_modified_http.as_deref().map(Arc::from),
+            headers: self
+                .headers
+                .iter()
+                .map(|(k, v)| (Arc::from(k.as_str()), Arc::from(v.as_str())))
+                .collect(),
+        })
+    }
+}
+
 impl FrameworkState {
     pub(crate) fn build(
         config: crate::config::RendererConfig,
@@ -1601,6 +1676,7 @@ impl FrameworkState {
                 // time, so there is no input file whose mtime describes it.
                 last_modified: None,
                 last_modified_http: None,
+                head: Default::default(),
                 // A code route is bound by pattern and method at the call
                 // site, so it names no handler and carries no config of its
                 // own. The config-declared form below is the one that does.
@@ -1625,6 +1701,7 @@ impl FrameworkState {
                 headers: rc.headers.clone(),
                 last_modified: None,
                 last_modified_http: None, // filled in below, once templates_mtime is known
+                head: Default::default(),
                 handler: rc.handler.clone(),
                 settings: Arc::clone(&rc.settings),
                 base_dict: Arc::new(Map::new()), // filled in below
@@ -1677,6 +1754,9 @@ impl FrameworkState {
             }
             route.last_modified = newest;
             route.last_modified_http = newest.map(httpdate::fmt_http_date);
+            // The route's header texts are made here, once, and not by a request.
+            route.head = std::sync::OnceLock::new();
+            let _ = route.route_head();
         }
 
         // Collect template paths from config routes.
@@ -1974,10 +2054,16 @@ impl FrameworkState {
         // 8. Built-in keys (set after params files — cannot be overridden by them).
         // The reading comes from the layer and chrono only formats it.
         let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
-        let (datetime, year) = Self::builtin_dates(now);
-        dict.insert("request_path", Value::String(raw.path().to_string()));
-        dict.insert("datetime", Value::String(datetime));
-        dict.insert("year", Value::String(year));
+        let (mut datetime, mut year) = (
+            crate::headers::InlineBuf::new(),
+            crate::headers::InlineBuf::new(),
+        );
+        Self::builtin_dates(now, &mut datetime, &mut year);
+        // Written into the buffers these three keys held for the last request,
+        // so a page after a page allocates nothing for them.
+        dict.insert_str("request_path", raw.path());
+        dict.insert_str("datetime", datetime.as_str());
+        dict.insert_str("year", year.as_str());
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -2029,21 +2115,44 @@ impl FrameworkState {
             dict.insert("csrf_token", Value::String(token));
         }
 
+        if dict.overflowed() {
+            let limit = crate::dict::entry_limit();
+            return Err(Error::BadRequest(
+                limit
+                    .exceeded(limit.max() + 1, "the request's fields")
+                    .to_string(),
+            ));
+        }
+
         Ok(dict)
     }
 
-    /// The two built-in date values: RFC 3339 in UTC to the second, and the
-    /// four-digit year. No format string is parsed on the request path.
-    fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
-        use chrono::Datelike as _;
+    /// The two built-in date values, written into `datetime` and `year`: RFC
+    /// 3339 in UTC to the second, and the four-digit year. No format string is
+    /// parsed on the request path and no `String` is made.
+    fn builtin_dates(
+        now: chrono::DateTime<chrono::Utc>,
+        datetime: &mut crate::headers::InlineBuf,
+        year: &mut crate::headers::InlineBuf,
+    ) {
+        use chrono::{Datelike as _, Timelike as _};
         use std::fmt::Write as _;
         // `{:04}` is what `%Y` does for the years a site can see: four digits,
         // zero padded, so 0999 is "0999" and not "999". Negative and
         // five-digit years arrive with a sign or a fifth digit, which `%Y`
         // also prints, and neither can come from `Utc::now()`.
-        let mut year = String::new();
-        write!(year, "{:04}", now.year()).expect("writing to a String cannot fail");
-        (now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), year)
+        write!(year, "{:04}", now.year()).expect("a year fits an inline buffer");
+        write!(
+            datetime,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        )
+        .expect("a timestamp fits an inline buffer");
     }
 
     /// Render a template response.
@@ -2061,7 +2170,7 @@ impl FrameworkState {
         page_area: &RefCell<crate::limits::BoundedBuf>,
         resp: &mut Response,
         dict: &Dict,
-    ) -> std::result::Result<(), RenderError> {
+    ) -> std::result::Result<bool, RenderError> {
         if let Some(template_name) = resp.template_name.take() {
             // No copy on the common path. A response that supplied its own
             // context is rendered against that; one that did not is rendered
@@ -2072,26 +2181,55 @@ impl FrameworkState {
                 Some(supplied) => supplied,
                 None => dict,
             };
-            // The page is written into the reusable area, then copied out once
-            // at its exact size: the response owns its bytes, and the area is
-            // empty again for the next page.
+            // The page is written into the reusable area and left there: the
+            // caller reads it from the area, and copies it out only when
+            // nothing else makes the response's own bytes from it. Returns
+            // `true` for that.
             let mut area = page_area.borrow_mut();
             area.clear();
             renderer.render(template_name.as_ref(), ctx, &mut area)?;
-            resp.body = crate::response::Body::Bytes(area.as_bytes().to_vec());
             resp.headers.push((
-                "Content-Type".to_string(),
-                "text/html; charset=utf-8".to_string(),
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("text/html; charset=utf-8"),
             ));
             resp.template_dict = None;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 }
 
 #[cfg(test)]
 mod builtin_dates_tests {
     use super::FrameworkState;
+
+    /// The two values as `String`s, from the inline buffers `build_dict` uses.
+    fn dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+        let mut datetime = crate::headers::InlineBuf::new();
+        let mut year = crate::headers::InlineBuf::new();
+        FrameworkState::builtin_dates(now, &mut datetime, &mut year);
+        (datetime.as_str().to_string(), year.as_str().to_string())
+    }
+
+    /// The hand-written form is the one chrono's `to_rfc3339_opts` writes, for
+    /// the years a clock can show.
+    #[test]
+    fn builtin_dates_match_chrono_across_the_years() {
+        use chrono::TimeZone as _;
+        for (y, secs) in [
+            (1970, 0),
+            (2000, 86_399),
+            (2026, 1_234_567),
+            (2099, 31_000_000),
+        ] {
+            let now = chrono::Utc.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap()
+                + chrono::Duration::seconds(secs);
+            assert_eq!(
+                dates(now).0,
+                now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            );
+        }
+    }
 
     /// The built-in dates keep the shape templates already read:
     /// `%Y-%m-%dT%H:%M:%SZ` and `%Y`. Pinned here so a change to how they are
@@ -2101,21 +2239,21 @@ mod builtin_dates_tests {
         use chrono::TimeZone as _;
 
         let now = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        let (datetime, year) = FrameworkState::builtin_dates(now);
+        let (datetime, year) = dates(now);
         assert_eq!(datetime, "2026-01-02T03:04:05Z");
         assert_eq!(year, "2026");
 
         let last = chrono::Utc
             .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
             .unwrap();
-        let (datetime, year) = FrameworkState::builtin_dates(last);
+        let (datetime, year) = dates(last);
         assert_eq!(datetime, "9999-12-31T23:59:59Z");
         assert_eq!(year, "9999");
 
         // The year `%Y` zero-pads and `to_string` did not, which is the only
         // place the two forms ever differed.
         let early = chrono::Utc.with_ymd_and_hms(999, 6, 1, 0, 0, 0).unwrap();
-        let (_, year) = FrameworkState::builtin_dates(early);
+        let (_, year) = dates(early);
         assert_eq!(year, "0999");
     }
 }
@@ -2819,6 +2957,117 @@ mod tests {
         assert!(site.state.page_area.borrow().overflow().is_some());
     }
 
+    /// The headers a route sets on every response are made once at load and
+    /// borrowed by each response: two requests share the same text, and a page
+    /// carries its `ETag` held in the header.
+    #[test]
+    fn a_rendered_pages_route_headers_are_borrowed_not_made_per_request() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            &[],
+        );
+        let get = || {
+            let mut slots = [httparse::EMPTY_HEADER; 64];
+            let head = match parse_head(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut slots) {
+                crate::h1::HeadResult::Complete(head) => head,
+                _ => panic!("the test's request must parse"),
+            };
+            match site.handle(&head) {
+                Handled::Done(resp) => resp,
+                _ => panic!("a template route is answered by core"),
+            }
+        };
+        let (first, second) = (get(), get());
+        let cache = |r: &Response| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+                .map(|(_, v)| v.clone())
+                .expect("a page carries Cache-Control")
+        };
+        let (a, b) = (cache(&first), cache(&second));
+        assert!(
+            matches!(a, HeaderText::Shared(_)) && matches!(b, HeaderText::Shared(_)),
+            "the route's Cache-Control is borrowed"
+        );
+        assert!(std::ptr::eq(a.as_str(), b.as_str()), "both borrow one text");
+        let etag = first
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+            .expect("a page carries an ETag");
+        assert!(
+            matches!(etag.1, HeaderText::Inline { .. }),
+            "the ETag is inline"
+        );
+    }
+
+    /// A request with more fields than the `request_dict` maximum is refused
+    /// with a 400, and one within it is answered.
+    #[test]
+    fn a_request_with_too_many_fields_is_refused_with_a_400() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            &[],
+        );
+        let post = |fields: usize| {
+            let body: String = std::iter::once("name=Ada".to_string())
+                .chain((0..fields).map(|i| format!("f{i}=x")))
+                .collect::<Vec<_>>()
+                .join("&");
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut slots = [httparse::EMPTY_HEADER; 64];
+            let head = match parse_head(request.as_bytes(), &mut slots) {
+                crate::h1::HeadResult::Complete(head) => head,
+                _ => panic!("the test's request must parse"),
+            };
+            match site.handle(&head) {
+                Handled::Done(resp) => resp.status,
+                _ => panic!("a template route is answered by core"),
+            }
+        };
+        let max = crate::dict::entry_limit().max();
+        assert_eq!(post(10), 200);
+        assert_eq!(post(max + 10), 400, "past [limits.request_dict] max");
+    }
+
+    /// A site owns its route header texts: a reload replaces the site, and the
+    /// old site's texts are freed once the responses still holding them are
+    /// done. A thousand reloads with changing values leave nothing behind.
+    #[test]
+    fn a_reload_frees_the_old_sites_route_header_texts() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            &[],
+        );
+        let base = site.state.routes.routes()[0].clone();
+        let mut in_flight: Vec<(std::sync::Weak<str>, HeaderText)> = Vec::new();
+        for i in 0..1000 {
+            // A reload: a new route with values that changed.
+            let mut route = base.clone();
+            route.cache = format!("public, max-age={i}");
+            route.head = std::sync::OnceLock::new();
+            let head = route.route_head();
+            let weak = Arc::downgrade(&head.cache);
+            // A response holds the text while it is sent.
+            let held = HeaderText::Shared(Arc::clone(&head.cache));
+            drop(route);
+            assert!(
+                weak.upgrade().is_some(),
+                "an in-flight response keeps its text"
+            );
+            in_flight.push((weak, held));
+        }
+        // Every response finishes; no old text is left anywhere.
+        let weaks: Vec<_> = in_flight.drain(..).map(|(w, _held)| w).collect();
+        assert_eq!(weaks.iter().filter(|w| w.upgrade().is_some()).count(), 0);
+    }
+
     /// A page past the `minify_output` or `compress_output` maximum is refused
     /// with a 500, not served unminified or uncompressed.
     #[test]
@@ -3170,6 +3419,7 @@ mod tests {
             headers: vec![],
             last_modified: None,
             last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
@@ -3202,6 +3452,7 @@ mod tests {
             headers: vec![],
             last_modified: None,
             last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
@@ -3227,6 +3478,7 @@ mod tests {
                 headers: vec![],
                 last_modified: None,
                 last_modified_http: None,
+                head: Default::default(),
                 handler: None,
                 settings: Arc::new(Map::new()),
                 base_dict: Arc::new(Map::new()),
@@ -3243,6 +3495,7 @@ mod tests {
                 headers: vec![],
                 last_modified: None,
                 last_modified_http: None,
+                head: Default::default(),
                 handler: None,
                 settings: Arc::new(Map::new()),
                 base_dict: Arc::new(Map::new()),
@@ -3515,6 +3768,7 @@ mod wildcard_route_tests {
             headers: Vec::new(),
             last_modified: None,
             last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),
@@ -4435,6 +4689,7 @@ mod route_rule_tests {
             headers: Vec::new(),
             last_modified: None,
             last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: Arc::new(Map::new()),
             base_dict: Arc::new(Map::new()),

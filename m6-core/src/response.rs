@@ -13,6 +13,7 @@
 //! `send` takes `self` by value, because a stream owns its reader and a
 //! response goes on the wire once.
 
+use crate::headers::{HeaderText, Headers};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -107,7 +108,7 @@ impl std::fmt::Debug for Body {
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::headers::Headers,
     pub body: Body,
     /// The handler has produced the exact representation to send.
     ///
@@ -157,7 +158,7 @@ impl From<crate::http::RawResponse> for Response {
     fn from(r: crate::http::RawResponse) -> Self {
         Self {
             status: r.status,
-            headers: r.headers,
+            headers: headers_of_iter(r.headers.into_iter().map(|(k, v)| (k.into(), v.into()))),
             body: Body::Bytes(r.body),
             verbatim: true,
             template_name: None,
@@ -212,7 +213,7 @@ impl Response {
     ) -> Result<Self> {
         Ok(Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: Some(template.into()),
@@ -228,7 +229,7 @@ impl Response {
     pub fn render_request_dict(template: impl Into<Arc<str>>, status: u16) -> Self {
         Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: Some(template.into()),
@@ -239,7 +240,7 @@ impl Response {
     pub fn redirect(location: &str) -> Self {
         Self {
             status: 302,
-            headers: vec![("Location".to_string(), location.to_string())],
+            headers: headers_of([(HeaderText::Static("Location"), location.into())]),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -250,7 +251,7 @@ impl Response {
     pub fn redirect_permanent(location: &str) -> Self {
         Self {
             status: 301,
-            headers: vec![("Location".to_string(), location.to_string())],
+            headers: headers_of([(HeaderText::Static("Location"), location.into())]),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -266,7 +267,10 @@ impl Response {
         let body = serde_json::to_vec(&value).unwrap_or_default();
         Self {
             status,
-            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            headers: headers_of([(
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("application/json"),
+            )]),
             body: Body::Bytes(body),
             verbatim: false,
             template_name: None,
@@ -282,10 +286,10 @@ impl Response {
     pub fn html(s: impl Into<String>) -> Self {
         Self {
             status: 200,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/html; charset=utf-8".to_string(),
-            )],
+            headers: headers_of([(
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("text/html; charset=utf-8"),
+            )]),
             body: Body::Bytes(s.into().into_bytes()),
             verbatim: false,
             template_name: None,
@@ -316,7 +320,7 @@ impl Response {
     pub fn stream(status: u16, len: u64, reader: impl std::io::Read + Send + 'static) -> Self {
         Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::Stream {
                 len,
                 reader: Box::new(reader),
@@ -346,10 +350,10 @@ impl Response {
     pub fn text(s: &str) -> Self {
         Self {
             status: 200,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
+            headers: headers_of([(
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("text/plain; charset=utf-8"),
+            )]),
             body: Body::Bytes(s.as_bytes().to_vec()),
             verbatim: false,
             template_name: None,
@@ -369,7 +373,7 @@ impl Response {
     pub fn status(code: u16) -> Self {
         Self {
             status: code,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -392,7 +396,7 @@ impl Response {
     // ---------- chained modifiers ----------
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_string(), value.to_string()));
+        self.headers.push((name.into(), value.into()));
         self
     }
 
@@ -408,7 +412,8 @@ impl Response {
         } else {
             crate::cookie::Cookie::new(name, value).max_age(max_age)
         };
-        self.headers.push(c.path("/").http_only().to_header());
+        let (k, v) = c.path("/").http_only().to_header();
+        self.headers.push((k.into(), v.into()));
         self
     }
 
@@ -434,13 +439,14 @@ impl Response {
 
         let cookie_val = format!("{}.{}", msg_b64, sig_b64);
         let mut s = self;
-        s.headers.push(
-            crate::cookie::Cookie::new("_flash", cookie_val)
+        {
+            let (name, value) = crate::cookie::Cookie::new("_flash", cookie_val)
                 .max_age(120)
                 .path("/")
                 .http_only()
-                .to_header(),
-        );
+                .to_header();
+            s.headers.push((name.into(), value.into()));
+        }
         s
     }
 
@@ -507,7 +513,7 @@ impl Response {
 /// One rule for every sender: `Response::send` and a connection slot both build
 /// their head from this, so the two cannot default differently.
 pub(crate) fn head_fields<'a>(
-    headers: &'a [(String, String)],
+    headers: &'a [crate::headers::Header],
     body_is_empty: bool,
 ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
     let fields = headers.iter().map(|(k, v)| (k.as_str(), v.as_str()));
@@ -519,13 +525,24 @@ pub(crate) fn head_fields<'a>(
     fields.chain(content_type)
 }
 
+/// A header list holding `items`.
+fn headers_of<const N: usize>(items: [crate::headers::Header; N]) -> Headers {
+    headers_of_iter(items)
+}
+
+fn headers_of_iter(items: impl IntoIterator<Item = crate::headers::Header>) -> Headers {
+    let mut list = Headers::new();
+    list.extend(items);
+    list
+}
+
 /// The default `ETag` for a buffered body: a content hash, unless the response
 /// carries its own tag, has no body, or asks caches not to store it.
 ///
 /// A `Body::Stream` has no `ETag` by construction: hashing it would mean
 /// reading it, which is the whole thing streaming avoids. One rule for
 /// `Response::send` and a connection slot, so the tag they emit cannot differ.
-pub(crate) fn default_etag(headers: &[(String, String)], body: &Body) -> Option<u64> {
+pub(crate) fn default_etag(headers: &[crate::headers::Header], body: &Body) -> Option<u64> {
     let Body::Bytes(bytes) = body else {
         return None;
     };
@@ -552,7 +569,7 @@ fn content_hash(body: &[u8]) -> u64 {
 /// one directive and does not read as `no-store`. `no-store` is a bare
 /// directive name, matched exactly and case-insensitively across every field
 /// line. It is also the rule for minification in `site.rs`.
-pub(crate) fn cache_control_no_store(headers: &[(String, String)]) -> bool {
+pub(crate) fn cache_control_no_store(headers: &[crate::headers::Header]) -> bool {
     crate::headers::get_all(headers, "cache-control").any(|value| {
         let mut in_quotes = false;
         let mut escaped = false;

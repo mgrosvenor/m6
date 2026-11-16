@@ -131,6 +131,10 @@ pub const H2_RECV: LimitSpec = bytes("h2_recv", 16 * KIB, 4 * MIB);
 pub const H2_HEADER_BLOCK: LimitSpec = bytes("h2_header_block", 16 * KIB, 256 * KIB);
 /// The body of one HTTP/2 request stream.
 pub const H2_STREAM_BODY: LimitSpec = bytes("h2_stream_body", 4 * KIB, 32 * MIB);
+/// Entries in one request's dictionary overlay: the query, form fields,
+/// path parameters, cookies and built-ins. A request that needs more is
+/// refused with a 400.
+pub const REQUEST_DICT: LimitSpec = count("request_dict", 32, 4096);
 /// Stale cache entries waiting to be fetched again.
 pub const REFRESH_QUEUE: LimitSpec = count("refresh_queue", 16, 4096);
 /// Client addresses the per-address request counter tracks.
@@ -162,6 +166,7 @@ pub const KNOWN: &[LimitSpec] = &[
     H2_HEADER_BLOCK,
     H2_STREAM_BODY,
     REFRESH_QUEUE,
+    REQUEST_DICT,
     RATE_LIMIT_ADDRESSES,
     CACHE_BYTES,
     HISTORY_QUEUE,

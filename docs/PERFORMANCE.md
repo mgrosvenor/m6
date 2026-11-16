@@ -135,6 +135,55 @@ The cheaper lever sits on the site side: a content file named as both `global_pa
 Removing core's copying left one measured cost inside the template engine and nothing measurable in core itself.
 The file path had a separate problem, which was allocation rather than latency.
 
+### 2.6. The borrowed response head
+
+A rendered page's header names and values are set up once and borrowed, and the page's own bytes are copied out of the page area once, as the minified body.
+The change took the page path from 50 allocations per request to 41 in `site_allocs`, and from 36 to 27 in `request_allocs`.
+Of the 27, 22 are the libraries': 11 in Tera's context and render, 2 in `render_to`, and 11 in minify-html.
+The other 5 are ours: the built-in `year` and `datetime` values (2), the dictionary overlay's first map node and its key insert (2), and the response's header vector (1).
+
+What changed:
+
+- `Response.headers` holds `HeaderText` pairs. A `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline, or owns a `String`, and it derefs to `str`.
+- A route's `Cache-Control`, `Last-Modified` and extra headers are made once, when the route loads, as `Arc<str>` texts that the route owns, and each response clones the `Arc`, which is a count and not an allocation. A reload that replaces the site frees the old texts once the responses still sending them are done, so nothing grows across reloads. The header names `Content-Type`, `Content-Encoding`, `ETag` and `Cache-Control` are literals.
+- The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes where it was before, so the page carries its validator to the caller and to the edge's cache, as CACHE-HDR's tests require. Computing it at serialisation instead would move it out of `Response.headers`, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it there.
+- A rendered page stays in the page area until the minifier has read it, so the copy out of the area is the minified body. A page that is not minified is copied once, as before.
+
+What stays, and why:
+
+- The response's header vector allocates once. Its removal needs a header buffer that the connection owns and reuses, which is the page-context redesign that also removes the four dictionary allocations.
+- A response is not written straight from the page area, because `Response.body` is an owned `Vec<u8>` that the compression stage and the caller take. The area is read directly where a stage can read it, which is the minifier.
+
+**Rollback.**
+Revert the merge commit of `perf/borrowed-response-head`, found with `git log --first-parent --merges --grep borrowed-response-head`.
+Reverting returns `Response.headers` to `Vec<(String, String)>`, one `String` pair for each header a page sets, and the page copy out of the area.
+The budgets go back with it: `site_allocs` from 41 to 50, `request_allocs`'s template budget from 27 to 36 and its handler budget from 21 to 23.
+The revert changes no wire byte: a page carries the same headers in the same order before and after.
+
+### 2.7. The reusable page context
+
+A rendered page now makes no allocation of its own.
+In `request_allocs` a template request went from 27 allocations to 22, and every one of the 22 is Tera's or minify-html's.
+In `site_allocs`, which carries a params file and the connection's read and write, the page path went from 41 to 36, and a traced run shows all 36 are minify-html's 21 and Tera's 15.
+The handler request went from 21 to 16: the owned request (10), its cookies (5) and the route handle (1) are the ones left.
+
+What changed:
+
+- The dictionary's per-request layer is a list, not a map, and it is taken from a spare one that the last request left on the thread. The service runs one loop on one thread, so the spare is the service's own reusable dictionary. It is cleared, not freed, and it never shrinks.
+- The three built-in values, `request_path`, `datetime` and `year`, are written into the `String` buffers the last request left for those keys. A spare overlay keeps only those three, each at most 8 KiB, so nothing else of the last request waits in it.
+- `datetime` and `year` are formatted into stack buffers, and no format string is parsed.
+- A response's header list goes back to a spare list on the thread when the response is dropped, with sixteen headers of room, and the next response takes it.
+- The overlay's size follows the `request_dict` limit, 32 entries at start and 4096 at most. A request with more fields is refused with a 400 that names the key.
+
+What stays: the handler path's owned request and its cookies, because a handler is handed a `Request` that owns them.
+
+**Rollback.**
+Revert the merge commit of `perf/reusable-page-context`, found with `git log --first-parent --merges --grep reusable-page-context`.
+Reverting returns the overlay to a `BTreeMap`, the built-ins to a fresh `String` for each request, and the header list to a `Vec` made for each response: five allocations on a rendered page.
+The budgets go back with it: `site_allocs` from 36 to 41, `request_allocs`'s template budget from 22 to 27 and its handler budget from 16 to 21.
+The `request_dict` key is removed with it, and a config that sets it then stops the start with exit 2 as an unknown limit.
+The revert changes no wire byte and no template's context.
+
 ---
 
 ## 3. Allocation on the static file path

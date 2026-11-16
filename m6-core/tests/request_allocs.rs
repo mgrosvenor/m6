@@ -38,7 +38,14 @@ const BASE_IDENTITY_DIFFERENCE: usize = 1;
 /// ever be lowered: a change that raises it is refused rather than priced in.
 /// A dependency update that moves it down records the new number, with the
 /// reason, in that commit.
-const HANDLER_BUDGET: usize = 23;
+///
+/// 23 before the borrowed response head, which made `Response::text`'s two
+/// header texts and the route's `Cache-Control` borrow a `&'static str`: 21.
+///
+/// 21 before the reusable page context, which made the dictionary overlay, its
+/// built-in values and the response's header list reusable: 16. The 16 are the
+/// owned request's (10), its cookies' (5) and the route handle's (1).
+const HANDLER_BUDGET: usize = 16;
 
 /// The allocations one `/page` request makes with every removal in place.
 ///
@@ -55,9 +62,18 @@ const HANDLER_BUDGET: usize = 23;
 /// rendered-page job then removed the owned request (9), the compression
 /// candidate `Vec` (1) and two of the ETag's four (the pre-sized value), took
 /// the cached `Last-Modified` (1), borrowed the dictionary's built-in keys (5)
-/// and shared the template name (1): 36. What remains is listed in
-/// `work-queue/out/ALLOC-RENDER-ZERO.md`.
-const TEMPLATE_BUDGET: usize = 36;
+/// and shared the template name (1): 36. The borrowed response head then took
+/// the header names (4), the `Cache-Control`, `Last-Modified` and
+/// `Content-Type` values (3), the `ETag` value (1, now held inline in the
+/// header) and the copy of the page out of the page area that minification
+/// replaces anyway (1): 27. Of the 27, 22 are Tera's (11 for the context and
+/// render, 2 in `render_to`) and minify-html's (11), and 5 are ours: the
+/// built-in `year` and `datetime` values (2), the dictionary overlay's first
+/// map node and its key insert (2), and the response's header vector (1).
+/// The reusable page context then took all five: the overlay and its built-in
+/// values are reused from one request to the next, and the header list is
+/// reused across responses. 22, every one of them Tera's or minify-html's.
+const TEMPLATE_BUDGET: usize = 22;
 
 const BIG: &[u8] = b"GET /big HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
 const RAW: &[u8] = b"GET /raw HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";

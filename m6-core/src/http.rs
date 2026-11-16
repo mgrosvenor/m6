@@ -328,6 +328,34 @@ impl HeaderSource for [(String, String)] {
     }
 }
 
+impl HeaderSource for [crate::headers::Header] {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl HeaderSource for Vec<crate::headers::Header> {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.as_slice().find(name)
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.as_slice().find_all(name)
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
 // `&Vec<T>` does not itself satisfy a generic `impl HeaderSource` bound even
 // though it coerces to `&[T]` in ordinary (non-generic) call positions — trait
 // resolution for `impl Trait` arguments needs the concrete type to implement

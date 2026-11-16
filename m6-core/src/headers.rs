@@ -42,6 +42,318 @@
 
 use crate::http::HeaderSource;
 
+/// The text of one response header name or value.
+///
+/// A response's headers were `String` pairs, so every response paid an
+/// allocation for each name and each value, including the ones core sets the
+/// same way for every request on a route. This holds the three shapes a header
+/// text takes without one:
+///
+/// - [`HeaderText::Static`] borrows a `&'static str`: a name such as
+///   `Cache-Control` or a constant value.
+/// - [`HeaderText::Shared`] shares an `Arc<str>`: a route's value, made once
+///   when the site loads and owned by that site. A response clones the `Arc`,
+///   which is a count and not an allocation, and keeps its text alive until it
+///   is sent even if a reload has replaced the site.
+/// - [`HeaderText::Inline`] keeps up to 23 bytes in the value itself: an `ETag`
+///   is 18.
+/// - [`HeaderText::Owned`] is the `String` a handler supplied.
+///
+/// It derefs to `str`, so a reader needs no change.
+#[derive(Clone)]
+pub enum HeaderText {
+    Static(&'static str),
+    Shared(std::sync::Arc<str>),
+    Inline { len: u8, bytes: [u8; 23] },
+    Owned(String),
+}
+
+impl HeaderText {
+    /// A text that borrows a `'static` string.
+    pub const fn from_static(s: &'static str) -> Self {
+        HeaderText::Static(s)
+    }
+
+    /// A text holding `s` in the value itself, or `None` when it is longer than
+    /// 23 bytes.
+    pub fn inline(s: &str) -> Option<Self> {
+        if s.len() > 23 {
+            return None;
+        }
+        let mut bytes = [0u8; 23];
+        bytes[..s.len()].copy_from_slice(s.as_bytes());
+        Some(HeaderText::Inline {
+            len: s.len() as u8,
+            bytes,
+        })
+    }
+
+    /// The text as a `str`.
+    pub fn as_str(&self) -> &str {
+        match self {
+            HeaderText::Static(s) => s,
+            HeaderText::Shared(s) => s,
+            HeaderText::Inline { len, bytes } => {
+                std::str::from_utf8(&bytes[..*len as usize]).expect("an inline text is UTF-8")
+            }
+            HeaderText::Owned(s) => s,
+        }
+    }
+
+    /// The text as an owned `String`.
+    pub fn into_string(self) -> String {
+        match self {
+            HeaderText::Owned(s) => s,
+            other => other.as_str().to_string(),
+        }
+    }
+}
+
+impl std::ops::Deref for HeaderText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for HeaderText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for HeaderText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for HeaderText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl From<String> for HeaderText {
+    fn from(s: String) -> Self {
+        HeaderText::Owned(s)
+    }
+}
+
+impl From<&str> for HeaderText {
+    fn from(s: &str) -> Self {
+        HeaderText::Owned(s.to_string())
+    }
+}
+
+impl From<std::sync::Arc<str>> for HeaderText {
+    fn from(s: std::sync::Arc<str>) -> Self {
+        HeaderText::Shared(s)
+    }
+}
+
+impl From<&String> for HeaderText {
+    fn from(s: &String) -> Self {
+        HeaderText::Owned(s.clone())
+    }
+}
+
+impl From<HeaderText> for String {
+    fn from(t: HeaderText) -> String {
+        t.into_string()
+    }
+}
+
+impl PartialEq for HeaderText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for HeaderText {}
+
+impl PartialEq<str> for HeaderText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for HeaderText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for HeaderText {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<HeaderText> for &str {
+    fn eq(&self, other: &HeaderText) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<HeaderText> for String {
+    fn eq(&self, other: &HeaderText) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+/// A writer that fills the 23 inline bytes of a [`HeaderText`], for a value
+/// formatted per response, such as an `ETag`. Writing more than 23 bytes is an
+/// error, so a caller that cannot bound its value uses a `String`.
+#[derive(Default)]
+pub struct InlineBuf {
+    len: usize,
+    bytes: [u8; 23],
+}
+
+impl InlineBuf {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The bytes written, as a `str`.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("only str was written")
+    }
+
+    /// The bytes written, as an inline [`HeaderText`].
+    pub fn into_text(self) -> HeaderText {
+        HeaderText::Inline {
+            len: self.len as u8,
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl std::fmt::Write for InlineBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.bytes.len() {
+            return Err(std::fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// One response header, name then value.
+pub type Header = (HeaderText, HeaderText);
+
+/// How many header lists one thread keeps for the next response, and how many
+/// headers each starts with.
+const SPARE_HEADER_LISTS: usize = 4;
+const HEADER_LIST_START: usize = 16;
+
+thread_local! {
+    /// Header lists whose response has been sent: cleared, capacity kept. A
+    /// service runs one loop on one thread, so this is the service's own
+    /// reusable header list.
+    ///
+    /// Made with room for every spare it keeps, on the thread's first use, so
+    /// putting a list back never allocates.
+    static SPARE_HEADERS: std::cell::RefCell<Vec<Vec<Header>>> =
+        std::cell::RefCell::new(Vec::with_capacity(SPARE_HEADER_LISTS));
+}
+
+/// Make this thread's spare header lists. Start only: a service calls it before
+/// its loop, so the first response sent allocates nothing for them.
+pub fn warm_spare_lists() {
+    SPARE_HEADERS.with(|_| {});
+}
+
+/// A response's header list. It is a `Vec<Header>` that goes back to a spare
+/// list for this thread when the response is dropped, with its capacity, so the
+/// next response pushes into room that already exists and allocates nothing.
+/// It never shrinks.
+#[derive(Default)]
+pub struct Headers(Vec<Header>);
+
+impl Headers {
+    /// An empty list: a spare one if this thread has one, else one with room for
+    /// sixteen headers.
+    pub fn new() -> Self {
+        Headers(
+            SPARE_HEADERS
+                .with(|s| s.borrow_mut().pop())
+                .unwrap_or_else(|| Vec::with_capacity(HEADER_LIST_START)),
+        )
+    }
+
+    /// The headers as an owned `Vec`, which does not go back to the spares.
+    pub fn into_vec(mut self) -> Vec<Header> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Headers {
+    fn drop(&mut self) {
+        if self.0.capacity() == 0 {
+            return;
+        }
+        let mut list = std::mem::take(&mut self.0);
+        list.clear();
+        SPARE_HEADERS.with(|s| {
+            let mut spare = s.borrow_mut();
+            if spare.len() < SPARE_HEADER_LISTS {
+                spare.push(list);
+            }
+        });
+    }
+}
+
+impl std::ops::Deref for Headers {
+    type Target = Vec<Header>;
+    fn deref(&self) -> &Vec<Header> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Headers {
+    fn deref_mut(&mut self) -> &mut Vec<Header> {
+        &mut self.0
+    }
+}
+
+impl Clone for Headers {
+    fn clone(&self) -> Self {
+        Headers(self.0.clone())
+    }
+}
+
+impl std::fmt::Debug for Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Vec<Header>> for Headers {
+    fn from(v: Vec<Header>) -> Self {
+        Headers(v)
+    }
+}
+
+impl<'a> IntoIterator for &'a Headers {
+    type Item = &'a Header;
+    type IntoIter = std::slice::Iter<'a, Header>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for Headers {
+    type Item = Header;
+    type IntoIter = std::vec::IntoIter<Header>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
 /// The largest one request header field, counted as its name plus its value.
 ///
 /// The number is the one nginx bounds a field line with (`8k`), the one
@@ -96,13 +408,10 @@ pub fn get<'a>(headers: &'a (impl HeaderSource + ?Sized), name: &str) -> Option<
 
 /// Every value for `name`, in the order sent.
 pub fn get_all<'a>(
-    headers: &'a [(String, String)],
+    headers: &'a (impl HeaderSource + ?Sized),
     name: &'a str,
 ) -> impl Iterator<Item = &'a str> + 'a {
-    headers
-        .iter()
-        .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+    headers.find_all(name)
 }
 
 pub fn contains(headers: &(impl HeaderSource + ?Sized), name: &str) -> bool {
@@ -116,7 +425,7 @@ pub fn contains(headers: &(impl HeaderSource + ?Sized), name: &str) -> bool {
 /// `Set-Cookie` rather than a joined string is the point: a caller that wanted
 /// the values gets nothing and goes looking, instead of getting something
 /// plausible and wrong.
-pub fn combine(headers: &[(String, String)], name: &str) -> Option<String> {
+pub fn combine(headers: &(impl HeaderSource + ?Sized), name: &str) -> Option<String> {
     if !may_combine(name) {
         return None;
     }
@@ -190,6 +499,50 @@ pub fn remove(headers: &mut Vec<(String, String)>, name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
+    #[test]
+    fn a_header_text_holds_static_inline_and_owned_text_the_same_way() {
+        let texts = [
+            HeaderText::from_static("etag"),
+            HeaderText::from(std::sync::Arc::<str>::from("etag")),
+            HeaderText::inline("etag").unwrap(),
+            HeaderText::from("etag".to_string()),
+            HeaderText::from("etag"),
+        ];
+        for t in &texts {
+            assert_eq!(t, "etag");
+            assert_eq!(&**t, "etag");
+            assert_eq!(*t, texts[0]);
+            assert_eq!(format!("{t} {t:?}"), "etag \"etag\"");
+        }
+        assert!(HeaderText::inline(&"x".repeat(23)).is_some());
+        assert!(HeaderText::inline(&"x".repeat(24)).is_none());
+    }
+
+    /// A response's header list goes back to a spare one when it is dropped,
+    /// empty and with its room, and the next response takes it.
+    #[test]
+    fn a_header_list_is_reused_by_the_next_response() {
+        let mut first = Headers::new();
+        first.push(("A".into(), "1".into()));
+        let buffer = first.as_ptr();
+        drop(first);
+        let second = Headers::new();
+        assert!(second.is_empty(), "nothing of the last response is left");
+        assert!(second.capacity() >= HEADER_LIST_START);
+        assert_eq!(second.as_ptr(), buffer, "the list is the last one's");
+    }
+
+    #[test]
+    fn an_inline_buffer_takes_an_etag_and_refuses_what_does_not_fit() {
+        let mut b = InlineBuf::new();
+        write!(b, "\"{:x}\"", u64::MAX).unwrap();
+        assert_eq!(b.into_text(), "\"ffffffffffffffff\"");
+        let mut b = InlineBuf::new();
+        assert!(write!(b, "{}", "x".repeat(24)).is_err());
+    }
+
     use super::*;
 
     fn h() -> Vec<(String, String)> {
