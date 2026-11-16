@@ -20,6 +20,7 @@ use crate::forward::{HttpRequest, PendingDispatch};
 use crate::http11::{HitHeaders, RequestOutcome};
 use crate::priority::Priority;
 use m6_core::headers::MAX_REQUEST_HEAD;
+use m6_core::log::error;
 
 /// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over a private backbone).
 pub enum H2Io<'a> {
@@ -30,6 +31,14 @@ pub enum H2Io<'a> {
     Plain {
         stream: &'a std::net::TcpStream,
     },
+}
+
+impl H2Io<'_> {
+    /// Whether rustls holds encrypted bytes the socket has not taken, which is
+    /// the socket refusing more.
+    fn tls_pending(&self) -> bool {
+        matches!(self, H2Io::Tls { tls, .. } if tls.wants_write())
+    }
 }
 
 // ── Frame type constants ──────────────────────────────────────────────────────
@@ -77,14 +86,14 @@ const MAX_CONCURRENT: u32 = 100;
 /// a peer could park here by opening and closing large uploads.
 const FREE_STREAMS: usize = MAX_CONCURRENT as usize;
 
-/// Hard ceiling on a single buffered HTTP/2 request body.
-///
-/// Not an RFC requirement -- a robustness one. Request bodies were accumulated
-/// with no bound while flow-control credit was handed straight back, so a peer
-/// could stream indefinitely and grow the process until it was killed. Any cap
-/// removes that; this one is above the 16 MiB multipart limit the renderers
-/// already enforce, so it never trips before their own check does.
-const MAX_H2_BODY: usize = 20 * 1024 * 1024;
+// The ceiling on a single buffered HTTP/2 request body is the `h2_stream_body`
+// limit's maximum.
+//
+// Not an RFC requirement -- a robustness one. Request bodies were accumulated
+// with no bound while flow-control credit was handed straight back, so a peer
+// could stream indefinitely and grow the process until it was killed. Any cap
+// removes that; this one is above the 16 MiB multipart limit the renderers
+// already enforce, so it never trips before their own check does.
 
 /// Largest inbound frame payload we will accept, RFC 9113 4.2.
 ///
@@ -97,27 +106,26 @@ const MAX_H2_BODY: usize = 20 * 1024 * 1024;
 /// the limit we are obliged to enforce (F-005, defect 1).
 const MAX_FRAME_SIZE: usize = 16_384;
 
-/// Ceiling on one request's accumulated header block, across HEADERS plus
-/// every CONTINUATION that follows it.
-///
-/// This is the CONTINUATION-flood bound (CVE-2024-27316 class, F-005 defect
-/// 2). Header bytes accumulated with no limit at all: `MAX_H2_BODY` caps the
-/// request *body* and `MAX_REQUEST_BYTES` caps the HTTP/1.1 read buffer, and
-/// neither touches this buffer.
-///
-/// Why the flood evades every other defence: the per-IP rate limiter runs
-/// inside the request handler, and the handler is only reached once a request
-/// completes. A sequence that never sets END_HEADERS never dispatches, so the
-/// limiter never sees it, while the idle timeout is reset by each frame
-/// received. One connection, unauthenticated, grows memory until the process
-/// is OOM-killed.
-///
-/// 256 KiB is generous for real traffic (a large browser request is a few KiB)
-/// and matches the order other servers use.
-const MAX_HEADER_BLOCK: usize = 256 * 1024;
+// The ceiling on one request's accumulated header block, across HEADERS plus
+// every CONTINUATION that follows it, is the `h2_header_block` limit's maximum.
+//
+// This is the CONTINUATION-flood bound (CVE-2024-27316 class, F-005 defect
+// 2). Header bytes accumulated with no limit at all: the `h2_stream_body` limit caps the
+// request *body* and the `edge_request` limit caps the HTTP/1.1 read buffer, and
+// neither touches this buffer.
+//
+// Why the flood evades every other defence: the per-IP rate limiter runs
+// inside the request handler, and the handler is only reached once a request
+// completes. A sequence that never sets END_HEADERS never dispatches, so the
+// limiter never sees it, while the idle timeout is reset by each frame
+// received. One connection, unauthenticated, grows memory until the process
+// is OOM-killed.
+//
+// 256 KiB is generous for real traffic (a large browser request is a few KiB)
+// and matches the order other servers use.
 
 // The decoded head is bounded by `m6_core::headers::MAX_REQUEST_HEAD`, the one
-// number the HTTP/1.1 parser and both backends use. `MAX_HEADER_BLOCK` bounds
+// number the HTTP/1.1 parser and both backends use. The `h2_header_block` limit bounds
 // the compressed block only: HPACK lets one byte refer to a table entry of up
 // to 4096 bytes, so a block under that cap can still decode to hundreds of
 // megabytes of fields (an HPACK bomb), and the decoded bound closes that
@@ -146,11 +154,12 @@ const HPACK_MAX_TABLE_SIZE: usize = 4096;
 
 /// How many recently-reset stream ids to remember. See `recently_reset`.
 ///
-/// Deliberately above `MAX_CONCURRENT`, because these entries are also what
-/// makes the concurrency cap bind against Rapid Reset (see `RESET_DECAY`). At
-/// or below the cap, a peer could evict its own reset records by resetting
-/// enough streams and win back the slots that way.
-const RESET_MEMORY: usize = 128;
+/// Twice `MAX_CONCURRENT`, derived from it so the memory stays above the
+/// concurrency cap whatever the cap is. These entries are also what makes the
+/// cap bind against Rapid Reset (see `RESET_DECAY`). At or below the cap, a
+/// peer could evict its own reset records by resetting enough streams and win
+/// back the slots that way.
+const RESET_MEMORY: usize = 2 * MAX_CONCURRENT as usize;
 
 /// How long a stream terminated by RST_STREAM keeps occupying a concurrency
 /// slot. Rapid Reset, CVE-2023-44487.
@@ -642,7 +651,7 @@ impl Http2Conn {
     pub fn new() -> Self {
         Http2Conn {
             phase: Phase::Preface,
-            recv_buf: Vec::with_capacity(16_384),
+            recv_buf: Vec::with_capacity(crate::limits::edge().h2_recv.start()),
             send_buf: Vec::with_capacity(16_384),
             decode_buf: Vec::with_capacity(MAX_REQUEST_HEAD.min(16 * 1024)),
             hdr_scratch: Vec::with_capacity(8 * 1024),
@@ -690,11 +699,15 @@ impl Http2Conn {
     /// send queue and continues that stream. A stream whose END_STREAM has gone
     /// out counts too, so the next flush frees its slot.
     pub fn has_pending_send(&self) -> bool {
-        !self.send_buf.is_empty()
-            || self
-                .streams
-                .values()
-                .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent)
+        !self.send_buf.is_empty() || self.more_to_flush()
+    }
+
+    /// Whether a stream still has DATA the windows allow, or has sent its
+    /// END_STREAM and waits to be reaped.
+    fn more_to_flush(&self) -> bool {
+        self.streams
+            .values()
+            .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent)
     }
 
     /// Drive one step: pump I/O, parse frames, dispatch requests. Returns
@@ -753,11 +766,9 @@ impl Http2Conn {
             }
         }
 
-        // Flush any response data that became unblocked this iteration
-        // (e.g. a WINDOW_UPDATE was processed inside the frame loop above).
-        self.flush_pending_streams();
-
-        if let Err(e) = self.flush_io(&mut io) {
+        // Send any response data that became unblocked this iteration (e.g. a
+        // WINDOW_UPDATE was processed inside the frame loop above).
+        if let Err(e) = self.send_until_blocked(&mut io) {
             m6_core::log::trace!("h2 flush_io: {e}");
             self.phase = Phase::Done;
         }
@@ -849,7 +860,24 @@ impl Http2Conn {
                 }
             }
         }
+        // Past the maximum the connection is refused, never read on: the
+        // frames wait in this buffer for the next turn's parse, and a peer
+        // that sends more than the maximum between two turns is not an
+        // HTTP/2 peer.
+        self.check_recv_room()?;
         Ok(moved)
+    }
+
+    /// Refuse the connection when its input buffer has passed the `h2_recv`
+    /// maximum, with an error that names the key.
+    fn check_recv_room(&self) -> io::Result<()> {
+        let limit = &crate::limits::edge().h2_recv;
+        if self.recv_buf.len() > limit.max() {
+            let refusal = limit.exceeded(self.recv_buf.len(), "an HTTP/2 connection's input");
+            error!("{refusal}");
+            return Err(io::Error::other(refusal));
+        }
+        Ok(())
     }
 
     fn flush_io(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
@@ -1449,7 +1477,7 @@ impl Http2Conn {
                 // SETTINGS_HEADER_TABLE_SIZE = 0xFFFFFFFF and m6 would size its
                 // own dynamic table cap at 4 GiB, then fill it with indexed
                 // literals across many header blocks -- the table lives for the
-                // whole connection, so MAX_HEADER_BLOCK's per-block cap does not
+                // whole connection, so the `h2_header_block` per-block cap does not
                 // bound the total. That is an out-of-memory vector, and it costs
                 // an attacker one SETTINGS frame.
                 //
@@ -1828,10 +1856,18 @@ impl Http2Conn {
                 stream.headers_done = true;
             }
         } else {
-            if self.header_block_buf.len() + header_block.len() > MAX_HEADER_BLOCK {
+            let limit = &crate::limits::edge().h2_header_block;
+            if self.header_block_buf.len() + header_block.len() > limit.max() {
+                error!(
+                    "{}",
+                    limit.exceeded(
+                        self.header_block_buf.len() + header_block.len(),
+                        "an HTTP/2 header block"
+                    )
+                );
                 self.send_goaway(ERR_ENHANCE_YOUR_CALM);
                 self.phase = Phase::GoingAway;
-                return Err("header block exceeds MAX_HEADER_BLOCK");
+                return Err("header block exceeds the h2_header_block maximum");
             }
             self.header_block_buf.extend_from_slice(header_block);
             self.continuation_stream_id = Some(stream_id);
@@ -1858,10 +1894,18 @@ impl Http2Conn {
         // The flood bound. Checked on every CONTINUATION, not merely at the end
         // of the block: the whole point of the attack is that the block never
         // ends, so a check that only runs at END_HEADERS never runs at all.
-        if self.header_block_buf.len() + payload.len() > MAX_HEADER_BLOCK {
+        let limit = &crate::limits::edge().h2_header_block;
+        if self.header_block_buf.len() + payload.len() > limit.max() {
+            error!(
+                "{}",
+                limit.exceeded(
+                    self.header_block_buf.len() + payload.len(),
+                    "an HTTP/2 header block"
+                )
+            );
             self.send_goaway(ERR_ENHANCE_YOUR_CALM);
             self.phase = Phase::GoingAway;
-            return Err("header block exceeds MAX_HEADER_BLOCK");
+            return Err("header block exceeds the h2_header_block maximum");
         }
         self.header_block_buf.extend_from_slice(payload);
         if flags & FLAG_END_HEADERS != 0 {
@@ -1985,11 +2029,21 @@ impl Http2Conn {
             if s.recv_window < 0 {
                 return Err("stream flow control exceeded");
             }
-            if s.body.len() + data_len > MAX_H2_BODY {
+            let limit = &crate::limits::edge().h2_stream_body;
+            if s.body.len() + data_len > limit.max() {
+                error!(
+                    "{}",
+                    limit.exceeded(s.body.len() + data_len, "an HTTP/2 request body")
+                );
                 over_cap = true;
                 false
             } else {
+                if s.body.capacity() == 0 {
+                    s.body.reserve_exact(limit.start());
+                }
+                let before = s.body.capacity();
                 s.body.extend_from_slice(data);
+                crate::limits::log_growth(limit, before, s.body.capacity());
                 if flags & FLAG_END_STREAM != 0 {
                     s.state = StreamState::HalfClosedRemote;
                 }
@@ -2302,12 +2356,35 @@ impl Http2Conn {
             },
             method.eq_ignore_ascii_case("HEAD"),
         );
-        if self.flush_io(io).is_err() {
+        if self.send_until_blocked(io).is_err() {
             self.phase = Phase::Done;
         }
     }
 
     // ── Flow-controlled response flusher ─────────────────────────────────────
+
+    /// Frame DATA and write it, again and again, until the socket would block
+    /// or nothing is left that the windows allow.
+    ///
+    /// The send queue is bounded at [SEND_QUEUE_BYTES], so one pass frames one
+    /// queue's worth and a body of any length needs many. The loop is
+    /// edge-triggered: a socket that took everything it was given reports no new
+    /// writable edge, because it never stopped being writable, so a pass that
+    /// frames one queue and returns waits for an event that never comes. Writing
+    /// until the socket refuses is what makes the next edge certain: it arrives
+    /// when the kernel drains below the mark, and that event runs this again.
+    /// On a link slow enough to refuse, the bound and the kernel's own mark are
+    /// what keep the order m6's; on one that never refuses, there is no queue
+    /// for an order to matter in.
+    fn send_until_blocked(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        loop {
+            self.flush_pending_streams();
+            self.flush_io(io)?;
+            if !self.send_buf.is_empty() || io.tls_pending() || !self.more_to_flush() {
+                return Ok(());
+            }
+        }
+    }
 
     /// Frame response DATA for the streams that have some, until the send
     /// queue holds [SEND_QUEUE_BYTES] or nothing is left that the windows
@@ -4145,7 +4222,7 @@ mod f005_regression {
         }
         assert!(drain_buf(&mut c).is_err(), "the flood must be refused");
         assert!(
-            c.header_block_buf.len() <= MAX_HEADER_BLOCK,
+            c.header_block_buf.len() <= crate::limits::edge().h2_header_block.max(),
             "buffer must never exceed the cap, reached {}",
             c.header_block_buf.len()
         );
@@ -5455,6 +5532,19 @@ mod tests {
     /// however much the peer's windows allow. Unbounded, a cache hit's whole
     /// body reached the socket at once and the kernel, not m6, decided what
     /// left first.
+    /// An input buffer past the `h2_recv` maximum refuses the connection with
+    /// an error that names the key, and one at the maximum does not.
+    #[test]
+    fn an_input_buffer_past_its_limit_is_refused() {
+        let mut c = Http2Conn::new();
+        let max = crate::limits::edge().h2_recv.max();
+        c.recv_buf = vec![0; max];
+        assert!(c.check_recv_room().is_ok());
+        c.recv_buf.push(0);
+        let err = c.check_recv_room().unwrap_err().to_string();
+        assert!(err.contains("over [limits.h2_recv] max = 4 MiB"), "{err}");
+    }
+
     #[test]
     fn send_queue_stays_bounded() {
         let mut c = request_with_body(1, 1 << 20);
@@ -5472,6 +5562,30 @@ mod tests {
         assert!(
             !sent_frames(&c.send_buf, TYPE_DATA).is_empty(),
             "the flush must still frame the next DATA"
+        );
+    }
+
+    /// The bound frames one queue per pass, so a connection whose socket takes
+    /// everything has to go on framing in the same turn: no writable edge comes
+    /// for a socket that never stopped being writable. A 40 KiB body is the
+    /// smallest that needs a third pass, and fits any socket buffer.
+    #[test]
+    fn send_until_blocked_goes_past_one_queue_when_the_socket_takes_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (_peer, _) = m6_core::platform::net::connect_tcp(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server.set_nonblocking(true).expect("nonblocking");
+        let mut c = request_with_body(1, 40 * 1024);
+        c.conn_send_window = 1 << 20;
+        c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
+        c.send_until_blocked(&mut H2Io::Plain { stream: &server })
+            .expect("the write");
+        assert!(
+            c.send_buf.is_empty() && !c.more_to_flush(),
+            "the socket took it all, so nothing may be left: {} bytes queued, {:?}",
+            c.send_buf.len(),
+            c.streams.get(&1).map(|s| (s.resp_sent, s.end_stream_sent))
         );
     }
 

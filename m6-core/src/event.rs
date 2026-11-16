@@ -114,7 +114,7 @@ pub struct Slots<T> {
     items: Vec<T>,
     free: Vec<usize>,
     ceiling: usize,
-    make: fn() -> T,
+    make: Box<dyn Fn() -> T + Send>,
 }
 
 /// A slot handed out by [`Slots::take`], with whether the table grew.
@@ -127,12 +127,12 @@ pub struct Taken {
 
 impl<T> Slots<T> {
     /// `initial` slots made at once with `make`, each with its own buffers.
-    pub fn new(initial: usize, ceiling: usize, make: fn() -> T) -> Slots<T> {
+    pub fn new(initial: usize, ceiling: usize, make: impl Fn() -> T + Send + 'static) -> Slots<T> {
         Slots {
             items: (0..initial).map(|_| make()).collect(),
             free: (0..initial).rev().collect(),
             ceiling,
-            make,
+            make: Box::new(make),
         }
     }
 

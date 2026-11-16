@@ -190,7 +190,6 @@ use crate::poll::NodeReading;
 
 pub const DEFAULT_MAX_MB: u64 = 256;
 pub const MAX_MB: u64 = 1_048_576;
-const QUEUE_POLLS: usize = 8;
 const PRUNE_BATCH: u32 = 256;
 
 const SCHEMA_V1: &str = "
@@ -1151,9 +1150,10 @@ pub struct History {
     cfg: Option<Config>,
     store: Option<Store>,
     status: Status,
-    /// Batches held for a locked file, oldest first.
-    queue: std::collections::VecDeque<Batch>,
-    /// Polls dropped because the hold was full.
+    /// Batches held for a locked file, oldest first, under the
+    /// `history_queue` limit.
+    queue: m6_core::limits::BoundedQueue<Batch>,
+    /// Polls refused because the hold was past its maximum.
     dropped: u64,
 }
 
@@ -1227,17 +1227,17 @@ impl History {
 
     /// Add one poll and write every held batch that will go.
     ///
-    /// A full hold drops the oldest poll and counts it, so the newest polls are
-    /// the ones a locked file keeps.
+    /// The hold grows by doubling while the file stays locked. Past the
+    /// `history_queue` maximum the new poll is refused with an error that names
+    /// the key, and counted, so what is held stays whole and in order.
     pub fn record(&mut self, b: Batch) {
         if self.cfg.is_none() {
             return;
         }
-        if self.queue.len() >= QUEUE_POLLS {
-            self.queue.pop_front();
+        if let Err((_, refusal)) = self.queue.push_back(b, "a poll") {
             self.dropped += 1;
+            m6_core::log::error!("{refusal}");
         }
-        self.queue.push_back(b);
         self.write_held();
     }
 
@@ -1384,12 +1384,12 @@ fn is_busy(e: &anyhow::Error) -> bool {
 /// `not_open`, and the next poll tries again. The connection's busy timeout is
 /// set to zero after the open, so a write that meets a lock returns at once and
 /// its batch stays held.
-pub fn start(cfg: Option<Config>) -> anyhow::Result<History> {
+pub fn start(cfg: Option<Config>, queue: &m6_core::limits::Limit) -> anyhow::Result<History> {
     let mut history = History {
         cfg: cfg.clone(),
         store: None,
         status: Status::default(),
-        queue: std::collections::VecDeque::with_capacity(QUEUE_POLLS),
+        queue: m6_core::limits::BoundedQueue::new(queue),
         dropped: 0,
     };
     let Some(cfg) = cfg else {
@@ -2815,12 +2815,13 @@ mod tests {
         assert_eq!(d.state, "ok");
     }
 
-    /// A hold of more than `QUEUE_POLLS` polls drops the oldest and counts it,
-    /// so the newest polls are what a long lock keeps.
+    /// A hold past the `history_queue` maximum refuses the new poll with an
+    /// error naming the key and counts it, so what is held stays whole and in
+    /// order.
     #[test]
-    fn a_full_hold_drops_the_oldest_and_counts_it() {
+    fn a_hold_past_its_maximum_refuses_the_new_poll_and_counts_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mut h = start(Some(cfg(dir.path(), 64))).unwrap();
+        let mut h = super::start(Some(cfg(dir.path(), 64)), &queue_limit(2, QUEUE_POLLS)).unwrap();
         let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
         for i in 0..QUEUE_POLLS as i64 + 2 {
@@ -2844,8 +2845,24 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        let want: Vec<i64> = (2..QUEUE_POLLS as i64 + 2).map(|i| T0 + i).collect();
-        assert_eq!(rows, want, "the newest {QUEUE_POLLS} polls are kept");
+        let want: Vec<i64> = (0..QUEUE_POLLS as i64).map(|i| T0 + i).collect();
+        assert_eq!(
+            rows, want,
+            "the first {QUEUE_POLLS} polls are kept in order"
+        );
+    }
+
+    /// The most polls a test's hold takes.
+    const QUEUE_POLLS: usize = 8;
+
+    /// `start` with the hold's default limit.
+    fn start(cfg: Option<Config>) -> anyhow::Result<History> {
+        super::start(cfg, &queue_limit(2, QUEUE_POLLS))
+    }
+
+    /// The hold's limit for a test.
+    fn queue_limit(start: usize, max: usize) -> m6_core::limits::Limit {
+        m6_core::limits::Limit::custom(&m6_core::limits::HISTORY_QUEUE, start, max)
     }
 
     fn history(c: Config) -> History {
@@ -2853,7 +2870,7 @@ mod tests {
             cfg: Some(c),
             store: None,
             status: Status::default(),
-            queue: std::collections::VecDeque::with_capacity(QUEUE_POLLS),
+            queue: m6_core::limits::BoundedQueue::new(&queue_limit(2, QUEUE_POLLS)),
             dropped: 0,
         }
     }
@@ -3028,7 +3045,8 @@ mod tests {
         );
         h.status.last_error = None;
         h.dropped = 2;
-        h.queue.push_back(make(T0, &[reading("a")]));
+        let held = h.queue.push_back(make(T0, &[reading("a")]), "a poll");
+        assert!(held.is_ok(), "the hold has room");
         assert_eq!(h.digest().state, "behind");
         assert_eq!(
             finding(&h.digest()).unwrap().text,

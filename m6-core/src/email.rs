@@ -223,6 +223,8 @@ pub struct Smtp {
     eight_bit: bool,
     /// The EHLO command bytes, copied from the relay at start.
     ehlo: Vec<u8>,
+    /// The `smtp_reply` limit the input buffer grows under.
+    reply_limit: crate::limits::Limit,
     credentials: Option<(String, String)>,
     mechanism: Option<Mechanism>,
     server: ServerInfo,
@@ -232,13 +234,24 @@ pub struct Smtp {
 }
 
 impl Smtp {
-    /// At start: the buffers every message reuses.
+    /// At start: the buffers every message reuses, with the built-in maximum of
+    /// `smtp_reply`.
     pub fn new(read_cap: usize, write_cap: usize) -> Smtp {
+        use crate::limits::{Limit, SMTP_REPLY};
+        let reply = Limit::custom(&SMTP_REPLY, read_cap.max(1), SMTP_REPLY.max.max(read_cap));
+        Smtp::with_limit(&reply, write_cap)
+    }
+
+    /// At start: the buffers every message reuses, the input buffer following
+    /// the `smtp_reply` limit.
+    pub fn with_limit(reply: &crate::limits::Limit, write_cap: usize) -> Smtp {
+        let read_cap = reply.start();
         assert!(
             read_cap > 0 && write_cap >= 8,
             "an SMTP slot needs both buffers"
         );
         Smtp {
+            reply_limit: reply.clone(),
             stream: None,
             tls: None,
             eof: false,
@@ -331,9 +344,10 @@ impl Smtp {
         Ok(())
     }
 
-    /// The descriptor to register with the poll.
-    pub fn fd(&self) -> RawFd {
-        self.stream.as_ref().expect("no connection").as_raw_fd()
+    /// The descriptor to register with the poll, or `None` while there is no
+    /// connection: before `start`, and after `close` or a finished delivery.
+    pub fn fd(&self) -> Option<RawFd> {
+        self.stream.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     /// The interest to register for the current step.
@@ -516,6 +530,7 @@ impl Smtp {
 
     /// Read what the socket has, until WouldBlock or EOF.
     fn read_in(&mut self) -> Result<(), SmtpError> {
+        self.make_room()?;
         let Some(stream) = self.stream.as_mut() else {
             return Ok(());
         };
@@ -536,7 +551,19 @@ impl Smtp {
         }
         loop {
             if self.in_len == self.in_buf.len() {
-                return Err(self.error("the reply exceeded the slot's buffer"));
+                // `stream` borrows `self`, so the growth is repeated here
+                // from the fields it leaves free.
+                let Some(grown) = self
+                    .reply_limit
+                    .grown(self.in_buf.len(), self.in_buf.len() + 1)
+                else {
+                    let refusal = self
+                        .reply_limit
+                        .exceeded(self.in_buf.len() + 1, "the relay's reply");
+                    return Err(self.error(&refusal.to_string()));
+                };
+                self.in_buf.resize(grown, 0);
+                self.reply_limit.log_growth(grown);
             }
             match stream.read(&mut self.in_buf[self.in_len..]) {
                 Ok(0) => {
@@ -560,9 +587,29 @@ impl Smtp {
 
     // ── replies and commands ─────────────────────────────────────────────
 
+    /// Grow the input buffer when it is full, or refuse the reply past the
+    /// `smtp_reply` maximum.
+    fn make_room(&mut self) -> Result<(), SmtpError> {
+        if self.in_len < self.in_buf.len() {
+            return Ok(());
+        }
+        let Some(grown) = self
+            .reply_limit
+            .grown(self.in_buf.len(), self.in_buf.len() + 1)
+        else {
+            let refusal = self
+                .reply_limit
+                .exceeded(self.in_buf.len() + 1, "the relay's reply");
+            return Err(self.error(&refusal.to_string()));
+        };
+        self.in_buf.resize(grown, 0);
+        self.reply_limit.log_growth(grown);
+        Ok(())
+    }
+
     /// Remove one complete reply from the input buffer, if there is one.
     fn take_reply(&mut self) -> Result<Option<Response>, SmtpError> {
-        let end = match reply_end(&self.in_buf[..self.in_len]) {
+        let end = match reply_end(&self.in_buf[..self.in_len], self.reply_limit.max()) {
             Ok(Some(end)) => end,
             Ok(None) => return Ok(None),
             Err(why) => return Err(self.error(why)),
@@ -797,9 +844,9 @@ fn write_command(buf: &mut [u8], command: &impl Display) -> usize {
 /// The end of one complete reply in `buf`, or `Ok(None)` when more bytes are
 /// needed. Every line starts with three digits; a space after them ends the
 /// reply and a hyphen continues it.
-fn reply_end(buf: &[u8]) -> Result<Option<usize>, &'static str> {
-    if buf.len() > 100_000 {
-        return Err("the reply is over 100000 bytes");
+fn reply_end(buf: &[u8], max: usize) -> Result<Option<usize>, &'static str> {
+    if buf.len() > max {
+        return Err("the reply is over the smtp_reply maximum");
     }
     let mut start = 0usize;
     loop {
@@ -939,13 +986,25 @@ mod tests {
         read_cap: usize,
         write_cap: usize,
     ) -> (Result<Option<()>, SmtpError>, Smtp) {
-        let mut smtp = Smtp::new(read_cap, write_cap);
+        deliver_with(Smtp::new(read_cap, write_cap), relay, msg)
+    }
+
+    /// As [`deliver`], with a slot the test built.
+    fn deliver_with(
+        mut smtp: Smtp,
+        relay: &Relay,
+        msg: &lettre::Message,
+    ) -> (Result<Option<()>, SmtpError>, Smtp) {
         smtp.start(relay, msg).expect("start");
         let mut poll = Poll::new().expect("poll");
         let mut events = Events::with_capacity(8);
         let token = Token(0);
         poll.registry()
-            .register_fd(smtp.fd(), token, smtp.interest())
+            .register_fd(
+                smtp.fd().expect("a started delivery has a socket"),
+                token,
+                smtp.interest(),
+            )
             .expect("register");
         let mut interest = smtp.interest();
         let deadline = crate::platform::now() + Duration::from_secs(30);
@@ -957,7 +1016,11 @@ mod tests {
             if smtp.interest() != interest {
                 interest = smtp.interest();
                 poll.registry()
-                    .reregister_fd(smtp.fd(), token, interest)
+                    .reregister_fd(
+                        smtp.fd().expect("a started delivery has a socket"),
+                        token,
+                        interest,
+                    )
                     .expect("reregister");
             }
             poll.poll(&mut events, Some(Duration::from_millis(100)))
@@ -967,6 +1030,40 @@ mod tests {
                 "the fixture did not finish in time"
             );
         }
+    }
+
+    /// A reply larger than the slot's buffer grows it, and one past the
+    /// `smtp_reply` maximum is refused with an error naming the key.
+    #[test]
+    fn a_reply_grows_the_buffer_and_past_the_maximum_is_refused() {
+        use crate::limits::{Limit, SMTP_REPLY};
+        // A greeting of about 2 KiB: 20 continuation lines of 100 bytes.
+        let line = format!("220-{}\r\n", "x".repeat(96));
+        let greeting: &'static str =
+            Box::leak(format!("{}220 ready\r\n", line.repeat(20)).into_boxed_str());
+
+        let (port, _log, handle) = fixture(greeting, vec![("EHLO", "250 ok\r\n")]);
+        let grows = Smtp::with_limit(&Limit::custom(&SMTP_REPLY, 512, 4096), 4096);
+        let (result, smtp) = deliver_with(grows, &relay(port), &message("hi\r\n"));
+        // The greeting was read whole: the failure, if any, is not the buffer's.
+        let text = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(!text.contains("smtp_reply"), "{text}");
+        let size = smtp.in_buf.len();
+        assert!(
+            (2048..=4096).contains(&size) && size.is_power_of_two(),
+            "{size}"
+        );
+        drop(handle);
+
+        let (port, _log, handle) = fixture(greeting, vec![]);
+        let refuses = Smtp::with_limit(&Limit::custom(&SMTP_REPLY, 512, 1024), 4096);
+        let (result, _) = deliver_with(refuses, &relay(port), &message("hi\r\n"));
+        let text = result.expect_err("a reply past the maximum").to_string();
+        assert!(
+            text.contains("over [limits.smtp_reply] max = 1 KiB"),
+            "{text}"
+        );
+        drop(handle);
     }
 
     #[test]

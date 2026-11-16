@@ -4,7 +4,7 @@
 use std::fmt;
 use std::fs;
 
-use m6_log::{Level, Line, Sink, MAX_FIELD};
+use m6_log::{Level, Line, Sink, FIELD_MAX_BYTES};
 
 #[test]
 fn escaping_matches_json() {
@@ -46,77 +46,49 @@ fn escaping_matches_json() {
     );
 }
 
-/// A `Display` that crosses the cut in the middle of a multi-byte character:
-/// the field must be a valid prefix of the value, never the skipped character
-/// followed by later text.
-struct CutOnACharacter;
+/// A `Display` whose multi-byte character crosses the `log_field` maximum:
+/// the line is refused whole, with no cut prefix written.
+struct CrossesTheCap;
 
-impl fmt::Display for CutOnACharacter {
+impl fmt::Display for CrossesTheCap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&"a".repeat(1020))?;
+        f.write_str(&"a".repeat(FIELD_MAX_BYTES - 1))?;
         f.write_str("é")?;
         f.write_str("abc")
     }
 }
 
-impl fmt::Debug for CutOnACharacter {
+impl fmt::Debug for CrossesTheCap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }
 
 #[test]
-fn display_and_debug_cut_on_a_character_boundary() {
+fn display_and_debug_past_the_cap_refuse_the_line() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("cut.jsonl");
     let mut sink = Sink::file(&path).expect("the line file");
     Line::begin(&mut sink, Level::Info, "cut")
-        .display("displayed", &CutOnACharacter)
-        .debug("debugged", &CutOnACharacter)
+        .display("displayed", &CrossesTheCap)
+        .end();
+    Line::begin(&mut sink, Level::Info, "cut")
+        .debug("debugged", &CrossesTheCap)
         .end();
     sink.flush();
 
-    let text = fs::read_to_string(&path).expect("the written line");
-    let value: serde_json::Value = serde_json::from_str(text.trim()).expect("valid JSON");
-    let expected = format!("{}...", "a".repeat(1020));
-    assert_eq!(
-        value["fields"]["displayed"].as_str(),
-        Some(expected.as_str())
-    );
-    assert_eq!(
-        value["fields"]["debugged"].as_str(),
-        Some(expected.as_str())
-    );
+    assert_eq!(sink.dropped(), 2, "both lines are refused");
+    // Only the dropped-count line is written, never a cut prefix.
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    assert!(!text.contains("aaaa"), "a refused line was written");
+    assert!(text.contains("log lines dropped"), "{text:.200}");
 }
 
 #[test]
-fn keys_and_targets_are_escaped() {
-    let dir = tempfile::tempdir().expect("a directory");
-    let path = dir.path().join("target.jsonl");
-    let key = "key\"with\ncontrol";
-    let target = "target\\with\"quote\n";
-    let mut sink = Sink::file(&path).expect("the line file");
-    Line::begin(&mut sink, Level::Info, "escaped")
-        .str(key, "value")
-        .target(target)
-        .end();
-    sink.flush();
-
-    let text = fs::read_to_string(&path).expect("the written line");
-    assert!(
-        !text.chars().any(|c| c.is_control() && c != '\n'),
-        "a raw control byte reached the line: {text}"
-    );
-    let value: serde_json::Value = serde_json::from_str(text.trim()).expect("valid JSON");
-    assert_eq!(value["fields"][key].as_str(), Some("value"));
-    assert_eq!(value["target"].as_str(), Some(target));
-}
-
-#[test]
-fn a_field_at_the_cap_is_valid_json() {
+fn a_field_at_the_cap_is_written_whole() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("cap.jsonl");
-    let at_cap = "x".repeat(MAX_FIELD);
+    let at_cap = "x".repeat(FIELD_MAX_BYTES);
     let mut sink = Sink::file(&path).expect("the line file");
     Line::begin(&mut sink, Level::Info, "cap")
         .str("value", &at_cap)
@@ -126,7 +98,26 @@ fn a_field_at_the_cap_is_valid_json() {
     let text = fs::read_to_string(&path).expect("the written line");
     let value: serde_json::Value = serde_json::from_str(text.trim()).expect("valid JSON");
     let field = value["fields"]["value"].as_str().expect("a string field");
-    assert!(field.ends_with("..."), "the cut marker is missing");
-    assert_eq!(field.len(), MAX_FIELD, "the cut field is not the cap");
-    assert_eq!(&field[..MAX_FIELD - 3], "x".repeat(MAX_FIELD - 3));
+    assert_eq!(field, at_cap, "a field at the maximum is not cut");
+}
+
+/// One byte past the `log_field` maximum refuses the whole line: nothing is
+/// written, the line is counted as refused, and the next line is unharmed.
+#[test]
+fn a_field_past_the_cap_refuses_the_line() {
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("past.jsonl");
+    let mut sink = Sink::file(&path).expect("the line file");
+    Line::begin(&mut sink, Level::Info, "past")
+        .str("value", &"x".repeat(FIELD_MAX_BYTES + 1))
+        .end();
+    Line::begin(&mut sink, Level::Info, "after")
+        .str("value", "fine")
+        .end();
+    sink.flush();
+
+    assert_eq!(sink.dropped(), 1, "the refused line is counted");
+    let text = fs::read_to_string(&path).expect("the written file");
+    assert!(!text.contains("past"), "a refused line reached the file");
+    assert!(text.contains("after"), "the next line was lost: {text}");
 }

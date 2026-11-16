@@ -750,6 +750,10 @@ pub struct PendingUrlContext {
     /// the error context `apply_error_mode` expects. `None` for URL backends,
     /// whose completion already builds `route: None`.
     pub route_path: Option<String>,
+    /// The `cache` the matched route sets, which replaces the backend's own
+    /// `Cache-Control` on the reply before it is stored or sent. `None` leaves
+    /// the backend's header alone.
+    pub route_cache: Option<String>,
     /// Whether the response may enter the shared cache. False for
     /// `require`-protected routes (the cache key carries no identity, so a
     /// stored entry would later be served to anonymous callers) and for
@@ -802,6 +806,7 @@ impl PendingUrlContext {
             backend_name: "genid".to_string(),
             kind: PendingKind::Socket,
             route_path: None,
+            route_cache: None,
             cacheable: false,
             is_prefetch: false,
             start: m6_core::platform::now(),
@@ -830,6 +835,7 @@ impl PendingUrlContext {
             backend_name: "genid".to_string(),
             kind: PendingKind::Url,
             route_path: None,
+            route_cache: None,
             cacheable: false,
             is_prefetch: true,
             start: m6_core::platform::now(),

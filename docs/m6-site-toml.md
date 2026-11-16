@@ -267,6 +267,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, max_requests_per_connection, reuse_port | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
+| `[limits.<name>]` | System config | The start and maximum of this node's buffers and queues, memory a node owns |
 | `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
 | `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
@@ -564,9 +565,12 @@ Take from it that a route is a path and a backend, with an optional claim.
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | `"group:<name>"` or `"role:<name>"`. A token must satisfy it |
 | `methods` | array of strings | no | The methods the route answers, such as `["POST"]`. Absent adds no restriction |
+| `cache` | string | no | A `Cache-Control` value, such as `"no-store"`, that replaces the one the backend set on every reply this route gets. Absent leaves the backend's header alone |
 
 **Table 10: the `[[route]]` keys.**
 A `{param}` matches one segment, and a `{*rest}` in the last segment matches the rest of the path.
+A route that names `cache` has that value sent in place of the `Cache-Control` the backend set, so one path can be `no-store` whatever its handler decides.
+The edge applies it before it decides whether to store the reply, so `no-store` keeps the reply out of the cache, and a hit replays the stored value.
 A route that lists `methods` answers exactly those: `GET` also answers `HEAD`, and a request with another method gets 405 with `Allow` before the cache or a backend is touched.
 The names m6 accepts are `GET`, `POST`, `PUT`, `PATCH` and `DELETE`.
 A name outside that set, or an empty list, stops the start with exit 2, and `--dump-config` fails the same way.
@@ -585,6 +589,7 @@ Take from it that the glob is a path on disk and `path` is the URL the file is s
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | As `[[route]]` |
 | `methods` | array of strings | no | As `[[route]]` |
+| `cache` | string | no | As `[[route]]` |
 
 **Table 11: the `[[route_group]]` keys.**
 The glob is expanded once at start, so the routes a group adds are fixed until a restart.
@@ -726,6 +731,22 @@ enabled = true
 requests_per_min = 300
 ```
 
+### 4.14. `[limits]`
+
+m6-http sizes its buffers and queues from named limits, each with a `start` and a `max`.
+The table lives in the system config, because memory is a property of the node.
+A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
+The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer` and `log_field`.
+[`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
+
+```toml
+[limits.edge_request]
+start = "4KiB"
+max   = "32MiB"
+```
+
+Take from the example that a limit is two sizes, and that a request past `max` is refused with an error that names `[limits.edge_request] max` and the file to raise it in.
+
 ## 5. Route matching
 
 m6-http answers a request from the cache first, and a cache hit is answered without selecting a route or contacting a backend.
@@ -783,11 +804,12 @@ Exit 2 on:
 - `[auth]` in `site.toml`, in a two-file config
 - A system config with no `[node]`
 - `[log] level` unrecognised
+- `[limits]` with an unknown limit, an unknown key, a value that is not a size, a zero, or a `max` below its `start`
 - Any route missing `path` or `backend`
 - Any route `backend` value not declared in `[[backend]]`
 - A `[[backend]]` `sockets` glob that matches no socket
 - Duplicate `path` values across `[[route]]`
-- `cache` on a `[[route]]` or a `[[route_group]]`
+- `cache` on a `[[route]]` or a `[[route_group]]` that is empty or holds a control character
 - A `methods` list naming a method other than `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or an empty list
 - `[errors] mode = "custom"` without `path`
 - `[auth]` declared but `public_key` file not found

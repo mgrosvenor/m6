@@ -29,8 +29,10 @@ Strings are escaped as JSON requires.
 The quote and the backslash are escaped, and every byte from 0x00 to 0x1f is written as `\u00xx`.
 Non-ASCII UTF-8 passes through unchanged.
 Keys and targets use the same escaper as the string fields.
-A string field writes at most 1021 escaped bytes inside its quotes.
-A value that needs more is cut on a character boundary and ends in `...`, so the field keeps at most 1024 bytes, the marker included.
+A string field writes at most `[limits.log_field] max` escaped bytes inside its quotes, 8 KiB by default.
+A value that needs more refuses its whole line: nothing is cut, the line counts as dropped, and one line on stderr names the key and the file.
+The Sink's buffer starts at `[limits.log_buffer] start`, 16 KiB by default, doubles when a line does not fit and the destination is blocked, and keeps its size.
+A line past `[limits.log_buffer] max`, 1 MiB by default, is refused the same way.
 A message, a `%display` field and a `?debug` field are formatted straight into the buffer through the escaping adapter, with no `String`.
 
 A field with no value is omitted, as tracing omitted it.

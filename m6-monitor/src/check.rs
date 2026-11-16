@@ -2452,7 +2452,11 @@ mod health_tests {
             file: dir.path().join("history.sqlite3"),
             max_bytes: 64 << 20,
         };
-        let mut history = crate::history::start(Some(cfg)).expect("history opens");
+        let mut history = crate::history::start(
+            Some(cfg),
+            &m6_core::limits::Limit::builtin(&m6_core::limits::HISTORY_QUEUE),
+        )
+        .expect("history opens");
         let r = reading(node, None);
         let at_ms = crate::history::now_ms() - i64::try_from(age_s).expect("a small age") * 1000;
         let d = crate::digest::build(
@@ -2620,7 +2624,11 @@ mod health_tests {
             file: dir.path().join("history.sqlite3"),
             max_bytes: 64 << 20,
         };
-        let mut history = crate::history::start(Some(cfg)).expect("history opens");
+        let mut history = crate::history::start(
+            Some(cfg),
+            &m6_core::limits::Limit::builtin(&m6_core::limits::HISTORY_QUEUE),
+        )
+        .expect("history opens");
         let now = crate::history::now_ms();
         for (ago_s, r) in [
             (300, answering("edge-a", 200, "ok")),

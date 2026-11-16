@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use m6_core::testkit::{assert_app_lifecycle, binary, Service};
+use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
 
 mod support;
 
@@ -351,18 +351,25 @@ fn assert_single_loop(what: &str, count: usize) {
     );
 }
 
-/// The thread count of `pid` once two readings 100 ms apart agree.
+/// The thread count of `pid` once it is the count a settled monitor holds: the
+/// loop thread and the platform's idle certificate-store workers, so inside
+/// the range `assert_single_loop` accepts.
+///
+/// The process makes short-lived threads while it starts, and a loaded host
+/// stretches how long they live, so a reading taken at a fixed moment, or two
+/// that happen to agree, can catch one. The event waited for is the count
+/// reaching the settled range. A thread that never goes away, such as one per
+/// node, never reaches it: the deadline passes and the last reading is
+/// returned for the assertion to name.
 fn settled_count(pid: u32) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let (workers_low, workers_high) = m6_core::platform::process::certificate_store_workers();
+    let settled = (1 + workers_low)..=(1 + workers_high);
     let mut last = thread_count(pid);
-    loop {
-        std::thread::sleep(Duration::from_millis(100));
-        let next = thread_count(pid);
-        if next == last || Instant::now() > deadline {
-            return next;
-        }
-        last = next;
-    }
+    wait::until(Duration::from_secs(5), || {
+        last = thread_count(pid);
+        settled.contains(&last)
+    });
+    last
 }
 
 /// A history adds no thread, within the platform workers' one-thread swing.

@@ -12,7 +12,9 @@
 //! - a backend that closes its HTTP/1.1 connection, so every reply carries
 //!   `Connection: close`, which h3 must drop and h1 must keep;
 //! - `Content-Length` as `1*DIGIT` on h1 and h2 (RFC 9110 8.6, 5.6.3);
-//! - `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5).
+//! - `If-None-Match` answered 304 on h1, h2 and h3 (RFC 9110 13.1.2, 15.4.5);
+//! - a route's `cache` replacing the `Cache-Control` the backend set, on h1, h2
+//!   and h3 (RFC 9111 5.2).
 //!
 //! This file is that coverage. Every test names the RFC section it pins, and
 //! `tools/conformance.sh` fails the gate when one of them fails.
@@ -138,7 +140,8 @@ impl Fixture {
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
-                 [[route]]\npath = \"/submit\"\nbackend = \"b\"\nmethods = [\"POST\"]\n",
+                 [[route]]\npath = \"/submit\"\nbackend = \"b\"\nmethods = [\"POST\"]\n\n\
+                 [[route]]\npath = \"/override\"\nbackend = \"b\"\ncache = \"no-store\"\n",
                 d.join("b-*.sock").display()
             ),
         )
@@ -314,7 +317,15 @@ fn h2_get(
             .connect(name, tcp)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
-        let (mut client, connection) = h2::client::handshake(tls)
+        // The windows a browser announces: Chromium opens every stream with 6 MiB
+        // and the connection with 15 MiB, so while a body is in flight it sends no
+        // WINDOW_UPDATE and the server gets no readable event to continue on. The
+        // library's own 64 KiB default sends updates all the time, and hides a
+        // server that only goes on when the peer speaks.
+        let (mut client, connection) = h2::client::Builder::new()
+            .initial_window_size(6 * 1024 * 1024)
+            .initial_connection_window_size(15 * 1024 * 1024)
+            .handshake::<_, bytes::Bytes>(tls)
             .await
             .map_err(|e| format!("h2 handshake: {e}"))?;
         // The driver owns the socket; without it no frame moves.
@@ -341,6 +352,9 @@ fn h2_get(
         let mut bytes = Vec::new();
         while let Some(chunk) = body.data().await {
             let chunk = chunk.map_err(|e| format!("body: {e}"))?;
+            // A client that never gives the window back stalls its own download
+            // at the initial 65,535 bytes, so a long body needs this.
+            let _ = body.flow_control().release_capacity(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
         Ok((status, headers, bytes))
@@ -1030,4 +1044,250 @@ fn rfc9110_13_1_2_if_none_match_304_h3() {
         field_value(&fields, "content-length").is_none(),
         "RFC 9110 15.4.5 and 8.6: a 304 carries no content-length it cannot justify"
     );
+}
+
+// ── A route's `cache` replaces the backend's Cache-Control (RFC 9111 5.2) ─────
+
+/// Every `Cache-Control` value in an h1 head, in order.
+fn h1_cache_controls(head: &str) -> Vec<String> {
+    head.lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("cache-control"))
+        .map(|(_, v)| v.trim().to_string())
+        .collect()
+}
+
+/// Every `Cache-Control` value in an h2 or h3 field list, in order.
+fn field_cache_controls(fields: &Fields) -> Vec<String> {
+    fields
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+/// What the route `/override` must send. The backend answers every path with
+/// `Cache-Control: public, max-age=60`, which a shared cache may store (RFC 9111
+/// 5.2.2.5 does not forbid it), so the only way the client sees `no-store` is
+/// the route's `cache` replacing it. One field, not two: a second
+/// `Cache-Control` is two answers to one question (RFC 9110 5.3).
+fn assert_route_cache_won(controls: &[String], age: Option<String>, what: &str) {
+    assert_eq!(
+        controls,
+        ["no-store"],
+        "{what}: the route's `cache` must replace the backend's Cache-Control, leaving one field"
+    );
+    assert!(
+        age.is_none(),
+        "{what}: `no-store` must stop the reply entering the cache, so the second GET is no hit"
+    );
+}
+
+#[test]
+fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h1() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+    let _ = warm_h1(&fixture);
+
+    let request = format!(
+        "GET /override HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        fixture.port()
+    );
+    let (status, _, _) = h1_request(fixture.port(), &fixture.cert_der, &request);
+    assert_eq!(status, 200);
+    let (status, head, _) = h1_request(fixture.port(), &fixture.cert_der, &request);
+    assert_eq!(status, 200);
+    assert_route_cache_won(&h1_cache_controls(&head), h1_header(&head, "age"), "h1");
+
+    // A route with no `cache` leaves the backend's own header alone.
+    let (_, head, _) = h1_request(
+        fixture.port(),
+        &fixture.cert_der,
+        &format!(
+            "GET / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            fixture.port()
+        ),
+    );
+    assert_eq!(h1_cache_controls(&head), ["public, max-age=60"]);
+}
+
+#[test]
+fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h2() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+    let _ = warm_h1(&fixture);
+
+    let get = |path: &str| {
+        h2_get(fixture.port(), &fixture.cert_der, path, &[])
+            .unwrap_or_else(|e| panic!("HTTP/2 fetch failed: {e}"))
+    };
+    let (status, _, _) = get("/override");
+    assert_eq!(status, 200);
+    let (status, fields, _) = get("/override");
+    assert_eq!(status, 200);
+    assert_route_cache_won(
+        &field_cache_controls(&fields),
+        field_value(&fields, "age"),
+        "h2",
+    );
+
+    let (_, fields, _) = get("/");
+    assert_eq!(field_cache_controls(&fields), ["public, max-age=60"]);
+}
+
+#[test]
+fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h3() {
+    let fixture = Fixture::new();
+    fixture.start_backend();
+    let _svc = fixture.start();
+    let _ = warm_h1(&fixture);
+
+    let get = |path: &str| {
+        h3_get(fixture.port(), path, &[]).unwrap_or_else(|e| panic!("HTTP/3 fetch failed: {e}"))
+    };
+    let (status, _, _) = get("/override");
+    assert_eq!(status, 200);
+    let (status, fields, _) = get("/override");
+    assert_eq!(status, 200);
+    assert_route_cache_won(
+        &field_cache_controls(&fields),
+        field_value(&fields, "age"),
+        "h3",
+    );
+
+    let (_, fields, _) = get("/");
+    assert_eq!(field_cache_controls(&fields), ["public, max-age=60"]);
+}
+
+// ── Bodies longer than the send queue ────────────────────────────────────────
+
+/// How long a body of any tested size may take over loopback. The page is
+/// already in m6-http's cache, so the time is the protocol's, and a stall shows
+/// as the limit passing, not as a slow answer.
+const BODY_LIMIT: Duration = Duration::from_secs(10);
+
+/// A cacheable backend reply with a body of exactly `len` bytes.
+fn sized_backend_response(len: usize) -> Vec<u8> {
+    let mut r = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+         Cache-Control: public, max-age=60\r\nETag: \"sized-1\"\r\n\
+         Content-Length: {len}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    r.extend((0..len).map(|i| (i % 251) as u8));
+    r
+}
+
+/// Run `fetch` on its own thread and return its result, or fail the test when it
+/// does not finish within [BODY_LIMIT]. A stalled h2 or h3 client waits for ever,
+/// so the test has to bring its own deadline.
+fn within_limit<T: Send + 'static>(
+    what: &str,
+    fetch: impl FnOnce() -> T + Send + 'static,
+) -> (T, Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch());
+    });
+    match rx.recv_timeout(BODY_LIMIT) {
+        Ok(value) => (value, started.elapsed()),
+        Err(_) => panic!(
+            "{what} did not finish within {} s: the response stopped part way",
+            BODY_LIMIT.as_secs()
+        ),
+    }
+}
+
+/// Warm the cache with a body of `len` bytes over h1, so the h2 and h3 requests
+/// that follow are cache hits, the path a browser's page load takes.
+fn fixture_serving(len: usize) -> (Fixture, Service) {
+    let fixture = Fixture::new();
+    fixture.start_backend_with(sized_backend_response(len));
+    let svc = fixture.start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match h1_get(fixture.port(), &fixture.cert_der, "/") {
+            (200, body) if body.len() == len => break,
+            (200, body) => panic!("h1 served {} bytes, not {len}", body.len()),
+            (status, _) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "m6-http never served / over h1: last status {status}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    (fixture, svc)
+}
+
+fn h2_serves_a_body_of(len: usize) {
+    let (fixture, _svc) = fixture_serving(len);
+    let (port, cert) = (fixture.port(), fixture.cert_der.clone());
+    let (result, took) = within_limit("the HTTP/2 response", move || h2_get(port, &cert, "/", &[]));
+    let (status, _, body) = result.expect("the HTTP/2 fetch");
+    assert_eq!(status, 200, "HTTP/2 status");
+    assert_eq!(
+        body.len(),
+        len,
+        "HTTP/2 must deliver the whole {len} byte body (took {took:?})"
+    );
+}
+
+fn h3_serves_a_body_of(len: usize) {
+    let (fixture, _svc) = fixture_serving(len);
+    let port = fixture.port();
+    let (result, took) = within_limit("the HTTP/3 response", move || h3_get(port, "/", &[]));
+    let (status, _, body) = result.expect("the HTTP/3 fetch");
+    assert_eq!(status, 200, "HTTP/3 status");
+    assert_eq!(
+        body.len(),
+        len,
+        "HTTP/3 must deliver the whole {len} byte body (took {took:?})"
+    );
+}
+
+/// RFC 9113 6.9 and 5.1: a response longer than the 16 KiB send queue completes.
+///
+/// m6-http frames response DATA only while fewer than 16 KiB sit unsent, and
+/// the next writable event is meant to frame the next piece. A page load takes
+/// bodies of tens of KiB to a few MiB over h2, and a connection that stops after
+/// the first two frames serves a status and a content-length and then 32,768
+/// bytes, which is what a browser sees as a page that never finishes. 37 KiB is
+/// the smallest size that shows it, 300 KiB is a large image, 2 MiB is more than
+/// both windows.
+#[test]
+fn rfc9113_6_9_h2_serves_a_37_kib_body() {
+    h2_serves_a_body_of(37 * 1024);
+}
+
+#[test]
+fn rfc9113_6_9_h2_serves_a_300_kib_body() {
+    h2_serves_a_body_of(300 * 1024);
+}
+
+#[test]
+fn rfc9113_6_9_h2_serves_a_2_mib_body() {
+    h2_serves_a_body_of(2 * 1024 * 1024);
+}
+
+/// The same three sizes over h3, which quiche paces, so the send-queue bound
+/// is not expected to touch it. The tests pin that, because a page load takes
+/// both protocols.
+#[test]
+fn rfc9114_4_1_h3_serves_a_37_kib_body() {
+    h3_serves_a_body_of(37 * 1024);
+}
+
+#[test]
+fn rfc9114_4_1_h3_serves_a_300_kib_body() {
+    h3_serves_a_body_of(300 * 1024);
+}
+
+#[test]
+fn rfc9114_4_1_h3_serves_a_2_mib_body() {
+    h3_serves_a_body_of(2 * 1024 * 1024);
 }
