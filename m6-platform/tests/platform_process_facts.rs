@@ -1,8 +1,10 @@
-//! H7, H8 and H9 of the platform contract, in a test binary of their own.
+//! H7, H8 and H9 of the platform contract.
 //!
 //! Each counts this process's threads or descriptors, so nothing else may
-//! start a thread or open a descriptor while it runs. One `#[test]` runs the
-//! three in sequence, and the binary holds no other test.
+//! run in the process while it does. One `#[test]` runs the three in
+//! sequence, and that test re-executes this binary with `--exact` so it is
+//! the only test measuring in the process. This binary may hold other tests
+//! beside it, and they do not move the counts.
 
 #![allow(
     clippy::disallowed_methods,
@@ -12,6 +14,10 @@
 use std::time::{Duration, Instant};
 
 use m6_platform::{host, process};
+
+/// Set in the child that measures, so it runs the sequence in place rather
+/// than starting another child.
+const IN_MEASURING_CHILD: &str = "M6_PROCESS_FACTS_CHILD";
 
 /// The thread count once it has stopped changing: a thread that just ended is
 /// still being torn down when `join` returns, on every supported target, so a
@@ -30,11 +36,49 @@ fn settled_threads(pid: u32) -> usize {
     }
 }
 
+/// H7, H8 and H9 in one measurement.
+///
+/// The counts are of the whole process, so they are a fact about `host::snapshot`
+/// and the descriptor table only while no other code runs. libtest runs the tests
+/// of a binary on its own threads, and a test thread that ends between two
+/// readings moves the count by one. A branch that added two more tests to this
+/// file failed H7 with `left: 3, right: 2` about one run in four for that
+/// reason, while `--test-threads=1` and `nextest` both passed. So the
+/// sequence runs in a child of this binary filtered to exactly this test, where
+/// it is the only test in the process, and the parent's whole job is to run it.
 #[test]
 fn process_wide_counts_follow_the_process() {
+    if std::env::var_os(IN_MEASURING_CHILD).is_none() {
+        measure_in_a_process_of_its_own();
+        return;
+    }
     a_snapshot_starts_no_thread();
     thread_count_follows_the_threads();
     open_descriptors_follow_the_files();
+}
+
+/// Run [`process_wide_counts_follow_the_process`] alone, and fail with the
+/// child's own output. `--exact` leaves every other test in this binary out of
+/// the child's process, and the environment marker keeps the child from
+/// starting a third.
+fn measure_in_a_process_of_its_own() {
+    let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "process_wide_counts_follow_the_process"])
+        .env(IN_MEASURING_CHILD, "1")
+        .output()
+        .expect("run this test binary again");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `--exact` names one test, so exactly one must run. A filter that matches
+    // nothing exits zero and the measurement would never be taken.
+    assert!(
+        out.status.success() && text.contains("1 passed"),
+        "the isolated run of the process counts exited with {} and printed:\n{text}",
+        out.status
+    );
 }
 
 /// H7. Break: `sysinfo` with its default features (`multithread` pulls
