@@ -46,6 +46,7 @@ fn core_routes(patterns: &[&str]) -> CoreTable {
                     headers: vec![],
                     last_modified: None,
                     last_modified_http: None,
+                    head: Default::default(),
                     handler: None,
                     settings: Arc::new(Map::new()),
                     base_dict: Arc::new(Map::new()),

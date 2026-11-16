@@ -42,6 +42,216 @@
 
 use crate::http::HeaderSource;
 
+/// The text of one response header name or value.
+///
+/// A response's headers were `String` pairs, so every response paid an
+/// allocation for each name and each value, including the ones core sets the
+/// same way for every request on a route. This holds the three shapes a header
+/// text takes without one:
+///
+/// - [`HeaderText::Static`] borrows a `&'static str`: a name such as
+///   `Cache-Control`, a constant value, or a route's value made once at load
+///   by [`intern`].
+/// - [`HeaderText::Inline`] keeps up to 23 bytes in the value itself: an `ETag`
+///   is 18.
+/// - [`HeaderText::Owned`] is the `String` a handler supplied.
+///
+/// It derefs to `str`, so a reader needs no change.
+#[derive(Clone)]
+pub enum HeaderText {
+    Static(&'static str),
+    Inline { len: u8, bytes: [u8; 23] },
+    Owned(String),
+}
+
+impl HeaderText {
+    /// A text that borrows a `'static` string.
+    pub const fn from_static(s: &'static str) -> Self {
+        HeaderText::Static(s)
+    }
+
+    /// A text holding `s` in the value itself, or `None` when it is longer than
+    /// 23 bytes.
+    pub fn inline(s: &str) -> Option<Self> {
+        if s.len() > 23 {
+            return None;
+        }
+        let mut bytes = [0u8; 23];
+        bytes[..s.len()].copy_from_slice(s.as_bytes());
+        Some(HeaderText::Inline {
+            len: s.len() as u8,
+            bytes,
+        })
+    }
+
+    /// The text as a `str`.
+    pub fn as_str(&self) -> &str {
+        match self {
+            HeaderText::Static(s) => s,
+            HeaderText::Inline { len, bytes } => {
+                std::str::from_utf8(&bytes[..*len as usize]).expect("an inline text is UTF-8")
+            }
+            HeaderText::Owned(s) => s,
+        }
+    }
+
+    /// The text as an owned `String`.
+    pub fn into_string(self) -> String {
+        match self {
+            HeaderText::Owned(s) => s,
+            other => other.as_str().to_string(),
+        }
+    }
+}
+
+impl std::ops::Deref for HeaderText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for HeaderText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for HeaderText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for HeaderText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl From<String> for HeaderText {
+    fn from(s: String) -> Self {
+        HeaderText::Owned(s)
+    }
+}
+
+impl From<&str> for HeaderText {
+    fn from(s: &str) -> Self {
+        HeaderText::Owned(s.to_string())
+    }
+}
+
+impl From<&String> for HeaderText {
+    fn from(s: &String) -> Self {
+        HeaderText::Owned(s.clone())
+    }
+}
+
+impl From<HeaderText> for String {
+    fn from(t: HeaderText) -> String {
+        t.into_string()
+    }
+}
+
+impl PartialEq for HeaderText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for HeaderText {}
+
+impl PartialEq<str> for HeaderText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for HeaderText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for HeaderText {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<HeaderText> for &str {
+    fn eq(&self, other: &HeaderText) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<HeaderText> for String {
+    fn eq(&self, other: &HeaderText) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+/// A writer that fills the 23 inline bytes of a [`HeaderText`], for a value
+/// formatted per response, such as an `ETag`. Writing more than 23 bytes is an
+/// error, so a caller that cannot bound its value uses a `String`.
+#[derive(Default)]
+pub struct InlineBuf {
+    len: usize,
+    bytes: [u8; 23],
+}
+
+impl InlineBuf {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The bytes written, as an inline [`HeaderText`].
+    pub fn into_text(self) -> HeaderText {
+        HeaderText::Inline {
+            len: self.len as u8,
+            bytes: self.bytes,
+        }
+    }
+}
+
+impl std::fmt::Write for InlineBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.bytes.len() {
+            return Err(std::fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// One response header, name then value.
+pub type Header = (HeaderText, HeaderText);
+
+/// Make `s` live for the rest of the process, once per distinct value.
+///
+/// A route's `Cache-Control`, `Last-Modified` and extra headers are the same
+/// for every request on it, so they are made once at load and each response
+/// borrows them as a [`HeaderText::Static`]. A reload that sets the same value
+/// finds the one already made, so the table holds the distinct values a process
+/// has ever loaded, a few dozen bytes each, and nothing grows per request.
+pub fn intern(s: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static TABLE: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut table = TABLE
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(found) = table.get(s) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+    table.insert(leaked);
+    leaked
+}
+
 /// The largest one request header field, counted as its name plus its value.
 ///
 /// The number is the one nginx bounds a field line with (`8k`), the one
@@ -96,13 +306,10 @@ pub fn get<'a>(headers: &'a (impl HeaderSource + ?Sized), name: &str) -> Option<
 
 /// Every value for `name`, in the order sent.
 pub fn get_all<'a>(
-    headers: &'a [(String, String)],
+    headers: &'a (impl HeaderSource + ?Sized),
     name: &'a str,
 ) -> impl Iterator<Item = &'a str> + 'a {
-    headers
-        .iter()
-        .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+    headers.find_all(name)
 }
 
 pub fn contains(headers: &(impl HeaderSource + ?Sized), name: &str) -> bool {
@@ -116,7 +323,7 @@ pub fn contains(headers: &(impl HeaderSource + ?Sized), name: &str) -> bool {
 /// `Set-Cookie` rather than a joined string is the point: a caller that wanted
 /// the values gets nothing and goes looking, instead of getting something
 /// plausible and wrong.
-pub fn combine(headers: &[(String, String)], name: &str) -> Option<String> {
+pub fn combine(headers: &(impl HeaderSource + ?Sized), name: &str) -> Option<String> {
     if !may_combine(name) {
         return None;
     }
@@ -190,6 +397,43 @@ pub fn remove(headers: &mut Vec<(String, String)>, name: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
+    #[test]
+    fn a_header_text_holds_static_inline_and_owned_text_the_same_way() {
+        let texts = [
+            HeaderText::from_static("etag"),
+            HeaderText::inline("etag").unwrap(),
+            HeaderText::from("etag".to_string()),
+            HeaderText::from("etag"),
+        ];
+        for t in &texts {
+            assert_eq!(t, "etag");
+            assert_eq!(&**t, "etag");
+            assert_eq!(*t, texts[0]);
+            assert_eq!(format!("{t} {t:?}"), "etag \"etag\"");
+        }
+        assert!(HeaderText::inline(&"x".repeat(23)).is_some());
+        assert!(HeaderText::inline(&"x".repeat(24)).is_none());
+    }
+
+    #[test]
+    fn an_inline_buffer_takes_an_etag_and_refuses_what_does_not_fit() {
+        let mut b = InlineBuf::new();
+        write!(b, "\"{:x}\"", u64::MAX).unwrap();
+        assert_eq!(b.into_text(), "\"ffffffffffffffff\"");
+        let mut b = InlineBuf::new();
+        assert!(write!(b, "{}", "x".repeat(24)).is_err());
+    }
+
+    #[test]
+    fn intern_makes_one_copy_of_a_value() {
+        let a = intern("public, max-age=0");
+        let b = intern(&String::from("public, max-age=0"));
+        assert!(std::ptr::eq(a, b), "the same text is one allocation");
+        assert_eq!(a, "public, max-age=0");
+    }
+
     use super::*;
 
     fn h() -> Vec<(String, String)> {

@@ -135,6 +135,31 @@ The cheaper lever sits on the site side: a content file named as both `global_pa
 Removing core's copying left one measured cost inside the template engine and nothing measurable in core itself.
 The file path had a separate problem, which was allocation rather than latency.
 
+### 2.6. The borrowed response head
+
+A rendered page's header names and values are set up once and borrowed, and the page's own bytes are copied out of the page area once, as the minified body.
+The change took the page path from 50 allocations per request to 41 in `site_allocs`, and from 36 to 27 in `request_allocs`.
+Of the 27, 22 are the libraries': 11 in Tera's context and render, 2 in `render_to`, and 11 in minify-html.
+The other 5 are ours: the built-in `year` and `datetime` values (2), the dictionary overlay's first map node and its key insert (2), and the response's header vector (1).
+
+What changed:
+
+- `Response.headers` holds `HeaderText` pairs. A `HeaderText` borrows a `&'static str`, holds up to 23 bytes inline, or owns a `String`, and it derefs to `str`.
+- A route's `Cache-Control`, `Last-Modified` and extra headers are made once, when the route loads, through `headers::intern`, and each response borrows them. The header names `Content-Type`, `Content-Encoding`, `ETag` and `Cache-Control` are literals.
+- The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes where it was before, so the page carries its validator to the caller and to the edge's cache, as CACHE-HDR's tests require. Computing it at serialisation instead would move it out of `Response.headers`, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it there.
+- A rendered page stays in the page area until the minifier has read it, so the copy out of the area is the minified body. A page that is not minified is copied once, as before.
+
+What stays, and why:
+
+- The response's header vector allocates once. Its removal needs a header buffer that the connection owns and reuses, which is the page-context redesign that also removes the four dictionary allocations.
+- A response is not written straight from the page area, because `Response.body` is an owned `Vec<u8>` that the compression stage and the caller take. The area is read directly where a stage can read it, which is the minifier.
+
+**Rollback.**
+Revert the merge commit of `perf/borrowed-response-head`, found with `git log --first-parent --merges --grep borrowed-response-head`.
+Reverting returns `Response.headers` to `Vec<(String, String)>`, one `String` pair for each header a page sets, and the page copy out of the area.
+The budgets go back with it: `site_allocs` from 41 to 50, `request_allocs`'s template budget from 27 to 36 and its handler budget from 21 to 23.
+The revert changes no wire byte: a page carries the same headers in the same order before and after.
+
 ---
 
 ## 3. Allocation on the static file path

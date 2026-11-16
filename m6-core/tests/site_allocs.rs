@@ -45,7 +45,9 @@ const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 /// target is zero, and the remaining 13 are listed in
 /// `work-queue/out/ALLOC-RENDER-ZERO.md`; a change that raises this is
 /// refused, and one that lowers it records the new number in that commit.
-const PAGE_BUDGET: usize = 50;
+/// The borrowed response head took nine of the 13 and the page copy one more:
+/// 41. A revert of that change puts this back to 50.
+const PAGE_BUDGET: usize = 41;
 
 fn main() {
     let mut args = Arguments::from_args();
