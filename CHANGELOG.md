@@ -439,6 +439,8 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 
 ### Docs
 
+**`docs/PERFORMANCE.md` now carries a measured breakdown of a TLS 1.3 handshake, with the crypto, kernel and m6 shares, the loopback price, the cipher-suite and provider comparison, the hit distribution under handshake load, and the system-call cost.**
+
 **The docs now state the four cache counts, the HTTP/2 send loop and m6-file's tail mode, and drop five claims the code no longer meets.**
 The README's 8 KiB stack header buffer and its two out-of-scope items (per-address rate limiting, shared-port scaling), the m6-file page's "no route can set `Cache-Control`" and "tracked as #126", and the head-limit refusal named 431 where the code sends 400 and 414.
 Verified by loading each configuration example with `--dump-config` of the matching binary.
