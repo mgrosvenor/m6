@@ -136,7 +136,6 @@ Two fixed routes on one path, and two patterns that can both match some path, ar
 `[rate_limit]` in `site.toml` sets `enabled` (default true) and `requests_per_min` (default 300), and the limit uses a fixed 60-second window.
 A request over the limit is answered 429 with `Retry-After: 60` and the body "Too Many Requests", before the cache lookup and any backend work.
 The counter is a map in one process's memory, keyed by the client address.
-With `[server] reuse_port`, each m6-http process on the shared port keeps its own map, so N processes allow N times `requests_per_min`.
 A process restart clears the count.
 The limit applies on HTTP/1.1, HTTP/2 and HTTP/3 alike, and `m6-site-toml.md` §4.13 owns the keys.
 
