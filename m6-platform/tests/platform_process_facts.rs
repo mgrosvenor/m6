@@ -81,8 +81,13 @@ fn measure_in_a_process_of_its_own() {
     );
 }
 
-/// H7. Break: `sysinfo` with its default features (`multithread` pulls
-/// rayon), or a reader that starts a helper thread.
+/// H7. Break: a reader that starts a helper thread.
+///
+/// The recorded break was `sysinfo`'s `multithread` feature, which pulls
+/// rayon. It no longer reaches this on either target: the Linux arm reads
+/// `/proc` and links no `sysinfo`, and the macOS arm asks `Networks` and
+/// `System::new` only, neither of which builds a rayon pool. Enabling the
+/// feature and rebuilding on macOS leaves this passing.
 fn a_snapshot_starts_no_thread() {
     let me = std::process::id();
     let before = settled_threads(me);
