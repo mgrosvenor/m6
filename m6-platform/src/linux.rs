@@ -205,8 +205,8 @@ fn lock_memory_refused(reason: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "{reason}: RLIMIT_MEMLOCK is below what this process holds. \
-             Raise it: under systemd set LimitMEMLOCK=infinity in the unit, otherwise \
+            "{reason}. Pinning memory needs RLIMIT_MEMLOCK unlimited. \
+             Under systemd set LimitMEMLOCK=infinity in the unit, otherwise \
              `ulimit -l unlimited` as root. Or set [server] lock_memory = false to run unpinned"
         ),
     )
@@ -234,20 +234,32 @@ fn lock_memory_refused(reason: &str) -> io::Error {
 /// by falling back to pinning every mapping. The value is `libc`'s, and nix's
 /// `MlockAllFlags` has no constant for it, so the call is made through `libc`.
 ///
-/// The limit must be unlimited. With `MCL_ONFAULT` the kernel no longer tests
-/// `RLIMIT_MEMLOCK` against the current mappings here, because it does not have
-/// to populate them, so a finite limit would let this call succeed and let a
-/// later `mmap` (mimalloc's next 1 GiB arena) be made unlocked once the limit is
-/// short: a service that carries on half pinned. `LimitMEMLOCK=infinity` is what
-/// the unit sets and what the error names, so a limit that cannot honour the
-/// request is refused here, at start, with the same error as one the kernel
-/// refuses.
+/// The limit must be unlimited, and that is the owner's rule for how a service
+/// starts. The kernel tests `RLIMIT_MEMLOCK` itself: `mlockall` compares
+/// `mm->total_vm` with the soft limit before it applies any flag, so a finite
+/// limit below this process's address space fails the call with `ENOMEM`
+/// whether or not `MCL_ONFAULT` is set (`mm/mlock.c`). Under `MCL_FUTURE` every
+/// later `mmap` and `brk` checks `mlock_future_ok`, which refuses a mapping
+/// that would take `mm->locked_vm` past the same soft limit (`mm/mmap.c`), so
+/// the kernel never creates a locked mapping unlocked. It cannot half-pin this
+/// process.
+///
+/// The limit is checked here anyway, so a finite one is one error at start with
+/// the same text for every limit and every process, including a privileged
+/// process the kernel would have allowed. That is the policy.
+/// `LimitMEMLOCK=infinity` is what the unit sets and what the error names.
 pub(super) fn lock_memory() -> io::Result<()> {
     use nix::sys::resource::{getrlimit, Resource};
-    let (_, hard) = getrlimit(Resource::RLIMIT_MEMLOCK)?;
-    if hard != nix::libc::RLIM_INFINITY {
+    // The soft limit is the one the kernel enforces. `mlockall` compares
+    // `mm->total_vm` with `rlimit(RLIMIT_MEMLOCK)`, and every later `mmap` and
+    // `brk` compares `mm->locked_vm` with the same soft limit (`mlock_future_ok`
+    // in `mm/mmap.c`), so a hard limit of infinity with a finite soft limit
+    // would pass a hard-only check and be refused by the kernel.
+    let (soft, _hard) = getrlimit(Resource::RLIMIT_MEMLOCK)?;
+    if soft != nix::libc::RLIM_INFINITY {
         return Err(lock_memory_refused(&format!(
-            "pinning pages as they are faulted needs RLIMIT_MEMLOCK unlimited, and it is {hard} bytes"
+            "pinning pages as they are faulted needs an unlimited RLIMIT_MEMLOCK, and the soft \
+             limit is {soft} bytes"
         )));
     }
     const FLAGS: nix::libc::c_int =

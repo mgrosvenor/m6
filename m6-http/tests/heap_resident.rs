@@ -13,10 +13,12 @@
 //! This test warms a real server with cache hits and holds three properties:
 //!
 //! - **the bound**: the resident set is at most what the process held before
-//!   pinning, plus the reservation the site configured, plus one huge page per
-//!   mimalloc segment class in use, plus a tenth of that. The pin may make the
-//!   reservation resident, and the kernel rounds each segment class's pages up
-//!   to a huge page. It may not make anything else resident.
+//!   pinning, plus the reservation the site configured, plus a measured
+//!   allowance for the excess the pinned build held over the base, plus a tenth
+//!   of that. It is also at most an absolute ceiling measured from the build
+//!   host, so a regression that raises both the pre-pin resident set and the
+//!   formula still fails. The pin may make the reservation resident. It may not
+//!   make anything else resident.
 //! - **the pin is in force**: `VmLck` is above zero, so the test cannot pass by
 //!   having no lock at all.
 //! - **the hot path**: 1,000 cache hits after the warm-up take zero minor page
@@ -28,6 +30,11 @@
 //!
 //! Linux only. macOS reports no resident set for another process and has
 //! nothing to pin, so there is no number to assert.
+//!
+//! To watch the bound fail the way the defect did, drop `MCL_ONFAULT` from
+//! `FLAGS` in `m6-platform/src/linux.rs` in a throwaway worktree and run this
+//! test on Linux. The logging the bound reads is unchanged, the eager pin makes
+//! about 1.2 GiB resident, and this test fails by a wide margin.
 
 #![allow(
     clippy::disallowed_methods,
@@ -62,16 +69,27 @@ const BODY_LEN: usize = 4096;
 /// first 64 KiB page mimalloc touches in a segment makes the whole 2 MiB page
 /// resident.
 const HUGE_PAGE: usize = 2 * 1024 * 1024;
-/// Huge pages the bound allows for that rounding: one per mimalloc arena or
-/// segment class in use.
+/// Huge pages the bound allows for the excess over the base: a measured
+/// allowance, rounded up.
 ///
-/// 24 comes from the measurement, and not from a guess. On the build host the
-/// pinned build held 129,028 KiB against the base's 95,712 with the small
-/// cache, an excess of 33,316 KiB, and 277,632 KiB against 228,788 with the
-/// cache full, an excess of 48,844 KiB. Those excesses are 16.3 and 23.8 huge
-/// pages, and the allowance is the larger one rounded up. A class that the load
-/// touches once costs a whole page whether it wanted 64 KiB of it or all 2 MiB.
+/// 24 comes from the build host. With the 128 MiB cache full the pinned build
+/// held 277,632 KiB against the base's 228,788, an excess of 48,844 KiB. That
+/// is 23.8 huge pages of 2 MiB, so the term is 24. This test runs a 32 MiB
+/// cache, whose matching run held an excess of 33,316 KiB (16.3 pages), so 24
+/// is the larger measurement applied conservatively here. The excess covers
+/// huge-page rounding and the part of the reservation that warm-up makes
+/// resident, and at 48 MiB it is a real fraction of the roughly 200 MiB bound.
 const SEGMENT_CLASS_HUGE_PAGES: usize = 24;
+/// The absolute ceiling on the resident set, beside the anchored formula.
+///
+/// The formula starts from the resident set the process reports before it pins,
+/// so a regression that moves occupancy before the lock raises the bound with
+/// it. This ceiling does not move with the process. 192 MiB comes from the
+/// build host: the pinned build with the small cache held 129,028 KiB (126
+/// MiB), and 192 MiB is that plus half again, rounded up to a multiple of 64
+/// MiB, which leaves 66 MiB for variation. The eager pin held 1,229 MiB, 6.4
+/// times this ceiling.
+const RESIDENT_CEILING: usize = 192 * 1024 * 1024;
 
 /// A cacheable response from the fake origin. `public` with a positive
 /// `max-age` is what m6-http stores, and `Connection: close` is what an
@@ -152,9 +170,8 @@ fn a_warm_server_is_resident_within_its_reservation() {
 
     // The bound, as the build host fixed it: the resident set the process
     // reported before it pinned, plus the heap reservation the site
-    // configured, plus one 2 MiB page per mimalloc arena or segment class in
-    // use, plus a tenth. The pin may make the reservation resident and the
-    // kernel rounds each segment class up to a huge page. It may not make
+    // configured, plus the measured allowance for the excess over the base,
+    // plus a tenth. The pin may make the reservation resident. It may not make
     // anything else resident.
     //
     // Against the defect this test exists for, 1,259,140 KiB resident and 1 GiB
@@ -174,6 +191,15 @@ fn a_warm_server_is_resident_within_its_reservation() {
          byte reservation, plus {SEGMENT_CLASS_HUGE_PAGES} huge pages of {HUGE_PAGE} bytes, \
          plus a tenth. Anything above that is memory the pin made resident that the load never \
          touched. VmLck is {locked} bytes and is not the resident set.\n{output}"
+    );
+    assert!(
+        rss <= RESIDENT_CEILING,
+        "m6-http holds {rss} bytes resident of {mapped} mapped after {WARMUP} cache hits, \
+         above the absolute ceiling of {RESIDENT_CEILING} bytes. The ceiling is measured from \
+         the build host's matching run (129,028 KiB) and does not move with the \
+         resident_before_pinning that anchors the formula, so it catches a regression that grew \
+         the process before the lock as well as one the pin made resident. VmLck is {locked} \
+         bytes and is not the resident set.\n{output}"
     );
 }
 
@@ -250,9 +276,15 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_m6-http"));
         cmd.arg(&self.site)
             .arg(&self.system)
-            // The periodic stats emit is not per request, and a run that crossed
-            // its tick would turn one fault into two. Push the first emit past
-            // any run, as the allocation tests do.
+            // The periodic stats emit is not per request, and its formatting can
+            // grow the log buffer, so push the first emit past any run as the
+            // allocation tests do. This variable moves only that emit, which is
+            // ten seconds by default and debug-only. It does not move the log
+            // tick, which is a fixed one second (m6-http/src/main.rs:2899). That
+            // tick flushes the log sink and reads mimalloc's counters through
+            // `alloc::note_growth`, and both are free of faults once the warm-up
+            // has filled the buffer, so a run that crosses it inside the window
+            // still takes zero minor faults.
             .env("M6_TEST_STATS_INTERVAL_SECS", "3600")
             .current_dir(self.dir.path());
         let mut svc = m6_core::testkit::Service::spawn("m6-http-heap-resident", &mut cmd);
