@@ -98,6 +98,12 @@ impl TestEnv {
         cmd.output().expect("run binary")
     }
 
+    /// The database this test's config names, for a fixture that writes it
+    /// through `m6_auth` rather than through the CLI.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.dir.path().join("data/auth.db")
+    }
+
     /// Create a user directly at bcrypt's lowest cost, 4.
     ///
     /// `user add` is production code and hashes at cost 12, which an
@@ -105,7 +111,7 @@ impl TestEnv {
     /// seeds it here. The tests whose subject is `user add` or `user passwd`
     /// still run the command.
     fn seed(&self, username: &str, password: &str, roles: &[&str]) {
-        let db = m6_auth::Db::open(&self.dir.path().join("data/auth.db")).expect("open db");
+        let db = m6_auth::Db::open(&self.db_path()).expect("open db");
         db.user_create_with_cost(username, password, roles, 4)
             .expect("seed user");
     }
@@ -493,23 +499,128 @@ fn test_token_ls_shows_created_token() {
     assert!(body.contains("mytoken"), "expected token name in: {}", body);
 }
 
+/// The diagnostic for a `token ls --json` failure, built at the moment it is
+/// needed.
+///
+/// The m6 issue 327 record carried neither command stream and no independent
+/// view of the rows. This message carries both streams, the array the listing
+/// answered, and the rows a second, fresh connection can read right now, so a
+/// failure shows whether the rows existed independently of the listing.
+fn listing_failure(env: &TestEnv, out: &Output) -> String {
+    let out_text = stdout(out);
+    let err_text = stderr(out);
+    let parsed = match serde_json::from_str::<serde_json::Value>(&out_text) {
+        Ok(value) => match value.as_array() {
+            Some(arr) => format!("{arr:?}"),
+            None => format!("<not an array: {value:?}>"),
+        },
+        Err(e) => format!("<no JSON array: {e}>"),
+    };
+    let rows = match m6_auth::Db::open(&env.db_path()) {
+        Ok(db) => match db.api_token_list("alice") {
+            Ok(tokens) => {
+                let names: Vec<&str> = tokens.iter().map(|tok| tok.name.as_str()).collect();
+                format!("{} {:?}", tokens.len(), names)
+            }
+            Err(e) => format!("<fresh connection could not list the rows: {e}>"),
+        },
+        Err(e) => format!("<fresh connection could not open the database: {e}>"),
+    };
+    format!(
+        "stdout: {out_text:?}\nstderr: {err_text:?}\nparsed array: {parsed}\nfresh-connection rows: {rows}"
+    )
+}
+
 #[test]
 fn test_token_ls_json_is_valid_array() {
     let env = TestEnv::new();
     env.setup_keys();
     env.seed("alice", "pw", &[]);
+    // The rows this test counts are written by the two CLI processes it runs,
+    // so the count proves that two `token create` processes that exited 0 are
+    // both visible to the next command. The failure message reads the rows
+    // again through a second, fresh connection, so a failure shows whether the
+    // rows existed at all.
     env.run_ok(&["token", "create", "alice", "--name", "t1"]);
     env.run_ok(&["token", "create", "alice", "--name", "t2"]);
 
     let out = env.run(&["token", "ls", "alice", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "token ls failed: {}",
+        listing_failure(&env, &out)
+    );
     let body = stdout(&out);
-    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(parsed.is_array(), "expected array, got: {}", body);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "token ls did not answer JSON ({e}): {}",
+            listing_failure(&env, &out)
+        )
+    });
+    assert!(
+        parsed.is_array(),
+        "token ls answered no array: {}",
+        listing_failure(&env, &out)
+    );
     let arr = parsed.as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    assert!(arr.iter().any(|t| t["name"] == "t1"), "t1 not found");
-    assert!(arr.iter().any(|t| t["name"] == "t2"), "t2 not found");
+    assert_eq!(
+        arr.len(),
+        2,
+        "the two tokens the CLI created are not both listed: {}",
+        listing_failure(&env, &out)
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "t1"),
+        "t1 is not listed: {}",
+        listing_failure(&env, &out)
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "t2"),
+        "t2 is not listed: {}",
+        listing_failure(&env, &out)
+    );
+}
+
+/// The record from m6 issue 327: a `token create` that exits 0 must be listed
+/// by the very next command. No retry and no sleep: the create's exit is the
+/// event, and the listing is the assertion, so a create that reports success
+/// without its row being visible fails here with both commands' output.
+#[test]
+fn test_token_ls_lists_the_token_the_previous_command_created() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.seed("alice", "pw", &[]);
+    env.run_ok(&["token", "create", "alice", "--name", "after-create"]);
+
+    let out = env.run(&["token", "ls", "alice", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "token ls failed: {}",
+        listing_failure(&env, &out)
+    );
+    let body = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "token ls did not answer JSON ({e}): {}",
+            listing_failure(&env, &out)
+        )
+    });
+    let arr = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array: {}", listing_failure(&env, &out)));
+    assert_eq!(
+        arr.len(),
+        1,
+        "the token the previous command created is not listed: {}",
+        listing_failure(&env, &out)
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "after-create"),
+        "the created token is not listed: {}",
+        listing_failure(&env, &out)
+    );
 }
 
 #[test]
