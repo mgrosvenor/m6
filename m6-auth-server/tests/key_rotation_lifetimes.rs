@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{binary, read_response, wait, Service, RESPONSE_BOUND};
 
 const ISSUER: &str = "test.example.com";
 
@@ -143,19 +143,21 @@ fn seed_user(site_dir: &Path, username: &str, password: &str) -> m6_auth::User {
 }
 
 /// Send a raw HTTP request over a Unix socket and return the full response bytes.
-fn http_request(socket_path: &Path, request: &str) -> String {
+/// Send a request and wait for the response event or the service's exit.
+///
+/// [`RESPONSE_BOUND`] is the safety net above the work, not a read deadline
+/// guessed at it.
+fn http_request(svc: &mut Service, socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     let method = request.split(' ').next().unwrap_or("");
-    let resp = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let resp = read_response(svc, stream, method, RESPONSE_BOUND).unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&resp).into_owned()
 }
 
 fn http_request_with_body(
+    svc: &mut Service,
     socket_path: &Path,
     method: &str,
     path: &str,
@@ -170,7 +172,7 @@ fn http_request_with_body(
         body.len(),
         body
     );
-    http_request(socket_path, &req)
+    http_request(svc, socket_path, &req)
 }
 
 fn parse_status(resp: &str) -> u16 {
@@ -181,9 +183,15 @@ fn parse_status(resp: &str) -> u16 {
 }
 
 /// Log in over JSON and return `(access_token, refresh_token)`.
-fn login_json(socket_path: &Path, username: &str, password: &str) -> (String, String) {
+fn login_json(
+    svc: &mut Service,
+    socket_path: &Path,
+    username: &str,
+    password: &str,
+) -> (String, String) {
     let body = serde_json::json!({ "username": username, "password": password }).to_string();
     let resp = http_request_with_body(
+        svc,
         socket_path,
         "POST",
         "/auth/login",
@@ -199,9 +207,10 @@ fn login_json(socket_path: &Path, username: &str, password: &str) -> (String, St
 }
 
 /// Refresh a token over JSON and return the response.
-fn refresh_json(socket_path: &Path, refresh_token: &str) -> String {
+fn refresh_json(svc: &mut Service, socket_path: &Path, refresh_token: &str) -> String {
     let body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
     http_request_with_body(
+        svc,
         socket_path,
         "POST",
         "/auth/refresh",
@@ -257,13 +266,13 @@ fn rotate_key(env: &TestEnv, mut guard: Service) -> Service {
 fn a_refresh_token_issued_before_rotation_still_refreshes_after_the_key_rotates() {
     let env = setup_test_env("rotate-pre-token");
     seed_user(&env.site_dir, "ada", "ada-password");
-    let guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
-    let (_, refresh_a) = login_json(&env.socket_path, "ada", "ada-password");
+    let (_, refresh_a) = login_json(&mut guard, &env.socket_path, "ada", "ada-password");
 
-    let guard = rotate_key(&env, guard);
+    let mut guard = rotate_key(&env, guard);
 
-    let resp = refresh_json(&env.socket_path, &refresh_a);
+    let resp = refresh_json(&mut guard, &env.socket_path, &refresh_a);
     assert_eq!(
         parse_status(&resp),
         200,
@@ -282,10 +291,10 @@ fn a_refresh_token_issued_after_rotation_refreshes_at_once() {
     seed_user(&env.site_dir, "bee", "bee-password");
     let guard = spawn_server(&env);
 
-    let guard = rotate_key(&env, guard);
+    let mut guard = rotate_key(&env, guard);
 
-    let (_, refresh_b) = login_json(&env.socket_path, "bee", "bee-password");
-    let resp = refresh_json(&env.socket_path, &refresh_b);
+    let (_, refresh_b) = login_json(&mut guard, &env.socket_path, "bee", "bee-password");
+    let resp = refresh_json(&mut guard, &env.socket_path, &refresh_b);
     assert_eq!(
         parse_status(&resp),
         200,
@@ -305,12 +314,12 @@ fn a_refresh_token_signed_by_a_foreign_key_is_rejected() {
     let user = seed_user(&env.site_dir, "cee", "cee-password");
     let guard = spawn_server(&env);
 
-    let guard = rotate_key(&env, guard);
+    let mut guard = rotate_key(&env, guard);
 
     let (foreign_private, foreign_public) = generate_test_rsa_keys();
     let foreign_token = mint_refresh_token(&foreign_private, &foreign_public, ISSUER, &user);
 
-    let resp = refresh_json(&env.socket_path, &foreign_token);
+    let resp = refresh_json(&mut guard, &env.socket_path, &foreign_token);
     assert_eq!(
         parse_status(&resp),
         401,

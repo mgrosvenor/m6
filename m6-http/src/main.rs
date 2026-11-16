@@ -2192,7 +2192,10 @@ fn follower_answered(
 /// A forwarded client request could not reach the upstream: mark it down, log
 /// the transition once, and serve held content from here on.
 fn follower_failed(state: &mut ServerState, reason: &'static str, now: Instant) {
-    let first = state.genid.cache_mut().is_some_and(|f| f.failed(now));
+    let first = state
+        .genid
+        .cache_mut()
+        .is_some_and(|f| f.failed(reason, now));
     if !first {
         return;
     }
@@ -4686,6 +4689,37 @@ fn handle_request_inner(
             health::HEALTH_BACKEND.to_string(),
             None,
         );
+    }
+
+    // ── Readiness, beside /health and deliberately a second answer ─────────
+    // /health answers for the process and keeps answering 200 while the
+    // process serves, which is the correct liveness answer even with the
+    // origin gone: a warm cache still serves hits. A load balancer needs the
+    // other question answered, and it reads a status code rather than a body.
+    // Answered here, ahead of routing, so a catch-all route can never shadow
+    // it, and public because /health is.
+    //
+    // The whole cost is reading state the loop already holds: the role chosen
+    // once at start, and the follower's down flag, last answer and last
+    // failure reason. No socket, no request upstream, no allocation for the
+    // decision. The body is formatted into a fixed stack buffer and copied
+    // once into the response.
+    if state.config.health.enabled && req.path == health::READY_PATH {
+        let ready = health::readiness(&state.genid, m6_core::platform::now());
+        let (code, headers, body) = health::ready_response(&state.config.node.name, ready);
+        // Recorded like /health, so a readiness poll is observable without
+        // being counted as a visitor.
+        analytics::log_monitor(
+            state.config.analytics.enabled,
+            &req.headers,
+            &state.config.node.name,
+            &req.path,
+            code,
+            client_ip,
+            None,
+            &mut state.traffic,
+        );
+        return RequestOutcome::Ready(code, headers, body, health::READY_BACKEND.to_string(), None);
     }
 
     // ── Metrics endpoint, deliberately a separate path from /health ─────────
