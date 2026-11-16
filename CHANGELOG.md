@@ -139,6 +139,14 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`m6_core::auth` is the one place the credential decision lives.**
+`Identity`, `Require`, `Answer` and `Decision` name the identity a `/check` 200 answers, the `role:<name>` or `group:<name>` matcher, the total parser for the answer, and the decision the edge acts on.
+`parse_check` maps a 200 to the identity, a 401 to `Refused`, and every other status or an unparsable 200 to `NoDecision`, which is answered 503 and never 401.
+`encode_claims_header` writes the four identity keys and no token claim.
+The `testkit` feature gains `CheckServer`, a fake `/check` authority with a token table that answers a 200 identity, a 401, a 403, a 503, a slow answer, a close mid-answer, or a refused connection, and counts the calls it served.
+No edge behaviour changes: `m6-http` keeps its own verifier until steps 5 to 7, and nothing calls these types on a request path yet.
+Verified on 2026-11-17 on a macOS sandbox: 12 unit tests in `m6-core/src/auth.rs`, including `no_decision_is_labelled_as_no_credential`, and 7 tests of the fake server.
+
 **`m6-auth-server` can serve `/check` on its own Unix socket, and a deployment can run the login side as its own process.**
 The check socket is derived beside the primary socket as `<parent>/check-<file name>`, so `/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`, and `M6_CHECK_SOCKET_OVERRIDE` sets it outright.
 The four login routes keep the primary socket, and the new `--login-only` and `--check-only` flags bind one listener each, with neither flag binding both.

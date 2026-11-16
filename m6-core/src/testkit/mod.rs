@@ -54,6 +54,8 @@
 // the harness, so a service binary can count its own loop's allocations.
 pub mod alloc_count;
 #[cfg(feature = "testkit")]
+pub mod check;
+#[cfg(feature = "testkit")]
 pub mod paths;
 #[cfg(feature = "testkit")]
 pub mod port;
@@ -64,6 +66,8 @@ pub mod response;
 #[cfg(feature = "testkit")]
 pub mod wait;
 
+#[cfg(feature = "testkit")]
+pub use check::{CheckServer, Reply};
 #[cfg(feature = "testkit")]
 pub use paths::{binary, exec_scratch_root};
 #[cfg(feature = "testkit")]

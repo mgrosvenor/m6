@@ -127,6 +127,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `request` | `Request`, the handler's view: the dictionary, body access, file I/O helpers, query and form parsing, and percent-encoding. |
 | | `response` | `Response`, every constructor a handler needs, and `send`. |
 | | `http` | `RawRequest`, `RawResponse`, `Method`, the `HeaderSource` trait and `is_same_origin_path`. |
+| | `auth` | `Identity`, `Answer`, `Decision` and `Require`: the identity a `/check` answers, the `role:<name>` or `group:<name>` matcher, the answer parser and the head decision. No I/O. |
 | | `headers` | Reading and writing a header list, once. `get`, `get_all`, `combine`, `set`, `append`, `remove`. |
 | | `cookie` | `Cookie` and `SameSite`. One place that says what a cookie can be. |
 | | `multipart` | `Upload` and `parse_upload`. Feature `multipart`. |
@@ -502,7 +503,25 @@ It says which parameter to fix and never repeats the value the client sent.
 It returns a value that formats when displayed, so a row can carry it without a `String` per line, and a negative or out-of-range input gives the epoch.
 
 Those six modules are the handler's whole surface: one request, one response, the wire types they are built from, and the three helpers for headers, cookies and time ranges.
-Section 6 turns to the parsers and the HTTP rules those objects implement.
+Section 5.7 adds the credential decision that runs before a handler, and section 6 turns to the parsers and the HTTP rules those objects implement.
+
+### 5.7. `auth`
+
+`m6_core::auth` is where the credential decision lives.
+It does no I/O and starts no thread.
+
+- `Identity` is what a `/check` 200 answers: `sub`, `username`, `roles` and `groups`.
+- `Require::parse("role:<name>")` and `Require::parse("group:<name>")` are the one definition of a route's requirement, and `check_require(identity, require)` matches it.
+  Any other form denies.
+- `parse_check(status, body)` is total: a 200 with all four fields is `Answer::Identified`, a 401 is `Answer::Refused`, and every other status or a 200 that does not parse is `Answer::NoDecision`.
+  A 403 is `NoDecision`.
+- `Answer::decide(require)` maps to `Decision`: `Allow(identity)`, `Deny`, `NoCredential` or `NoDecision`.
+  `Decision::refusal()` returns the 401 or 403 bytes from `http::token_refusal`.
+  `NoDecision` returns `None` and is answered 503, so a caller must match it before reading `None` as permission.
+- `encode_claims_header(identity)` writes the four keys as base64 JSON for `X-Auth-Claims`, and no token claim survives.
+
+The rule that matters: a 401 is the authority's decision, and a 503 is its absence.
+`NoDecision` never becomes `NoCredential`, because a 401 tells a user with a valid credential to log in again.
 
 ---
 
@@ -1078,6 +1097,13 @@ links it.
 - `testkit::paths::binary(name)` builds the release binary from the current source, once per name per test process, and returns its path.
 - `testkit::response::read_one(r, method)` reads exactly one response, HEAD
   included.
+- `testkit::check::CheckServer` is a fake `/check` authority on a Unix socket.
+  `answer(token, Reply)` sets the table, `serve_one()` accepts and answers one
+  queued connection with no thread, and `calls()` counts check requests.
+  `Reply` can answer a 200 identity, a 401, a 403, a 503, any other status, a
+  slow answer, or a close in the middle of an answer.
+  `close()` stops listening and leaves the socket file with no listener, so the
+  next connect is refused.
 
 ---
 
