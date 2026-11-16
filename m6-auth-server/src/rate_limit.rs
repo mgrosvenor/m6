@@ -89,6 +89,32 @@ impl RateLimiter {
         }
     }
 
+    /// Whole seconds until `ip`'s window ends, rounded up.
+    ///
+    /// The block lifts once `window_secs` has passed since the most recent
+    /// failure, so the true wait is `window_secs` minus the elapsed fraction.
+    /// The fraction is truncated before it is subtracted, which makes this the
+    /// ceiling of that wait: never below the true wait and at most one second
+    /// above it. `Retry-After` must not send a client back early, so the
+    /// rounding goes up.
+    ///
+    /// Zero means the window has already elapsed. An address with no recorded
+    /// failure also answers zero, because it has no wait to report.
+    pub fn retry_after_secs(&self, ip: &str) -> u64 {
+        self.retry_after_secs_at(ip, m6_core::platform::now())
+    }
+
+    /// [`retry_after_secs`](Self::retry_after_secs) at a caller-supplied time,
+    /// so a test can check the rounding without sleeping.
+    fn retry_after_secs_at(&self, ip: &str, now: Instant) -> u64 {
+        match self.map.get(ip) {
+            Some((_, last)) => self
+                .window_secs
+                .saturating_sub(now.saturating_duration_since(*last).as_secs()),
+            None => 0,
+        }
+    }
+
     /// Count one failed login against `ip`.
     pub fn record_failure(&mut self, ip: &str) {
         self.record_failure_at(ip, m6_core::platform::now());
@@ -225,5 +251,72 @@ mod tests {
             !rl.is_blocked("192.0.2.1"),
             "the client stayed blocked after the window rolled over"
         );
+    }
+
+    /// The header value is the remaining window, rounded up. A failure just
+    /// recorded leaves the whole window. Any elapsed fraction costs one whole
+    /// second, because a `Retry-After` below the true wait sends the client
+    /// back early.
+    #[test]
+    fn retry_after_is_the_remaining_window_rounded_up() {
+        let mut rl = RateLimiter::with_limits(1, 60);
+        let t0 = m6_core::platform::now();
+        rl.record_failure_at("192.0.2.1", t0);
+
+        assert_eq!(rl.retry_after_secs_at("192.0.2.1", t0), 60);
+        assert_eq!(
+            rl.retry_after_secs_at("192.0.2.1", t0 + Duration::from_millis(1)),
+            60,
+            "a fraction of a second still leaves the whole 60-second wait"
+        );
+        assert_eq!(
+            rl.retry_after_secs_at("192.0.2.1", t0 + Duration::from_millis(59_500)),
+            1,
+            "the last half second is reported as a whole one"
+        );
+        assert_eq!(
+            rl.retry_after_secs_at("192.0.2.1", t0 + Duration::from_secs(60)),
+            0,
+            "the window has elapsed"
+        );
+        assert_eq!(
+            rl.retry_after_secs_at("192.0.2.2", t0),
+            0,
+            "an address with no failure has no wait"
+        );
+    }
+
+    /// Two configured windows answer in proportion, and every answer is at or
+    /// above the true wait and less than one second above it. Rounding down
+    /// would break the first bound, and a constant cannot satisfy both windows.
+    #[test]
+    fn retry_after_is_never_below_the_true_wait() {
+        for window_secs in [120u64, 900] {
+            let mut rl = RateLimiter::with_limits(1, window_secs);
+            let t0 = m6_core::platform::now();
+            rl.record_failure_at("192.0.2.1", t0);
+            assert_eq!(rl.retry_after_secs_at("192.0.2.1", t0), window_secs);
+
+            for offset in [
+                Duration::ZERO,
+                Duration::from_millis(1),
+                Duration::from_millis(999),
+                Duration::from_secs(1),
+                Duration::from_secs(window_secs / 2),
+                Duration::from_secs(window_secs - 1),
+            ] {
+                let answered =
+                    Duration::from_secs(rl.retry_after_secs_at("192.0.2.1", t0 + offset));
+                let true_wait = Duration::from_secs(window_secs) - offset;
+                assert!(
+                    answered >= true_wait,
+                    "window {window_secs}s, {offset:?} elapsed: answered {answered:?}, true wait {true_wait:?}"
+                );
+                assert!(
+                    answered < true_wait + Duration::from_secs(1),
+                    "window {window_secs}s, {offset:?} elapsed: answered {answered:?} is more than a second above the true wait {true_wait:?}"
+                );
+            }
+        }
     }
 }
