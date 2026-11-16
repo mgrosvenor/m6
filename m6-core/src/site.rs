@@ -348,6 +348,12 @@ impl Site {
                 .map_err(|e| (format!("Config error: {e}"), 2))?,
         };
 
+        // A limit rounded up is a warning, not a refusal: one line each, on
+        // stderr, before the log is up.
+        for warning in config.limits.warnings() {
+            eprintln!("{name}: {warning}");
+        }
+
         let site_toml = validate_startup(&config, &site_dir, &config_path)
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
 
@@ -616,8 +622,22 @@ impl Site {
         // Render a template the response names.
         if resp.template_name.is_some() {
             if let Some(dict) = dict {
-                match FrameworkState::render_response(&*self.state.renderer, &mut resp, dict) {
+                match FrameworkState::render_response(
+                    &*self.state.renderer,
+                    &self.state.page_area,
+                    &mut resp,
+                    dict,
+                ) {
                     Ok(()) => {}
+                    Err(RenderError::TooLarge(needed)) => {
+                        let limit = self.state.config.limits.get(&crate::limits::RENDER_PAGE);
+                        error!(
+                            "{}: {}",
+                            self.name,
+                            limit.exceeded(needed, &format!("page {}", raw.path()))
+                        );
+                        resp = Response::status(500);
+                    }
                     Err(RenderError::NotFound) => {
                         warn!(path = raw.path(), "template signalled not_found");
                         resp = Response::not_found();
@@ -1485,6 +1505,11 @@ pub(crate) struct FrameworkState {
     pub(crate) params_cache: ParamsCache,
 
     pub(crate) renderer: Arc<dyn Renderer>,
+    /// The working area every rendered page is written into: made once at the
+    /// `render_page` limit's start, grown only past it, never shrunk and never
+    /// freed per request. One request renders at a time on the service's one
+    /// loop, so the borrow is never contended.
+    pub(crate) page_area: RefCell<crate::limits::BoundedBuf>,
 
     #[cfg(feature = "flash")]
     pub(crate) flash_secret: Vec<u8>,
@@ -1743,6 +1768,10 @@ impl FrameworkState {
             }
         };
 
+        let page_area = RefCell::new(crate::limits::BoundedBuf::new(
+            config.limits.get(&crate::limits::RENDER_PAGE),
+        ));
+
         Ok(Self {
             config: Arc::new(config),
             site_dir: Arc::new(site_dir),
@@ -1753,6 +1782,7 @@ impl FrameworkState {
             static_params,
             params_cache,
             renderer: Arc::from(renderer),
+            page_area,
             #[cfg(feature = "flash")]
             flash_secret,
         })
@@ -1980,6 +2010,7 @@ impl FrameworkState {
     /// released the read lock.
     pub(crate) fn render_response(
         renderer: &dyn Renderer,
+        page_area: &RefCell<crate::limits::BoundedBuf>,
         resp: &mut Response,
         dict: &Dict,
     ) -> std::result::Result<(), RenderError> {
@@ -1993,8 +2024,13 @@ impl FrameworkState {
                 Some(supplied) => supplied,
                 None => dict,
             };
-            let html = renderer.render(template_name.as_ref(), ctx)?;
-            resp.body = crate::response::Body::Bytes(html.into_bytes());
+            // The page is written into the reusable area, then copied out once
+            // at its exact size: the response owns its bytes, and the area is
+            // empty again for the next page.
+            let mut area = page_area.borrow_mut();
+            area.clear();
+            renderer.render(template_name.as_ref(), ctx, &mut area)?;
+            resp.body = crate::response::Body::Bytes(area.as_bytes().to_vec());
             resp.headers.push((
                 "Content-Type".to_string(),
                 "text/html; charset=utf-8".to_string(),
@@ -2643,6 +2679,12 @@ mod tests {
         std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
         // Prints a form field, so a test can see the dictionary a POST built.
         std::fs::write(dir.path().join("templates/form.html"), "<p>{{ name }}</p>").unwrap();
+        // About 123 KB: over a 64 KiB area, under a 128 KiB one.
+        std::fs::write(
+            dir.path().join("templates/big.html"),
+            "{% for i in range(end=3000) %}0123456789012345678901234567890123456789\n{% endfor %}",
+        )
+        .unwrap();
         let config_path = dir.path().join("m6-site.toml");
         std::fs::write(&config_path, toml).unwrap();
         let config = crate::config::load(&config_path, dir.path()).unwrap();
@@ -2684,6 +2726,49 @@ mod tests {
             "<p>Ada</p>",
             "the template must see the form field read from the head's body"
         );
+    }
+
+    /// GET `/big` through `site`.
+    fn get_big(site: &Site) -> Response {
+        let mut slots = [httparse::EMPTY_HEADER; 64];
+        let head = match parse_head(b"GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut slots) {
+            crate::h1::HeadResult::Complete(head) => head,
+            _ => panic!("the test's request must parse"),
+        };
+        match site.handle(&head) {
+            Handled::Done(resp) => resp,
+            _ => panic!("a template route is answered by core"),
+        }
+    }
+
+    const BIG_ROUTE: &str = "[[route]]\npath = \"/big\"\ntemplate = \"templates/big.html\"\n";
+
+    /// A page over the start grows the service's one page area by doubling and
+    /// the area keeps the size, so the next page is rendered with no growth.
+    #[test]
+    fn a_page_over_the_start_grows_the_area_and_it_keeps_the_size() {
+        let config =
+            format!("{BIG_ROUTE}[limits.render_page]\nstart = \"16KiB\"\nmax = \"1MiB\"\n");
+        let (site, _dir) = site_from(&config, &[]);
+        assert_eq!(site.state.page_area.borrow().capacity(), 16 * 1024);
+        let resp = get_big(&site);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.as_bytes().unwrap().len() > 120_000);
+        assert_eq!(site.state.page_area.borrow().capacity(), 128 * 1024);
+        assert_eq!(get_big(&site).status, 200);
+        assert_eq!(site.state.page_area.borrow().capacity(), 128 * 1024);
+    }
+
+    /// A page past the maximum is refused with a 500, and the area keeps the
+    /// size it had reached.
+    #[test]
+    fn a_page_past_the_maximum_is_refused_with_a_500() {
+        let config =
+            format!("{BIG_ROUTE}[limits.render_page]\nstart = \"16KiB\"\nmax = \"64KiB\"\n");
+        let (site, _dir) = site_from(&config, &[]);
+        assert_eq!(get_big(&site).status, 500);
+        assert_eq!(site.state.page_area.borrow().capacity(), 64 * 1024);
+        assert!(site.state.page_area.borrow().overflow().is_some());
     }
 
     #[test]

@@ -163,6 +163,9 @@ pub struct RendererConfig {
     pub minification: MinificationConfig,
     /// Logging settings from `[log]` in the config file.
     pub log: LogConfig,
+    /// The named size limits from `[limits]`: each bounded buffer's start and
+    /// maximum. See [`crate::limits`].
+    pub limits: crate::limits::Limits,
     /// Where `site.toml` is, from the reserved key `site_toml`.
     ///
     /// A relative path resolves against `site_dir`. `None` means
@@ -245,6 +248,7 @@ const FRAMEWORK_KEYS: &[&str] = &[
     "compression",
     "minification",
     "log",
+    "limits",
     "errors",
     "flash_secret",
     "site_toml",
@@ -320,7 +324,14 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
         // Silently ignore if absent.
     }
 
-    parse_config(toml_val, site_dir)
+    let limits = crate::limits::Limits::from_toml(
+        toml_val.get("limits"),
+        config_path,
+        crate::platform::process::page_size(),
+    )?;
+    let mut config = parse_config(toml_val, site_dir)?;
+    config.limits = limits;
+    Ok(config)
 }
 
 /// The path a setting that names a secret, key or certificate holds, which
@@ -599,6 +610,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         compression,
         minification,
         log,
+        limits: crate::limits::Limits::default(),
         site_toml,
         site_size_budget_mb,
     })
@@ -871,6 +883,23 @@ template = "templates/home.html"
         let mut f = NamedTempFile::new().unwrap();
         write!(f, "{body}").unwrap();
         load(f.path(), Path::new("/tmp"))
+    }
+
+    /// `[limits]` is read by `load` with the file's own path, kept out of the
+    /// request dictionary, and a value that cannot work is refused naming the
+    /// file.
+    #[test]
+    fn limits_are_read_from_the_file_and_kept_out_of_the_dictionary() {
+        let cfg = load_text("[limits.render_page]\nstart = \"1MiB\"\nmax = \"8MiB\"\n").unwrap();
+        let page = cfg.limits.get(&crate::limits::RENDER_PAGE);
+        assert_eq!((page.start(), page.max()), (1 << 20, 8 << 20));
+        assert!(cfg.user_config.get("limits").is_none());
+
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "[limits.render_page]\nmax = \"4KiB\"\n").unwrap();
+        let err = load(f.path(), Path::new("/tmp")).unwrap_err().to_string();
+        assert!(err.contains("is below start = 512 KiB"), "{err}");
+        assert!(err.contains(&f.path().display().to_string()), "{err}");
     }
 
     #[test]

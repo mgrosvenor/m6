@@ -11,6 +11,7 @@ pub mod firewall;
 pub mod h1;
 pub mod headers;
 pub mod http;
+pub mod limits;
 pub mod log;
 pub mod mime;
 /// The HTML, CSS, JavaScript and JSON minifiers. On by default; see the

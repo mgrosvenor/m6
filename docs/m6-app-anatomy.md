@@ -332,7 +332,7 @@ Those paths are decided before the socket exists, which is why §4 comes next: t
 
 ## 4. The configuration
 
-**Core reserves eleven top-level keys and hands the service everything else.**
+**Core reserves twelve top-level keys and hands the service everything else.**
 This section gives the reserved keys and their defaults, the name that ties the configuration file to the socket and to `site.toml`, and what is read at start.
 
 Table 5 is the reserved set, and a key in it never reaches a template.
@@ -344,6 +344,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[compression]` | core | brotli and gzip levels per MIME type |
 | `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 11 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info` |
+| `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 |
 | `[[route]]` | core | the configuration route table, §5 |
 | `global_params` | core | JSON files merged into every request dictionary |
 | `secrets_file` | core | a second TOML file merged with this one, so a secret stays out of the tracked configuration. One key, one owner: a key set in both files is refused with an error naming every clash. An absolute path, and a relative one is exit 2 |
@@ -351,7 +352,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `site_toml` | core | the path of `site.toml`. Absolute as given, relative to `site_dir`, default `<site_dir>/site.toml`. A named file that does not exist, cannot be read or is not valid TOML is exit 2 |
 | `[errors]` | `m6-http`, in `site.toml` | reserved, so it does not reach the request dictionary. The section itself belongs to `site.toml` |
 
-**Table 5: the eleven reserved keys, who reads each, and its default.**
+**Table 5: the twelve reserved keys, who reads each, and its default.**
 Take from it that every value core reads has a working default, and that `[server]` refuses a value it cannot parse, because a service that started with a deadline nobody chose looks healthy. An unknown key inside one of these tables stops the service at start with exit 2.
 
 A `[thread_pool]` table is refused with its own message, because one process runs one loop on one core.
@@ -405,6 +406,41 @@ The name also carries one agreement that core checks at startup.
 A service that compresses where `site.toml` says it does not lets the edge cache a compressed body and replay it to a client that asked for identity, and the reverse fragments every downstream cache on a header that cannot change the body.
 
 The route table is the part of that configuration a service writes code against, and §5 is how the two meet.
+
+### 4.2 Limits
+
+**Every bounded buffer and queue in a service has a named limit with a `start` and a `max`, and both are config keys.**
+Table 6 lists the limits that exist, with the defaults a config that says nothing gets.
+A key under `[limits]` that is not in the table stops the service at start with exit 2.
+
+| limit | start | max | what it bounds | past `max` |
+|---|---|---|---|---|
+| `render_page` | 512 KiB | 4 MiB | the working area one rendered page is written into, one per service | the page is refused, the client gets 500 and the log names the page, the size needed and the key |
+
+**Table 6: the named limits, their defaults, and what happens past the maximum.**
+Take from it that a service allocates `start` once, and that `render_page` is the only limit so far.
+
+```toml
+[limits.render_page]
+start = "512KiB"
+max   = "4MiB"
+```
+
+A size is a whole number of bytes, or a number followed by `B`, `KiB`, `MiB` or `GiB`.
+Either key may be left out, and the default for that name applies.
+
+The same rule holds for every limit:
+
+1. The area is allocated at `start` when the service starts.
+2. It grows only when a write does not fit, by doubling, and the last step is clamped to `max`.
+3. It keeps the grown size and never shrinks.
+4. Each growth writes one log line that names the limit and the new size, so an operator can raise `start` until growth stops.
+5. A write that needs more than `max` is refused with one error line, for example: `m6-html: page /blog/x needs at least 5 MiB, over [limits.render_page] max = 4 MiB in /etc/m6/m6-html.toml; raise max to fix this`.
+
+Sizes are whole multiples of the operating system's page, `page * 2^k`, where the page comes from `m6-platform`: 4 KiB on Linux x86_64 and 16 KiB on macOS arm64.
+A value of another size is rounded up to the next one, and the service writes one warning to stderr per value, naming the key, the file, the value set and the value used:
+`m6-html: [limits.render_page] start = 500KiB in /etc/m6/m6-html.toml is not a power-of-two multiple of the 16 KiB page; using 512 KiB. Set it to 512KiB to silence this.`
+A value that cannot work stops the start with exit 2: a `max` below its `start`, a zero, a unit that is not a size, an unknown limit or an unknown key.
 
 ---
 
@@ -485,7 +521,7 @@ root    = "assets/"
 Configuration routes are compiled at start.
 A route naming a handler that was never registered exits 2 at startup, and the response comes back as `Handled::Named(index, req)` for the service's `match` to call.
 
-Table 6 gives the keys a `[[route]]` may carry.
+Table 7 gives the keys a `[[route]]` may carry.
 
 | key | what it does |
 |---|---|
@@ -499,7 +535,7 @@ Table 6 gives the keys a `[[route]]` may carry.
 | `headers` | extra response headers, as `[[key, value]]` pairs |
 | anything else | kept verbatim and read by the handler through `Request::route_setting` |
 
-**Table 6: the eight keys core defines on a `[[route]]`, and what happens to a ninth.**
+**Table 7: the eight keys core defines on a `[[route]]`, and what happens to a ninth.**
 Take from it that the defaults for `cache` depend on the kind of route, because letting a handler route inherit the page default would put computed output in a shared cache by omission, and that core deliberately does not know what `root` means.
 
 A route carrying both a template and a handler goes to the handler.
@@ -689,7 +725,7 @@ That is the last of the contract, and §10 collects it.
 ## 10. Summary
 
 **Everything above is one claim: a new m6 service is its routes, its state and its loop, and the parts come from core.**
-Table 7 is the whole contract in one place.
+Table 8 is the whole contract in one place.
 
 | the service supplies | `m6-core` supplies |
 |---|---|
@@ -700,7 +736,7 @@ Table 7 is the whole contract in one place.
 | a systemd unit naming the two paths and what it writes | `Lifecycle`: the start line, the signal line, the socket unlink and the exit |
 | one call to `assert_app_lifecycle` | the assertion behind it |
 
-**Table 7: the division of labour between a service and `m6-core`.**
+**Table 8: the division of labour between a service and `m6-core`.**
 Take from it that the left column is the whole of a new service, and that every row on the right was once written once per service, which `m6-architecture.md` §6.2, "why each thing in core exists exactly once", counts.
 
 Two consequences follow, and both are reasons to stay inside the shape.
