@@ -92,3 +92,40 @@ fn lock_memory_pins_or_names_the_limit_and_the_fix() {
         assert!(text.contains("lock_memory = false"), "{text}");
     }
 }
+
+/// With the memlock limit lowered to zero, `lock_memory` on Linux refuses with
+/// the limit and the fix named, and on macOS, which has nothing to pin, still
+/// answers `Ok`. The limit is lowered for a child only, by `ulimit -l 0` in the
+/// shell that runs the test binary again with `M6_LOCK_CHILD` set, so no other
+/// test is affected and the test needs no privilege.
+#[test]
+fn lock_memory_under_a_lowered_limit_refuses_naming_the_limit_and_the_fix() {
+    if std::env::var_os("M6_LOCK_CHILD").is_some() {
+        let result = process::lock_memory();
+        if std::env::consts::OS == "linux" {
+            let text = result.expect_err("mlockall under a zero limit").to_string();
+            assert!(text.contains("RLIMIT_MEMLOCK"), "{text}");
+            assert!(text.contains("LimitMEMLOCK=infinity"), "{text}");
+        } else {
+            result.expect("this OS has nothing to pin");
+        }
+        return;
+    }
+    let out = std::process::Command::new("sh")
+        .args(["-c", "ulimit -S -H -l 0 2>/dev/null; exec \"$0\" \"$@\""])
+        .arg(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "lock_memory_under_a_lowered_limit_refuses_naming_the_limit_and_the_fix",
+            "--nocapture",
+        ])
+        .env("M6_LOCK_CHILD", "1")
+        .output()
+        .expect("run the child");
+    assert!(
+        out.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

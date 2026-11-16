@@ -170,6 +170,10 @@ jobs:
       - name: Test suite
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           status=0
           cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
@@ -193,6 +197,10 @@ jobs:
       - name: Feature-gated tests, named explicitly
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           # `testkit` also turns on `alloc-count`, so all five counting tests build.
           cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
           # `email` makes these two visible, `testkit` is the harness they use.
@@ -377,6 +385,10 @@ jobs:
       - name: Test suite
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           status=0
           cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
@@ -397,6 +409,10 @@ jobs:
       - name: Feature-gated tests, named explicitly
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           # `testkit` also turns on `alloc-count`, so all five counting tests build.
           cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
           # `email` makes these two visible, `testkit` is the harness they use.
@@ -461,7 +477,12 @@ jobs:
       # installed above, so an absent one here is a failure and not a skip.
       # That flag exists for a laptop and is never a way to ship.
       - name: Conformance
-        run: ./tools/conformance.sh
+        run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          ./tools/conformance.sh
 
   dependencies:
     name: advisories, licences, duplicates
@@ -702,6 +723,10 @@ jobs:
         if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
         working-directory: m6-examples/examples/05-cms
         run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
           for _ in $(seq 1 180); do
             code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)

@@ -21,7 +21,8 @@
 //! - [`never_return`] stops mimalloc handing freed memory back, so the heap
 //!   grows and never shrinks. Call it first in `main`.
 //! - [`reserve`] takes `[limits.heap_reserve]` bytes from the OS once, at start,
-//!   committed and on huge pages where the kernel has them, so allocation
+//!   committed and on huge pages where the kernel has them (explicit ones when
+//!   mimalloc finds a pool, else transparent ones through `madvise`), so allocation
 //!   inside it is a pointer move and no `mprotect`.
 //! - Past the reservation mimalloc still asks the OS for more. That is growth,
 //!   not a failure; [`note_growth`] logs the first time.
@@ -40,6 +41,12 @@ use mimalloc::MiMalloc;
 /// `build.rs` counts it from the `mimalloc.h` bundled with `libmimalloc-sys`:
 /// the number always belongs to the library that is linked.
 const PURGE_DELAY: mi::mi_option_t = include!(concat!(env!("OUT_DIR"), "/purge_delay.in"));
+
+extern "C" {
+    /// The start and size of a reserved arena. In mimalloc's public header, and
+    /// not in the Rust binding.
+    fn mi_arena_area(arena_id: mi::mi_arena_id_t, size: *mut usize) -> *mut std::ffi::c_void;
+}
 
 /// mimalloc, counting under the `alloc-count` feature.
 pub struct M6Alloc;
@@ -99,6 +106,17 @@ pub fn reserve(size: usize) -> bool {
     let status = unsafe { mi::mi_reserve_os_memory_ex(size, true, true, false, &mut arena) };
     if status == 0 {
         RESERVED.store(size, Ordering::Relaxed);
+        // mimalloc asks for explicit huge pages only (`MAP_HUGETLB`), and a
+        // host with none in its pool, or with transparent huge pages in
+        // `madvise` mode, would get normal pages. So the reserved range is
+        // also advised for transparent huge pages, which is a hint: `AnonHugePages`
+        // in /proc/PID/smaps_rollup says what the kernel gave.
+        let mut area = 0usize;
+        // SAFETY: `arena` was just made, and `area` outlives the call.
+        let start = unsafe { mi_arena_area(arena, &mut area) };
+        if !start.is_null() {
+            let _ = m6_platform::process::advise_huge_pages(start.cast(), area);
+        }
         true
     } else {
         // The log may not be open yet, so this goes to stderr like a limit's

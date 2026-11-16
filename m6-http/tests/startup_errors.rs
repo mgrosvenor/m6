@@ -735,3 +735,44 @@ fn an_unknown_route_method_name_exits_2_and_names_it() {
         "the error must name the route, got: {err}"
     );
 }
+
+/// Scenario: `[server] lock_memory = true` and the account's memlock limit is
+/// too low. Wrong outcome: m6-http starts unpinned without a word, or stops
+/// without naming the limit and the fix. The limit is lowered with `ulimit -l 0`
+/// in the shell that execs m6-http. Linux only: macOS has nothing to pin.
+#[test]
+fn lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix() {
+    if std::env::consts::OS != "linux" {
+        return;
+    }
+    let claim = testkit::claim_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    write_cert_key(&site);
+    std::fs::write(site.join("site.toml"), site_toml()).expect("site.toml");
+    let system = dir.path().join("system.toml");
+    std::fs::write(
+        &system,
+        format!(
+            "[node]\nname = \"startup-errors\"\n\n\
+             [server]\nbind = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nlock_memory = true\n",
+            claim.addr(),
+            site.join("cert.pem").display(),
+            site.join("key.pem").display(),
+        ),
+    )
+    .expect("system config");
+
+    let out = Command::new("sh")
+        .args(["-c", "ulimit -S -H -l 0 && exec \"$0\" \"$@\""])
+        .arg(testkit::binary("m6-http"))
+        .arg(&site)
+        .arg(&system)
+        .output()
+        .expect("run m6-http under sh");
+    let err = stderr_of(&out);
+    assert_eq!(exit_code(&out), 2, "stderr: {err}");
+    assert!(err.contains("RLIMIT_MEMLOCK"), "{err}");
+    assert!(err.contains("LimitMEMLOCK=infinity"), "{err}");
+}

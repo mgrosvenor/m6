@@ -193,6 +193,11 @@ pub(super) fn lock_memory() -> io::Result<()> {
     Ok(())
 }
 
+/// macOS has no transparent huge pages to ask for.
+pub(super) fn advise_huge_pages(_start: *mut u8, _len: usize) -> io::Result<()> {
+    Ok(())
+}
+
 /// macOS reports no huge-page use to a process.
 pub(super) fn huge_page_bytes() -> usize {
     0

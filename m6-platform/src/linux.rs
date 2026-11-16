@@ -221,6 +221,17 @@ pub(super) fn lock_memory() -> io::Result<()> {
     })
 }
 
+/// `madvise(MADV_HUGEPAGE)` on the range.
+#[allow(unsafe_code)] // the caller owns the range, and the advice changes no byte of it
+pub(super) fn advise_huge_pages(start: *mut u8, len: usize) -> io::Result<()> {
+    use nix::sys::mman::{madvise, MmapAdvise};
+    let Some(start) = std::ptr::NonNull::new(start.cast::<std::ffi::c_void>()) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "null range"));
+    };
+    // SAFETY: MADV_HUGEPAGE only changes how the kernel backs the range.
+    unsafe { madvise(start, len, MmapAdvise::MADV_HUGEPAGE) }.map_err(io::Error::from)
+}
+
 /// `AnonHugePages` (transparent) and `Hugetlb` (explicit) of this process, from
 /// `/proc/self/smaps_rollup`, in bytes.
 pub(super) fn huge_page_bytes() -> usize {

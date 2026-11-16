@@ -59,6 +59,18 @@ pub fn lock_memory() -> io::Result<()> {
     os::lock_memory()
 }
 
+/// Ask the kernel to back `len` bytes at `start` with transparent huge pages.
+///
+/// Where transparent huge pages are in `madvise` mode, which is the common
+/// default, only a range advised this way gets them; in `always` mode the call
+/// is harmless, and in `never` mode it has no effect. A hint, never a promise:
+/// [`huge_page_bytes`] says what the kernel gave. Call it on a range this
+/// process owns and has not freed, before the range is first touched. Does
+/// nothing on macOS.
+pub fn advise_huge_pages(start: *mut u8, len: usize) -> io::Result<()> {
+    os::advise_huge_pages(start, len)
+}
+
 /// Bytes of this process's memory that sit on huge pages now, explicit or
 /// transparent. Zero where the kernel gave none, and on macOS, which has no
 /// such report. A service reads it once after reserving its heap, to log which
