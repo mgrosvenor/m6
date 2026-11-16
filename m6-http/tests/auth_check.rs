@@ -1,0 +1,436 @@
+//! Route `require` asks the authority: the step 5 request path, end to end.
+//!
+//! A real `m6-http`, a real `m6-file` content backend, and `testkit::CheckServer`
+//! as the authority. The edge no longer verifies a token locally: it sends the
+//! credential to `POST /check` and applies the route's `require` to the identity
+//! that comes back.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: a blocking TLS client and a scoped thread serve the fake checker while the child runs"
+)]
+
+use std::cell::RefCell;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rustls::StreamOwned;
+
+use m6_core::auth::Identity;
+use m6_core::testkit::{binary, claim_port, CheckServer, PortClaim, Reply, Service};
+
+/// Build the one identity these tests answer, optionally with a group.
+fn identity(groups: &[&str]) -> Identity {
+    Identity {
+        sub: "user-1".to_string(),
+        username: "alice".to_string(),
+        roles: vec!["user".to_string()],
+        groups: groups.iter().map(|group| group.to_string()).collect(),
+    }
+}
+
+// ── TLS client, copied from auth_paths ────────────────────────────────────────
+
+fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
+    let mut store = rustls::RootCertStore::empty();
+    store.add(cert).unwrap();
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(store)
+            .with_no_client_auth(),
+    )
+}
+
+struct HttpResponse {
+    status: u16,
+    headers: String,
+}
+
+impl HttpResponse {
+    fn header_value(&self, name: &str) -> Option<String> {
+        let want = format!("{}:", name.to_ascii_lowercase());
+        self.headers
+            .split("\r\n")
+            .skip(1)
+            .find(|line| line.to_ascii_lowercase().starts_with(&want))
+            .and_then(|line| {
+                line.split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+            })
+    }
+}
+
+fn https_get(
+    port: u16,
+    http: &RefCell<Service>,
+    path: &str,
+    extra: &[(&str, &str)],
+    tls: Arc<rustls::ClientConfig>,
+) -> HttpResponse {
+    let tcp = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            http.borrow_mut().assert_alive("the client was connecting");
+            return HttpResponse {
+                status: 0,
+                headers: format!("<no connection: {e}>"),
+            };
+        }
+    };
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+    let conn = rustls::ClientConnection::new(tls, name).unwrap();
+    let mut stream = StreamOwned::new(conn, tcp);
+
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
+    for (key, value) in extra {
+        req.push_str(&format!("{key}: {value}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    let end = text.find("\r\n\r\n").unwrap_or(raw.len());
+    let headers = text[..end].to_string();
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .unwrap_or(0);
+    HttpResponse { status, headers }
+}
+
+// ── Fixture ───────────────────────────────────────────────────────────────────
+
+struct TestServer {
+    port: u16,
+    cert_der: Vec<u8>,
+    http: RefCell<Service>,
+    _file: Service,
+    check: CheckServer,
+    /// `check.calls()` after the start probe, so a test counts request checks.
+    base_calls: usize,
+    _dir: tempfile::TempDir,
+    _port: PortClaim,
+}
+
+impl TestServer {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path();
+
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let cert_der = cert.cert.der().to_vec();
+        std::fs::write(site.join("cert.pem"), &cert_pem).unwrap();
+        std::fs::write(site.join("key.pem"), &key_pem).unwrap();
+        let jwt_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        std::fs::write(site.join("auth-public.pem"), jwt_key.public_key_pem()).unwrap();
+
+        std::fs::create_dir_all(site.join("private")).unwrap();
+        std::fs::write(site.join("private/secret.txt"), b"TOP SECRET").unwrap();
+
+        let check_path = site.join("check.sock");
+        let mut check = CheckServer::bind(&check_path).unwrap();
+
+        let file_sock = site.join("m6-file-1.sock");
+        let file_glob = site.join("m6-file-*.sock");
+        std::fs::write(
+            site.join("site.toml"),
+            format!(
+                r#"
+[site]
+name = "auth-check"
+domain = "example.com"
+
+[log]
+level = "debug"
+
+[errors]
+mode = "internal"
+
+[analytics]
+enabled = false
+
+[[backend]]
+name = "m6-file"
+sockets = "{file_glob}"
+
+[[backend]]
+name = "auth-check"
+sockets = "{check}"
+
+[[route]]
+path = "/private/{{relpath}}"
+backend = "m6-file"
+require = "group:admins"
+"#,
+                file_glob = file_glob.display(),
+                check = check_path.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            site.join("m6-file.conf"),
+            r#"
+[[route]]
+path = "/private/{*relpath}"
+handler = "files"
+root = "private/"
+"#,
+        )
+        .unwrap();
+
+        let claim = claim_port();
+        let port = claim.port();
+        let system = site.join("system.toml");
+        std::fs::write(
+            &system,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:{port}"
+tls_cert = "{cert}"
+tls_key = "{key}"
+
+[node]
+name = "test-node"
+
+[auth]
+backend = "auth-check"
+public_key = "{pubkey}"
+"#,
+                cert = site.join("cert.pem").display(),
+                key = site.join("key.pem").display(),
+                pubkey = site.join("auth-public.pem").display(),
+            ),
+        )
+        .unwrap();
+
+        let mut file = Service::spawn(
+            "m6-file",
+            Command::new(binary("m6-file"))
+                .arg(site)
+                .arg(site.join("m6-file.conf"))
+                .env("M6_SOCKET_OVERRIDE", &file_sock),
+        );
+        file.wait_for_path(&file_sock, Duration::from_secs(10));
+        file.wait_for_started(Duration::from_secs(10));
+
+        let mut http = Service::spawn(
+            "m6-http",
+            Command::new(binary("m6-http")).arg(site).arg(&system),
+        );
+        // The start probe sends no credential, so the fake's default 401 is
+        // its answer, and the node starts.
+        check.serve_one().expect("serve the start probe");
+        http.wait_for_started(Duration::from_secs(20));
+        let base_calls = check.calls();
+
+        TestServer {
+            port,
+            cert_der,
+            http: RefCell::new(http),
+            _file: file,
+            check,
+            base_calls,
+            _dir: dir,
+            _port: claim,
+        }
+    }
+
+    /// One request that is expected to make one check call. The fake serves the
+    /// check from a scoped thread while the blocking client waits.
+    fn request(&mut self, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
+        let TestServer {
+            port,
+            cert_der,
+            http,
+            check,
+            ..
+        } = self;
+        let tls = tls_client_config(cert_der);
+        std::thread::scope(|scope| {
+            let served = scope.spawn(|| check.serve_one());
+            let response = https_get(*port, http, path, extra, tls);
+            // A timeout test's checker wakes after the edge has closed the
+            // slot, so its write may fail. That is the scenario, not a failure
+            // of the test.
+            let _ = served.join();
+            response
+        })
+    }
+
+    fn request_without_check(&self, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
+        https_get(
+            self.port,
+            &self.http,
+            path,
+            extra,
+            tls_client_config(&self.cert_der),
+        )
+    }
+
+    fn checks_since_start(&self) -> usize {
+        self.check.calls() - self.base_calls
+    }
+
+    fn answer(&mut self, token: &str, reply: Reply) {
+        self.check.answer(token, reply);
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// The test for the whole job: a credential that is not a JWT, holding no
+/// locally checkable claim, is accepted because the authority said who it is.
+#[test]
+fn a_credential_that_is_not_a_jwt_is_checked_by_the_authority() {
+    let mut srv = TestServer::start();
+    srv.answer("opaque-token", Reply::Identity(identity(&["admins"])));
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(
+        response.status, 200,
+        "the authority's identity was not accepted\n{}",
+        response.headers
+    );
+}
+
+/// A protected request with no credential is refused locally, with no call.
+#[test]
+fn no_credential_makes_no_call() {
+    let srv = TestServer::start();
+    let response = srv.request_without_check("/private/secret.txt", &[]);
+    assert_eq!(response.status, 401, "{}", response.headers);
+    assert_eq!(
+        srv.checks_since_start(),
+        0,
+        "an anonymous request reached the authority"
+    );
+}
+
+#[test]
+fn one_protected_request_makes_one_call() {
+    let mut srv = TestServer::start();
+    srv.answer("opaque-token", Reply::Identity(identity(&["admins"])));
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(srv.checks_since_start(), 1);
+}
+
+/// The authority decides the role on every request. Changing its answer between
+/// two requests changes the second answer, so no decision was reused.
+#[test]
+fn a_removed_role_is_refused_on_the_next_request() {
+    let mut srv = TestServer::start();
+    srv.answer("opaque-token", Reply::Identity(identity(&["admins"])));
+    let first = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(first.status, 200, "{}", first.headers);
+
+    srv.answer("opaque-token", Reply::Identity(identity(&[])));
+    let second = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(
+        second.status, 403,
+        "the removed role was not seen on the next request\n{}",
+        second.headers
+    );
+    assert_eq!(
+        srv.checks_since_start(),
+        2,
+        "the second request reused a decision"
+    );
+}
+
+/// A checker that does not answer inside 50 ms is a 503 with `Retry-After: 1`,
+/// not a 401 and not a 502.
+#[test]
+fn a_check_that_times_out_is_503_with_retry_after() {
+    let mut srv = TestServer::start();
+    srv.answer(
+        "opaque-token",
+        Reply::Slow {
+            after: Duration::from_millis(200),
+            answer: Box::new(Reply::Identity(identity(&["admins"]))),
+        },
+    );
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(response.status, 503, "{}", response.headers);
+    assert_eq!(
+        response.header_value("retry-after").as_deref(),
+        Some("1"),
+        "{}",
+        response.headers
+    );
+}
+
+/// A 401 from the authority is the edge's 401, with the one token refusal.
+#[test]
+fn a_check_that_is_refused_is_401_with_www_authenticate() {
+    let mut srv = TestServer::start();
+    srv.answer("opaque-token", Reply::Unauthorised);
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(response.status, 401, "{}", response.headers);
+    assert_eq!(
+        response.header_value("www-authenticate").as_deref(),
+        Some("Bearer"),
+        "{}",
+        response.headers
+    );
+}
+
+/// A browser holding a refresh cookie is sent to the refresh path when the
+/// authority refuses, exactly as the local check did.
+#[test]
+fn a_browser_with_a_refresh_cookie_is_sent_to_refresh_when_the_check_refuses() {
+    let mut srv = TestServer::start();
+    srv.answer("opaque-token", Reply::Unauthorised);
+    let response = srv.request(
+        "/private/secret.txt",
+        &[
+            ("Authorization", "Bearer opaque-token"),
+            ("Accept", "text/html"),
+            ("Cookie", "refresh=abc"),
+        ],
+    );
+    assert_eq!(response.status, 302, "{}", response.headers);
+    assert_eq!(
+        response.header_value("location").as_deref(),
+        Some("/auth/refresh"),
+        "{}",
+        response.headers
+    );
+}

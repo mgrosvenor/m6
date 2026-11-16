@@ -542,6 +542,15 @@ Comments only.
 
 ### Changed
 
+**A route with `require` now asks m6-auth-server instead of verifying the token in m6-http.**
+Each protected request sends one `POST /check` with the caller's credential over the `[auth] backend` socket, under a 50 ms deadline, and applies the route's `require` to the identity in the answer.
+A request with no credential is answered 401 locally and makes no call.
+A 401 from the authority is 401, an identity without the requirement is 403, and a timeout, a connect failure, a 500 or an unparsable answer is 503 with `Retry-After: 1`.
+No decision is cached, so a role change or a revocation counts from the next request.
+The edge decodes no token and holds no key on a protected route, and `X-Auth-Claims` now carries `sub`, `username`, `roles` and `groups` and no token claim.
+A config with a `require` route now needs `[auth] backend`, and the start fails without it.
+Public routes are unchanged and reach no authority.
+
 **`[auth] backend` now names the backend whose members answer `POST /check`, and every member is probed at start.**
 The key keeps its name and stays optional.
 It must name a `[[backend]]` with `sockets`, and a `url` backend is refused by name.

@@ -671,6 +671,10 @@ pub fn parse_request(data: &[u8]) -> Result<HttpRequest, String> {
 pub enum PendingKind {
     Url,
     Socket,
+    /// The request is waiting for `POST /check` on the auth backend. The
+    /// completion re-enters `handle_request` with the decision, rather than
+    /// finalising the check's answer as a client response.
+    Auth,
 }
 
 /// Which upstream a pending request was dispatched to, so the loop can store
@@ -750,6 +754,14 @@ pub struct PendingUrlContext {
     /// the error context `apply_error_mode` expects. `None` for URL backends,
     /// whose completion already builds `route: None`.
     pub route_path: Option<String>,
+    /// The `require` string whose answer this dispatch is waiting for. Set only
+    /// on `PendingKind::Auth`, where the completion applies it to the identity
+    /// the authority answered.
+    pub auth_require: Option<String>,
+    /// The request arrived on the internal h2c listener. Carried so the check
+    /// completion can re-enter `handle_request` with the same view the first
+    /// pass had.
+    pub from_internal: bool,
     /// The `cache` the matched route sets, which replaces the backend's own
     /// `Cache-Control` on the reply before it is stored or sent. `None` leaves
     /// the backend's header alone.
@@ -806,6 +818,8 @@ impl PendingUrlContext {
             backend_name: "genid".to_string(),
             kind: PendingKind::Socket,
             route_path: None,
+            auth_require: None,
+            from_internal: false,
             route_cache: None,
             cacheable: false,
             is_prefetch: false,
@@ -835,6 +849,8 @@ impl PendingUrlContext {
             backend_name: "genid".to_string(),
             kind: PendingKind::Url,
             route_path: None,
+            auth_require: None,
+            from_internal: false,
             route_cache: None,
             cacheable: false,
             is_prefetch: true,

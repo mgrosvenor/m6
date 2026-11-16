@@ -576,14 +576,14 @@ See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment) and the 
 ## 7. Auth Flow
 
 Figure 4 follows a browser login and token refresh.
-Take from it that only login and refresh reach m6-auth-server, and that every other request verifies the token locally.
+Take from it that login and refresh reach m6-auth-server, and that a protected route asks it for the identity before forwarding.
 
 ```
 Browser                  m6-http                  m6-auth-server
    │                        │                            │
    │  GET /admin/dashboard  │                            │
    │───────────────────────►│                            │
-   │                        │ verify JWT (local, no RPC) │
+   │                        │ ask /check (auth server)   │
    │                        │  – expired session cookie  │
    │                        │  – valid refresh cookie    │
    │                        │                            │
@@ -598,13 +598,13 @@ Browser                  m6-http                  m6-auth-server
    │                        │                            │
    │  GET /admin/dashboard  │                            │
    │───────────────────────►│                            │
-   │                        │ verify JWT (local) ✓       │
+   │                        │ ask /check (auth) ✓        │
    │                        │ forward X-Auth-Claims      │
    │                        │──────────────────────────► m6-html
 ```
 
 **Figure 4: a browser login and token refresh.**
-An expired session cookie is answered 302 to the refresh endpoint, the new token becomes a session cookie, and m6-http forwards the claims to the backend.
+An expired session cookie is answered 302 to the refresh endpoint, the new token becomes a session cookie, and m6-http forwards the identity the authority answered to the backend.
 
 ---
 
@@ -635,8 +635,8 @@ The last is a rule about what `site.toml` may hold.
 
 - TLS always required, and m6-http terminates it.
   Internal communication runs over Unix sockets or TLS URL backends
-- JWT verified on every request against m6-auth's public key, which m6-http holds locally, so verification costs no network hop to m6-auth.
-  Only login and refresh reach m6-auth-server
+- Every protected request asks m6-auth-server's `POST /check` under a 50 ms deadline, and the answer is used once.
+  Login, refresh, logout and check reach m6-auth-server, and nothing caches a decision
 - Path traversal: `..` in any URL path answered 404, and `..` in a route param answered 400
 - Symlink guard: resolves symlinks at request time, and a symlink escaping `site_dir` is answered 404
 - Rate limiting on login: 5 attempts / 15 min / IP

@@ -133,10 +133,11 @@ Take from it that a protected route is the only place the claims field appears.
 
 | Field | When | Meaning |
 |---|---|---|
-| `X-Auth-Claims` | The route declares `require` | Verified *JWT* (JSON Web Token) claims, base64-encoded JSON |
+| `X-Auth-Claims` | The route declares `require` | The identity the auth server answered for this request: `sub`, `username`, `roles` and `groups`, base64-encoded JSON |
 
 **Table 2: the field the proxy adds after routing.**
 The value is encoded, so a backend decodes it before reading any claim.
+The four named fields are the whole value. The token's `exp`, `iss` and any extra claim do not survive, because the proxy forwards the identity the authority answered and not the token it received.
 
 Every field not in Table 1 or Table 2 is forwarded from the client unchanged, in the order the client sent it, except the hop-by-hop and proxy-owned fields in §2.5.
 A field named by the client's `Connection` header is also dropped (RFC 9110 §7.6.1).

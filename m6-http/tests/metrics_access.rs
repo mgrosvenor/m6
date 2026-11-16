@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
-use m6_core::testkit::{self, claim_port, PortClaim, Service};
+use m6_core::testkit::{self, claim_port, PortClaim, Reply, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
 use m6_http_lib::forward::{HttpRequest, HttpResponse};
 use m6_http_lib::h2c_client::H2cClientConn;
 use m6_http_lib::h2s_client::H2sTlsClientConn;
@@ -101,9 +104,8 @@ fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
 
 // ── The site under test ───────────────────────────────────────────────────────
 
-/// The legacy bearer string every fixture writes to `metrics.token`.
-/// `[auth]` with a verify key only.
-const AUTH: &str = "[auth]\npublic_key = \"{KEY}\"\n";
+/// The `[auth]` block with the check backend the route gate asks.
+const AUTH: &str = "[auth]\nbackend = \"auth-check\"\npublic_key = \"{KEY}\"\n";
 
 /// A route that needs a role, which belongs in site.toml.
 const PRIVATE_ROUTE: &str =
@@ -124,6 +126,10 @@ struct Fixture {
     cert_der: Vec<u8>,
     /// Signing key whose public half is `auth-public.pem`.
     private_pem: String,
+    /// The authority's answer for the two role sets the tests use.
+    monitor_token: String,
+    reader_token: String,
+    _check: check_support::RunningCheck,
     /// A signing key the site does not trust.
     other_private_pem: String,
     /// The accounting tick this test needs, in seconds. Production is a fixed
@@ -162,6 +168,23 @@ impl Fixture {
         let (private_pem, public_pem) = keypair();
         let (other_private_pem, _) = keypair();
         std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
+        let monitor_token = mint(&private_pem, &["monitor"], 3600);
+        let reader_token = mint(&private_pem, &["reader"], 3600);
+        let check_path = d.join("check.sock");
+        let check = check_support::RunningCheck::start(
+            &check_path,
+            vec![
+                (
+                    monitor_token.clone(),
+                    Reply::Identity(check_support::identity(&[], &["monitor"])),
+                ),
+                (
+                    reader_token.clone(),
+                    Reply::Identity(check_support::identity(&[], &["reader"])),
+                ),
+            ],
+        )
+        .unwrap();
         std::fs::write(d.join("analytics.ndjson"), "").unwrap();
         std::fs::create_dir_all(d.join("state")).unwrap();
 
@@ -188,10 +211,12 @@ impl Fixture {
                  [analytics]\nenabled = {}\nlog_path = \"{}\"\n\n\
                  [rate_limit]\nenabled = false\n\n\
                  [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
+                 [[backend]]\nname = \"auth-check\"\nsockets = \"{}\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"b\"\n\n{}",
                 analytics,
                 d.join("analytics.ndjson").display(),
                 backend_glob.display(),
+                check_path.display(),
                 sub(site),
             ),
         )
@@ -220,6 +245,9 @@ impl Fixture {
             cert_der: ck.cert.der().to_vec(),
             private_pem,
             other_private_pem,
+            monitor_token,
+            reader_token,
+            _check: check,
             dir,
             stats_interval: None,
             log_level: "info",
@@ -362,9 +390,15 @@ impl Running {
         self.fx.port.port()
     }
 
-    /// A token for `roles` signed by the key the site trusts.
+    /// A token for `roles` signed by the key the site trusts. The check table
+    /// was built from these two, because the authority answers the credential
+    /// string and a freshly minted token would not be in it.
     fn token(&self, roles: &[&str]) -> String {
-        mint(&self.fx.private_pem, roles, 3600)
+        match roles {
+            ["monitor"] => self.fx.monitor_token.clone(),
+            ["reader"] => self.fx.reader_token.clone(),
+            _ => mint(&self.fx.private_pem, roles, 3600),
+        }
     }
 
     /// A token for `roles` signed by a key the site does not trust.
@@ -671,11 +705,11 @@ fn a_require_route_401_carries_www_authenticate() {
     assert_eq!(bad.header("www-authenticate"), Some("Bearer"));
 }
 
-/// `[auth]` without a `backend` still verifies for a `require` route: no token
-/// is 401, a token with the role passes the check and reaches the (absent)
-/// backend, which is a 502 or 503.
+/// A `require` route asks the check backend: no token is 401 with no call, a
+/// token whose identity has the role passes the check and reaches the absent
+/// backend, which is a 502 or 503, and an identity without the role is 403.
 #[test]
-fn a_require_route_is_enforced_with_a_verify_only_auth() {
+fn a_require_route_is_enforced_with_a_check_only_auth() {
     let run = Fixture::new(PRIVATE_ROUTE, "", AUTH).start();
     assert_eq!(run.h1("/private/x", &[]).status, 401);
     let token = run.token(&["monitor"]);

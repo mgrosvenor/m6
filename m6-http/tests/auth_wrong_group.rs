@@ -30,7 +30,10 @@ use std::time::Duration;
 
 use rustls::StreamOwned;
 
-use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+use m6_core::testkit::{binary, claim_port, PortClaim, Reply, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
 
 // ── Crypto fixtures ───────────────────────────────────────────────────────────
 
@@ -173,8 +176,7 @@ struct Server {
     http: std::cell::RefCell<Service>,
     /// The m6-file backend, held so it stays alive for the test's lifetime.
     _file: Service,
-    /// The signing key whose public half is `auth-public.pem` in the site.
-    private_pem: String,
+    _check: check_support::RunningCheck,
     _dir: tempfile::TempDir,
     _port: PortClaim,
 }
@@ -213,7 +215,7 @@ impl Server {
 /// Bring up `m6-file` + `m6-http` over a site with:
 ///   - `/public/{relpath}`   → open, the readiness probe
 ///   - `/editors/{relpath}`  → `require = "group:editors"`
-fn start_server() -> Server {
+fn start_server(groups: &[&str]) -> (Server, String) {
     let dir = tempfile::tempdir().unwrap();
     let site = dir.path();
 
@@ -223,6 +225,16 @@ fn start_server() -> Server {
 
     let (private_pem, public_pem) = generate_jwt_keypair();
     std::fs::write(site.join("auth-public.pem"), &public_pem).unwrap();
+    let token = mint_jwt(&private_pem, groups);
+    let check_path = dir.path().join("check.sock");
+    let check = check_support::RunningCheck::start(
+        &check_path,
+        vec![(
+            token.clone(),
+            Reply::Identity(check_support::identity(groups, &["user"])),
+        )],
+    )
+    .unwrap();
 
     std::fs::create_dir_all(site.join("public")).unwrap();
     std::fs::create_dir_all(site.join("editors")).unwrap();
@@ -254,6 +266,10 @@ enabled = false
 name    = "m6-file"
 sockets = "{sock_glob}"
 
+[[backend]]
+name    = "auth-check"
+sockets = "{check}"
+
 [[route]]
 path    = "/public/{{relpath}}"
 backend = "m6-file"
@@ -264,6 +280,7 @@ backend = "m6-file"
 require = "group:editors"
 "#,
             sock_glob = sock_glob.display(),
+            check = check_path.display(),
         ),
     )
     .unwrap();
@@ -299,9 +316,7 @@ tls_key  = "{key}"
 name = "test-node"
 
 [auth]
-# No backend here: this test exercises local verification, and no request path
-# calls /check yet. Naming the content backend would fail the start probe with
-# 404, which is the probe doing its job.
+backend    = "auth-check"
 public_key = "{pubkey}"
 "#,
             cert = site.join("cert.pem").display(),
@@ -333,12 +348,12 @@ public_key = "{pubkey}"
         cert_der,
         http: std::cell::RefCell::new(http_proc),
         _file: file_proc,
-        private_pem,
+        _check: check,
         _dir: dir,
         _port: claim,
     };
     srv.wait_until_serving();
-    srv
+    (srv, token)
 }
 
 // ── #333: a wrong-group token is answered 403 ─────────────────────────────────
@@ -349,8 +364,7 @@ public_key = "{pubkey}"
 /// a token without the required group is served or mislabelled.
 #[test]
 fn valid_token_without_required_group_gets_403() {
-    let srv = start_server();
-    let token = mint_jwt(&srv.private_pem, &["users"]);
+    let (srv, token) = start_server(&["users"]);
     let bearer = format!("Bearer {token}");
 
     let resp = https_get(
@@ -372,8 +386,7 @@ fn valid_token_without_required_group_gets_403() {
 /// 403 assertion vacuous.
 #[test]
 fn valid_token_with_required_group_is_served() {
-    let srv = start_server();
-    let token = mint_jwt(&srv.private_pem, &["editors", "users"]);
+    let (srv, token) = start_server(&["editors", "users"]);
     let bearer = format!("Bearer {token}");
 
     let resp = https_get(

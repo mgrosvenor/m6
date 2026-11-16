@@ -40,6 +40,9 @@ use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
+#[path = "support/check.rs"]
+mod check_support;
+
 /// How long to wait for a log line to reach the child's output buffer.
 const LOG_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -163,6 +166,7 @@ struct Server {
     cert_der: Vec<u8>,
     http: std::cell::RefCell<Service>,
     file: Service,
+    _check: check_support::RunningCheck,
     _dir: tempfile::TempDir,
     _port: PortClaim,
 }
@@ -247,6 +251,8 @@ fn start_server() -> Server {
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
+    let check_path = dir.path().join("check.sock");
+    let check = check_support::RunningCheck::start(&check_path, Vec::new()).unwrap();
 
     std::fs::write(
         site.join("site.toml"),
@@ -269,6 +275,10 @@ enabled = false
 name    = "m6-file"
 sockets = "{sock_glob}"
 
+[[backend]]
+name    = "auth-check"
+sockets = "{check}"
+
 [[route]]
 path    = "/public/{{relpath}}"
 backend = "m6-file"
@@ -279,6 +289,7 @@ backend = "m6-file"
 require = "group:admins"
 "#,
             sock_glob = sock_glob.display(),
+            check = check_path.display(),
         ),
     )
     .unwrap();
@@ -314,9 +325,7 @@ tls_key  = "{key}"
 name = "test-node"
 
 [auth]
-# No backend here: this test exercises local verification, and no request path
-# calls /check yet. Naming the content backend would fail the start probe with
-# 404, which is the probe doing its job.
+backend    = "auth-check"
 public_key = "{pubkey}"
 "#,
             cert = site.join("cert.pem").display(),
@@ -348,6 +357,7 @@ public_key = "{pubkey}"
         cert_der,
         http: std::cell::RefCell::new(http_proc),
         file: file_proc,
+        _check: check,
         _dir: dir,
         _port: claim,
     };

@@ -2,7 +2,7 @@
 
 `m6-auth-server` is the authentication service in m6.
 It checks a username and password, issues *JWT* (JSON Web Token) access and refresh tokens, renews an access token, revokes a refresh token, and publishes the signing public key.
-m6-http verifies access tokens locally, so only login, refresh and logout reach this service.
+m6-http asks this service for the identity on a protected route, so login, refresh, logout and check reach it.
 
 This page is the reference for the service binary.
 The library crate has its own page in [`m6-auth-lib.md`](m6-auth-lib.md), the administrative tool in [`m6-auth-cli.md`](m6-auth-cli.md), and the route and `[auth]` configuration in [`m6-site-toml.md`](m6-site-toml.md).
@@ -343,7 +343,7 @@ It does not call this route, and the route exists for any other client that need
 `POST /check` answers the current identity for an access token.
 It takes `Authorization: Bearer <access token>` and returns `sub`, `username`, `roles` and `groups` read from the database.
 The answer is the decision for this request only, with no cache hint: nothing caches a decision, so a revocation counts from the next request.
-The route is additive: no m6-http route calls it yet, and local verification is still what decides a request.
+A route with `require` calls it, and the edge applies that route's requirement to the identity in the answer.
 
 A missing, invalid or expired token is 401 `{"error":"unauthorised"}`.
 A user who is not in the database, including a deleted user, is the same 401 rather than an empty role list.
@@ -378,21 +378,18 @@ m6-http ignores `type`, so a refresh token presented as a bearer token is refuse
 
 The algorithm follows the key: an EC P-256 key gives ES256, and an RSA key gives RS256.
 The `alg` header is set from the key at startup.
-m6-http accepts either algorithm and picks the decoder from the public key.
+The service checks the signature, `iss` and `exp` in `POST /check`, and on refresh and the JSON logout path.
+m6-http no longer decodes the token, so the algorithm and the key are this service's business.
 
-m6-http verifies the signature and the `exp` claim.
-The service checks `iss` when it decodes its own tokens, on refresh and on the JSON logout path.
-The `iss` claim reaches m6-http as data and does not decide whether a request is served.
+The access token's groups and roles are a snapshot at issue time.
+`POST /check` answers the database's current roles and groups, so a role change or a revocation counts from the next request.
 
-The access token's groups and roles are a snapshot.
-A role change takes effect at the next login or refresh, and an outstanding access token keeps its old claims until it expires.
-
-The two token shapes are the contract between this service and every verifier.
-Section 7 gives the verifier in m6-http, and section 8 gives the claims a backend receives.
+The two token shapes are the contract between this service and its clients.
+Section 7 gives the m6-http configuration, and section 8 gives the identity a backend receives.
 
 ## 7. m6-http integration
 
-m6-http verifies access tokens and enforces route `require` rules.
+m6-http asks this service for the identity and enforces route `require` rules on the answer.
 This section gives the one configuration that points m6-http at this service, and where the rest is specified.
 
 ```toml
@@ -426,17 +423,19 @@ A deployment can keep the login backend unchanged while it splits the service in
 
 `[auth] backend` names the check backend.
 m6-http probes each member once at start: 401 or 503 passes, 404 stops the start, and a refused connection warns.
-Nothing on a request path calls `/check` yet, so `public_key` alone verifies a token.
-The token sources, the `require` forms and the five outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
-The edge check is local, so the header it sets carries the result to a backend, and section 8 shows what a backend does with it.
+A route with `require` sends one `POST /check` per protected request, under a 50 ms deadline, and applies the route's requirement to the identity in the answer.
+No credential is 401 with no call, a 401 from this service is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
+Nothing caches the answer, so a role change or a revocation counts from the next request.
+The token sources, the `require` forms and the outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
+The header the edge sets carries the identity this service answered, and section 8 shows what a backend does with it.
 
 ## 8. Renderer integration
 
-A backend receives the verified claims in the `X-Auth-Claims` header, and m6 turns them into the `auth_*` request-dictionary keys.
-The keys exist only on a route with `require` and a token that passed the check, so a backend that needs a claim on every request declares `require` on the route.
+A backend receives the identity in the `X-Auth-Claims` header, and m6 turns it into the `auth_*` request-dictionary keys.
+The keys exist only on a route with `require` and an identity that passed the check, so a backend that needs a claim on every request declares `require` on the route.
 The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.6.
 
-Token verification, the edge check and the backend keys are one chain.
+The authority's answer, the edge's `require` match and the backend keys are one chain.
 Section 9 covers the database that holds the users the chain begins with.
 
 ## 9. Storage
@@ -570,7 +569,7 @@ The six items above are the scope, and section 13 collects the documents that ow
 
 ## 13. Summary and further reading
 
-`m6-auth-server` turns a password into a short-lived access token and a refresh token, and m6-http verifies the access token without a network call.
+`m6-auth-server` turns a password into a short-lived access token and a refresh token, and answers the current identity on `POST /check` for a protected route.
 The service has five routes, one or two listeners, one config file and one SQLite database.
 The rotation steps and the two path rules are in section 4.
 

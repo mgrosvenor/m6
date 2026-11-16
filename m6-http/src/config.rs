@@ -1417,21 +1417,39 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     }
 
-    // Validate require on routes needs [auth]
+    // Validate require on routes needs [auth], and [auth] needs the check
+    // backend that answers POST /check.
+    let auth_backend = auth.as_ref().and_then(|auth| auth.backend.as_deref());
     for route in &routes {
-        if route.require.is_some() && auth.is_none() {
-            anyhow::bail!(
-                "config error: route {} has `require` but no [auth] declared",
-                route.path
-            );
+        if route.require.is_some() {
+            if auth.is_none() {
+                anyhow::bail!(
+                    "config error: route {} has `require` but no [auth] declared",
+                    route.path
+                );
+            }
+            if auth_backend.is_none() {
+                anyhow::bail!(
+                    "config error: route {} has `require` but [auth] has no `backend`; the edge asks POST /check, so [auth] backend must name a [[backend]] with `sockets`",
+                    route.path
+                );
+            }
         }
     }
     for rg in &route_groups {
-        if rg.require.is_some() && auth.is_none() {
-            anyhow::bail!(
-                "config error: route_group {} has `require` but no [auth] declared",
-                rg.path
-            );
+        if rg.require.is_some() {
+            if auth.is_none() {
+                anyhow::bail!(
+                    "config error: route_group {} has `require` but no [auth] declared",
+                    rg.path
+                );
+            }
+            if auth_backend.is_none() {
+                anyhow::bail!(
+                    "config error: route_group {} has `require` but [auth] has no `backend`; the edge asks POST /check, so [auth] backend must name a [[backend]] with `sockets`",
+                    rg.path
+                );
+            }
         }
     }
 
