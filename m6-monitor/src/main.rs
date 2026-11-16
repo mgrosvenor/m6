@@ -236,9 +236,14 @@ fn run_service() -> Result<()> {
     // itself full: `Slots::is_full` would stay false past the kernel's limit.
     let initial = INITIAL_CONNECTIONS.min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
+    // The signals first, then the socket: the socket appearing is the signal
+    // that the service is ready, and a SIGTERM sent on seeing it must find the
+    // signals already routed. On macOS `Signals::new` sets the three to
+    // ignore, which discards one already pending, so a SIGTERM that arrived
+    // between the bind and this call was lost and the process never stopped.
+    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
-    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
