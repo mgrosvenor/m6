@@ -44,6 +44,11 @@ The released versions, newest first:
 
 ### Migration
 
+**The `Renderer` trait writes into a page area instead of returning a `String`.**
+`Renderer::render(&self, template, ctx, out: &mut BoundedBuf)` replaces `render(&self, template, ctx) -> Result<String, RenderError>`, and `RenderError` gains `TooLarge(usize)`.
+A service that links `m6-core` and uses `TeraFactory` or `NoTemplates` changes nothing.
+A service that implements its own `Renderer` writes the page into `out` with `std::io::Write` and returns `RenderError::TooLarge(out.overflow()?)` when a write fails.
+
 **The per-IP limit is counted per process, so a node that shares its public port with `[server] reuse_port` allows one client up to N times `requests_per_min` across N processes.** The default is 300 requests per client in 60 seconds, so three processes on the port allow 900. A config that sets `[server] reuse_port = true` and leaves `[rate_limit]` enabled starts without an error. `docs/m6-http.md` and `docs/m6-site-toml.md` §4.13 state the number and the consequence. No configuration change is required. A node that must enforce one number sets `requests_per_min` to the node total divided by the process count, or enforces the limit at the front door.
 
 **`[health] metrics_token_file` is removed, and a config that still names it stops m6-http at start with exit 2.** Switch `/perf` and `/traffic` to `[health] metrics_require = "role:<name>"` or `"group:<name>"` with `[auth] public_key`, and give the monitor a signed API token. A node that used only the legacy bearer file serves neither endpoint until it does. The refusal body on every token-gated route is now `{"error":"unauthorised"}` (401, with `WWW-Authenticate: Bearer`) or `{"error":"forbidden"}` (403); an API client that parsed a route's HTML 401 or 403 page gets JSON. A browser with no credential is still redirected to `/login` or `/auth/refresh`, and a browser with a valid token for the wrong role still gets the site's 403 page; a browser with an invalid or expired token is now redirected to login instead of shown a 401 page.
@@ -110,6 +115,20 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 **`[monitor] one_certificate` is new and optional, default false.** A deployment whose fleet is meant to carry one certificate sets it to true to turn a differing node into a fault in `/check` and `/digest`. Leave it unset where each node renews its own certificate. `m6-monitor` ignores a `[monitor]` key it does not know, so an older monitor starts against a config that has this key and simply does not check it. No other setting changes.
 
 ### Added
+
+**Every bounded buffer has a named limit with a `start` and a `max` read from one config table, and the rendered page is the first buffer on it.**
+`[limits.render_page]` takes `start` and `max`, as bytes or as `"512KiB"` and `"4MiB"`, and an absent table gives the defaults: 512 KiB at start, 4 MiB at most (`docs/m6-app-anatomy.md` §4.2).
+The new `m6_core::limits` module owns one rule: allocate `start` at start, grow only when a write does not fit, by doubling and clamped at `max`, keep the size and never shrink, and log one line naming the limit and the new size on each growth.
+A page past `max` is refused with a 500 and one log line that names the limit, the size needed against the maximum, the page and the exact key and file to raise, for example `page /blog/x needs at least 5 MiB, over [limits.render_page] max = 4 MiB in /etc/m6/m6-html.toml; raise max to fix this`.
+Sizes are `page * 2^k` with the page read from `m6-platform` (`process::page_size`, 4 KiB on Linux x86_64 and 16 KiB on macOS arm64).
+A value of another size is rounded up with one stderr warning that names the key, the file, the value set and the value used, and a `max` below its `start`, a zero, an unknown limit or an unknown key stops the start with exit 2.
+Before, `Tera` returned a fresh `String` for every page, which re-grew several times as the page was written.
+Now every page is written into one area the service makes at start, then copied out once at its exact size, so the area allocates nothing once it has reached the largest page seen.
+A reload builds a new service state, and the area starts again at `start`.
+Verified by `m6-core/tests/limit_page_allocs.rs` under the counting allocator: 100 pages under the start allocate nothing for the area, one 600 KiB page grows it once to 1 MiB, and the next pages of any size up to 1 MiB allocate nothing for it.
+With `BoundedBuf::clear` made to drop its capacity, the three tests fail with 100, 2 and 5 allocations against 0, 1 and 0.
+Unit tests cover the rounding and its one warning, the refusals, the doubling and clamping, and the over-max message naming its key and file, and two site tests cover a page that grows the area and a page past the maximum.
+The per-request allocation budgets in `site_allocs` and `request_allocs` are unchanged, because the small test pages never re-grew a `String`.
 
 **CI fails when a document names a commit that no longer exists.** `tools/check-commit-hashes.sh` reads every tracked Markdown file and runs `git cat-file` on each lowercase hex token of 7 to 40 characters that names a commit.
 A max-age, a byte size, an allocation count, a colour, a UUID, an ETag and a versioned-asset hash are not commits, so they are not flagged, which is what keeps the check from being switched off.

@@ -32,6 +32,20 @@ pub fn raise_fd_limit() -> io::Result<usize> {
     Ok(usize::try_from(soft.saturating_sub(FD_MARGIN as u64)).unwrap_or(usize::MAX))
 }
 
+/// The size of one memory page in bytes: 4 KiB on Linux x86_64, 16 KiB on
+/// macOS arm64. A power of two. The unit large buffers are sized in.
+/// Start only: a service reads it once, when it builds its limits.
+pub fn page_size() -> usize {
+    use nix::unistd::{sysconf, SysconfVar};
+    match sysconf(SysconfVar::PAGE_SIZE) {
+        Ok(Some(n)) if n > 0 => usize::try_from(n).unwrap_or(4096),
+        // The call cannot fail for this name on either family. 4 KiB is the
+        // smallest page any supported CPU uses, and every larger one is a
+        // multiple of it.
+        _ => 4096,
+    }
+}
+
 /// The soft and hard open-file limits of this process.
 pub fn fd_limits() -> io::Result<(u64, u64)> {
     let (soft, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?;

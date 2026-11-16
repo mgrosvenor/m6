@@ -184,6 +184,14 @@ name    = "event_allocs"
 harness = false
 required-features = ["testkit"]
 
+# The page area's allocation rules (I-217, I-223): a page under the start
+# allocates nothing for the area, an oversized one grows it once, and the next
+# pages of any size allocate nothing for it. Its own `main`, as `event_allocs`.
+[[test]]
+name    = "limit_page_allocs"
+harness = false
+required-features = ["testkit"]
+
 # `client::Upstream`'s no-allocation proof: a thousand plain requests allocate
 # nothing. Its own `main` so the counting allocator is installed before any
 # thread, and the count is only this binary's own.

@@ -768,24 +768,32 @@ impl crate::render::Renderer for TeraRenderer {
         &self,
         template: &str,
         ctx: &crate::dict::Dict,
-    ) -> std::result::Result<String, crate::render::RenderError> {
+        out: &mut crate::limits::BoundedBuf,
+    ) -> std::result::Result<(), crate::render::RenderError> {
         let mut tctx = tera::Context::new();
         for (k, v) in ctx.iter() {
             tctx.insert(k, v);
         }
-        self.tera.render(template, &tctx).map_err(|e| {
-            // `{{ not_found() }}` fails the render with a sentinel, because a
-            // Tera error carries nothing but a string. The sentinel stops
-            // here: core is told `NotFound`, not handed a string to search.
-            let msg = format!("{e:#}");
-            if msg.contains(NOT_FOUND_SENTINEL) {
-                crate::render::RenderError::NotFound
-            } else {
-                crate::render::RenderError::Failed(
-                    anyhow::Error::new(e).context(format!("rendering template {template}")),
-                )
-            }
-        })
+        self.tera
+            .render_to(template, &tctx, &mut *out)
+            .map_err(|e| {
+                // The area refused a write past its maximum. Tera wraps the I/O
+                // error, so the refusal is read from the area, not the message.
+                if let Some(needed) = out.overflow() {
+                    return crate::render::RenderError::TooLarge(needed);
+                }
+                // `{{ not_found() }}` fails the render with a sentinel, because a
+                // Tera error carries nothing but a string. The sentinel stops
+                // here: core is told `NotFound`, not handed a string to search.
+                let msg = format!("{e:#}");
+                if msg.contains(NOT_FOUND_SENTINEL) {
+                    crate::render::RenderError::NotFound
+                } else {
+                    crate::render::RenderError::Failed(
+                        anyhow::Error::new(e).context(format!("rendering template {template}")),
+                    )
+                }
+            })
     }
 }
 

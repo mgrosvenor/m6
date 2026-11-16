@@ -1089,6 +1089,15 @@ mod limits {
     use super::*;
     use m6_platform::process::FD_MARGIN;
 
+    /// The page size is a power of two of at least 4 KiB, the unit the
+    /// bounded buffers are sized in.
+    #[test]
+    fn page_size_is_a_power_of_two_of_at_least_4_kib() {
+        let page = process::page_size();
+        assert!(page >= 4096, "{page}");
+        assert!(page.is_power_of_two(), "{page}");
+    }
+
     /// L1. Break: the hard limit returned on an OS that refuses it (macOS
     /// reports `RLIM_INFINITY` and enforces `kern.maxfilesperproc`).
     #[test]

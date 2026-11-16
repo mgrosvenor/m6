@@ -272,6 +272,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
 | Service `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | Service config | The service's own state |
+| Service `[limits.<name>]` | Service config | The start and maximum of the service's own buffers, `m6-app-anatomy.md` §4.2 |
 | Service `[log]` | Both | `site.toml` sets the site default and the service config overrides it |
 | Service `site_toml` | Service config | Names where `site.toml` is |
 | Mail credentials | `secrets_file` | Secret, held outside the repo |

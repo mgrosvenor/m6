@@ -194,7 +194,7 @@ jobs:
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
           # `testkit` also turns on `alloc-count`, so all five counting tests build.
-          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
           # `email` makes these two visible, `testkit` is the harness they use.
           cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
           # `count-allocations` builds the counting allocator into the binary the test reads.
@@ -310,7 +310,7 @@ jobs:
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
           # `testkit` also turns on `alloc-count`, so all five counting tests build.
-          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
           # `email` makes these two visible, `testkit` is the harness they use.
           cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
           # `count-allocations` builds the counting allocator into the binary the test reads.
@@ -398,7 +398,7 @@ jobs:
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
           # `testkit` also turns on `alloc-count`, so all five counting tests build.
-          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
           # `email` makes these two visible, `testkit` is the harness they use.
           cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
           # `count-allocations` builds the counting allocator into the binary the test reads.

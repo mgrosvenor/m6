@@ -42,6 +42,7 @@ Table 1 lists them.
 | sockets | every socket the layer makes gives `BrokenPipe` on a write to a closed peer, never a signal | the runtime ignores `SIGPIPE` | the same, and `SO_NOSIGPIPE` on every socket |
 | `MAX_SOCKET_PATH` | a path too long to bind fails at start naming the path and the limit | 108 | 104 |
 | `process::raise_fd_limit` | the soft limit becomes the highest the kernel accepts, the number returned is what connections may use, a second call returns the same | the hard limit | `kern.maxfilesperproc`, because the hard limit reads as unlimited |
+| `process::page_size` | the size of one memory page, a power of two of at least 4 KiB, the unit `m6-core`'s bounded buffers are sized in | 4 KiB on x86_64 | 16 KiB on arm64 |
 | `host` | memory, load, uptime, disk space and interface counters are real values, an unreadable source is `None` or an empty list, never a row of zeros | `/proc` and `/sys` | `sysinfo` with its default features off, so no thread starts |
 | `process` facts | thread count, open descriptors, alive, listening on TCP, root, and the worker range reading the host's certificate store leaves | `/proc/<pid>`; the store is a file read and leaves no thread | `proc_pidinfo`, `lsof`; the Security framework leaves three or four |
 | directories | `runtime_dir` is `/run/m6`, `temp_dir` honours `TMPDIR` and takes a socket, `scratch_dir` permits exec, `create_private` gives 0700 and 0600 | the same | the same |
