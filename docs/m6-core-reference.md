@@ -453,7 +453,7 @@ Builders: `body`, `with_status`, `header`, `cookie` and `flash` (feature `flash`
 
 `Method` is a newtype over `&'static str` with the six constants.
 
-`HeaderSource` is the trait that lets header lookup work over `[(String, String)]`, `Vec<(String, String)>` and a `Response`'s `Vec<Header>`, whose `HeaderText` borrows a `&'static str`, holds up to 23 bytes inline or owns a `String`, and `header(headers, name)` is the case-insensitive first-match lookup.
+`HeaderSource` is the trait that lets header lookup work over `[(String, String)]`, `Vec<(String, String)>` and a `Response`'s `Vec<Header>`, whose `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline or owns a `String`, and `header(headers, name)` is the case-insensitive first-match lookup.
 
 `is_same_origin_path(candidate)` is the redirect guard: it answers whether a path is safe to redirect to without leaving the origin.
 

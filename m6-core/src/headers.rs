@@ -50,8 +50,11 @@ use crate::http::HeaderSource;
 /// text takes without one:
 ///
 /// - [`HeaderText::Static`] borrows a `&'static str`: a name such as
-///   `Cache-Control`, a constant value, or a route's value made once at load
-///   by [`intern`].
+///   `Cache-Control` or a constant value.
+/// - [`HeaderText::Shared`] shares an `Arc<str>`: a route's value, made once
+///   when the site loads and owned by that site. A response clones the `Arc`,
+///   which is a count and not an allocation, and keeps its text alive until it
+///   is sent even if a reload has replaced the site.
 /// - [`HeaderText::Inline`] keeps up to 23 bytes in the value itself: an `ETag`
 ///   is 18.
 /// - [`HeaderText::Owned`] is the `String` a handler supplied.
@@ -60,6 +63,7 @@ use crate::http::HeaderSource;
 #[derive(Clone)]
 pub enum HeaderText {
     Static(&'static str),
+    Shared(std::sync::Arc<str>),
     Inline { len: u8, bytes: [u8; 23] },
     Owned(String),
 }
@@ -88,6 +92,7 @@ impl HeaderText {
     pub fn as_str(&self) -> &str {
         match self {
             HeaderText::Static(s) => s,
+            HeaderText::Shared(s) => s,
             HeaderText::Inline { len, bytes } => {
                 std::str::from_utf8(&bytes[..*len as usize]).expect("an inline text is UTF-8")
             }
@@ -138,6 +143,12 @@ impl From<String> for HeaderText {
 impl From<&str> for HeaderText {
     fn from(s: &str) -> Self {
         HeaderText::Owned(s.to_string())
+    }
+}
+
+impl From<std::sync::Arc<str>> for HeaderText {
+    fn from(s: std::sync::Arc<str>) -> Self {
+        HeaderText::Shared(s)
     }
 }
 
@@ -228,29 +239,6 @@ impl std::fmt::Write for InlineBuf {
 
 /// One response header, name then value.
 pub type Header = (HeaderText, HeaderText);
-
-/// Make `s` live for the rest of the process, once per distinct value.
-///
-/// A route's `Cache-Control`, `Last-Modified` and extra headers are the same
-/// for every request on it, so they are made once at load and each response
-/// borrows them as a [`HeaderText::Static`]. A reload that sets the same value
-/// finds the one already made, so the table holds the distinct values a process
-/// has ever loaded, a few dozen bytes each, and nothing grows per request.
-pub fn intern(s: &str) -> &'static str {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static TABLE: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut table = TABLE
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(found) = table.get(s) {
-        return found;
-    }
-    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    table.insert(leaked);
-    leaked
-}
 
 /// The largest one request header field, counted as its name plus its value.
 ///
@@ -403,6 +391,7 @@ mod tests {
     fn a_header_text_holds_static_inline_and_owned_text_the_same_way() {
         let texts = [
             HeaderText::from_static("etag"),
+            HeaderText::from(std::sync::Arc::<str>::from("etag")),
             HeaderText::inline("etag").unwrap(),
             HeaderText::from("etag".to_string()),
             HeaderText::from("etag"),
@@ -424,14 +413,6 @@ mod tests {
         assert_eq!(b.into_text(), "\"ffffffffffffffff\"");
         let mut b = InlineBuf::new();
         assert!(write!(b, "{}", "x".repeat(24)).is_err());
-    }
-
-    #[test]
-    fn intern_makes_one_copy_of_a_value() {
-        let a = intern("public, max-age=0");
-        let b = intern(&String::from("public, max-age=0"));
-        assert!(std::ptr::eq(a, b), "the same text is one allocation");
-        assert_eq!(a, "public, max-age=0");
     }
 
     use super::*;

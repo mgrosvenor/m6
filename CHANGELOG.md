@@ -45,7 +45,7 @@ The released versions, newest first:
 ### Migration
 
 **`Response.headers` is `Vec<Header>`, a pair of `HeaderText`, where it was `Vec<(String, String)>`.**
-A `HeaderText` borrows a `&'static str`, holds up to 23 bytes inline or owns a `String`, derefs to `str` and compares equal to a `&str` and a `String`, so a reader of `resp.headers` changes nothing, and `Response::header(name, value)` still takes two `&str`.
+A `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline or owns a `String`, derefs to `str` and compares equal to a `&str` and a `String`, so a reader of `resp.headers` changes nothing, and `Response::header(name, value)` still takes two `&str`.
 Code that pushes a pair into `resp.headers` writes `(name.into(), value.into())`, or `HeaderText::Static("Name")` to borrow a literal.
 `CompiledRoute` gains a `head` field, `Default::default()` in a literal.
 
@@ -483,12 +483,12 @@ Comments only.
 ### Changed
 
 **A rendered page's header names and values are borrowed, and the page's copy out of the page area is the minified body (page path 50 to 41 allocations, template request 36 to 27, handler request 23 to 21).**
-A route's `Cache-Control`, `Last-Modified` and extra headers are made once at load and each response borrows them, the header names are literals, and the page's `ETag`, 18 bytes, is held inline in its header.
+A route's `Cache-Control`, `Last-Modified` and extra headers are made once at load as `Arc<str>` texts the route owns, and each response clones the `Arc`, the header names are literals, and the page's `ETag`, 18 bytes, is held inline in its header.
 Of the 27 allocations a rendered page still makes, 22 are Tera's and minify-html's and 5 are ours: the built-in `year` and `datetime` values (2), the dictionary overlay's first node and key insert (2) and the response's header vector (1).
 The wire is unchanged: CACHE-HDR's tests, the cache-hit 304 tests over HTTP/1.1, HTTP/2 and HTTP/3 and `rfc9111_5_2` pass without an edit.
 The `ETag` is still computed in `finish`, not at serialisation, because CACHE-HDR's contract is that the caller and the edge's cache see it in `Response.headers`; held inline it costs no allocation.
 **Rollback:** revert the merge commit of `perf/borrowed-response-head` (`git log --first-parent --merges --grep borrowed-response-head`). `Response.headers` returns to `Vec<(String, String)>`, each header a page sets costs a `String` pair again, and the budgets go back: `site_allocs` 41 to 50, `request_allocs` template 27 to 36 and handler 21 to 23. `docs/PERFORMANCE.md` §2.6 records the same.
-Verified by the three budgets, which fail when a header comes back as a `String`, by `a_rendered_pages_route_headers_are_borrowed_not_made_per_request`, which reads the borrowed text and the inline `ETag` off two requests, and by the unit tests of `HeaderText`, `InlineBuf` and `intern`.
+Verified by the three budgets, which fail when a header comes back as a `String`, by `a_rendered_pages_route_headers_are_borrowed_not_made_per_request`, which reads the borrowed text and the inline `ETag` off two requests, by `a_reload_frees_the_old_sites_route_header_texts`, which reloads a route 1,000 times with changing values and finds every old text freed once its response finishes, and by the unit tests of `HeaderText` and `InlineBuf`.
 
 **`docs/m6-http.md` follows the documentation ruleset, and the claims the code no longer supported are corrected (#148).**
 The document had 20 em dashes, no contents list, unnumbered headings, three semicolons and captioned tables out of order. It now has none of the dashes or semicolons, one contents list, numbered headings, sequential table captions and one sentence to a line.

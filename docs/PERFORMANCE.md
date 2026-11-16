@@ -144,8 +144,8 @@ The other 5 are ours: the built-in `year` and `datetime` values (2), the diction
 
 What changed:
 
-- `Response.headers` holds `HeaderText` pairs. A `HeaderText` borrows a `&'static str`, holds up to 23 bytes inline, or owns a `String`, and it derefs to `str`.
-- A route's `Cache-Control`, `Last-Modified` and extra headers are made once, when the route loads, through `headers::intern`, and each response borrows them. The header names `Content-Type`, `Content-Encoding`, `ETag` and `Cache-Control` are literals.
+- `Response.headers` holds `HeaderText` pairs. A `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline, or owns a `String`, and it derefs to `str`.
+- A route's `Cache-Control`, `Last-Modified` and extra headers are made once, when the route loads, as `Arc<str>` texts that the route owns, and each response clones the `Arc`, which is a count and not an allocation. A reload that replaces the site frees the old texts once the responses still sending them are done, so nothing grows across reloads. The header names `Content-Type`, `Content-Encoding`, `ETag` and `Cache-Control` are literals.
 - The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes where it was before, so the page carries its validator to the caller and to the edge's cache, as CACHE-HDR's tests require. Computing it at serialisation instead would move it out of `Response.headers`, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it there.
 - A rendered page stays in the page area until the minifier has read it, so the copy out of the area is the minified body. A page that is not minified is copied once, as before.
 

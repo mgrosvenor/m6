@@ -681,26 +681,30 @@ impl Site {
                     .retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
                 resp.headers.push((
                     HeaderText::Static("Cache-Control"),
-                    HeaderText::Static(head.cache),
+                    HeaderText::Shared(Arc::clone(&head.cache)),
                 ));
             } else if !crate::headers::contains(&resp.headers[..], "cache-control") {
                 resp.headers.push((
                     HeaderText::Static("Cache-Control"),
-                    HeaderText::Static(head.cache),
+                    HeaderText::Shared(Arc::clone(&head.cache)),
                 ));
             }
             // Last-Modified, from the route's own inputs. Only on a success:
             // attaching a validator to a 404 or a 500 invites a client to keep
             // revalidating an error as though it were content.
             if resp.status < 300 {
-                if let Some(lm) = head.last_modified {
-                    resp.headers
-                        .push((HeaderText::Static("Last-Modified"), HeaderText::Static(lm)));
+                if let Some(lm) = &head.last_modified {
+                    resp.headers.push((
+                        HeaderText::Static("Last-Modified"),
+                        HeaderText::Shared(Arc::clone(lm)),
+                    ));
                 }
             }
             for (k, v) in &head.headers {
-                resp.headers
-                    .push((HeaderText::Static(k), HeaderText::Static(v)));
+                resp.headers.push((
+                    HeaderText::Shared(Arc::clone(k)),
+                    HeaderText::Shared(Arc::clone(v)),
+                ));
             }
         }
 
@@ -1081,13 +1085,15 @@ impl From<&RouteMethod> for Methods {
     }
 }
 
-/// The header texts a route sets on every response, borrowed by each response
-/// from the process-wide table of [`crate::headers::intern`].
+/// The header texts a route sets on every response, made once when the site
+/// loads. Each response clones the `Arc`s, which is a count and not an
+/// allocation. The route owns them, so a reload that replaces the site frees
+/// them, and a response still being sent keeps its own until it is done.
 #[derive(Debug, Clone)]
 pub struct RouteHead {
-    cache: &'static str,
-    last_modified: Option<&'static str>,
-    headers: Vec<(&'static str, &'static str)>,
+    cache: Arc<str>,
+    last_modified: Option<Arc<str>>,
+    headers: Vec<(Arc<str>, Arc<str>)>,
 }
 
 /// A compiled route pattern.
@@ -1129,7 +1135,7 @@ pub struct CompiledRoute {
     /// The header texts this route sets on every response, made once.
     ///
     /// `Cache-Control`, `Last-Modified` and the route's own `headers` are the
-    /// same for every request on a route, so each is interned once, when the
+    /// same for every request on a route, so each is made once, when the
     /// route is loaded, and a response borrows it. A route built without going
     /// through load makes them on first use.
     pub head: std::sync::OnceLock<RouteHead>,
@@ -1617,15 +1623,12 @@ impl CompiledRoute {
     /// request makes them.
     pub fn route_head(&self) -> &RouteHead {
         self.head.get_or_init(|| RouteHead {
-            cache: crate::headers::intern(&self.cache),
-            last_modified: self
-                .last_modified_http
-                .as_deref()
-                .map(crate::headers::intern),
+            cache: Arc::from(self.cache.as_str()),
+            last_modified: self.last_modified_http.as_deref().map(Arc::from),
             headers: self
                 .headers
                 .iter()
-                .map(|(k, v)| (crate::headers::intern(k), crate::headers::intern(v)))
+                .map(|(k, v)| (Arc::from(k.as_str()), Arc::from(v.as_str())))
                 .collect(),
         })
     }
@@ -2924,7 +2927,7 @@ mod tests {
         };
         let (a, b) = (cache(&first), cache(&second));
         assert!(
-            matches!(a, HeaderText::Static(_)) && matches!(b, HeaderText::Static(_)),
+            matches!(a, HeaderText::Shared(_)) && matches!(b, HeaderText::Shared(_)),
             "the route's Cache-Control is borrowed"
         );
         assert!(std::ptr::eq(a.as_str(), b.as_str()), "both borrow one text");
@@ -2937,6 +2940,38 @@ mod tests {
             matches!(etag.1, HeaderText::Inline { .. }),
             "the ETag is inline"
         );
+    }
+
+    /// A site owns its route header texts: a reload replaces the site, and the
+    /// old site's texts are freed once the responses still holding them are
+    /// done. A thousand reloads with changing values leave nothing behind.
+    #[test]
+    fn a_reload_frees_the_old_sites_route_header_texts() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            &[],
+        );
+        let base = site.state.routes.routes()[0].clone();
+        let mut in_flight: Vec<(std::sync::Weak<str>, HeaderText)> = Vec::new();
+        for i in 0..1000 {
+            // A reload: a new route with values that changed.
+            let mut route = base.clone();
+            route.cache = format!("public, max-age={i}");
+            route.head = std::sync::OnceLock::new();
+            let head = route.route_head();
+            let weak = Arc::downgrade(&head.cache);
+            // A response holds the text while it is sent.
+            let held = HeaderText::Shared(Arc::clone(&head.cache));
+            drop(route);
+            assert!(
+                weak.upgrade().is_some(),
+                "an in-flight response keeps its text"
+            );
+            in_flight.push((weak, held));
+        }
+        // Every response finishes; no old text is left anywhere.
+        let weaks: Vec<_> = in_flight.drain(..).map(|(w, _held)| w).collect();
+        assert_eq!(weaks.iter().filter(|w| w.upgrade().is_some()).count(), 0);
     }
 
     /// A page past the `minify_output` or `compress_output` maximum is refused
