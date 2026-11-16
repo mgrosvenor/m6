@@ -317,7 +317,15 @@ fn h2_get(
             .connect(name, tcp)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
-        let (mut client, connection) = h2::client::handshake(tls)
+        // The windows a browser announces: Chromium opens every stream with 6 MiB
+        // and the connection with 15 MiB, so while a body is in flight it sends no
+        // WINDOW_UPDATE and the server gets no readable event to continue on. The
+        // library's own 64 KiB default sends updates all the time, and hides a
+        // server that only goes on when the peer speaks.
+        let (mut client, connection) = h2::client::Builder::new()
+            .initial_window_size(6 * 1024 * 1024)
+            .initial_connection_window_size(15 * 1024 * 1024)
+            .handshake::<_, bytes::Bytes>(tls)
             .await
             .map_err(|e| format!("h2 handshake: {e}"))?;
         // The driver owns the socket; without it no frame moves.
@@ -344,6 +352,9 @@ fn h2_get(
         let mut bytes = Vec::new();
         while let Some(chunk) = body.data().await {
             let chunk = chunk.map_err(|e| format!("body: {e}"))?;
+            // A client that never gives the window back stalls its own download
+            // at the initial 65,535 bytes, so a long body needs this.
+            let _ = body.flow_control().release_capacity(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
         Ok((status, headers, bytes))
@@ -1148,4 +1159,135 @@ fn rfc9111_5_2_route_cache_replaces_backend_cache_control_h3() {
 
     let (_, fields, _) = get("/");
     assert_eq!(field_cache_controls(&fields), ["public, max-age=60"]);
+}
+
+// ── Bodies longer than the send queue ────────────────────────────────────────
+
+/// How long a body of any tested size may take over loopback. The page is
+/// already in m6-http's cache, so the time is the protocol's, and a stall shows
+/// as the limit passing, not as a slow answer.
+const BODY_LIMIT: Duration = Duration::from_secs(10);
+
+/// A cacheable backend reply with a body of exactly `len` bytes.
+fn sized_backend_response(len: usize) -> Vec<u8> {
+    let mut r = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+         Cache-Control: public, max-age=60\r\nETag: \"sized-1\"\r\n\
+         Content-Length: {len}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    r.extend((0..len).map(|i| (i % 251) as u8));
+    r
+}
+
+/// Run `fetch` on its own thread and return its result, or fail the test when it
+/// does not finish within [BODY_LIMIT]. A stalled h2 or h3 client waits for ever,
+/// so the test has to bring its own deadline.
+fn within_limit<T: Send + 'static>(
+    what: &str,
+    fetch: impl FnOnce() -> T + Send + 'static,
+) -> (T, Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch());
+    });
+    match rx.recv_timeout(BODY_LIMIT) {
+        Ok(value) => (value, started.elapsed()),
+        Err(_) => panic!(
+            "{what} did not finish within {} s: the response stopped part way",
+            BODY_LIMIT.as_secs()
+        ),
+    }
+}
+
+/// Warm the cache with a body of `len` bytes over h1, so the h2 and h3 requests
+/// that follow are cache hits, the path a browser's page load takes.
+fn fixture_serving(len: usize) -> (Fixture, Service) {
+    let fixture = Fixture::new();
+    fixture.start_backend_with(sized_backend_response(len));
+    let svc = fixture.start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match h1_get(fixture.port(), &fixture.cert_der, "/") {
+            (200, body) if body.len() == len => break,
+            (200, body) => panic!("h1 served {} bytes, not {len}", body.len()),
+            (status, _) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "m6-http never served / over h1: last status {status}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    (fixture, svc)
+}
+
+fn h2_serves_a_body_of(len: usize) {
+    let (fixture, _svc) = fixture_serving(len);
+    let (port, cert) = (fixture.port(), fixture.cert_der.clone());
+    let (result, took) = within_limit("the HTTP/2 response", move || h2_get(port, &cert, "/", &[]));
+    let (status, _, body) = result.expect("the HTTP/2 fetch");
+    assert_eq!(status, 200, "HTTP/2 status");
+    assert_eq!(
+        body.len(),
+        len,
+        "HTTP/2 must deliver the whole {len} byte body (took {took:?})"
+    );
+}
+
+fn h3_serves_a_body_of(len: usize) {
+    let (fixture, _svc) = fixture_serving(len);
+    let port = fixture.port();
+    let (result, took) = within_limit("the HTTP/3 response", move || h3_get(port, "/", &[]));
+    let (status, _, body) = result.expect("the HTTP/3 fetch");
+    assert_eq!(status, 200, "HTTP/3 status");
+    assert_eq!(
+        body.len(),
+        len,
+        "HTTP/3 must deliver the whole {len} byte body (took {took:?})"
+    );
+}
+
+/// RFC 9113 6.9 and 5.1: a response longer than the 16 KiB send queue completes.
+///
+/// m6-http frames response DATA only while fewer than 16 KiB sit unsent, and
+/// the next writable event is meant to frame the next piece. A page load takes
+/// bodies of tens of KiB to a few MiB over h2, and a connection that stops after
+/// the first two frames serves a status and a content-length and then 32,768
+/// bytes, which is what a browser sees as a page that never finishes. 37 KiB is
+/// the smallest size that shows it, 300 KiB is a large image, 2 MiB is more than
+/// both windows.
+#[test]
+fn rfc9113_6_9_h2_serves_a_37_kib_body() {
+    h2_serves_a_body_of(37 * 1024);
+}
+
+#[test]
+fn rfc9113_6_9_h2_serves_a_300_kib_body() {
+    h2_serves_a_body_of(300 * 1024);
+}
+
+#[test]
+fn rfc9113_6_9_h2_serves_a_2_mib_body() {
+    h2_serves_a_body_of(2 * 1024 * 1024);
+}
+
+/// The same three sizes over h3, which quiche paces, so the send-queue bound
+/// is not expected to touch it. The tests pin that, because a page load takes
+/// both protocols.
+#[test]
+fn rfc9114_4_1_h3_serves_a_37_kib_body() {
+    h3_serves_a_body_of(37 * 1024);
+}
+
+#[test]
+fn rfc9114_4_1_h3_serves_a_300_kib_body() {
+    h3_serves_a_body_of(300 * 1024);
+}
+
+#[test]
+fn rfc9114_4_1_h3_serves_a_2_mib_body() {
+    h3_serves_a_body_of(2 * 1024 * 1024);
 }
