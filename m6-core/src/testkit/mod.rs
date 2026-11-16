@@ -45,7 +45,9 @@
 //!
 //! [`alloc_count`] is also reachable through the `alloc-count` feature on its
 //! own, which exposes that one file and none of the harness. A service built
-//! with it declares its own `#[global_allocator]` and reads its loop's count.
+//! with it declares `m6_core::alloc::M6Alloc` as its `#[global_allocator]`, which
+//! counts under this feature and is plain mimalloc without it, and reads its
+//! loop's count.
 //! ALLOC-0's `m6-http` is the first caller.
 
 // Ungated: the `alloc-count` feature exposes this one file without the rest of

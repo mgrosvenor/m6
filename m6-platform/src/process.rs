@@ -46,6 +46,27 @@ pub fn page_size() -> usize {
     }
 }
 
+/// Pin every page this process holds, and every page it maps later, in RAM, so
+/// the kernel never swaps one out and a hot page is never a page fault. Start
+/// only, after the heap is reserved and before serving.
+///
+/// Where memory cannot be pinned the error names the limit and the fix. On
+/// macOS there is nothing to ask for and the call does nothing: it returns
+/// `Ok`, and the process's memory is as the kernel manages it.
+///
+/// Linux: `mlockall(MCL_CURRENT | MCL_FUTURE)`, bounded by `RLIMIT_MEMLOCK`.
+pub fn lock_memory() -> io::Result<()> {
+    os::lock_memory()
+}
+
+/// Bytes of this process's memory that sit on huge pages now, explicit or
+/// transparent. Zero where the kernel gave none, and on macOS, which has no
+/// such report. A service reads it once after reserving its heap, to log which
+/// kind of page it got.
+pub fn huge_page_bytes() -> usize {
+    os::huge_page_bytes()
+}
+
 /// The soft and hard open-file limits of this process.
 pub fn fd_limits() -> io::Result<(u64, u64)> {
     let (soft, hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)?;

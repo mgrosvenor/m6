@@ -25,7 +25,7 @@ use m6_core::client::{Addr, Upstream};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 

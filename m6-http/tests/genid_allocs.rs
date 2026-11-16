@@ -21,7 +21,7 @@ use m6_http_lib::cache::CachedResponse;
 use m6_http_lib::http11::{build_response, write_cached_h1, HitHeaders};
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 fn main() {
     let mut args = Arguments::from_args();

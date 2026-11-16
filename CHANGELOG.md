@@ -135,6 +135,12 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`[limits.heap_reserve]`, and for m6-http `[server] lock_memory`, which pins the heap in RAM.**
+`heap_reserve` is the heap reserved from the OS at start: 32 MiB by default and at most 4 GiB, rounded to a power of two with one warning. m6-http defaults it to `cache_bytes` max plus 64 MiB rounded to 2 MiB, so the cache is carved from the huge-page region, and warns at start, naming `[limits.heap_reserve] start` and `[limits.cache_bytes] max`, when a configured value leaves the cache outside it.
+`lock_memory` defaults to true. After the reservation and before the first request m6-http calls `m6_platform::process::lock_memory` (`mlockall(MCL_CURRENT | MCL_FUTURE)` on Linux, a documented no-op on macOS). If the kernel refuses because `RLIMIT_MEMLOCK` is too low, m6-http stops with exit 2 and an error that names the limit and the fix (`LimitMEMLOCK=infinity` under systemd, or `lock_memory = false`); it never carries on unpinned when pinning was asked for. `m6_platform::process::huge_page_bytes` reports how much of the process sits on huge pages, and m6-http logs it once at start.
+`tools/memcalls.sh` attaches `strace -c -f` to a warmed-up m6-http (cache hits) and m6-html (renders) and counts `brk`, `mmap`, `munmap`, `madvise`, `mremap` and `mprotect` over 10,000 requests, base against branch. `tools/hwcounters.sh` runs `perf stat` over 10,000 hot cache hits with the cache full and prints page faults, dTLB and iTLB misses, cache misses, instructions and cycles per request, or says "hardware counters not available on this host" and prints only the software events.
+Verified on macOS: unit tests for the limit and its m6-http default, `lock_memory` and the `lock_memory` key; both scripts pass shellcheck and ran their server and request paths against dev builds with a stand-in for `strace`. The Linux pins, the counters and the strace table have not run yet.
+
 **Every bounded buffer has a named limit with a `start` and a `max` read from one config table, and the rendered page is the first buffer on it.**
 `[limits.render_page]` takes `start` and `max`, as bytes or as `"512KiB"` and `"4MiB"`, and an absent table gives the defaults: 512 KiB at start, 4 MiB at most (`docs/m6-app-anatomy.md` §4.2).
 The new `m6_core::limits` module owns one rule: allocate `start` at start, grow only when a write does not fit, by doubling and clamped at `max`, keep the size and never shrink, and log one line naming the limit and the new size on each growth.
@@ -491,6 +497,13 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
+`m6_core::alloc::M6Alloc` wraps mimalloc and is the one allocator type: m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor declare it in `main.rs`, and every allocation-counting test and example declares the same type, so counts are taken against the allocator production runs. Under `alloc-count` (the `testkit` and `count-allocations` features) it counts exactly as `testkit::alloc_count::Counting` did, and without them the counting is not compiled. `Counting` is removed. A library crate declares no allocator. m6-auth-cli is a one-shot command and keeps the system allocator.
+Each service sets mimalloc's options in code at the top of `main`: freed memory is never returned to the OS (purge delay -1), so the heap grows and does not shrink. It then reserves `[limits.heap_reserve]` bytes from the OS once, committed and on huge pages where the kernel offers them, and logs once when the heap later grows past it; growth is never a failure.
+This is on trial. `docs/PERFORMANCE.md` §2.8 says the A/B in §7.2 decides whether it stays, and a worse latency, or memory calls that do not fall to zero, reverts it.
+Verified on macOS: 2301 tests pass; every counting test (`alloc_count_armed`, `event_allocs`, `limit_page_allocs`, `server_conn`, `site_allocs`, `upstream_no_alloc`, `email_allocs`, `allocations`, `client_allocs`) builds and passes with its budget unchanged.
+Not yet verified on Linux: the strace, `perf stat`, latency and RSS comparison on the idle build host (`tools/memcalls.sh`, `tools/hwcounters.sh`, `tools/perfcheck.sh`).
 
 **A rendered page makes no allocation of its own: the dictionary overlay, its built-in values and the response's header list are reused from one request to the next (template request 27 to 22 allocations, page path 41 to 36, handler request 21 to 16).**
 The overlay is taken from a spare one on the thread, cleared and not freed, and it keeps only the buffers of `request_path`, `datetime` and `year`; `datetime` and `year` are formatted into stack buffers; a response's header list returns to a spare list when the response is dropped. The 22 that remain on a page are Tera's and minify-html's, and a traced run of `site_allocs` shows all 36 on its path are theirs.

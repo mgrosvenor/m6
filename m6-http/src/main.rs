@@ -38,13 +38,12 @@ use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
 
-/// ALLOC-0's counting allocator, behind a feature that is off by default and
-/// never on in a release build of a service. A plain build installs no
-/// allocator, and the loop's arm and stop lines below are compiled out with it,
-/// so the loop is the code it always was.
-#[cfg(all(feature = "count-allocations", not(feature = "alloc-attribution")))]
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
+#[cfg(not(feature = "alloc-attribution"))]
 #[global_allocator]
-static ALLOCATOR: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 /// ALLOC-ATTR: dhat replaces the counter only when attribution is asked for,
 /// because the two global allocators cannot coexist. Still behind
@@ -2899,6 +2898,7 @@ fn event_loop(
         // the loop trace's own accounting.
         if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
             m6_core::log::tick(m6_core::platform::wall());
+            m6_core::alloc::note_growth();
             last_log_tick = now2;
         }
 
@@ -6478,6 +6478,8 @@ fn urlencoded(s: &str) -> String {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // Never hand freed memory back to the OS: the heap grows and does not shrink.
+    m6_core::alloc::never_return();
     // Block SIGTERM and SIGINT before anything else. The mask is inherited
     // only by threads created after this point, and the signal descriptor
     // refuses to open without it. See m6_core::signal.
@@ -6537,6 +6539,13 @@ fn run(args: Vec<String>) -> i32 {
     // The named limits every buffer and queue below follows, and the log's own,
     // set before the log opens.
     m6_http_lib::limits::init(&config.limits);
+    {
+        let (bytes, warning) = m6_http_lib::limits::heap_reserve(&config.limits);
+        if let Some(warning) = warning {
+            eprintln!("m6-http: {warning}");
+        }
+        m6_core::alloc::reserve(bytes);
+    }
     for warning in config.limits.warnings() {
         eprintln!("m6-http: {warning}");
     }
@@ -7016,6 +7025,26 @@ fn run(args: Vec<String>) -> i32 {
         seed_cache_warm(&mut state);
     }
 
+    // Pin the heap, after it is reserved and before the first request. Asked
+    // for and refused is a stop, not a quiet unpinned run.
+    if state.config.server.lock_memory {
+        if let Err(e) = m6_core::platform::process::lock_memory() {
+            eprintln!("m6-http: [server] lock_memory: {e}");
+            return 2;
+        }
+    }
+    let huge = m6_core::platform::process::huge_page_bytes();
+    info!(
+        huge_page_bytes = huge,
+        "heap: {} MiB on huge pages{}",
+        huge / (1024 * 1024),
+        if state.config.server.lock_memory {
+            ", memory pinned"
+        } else {
+            ", memory not pinned"
+        }
+    );
+
     let code = event_loop(
         EventLoopIo {
             udp,
@@ -7091,6 +7120,7 @@ mod www_redirect_tests {
                 internal_peers: Vec::new(),
                 redirect_bind: None,
                 warm_on_start: false,
+                lock_memory: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
             },
             log: LogConfig::default(),

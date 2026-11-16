@@ -155,13 +155,22 @@ fn peer_ip(req: &Request) -> String {
         .to_string()
 }
 
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
+#[global_allocator]
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
+
 fn main() -> Result<()> {
+    // Never hand freed memory back to the OS: the heap grows and does not shrink.
+    m6_core::alloc::never_return();
     // Block the signals before anything else: the mask is inherited only by
     // threads created after this point, and logging starts one.
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
     let mut site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
+    m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
     let read_timeout = site.read_timeout();
     let (state, db) = build_state(&site).unwrap_or_else(|e| fail("building the auth state", e));
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
@@ -415,6 +424,7 @@ fn main() -> Result<()> {
         last = end;
         if end - last_report >= TICK {
             m6_core::log::tick(m6_core::platform::wall());
+            m6_core::alloc::note_growth();
             let _ = trace.report();
             last_report = end;
         }

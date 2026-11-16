@@ -144,6 +144,12 @@ pub const RATE_LIMIT_ADDRESSES: LimitSpec = count("rate_limit_addresses", 1024, 
 pub const CACHE_BYTES: LimitSpec = bytes("cache_bytes", 128 * MIB, 128 * MIB);
 /// Polls the monitor holds in memory while its history file catches up.
 pub const HISTORY_QUEUE: LimitSpec = count("history_queue", 8, 1024);
+/// The heap a service reserves from the OS once at start, committed, so a warm
+/// service makes no kernel memory call. `start` is the reservation; past it the
+/// heap still grows, logged once, and is never an error. `max` is a ceiling on
+/// what a config may ask to reserve. m6-http, whose cache is the hot data, takes
+/// its default from `cache_bytes` instead (see `m6-http`'s `heap_reserve`).
+pub const HEAP_RESERVE: LimitSpec = bytes("heap_reserve", 32 * MIB, 4 * GIB);
 
 /// Every limit m6 knows. A name outside this list under `[limits]` is refused.
 pub const KNOWN: &[LimitSpec] = &[
@@ -170,6 +176,7 @@ pub const KNOWN: &[LimitSpec] = &[
     RATE_LIMIT_ADDRESSES,
     CACHE_BYTES,
     HISTORY_QUEUE,
+    HEAP_RESERVE,
 ];
 
 /// One limit, with its values rounded and checked.
@@ -180,6 +187,7 @@ pub struct Limit {
     max: usize,
     unit: Unit,
     file: std::sync::Arc<Path>,
+    start_set: bool,
 }
 
 impl Limit {
@@ -193,6 +201,7 @@ impl Limit {
             max,
             unit: spec.unit,
             file: Path::new("").into(),
+            start_set: false,
         }
     }
 
@@ -248,6 +257,12 @@ impl Limit {
 
     pub fn start(&self) -> usize {
         self.start
+    }
+
+    /// Whether the config named this limit's `start`, as against the built-in
+    /// default. A service whose default depends on another limit asks.
+    pub fn start_set(&self) -> bool {
+        self.start_set
     }
 
     pub fn max(&self) -> usize {
@@ -402,6 +417,7 @@ impl Limits {
                 max,
                 unit: spec.unit,
                 file: file.into(),
+                start_set: body.is_some_and(|b| b.contains_key("start")),
             });
         }
         Ok(Self {
@@ -887,6 +903,19 @@ mod tests {
         let l = parse("[limits.smtp_reply]\nstart = 600\n", 16384).unwrap();
         assert_eq!(l.get(&SMTP_REPLY).start(), 1024);
         assert!(l.warnings()[0].contains("is not a power of two; using 1 KiB"));
+    }
+
+    /// `start_set` tells a configured `start` from the built-in default, so a
+    /// service can derive its own default only when the operator named none.
+    #[test]
+    fn start_set_tells_a_configured_start_from_the_default() {
+        let none = parse("", 4096).unwrap();
+        assert!(!none.get(&HEAP_RESERVE).start_set());
+        assert_eq!(none.get(&HEAP_RESERVE).start(), 32 * MIB);
+        let set = parse("[limits.heap_reserve]\nstart = \"100MiB\"\n", 4096).unwrap();
+        assert!(set.get(&HEAP_RESERVE).start_set());
+        assert_eq!(set.get(&HEAP_RESERVE).start(), 128 * MIB);
+        assert!(set.warnings()[0].contains("heap_reserve"));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 fn main() {
     let mut args = Arguments::from_args();

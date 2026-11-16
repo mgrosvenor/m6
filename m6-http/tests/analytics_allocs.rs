@@ -30,7 +30,7 @@ use m6_http_lib::analytics::{self, Event, SessionId};
 use m6_http_lib::health::TrafficWindow;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const REQUESTS: usize = 1_000;
 

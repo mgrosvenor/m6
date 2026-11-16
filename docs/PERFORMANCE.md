@@ -186,6 +186,27 @@ The revert changes no wire byte and no template's context.
 
 ---
 
+### 2.8. mimalloc as the global allocator, and whether it stays
+
+Every m6 binary installs `m6_core::alloc::M6Alloc`, which is mimalloc, and every allocation-counting test installs the same type, so the counts are taken against the allocator production runs.
+The change is on trial: **the A/B in section 7.2 decides whether it stays.**
+It stays only if cache-hit latency and render latency are no worse than the base build, and the memory-call and page-fault counts the owner asked for fall to zero or to a named handful.
+A result that is worse is a revert, not a tuning exercise.
+
+The claim is about the kernel, not the allocator's own time.
+A warm service should make no `brk`, `mmap`, `munmap`, `madvise`, `mremap` or `mprotect` call.
+That takes four settings, all made in code at start and none through an environment variable:
+
+| setting | what it does | where |
+|---|---|---|
+| purge delay -1 | mimalloc never hands freed memory back, so the heap grows and does not shrink | `m6_core::alloc::never_return`, first line of `main` |
+| `[limits.heap_reserve]` | one committed reservation taken from the OS at start, on huge pages where the kernel offers them; m6-http defaults it to `cache_bytes` plus 64 MiB so the cache lives in it | `m6_core::alloc::reserve` |
+| `[server] lock_memory` | `mlockall`, so the reservation is resident and a hot page is never a page fault | m6-http, after the reservation and before serving |
+| growth past the reservation | allowed, never a failure, logged once | `m6_core::alloc::note_growth`, on each service's one-second accounting tick |
+
+**Table: the settings that keep a warm service out of the kernel.**
+Take from it that the reservation is sized from the cache, so the hot data sits in one pinned region.
+
 ## 3. Allocation on the static file path
 
 Two changes stopped `m6-file` reading bytes it never sent.
@@ -208,7 +229,7 @@ The cache path raised a different question: whether its latency had regressed at
 ### 3.1. Allocations per request
 
 `m6-http` counts its own heap allocations behind the `count-allocations` feature, which is off by default.
-A plain build installs no allocator and compiles the arm and stop calls out, so its loop is unchanged.
+A plain build compiles the counting and the arm and stop calls out, so its loop is unchanged: `m6_core::alloc::M6Alloc`, the allocator every binary and every counting test installs, is plain mimalloc without the feature and counts with it.
 With the feature on, the run loop arms `m6_core::testkit::alloc_count` when it starts and logs `calls` and `bytes` once at stop.
 The count covers every `alloc`, `alloc_zeroed` and `realloc` the loop thread made while serving, from m6-http, m6-core, rustls, quiche and every other Rust library in the process.
 
@@ -647,6 +668,53 @@ cargo build --release --bin m6-probe-h1 --bin m6-probe-h2 --bin m6-probe-h3
 The probes take any host, which is how Tables 15 and 16 were measured against third-party edges.
 
 ---
+
+### 7.2. The mimalloc A/B on the build host
+
+Run on the idle build host, holding the host lock, the base (`ce6c29c`) against the branch (`perf/mimalloc`).
+Build both with the release profile, which this is one of the two places for.
+
+```sh
+git worktree add ~/build/base ce6c29c
+git worktree add ~/build/cand perf/mimalloc
+for t in base cand; do
+  (cd ~/build/$t && cargo build --release -p m6-http -p m6-html -p m6-file --bins)
+done
+```
+
+**The pass mark, the kernel memory calls.** Attach `strace` to the running service after a warm-up:
+
+```sh
+cd ~/build/cand
+MEMCALLS_SUDO=sudo tools/memcalls.sh base=$HOME/build/base/target/release \
+  cand=$HOME/build/cand/target/release --requests 10000 --warmup 2000
+```
+
+It prints, for m6-http over hot cache hits and for m6-html over renders, one row per call (`brk`, `mmap`, `munmap`, `madvise`, `mremap`, `mprotect`), the total, the minor page faults and the RSS after the window.
+The candidate's total should be 0, or a handful with every call named in the table.
+
+**Page faults, TLB and cache misses per request, with the cache full:**
+
+```sh
+tools/hwcounters.sh base=$HOME/build/base/target/release cand=$HOME/build/cand/target/release \
+  --requests 10000 --warmup 2000 --fill-mib 128
+```
+
+The script says "hardware counters not available on this host" and reports the software events alone when the VM exposes no counters.
+`dTLB-load-misses` per request is the number huge pages should bring close to zero.
+
+**Render latency**, interleaved and pinned, from the candidate checkout:
+
+```sh
+tools/perfcheck.sh --base-bin $HOME/build/base/target/release/m6-html \
+  --cand-bin $HOME/build/cand/target/release/m6-html
+```
+
+**Cache-hit latency end to end**: `./bench.sh --latency-n 20000` in each checkout, alternating base and candidate for five rounds, and compare the HTTP/1.1 and HTTP/2 cache-hit rows.
+`tools/paired_bench.sh cache_hit` is not an allocator measurement: that bench runs in-process and installs no allocator of its own.
+
+**RSS after warm-up** is the `rss` row of both scripts above.
+Record the binary sizes (`ls -l target/release/m6-http`) and the release build time beside it.
 
 ## 8. What is not measured
 

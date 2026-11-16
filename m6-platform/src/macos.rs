@@ -187,6 +187,17 @@ pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     }
 }
 
+/// There is no call that pins a whole process on macOS, so there is nothing to
+/// do and nothing to refuse.
+pub(super) fn lock_memory() -> io::Result<()> {
+    Ok(())
+}
+
+/// macOS reports no huge-page use to a process.
+pub(super) fn huge_page_bytes() -> usize {
+    0
+}
+
 // ── Process facts, through libproc ───────────────────────────────────────────
 
 /// The task information of `pid`. `NotFound` for a pid that is gone,

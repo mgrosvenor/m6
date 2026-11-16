@@ -255,6 +255,15 @@ pub struct ServerConfig {
     /// cannot stampede: it is the same mechanism that refreshes stale entries.
     #[serde(default)]
     pub warm_on_start: bool,
+    /// Pin every page of the process in RAM at start, after the heap is
+    /// reserved and before serving (`mlockall`), so a hot page is never a page
+    /// fault and the kernel never swaps the cache out. Default true. When the
+    /// kernel refuses because `RLIMIT_MEMLOCK` is too low, m6-http stops at
+    /// start with exit 2 and an error that names the limit and the fix
+    /// (systemd `LimitMEMLOCK=infinity`); it never carries on unpinned when
+    /// pinning was asked for. Set false to run unpinned. A no-op on macOS.
+    /// Read at start, and a change needs a restart.
+    pub lock_memory: bool,
     /// Request methods this server will serve. Anything else is answered 405
     /// with an `Allow` header, before routing, cache lookup or backend
     /// dispatch.
@@ -881,6 +890,7 @@ struct RawSiteSection {
 struct RawServerSection {
     bind: Option<String>,
     warm_on_start: Option<bool>,
+    lock_memory: Option<bool>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
@@ -1177,6 +1187,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     let redirect_bind = node_server.redirect_bind;
     // Warming is a property of the node, not of the site it serves.
     let warm_on_start = node_server.warm_on_start.unwrap_or(false);
+    let lock_memory = node_server.lock_memory.unwrap_or(true);
 
     // A redirector binds `redirect_bind` and nothing else, so requiring a
     // separate `bind` there would mean every redirect config carried the same
@@ -1281,6 +1292,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         internal_binds,
         internal_peers,
         warm_on_start,
+        lock_memory,
         redirect_bind: redirect_bind.clone(),
         // Uppercased once at load so the hot-path check is a plain comparison
         // rather than a case-insensitive one per request.
@@ -1612,6 +1624,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "internal_peers",
     "redirect_bind",
     "warm_on_start",
+    "lock_memory",
     "max_requests_per_connection",
     "reuse_port",
     "reuse_port_processes",
@@ -3256,6 +3269,7 @@ domain = "test.example.com"
                 "h2c_bind",
                 "internal_binds",
                 "internal_peers",
+                "lock_memory",
                 "max_requests_per_connection",
                 "process_index",
                 "redirect_bind",
@@ -3271,7 +3285,7 @@ domain = "test.example.com"
         health.sort_unstable();
         assert_eq!(health, ["metrics_peers", "metrics_require"]);
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "limits", "node"]);
-        assert_eq!(all.len(), 15 + 2 + 5);
+        assert_eq!(all.len(), 16 + 2 + 5);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),

@@ -200,6 +200,44 @@ pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     Ok(None)
 }
 
+/// Pin all current and future pages. `ENOMEM` and `EPERM` are the memlock
+/// limit, and are the cases an operator can fix.
+pub(super) fn lock_memory() -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::mman::{mlockall, MlockAllFlags};
+    mlockall(MlockAllFlags::MCL_CURRENT | MlockAllFlags::MCL_FUTURE).map_err(|errno| {
+        if matches!(errno, Errno::ENOMEM | Errno::EPERM) {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "mlockall failed ({errno}): RLIMIT_MEMLOCK is below what this process holds. \
+                     Raise it: under systemd set LimitMEMLOCK=infinity in the unit, otherwise \
+                     `ulimit -l unlimited` as root. Or set [server] lock_memory = false to run unpinned"
+                ),
+            )
+        } else {
+            io::Error::from(errno)
+        }
+    })
+}
+
+/// `AnonHugePages` (transparent) and `Hugetlb` (explicit) of this process, from
+/// `/proc/self/smaps_rollup`, in bytes.
+pub(super) fn huge_page_bytes() -> usize {
+    let Ok(text) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("AnonHugePages:")
+                .or_else(|| line.strip_prefix("Hugetlb:"))?;
+            rest.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()
+        })
+        .sum::<usize>()
+        * 1024
+}
+
 // ── Process facts ────────────────────────────────────────────────────────────
 
 pub(super) fn thread_count(pid: u32) -> io::Result<usize> {

@@ -80,3 +80,15 @@ fn open_descriptors_follow_the_files() {
     drop(f);
     assert_eq!(process::open_descriptors(me).expect("fds"), before, "H9");
 }
+
+/// Pinning memory either works, or says which limit refused it and what to
+/// change. macOS has nothing to pin and always answers `Ok`.
+#[test]
+fn lock_memory_pins_or_names_the_limit_and_the_fix() {
+    if let Err(e) = process::lock_memory() {
+        let text = e.to_string();
+        assert!(text.contains("RLIMIT_MEMLOCK"), "{text}");
+        assert!(text.contains("LimitMEMLOCK=infinity"), "{text}");
+        assert!(text.contains("lock_memory = false"), "{text}");
+    }
+}

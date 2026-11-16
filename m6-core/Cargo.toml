@@ -67,6 +67,10 @@ http-client = ["dep:url"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+# The allocator behind `m6_core::alloc::M6Alloc`. The `-sys` crate is named for
+# the option and arena calls that set the heap up in code at start.
+mimalloc = "0.1.52"
+libmimalloc-sys = { version = "0.1.49", features = ["extended", "arena"] }
 # The platform layer: the one crate that knows the operating system, re-exported
 # as `m6_core::platform` so a service names nothing below m6-core.
 m6-platform = { path = "../m6-platform" }

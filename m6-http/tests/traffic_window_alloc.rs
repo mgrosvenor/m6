@@ -11,7 +11,7 @@ use m6_core::testkit::alloc_count;
 use m6_http_lib::health::{Kind, TrafficWindow};
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 /// Far more events than the ring holds, so the wrap path is measured too.
 const PUSHES: usize = 100_000;

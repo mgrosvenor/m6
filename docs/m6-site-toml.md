@@ -264,7 +264,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 |---|---|---|
 | `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
 | `[node]` name | System config | Names this node |
-| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, max_requests_per_connection, reuse_port | System config | Differs per node |
+| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, lock_memory, max_requests_per_connection, reuse_port | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[limits.<name>]` | System config | The start and maximum of this node's buffers and queues, memory a node owns |
@@ -340,6 +340,7 @@ Take from it that the bind, the certificate and the key are required, and every 
 | `max_requests_per_connection` | integer | no | Default `100`, and `0` is a config error. The most requests one HTTP/1.1 connection serves before m6-http closes it, so a client that makes more than this many HTTP/1.1 requests reconnects, with a new TLS handshake. System config only, read at start |
 | `reuse_port` | boolean | no | Default `false`. When `true`, only the public 443 port is shared: its TLS listener and QUIC UDP socket on `bind` are bound with `SO_REUSEPORT` in one call, so several m6-http processes serve that port. The redirect port 80, the internal h2c socket and every backend socket are not shared. Linux spreads a new connection by a hash and macOS does not, so the split is not even unless `reuse_port_processes` is set. System config only, read at start |
 | `reuse_port_processes` | integer, at least 1 | no | Unset by default. With `reuse_port`, the number of m6-http processes that share the port. On Linux a socket filter attached to the TLS listener and the QUIC socket sends (a hash of the client's source address) mod this number to one socket, so one client address always reaches the same process, for HTTP/1.1, HTTP/2 and HTTP/3, over IPv4 and IPv6. Every process on the port must set the same number. macOS has no such filter and ignores it. System config only, read at start |
+| `lock_memory` | boolean | no | Default `true`. Pins every page of the process in RAM at start, after the heap reservation and before the first request (`mlockall` on Linux, nothing on macOS), so a hot page is never a page fault and the cache is never swapped out. If the kernel refuses because `RLIMIT_MEMLOCK` is too low, m6-http stops at start with exit 2 and an error that names the limit; it never carries on unpinned when pinning was asked for. Under systemd set `LimitMEMLOCK=infinity` in the unit. Set `false` to run unpinned. System config only, read at start |
 | `process_index` | integer | no | Unset by default. This process's number among the m6-http processes of one node, 0 to N-1, below `reuse_port_processes` when that is set. `/health` and `/perf` report it as `process_index`, and with `status_bind` it picks this process's status port. System config only, read at start |
 | `status_bind` | string, `"<address>:<base port>"` | no | Unset by default. With `reuse_port`, each process also answers `/health`, `/perf` and `/traffic` on a TLS listener of its own at the base port plus its `process_index`, so a monitor reads every process and not whichever one the kernel picked on 443. Every other path on it is 404, and the `[health]` gate applies as on the shared port. Needs `process_index`; a port past 65535 is exit 2. It is not in the `reuse_port` group, so nothing steers to it. Bind it to the node's tunnel address, never a public one. System config only, read at start |
 
@@ -736,7 +737,8 @@ requests_per_min = 300
 m6-http sizes its buffers and queues from named limits, each with a `start` and a `max`.
 The table lives in the system config, because memory is a property of the node.
 A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
-The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer` and `log_field`.
+The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer`, `log_field` and `heap_reserve`.
+`heap_reserve` is the heap m6-http reserves from the OS at start, on huge pages where the kernel has them: by default `cache_bytes` max plus 64 MiB, rounded to 2 MiB, so the cache is carved from it. A `start` below `cache_bytes` max is warned at start, naming both keys.
 [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
 
 ```toml

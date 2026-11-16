@@ -205,6 +205,12 @@ fn parse_args(args: &[String]) -> Result<Cli> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
+#[global_allocator]
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run(args));
