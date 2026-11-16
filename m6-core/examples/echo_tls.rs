@@ -1,5 +1,6 @@
-//! The TLS version of the echo server: the same loop, with rustls (the ring
-//! provider, as m6-http uses) between the socket and the buffer.
+//! The TLS version of the echo server: the same loop, with rustls (rustls's
+//! default provider, aws-lc-rs, as m6-http uses) between the socket and the
+//! buffer.
 //!
 //! Usage: echo_tls ADDR CERT KEY. ECHO_IDLE_MS, ECHO_DRAIN_MS and ECHO_CONNS
 //! as echo.
@@ -66,11 +67,11 @@ fn main() -> io::Result<()> {
         .collect::<Result<_, _>>()
         .map_err(invalid)?;
     let key = PrivateKeyDer::from_pem_file(&key).map_err(invalid)?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .and_then(|b| b.with_no_client_auth().with_single_cert(certs, key))
-        .map_err(io::Error::other)?;
+    let mut config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(io::Error::other)?;
     config.send_tls13_tickets = 0; // as the C server: no session tickets
     let config = Arc::new(config);
     let idle = Duration::from_millis(env_or("ECHO_IDLE_MS", 10_000));

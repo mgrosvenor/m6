@@ -123,8 +123,16 @@ ahash          = "0.8"
 # tls12 and logging reached release builds only through tokio-rustls's default
 # features while the cold-start benchmark was a [[bin]]. Declare them here so
 # the listener keeps the protocol versions and log records it had when
-# tokio-rustls is a dev-dependency. The one crypto provider is ring.
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# tokio-rustls is a dev-dependency.
+#
+# aws-lc-rs is rustls's own default provider and the only one this tree builds.
+# The build host measured it on Linux guests that hide ADX and SHA-NI: ring's
+# X25519 falls back to its generic path at 83 us per handshake, aws-lc-rs has a
+# non-ADX fast path at 56 us, and aws-lc-rs makes 0 getrandom calls per
+# handshake against ring's 9. Nothing here needs ring, so it is not a second
+# path: `builder()` resolves the provider from these features and there is
+# exactly one provider to resolve.
+rustls         = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 # rustls-pki-types rather than rustls-pemfile: that crate is unmaintained
 # (RUSTSEC-2025-0134) and its advisory points at this one, which carries the same
 # PEM code behind the `PemObject` trait. rustls already depends on it, so this is

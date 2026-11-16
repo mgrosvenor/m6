@@ -20,7 +20,6 @@
 use m6_http_lib::probe;
 
 fn main() {
-    probe::install_crypto();
     let (addr, n) = probe::args("127.0.0.1:443", 100);
     let no_resume = std::env::args().any(|a| a == "--no-resume");
     // ONE config, shared, so the session store persists between connections.

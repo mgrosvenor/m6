@@ -211,7 +211,6 @@ impl Fixture {
 
 /// One GET over HTTP/1.1 and TLS. Returns the status and the body.
 fn get(port: u16, path: &str) -> Result<(u16, String), String> {
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;

@@ -206,7 +206,6 @@ impl Stack {
     }
 
     fn get_with(&self, path: &str, extra: &[(&str, &str)]) -> (u16, String) {
-        probe::install_crypto();
         let tcp = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
         tcp.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");
