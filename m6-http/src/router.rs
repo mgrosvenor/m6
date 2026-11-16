@@ -343,6 +343,8 @@ mod tests {
                 max_requests_per_connection: 100,
                 reuse_port: false,
                 reuse_port_processes: None,
+                process_index: None,
+                status_bind: None,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),

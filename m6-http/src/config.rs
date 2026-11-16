@@ -185,6 +185,23 @@ pub struct ServerConfig {
     /// every client. Read at start, and a change needs a restart.
     #[serde(default)]
     pub reuse_port_processes: Option<std::num::NonZeroU32>,
+    /// This process's number among the m6-http processes of one node, 0 to N-1
+    /// (N is `reuse_port_processes` when set). `/health` and `/perf` report it
+    /// as `process_index`, so a monitor can tell which process answered. With
+    /// `status_bind` it also picks this process's status port. Read at start,
+    /// and a change needs a restart.
+    #[serde(default)]
+    pub process_index: Option<u32>,
+    /// `"<address>:<base port>"`: where this process answers `/health`,
+    /// `/perf` and `/traffic` for a monitor, as a TLS listener of its own on
+    /// the base port plus `process_index`. It answers those three paths and
+    /// 404s every other, under the same `[health]` gate as the shared port.
+    /// Needs `process_index`. It is not part of the `reuse_port` group, so
+    /// nothing steers to it. Bind it to the node's tunnel address, never a
+    /// public one. Unset means no status listener. Read at start, and a change
+    /// needs a restart.
+    #[serde(default)]
+    pub status_bind: Option<String>,
     /// Optional H2C (HTTP/2 cleartext) listener address.
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
@@ -273,6 +290,48 @@ fn default_allowed_methods() -> Vec<String> {
 
 fn default_backend_timeout_secs() -> u64 {
     30
+}
+
+/// The address a process's status listener binds: `status_bind`'s address with
+/// its port raised by `process_index`. Checked by `load`, so a bad value is
+/// exit 2 and never reaches the bind.
+pub fn status_addr(status_bind: &str, process_index: u32) -> anyhow::Result<std::net::SocketAddr> {
+    let mut addr = crate::http11::resolve_bind(status_bind)?;
+    let port = u32::from(addr.port()) + process_index;
+    let port = u16::try_from(port).map_err(|_| {
+        anyhow::anyhow!(
+            "config error: [server].status_bind {status_bind:?} plus process_index {process_index} is port {port}, past 65535"
+        )
+    })?;
+    addr.set_port(port);
+    Ok(addr)
+}
+
+/// `[server]` `process_index` and `status_bind`: a status listener needs an
+/// index, and the index must be one of the `reuse_port_processes` when that is
+/// set.
+fn validate_status(
+    process_index: Option<u32>,
+    status_bind: Option<String>,
+    processes: Option<std::num::NonZeroU32>,
+) -> anyhow::Result<(Option<u32>, Option<String>)> {
+    if let (Some(i), Some(n)) = (process_index, processes) {
+        if i >= n.get() {
+            anyhow::bail!(
+                "config error: [server].process_index {i} is not below [server].reuse_port_processes {n}: the indexes run 0 to {}",
+                n.get() - 1
+            );
+        }
+    }
+    if let Some(bind) = &status_bind {
+        let Some(i) = process_index else {
+            anyhow::bail!(
+                "config error: [server].status_bind needs [server].process_index, which picks this process's port"
+            );
+        };
+        status_addr(bind, i)?;
+    }
+    Ok((process_index, status_bind))
 }
 
 fn default_max_requests_per_connection() -> u32 {
@@ -805,6 +864,8 @@ struct RawServerSection {
     max_requests_per_connection: Option<u32>,
     reuse_port: Option<bool>,
     reuse_port_processes: Option<std::num::NonZeroU32>,
+    process_index: Option<u32>,
+    status_bind: Option<String>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
@@ -1107,6 +1168,11 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             "config error: [server].max_requests_per_connection must be at least 1, because 0 would close every connection before it served a request"
         );
     }
+    let (process_index, status_bind) = validate_status(
+        node_server.process_index,
+        node_server.status_bind,
+        node_server.reuse_port_processes,
+    )?;
     let h2c_bind = node_server.h2c_bind;
     // Nothing is inferred from an address: a listener is internal only when
     // this list names it. A redirector binds nothing the list could name, so a
@@ -1171,6 +1237,8 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         max_requests_per_connection,
         reuse_port: node_server.reuse_port.unwrap_or(false),
         reuse_port_processes: node_server.reuse_port_processes,
+        process_index,
+        status_bind,
         h2c_bind,
         internal_binds,
         internal_peers,
@@ -1518,6 +1586,8 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "max_requests_per_connection",
     "reuse_port",
     "reuse_port_processes",
+    "process_index",
+    "status_bind",
 ];
 /// The fields of `RawSystemHealth`; change both together.
 const NODE_HEALTH_KEYS: &[&str] = &["metrics_require", "metrics_peers"];
@@ -2065,6 +2135,54 @@ sockets = "/run/m6/*.sock"
     }
 
     /// A zero would be a modulus of zero in the kernel filter.
+    #[test]
+    fn status_listener_keys_are_read_and_default_off() {
+        let cfg = load_with_system_server_line("").unwrap();
+        assert_eq!(
+            (cfg.server.process_index, cfg.server.status_bind),
+            (None, None)
+        );
+        let cfg = load_with_system_server_line(
+            "reuse_port_processes = 3\nprocess_index = 2\nstatus_bind = \"127.0.0.1:9440\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.process_index, Some(2));
+        assert_eq!(
+            status_addr(cfg.server.status_bind.as_deref().unwrap(), 2)
+                .unwrap()
+                .port(),
+            9442
+        );
+    }
+
+    #[test]
+    fn status_bind_without_an_index_is_rejected() {
+        let err = load_with_system_server_line("status_bind = \"127.0.0.1:9440\"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("status_bind") && err.contains("process_index"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_index_past_the_process_count_is_rejected() {
+        let err = load_with_system_server_line("reuse_port_processes = 2\nprocess_index = 2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("process_index 2"), "error: {err}");
+    }
+
+    #[test]
+    fn a_status_port_past_65535_is_rejected() {
+        let err =
+            load_with_system_server_line("process_index = 5\nstatus_bind = \"127.0.0.1:65533\"")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("past 65535"), "error: {err}");
+    }
+
     #[test]
     fn reuse_port_processes_zero_is_rejected() {
         let err = load_with_system_server_line("reuse_port = true\nreuse_port_processes = 0")
@@ -3088,9 +3206,11 @@ domain = "test.example.com"
                 "internal_binds",
                 "internal_peers",
                 "max_requests_per_connection",
+                "process_index",
                 "redirect_bind",
                 "reuse_port",
                 "reuse_port_processes",
+                "status_bind",
                 "tls_cert",
                 "tls_key",
                 "warm_on_start",
@@ -3100,7 +3220,7 @@ domain = "test.example.com"
         health.sort_unstable();
         assert_eq!(health, ["metrics_peers", "metrics_require"]);
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "node"]);
-        assert_eq!(all.len(), 13 + 2 + 4);
+        assert_eq!(all.len(), 15 + 2 + 4);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),

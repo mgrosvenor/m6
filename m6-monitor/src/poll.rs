@@ -620,6 +620,10 @@ impl Poller {
 
     /// The next header check that applies to this node, from `from` on.
     fn next_header(&self, node: usize, from: usize) -> Step {
+        // The public face is one thing per node, so only process 0 asks it.
+        if self.nodes[node].process.is_some_and(|p| p != 0) {
+            return Step::Done;
+        }
         let role = &self.readings[node].role;
         for i in from..self.header_checks.len() {
             let hc = &self.header_checks[i];
@@ -687,8 +691,11 @@ impl Poller {
             }
             Step::Done => unreachable!("a done step starts no request"),
         };
-        let addr = match step {
-            Step::Perf | Step::Traffic => Addr::Tcp(n.metrics_addr()),
+        let addr = match (step, n.status_addr) {
+            // A header check asks the public face, whatever the process.
+            (Step::Header(_), _) => Addr::Tcp(n.addr),
+            (_, Some(status)) => Addr::Tcp(status),
+            (Step::Perf | Step::Traffic, None) => Addr::Tcp(n.metrics_addr()),
             _ => Addr::Tcp(n.addr),
         };
         (addr, path, n.authority.clone(), token)
@@ -774,7 +781,21 @@ impl Poller {
                 r.rtt = Some(self.running.step_started[node].elapsed());
                 r.health_status = Some(reply.status);
                 match serde_json::from_slice::<HealthReport>(reply.body) {
-                    Ok(h) => r.health = Some(h),
+                    Ok(h) => {
+                        // A status port answers as the process it was bound
+                        // for: another index means two processes were given
+                        // one index, or the config names the wrong base.
+                        if let Some(expected) = self.nodes[node].process {
+                            if h.process_index != Some(expected) {
+                                r.unreachable = Some(format!(
+                                    "the status port of process {expected} answered as process {}",
+                                    h.process_index
+                                        .map_or_else(|| "none".to_string(), |i| i.to_string())
+                                ));
+                            }
+                        }
+                        r.health = Some(h);
+                    }
                     Err(e) => {
                         r.unreachable = Some(format!(
                             "/health answered {} but did not parse: {e}",
@@ -1330,6 +1351,7 @@ mod tests {
             role: "origin".into(),
             url: "http://origin.example.com".into(),
             health: status.map(|s| HealthReport {
+                process_index: None,
                 status: s.to_string(),
                 node: "origin".into(),
             }),
@@ -1492,7 +1514,86 @@ mod tests {
                 public_key: None,
             }),
             metrics_over_tunnel: true,
+            processes: None,
+            process: None,
         }
+    }
+
+    fn process_node(status_port: u16, index: u32) -> Node {
+        Node {
+            name: format!("edge/{index}"),
+            // Nothing listens here: a request that went to the public face
+            // instead of the status port would read the node as unreachable.
+            url: "http://127.0.0.1:1".into(),
+            role: "cache".into(),
+            perf_token_file: None,
+            tunnel: Some(crate::fleet::Tunnel {
+                address: format!("127.0.0.1:{status_port}"),
+                public_key: None,
+            }),
+            metrics_over_tunnel: true,
+            processes: None,
+            process: Some(index),
+        }
+    }
+
+    /// A process entry asks its status port for `/health`, `/perf` and
+    /// `/traffic`, and nothing else: no header check, no public address. Break:
+    /// `/health` sent to the public address, which reads unreachable here.
+    #[test]
+    fn a_process_entry_asks_its_status_port_for_all_three_paths() {
+        let (port, seen) = serve(3, |path| match path {
+            "/health" => (200, r#"{"status":"ok","node":"edge","process_index":1}"#),
+            _ => (404, r#"{"error":"not found"}"#),
+        });
+        let polled = run(&fleet_of(process_node(port, 1)), Some("tok"));
+        let r = &polled.readings[0];
+        assert_eq!(r.unreachable, None);
+        assert_eq!(r.health.as_ref().map(|h| h.status.as_str()), Some("ok"));
+        let lines: Vec<String> = seen.join().unwrap().into_iter().map(|(l, _)| l).collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /health HTTP/1.1",
+                "GET /perf HTTP/1.1",
+                "GET /traffic HTTP/1.1"
+            ]
+        );
+    }
+
+    /// A status port that answers as another process is a fault that names
+    /// both. Break: the index is not compared, and two processes given one
+    /// index read as healthy.
+    #[test]
+    fn a_status_port_that_answers_as_another_process_is_a_fault() {
+        let (port, seen) = serve(1, |path| match path {
+            "/health" => (200, r#"{"status":"ok","node":"edge","process_index":0}"#),
+            _ => (404, r#"{"error":"not found"}"#),
+        });
+        let polled = run(&fleet_of(process_node(port, 2)), Some("tok"));
+        seen.join().unwrap();
+        let why = polled.readings[0]
+            .unreachable
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            why.contains("process 2") && why.contains("answered as process 0"),
+            "{why}"
+        );
+        assert_eq!(polled.readings[0].status(), "unreachable");
+    }
+
+    /// A process that is down refuses its own port, and is reported as that
+    /// index. This is what the shared port hides.
+    #[test]
+    fn a_process_that_is_down_is_unreachable_under_its_own_name() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let polled = run(&fleet_of(process_node(port, 1)), Some("tok"));
+        assert_eq!(polled.readings[0].name, "edge/1");
+        assert!(polled.readings[0].unreachable.is_some());
     }
 
     #[test]
@@ -1559,6 +1660,8 @@ mod tests {
             perf_token_file: None,
             tunnel: None,
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         let mut fleet = fleet_of(n);
         fleet.timeout_ms = 100;
@@ -1595,6 +1698,8 @@ mod tests {
             perf_token_file: None,
             tunnel: None,
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         let checks = vec![crate::fleet::HeaderCheck {
             path: "/capabilities".into(),
@@ -1699,6 +1804,8 @@ mod tests {
             perf_token_file: None,
             tunnel: None,
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         let (nameserver, server) = scripted_nameserver();
         let polled = run_with(&fleet_of(n), Some("tok"), nameserver);
@@ -1730,6 +1837,8 @@ mod tests {
             perf_token_file: None,
             tunnel: None,
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         let mut fleet = fleet_of(n);
         fleet.timeout_ms = 100;
@@ -1793,6 +1902,8 @@ mod tests {
                 public_key: None,
             }),
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         let mut fleet = fleet_of(n);
         let token = tempfile::NamedTempFile::new().unwrap();
@@ -1841,6 +1952,8 @@ mod tests {
                 public_key: None,
             }),
             metrics_over_tunnel: false,
+            processes: None,
+            process: None,
         };
         let polled = run(&fleet_of(n), None);
         seen.join().unwrap();

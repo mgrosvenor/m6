@@ -154,6 +154,11 @@ pub struct PoolHealth {
 /// `/perf` now, which is token-gated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthReport {
+    /// Which of a node's `reuse_port` processes answered, 0 to N-1. Absent
+    /// unless `[server] process_index` is set, so an existing node's body is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_index: Option<u32>,
     /// `"ok"`. A node running an older m6-http could still send `"degraded"`,
     /// which the monitor reads as a fault.
     ///
@@ -286,6 +291,7 @@ impl HealthReport {
         (
             200,
             HealthReport {
+                process_index: None,
                 status: "ok".to_string(),
                 node: node.to_string(),
             },
@@ -330,6 +336,10 @@ impl HealthReport {
 /// latency percentiles are: they describe the shape of the thing being served.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfReport {
+    /// Which of a node's `reuse_port` processes answered, 0 to N-1. Absent
+    /// unless `[server] process_index` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_index: Option<u32>,
     pub node: String,
     /// What this node is running: name, version and build hash.
     ///
@@ -441,6 +451,8 @@ pub struct PerfSubject<'a> {
     pub pools: Vec<PoolHealth>,
     pub url_backends: Vec<String>,
     pub host_path: &'a std::path::Path,
+    /// This process's `[server] process_index`, if it has one.
+    pub process_index: Option<u32>,
 }
 
 impl PerfReport {
@@ -451,6 +463,7 @@ impl PerfReport {
         snapshot: impl FnOnce() -> StatsSnapshot,
     ) -> PerfOutcome {
         let PerfSubject {
+            process_index,
             node,
             uptime_s,
             pools,
@@ -462,6 +475,7 @@ impl PerfReport {
         // Read after authorisation, like the reservoir sort: an
         // anonymous caller never causes a /proc read either.
         PerfOutcome::Ok(Box::new(PerfReport {
+            process_index,
             node: node.to_string(),
             build: build_id().clone(),
             uptime_s,
@@ -572,6 +586,7 @@ mod tests {
     fn perf_reports_the_running_build_identity() {
         let out = PerfReport::build_authorised(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
@@ -653,6 +668,7 @@ mod tests {
         // at one failed on unrelated required fields of StatsSnapshot.
         let out = PerfReport::build_authorised(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
@@ -675,6 +691,7 @@ mod tests {
     fn authorised_perf_json() -> serde_json::Value {
         let out = PerfReport::build_authorised(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
@@ -723,6 +740,7 @@ mod tests {
     fn build_authorised_reports_without_a_token() {
         let out = PerfReport::build_authorised(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
@@ -764,6 +782,7 @@ mod tests {
     fn perf_returns_metrics_when_authorised() {
         let out = PerfReport::build_authorised(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 11,
                 pools: vec![PoolHealth {
@@ -1245,5 +1264,20 @@ mod traffic_tests {
         // And the count still goes out under the name an older reader expects.
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["heavy_hitters"][0]["user_agents"], 3);
+    }
+
+    /// `process_index` is in the body only when the process has one, so a node
+    /// that does not set it answers as before. Break: always serialised, which
+    /// changes every existing `/health` body.
+    #[test]
+    fn process_index_is_reported_only_when_set() {
+        let (_, plain) = HealthReport::build("edge");
+        let body = String::from_utf8(plain.into_response(200).2).unwrap();
+        assert!(!body.contains("process_index"), "{body}");
+
+        let (_, mut with) = HealthReport::build("edge");
+        with.process_index = Some(2);
+        let body = String::from_utf8(with.into_response(200).2).unwrap();
+        assert!(body.contains("\"process_index\":2"), "{body}");
     }
 }

@@ -505,7 +505,13 @@ In two-file mode all four are node state and live in the system config.
 In one-file mode they live in that one file.
 
 Each of the three endpoints reports the process that accepted the request.
-With `[server] reuse_port`, the kernel chooses that process, so a monitor polling one address reads one front end of N per poll and the report holds that process's share of the node.
+With `[server] reuse_port`, the kernel chooses that process on the shared port, so a monitor polling that address reads one front end of N per poll and the report holds that process's share of the node.
+To read every process, set `[server] process_index` and `status_bind` on each: the process then also answers these three paths on a TLS listener of its own at the `status_bind` port plus its index, and nothing else (any other path is 404).
+The listener is another socket in the same event loop and runs the same handler, under the same `[health]` gate, so the request path of the shared port is unchanged and a process allocates nothing more per request.
+`/health` and `/perf` carry `process_index` when it is set.
+In m6-monitor, `processes = N` on a node polls process `i` at `tunnel.address` with its port raised by `i`, over the tunnel, and reports it as `<node>/<i>`, with one `PROCESSES` line in `/check` and `process_groups` in `/digest` adding the node's processes together.
+A process that is down refuses its own port, so the monitor names that index as a fault.
+`processes = 1` or no `processes` polls the node as one address, as before.
 Section 4.1 states the same split for the request counters.
 
 `/perf` reports three traffic populations and never pools them.

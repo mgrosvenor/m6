@@ -168,6 +168,8 @@ const TOKEN_SIGNAL: Token = Token(usize::MAX - 3);
 /// The operational log's stdout, registered while it holds bytes a full
 /// destination would not take.
 const TOKEN_LOG: Token = Token(usize::MAX - 4);
+/// The per-process status listener, `[server] status_bind`.
+const TOKEN_STATUS_LISTENER: Token = Token(usize::MAX - 5);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 /// Who owns a per-descriptor token: the owner and the owner's own slot index.
@@ -190,7 +192,7 @@ enum Source {
 fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
     match token {
         Some(TOKEN_UDP) => 3,
-        Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) => 0,
+        Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) | Some(TOKEN_STATUS_LISTENER) => 0,
         Some(TOKEN_SIGNAL) => 4,
         // A log drain is the loop's own bookkeeping, named so /perf does not
         // report it as a timeout that did not happen.
@@ -1167,12 +1169,17 @@ fn limit_kernel_send_queue(fd: RawFd) {
 /// full. Returns whether the table is at its ceiling.
 fn accept_tls(
     tcp: &mut Http11Listener,
+    status: bool,
     state: &mut ServerState,
     registry: &m6_core::platform::Registry,
     now: Instant,
 ) -> bool {
     loop {
-        let Some(conn) = tcp.accept_one() else {
+        let Some(conn) = (if status {
+            tcp.accept_status()
+        } else {
+            tcp.accept_one()
+        }) else {
             return false;
         };
         let Some(token) = take_token(state) else {
@@ -1265,18 +1272,37 @@ fn drive_conn_token(
         alt_svc: state.alt_svc_line.clone(),
         describedby: state.describedby_line.clone(),
     };
+    // A connection on the status listener answers the monitoring paths only.
+    let status = !is_h2c && tcp.as_ref().is_some_and(|t| t.is_status(slot));
     let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
+        if status && !is_status_path(state, head.path) {
+            return status_refusal();
+        }
         on_request_head(state, head, buf, ip, quic_port, registry)
     };
     // Only a method refusal is decided from a head. Any other body-bearing
     // request has to be read before it can be routed, as before.
     let mut on_head_early =
         |state: &mut ServerState, head: &RequestHead<'_>, _ip: &str| -> Option<RequestOutcome> {
+            if status && !is_status_path(state, head.path) {
+                return Some(status_refusal());
+            }
             route_method_refusal(state, head.path, head.method)
         };
-    let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| match req {
-        RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
-        RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
+    let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| {
+        if status {
+            let path = match &req {
+                RequestRef::Owned(r) => r.path.as_str(),
+                RequestRef::H2(r) => r.path,
+            };
+            if !is_status_path(state, path) {
+                return status_refusal();
+            }
+        }
+        match req {
+            RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
+            RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
+        }
     };
     let mut drive = if is_h2c {
         match h2c.as_mut() {
@@ -1357,6 +1383,20 @@ fn drive_conn_token(
     } else {
         ConnOutcome::Active
     }
+}
+
+/// Whether `path` is one the status listener answers: the health, perf and
+/// traffic paths this process serves on the shared port.
+fn is_status_path(state: &ServerState, path: &str) -> bool {
+    let health = &state.config.health;
+    path == health.path || path == health.perf_path || path == health.traffic_path
+}
+
+/// The answer to any other path on the status listener: the 404 of a disabled
+/// endpoint, which says nothing about the site.
+fn status_refusal() -> RequestOutcome {
+    let (code, headers, body) = health::PerfOutcome::Disabled.into_response();
+    RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string(), None)
 }
 
 /// Deregister and free a connection token.
@@ -2465,6 +2505,9 @@ fn ensure_h2s_conn(
 fn deregister_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
     if let Some(t) = tcp {
         poll.registry().deregister_fd(t.raw_fd()).ok();
+        if let Some(fd) = t.status_fd() {
+            poll.registry().deregister_fd(fd).ok();
+        }
     }
     if let Some(h) = h2c {
         poll.registry().deregister_fd(h.raw_fd()).ok();
@@ -2477,6 +2520,11 @@ fn register_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2
         poll.registry()
             .register_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE)
             .ok();
+        if let Some(fd) = t.status_fd() {
+            poll.registry()
+                .register_fd(fd, TOKEN_STATUS_LISTENER, Interest::READABLE)
+                .ok();
+        }
     }
     if let Some(h) = h2c {
         poll.registry()
@@ -2518,6 +2566,11 @@ fn event_loop(
         let _ = poll
             .registry()
             .register_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE);
+        if let Some(fd) = t.status_fd() {
+            let _ = poll
+                .registry()
+                .register_fd(fd, TOKEN_STATUS_LISTENER, Interest::READABLE);
+        }
     }
     if let Some(ref h) = h2c {
         let _ = poll
@@ -2651,7 +2704,16 @@ fn event_loop(
                 }
                 TOKEN_TLS_LISTENER => {
                     if let Some(t) = tcp.as_mut() {
-                        let full = accept_tls(t, state, poll.registry(), now);
+                        let full = accept_tls(t, false, state, poll.registry(), now);
+                        if full && accepting {
+                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                            accepting = false;
+                        }
+                    }
+                }
+                TOKEN_STATUS_LISTENER => {
+                    if let Some(t) = tcp.as_mut() {
+                        let full = accept_tls(t, true, state, poll.registry(), now);
                         if full && accepting {
                             deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
                             accepting = false;
@@ -4597,7 +4659,8 @@ fn handle_request_inner(
     // It sits *after* method validation so a health path still refuses PUT
     // and friends like every other path, rather than becoming a hole in it.
     if state.config.health.enabled && req.path == state.config.health.path {
-        let (code, report) = health::HealthReport::build(&state.config.node.name);
+        let (code, mut report) = health::HealthReport::build(&state.config.node.name);
+        report.process_index = state.config.server.process_index;
         let (code, headers, body) = report.into_response(code);
         // Recorded, not discarded. `message = "monitor"` keeps it out of the
         // site-traffic rows every consumer already filters for, so an uptime
@@ -4649,6 +4712,7 @@ fn handle_request_inner(
                     .collect();
                 let outcome = health::PerfReport::build_authorised(
                     health::PerfSubject {
+                        process_index: state.config.server.process_index,
                         node: &state.config.node.name,
                         uptime_s: state.started.elapsed().as_secs(),
                         pools,
@@ -6737,6 +6801,29 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    // The per-process status listener joins the TLS listener's connection
+    // table. Configured and failed is fatal, as for the listeners above.
+    let tcp_listener = match (tcp_listener, config.server.status_bind.as_deref()) {
+        (Some(t), Some(bind)) => {
+            let index = config.server.process_index.unwrap_or_default();
+            let bound = config::status_addr(bind, index)
+                .and_then(|addr| Ok(m6_core::server::bind_tcp_reuseaddr(addr)?))
+                .and_then(|l| t.with_status(l));
+            match bound {
+                Ok(t) => {
+                    info!(bind = %bind, process_index = index, "status listener started");
+                    Some(t)
+                }
+                Err(e) => {
+                    error!(bind = %bind, error = %e,
+                           "status listener bind failed; it is configured, so refusing to run without it");
+                    return 1;
+                }
+            }
+        }
+        (t, _) => t,
+    };
+
     let h2c_listener = if let Some(ref h2c_bind) = config.server.h2c_bind {
         let internal_peers = config
             .server
@@ -6949,6 +7036,8 @@ mod www_redirect_tests {
                 max_requests_per_connection: 100,
                 reuse_port: false,
                 reuse_port_processes: None,
+                process_index: None,
+                status_bind: None,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
