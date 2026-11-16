@@ -11,11 +11,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sink::Sink;
 
-/// The most bytes a string field writes inside its quotes, the `...` marker
-/// included. A longer value is cut on a character boundary and ends in `...`,
-/// all inside the same 1024 bytes.
-pub const MAX_FIELD: usize = 1024;
-
 /// The severity of a line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -296,18 +291,19 @@ impl<'a> Line<'a> {
             self.failed = true;
             return self;
         }
-        let mut left = MAX_FIELD - 3;
-        let cut = match self.sink.push_escaped_limited(value, &mut left) {
-            Ok(true) => false,
-            Ok(false) => true,
+        let mut left = self.sink.field_max();
+        match self.sink.push_escaped_limited(value, &mut left) {
+            Ok(true) => {}
+            // Past the maximum the whole line is refused, never cut.
+            Ok(false) => {
+                self.sink.refuse_field();
+                self.failed = true;
+                return self;
+            }
             Err(()) => {
                 self.failed = true;
                 return self;
             }
-        };
-        if cut && !self.sink.push(b"...") {
-            self.failed = true;
-            return self;
         }
         if !self.sink.push(b"\"") {
             self.failed = true;
@@ -315,8 +311,8 @@ impl<'a> Line<'a> {
         self
     }
 
-    /// Write a string body in quotes, escaped by the adapter and cut at
-    /// [`MAX_FIELD`] bytes, the marker included.
+    /// Write a string body in quotes, escaped by the adapter. A body past the
+    /// `log_field` maximum refuses the line.
     fn formatted_body(mut self, args: fmt::Arguments<'_>) -> Self {
         if self.failed {
             return self;
@@ -326,20 +322,20 @@ impl<'a> Line<'a> {
             return self;
         }
         let (cut, failed) = {
+            let left = self.sink.field_max();
             let mut adapter = EscapeAdapter {
                 sink: self.sink,
-                left: MAX_FIELD - 3,
+                left,
                 cut: false,
                 failed: false,
             };
             let result = fmt::write(&mut adapter, args);
             (adapter.cut, adapter.failed || result.is_err())
         };
-        if failed {
-            self.failed = true;
-            return self;
+        if cut {
+            self.sink.refuse_field();
         }
-        if cut && !self.sink.push(b"...") {
+        if failed || cut {
             self.failed = true;
             return self;
         }

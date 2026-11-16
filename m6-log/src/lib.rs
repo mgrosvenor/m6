@@ -43,8 +43,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
-pub use line::{line_at, Field, Level, Line, MAX_FIELD};
-pub use sink::{Sink, BUFFER_BYTES};
+pub use line::{line_at, Field, Level, Line};
+pub use sink::{set_limits, LogLimits, Sink, BUFFER_BYTES, BUFFER_MAX_BYTES, FIELD_MAX_BYTES};
 
 thread_local! {
     static LEVEL: Cell<Level> = const { Cell::new(Level::Info) };

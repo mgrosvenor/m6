@@ -364,6 +364,13 @@ impl Site {
         // sink without flushing it, and m6-log would record the already
         // nonblocking stdout as its own.
         if mode == StartMode::Service {
+            let buffer = config.limits.get(&crate::limits::LOG_BUFFER);
+            crate::log::set_limits(crate::log::LogLimits {
+                buffer_start: buffer.start(),
+                buffer_max: buffer.max(),
+                field_max: config.limits.get(&crate::limits::LOG_FIELD).max(),
+                file: config_path.display().to_string(),
+            });
             crate::log::init(level, None).map_err(|e| (format!("logging init error: {e}"), 1))?;
         }
 

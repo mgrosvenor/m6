@@ -12,8 +12,88 @@ use std::path::{Path, PathBuf};
 
 use crate::line::write_dropped_line;
 
-/// Bytes one Sink's buffer holds before it is written to its destination.
+/// The default size of one Sink's buffer at start, in bytes.
 pub const BUFFER_BYTES: usize = 16 * 1024;
+
+/// The default most a Sink's buffer grows to, in bytes.
+pub const BUFFER_MAX_BYTES: usize = 1024 * 1024;
+
+/// The default longest string field of a line, in bytes.
+pub const FIELD_MAX_BYTES: usize = 8 * 1024;
+
+/// How big the Sinks made after this call are, and how long a field may be.
+///
+/// A Sink's buffer starts at `buffer_start`, grows by doubling when a line does
+/// not fit and the destination cannot take it, keeps its size, and refuses a
+/// line past `buffer_max`. A string field longer than `field_max` refuses its
+/// line. Both refusals write one line to stderr that names the limit and
+/// `file`, the config file that sets it. The service sets these from its
+/// `[limits]` table before it opens the log.
+#[derive(Debug, Clone)]
+pub struct LogLimits {
+    pub buffer_start: usize,
+    pub buffer_max: usize,
+    pub field_max: usize,
+    /// The config file the limits came from, for the refusal message.
+    pub file: String,
+}
+
+impl Default for LogLimits {
+    fn default() -> Self {
+        Self {
+            buffer_start: BUFFER_BYTES,
+            buffer_max: BUFFER_MAX_BYTES,
+            field_max: FIELD_MAX_BYTES,
+            file: "the config file".to_string(),
+        }
+    }
+}
+
+impl LogLimits {
+    /// The error for a line that needs `needed` bytes of buffer.
+    pub fn buffer_refusal(&self, needed: usize) -> String {
+        format!(
+            "m6-log: the log buffer needs at least {needed} B, over [limits.log_buffer] max = {} in {}; raise max to fix this. A log line was refused.",
+            kib(self.buffer_max),
+            self.file
+        )
+    }
+
+    /// The error for a string field longer than `field_max`.
+    pub fn field_refusal(&self) -> String {
+        format!(
+            "m6-log: a log field needs at least {} B, over [limits.log_field] max = {} in {}; raise max to fix this. A log line was refused.",
+            self.field_max + 1,
+            kib(self.field_max),
+            self.file
+        )
+    }
+}
+
+static LIMITS: std::sync::Mutex<Option<LogLimits>> = std::sync::Mutex::new(None);
+
+/// Set the limits of every Sink made after this call. Start only.
+pub fn set_limits(limits: LogLimits) {
+    *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(limits);
+}
+
+fn current_limits() -> LogLimits {
+    LIMITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+fn kib(bytes: usize) -> String {
+    if bytes.is_multiple_of(1024 * 1024) {
+        format!("{} MiB", bytes / (1024 * 1024))
+    } else if bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 /// The escaped form of one byte of a JSON string's contents, and its length.
 ///
@@ -54,8 +134,12 @@ fn escaped_byte(b: u8) -> ([u8; 6], usize) {
 /// One log destination: a fixed buffer, its length and the descriptor it
 /// drains to.
 pub struct Sink {
-    /// The buffer, made once at start.
-    buf: Box<[u8]>,
+    /// The buffer: `buf.len()` is the size it has grown to, never smaller than
+    /// at start.
+    buf: Vec<u8>,
+    limits: LogLimits,
+    /// A refusal has been written to stderr since the buffer last drained.
+    refusal_noted: bool,
     /// Bytes in `buf`, including the line being built.
     len: usize,
     /// Bytes of `buf` that are complete lines and may be written.
@@ -99,7 +183,9 @@ impl Sink {
             Some(m6_platform::fd::set_nonblocking(&std::io::stdout(), true)?)
         };
         Ok(Sink {
-            buf: vec![0; BUFFER_BYTES].into_boxed_slice(),
+            buf: vec![0; current_limits().buffer_start],
+            limits: current_limits(),
+            refusal_noted: false,
             len: 0,
             commit: 0,
             fd: 1,
@@ -152,7 +238,9 @@ impl Sink {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let fd = file.as_raw_fd();
         Ok(Sink {
-            buf: vec![0; BUFFER_BYTES].into_boxed_slice(),
+            buf: vec![0; current_limits().buffer_start],
+            limits: current_limits(),
+            refusal_noted: false,
             len: 0,
             commit: 0,
             fd,
@@ -256,7 +344,7 @@ impl Sink {
         if self.len + bytes.len() > self.buf.len() {
             self.make_room();
         }
-        if self.len + bytes.len() > self.buf.len() {
+        if self.len + bytes.len() > self.buf.len() && !self.grow(self.len + bytes.len()) {
             return false;
         }
         self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
@@ -331,6 +419,46 @@ impl Sink {
         self.dropped += 1;
     }
 
+    /// Grow the buffer to hold `needed` bytes: doubling, clamped to the
+    /// maximum. Past the maximum the line is refused and one line on stderr
+    /// says which limit to raise.
+    fn grow(&mut self, needed: usize) -> bool {
+        let max = self.limits.buffer_max;
+        if needed > max {
+            if !self.refusal_noted {
+                self.refusal_noted = true;
+                eprintln!("{}", self.limits.buffer_refusal(needed));
+            }
+            return false;
+        }
+        let mut size = self.buf.len();
+        while size < needed {
+            size = size.saturating_mul(2);
+        }
+        let size = size.min(max);
+        self.buf.resize(size, 0);
+        // Not through the log itself: the line would be written into the
+        // buffer that is growing.
+        eprintln!("m6-log: limit log_buffer grew to {}", kib(size));
+        true
+    }
+
+    /// The size the buffer has grown to, in bytes.
+    pub fn buffer_size(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The longest string field a line of this Sink may carry.
+    pub(crate) fn field_max(&self) -> usize {
+        self.limits.field_max
+    }
+
+    /// A string field was longer than the `log_field` maximum: its line is
+    /// refused, and one line on stderr says which limit to raise.
+    pub(crate) fn refuse_field(&mut self) {
+        eprintln!("{}", self.limits.field_refusal());
+    }
+
     /// Make room for more line bytes: write complete lines and move the line
     /// being built to the front. Does nothing while the destination is known
     /// to be full: only an explicit flush retries then.
@@ -383,6 +511,9 @@ impl Sink {
             self.blocked = true;
         } else if self.commit == 0 {
             self.blocked = false;
+        }
+        if self.commit == 0 {
+            self.refusal_noted = false;
         }
     }
 
