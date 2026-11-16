@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod crypto;
 pub mod disk_cache;
 pub mod error;
 pub mod fields;

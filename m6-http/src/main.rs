@@ -6486,10 +6486,9 @@ fn main() {
     m6_core::signal::block();
 
     // rustls requires an explicit CryptoProvider when multiple are available
-    // (ring + aws-lc-rs both get pulled in transitively). Install ring first.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // (ring + aws-lc-rs both get pulled in transitively). Install ours first:
+    // ring unless built with the `aws-lc-rs` feature.
+    m6_http_lib::crypto::install();
     // ALLOC-ATTR: the profiler is held for the whole process so every
     // allocation is attributed. `run` returns before the explicit drop, because
     // `std::process::exit` does not run destructors and dhat writes its file on

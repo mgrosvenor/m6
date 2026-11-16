@@ -97,7 +97,7 @@ A test that shells out to `cargo build --release` makes the whole suite pay a fa
 The gate builds `cargo build --workspace --bins` in the dev profile before `cargo test`, so every binary a test needs is present.
 The scripts do not use `binary`.
 `tools/conformance.sh` and `tools/perfcheck.sh` run `target/release` directly and refuse to start when it is missing, so run `cargo build --workspace --release` before them.
-`bench.sh` builds the release binaries it needs itself.
+`bench.sh` builds the release binaries it needs itself. `bench.sh --handshake` measures handshakes only; see the header of `bench.sh` for `BENCH_KEY` and `BENCH_FEATURES`.
 
 ### 3.1. The accounting-tick test hook
 

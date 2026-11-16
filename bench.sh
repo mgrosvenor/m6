@@ -6,6 +6,14 @@
 #   ./bench.sh [--skip-verify] [--latency-n N] [--duration S] [--concurrency C]
 #              [--p99-limit-us F] [--rps-min F] [--addr HOST:PORT]
 #
+# Handshake suite (TLS 1.3 over TCP for h1 and h2, QUIC for h3):
+#   ./bench.sh --handshake [--handshake-n N]
+#   BENCH_KEY=ec|rsa          certificate key type (default rsa, as before)
+#   BENCH_FEATURES=aws-lc-rs  build m6-http on aws-lc-rs instead of ring
+# Prints p50 and p99 per handshake and the server's CPU per handshake for a full
+# handshake, a resumed one, and for h3 a 0-RTT request. Server CPU is read from
+# the OS for the m6-http process before and after each run.
+#
 # All suites (H1/H2/H3/H2C × socket latency/path/throughput + 4×4 URL matrix) are run.
 # Servers are restarted between each suite to avoid stale-connection pollution.
 set -euo pipefail
@@ -48,6 +56,8 @@ URL_H2S_PID=""
 # ── Parse pass-through flags ──────────────────────────────────────────────────
 # Extract flags we forward to m6-bench; discard protocol/suite filters
 # (bench.sh controls those itself).
+HANDSHAKE=0
+HANDSHAKE_N=1000
 BENCH_PASS=("--skip-verify")   # bench uses a self-signed cert; TLS validity is not the test
 i=0
 args=("$@")
@@ -56,6 +66,13 @@ while [[ $i -lt ${#args[@]} ]]; do
     case "$arg" in
         --skip-verify)
             # Already in BENCH_PASS above; accepted so the flag is not an error.
+            ;;
+        --handshake)
+            HANDSHAKE=1
+            ;;
+        --handshake-n)
+            HANDSHAKE_N="${args[$((i+1))]}"
+            i=$(( i + 1 ))
             ;;
         --latency-n|--duration|--concurrency|--p99-limit-us|--rps-min|--addr)
             BENCH_PASS+=("$arg" "${args[$((i+1))]}")
@@ -81,7 +98,9 @@ PROFILE="${BENCH_PROFILE:-release}"
 PROFILE_FLAG=()
 [[ "$PROFILE" == release ]] && PROFILE_FLAG=(--release)
 echo "==> Building binaries ($PROFILE)..."
-cargo build ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
+FEATURE_FLAG=()
+[[ -n "${BENCH_FEATURES:-}" ]] && FEATURE_FLAG=(--features "$BENCH_FEATURES")
+cargo build ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} ${FEATURE_FLAG[@]+"${FEATURE_FLAG[@]}"} \
     -p m6-http --bin m6-http --bin m6-bench --bin bench-url-backend \
     2>&1 | grep -E "^(error|warning\[|Compiling|Finished)" || true
 # A separate call: `--bin` above would otherwise limit every package to those names.
@@ -113,11 +132,22 @@ mkdir -p \
 
 # TLS certs — a throwaway self-signed certificate, made here. The old fixture
 # files no longer exist, and the tests make theirs the same way (rcgen, in the
-# test). RSA, because quiche's TLS library refuses LibreSSL's default EC output.
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
-    -keyout "$SITE_DIR/key.pem" -out "$SITE_DIR/cert.pem" 2>/dev/null \
-    || { echo "ERROR: openssl could not make a certificate" >&2; exit 1; }
+# test). RSA by default; BENCH_KEY=ec makes ECDSA, below.
+# BENCH_KEY=ec makes an ECDSA P-256 certificate instead. The key is made first
+# with a named curve: LibreSSL's `req -newkey ec` writes explicit curve
+# parameters, which rustls and quiche both refuse.
+if [[ "${BENCH_KEY:-rsa}" == ec ]]; then
+    openssl ecparam -name prime256v1 -genkey -noout -out "$SITE_DIR/key.pem" 2>/dev/null \
+        && openssl req -x509 -new -key "$SITE_DIR/key.pem" -days 2 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+            -out "$SITE_DIR/cert.pem" 2>/dev/null \
+        || { echo "ERROR: openssl could not make an EC certificate" >&2; exit 1; }
+else
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+        -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+        -keyout "$SITE_DIR/key.pem" -out "$SITE_DIR/cert.pem" 2>/dev/null \
+        || { echo "ERROR: openssl could not make a certificate" >&2; exit 1; }
+fi
 
 # site.toml — four routes:
 #   /              → m6-html (cacheable, Cache-Control: public)
@@ -296,6 +326,7 @@ stop_all() {
 }
 
 start_backends() {
+    local only_core="${1:-}"
     echo "  -> Starting m6-html..."
     M6_SOCKET_OVERRIDE="$HTML_SOCK" \
         "$M6_HTML" "$SITE_DIR" "$SITE_DIR/configs/m6-html.conf" \
@@ -321,6 +352,9 @@ start_backends() {
         fi
         sleep 0.2
     done
+
+    # The handshake suite needs only the two socket backends.
+    [[ "$only_core" == core ]] && return 0
 
     echo "  -> Starting bench-url-backend instances..."
     "$URL_BACKEND" --proto http  --addr "$URL_HTTP_ADDR"  \
@@ -395,6 +429,52 @@ run_suite() {
         "$suite_flag" \
         "${BENCH_PASS[@]}"
 }
+
+# ── Handshake suite ───────────────────────────────────────────────────────────
+
+# CPU time of a process in milliseconds. /proc where there is one (Linux);
+# otherwise ps, whose TIME column is M:SS.cc on macOS.
+cpu_ms() {
+    local pid="$1"
+    if [[ -r "/proc/$pid/stat" ]]; then
+        awk -v hz="$(getconf CLK_TCK)" '{ sub(/^.*\) /, ""); print ($12 + $13) * 1000 / hz }' "/proc/$pid/stat"
+    else
+        ps -o time= -p "$pid" | awk '{ n = split($1, t, ":"); s = 0;
+            for (k = 1; k <= n; k++) s = s * 60 + t[k]; print s * 1000 }'
+    fi
+}
+
+run_handshake_suites() {
+    echo ""
+    echo "Handshake suite: key=${BENCH_KEY:-rsa}  features=${BENCH_FEATURES:-none (ring)}  profile=$PROFILE  n=$HANDSHAKE_N"
+    printf '%-4s %-8s %6s %8s %9s %9s %9s %14s\n' proto kind n resumed p50_ms p99_ms 'cpu_us/hs' ''
+    local row kind before after served line rc=0
+    for row in "h1 full --http11-only" "h1 resumed --http11-only" "h2 full --http2-only" \
+               "h2 resumed --http2-only" "h3 full --http3-only" "h3 early --http3-only"; do
+        set -- $row
+        kind=$2
+        stop_all
+        start_backends core
+        start_http
+        # Warm "/" so the h3 early request is answered from cache, not 425.
+        curl -sk --http1.1 -o /dev/null "https://$BENCH_ADDR/" || true
+        before=$(cpu_ms "$HTTP_PID")
+        line=$("$M6_BENCH" --addr "$BENCH_ADDR" --handshake --handshake-kind "$kind" \
+                   --handshake-n "$HANDSHAKE_N" "$3" --skip-verify 2>&1) || rc=1
+        after=$(cpu_ms "$HTTP_PID")
+        served=$(grep -a HANDSHAKES_SERVED <<<"$line" | awk '{print $2}')
+        grep -a '^HS ' <<<"$line" | sed -E 's/^HS //; s/^([a-z0-9]+ [a-z]+):/\1/' | awk -v cpu="$(awk -v a="$after" -v b="$before" -v n="${served:-1}" 'BEGIN{printf "%.1f", (a-b)*1000/n}')" \
+            '{ for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+               printf "%-4s %-8s %6s %8s %9s %9s %9s\n", $1, $2, v["n"], v["resumed"], v["p50_ms"], v["p99_ms"], cpu }'
+        grep -a -v '^HS \|HANDSHAKES_SERVED' <<<"$line" | head -3 || true
+    done
+    return $rc
+}
+
+if (( HANDSHAKE )); then
+    run_handshake_suites
+    exit $?
+fi
 
 # ── Nine suites: H1/H2/H3 × latency/path/throughput ──────────────────────────
 

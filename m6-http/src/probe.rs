@@ -86,7 +86,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        crate::crypto::provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -99,7 +99,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 /// this. `m6-bench-detail` was missing this call and panicked before measuring
 /// anything, which is how a conformance tester came to be used instead.
 pub fn install_crypto() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::crypto::install();
 }
 
 /// A client config offering exactly one ALPN protocol.

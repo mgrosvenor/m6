@@ -57,6 +57,11 @@ struct Args {
     rps_min: f64,
     addr: String,
     h2c_addr: String,
+    /// Run the handshake suite instead of the request suites.
+    handshake: bool,
+    /// `full`, `resumed` or `early` (QUIC 0-RTT).
+    handshake_kind: String,
+    handshake_n: usize,
 }
 
 impl Args {
@@ -78,6 +83,9 @@ impl Args {
             rps_min: 50.0,
             addr: "127.0.0.1:8443".into(),
             h2c_addr: "127.0.0.1:8080".into(),
+            handshake: false,
+            handshake_kind: "full".into(),
+            handshake_n: 1000,
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -124,6 +132,15 @@ impl Args {
                     a.http3 = false;
                     a.h2c = false;
                     a.url = false;
+                }
+                "--handshake" => a.handshake = true,
+                "--handshake-kind" => {
+                    i += 1;
+                    a.handshake_kind = raw[i].clone();
+                }
+                "--handshake-n" => {
+                    i += 1;
+                    a.handshake_n = raw[i].parse().expect("handshake-n");
                 }
                 "--h2c" => a.h2c = true,
                 "--url" => a.url = true,
@@ -207,7 +224,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        m6_http_lib::crypto::provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1802,10 +1819,11 @@ fn run_path_benchmarks(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    m6_http_lib::crypto::install();
     let args = Args::parse();
+    if args.handshake {
+        std::process::exit(run_handshake_suite(&args));
+    }
     let mut all_pass = true;
 
     let run_latency = !args.throughput_only && !args.path_only;
@@ -2174,6 +2192,127 @@ fn main() {
         println!("One or more benchmarks FAILED.");
         std::process::exit(1);
     }
+}
+
+// ── Handshake suite ───────────────────────────────────────────────────────────
+
+/// Handshakes only, one protocol per run, strictly sequential: the figures a
+/// visitor's first (`full`) and returning (`resumed`) connection pay, and for
+/// h3 the QUIC 0-RTT request (`early`).
+///
+/// TCP+TLS (h1, h2) times from after the TCP connect to the client's Finished on
+/// the wire, as `probe::tls_handshake` does. QUIC (h3) times from the first
+/// Initial, so it INCLUDES the transport round trip; the two are not comparable.
+///
+/// Prints one `HS` line a table can be built from, then `HANDSHAKES_SERVED n`:
+/// every handshake the server saw, warm-ups included, which `bench.sh` divides
+/// the server's CPU delta by. Returns the exit status: non-zero if any
+/// handshake failed or a `resumed` run never resumed.
+fn run_handshake_suite(args: &Args) -> i32 {
+    use m6_http_lib::probe;
+    use std::time::Duration;
+
+    let proto = if args.http3 && !args.http11 && !args.http2 {
+        "h3"
+    } else if args.http2 && !args.http11 {
+        "h2"
+    } else {
+        "h1"
+    };
+    let kind = args.handshake_kind.as_str();
+    let n = args.handshake_n;
+    let mut samples: Vec<Duration> = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    let mut served = 0usize;
+    let mut resumed = 0usize;
+    let mut early_used = 0usize;
+    let mut too_early = 0usize;
+
+    match (proto, kind) {
+        ("h1" | "h2", "full" | "resumed") => {
+            let alpn: &[u8] = if proto == "h2" { b"h2" } else { b"http/1.1" };
+            let shared = probe::tls_config(alpn);
+            if kind == "resumed" {
+                // The first handshake earns the ticket and is not measured.
+                served += 1;
+                if probe::tls_handshake(&args.addr, Arc::clone(&shared)).is_err() {
+                    failures += 1;
+                }
+            }
+            for _ in 0..n {
+                let cfg = if kind == "resumed" {
+                    Arc::clone(&shared)
+                } else {
+                    probe::tls_config(alpn)
+                };
+                served += 1;
+                match probe::tls_handshake(&args.addr, cfg) {
+                    Ok(h) => {
+                        resumed += usize::from(h.resumed);
+                        samples.push(h.elapsed);
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("handshake failed: {e}");
+                    }
+                }
+            }
+        }
+        ("h3", "full") => {
+            for _ in 0..n {
+                served += 1;
+                match probe::quic_handshake(&args.addr) {
+                    Ok(d) => samples.push(d),
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("handshake failed: {e}");
+                    }
+                }
+            }
+        }
+        ("h3", "early") => {
+            // Each round is one full handshake (to earn the ticket) and one
+            // resumed connection whose request goes in the first flight.
+            for _ in 0..n {
+                served += 2;
+                match probe::zero_rtt_h3(&args.addr, "/", "GET") {
+                    Ok(r) => {
+                        if let Some(d) = r.warm_to_response {
+                            samples.push(d);
+                            resumed += 1;
+                        }
+                        early_used += usize::from(r.early_data_used);
+                        too_early += usize::from(r.status == Some(425));
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("0-RTT round failed: {e}");
+                    }
+                }
+            }
+        }
+        _ => {
+            eprintln!("no handshake suite for proto {proto} kind {kind} (h1/h2: full|resumed, h3: full|early)");
+            return 2;
+        }
+    }
+
+    let ok = samples.len();
+    let summary = probe::summarise(&mut samples);
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    match summary {
+        Some(s) => println!(
+            "HS {proto} {kind}: n={ok} failed={failures} resumed={resumed} early_data={early_used} \
+             status425={too_early} p50_ms={:.3} p90_ms={:.3} p99_ms={:.3} mean_ms={:.3}",
+            ms(s.p50),
+            ms(s.p90),
+            ms(s.p99),
+            ms(s.mean)
+        ),
+        None => println!("HS {proto} {kind}: no successful handshakes ({failures} failed)"),
+    }
+    println!("HANDSHAKES_SERVED {served}");
+    i32::from(failures > 0 || ok == 0 || (kind == "resumed" && resumed == 0))
 }
 
 #[cfg(test)]
