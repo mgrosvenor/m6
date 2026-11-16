@@ -16,7 +16,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use m6_auth::jwt::{hash_token, now_secs, AccessClaims, JwtEngine, RefreshClaims};
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{binary, read_response, wait, Service, RESPONSE_BOUND};
 
 const ISSUER: &str = "test.example.com";
 
@@ -194,19 +194,21 @@ fn decode_access(env: &TestEnv, token: &str) -> AccessClaims {
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
-fn http_request(socket_path: &Path, request: &str) -> String {
+/// Send a request and wait for the response event or the service's exit.
+///
+/// [`RESPONSE_BOUND`] is the safety net above the work, not a read deadline
+/// guessed at it.
+fn http_request(svc: &mut Service, socket_path: &Path, request: &str) -> String {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     std::io::Write::write_all(&mut stream, request.as_bytes()).unwrap();
     let method = request.split(' ').next().unwrap_or("");
-    let resp = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let resp = read_response(svc, stream, method, RESPONSE_BOUND).unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&resp).into_owned()
 }
 
 fn http_request_with_body(
+    svc: &mut Service,
     socket_path: &Path,
     method: &str,
     path: &str,
@@ -221,7 +223,7 @@ fn http_request_with_body(
         body.len(),
         body
     );
-    http_request(socket_path, &req)
+    http_request(svc, socket_path, &req)
 }
 
 fn parse_status(resp: &str) -> u16 {
@@ -237,9 +239,15 @@ fn json_body(resp: &str) -> serde_json::Value {
 }
 
 /// Log in over JSON and return the parsed body, which carries the tokens.
-fn login_json(socket_path: &Path, username: &str, password: &str) -> serde_json::Value {
+fn login_json(
+    svc: &mut Service,
+    socket_path: &Path,
+    username: &str,
+    password: &str,
+) -> serde_json::Value {
     let body = serde_json::json!({ "username": username, "password": password }).to_string();
     let resp = http_request_with_body(
+        svc,
         socket_path,
         "POST",
         "/auth/login",
@@ -250,9 +258,10 @@ fn login_json(socket_path: &Path, username: &str, password: &str) -> serde_json:
     json_body(&resp)
 }
 
-fn post_refresh_json(socket_path: &Path, token: &str) -> String {
+fn post_refresh_json(svc: &mut Service, socket_path: &Path, token: &str) -> String {
     let body = serde_json::json!({ "refresh_token": token }).to_string();
     http_request_with_body(
+        svc,
         socket_path,
         "POST",
         "/auth/refresh",
@@ -271,13 +280,13 @@ fn post_refresh_json(socket_path: &Path, token: &str) -> String {
 fn valid_json_refresh_returns_a_new_decodable_access_token() {
     let env = setup_test_env("valid-json-refresh");
     seed_user(&env, "alice", "alicepw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
-    let login = login_json(&env.socket_path, "alice", "alicepw");
+    let login = login_json(&mut guard, &env.socket_path, "alice", "alicepw");
     let refresh_token = login["refresh_token"].as_str().expect("refresh_token");
     let login_sub = decode_access(&env, login["access_token"].as_str().expect("access_token")).sub;
 
-    let resp = post_refresh_json(&env.socket_path, refresh_token);
+    let resp = post_refresh_json(&mut guard, &env.socket_path, refresh_token);
     assert_eq!(
         parse_status(&resp),
         200,
@@ -314,9 +323,9 @@ fn expired_refresh_token_json_answers_401() {
     let user = seed_user(&env, "bob", "bobpw");
     let expired = expired_refresh_token(&env, &user.id, &user.username);
     store_refresh_token(&env, &user.id, &expired, now_secs() - 1);
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
-    let resp = post_refresh_json(&env.socket_path, &expired);
+    let resp = post_refresh_json(&mut guard, &env.socket_path, &expired);
     assert_eq!(
         parse_status(&resp),
         401,
@@ -329,9 +338,9 @@ fn expired_refresh_token_json_answers_401() {
 #[test]
 fn invalid_refresh_token_json_answers_401() {
     let env = setup_test_env("invalid-json-refresh");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
-    let resp = post_refresh_json(&env.socket_path, "not_a_valid_jwt");
+    let resp = post_refresh_json(&mut guard, &env.socket_path, "not_a_valid_jwt");
     assert_eq!(
         parse_status(&resp),
         401,
@@ -345,9 +354,9 @@ fn invalid_refresh_token_json_answers_401() {
 fn revoked_refresh_token_after_logout_answers_401() {
     let env = setup_test_env("revoked-json-refresh");
     seed_user(&env, "carol", "carolpw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
-    let login = login_json(&env.socket_path, "carol", "carolpw");
+    let login = login_json(&mut guard, &env.socket_path, "carol", "carolpw");
     let refresh_token = login["refresh_token"].as_str().expect("refresh_token");
 
     // Browser logout revokes the refresh token by its hash.
@@ -355,14 +364,14 @@ fn revoked_refresh_token_after_logout_answers_401() {
         "POST /auth/logout HTTP/1.1\r\nHost: localhost\r\nCookie: refresh={}\r\nContent-Length: 0\r\n\r\n",
         refresh_token
     );
-    let logout_resp = http_request(&env.socket_path, &logout);
+    let logout_resp = http_request(&mut guard, &env.socket_path, &logout);
     assert_eq!(
         parse_status(&logout_resp),
         302,
         "logout did not answer 302\n{logout_resp}"
     );
 
-    let resp = post_refresh_json(&env.socket_path, refresh_token);
+    let resp = post_refresh_json(&mut guard, &env.socket_path, refresh_token);
     assert_eq!(
         parse_status(&resp),
         401,
