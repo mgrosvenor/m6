@@ -56,14 +56,15 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // above its budget is the defect the guard exists for.
 //
 // The integers the code makes are 2 for h1_tls_hit and 3 for h2_tls_hit (all
-// of them rustls; see below), and 47 for h1_tls_miss_insert. The h1 hit is
-// 2,000 (the response writer and the request read buffer are the connection's
-// own), read 2.000 to 2.003 over the runs, so its budget is 2,003, the top of
-// that spread with nothing added. The h2 hit is 3,000: fourteen runs after the
-// fix below read 3,000 twelve times, 3,001 once and 2,999 once. Its budget is
-// 3,001, and the one call above 3,000 is one more TLS record received in a run
-// than that run's baseline, which costs one `Payload::into_vec` and can grow
-// rustls's received-plaintext chunk queue. Both are rustls's buffers.
+// of them rustls; see below), and 47 for h1_tls_miss_insert. The h1 hit read
+// 2.000 in fourteen runs after its close-path allocation was removed, with
+// N = 1,000 counting 2,169 calls and 2N = 2,000 counting 4,169, so its budget
+// is 2,000, the whole request path with nothing added. The h2 hit is 3,000:
+// fourteen runs after its fix read 3,000 twelve times, 3,001 once and 2,999
+// once. Its budget is 3,001, and the one call above 3,000 is one more TLS
+// record received in a run than that run's baseline, which costs one
+// `Payload::into_vec` and can grow rustls's received-plaintext chunk queue.
+// Both are rustls's buffers.
 //
 // The h2 row read 3.002 on Linux before that fix, and the extra was ours: the
 // HTTP/2 TLS and plain close paths built `io::Error::new(UnexpectedEof,
@@ -72,6 +73,15 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // shutdown landed rather than with anything a request did. Both paths now build
 // the error from the kind, so the close allocates nothing and 3,000 is the
 // whole request path.
+//
+// The h1 row read 2.000 to 2.003 before its fix, and the extra was ours too: the
+// TLS close path in `advance_tls` built `io::Error::new(UnexpectedEof,
+// "closed")` when a peer closed, and that constructor boxes its message, so
+// every teardown inside the counted window added calls and the row moved with
+// when the shutdown landed. It builds the error from the kind now, and the
+// fixed part of each run fell by nine calls (N = 1,000 went 2,178 -> 2,169,
+// 2N = 2,000 went 4,178 -> 4,169). The two calls per request are rustls's
+// record buffers.
 //
 // The 3 left on h2's cached hit are rustls's, and nothing of ours:
 // two `rustls::msgs::base::Payload::into_vec` calls per request
@@ -96,7 +106,7 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 //
 // A path that allocates one more time per request adds 1,000 and fails every
 // budgeted row, which is the break.
-const H1_TLS_HIT_CALLS: u64 = 2_003;
+const H1_TLS_HIT_CALLS: u64 = 2_000;
 const H2_TLS_HIT_CALLS: u64 = 3_001;
 const H1_TLS_MISS_INSERT_CALLS: u64 = 47_004;
 

@@ -2120,7 +2120,12 @@ fn advance_tls(
     let mut progress = false;
     loop {
         match tls.read_tls(&mut &*stream) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
+            // A peer that has gone is the ordinary end of a connection, and it
+            // is not worth an allocation. An error built from a kind is a plain
+            // value, where `io::Error::new` with a message boxes one, so a
+            // teardown inside a counting run would add a call whose number
+            // moves with when the shutdown lands.
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(_) => {
                 progress = true;
                 tls.process_new_packets()
