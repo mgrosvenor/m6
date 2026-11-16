@@ -390,7 +390,9 @@ It refuses plain SMTP to any host but `127.0.0.1`, `::1` or `localhost`, resolve
 A host that does not resolve is an error, so the service stops at start, and a relay whose address changes needs a restart.
 `Smtp::new(read_cap, write_cap)` makes one slot per outgoing table entry, with its buffers.
 `Smtp::start` keeps the bytes from `formatted()` and begins a non-blocking connect.
+`fd()` is `None` while the slot has no connection.
 The service registers `fd()` with `interest()`, keeps the deadline from `deadline()` in its outgoing `Timeouts`, and calls `drive()` when the token fires.
+An outgoing event for a slot that is no longer sending is ignored: the client can leave and free the slot earlier in the same poll batch.
 `Ok(None)` reregisters and returns to the loop, `Ok(Some(()))` means the relay accepted the message, and `Err` names the step, the relay's code and its first line.
 The service answers 504 when its deadline passes first, and `close()` drops the connection and frees the slot.
 The connection's state is one `enum` of steps inside the slot, so the service's loop has one arm per outgoing token.

@@ -331,9 +331,10 @@ impl Smtp {
         Ok(())
     }
 
-    /// The descriptor to register with the poll.
-    pub fn fd(&self) -> RawFd {
-        self.stream.as_ref().expect("no connection").as_raw_fd()
+    /// The descriptor to register with the poll, or `None` while there is no
+    /// connection: before `start`, and after `close` or a finished delivery.
+    pub fn fd(&self) -> Option<RawFd> {
+        self.stream.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     /// The interest to register for the current step.
@@ -945,7 +946,11 @@ mod tests {
         let mut events = Events::with_capacity(8);
         let token = Token(0);
         poll.registry()
-            .register_fd(smtp.fd(), token, smtp.interest())
+            .register_fd(
+                smtp.fd().expect("a started delivery has a socket"),
+                token,
+                smtp.interest(),
+            )
             .expect("register");
         let mut interest = smtp.interest();
         let deadline = crate::platform::now() + Duration::from_secs(30);
@@ -957,7 +962,11 @@ mod tests {
             if smtp.interest() != interest {
                 interest = smtp.interest();
                 poll.registry()
-                    .reregister_fd(smtp.fd(), token, interest)
+                    .reregister_fd(
+                        smtp.fd().expect("a started delivery has a socket"),
+                        token,
+                        interest,
+                    )
                     .expect("reregister");
             }
             poll.poll(&mut events, Some(Duration::from_millis(100)))

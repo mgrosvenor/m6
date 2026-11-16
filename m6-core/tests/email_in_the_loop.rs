@@ -1,7 +1,7 @@
 //! A service sends mail from its own loop, in process, while it keeps serving.
 //!
 //! `harness = false`: this binary's `main` speaks libtest's listing protocol
-//! through `libtest-mimic`, so `nextest` lists and runs the four checks. The
+//! through `libtest-mimic`, so `nextest` lists and runs the five checks. The
 //! service under test is the reference loop from `examples/echo.rs` with
 //! `h1::ServerConn` clients and one `email::Smtp` slot per client, run in
 //! this process on its own thread. Each test owns a loopback SMTP stub in a
@@ -59,6 +59,10 @@ fn main() {
         Trial::test(
             "a_client_that_leaves_drops_the_delivery",
             a_client_that_leaves_drops_the_delivery,
+        ),
+        Trial::test(
+            "an_outgoing_event_after_the_client_left_is_ignored",
+            an_outgoing_event_after_the_client_left_is_ignored,
         ),
     ];
     libtest_mimic::run(&args, tests).exit();
@@ -172,7 +176,9 @@ fn service(path: &Path, relay_addr: SocketAddr, stop: Arc<AtomicBool>) -> io::Re
         while let Some(Token(k)) = deadlines.expired(now) {
             let conn = conns.get_mut(k);
             if conn.state == State::Sending {
-                poll.registry().deregister_fd(conn.smtp.fd())?;
+                if let Some(fd) = conn.smtp.fd() {
+                    poll.registry().deregister_fd(fd)?;
+                }
                 conn.smtp.close();
                 conn.state = State::Reading;
                 conn.conn.respond(504, &[], b"timeout");
@@ -200,8 +206,10 @@ fn client_event(
         Action::StartOutgoing => {
             let conn = conns.get_mut(k);
             let interest = conn.smtp.interest();
-            poll.registry()
-                .register_fd(conn.smtp.fd(), Token(2 * k + 1), interest)?;
+            if let Some(fd) = conn.smtp.fd() {
+                poll.registry()
+                    .register_fd(fd, Token(2 * k + 1), interest)?;
+            }
             conn.smtp_interest = interest;
             deadlines.touch(Token(k), now);
         }
@@ -256,12 +264,20 @@ fn outgoing_event(
     k: usize,
 ) -> io::Result<()> {
     let conn = conns.get_mut(k);
+    // The standard stale-event rule: the slot's outgoing event can arrive in
+    // the same poll batch after the slot was freed or its delivery ended.
+    // Such an event is ignored.
+    if conn.state != State::Sending {
+        return Ok(());
+    }
     match conn.smtp.drive() {
         Ok(None) => {
             let interest = conn.smtp.interest();
             if interest != conn.smtp_interest {
-                poll.registry()
-                    .reregister_fd(conn.smtp.fd(), Token(2 * k + 1), interest)?;
+                if let Some(fd) = conn.smtp.fd() {
+                    poll.registry()
+                        .reregister_fd(fd, Token(2 * k + 1), interest)?;
+                }
                 conn.smtp_interest = interest;
             }
         }
@@ -288,7 +304,9 @@ fn finish(
     k: usize,
 ) -> io::Result<()> {
     let conn = conns.get_mut(k);
-    poll.registry().deregister_fd(conn.smtp.fd())?;
+    if let Some(fd) = conn.smtp.fd() {
+        poll.registry().deregister_fd(fd)?;
+    }
     conn.smtp.close();
     deadlines.clear(Token(k));
     let _ = conn.conn.flush()?;
@@ -317,7 +335,9 @@ fn free(
     deadlines.clear(Token(k));
     let conn = conns.get_mut(k);
     if conn.state == State::Sending {
-        poll.registry().deregister_fd(conn.smtp.fd())?;
+        if let Some(fd) = conn.smtp.fd() {
+            poll.registry().deregister_fd(fd)?;
+        }
         conn.smtp.close();
     }
     conn.state = State::Reading;
@@ -589,6 +609,62 @@ fn a_client_that_leaves_drops_the_delivery() -> Result<(), Failed> {
             .expect("the relay must see EOF"),
         "close() must close the slot's socket"
     );
+    peer.join().expect("stub");
+    Ok(())
+}
+
+/// The stale event, delivered on purpose: the client leaves and the slot is
+/// freed, then the slot's outgoing event is handled as if it were in the same
+/// poll batch. No poll runs, so the order is fixed.
+fn an_outgoing_event_after_the_client_left_is_ignored() -> Result<(), Failed> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (relay_addr, accepted, _eof, peer) = silent_stub();
+    let relay = Relay::new(&RelayConfig {
+        host: "127.0.0.1".into(),
+        port: relay_addr.port(),
+        starttls: None,
+        credentials: None,
+        timeout: SMTP_TIMEOUT,
+    })?;
+    let path = dir.path().join("stale.sock");
+    let mut poll = Poll::new()?;
+    let listener = listen_unix(&path, 0o600)?;
+    let mut conns = Slots::new(INITIAL, CEILING, Conn::empty);
+    let mut deadlines = Timeouts::new(INITIAL, SMTP_TIMEOUT);
+
+    let mut client = UnixStream::connect(&path)?;
+    client.write_all(b"POST /send HTTP/1.1\r\nHost: x\r\n\r\n")?;
+    let taken = conns.take().expect("a free slot");
+    let k = taken.key;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
+            Err(e) => return Err(e.into()),
+        }
+    };
+    poll.registry()
+        .register(&mut stream, Token(2 * k), Interest::READABLE)?;
+    let conn = conns.get_mut(k);
+    conn.conn.attach(stream);
+    conn.state = State::Reading;
+    conn.interest = Interest::READABLE;
+
+    let now = platform::now();
+    client_event(&mut poll, &mut conns, &mut deadlines, &relay, k, now)?;
+    assert!(
+        conns.get_mut(k).state == State::Sending,
+        "the request must start the delivery"
+    );
+    accepted
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the service must connect to the relay");
+
+    // The client leaves. Its event frees the slot and the delivery.
+    drop(client);
+    client_event(&mut poll, &mut conns, &mut deadlines, &relay, k, now)?;
+    // The outgoing event for the same slot comes after, in the same batch.
+    outgoing_event(&mut poll, &mut conns, &mut deadlines, k)?;
     peer.join().expect("stub");
     Ok(())
 }

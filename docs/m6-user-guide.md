@@ -472,6 +472,7 @@ fn message(global: &Global, name: &str, email: &str, text: &str) -> Result<Messa
 The POST arm builds one message and calls `smtp.start(&state.relay, &msg)` on its connection's slot.
 The connection's state becomes `Sending`, and the loop registers `smtp.fd()` with `smtp.interest()` under the outgoing token and puts `smtp.deadline()` in the outgoing `Timeouts`.
 The client's own token stays `READABLE` while it waits.
+An outgoing event for a slot whose state is no longer `Sending` is ignored, because the client can leave in the same poll batch.
 When the outgoing token fires, `smtp.drive()` returns `Ok(None)` and the loop reregisters, or `Ok(Some(()))` and the handler renders `templates/contact.html` with `sent: true`, or `Err` and the handler answers with the cause.
 The outgoing deadline passing first answers 504.
 A client that closes while `Sending` frees its slot, which closes the relay connection.
