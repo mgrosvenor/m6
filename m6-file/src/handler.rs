@@ -359,9 +359,10 @@ fn tail_limit() -> &'static m6_core::limits::Limit {
     TAIL_LIMIT.get_or_init(|| m6_core::limits::Limit::builtin(&m6_core::limits::TAIL_READ))
 }
 
-/// The answer for a tail response that would read past the `tail_read`
-/// maximum: a 413 whose body and log line name the limit, the size needed and
-/// the key to raise. Nothing is cut and no partial chunk is sent.
+/// The answer for a last-N-lines request whose lines do not fit in one page of
+/// `tail_read` max bytes: a 413 whose body and log line name the limit, the
+/// size needed and the key to raise. Nothing is cut and no partial chunk is
+/// sent.
 fn tail_too_large(needed: u64) -> Response {
     let needed = usize::try_from(needed).unwrap_or(usize::MAX);
     let message = tail_limit()
@@ -380,10 +381,11 @@ fn tail_too_large(needed: u64) -> Response {
 ///   `offset=N` – start byte (default 0).
 ///   `n=N`      – when `offset=0`, return the **last N lines** of the file
 ///                (like `tail -n N`).  When `offset>0` or `n` is absent,
-///                read everything from `offset` to the end of the file.
+///                read from `offset`, at most one page of `tail_read` max bytes.
 ///
-/// A response that would read more than the `tail_read` maximum is refused
-/// with a 413 that names the key, never cut short.
+/// `X-Log-End` is where the page ended: a client behind by more than one page
+/// asks again from there. Only a last-N-lines request whose N lines do not
+/// fit in one page is refused, with a 413 that names the key.
 ///
 /// Always responds with `Cache-Control: no-store` and an `X-Log-End` header
 /// containing the end byte of the returned slice so the caller can request
@@ -479,13 +481,21 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
         let read_from = offset.min(file_size);
         file.seek(SeekFrom::Start(read_from))
             .map_err(|e| m6_core::Error::Other(e.into()))?;
-        // The bytes owed are known from the file's size, so the maximum is
-        // checked before a byte is read.
-        let owed = file_size - read_from;
-        if owed > tail_limit().max() as u64 {
-            return Ok(tail_too_large(owed));
+        // One response is one page of at most `tail_read` max bytes. A client
+        // further behind than that reads the next page from `X-Log-End`, so
+        // nothing is lost: paging splits a stream the client asks for, it does
+        // not cut a buffer. The page buffer starts at the limit's `start` and
+        // grows by doubling to the page.
+        let limit = tail_limit();
+        let owed = (file_size - read_from).min(limit.max() as u64);
+        let mut body = Vec::with_capacity(limit.start().min(owed as usize));
+        if owed as usize > body.capacity() {
+            let size = limit
+                .grown(body.capacity(), owed as usize)
+                .unwrap_or(owed as usize);
+            body.reserve_exact(size);
+            limit.log_growth(size);
         }
-        let mut body = Vec::with_capacity(owed as usize);
         Read::by_ref(&mut file)
             .take(owed)
             .read_to_end(&mut body)
@@ -594,24 +604,38 @@ mod tests {
         )
     }
 
-    /// A tail read past the `tail_read` maximum is refused with a 413 that
-    /// names the key, with no chunk cut off the front of the answer.
+    /// A client further behind than one page reads it all in pages of at most
+    /// `tail_read` max bytes, each ending at its `X-Log-End`, and nothing is
+    /// lost or repeated.
     #[test]
-    fn a_tail_read_past_the_maximum_is_refused_with_a_413() {
+    fn a_client_two_mib_behind_reads_it_all_in_pages() {
         let dir = tempfile::tempdir().unwrap();
-        // 600 KiB is over the 512 KiB default maximum.
-        std::fs::write(dir.path().join("big.log"), vec![b'x'; 600 * 1024]).unwrap();
-        let (status, _, body) = wire(&tail_req(dir.path(), "big.log", "offset=0"));
-        let text = String::from_utf8(body).unwrap();
-        assert_eq!(status, 413, "{text}");
-        assert!(
-            text.contains("over [limits.tail_read] max = 512 KiB"),
-            "{text}"
-        );
-
-        // A client that is within the maximum of the end is answered whole.
-        let (status, _, body) = wire(&tail_req(dir.path(), "big.log", "offset=153600"));
-        assert_eq!((status, body.len()), (200, 450 * 1024));
+        let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("big.log"), &data).unwrap();
+        let page = tail_limit().max();
+        let mut got = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0;
+        while offset < data.len() {
+            let (status, headers, body) = wire(&tail_req(
+                dir.path(),
+                "big.log",
+                &format!("offset={offset}"),
+            ));
+            assert_eq!(status, 200);
+            assert!(body.len() <= page, "a page is at most {page} bytes");
+            let end: usize = header(&headers, "x-log-end").unwrap().parse().unwrap();
+            assert_eq!(
+                end,
+                offset + body.len(),
+                "X-Log-End is where the page ended"
+            );
+            got.extend_from_slice(&body);
+            offset = end;
+            pages += 1;
+        }
+        assert_eq!(got, data, "every byte arrived once, in order");
+        assert_eq!(pages, data.len().div_ceil(page));
     }
 
     /// A last-N-lines window starts at the limit's `start` and doubles until it

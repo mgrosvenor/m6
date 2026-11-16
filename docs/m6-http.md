@@ -540,13 +540,13 @@ m6-http answers it with a cap on counted streams, a decay window that holds a ca
 |---|---|---|
 | `MAX_CONCURRENT` | 100 | Streams one connection may count at once |
 | `RESET_DECAY` | 1 second | How long a stream ended by RST_STREAM keeps its slot |
-| `RESET_MEMORY` | 128 | Reset stream ids remembered for the slot count and the closed-stream rule |
+| `RESET_MEMORY` | 200, twice `MAX_CONCURRENT` | Reset stream ids remembered for the slot count and the closed-stream rule |
 | `MAX_REFUSED_STREAK` | 50 | Consecutive REFUSED_STREAM answers before the connection ends |
 
 *Table 3: the four constants that bound a Rapid Reset flood, all in `m6-http/src/http2.rs`. Take from it that a peer may have at most `MAX_CONCURRENT` streams counted at once whether it finishes them or cancels them, and that a peer that ignores `MAX_REFUSED_STREAK` refusals loses the connection.*
 
 The cap counts started streams, because `active_streams` adds the live `streams` map to the client-initiated ids in `recently_reset` that are younger than `RESET_DECAY`.
-`note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY` (128, a constant on purpose: it must stay above the concurrency cap, so it has no config key).
+`note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY` (twice `MAX_CONCURRENT`, so 200 at the cap of 100: derived from the cap so it stays above it whatever the cap is, and so it has no config key of its own).
 `active_streams` counts only the client-initiated odd ids in that record.
 `resetting_streams_does_not_free_concurrency_slots` opens `MAX_CONCURRENT` streams, cancels each one, and checks that the count stays at `MAX_CONCURRENT` and that stream `1 + MAX_CONCURRENT * 2` is refused.
 

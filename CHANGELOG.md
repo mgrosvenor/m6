@@ -46,7 +46,7 @@ The released versions, newest first:
 
 **Past a limit's maximum, work is now refused with an error that names the key, where four places used to cut, drop or carry on.**
 A log line with a string field over `[limits.log_field] max` (8 KiB) is refused whole, where the field was cut at 1024 bytes and ended in `...`.
-A tail request that would read past `[limits.tail_read] max` (512 KiB) is answered 413, where `m6-file` returned the first 512 KiB and an `X-Log-End` to page on, so a client that is more than 512 KiB behind raises the key or polls sooner.
+A last-N-lines tail request whose N lines do not fit in one `[limits.tail_read] max` page (512 KiB) is answered 413, where `m6-file` returned fewer lines than asked. A client behind a log by more than one page still reads it in pages from `X-Log-End`, as before.
 A monitor poll that finds the history hold past `[limits.history_queue] max` (1024 polls) is refused and counted, where the oldest poll was dropped.
 A background refresh past `[limits.refresh_queue] max` (4096) is refused with an error line, where it was dropped without one, and a new client address past `[limits.rate_limit_addresses] max` (50,000) is answered 429, where the table grew without a bound.
 m6-http's largest HTTP/1.1 request is now 32 MiB (`[limits.edge_request] max`), the next power of two above the 20 MiB it was, and its largest HTTP/2 body is 32 MiB (`[limits.h2_stream_body] max`), above the 20 MiB it was.
@@ -303,8 +303,8 @@ Twenty-two limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from
 - m6-http: `edge_request`, `edge_response` (which had no bound), `h2_recv` (no bound), `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes` and `connections`.
 - m6-log: `log_buffer` grows from 16 KiB to 1 MiB where it was fixed and dropped lines, and `log_field` replaces the 1024-byte cut.
 - m6-monitor: `history_queue`, and its node requests follow `upstream_read` and `upstream_request`.
-- m6-file: `tail_read`.
-Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory of 128 streams, which must stay above the concurrency cap to hold against Rapid Reset, and the idle URL connection pool, which closes a spare connection and loses no work.
+- m6-file: `tail_read`, the page size of a tail response and the window a last-N-lines request scans.
+Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory, which is now twice the concurrency cap (200 where it was 128) so it stays above the cap whatever the cap is, and the idle URL connection pool, which closes a spare connection and loses no work.
 Verified by a test per limit that fills it past its maximum and reads the refusal: `m6-core/tests/server_conn.rs`, `m6-core/src/limits.rs`, `m6-core/src/client.rs`, `m6-core/src/email.rs`, `m6-core/src/site.rs`, `m6-log/tests/limits_refuse.rs`, `m6-log/tests/escaping.rs`, `m6-http/src/http11.rs`, `m6-http/src/http2.rs`, `m6-http/src/rate_limit.rs`, `m6-monitor/src/history.rs` and `m6-file/src/handler.rs`.
 The hot cache hit still allocates nothing (`m6-http --features count-allocations --test allocations`), and the page-path budgets in `site_allocs` and `request_allocs` are unchanged.
 m6-http conformance (h1spec, h2spec, h3spec) was not run on macOS and must be run on Linux.
