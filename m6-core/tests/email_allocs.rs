@@ -244,7 +244,11 @@ fn deliver(
         start = 0;
     }
     poll.registry()
-        .register_fd(smtp.fd(), SMTP, smtp.interest())
+        .register_fd(
+            smtp.fd().expect("a started delivery has a socket"),
+            SMTP,
+            smtp.interest(),
+        )
         .expect("register slot");
     let mut interest = smtp.interest();
     let mut drive = 0usize;
@@ -273,6 +277,10 @@ fn deliver(
                 }
                 PEER => peer.turn(poll),
                 SMTP => {
+                    // A slot that is no longer sending ignores its token.
+                    if smtp.fd().is_none() {
+                        continue;
+                    }
                     let before = alloc_count::now();
                     let done = smtp.drive().expect("drive");
                     if count {
@@ -280,7 +288,7 @@ fn deliver(
                     }
                     if done.is_some() {
                         poll.registry()
-                            .deregister_fd(smtp.fd())
+                            .deregister_fd(smtp.fd().expect("a started delivery has a socket"))
                             .expect("deregister slot");
                         smtp.close();
                         return (start, drive);
@@ -288,7 +296,11 @@ fn deliver(
                     if smtp.interest() != interest {
                         interest = smtp.interest();
                         poll.registry()
-                            .reregister_fd(smtp.fd(), SMTP, interest)
+                            .reregister_fd(
+                                smtp.fd().expect("a started delivery has a socket"),
+                                SMTP,
+                                interest,
+                            )
                             .expect("reregister slot");
                     }
                 }
