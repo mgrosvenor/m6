@@ -248,9 +248,11 @@ The four rows measured on macOS on 2026-11-15:
 - `h1_tls_miss_insert`, a new query string each time so each request reaches the backend and is stored: 47.001 calls per request. The cache entry keeps its header names and values in one byte arena and this branch stores them that way, so a miss builds the arena once instead of cloning twelve strings. A miss is a slow path, so its budget is a ceiling rather than a target.
 - `h1_tls_new_connection_per_connection`, a cached page with a full TLS handshake per request, measured per connection: 117.000 calls per connection.
 
-The difference did not repeat exactly under load: over the runs h1 read 1.997 to 2.003, h2 2.996 to 3.004 and the miss row 46.998 to 47.004.
+The difference did not repeat exactly under load: over the runs h1 read 1.997 to 2.003, the miss row 46.998 to 47.004, and h2 read 2.996 to 3.004 before the close-path allocation below was removed and 2.999 to 3.001 in fourteen runs after it.
 The request budgets are the top of that observed spread, with nothing added on top: 2,003 for h1's cached hit and 47,004 for the miss that inserts, in calls per 1,000 requests.
-The h2 budget is 3,001, the integer Linux's 2N run measured: the fourth call is one growth of rustls's received-plaintext chunk queue (`CommonState::take_received_plaintext`), seen once in the 2N dhat profile, and not ours.
+The h2 budget is 3,001, one call above the 3,000 the path makes: the call it allows is one more TLS record received in a run, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue, and it is rustls's.
+The h2 row read as high as 3.002 on Linux because its TLS and plain close paths built `io::Error::new(UnexpectedEof, "closed")`, which boxes a message: a connection torn down inside the counted window cost 0 to 3 calls, so the figure moved with when the shutdown landed rather than with anything a request did.
+Both paths build the error from the kind now, so closing a connection allocates nothing of ours and 3,000 is the whole request path.
 The miss row's one call above 47,000 is the single cache-table growth that its 1,000 inserts trigger.
 The new-connection row is a measure, not a budget: a full handshake per connection read 122.859 to 123.849 per connection across the runs, so a per-connection ceiling would flake.
 The budgets only go down. Each ALLOC job lowers the row it attacks, and a row above its budget fails the test.

@@ -796,9 +796,13 @@ impl Http2Conn {
             H2Io::Tls { tls, stream } => {
                 loop {
                     match tls.read_tls(&mut &**stream) {
-                        Ok(0) => {
-                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
-                        }
+                        // A peer that has gone is the ordinary end of a
+                        // connection, and it is not worth an allocation. An
+                        // error built from a kind is a plain value, where
+                        // `io::Error::new` with a message boxes one, so a
+                        // teardown inside a counting run would add a call whose
+                        // number moves with when the shutdown lands.
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
                         Ok(_) => {
                             moved = true;
                             tls.process_new_packets().map_err(|e| {
@@ -847,9 +851,9 @@ impl Http2Conn {
                 let mut tmp = [0u8; 8192];
                 loop {
                     match stream.read(&mut tmp) {
-                        Ok(0) => {
-                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
-                        }
+                        // The plain path's end of connection, for the same
+                        // reason: no allocation on the way out.
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
                         Ok(n) => {
                             self.recv_buf.extend_from_slice(&tmp[..n]);
                             moved = true;
