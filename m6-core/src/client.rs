@@ -19,10 +19,11 @@ use std::time::Instant;
 
 use rustls::ClientConnection;
 
-/// Ceiling on a backend response body. A hostile or misbehaving backend must not
-/// grow the process without limit, so a declared or decoded body above this is
-/// refused before it is read.
-pub const MAX_BODY: usize = 128 * 1024 * 1024;
+/// The default ceiling on a backend response body, the `upstream_read`
+/// maximum. A hostile or misbehaving backend must not grow the process without
+/// limit, so a declared or decoded body above the maximum is refused before it
+/// is read.
+pub const MAX_BODY: usize = crate::limits::UPSTREAM_READ.max;
 
 /// The most informational (1xx) responses one fetch skips before the backend
 /// must send a final one. A bound, so a backend cannot hold the caller by
@@ -334,6 +335,10 @@ pub struct Upstream {
     phase: Phase,
     /// The request bytes for the current request, written by the caller.
     request: Vec<u8>,
+    /// The `upstream_request` limit `request` is held to, checked at `start`.
+    request_limit: crate::limits::Limit,
+    /// The `upstream_read` limit `read_buf` grows under.
+    read_limit: crate::limits::Limit,
     write_offset: usize,
     /// The read buffer. Its length always equals its capacity, so reads write
     /// straight into the spare region and grow only by doubling, not per request.
@@ -388,15 +393,35 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    /// At start: the buffers this slot reuses for every request.
+    /// At start: the buffers this slot reuses for every request, with the
+    /// built-in maxima of `upstream_read` and `upstream_request`.
     pub fn new(read_cap: usize, write_cap: usize) -> Upstream {
+        use crate::limits::{Limit, UPSTREAM_READ, UPSTREAM_REQUEST};
+        let read = Limit::custom(
+            &UPSTREAM_READ,
+            read_cap.max(1),
+            UPSTREAM_READ.max.max(read_cap),
+        );
+        let request = Limit::custom(
+            &UPSTREAM_REQUEST,
+            write_cap.max(1),
+            UPSTREAM_REQUEST.max.max(write_cap),
+        );
+        Upstream::with_limits(&read, &request)
+    }
+
+    /// At start: the buffers this slot reuses for every request, following the
+    /// `upstream_read` and `upstream_request` limits.
+    pub fn with_limits(read: &crate::limits::Limit, request: &crate::limits::Limit) -> Upstream {
         Upstream {
             stream: None,
             tls: None,
             phase: Phase::Idle,
-            request: Vec::with_capacity(write_cap.max(1)),
+            request: Vec::with_capacity(request.start()),
+            request_limit: request.clone(),
+            read_limit: read.clone(),
             write_offset: 0,
-            read_buf: vec![0; read_cap.max(1)],
+            read_buf: vec![0; read.start()],
             read_len: 0,
             head_offset: 0,
             informational: 0,
@@ -438,6 +463,15 @@ impl Upstream {
         method_is_head: bool,
         deadline: Instant,
     ) -> io::Result<()> {
+        // A request the caller built past the `upstream_request` maximum is
+        // refused here, before any byte is sent.
+        if self.request.len() > self.request_limit.max() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                self.request_limit
+                    .exceeded(self.request.len(), "backend request"),
+            ));
+        }
         // Decide reuse before resetting, because `reusable` describes the last
         // reply and is cleared with the rest of the per-request state below.
         let can_reuse = self.stream.is_some()
@@ -733,7 +767,8 @@ impl Upstream {
             if self.read_len == self.read_buf.len() && !self.grow_read_buf() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("backend response exceeded the {MAX_BODY} byte limit"),
+                    self.read_limit
+                        .exceeded(self.read_buf.len() + 1, "backend response"),
                 ));
             }
             let before = self.read_len;
@@ -770,12 +805,15 @@ impl Upstream {
     /// Double the read buffer, up to the body ceiling plus head room. Returns
     /// `false` when the buffer is already at the ceiling.
     fn grow_read_buf(&mut self) -> bool {
-        let cap = MAX_BODY + MAX_HEAD;
-        if self.read_buf.len() >= cap {
+        let ceiling = self.read_limit.max() + MAX_HEAD;
+        let Some(new) =
+            self.read_limit
+                .grown_to(self.read_buf.len(), self.read_buf.len() + 1, ceiling)
+        else {
             return false;
-        }
-        let new = (self.read_buf.len() * 2).min(cap);
+        };
         self.read_buf.resize(new, 0);
+        self.read_limit.log_growth(new);
         true
     }
 
@@ -862,6 +900,7 @@ impl Upstream {
                 self.method_is_head,
                 http10,
                 &mut self.reusable,
+                &self.read_limit,
             )?);
             self.chunk_pos = header_end + 4;
             return Ok(true);
@@ -924,10 +963,13 @@ impl Upstream {
                 self.in_trailers = true;
                 continue;
             }
-            if size > MAX_BODY - self.body_len {
+            if size > self.read_limit.max().saturating_sub(self.body_len) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("chunked backend response exceeds the {MAX_BODY} byte limit"),
+                    self.read_limit.exceeded(
+                        self.body_len.saturating_add(size),
+                        "chunked backend response",
+                    ),
                 ));
             }
             let data_end = data_start + size;
@@ -1212,6 +1254,7 @@ pub fn parse_framing(
     method_is_head: bool,
     http10: bool,
     reusable: &mut bool,
+    limit: &crate::limits::Limit,
 ) -> io::Result<Framing> {
     let mut content_length: Option<usize> = None;
     let mut te_present = false;
@@ -1306,10 +1349,10 @@ pub fn parse_framing(
         Framing::Chunked
     } else if let Some(len) = content_length {
         // The cap is the bound the buffer is sized for, so refuse above it.
-        if len > MAX_BODY {
+        if len > limit.max() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("backend declared Content-Length {len}, above the {MAX_BODY} limit"),
+                limit.exceeded(len, "backend response"),
             ));
         }
         Framing::ContentLength(len)
@@ -1655,6 +1698,31 @@ mod tests {
         panic!("the one-byte response never completed");
     }
 
+    /// A request built past the `upstream_request` maximum is refused at
+    /// `start`, before a socket is opened, and the error names the key.
+    #[test]
+    fn a_request_past_its_limit_is_refused_at_start() {
+        use crate::limits::{Limit, UPSTREAM_READ, UPSTREAM_REQUEST};
+        let read = Limit::builtin(&UPSTREAM_READ);
+        let request = Limit::custom(&UPSTREAM_REQUEST, 1024, 4096);
+        let mut up = Upstream::with_limits(&read, &request);
+        up.request_buf().extend(std::iter::repeat_n(b'x', 4097));
+        let err = up
+            .start(
+                &Addr::Unix(PathBuf::from("/nonexistent")),
+                None,
+                false,
+                crate::platform::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "backend request needs at least 4097 B, over [limits.upstream_request] max = 4 KiB"
+            ),
+            "{err}"
+        );
+    }
+
     /// A declared Content-Length above the cap is refused at the head, before
     /// any body is read.
     #[test]
@@ -1662,7 +1730,8 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4000000000\r\n\r\n";
         let err = parse(raw, false).unwrap_err();
         assert!(
-            err.to_string().contains("above the") && err.to_string().contains("limit"),
+            err.to_string()
+                .contains("over [limits.upstream_read] max = 128 MiB"),
             "got: {err}"
         );
     }

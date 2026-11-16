@@ -7,7 +7,8 @@
 //!
 //! A thousand keep-alive requests allocate nothing, a pipelined pair is served
 //! from one readiness event, a request larger than the slot's buffer is taken
-//! whole and the buffer is cut back, a streamed body is pumped one chunk per
+//! whole and the buffer keeps its grown size, a request or response past its
+//! limit's maximum is refused, a streamed body is pumped one chunk per
 //! writable turn, keep-alive and the request cap behave, and a refusal answers
 //! as the blocking path does today.
 //!
@@ -63,10 +64,10 @@ fn main() {
                 a_pipelined_pair_is_served_from_one_read,
             )
         }),
-        Trial::test("a_large_upload_grows_and_returns_the_buffer", || {
+        Trial::test("a_large_upload_grows_and_keeps_the_buffer", || {
             check(
-                "a_large_upload_grows_and_returns_the_buffer",
-                a_large_upload_grows_and_returns_the_buffer,
+                "a_large_upload_grows_and_keeps_the_buffer",
+                a_large_upload_grows_and_keeps_the_buffer,
             )
         }),
         Trial::test("a_stream_body_is_pumped_per_writable_turn", || {
@@ -99,6 +100,18 @@ fn main() {
                 )
             },
         ),
+        Trial::test("a_request_past_its_limit_is_refused_with_413", || {
+            check(
+                "a_request_past_its_limit_is_refused_with_413",
+                a_request_past_its_limit_is_refused_with_413,
+            )
+        }),
+        Trial::test("a_response_past_its_limit_is_refused_with_500", || {
+            check(
+                "a_response_past_its_limit_is_refused_with_500",
+                a_response_past_its_limit_is_refused_with_500,
+            )
+        }),
         Trial::test("a_response_allocates_nothing", || {
             check("a_response_allocates_nothing", a_response_allocates_nothing)
         }),
@@ -145,9 +158,26 @@ fn harness() -> Harness {
 }
 
 fn harness_with(pair: (StdUnixStream, platform::net::UnixStream)) -> Harness {
+    harness_conn(pair, ServerConn::new(READ_CAP, WRITE_CAP))
+}
+
+/// A harness over `conn`, a slot with limits the test chose.
+fn harness_limited(read_max: usize, write_max: usize) -> Harness {
+    use m6_core::limits::{Limit, REQUEST_BODY, RESPONSE_BUFFER};
+    let (client, server) = StdUnixStream::pair().expect("a socket pair");
+    server.set_nonblocking(true).expect("non-blocking");
+    client.set_read_timeout(Some(DEADLINE)).expect("a deadline");
+    let read = Limit::custom(&REQUEST_BODY, READ_CAP, read_max);
+    let write = Limit::custom(&RESPONSE_BUFFER, WRITE_CAP, write_max);
+    harness_conn(
+        (client, platform::net::UnixStream::from_std(server)),
+        ServerConn::with_limits(&read, &write),
+    )
+}
+
+fn harness_conn(pair: (StdUnixStream, platform::net::UnixStream), mut conn: ServerConn) -> Harness {
     let (client, server) = pair;
     let poll = Poll::new().expect("a poll");
-    let mut conn = ServerConn::new(READ_CAP, WRITE_CAP);
     conn.attach(server);
     poll.registry()
         .register(conn.stream().expect("attached"), SERVER, Interest::READABLE)
@@ -391,7 +421,7 @@ fn a_pipelined_pair_is_served_from_one_read() -> bool {
         && response[RESPONSE_LEN..].starts_with(b"HTTP/1.1 200 OK\r\n")
 }
 
-fn a_large_upload_grows_and_returns_the_buffer() -> bool {
+fn a_large_upload_grows_and_keeps_the_buffer() -> bool {
     const BODY: usize = 1024 * 1024;
     let mut h = harness();
 
@@ -450,14 +480,16 @@ fn a_large_upload_grows_and_returns_the_buffer() -> bool {
     assert_eq!(requests, 2, "both requests must be served");
     uploader.join().expect("the uploading client");
 
-    // The grown input buffer was cut back after the large request, and the
-    // small request that followed allocated nothing, as the plan's row says.
+    // The grown input buffer keeps its size after the large request (it never
+    // shrinks, and doubles from the start), and the small request that
+    // followed allocated nothing.
     let (read_cap, write_cap) = h.conn.buffer_caps();
     println!(
         "  slot buffers after the upload: read {read_cap}, write {write_cap}; \
          small request: {small_allocations:?} allocation(s)"
     );
-    read_cap == READ_CAP && write_cap == WRITE_CAP && small_allocations == Some(0)
+    let doubled = read_cap > READ_CAP && (read_cap / READ_CAP).is_power_of_two();
+    doubled && write_cap == WRITE_CAP && small_allocations == Some(0)
 }
 
 /// A `Response` answered through `respond_response` allocates nothing: the
@@ -928,4 +960,82 @@ fn a_declared_body_does_not_allocate_before_it_arrives() -> bool {
     let (read_cap, _) = h.conn.buffer_caps();
     println!("  declared 16 MiB body, head only: read buffer {read_cap}");
     more && read_cap <= 2 * READ_CAP
+}
+
+/// Read what the server queued, flush it, and return the client's first bytes.
+fn refusal_text(h: &mut Harness) -> String {
+    h.conn.flush().expect("flush");
+    let mut buf = [0u8; 4096];
+    let n = h.client.read(&mut buf).expect("read the refusal");
+    String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
+/// A request past the `request_body` maximum is refused with 413, whether it
+/// declares its length or arrives chunked, and the slot's buffer never passes
+/// the maximum and its head.
+fn a_request_past_its_limit_is_refused_with_413() -> bool {
+    let max = 64 * 1024;
+    // A declared length over the maximum.
+    {
+        let mut h = harness_limited(max, 1024 * 1024);
+        h.client
+            .write_all(b"POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 70000\r\n\r\n")
+            .expect("write");
+        h.wait_readable();
+        let mut heads = h1::head_slots();
+        let more = matches!(h.conn.read(&mut heads).expect("read"), Read::More);
+        let text = refusal_text(&mut h);
+        if !more || !text.starts_with("HTTP/1.1 413 ") {
+            println!("  declared: {more} {text:?}");
+            return false;
+        }
+    }
+    // A chunked body whose decoded size passes it.
+    {
+        let mut h = harness_limited(max, 1024 * 1024);
+        let mut request =
+            b"POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        request.extend_from_slice(format!("{:x}\r\n", 70000).as_bytes());
+        request.extend_from_slice(&vec![b'a'; 70000]);
+        request.extend_from_slice(b"\r\n0\r\n\r\n");
+        // Larger than the socket's buffer, so the writer runs on its own
+        // thread while the server reads.
+        let mut writer = h.client.try_clone().expect("a client clone");
+        let writing = std::thread::spawn(move || {
+            let _ = writer.write_all(&request);
+        });
+        let mut text = String::new();
+        for _ in 0..64 {
+            h.wait_readable();
+            let mut heads = h1::head_slots();
+            let _ = h.conn.read(&mut heads).expect("read");
+            if h.conn.flush().expect("flush") == Flush::Close {
+                let mut buf = [0u8; 4096];
+                let n = h.client.read(&mut buf).expect("read");
+                text = String::from_utf8_lossy(&buf[..n]).to_string();
+                break;
+            }
+        }
+        drop(h.conn.detach());
+        let _ = writing.join();
+        if !text.starts_with("HTTP/1.1 413 ") {
+            println!("  chunked: {text:?}");
+            return false;
+        }
+    }
+    true
+}
+
+/// A response held in memory past the `response_buffer` maximum is refused
+/// with a 500 in its place, and the slot's output buffer does not grow.
+fn a_response_past_its_limit_is_refused_with_500() -> bool {
+    let mut h = harness_limited(1024 * 1024, WRITE_CAP);
+    h.conn.respond(200, &[], &vec![b'x'; WRITE_CAP]);
+    let text = refusal_text(&mut h);
+    let (_, write_cap) = h.conn.buffer_caps();
+    if !text.starts_with("HTTP/1.1 500 ") || write_cap != WRITE_CAP {
+        println!("  {text:?} write buffer {write_cap}");
+        return false;
+    }
+    true
 }

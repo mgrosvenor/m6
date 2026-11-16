@@ -148,12 +148,12 @@ pub fn to_string<'a, T: Serialize + 'a>(
 /// The `Content-Type` of a page.
 pub const CONTENT_TYPE: &str = "application/x-ndjson";
 /// Default page size in bytes: 4 MiB.
-pub const DEFAULT_PAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_PAGE_BYTES: usize = crate::limits::NDJSON_PAGE.start;
 /// Default page size in rows.
 pub const DEFAULT_PAGE_ROWS: usize = 10_000;
 /// The largest page a service can ask for: 64 MiB, half of the 128 MiB that
 /// m6-http will buffer from a backend.
-pub const MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PAGE_BYTES: usize = crate::limits::NDJSON_PAGE.max;
 /// The query key that carries a [`Cursor`].
 pub const CURSOR_PARAM: &str = "cursor";
 /// The longest cursor accepted, in bytes.
@@ -164,6 +164,8 @@ pub const MAX_CURSOR_LEN: usize = 128;
 pub struct PageLimits {
     max_bytes: usize,
     max_rows: usize,
+    /// The largest a first row may make a page: the `ndjson_page` maximum.
+    row_max: usize,
 }
 
 impl Default for PageLimits {
@@ -171,6 +173,7 @@ impl Default for PageLimits {
         Self {
             max_bytes: DEFAULT_PAGE_BYTES,
             max_rows: DEFAULT_PAGE_ROWS,
+            row_max: MAX_PAGE_BYTES,
         }
     }
 }
@@ -182,6 +185,17 @@ impl PageLimits {
         Self {
             max_bytes: max_bytes.clamp(1, MAX_PAGE_BYTES),
             max_rows: max_rows.max(1),
+            row_max: MAX_PAGE_BYTES,
+        }
+    }
+
+    /// Limits from the `ndjson_page` limit: its `start` is the page size and its
+    /// `max` the largest a row may make a page.
+    pub fn from_limit(limit: &crate::limits::Limit, max_rows: usize) -> Self {
+        Self {
+            max_bytes: limit.start(),
+            max_rows: max_rows.max(1),
+            row_max: limit.max(),
         }
     }
 
@@ -247,11 +261,16 @@ impl Page {
         self.buf.push(b'\n');
         let row_len = self.buf.len() - start;
         if self.rows == 0 {
-            if row_len > MAX_PAGE_BYTES {
+            if row_len > self.limits.row_max {
                 self.buf.truncate(start);
+                let limit = crate::limits::Limit::custom(
+                    &crate::limits::NDJSON_PAGE,
+                    self.limits.max_bytes.min(self.limits.row_max),
+                    self.limits.row_max,
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "a row is larger than the maximum page",
+                    limit.exceeded(row_len, "a row"),
                 ));
             }
         } else if self.buf.len() > self.limits.max_bytes {

@@ -31,6 +31,8 @@
 use crate::event::{Slots, Timeouts};
 use crate::headers::{field_over_limit, MAX_HEADER_LINE, MAX_REQUEST_HEAD};
 use crate::http::RawRequest;
+use crate::limits::{Limit, REQUEST_BODY, RESPONSE_BUFFER};
+use crate::log::error;
 use crate::parse::MAX_BODY_BYTES;
 use crate::response::{Body, Response};
 use crate::server::MAX_REQUESTS_PER_CONN;
@@ -211,8 +213,9 @@ fn trim_ows(value: &str) -> &str {
     value.trim_matches([' ', '\t'])
 }
 
-/// Largest decoded chunked body accepted, matching the Content-Length cap.
-const MAX_CHUNKED_BODY: usize = 16 * 1024 * 1024;
+/// Room kept beside a response body for its head, which the response's own
+/// headers set: 64 KiB is twice the largest head a request may have.
+const RESPONSE_HEAD_ALLOWANCE: usize = 64 * 1024;
 
 /// A chunked body's decode position: bytes decoded so far, the index of the
 /// next chunk header, and whether the body is past its last chunk and reading
@@ -259,6 +262,8 @@ enum Chunked {
     /// Malformed framing. Not recoverable: the connection cannot be trusted to
     /// resynchronise, because the next bytes might be a smuggled request.
     Bad,
+    /// The decoded body would pass the `request_body` maximum, at this size.
+    TooLarge(usize),
 }
 
 // Count of chunk-size lines read, for the linearity test only.
@@ -384,7 +389,7 @@ fn chunked_trailers(buf: &[u8], decoded: usize, mut i: usize, mut trailer_bytes:
 /// across reads is retried against the bytes as they arrived rather than
 /// against a half-decoded buffer, and each read continues from the position the
 /// last one reached.
-fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
+fn chunked_extent(buf: &[u8], from: ChunkProgress, body_max: usize) -> Chunked {
     let mut decoded = from.decoded;
     let mut i = from.next;
     if from.trailers {
@@ -415,8 +420,8 @@ fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
         let Some(decoded_end) = decoded.checked_add(size) else {
             return Chunked::Bad;
         };
-        if decoded_end > MAX_CHUNKED_BODY {
-            return Chunked::Bad;
+        if decoded_end > body_max {
+            return Chunked::TooLarge(decoded_end);
         }
         let Some(data_end) = i.checked_add(size) else {
             return Chunked::Bad;
@@ -460,8 +465,8 @@ fn chunked_extent(buf: &[u8], from: ChunkProgress) -> Chunked {
 /// data is copied behind its framing, so a connection's buffer holds the
 /// decoded body with no second allocation, and a pipelined request behind the
 /// raw body stays where it is.
-fn decode_chunked(buf: &mut [u8], from: ChunkProgress) -> Chunked {
-    let (decoded, raw) = match chunked_extent(buf, from) {
+fn decode_chunked(buf: &mut [u8], from: ChunkProgress, body_max: usize) -> Chunked {
+    let (decoded, raw) = match chunked_extent(buf, from, body_max) {
         Chunked::Done { decoded, raw } => (decoded, raw),
         other => return other,
     };
@@ -871,9 +876,10 @@ pub fn materialize(head: &RequestHead<'_>, buf: &[u8]) -> ParseResult {
         // copy is the owned body this function exists to produce, and the
         // decoder shrinks it in place.
         let mut body = buf[head.head_len..].to_vec();
-        match decode_chunked(&mut body, ChunkProgress::START) {
+        match decode_chunked(&mut body, ChunkProgress::START, MAX_BODY_BYTES) {
             Chunked::More(_) => return ParseResult::Incomplete,
             Chunked::Bad => return ParseResult::Error(HeadError::Malformed),
+            Chunked::TooLarge(_) => return ParseResult::Error(HeadError::Malformed),
             Chunked::Done { decoded, .. } => {
                 body.truncate(decoded);
                 body
@@ -1315,8 +1321,9 @@ const STREAM_CHUNK: u64 = 64 * 1024;
 /// A slot is made at start with its buffers ([`ServerConn::new`]), a stream is
 /// attached on accept and detached on close. Reading, parsing and writing go
 /// through those buffers, so serving a request allocates nothing: a request or
-/// a response larger than them is the one case that grows a buffer, and it is
-/// cut back afterwards.
+/// a response larger than them is the one case that grows a buffer. A buffer
+/// grows by doubling, keeps its size, and a request or response past the
+/// maximum of its limit is refused with an error that names the key.
 ///
 /// The turn loop a service writes per connection:
 ///
@@ -1401,11 +1408,10 @@ pub struct ServerConn {
     /// slot has. The buffer is filled directly, so no zeroing per read.
     in_buf: Vec<u8>,
     in_len: usize,
-    in_read_cap: usize,
+    read_limit: Limit,
     /// Bytes of the buffer the request being answered occupies. They are
     /// dropped when its answer is flushed (`release_request`), or at the next
-    /// read when no answer was flushed; the buffer grown for a large request is
-    /// cut back at that point too.
+    /// read when no answer was flushed.
     consumed: usize,
     /// How far a chunked body has been framed, so the next read continues
     /// from there rather than walking the chunks already seen again.
@@ -1414,7 +1420,7 @@ pub struct ServerConn {
     out_buf: Vec<u8>,
     out_len: usize,
     out_pos: usize,
-    out_write_cap: usize,
+    write_limit: Limit,
     body: Option<StreamBody>,
     is_head: bool,
     keep_alive: bool,
@@ -1424,23 +1430,38 @@ pub struct ServerConn {
 }
 
 impl ServerConn {
-    /// A slot with `read_cap` and `write_cap` bytes. Start only.
+    /// A slot that starts with `read_cap` and `write_cap` bytes and grows to
+    /// the built-in maxima of `request_body` and `response_buffer`. A service
+    /// that reads its limits from config calls [`ServerConn::with_limits`].
+    /// Start only.
     pub fn new(read_cap: usize, write_cap: usize) -> ServerConn {
         assert!(
             read_cap > 0 && write_cap > 0,
             "a connection slot needs both buffers"
         );
+        let read = Limit::custom(&REQUEST_BODY, read_cap, REQUEST_BODY.max.max(read_cap));
+        let write = Limit::custom(
+            &RESPONSE_BUFFER,
+            write_cap,
+            RESPONSE_BUFFER.max.max(write_cap),
+        );
+        ServerConn::with_limits(&read, &write)
+    }
+
+    /// A slot whose input buffer follows the `request_body` limit and whose
+    /// output buffer follows the `response_buffer` limit. Start only.
+    pub fn with_limits(read: &Limit, write: &Limit) -> ServerConn {
         ServerConn {
             stream: None,
-            in_buf: vec![0; read_cap],
+            in_buf: vec![0; read.start()],
             in_len: 0,
-            in_read_cap: read_cap,
+            read_limit: read.clone(),
             consumed: 0,
             chunk: None,
-            out_buf: vec![0; write_cap],
+            out_buf: vec![0; write.start()],
             out_len: 0,
             out_pos: 0,
-            out_write_cap: write_cap,
+            write_limit: write.clone(),
             body: None,
             is_head: false,
             keep_alive: true,
@@ -1498,7 +1519,11 @@ impl ServerConn {
         self.drop_consumed();
 
         loop {
-            match inspect(&self.in_buf[..self.in_len]) {
+            match inspect(&self.in_buf[..self.in_len], self.read_limit.max()) {
+                Next::TooLarge(needed) => {
+                    self.refuse_request(needed);
+                    return Ok(Read::More);
+                }
                 Next::Complete {
                     len,
                     is_head,
@@ -1513,9 +1538,17 @@ impl ServerConn {
                     keep_alive,
                 } => {
                     let from = self.chunk.unwrap_or(ChunkProgress::START);
-                    match decode_chunked(&mut self.in_buf[head_len..self.in_len], from) {
+                    match decode_chunked(
+                        &mut self.in_buf[head_len..self.in_len],
+                        from,
+                        self.read_limit.max(),
+                    ) {
                         Chunked::Bad => {
                             self.queue_error(400);
+                            return Ok(Read::More);
+                        }
+                        Chunked::TooLarge(needed) => {
+                            self.refuse_request(needed);
                             return Ok(Read::More);
                         }
                         Chunked::More(progress) => {
@@ -1553,13 +1586,16 @@ impl ServerConn {
             // allocate before its contents do. A declared length over the cap
             // was refused by `inspect`.
             if self.in_len == self.in_buf.len() {
-                let cap = MAX_REQUEST_HEAD + MAX_BODY_BYTES;
-                if self.in_buf.len() >= cap {
-                    self.queue_error(413);
+                let ceiling = self.read_limit.max() + MAX_REQUEST_HEAD;
+                let Some(grown) =
+                    self.read_limit
+                        .grown_to(self.in_buf.len(), self.in_buf.len() + 1, ceiling)
+                else {
+                    self.refuse_request(self.in_buf.len() + 1);
                     return Ok(Read::More);
-                }
-                let doubled = (self.in_buf.len() * 2).min(cap);
-                self.in_buf.resize(doubled, 0);
+                };
+                self.in_buf.resize(grown, 0);
+                self.read_limit.log_growth(grown);
             }
 
             match self.fill()? {
@@ -1629,16 +1665,22 @@ impl ServerConn {
     /// The slot's input and output buffer sizes.
     ///
     /// Testkit only: it proves a buffer grown for a request larger than the
-    /// slot was cut back afterwards, and that a declared body does not grow it
-    /// before the body arrives. Nothing on the wire can show either.
+    /// slot keeps its size, and that a declared body does not grow it before
+    /// the body arrives. Nothing on the wire can show either.
     #[cfg(feature = "testkit")]
     pub fn buffer_caps(&self) -> (usize, usize) {
         (self.in_buf.len(), self.out_buf.len())
     }
 
     /// Queue a short response into the slot's output buffer.
+    ///
+    /// A body that does not fit the `response_buffer` maximum is refused: a 500
+    /// is queued in its place and the error log names the limit.
     pub fn respond(&mut self, status: u16, headers: &[(&str, &str)], body: &[u8]) {
-        let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
+        if !self.has_room_for(body.len()) {
+            return;
+        }
+        let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len, &self.write_limit);
         let bodyless = write_head_to(
             &mut out,
             status,
@@ -1670,7 +1712,10 @@ impl ServerConn {
         } = response;
         match body {
             Body::Bytes(bytes) => {
-                let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
+                if !self.has_room_for(bytes.len()) {
+                    return;
+                }
+                let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len, &self.write_limit);
                 let bodyless = write_head_to(
                     &mut out,
                     status,
@@ -1688,7 +1733,8 @@ impl ServerConn {
             }
             Body::Stream { len, reader } => {
                 let bodyless = {
-                    let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
+                    let mut out =
+                        OutBuf::new(&mut self.out_buf, &mut self.out_len, &self.write_limit);
                     write_head_to(
                         &mut out,
                         status,
@@ -1757,21 +1803,8 @@ impl ServerConn {
         }
 
         // The request being answered is finished with the response, so it is
-        // dropped here rather than at the next read. That lets the input buffer
-        // a large request grew be cut back now, before the next request starts,
-        // so the cut-back is not charged to that request.
+        // dropped here rather than at the next read.
         self.release_request();
-
-        // A response larger than the slot's buffer grew it; cut it back now the
-        // response is out, so memory does not creep.
-        if self.out_buf.len() > self.out_write_cap {
-            self.out_buf.truncate(self.out_write_cap);
-            self.out_buf.shrink_to(self.out_write_cap);
-        }
-        if self.in_buf.len() > self.in_read_cap && self.in_len <= self.in_read_cap {
-            self.in_buf.truncate(self.in_read_cap);
-            self.in_buf.shrink_to(self.in_read_cap);
-        }
 
         Ok(if self.close_after || !self.keep_alive {
             Flush::Close
@@ -1806,15 +1839,32 @@ impl ServerConn {
         self.in_len -= self.consumed;
         self.consumed = 0;
         self.expect_answered = false;
-        if self.in_buf.len() > self.in_read_cap && self.in_len <= self.in_read_cap {
-            self.in_buf.truncate(self.in_read_cap);
-            self.in_buf.shrink_to(self.in_read_cap);
+    }
+
+    /// Whether a response body of `len` bytes, with its head, fits under the
+    /// `response_buffer` maximum. When it does not, the response is refused:
+    /// one error line names the limit, the size needed and the key to raise,
+    /// and a 500 is queued in its place.
+    fn has_room_for(&mut self, len: usize) -> bool {
+        let needed = self.out_len + len + RESPONSE_HEAD_ALLOWANCE;
+        if needed <= self.write_limit.max() {
+            return true;
         }
+        error!("{}", self.write_limit.exceeded(needed, "response"));
+        self.queue_error(500);
+        false
+    }
+
+    /// Refuse a request past the `request_body` maximum with 413. One error
+    /// line names the limit, the size needed and the key to raise.
+    fn refuse_request(&mut self, needed: usize) {
+        error!("{}", self.read_limit.exceeded(needed, "request"));
+        self.queue_error(413);
     }
 
     /// Queue a refusal, and mark the connection to close after it is written.
     fn queue_error(&mut self, status: u16) {
-        let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
+        let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len, &self.write_limit);
         let mut responder = Responder::new(&mut out, "", false);
         responder
             .error(status)
@@ -1824,7 +1874,7 @@ impl ServerConn {
     }
 
     fn queue_bytes(&mut self, bytes: &[u8]) {
-        let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len);
+        let mut out = OutBuf::new(&mut self.out_buf, &mut self.out_len, &self.write_limit);
         out.write_all(bytes)
             .expect("the slot's output buffer cannot fail");
     }
@@ -1860,14 +1910,6 @@ impl ServerConn {
         self.served = 0;
         self.close_after = false;
         self.expect_answered = false;
-        if self.in_buf.len() > self.in_read_cap {
-            self.in_buf.truncate(self.in_read_cap);
-            self.in_buf.shrink_to(self.in_read_cap);
-        }
-        if self.out_buf.len() > self.out_write_cap {
-            self.out_buf.truncate(self.out_write_cap);
-            self.out_buf.shrink_to(self.out_write_cap);
-        }
     }
 }
 
@@ -1916,11 +1958,13 @@ enum Next {
     Read,
     /// Refuse with this status and close.
     Error(u16),
+    /// The declared body is over the `request_body` maximum, at this size.
+    TooLarge(usize),
 }
 
 /// Frame the buffered bytes. Its own stack slots, so the caller's slots stay
 /// free for the lending parse that follows.
-fn inspect(in_buf: &[u8]) -> Next {
+fn inspect(in_buf: &[u8], body_max: usize) -> Next {
     let mut slots = head_slots();
     match parse_head_uninit(in_buf, &mut slots) {
         HeadResult::Error(why) => Next::Error(why.status()),
@@ -1945,8 +1989,8 @@ fn inspect(in_buf: &[u8]) -> Next {
                     is_head,
                     keep_alive,
                 }
-            } else if head.body_len > MAX_BODY_BYTES {
-                Next::Error(413)
+            } else if head.body_len > body_max {
+                Next::TooLarge(head.body_len)
             } else {
                 let total = head.head_len + head.body_len;
                 if in_buf.len() >= total {
@@ -1981,11 +2025,12 @@ enum Fill {
 struct OutBuf<'a> {
     buf: &'a mut Vec<u8>,
     len: &'a mut usize,
+    limit: &'a Limit,
 }
 
 impl<'a> OutBuf<'a> {
-    fn new(buf: &'a mut Vec<u8>, len: &'a mut usize) -> OutBuf<'a> {
-        OutBuf { buf, len }
+    fn new(buf: &'a mut Vec<u8>, len: &'a mut usize, limit: &'a Limit) -> OutBuf<'a> {
+        OutBuf { buf, len, limit }
     }
 }
 
@@ -1993,7 +2038,11 @@ impl std::io::Write for OutBuf<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let end = *self.len + bytes.len();
         if self.buf.len() < end {
-            self.buf.resize(end, 0);
+            let Some(size) = self.limit.grown(self.buf.len(), end) else {
+                return Err(io::Error::other(self.limit.exceeded(end, "response")));
+            };
+            self.buf.resize(size, 0);
+            self.limit.log_growth(size);
         }
         self.buf[*self.len..end].copy_from_slice(bytes);
         *self.len = end;

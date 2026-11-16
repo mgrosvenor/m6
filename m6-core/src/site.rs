@@ -449,6 +449,11 @@ impl Site {
         &self.site_toml
     }
 
+    /// The named limits from this service's `[limits]` table.
+    pub fn limits(&self) -> &crate::limits::Limits {
+        &self.state.config.limits
+    }
+
     /// The service's name, for the lifecycle lines and the startup log.
     pub fn name(&self) -> &str {
         &self.name

@@ -33,15 +33,30 @@ use anyhow::bail;
 
 use crate::log::info;
 
+/// What a limit counts, which decides how its values are rounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// Bytes in a large area: a whole power-of-two multiple of the OS page.
+    PageBytes,
+    /// Bytes in a small area: a power of two.
+    Bytes,
+    /// Entries in a queue or table, or items held. Used as written.
+    Count,
+}
+
 /// A limit's name and its built-in defaults.
+///
+/// A limit that holds no memory of its own, such as a cap on a log field,
+/// has a `start` equal to its `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitSpec {
     /// The key under `[limits]`.
     pub name: &'static str,
-    /// The size made at start, in bytes.
+    /// The size made at start, in the limit's unit.
     pub start: usize,
-    /// The size growth stops at, in bytes.
+    /// The size growth stops at, in the limit's unit.
     pub max: usize,
+    pub unit: Unit,
 }
 
 const KIB: usize = 1024;
@@ -53,10 +68,110 @@ pub const RENDER_PAGE: LimitSpec = LimitSpec {
     name: "render_page",
     start: 512 * KIB,
     max: 4 * MIB,
+    unit: Unit::PageBytes,
 };
 
+const fn bytes(name: &'static str, start: usize, max: usize) -> LimitSpec {
+    LimitSpec {
+        name,
+        start,
+        max,
+        unit: Unit::Bytes,
+    }
+}
+
+const fn count(name: &'static str, start: usize, max: usize) -> LimitSpec {
+    LimitSpec {
+        name,
+        start,
+        max,
+        unit: Unit::Count,
+    }
+}
+
+/// A service's read buffer for one HTTP/1.1 request on its socket, and so the
+/// largest request body it accepts. The head's own 32 KiB is a protocol limit
+/// and comes on top.
+pub const REQUEST_BODY: LimitSpec = bytes("request_body", 16 * KIB, 16 * MIB);
+/// A service's write buffer for one response held in memory.
+pub const RESPONSE_BUFFER: LimitSpec = bytes("response_buffer", 64 * KIB, 64 * MIB);
+/// The buffer an upstream client reads one backend response into.
+pub const UPSTREAM_READ: LimitSpec = bytes("upstream_read", 64 * KIB, 128 * MIB);
+/// The buffer an upstream client builds one request in.
+pub const UPSTREAM_REQUEST: LimitSpec = bytes("upstream_request", 16 * KIB, 32 * MIB);
+/// The connection table of a service: slots made at start, and the most it
+/// grows to. The open-file limit can lower the maximum.
+pub const CONNECTIONS: LimitSpec = count("connections", 1024, 1_048_576);
+/// The compressed form of one response.
+pub const COMPRESS_OUTPUT: LimitSpec = bytes("compress_output", 64 * KIB, 128 * MIB);
+/// The minified form of one response.
+pub const MINIFY_OUTPUT: LimitSpec = bytes("minify_output", 64 * KIB, 128 * MIB);
+/// The reply of a mail relay to one command.
+pub const SMTP_REPLY: LimitSpec = bytes("smtp_reply", 512, 64 * KIB);
+/// A page of an ndjson stream: `start` is the default page size and `max` the
+/// largest page a client can ask for. A row larger than `max` is refused.
+pub const NDJSON_PAGE: LimitSpec = bytes("ndjson_page", 4 * MIB, 64 * MIB);
+/// The most a tail request reads from a file in one response. A longer tail
+/// is returned in pages, each ending at the offset the next one starts from.
+pub const TAIL_READ: LimitSpec = bytes("tail_read", 64 * KIB, 512 * KIB);
+/// One operational log destination's buffer.
+pub const LOG_BUFFER: LimitSpec = bytes("log_buffer", 16 * KIB, MIB);
+/// The longest string field of one log line. A longer value is cut and ends in
+/// `...`.
+pub const LOG_FIELD: LimitSpec = bytes("log_field", 8 * KIB, 8 * KIB);
+/// The edge's read buffer for one HTTP/1.1 connection, and so the largest
+/// request it accepts.
+pub const EDGE_REQUEST: LimitSpec = bytes("edge_request", 4 * KIB, 32 * MIB);
+/// The edge's write buffer for one HTTP/1.1 connection, and so the largest
+/// response it holds in memory.
+pub const EDGE_RESPONSE: LimitSpec = bytes("edge_response", 512, 128 * MIB);
+/// The edge's read buffer for one HTTP/2 connection.
+pub const H2_RECV: LimitSpec = bytes("h2_recv", 16 * KIB, 4 * MIB);
+/// One HTTP/2 header block, before it is decoded.
+pub const H2_HEADER_BLOCK: LimitSpec = bytes("h2_header_block", 16 * KIB, 256 * KIB);
+/// The field list one HTTP/2 request decodes into.
+pub const H2_HEAD_SCRATCH: LimitSpec = bytes("h2_head_scratch", 8 * KIB, 256 * KIB);
+/// The body of one HTTP/2 request stream.
+pub const H2_STREAM_BODY: LimitSpec = bytes("h2_stream_body", 4 * KIB, 32 * MIB);
+/// Cancelled HTTP/2 streams remembered, so a late frame for one is not a
+/// protocol error.
+pub const H2_RESET_MEMORY: LimitSpec = count("h2_reset_memory", 128, 128);
+/// Stale cache entries waiting to be fetched again.
+pub const REFRESH_QUEUE: LimitSpec = count("refresh_queue", 16, 4096);
+/// Client addresses the per-address request counter tracks.
+pub const RATE_LIMIT_ADDRESSES: LimitSpec = count("rate_limit_addresses", 1024, 50_000);
+/// Idle connections kept per URL backend.
+pub const IDLE_URL_CONNECTIONS: LimitSpec = count("idle_url_connections", 8, 8);
+/// Polls the monitor holds in memory while its history file catches up.
+pub const HISTORY_QUEUE: LimitSpec = count("history_queue", 8, 1024);
+
 /// Every limit m6 knows. A name outside this list under `[limits]` is refused.
-pub const KNOWN: &[LimitSpec] = &[RENDER_PAGE];
+pub const KNOWN: &[LimitSpec] = &[
+    RENDER_PAGE,
+    REQUEST_BODY,
+    RESPONSE_BUFFER,
+    UPSTREAM_READ,
+    UPSTREAM_REQUEST,
+    CONNECTIONS,
+    COMPRESS_OUTPUT,
+    MINIFY_OUTPUT,
+    SMTP_REPLY,
+    NDJSON_PAGE,
+    TAIL_READ,
+    LOG_BUFFER,
+    LOG_FIELD,
+    EDGE_REQUEST,
+    EDGE_RESPONSE,
+    H2_RECV,
+    H2_HEADER_BLOCK,
+    H2_HEAD_SCRATCH,
+    H2_STREAM_BODY,
+    H2_RESET_MEMORY,
+    REFRESH_QUEUE,
+    RATE_LIMIT_ADDRESSES,
+    IDLE_URL_CONNECTIONS,
+    HISTORY_QUEUE,
+];
 
 /// One limit, with its values rounded and checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,10 +179,70 @@ pub struct Limit {
     name: &'static str,
     start: usize,
     max: usize,
-    file: PathBuf,
+    unit: Unit,
+    file: std::sync::Arc<Path>,
 }
 
 impl Limit {
+    /// A limit built in code, with no config file behind it: a test's, or a
+    /// service that has none. The over-max error then names no file.
+    pub fn custom(spec: &LimitSpec, start: usize, max: usize) -> Self {
+        assert!(start <= max, "a limit's max is not below its start");
+        Self {
+            name: spec.name,
+            start,
+            max,
+            unit: spec.unit,
+            file: Path::new("").into(),
+        }
+    }
+
+    /// The limit with its built-in defaults and no config file.
+    pub fn builtin(spec: &LimitSpec) -> Self {
+        Self::custom(spec, spec.start, spec.max)
+    }
+
+    /// The size an area of `current` bytes grows to so it holds `needed`:
+    /// doubling, the last step clamped to `max`, and `None` when `needed` is
+    /// past it. An area that already holds `needed` stays as it is.
+    pub fn grown(&self, current: usize, needed: usize) -> Option<usize> {
+        self.grown_to(current, needed, self.max)
+    }
+
+    /// As [`Limit::grown`] with the ceiling `ceiling` in place of `max`, for an
+    /// area that holds a protocol's fixed head beside a body of up to `max`.
+    pub fn grown_to(&self, current: usize, needed: usize, ceiling: usize) -> Option<usize> {
+        if needed <= current {
+            return Some(current);
+        }
+        if needed > ceiling {
+            return None;
+        }
+        let mut size = current.max(self.start).max(1);
+        while size < needed {
+            size = size.saturating_mul(2);
+        }
+        Some(size.min(ceiling))
+    }
+
+    /// Log the one line a growth to `size` owes.
+    pub fn log_growth(&self, size: usize) {
+        info!(
+            limit = self.name,
+            "limit {} grew to {}",
+            self.name,
+            self.text(size)
+        );
+    }
+
+    /// A size in this limit's unit, for a message.
+    pub fn text(&self, n: usize) -> String {
+        match self.unit {
+            Unit::Count => n.to_string(),
+            _ => size_text(n),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -84,9 +259,9 @@ impl Limit {
     pub fn exceeded(&self, needed: usize, what: &str) -> LimitExceeded {
         LimitExceeded {
             what: what.to_string(),
-            needed,
+            needed: self.text(needed),
             name: self.name,
-            max: self.max,
+            max: self.text(self.max),
             file: self.file.clone(),
         }
     }
@@ -96,22 +271,23 @@ impl Limit {
 #[derive(Debug)]
 pub struct LimitExceeded {
     what: String,
-    needed: usize,
+    needed: String,
     name: &'static str,
-    max: usize,
-    file: PathBuf,
+    max: String,
+    file: std::sync::Arc<Path>,
 }
 
 impl std::fmt::Display for LimitExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = if self.file.as_os_str().is_empty() {
+            "the config file".to_string()
+        } else {
+            self.file.display().to_string()
+        };
         write!(
             f,
-            "{} needs at least {}, over [limits.{}] max = {} in {}; raise max to fix this",
-            self.what,
-            size_text(self.needed),
-            self.name,
-            size_text(self.max),
-            self.file.display()
+            "{} needs at least {}, over [limits.{}] max = {} in {file}; raise max to fix this",
+            self.what, self.needed, self.name, self.max,
         )
     }
 }
@@ -187,18 +363,23 @@ impl Limits {
             }
             let mut sized = |key: &str, default: usize| -> anyhow::Result<usize> {
                 let Some(v) = body.and_then(|b| b.get(key)) else {
-                    return Ok(round_up(default, page));
+                    return Ok(round_unit(spec.unit, default, page));
                 };
-                let (bytes, text) = parse_size(v).map_err(|e| {
+                let (n, text) = parse_value(spec.unit, v).map_err(|e| {
                     anyhow::anyhow!("[limits.{}] {key} in {}: {e}", spec.name, file.display())
                 })?;
-                let used = round_up(bytes, page);
-                if used != bytes {
+                let used = round_unit(spec.unit, n, page);
+                if used != n {
+                    let rule = match spec.unit {
+                        Unit::PageBytes => {
+                            format!("a power-of-two multiple of the {} page", size_text(page))
+                        }
+                        _ => "a power of two".to_string(),
+                    };
                     warnings.push(format!(
-                        "[limits.{}] {key} = {text} in {} is not a power-of-two multiple of the {} page; using {}. Set it to {} to silence this.",
+                        "[limits.{}] {key} = {text} in {} is not {rule}; using {}. Set it to {} to silence this.",
                         spec.name,
                         file.display(),
-                        size_text(page),
                         size_text(used),
                         size_config(used),
                     ));
@@ -211,8 +392,8 @@ impl Limits {
                 bail!(
                     "[limits.{}] max = {} is below start = {} in {}: raise max or lower start",
                     spec.name,
-                    size_text(max),
-                    size_text(start),
+                    shown(spec.unit, max),
+                    shown(spec.unit, start),
                     file.display()
                 );
             }
@@ -220,7 +401,8 @@ impl Limits {
                 name: spec.name,
                 start,
                 max,
-                file: file.to_path_buf(),
+                unit: spec.unit,
+                file: file.into(),
             });
         }
         Ok(Self {
@@ -250,9 +432,37 @@ impl Limits {
     }
 }
 
-/// The smallest `page * 2^k` that holds `bytes`.
-fn round_up(bytes: usize, page: usize) -> usize {
-    page * bytes.div_ceil(page).next_power_of_two()
+/// The value a limit of `unit` takes for `n`: `page * 2^k` for a large area, a
+/// power of two for a small one, and `n` for a count.
+fn round_unit(unit: Unit, n: usize, page: usize) -> usize {
+    match unit {
+        Unit::PageBytes => page * n.div_ceil(page).next_power_of_two(),
+        Unit::Bytes => n.next_power_of_two(),
+        Unit::Count => n,
+    }
+}
+
+fn shown(unit: Unit, n: usize) -> String {
+    match unit {
+        Unit::Count => n.to_string(),
+        _ => size_text(n),
+    }
+}
+
+/// One config value of a limit: a size for bytes, a whole number for a count.
+/// Returns the number and the text as written.
+fn parse_value(unit: Unit, v: &toml::Value) -> anyhow::Result<(usize, String)> {
+    if unit != Unit::Count {
+        return parse_size(v);
+    }
+    match v {
+        toml::Value::Integer(n) => match usize::try_from(*n) {
+            Ok(0) => bail!("0 must be above zero"),
+            Ok(n) => Ok((n, n.to_string())),
+            Err(_) => bail!("{n} is not a count"),
+        },
+        other => bail!("must be a whole number of entries, got {other}"),
+    }
 }
 
 /// A size as the config states it: a whole number of bytes, or a number with
@@ -368,20 +578,13 @@ impl BoundedBuf {
             self.overflow = Some(needed);
             return false;
         }
-        let mut size = self.size;
-        while size < needed {
-            size = size.saturating_mul(2);
-        }
-        let size = size.min(self.limit.max);
+        let Some(size) = self.limit.grown(self.size, needed) else {
+            self.overflow = Some(needed);
+            return false;
+        };
         self.bytes.reserve_exact(size - self.bytes.len());
         self.size = size;
-        info!(
-            limit = self.limit.name,
-            bytes = size,
-            "limit {} grew to {}",
-            self.limit.name,
-            size_text(size)
-        );
+        self.limit.log_growth(size);
         true
     }
 }
@@ -569,5 +772,60 @@ mod tests {
         );
         b.clear();
         assert_eq!(b.overflow(), None);
+    }
+
+    #[test]
+    fn every_known_limit_has_valid_defaults() {
+        for page in [4096, 16384, 65536] {
+            let l = parse("", page).unwrap();
+            assert!(l.warnings().is_empty(), "{:?}", l.warnings());
+            for spec in KNOWN {
+                let limit = l.get(spec);
+                assert!(limit.start() <= limit.max(), "{}", spec.name);
+                if spec.unit != Unit::Count {
+                    assert!(limit.start().is_power_of_two(), "{}", spec.name);
+                    assert!(limit.max().is_power_of_two(), "{}", spec.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_count_is_used_as_written_and_a_zero_is_refused() {
+        let l = parse("[limits.refresh_queue]\nstart = 10\nmax = 300\n", 4096).unwrap();
+        let q = l.get(&REFRESH_QUEUE);
+        assert_eq!((q.start(), q.max()), (10, 300));
+        assert!(l.warnings().is_empty());
+        let err = parse("[limits.refresh_queue]\nmax = 0\n", 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 must be above zero"), "{err}");
+        let err = parse("[limits.refresh_queue]\nmax = \"4KiB\"\n", 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whole number of entries"), "{err}");
+    }
+
+    /// A small area is rounded to a power of two, not to a page.
+    #[test]
+    fn a_small_area_rounds_to_a_power_of_two() {
+        let l = parse("[limits.smtp_reply]\nstart = 600\n", 16384).unwrap();
+        assert_eq!(l.get(&SMTP_REPLY).start(), 1024);
+        assert!(l.warnings()[0].contains("is not a power of two; using 1 KiB"));
+    }
+
+    #[test]
+    fn grown_doubles_clamps_and_refuses_past_max() {
+        let limit = Limit::custom(&REQUEST_BODY, 1024, 8192);
+        assert_eq!(limit.grown(1024, 1000), Some(1024));
+        assert_eq!(limit.grown(1024, 1025), Some(2048));
+        assert_eq!(limit.grown(2048, 5000), Some(8192));
+        assert_eq!(limit.grown(8192, 8193), None);
+        assert_eq!(limit.grown_to(8192, 8193, 8192 + 100), Some(8292));
+        let msg = limit.exceeded(8193, "request").to_string();
+        assert_eq!(
+            msg,
+            "request needs at least 8193 B, over [limits.request_body] max = 8 KiB in the config file; raise max to fix this"
+        );
     }
 }
