@@ -482,6 +482,12 @@ Comments only.
 
 ### Changed
 
+**A rendered page makes no allocation of its own: the dictionary overlay, its built-in values and the response's header list are reused from one request to the next (template request 27 to 22 allocations, page path 41 to 36, handler request 21 to 16).**
+The overlay is taken from a spare one on the thread, cleared and not freed, and it keeps only the buffers of `request_path`, `datetime` and `year`; `datetime` and `year` are formatted into stack buffers; a response's header list returns to a spare list when the response is dropped. The 22 that remain on a page are Tera's and minify-html's, and a traced run of `site_allocs` shows all 36 on its path are theirs.
+A new limit, `[limits.request_dict]` (32 entries at start, 4096 at most), bounds the fields of one request, and a request past it is refused with a 400 that names the key.
+**Rollback:** revert the merge commit of `perf/reusable-page-context` (`git log --first-parent --merges --grep reusable-page-context`). The overlay returns to a `BTreeMap`, the built-ins to a `String` each request and the header list to a `Vec` made per response, five allocations on a page, and the budgets go back: `site_allocs` 36 to 41, `request_allocs` template 22 to 27 and handler 16 to 21. The `request_dict` key goes with it. `docs/PERFORMANCE.md` §2.7 records the same.
+Verified by the three budgets, which fail when an allocation comes back, by `a_dictionary_reuses_the_last_ones_built_in_buffers_and_shows_nothing_else` (the built-in's buffer is the last request's and nothing else of it is visible), `a_header_list_is_reused_by_the_next_response`, `an_insert_past_the_maximum_is_refused_and_reported` and `a_request_with_too_many_fields_is_refused_with_a_400`.
+
 **A rendered page's header names and values are borrowed, and the page's copy out of the page area is the minified body (page path 50 to 41 allocations, template request 36 to 27, handler request 23 to 21).**
 A route's `Cache-Control`, `Last-Modified` and extra headers are made once at load as `Arc<str>` texts the route owns, and each response clones the `Arc`, the header names are literals, and the page's `ETag`, 18 bytes, is held inline in its header.
 Of the 27 allocations a rendered page still makes, 22 are Tera's and minify-html's and 5 are ours: the built-in `year` and `datetime` values (2), the dictionary overlay's first node and key insert (2) and the response's header vector (1).

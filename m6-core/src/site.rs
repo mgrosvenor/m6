@@ -361,6 +361,9 @@ impl Site {
         // Logging: site.toml base, the service's `[log]`, then `--log-level`.
         let level = resolve_log(&site_toml, &config.log, cli_log_level)
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
+        crate::dict::set_entry_limit(config.limits.get(&crate::limits::REQUEST_DICT));
+        crate::dict::warm_spare_overlays();
+        crate::headers::warm_spare_lists();
         // A reload must not call `log::init` again: it replaces the running
         // sink without flushing it, and m6-log would record the already
         // nonblocking stdout as its own.
@@ -2051,10 +2054,16 @@ impl FrameworkState {
         // 8. Built-in keys (set after params files — cannot be overridden by them).
         // The reading comes from the layer and chrono only formats it.
         let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
-        let (datetime, year) = Self::builtin_dates(now);
-        dict.insert("request_path", Value::String(raw.path().to_string()));
-        dict.insert("datetime", Value::String(datetime));
-        dict.insert("year", Value::String(year));
+        let (mut datetime, mut year) = (
+            crate::headers::InlineBuf::new(),
+            crate::headers::InlineBuf::new(),
+        );
+        Self::builtin_dates(now, &mut datetime, &mut year);
+        // Written into the buffers these three keys held for the last request,
+        // so a page after a page allocates nothing for them.
+        dict.insert_str("request_path", raw.path());
+        dict.insert_str("datetime", datetime.as_str());
+        dict.insert_str("year", year.as_str());
 
         // 9. Auth keys.
         if let Some(claims_hdr) = raw.header("x-auth-claims") {
@@ -2106,21 +2115,44 @@ impl FrameworkState {
             dict.insert("csrf_token", Value::String(token));
         }
 
+        if dict.overflowed() {
+            let limit = crate::dict::entry_limit();
+            return Err(Error::BadRequest(
+                limit
+                    .exceeded(limit.max() + 1, "the request's fields")
+                    .to_string(),
+            ));
+        }
+
         Ok(dict)
     }
 
-    /// The two built-in date values: RFC 3339 in UTC to the second, and the
-    /// four-digit year. No format string is parsed on the request path.
-    fn builtin_dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
-        use chrono::Datelike as _;
+    /// The two built-in date values, written into `datetime` and `year`: RFC
+    /// 3339 in UTC to the second, and the four-digit year. No format string is
+    /// parsed on the request path and no `String` is made.
+    fn builtin_dates(
+        now: chrono::DateTime<chrono::Utc>,
+        datetime: &mut crate::headers::InlineBuf,
+        year: &mut crate::headers::InlineBuf,
+    ) {
+        use chrono::{Datelike as _, Timelike as _};
         use std::fmt::Write as _;
         // `{:04}` is what `%Y` does for the years a site can see: four digits,
         // zero padded, so 0999 is "0999" and not "999". Negative and
         // five-digit years arrive with a sign or a fifth digit, which `%Y`
         // also prints, and neither can come from `Utc::now()`.
-        let mut year = String::new();
-        write!(year, "{:04}", now.year()).expect("writing to a String cannot fail");
-        (now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), year)
+        write!(year, "{:04}", now.year()).expect("a year fits an inline buffer");
+        write!(
+            datetime,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        )
+        .expect("a timestamp fits an inline buffer");
     }
 
     /// Render a template response.
@@ -2171,6 +2203,34 @@ impl FrameworkState {
 mod builtin_dates_tests {
     use super::FrameworkState;
 
+    /// The two values as `String`s, from the inline buffers `build_dict` uses.
+    fn dates(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
+        let mut datetime = crate::headers::InlineBuf::new();
+        let mut year = crate::headers::InlineBuf::new();
+        FrameworkState::builtin_dates(now, &mut datetime, &mut year);
+        (datetime.as_str().to_string(), year.as_str().to_string())
+    }
+
+    /// The hand-written form is the one chrono's `to_rfc3339_opts` writes, for
+    /// the years a clock can show.
+    #[test]
+    fn builtin_dates_match_chrono_across_the_years() {
+        use chrono::TimeZone as _;
+        for (y, secs) in [
+            (1970, 0),
+            (2000, 86_399),
+            (2026, 1_234_567),
+            (2099, 31_000_000),
+        ] {
+            let now = chrono::Utc.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap()
+                + chrono::Duration::seconds(secs);
+            assert_eq!(
+                dates(now).0,
+                now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            );
+        }
+    }
+
     /// The built-in dates keep the shape templates already read:
     /// `%Y-%m-%dT%H:%M:%SZ` and `%Y`. Pinned here so a change to how they are
     /// formatted cannot drift from what a template sees.
@@ -2179,21 +2239,21 @@ mod builtin_dates_tests {
         use chrono::TimeZone as _;
 
         let now = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        let (datetime, year) = FrameworkState::builtin_dates(now);
+        let (datetime, year) = dates(now);
         assert_eq!(datetime, "2026-01-02T03:04:05Z");
         assert_eq!(year, "2026");
 
         let last = chrono::Utc
             .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
             .unwrap();
-        let (datetime, year) = FrameworkState::builtin_dates(last);
+        let (datetime, year) = dates(last);
         assert_eq!(datetime, "9999-12-31T23:59:59Z");
         assert_eq!(year, "9999");
 
         // The year `%Y` zero-pads and `to_string` did not, which is the only
         // place the two forms ever differed.
         let early = chrono::Utc.with_ymd_and_hms(999, 6, 1, 0, 0, 0).unwrap();
-        let (_, year) = FrameworkState::builtin_dates(early);
+        let (_, year) = dates(early);
         assert_eq!(year, "0999");
     }
 }
@@ -2940,6 +3000,40 @@ mod tests {
             matches!(etag.1, HeaderText::Inline { .. }),
             "the ETag is inline"
         );
+    }
+
+    /// A request with more fields than the `request_dict` maximum is refused
+    /// with a 400, and one within it is answered.
+    #[test]
+    fn a_request_with_too_many_fields_is_refused_with_a_400() {
+        let (site, _dir) = site_from(
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            &[],
+        );
+        let post = |fields: usize| {
+            let body: String = std::iter::once("name=Ada".to_string())
+                .chain((0..fields).map(|i| format!("f{i}=x")))
+                .collect::<Vec<_>>()
+                .join("&");
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\n\
+                 Content-Type: application/x-www-form-urlencoded\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut slots = [httparse::EMPTY_HEADER; 64];
+            let head = match parse_head(request.as_bytes(), &mut slots) {
+                crate::h1::HeadResult::Complete(head) => head,
+                _ => panic!("the test's request must parse"),
+            };
+            match site.handle(&head) {
+                Handled::Done(resp) => resp.status,
+                _ => panic!("a template route is answered by core"),
+            }
+        };
+        let max = crate::dict::entry_limit().max();
+        assert_eq!(post(10), 200);
+        assert_eq!(post(max + 10), 400, "past [limits.request_dict] max");
     }
 
     /// A site owns its route header texts: a reload replaces the site, and the

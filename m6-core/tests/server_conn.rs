@@ -513,7 +513,7 @@ fn a_response_allocates_nothing() -> bool {
     // Built before the count: the response and its bytes are the caller's.
     let response = Response {
         status: 200,
-        headers: vec![("Content-Type".into(), "text/plain".into())],
+        headers: vec![("Content-Type".into(), "text/plain".into())].into(),
         body: Body::Bytes(b"ok".to_vec()),
         verbatim: false,
         template_name: None,
@@ -551,7 +551,7 @@ fn a_stream_body_is_pumped_per_writable_turn() -> bool {
     }
     let response = Response {
         status: 200,
-        headers: vec![("Content-Type".into(), "text/plain".into())],
+        headers: vec![("Content-Type".into(), "text/plain".into())].into(),
         body: Body::Stream {
             len: BODY as u64,
             reader: Box::new(file),

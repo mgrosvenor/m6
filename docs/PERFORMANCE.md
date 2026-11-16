@@ -160,6 +160,30 @@ Reverting returns `Response.headers` to `Vec<(String, String)>`, one `String` pa
 The budgets go back with it: `site_allocs` from 41 to 50, `request_allocs`'s template budget from 27 to 36 and its handler budget from 21 to 23.
 The revert changes no wire byte: a page carries the same headers in the same order before and after.
 
+### 2.7. The reusable page context
+
+A rendered page now makes no allocation of its own.
+In `request_allocs` a template request went from 27 allocations to 22, and every one of the 22 is Tera's or minify-html's.
+In `site_allocs`, which carries a params file and the connection's read and write, the page path went from 41 to 36, and a traced run shows all 36 are minify-html's 21 and Tera's 15.
+The handler request went from 21 to 16: the owned request (10), its cookies (5) and the route handle (1) are the ones left.
+
+What changed:
+
+- The dictionary's per-request layer is a list, not a map, and it is taken from a spare one that the last request left on the thread. The service runs one loop on one thread, so the spare is the service's own reusable dictionary. It is cleared, not freed, and it never shrinks.
+- The three built-in values, `request_path`, `datetime` and `year`, are written into the `String` buffers the last request left for those keys. A spare overlay keeps only those three, each at most 8 KiB, so nothing else of the last request waits in it.
+- `datetime` and `year` are formatted into stack buffers, and no format string is parsed.
+- A response's header list goes back to a spare list on the thread when the response is dropped, with sixteen headers of room, and the next response takes it.
+- The overlay's size follows the `request_dict` limit, 32 entries at start and 4096 at most. A request with more fields is refused with a 400 that names the key.
+
+What stays: the handler path's owned request and its cookies, because a handler is handed a `Request` that owns them.
+
+**Rollback.**
+Revert the merge commit of `perf/reusable-page-context`, found with `git log --first-parent --merges --grep reusable-page-context`.
+Reverting returns the overlay to a `BTreeMap`, the built-ins to a fresh `String` for each request, and the header list to a `Vec` made for each response: five allocations on a rendered page.
+The budgets go back with it: `site_allocs` from 36 to 41, `request_allocs`'s template budget from 22 to 27 and its handler budget from 16 to 21.
+The `request_dict` key is removed with it, and a config that sets it then stops the start with exit 2 as an unknown limit.
+The revert changes no wire byte and no template's context.
+
 ---
 
 ## 3. Allocation on the static file path

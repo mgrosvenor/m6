@@ -13,7 +13,7 @@
 //! `send` takes `self` by value, because a stream owns its reader and a
 //! response goes on the wire once.
 
-use crate::headers::HeaderText;
+use crate::headers::{HeaderText, Headers};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -108,7 +108,7 @@ impl std::fmt::Debug for Body {
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
-    pub headers: Vec<crate::headers::Header>,
+    pub headers: crate::headers::Headers,
     pub body: Body,
     /// The handler has produced the exact representation to send.
     ///
@@ -158,11 +158,7 @@ impl From<crate::http::RawResponse> for Response {
     fn from(r: crate::http::RawResponse) -> Self {
         Self {
             status: r.status,
-            headers: r
-                .headers
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
+            headers: headers_of_iter(r.headers.into_iter().map(|(k, v)| (k.into(), v.into()))),
             body: Body::Bytes(r.body),
             verbatim: true,
             template_name: None,
@@ -217,7 +213,7 @@ impl Response {
     ) -> Result<Self> {
         Ok(Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: Some(template.into()),
@@ -233,7 +229,7 @@ impl Response {
     pub fn render_request_dict(template: impl Into<Arc<str>>, status: u16) -> Self {
         Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: Some(template.into()),
@@ -244,7 +240,7 @@ impl Response {
     pub fn redirect(location: &str) -> Self {
         Self {
             status: 302,
-            headers: vec![(HeaderText::Static("Location"), location.into())],
+            headers: headers_of([(HeaderText::Static("Location"), location.into())]),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -255,7 +251,7 @@ impl Response {
     pub fn redirect_permanent(location: &str) -> Self {
         Self {
             status: 301,
-            headers: vec![(HeaderText::Static("Location"), location.into())],
+            headers: headers_of([(HeaderText::Static("Location"), location.into())]),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -271,10 +267,10 @@ impl Response {
         let body = serde_json::to_vec(&value).unwrap_or_default();
         Self {
             status,
-            headers: vec![(
+            headers: headers_of([(
                 HeaderText::Static("Content-Type"),
                 HeaderText::Static("application/json"),
-            )],
+            )]),
             body: Body::Bytes(body),
             verbatim: false,
             template_name: None,
@@ -290,10 +286,10 @@ impl Response {
     pub fn html(s: impl Into<String>) -> Self {
         Self {
             status: 200,
-            headers: vec![(
+            headers: headers_of([(
                 HeaderText::Static("Content-Type"),
                 HeaderText::Static("text/html; charset=utf-8"),
-            )],
+            )]),
             body: Body::Bytes(s.into().into_bytes()),
             verbatim: false,
             template_name: None,
@@ -324,7 +320,7 @@ impl Response {
     pub fn stream(status: u16, len: u64, reader: impl std::io::Read + Send + 'static) -> Self {
         Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::Stream {
                 len,
                 reader: Box::new(reader),
@@ -354,10 +350,10 @@ impl Response {
     pub fn text(s: &str) -> Self {
         Self {
             status: 200,
-            headers: vec![(
+            headers: headers_of([(
                 HeaderText::Static("Content-Type"),
                 HeaderText::Static("text/plain; charset=utf-8"),
-            )],
+            )]),
             body: Body::Bytes(s.as_bytes().to_vec()),
             verbatim: false,
             template_name: None,
@@ -377,7 +373,7 @@ impl Response {
     pub fn status(code: u16) -> Self {
         Self {
             status: code,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -527,6 +523,17 @@ pub(crate) fn head_fields<'a>(
         None
     };
     fields.chain(content_type)
+}
+
+/// A header list holding `items`.
+fn headers_of<const N: usize>(items: [crate::headers::Header; N]) -> Headers {
+    headers_of_iter(items)
+}
+
+fn headers_of_iter(items: impl IntoIterator<Item = crate::headers::Header>) -> Headers {
+    let mut list = Headers::new();
+    list.extend(items);
+    list
 }
 
 /// The default `ETag` for a buffered body: a content hash, unless the response

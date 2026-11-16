@@ -41,7 +41,11 @@ const BASE_IDENTITY_DIFFERENCE: usize = 1;
 ///
 /// 23 before the borrowed response head, which made `Response::text`'s two
 /// header texts and the route's `Cache-Control` borrow a `&'static str`: 21.
-const HANDLER_BUDGET: usize = 21;
+///
+/// 21 before the reusable page context, which made the dictionary overlay, its
+/// built-in values and the response's header list reusable: 16. The 16 are the
+/// owned request's (10), its cookies' (5) and the route handle's (1).
+const HANDLER_BUDGET: usize = 16;
 
 /// The allocations one `/page` request makes with every removal in place.
 ///
@@ -66,7 +70,10 @@ const HANDLER_BUDGET: usize = 21;
 /// render, 2 in `render_to`) and minify-html's (11), and 5 are ours: the
 /// built-in `year` and `datetime` values (2), the dictionary overlay's first
 /// map node and its key insert (2), and the response's header vector (1).
-const TEMPLATE_BUDGET: usize = 27;
+/// The reusable page context then took all five: the overlay and its built-in
+/// values are reused from one request to the next, and the header list is
+/// reused across responses. 22, every one of them Tera's or minify-html's.
+const TEMPLATE_BUDGET: usize = 22;
 
 const BIG: &[u8] = b"GET /big HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
 const RAW: &[u8] = b"GET /raw HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";

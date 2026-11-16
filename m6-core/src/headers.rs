@@ -216,6 +216,11 @@ impl InlineBuf {
         Self::default()
     }
 
+    /// The bytes written, as a `str`.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("only str was written")
+    }
+
     /// The bytes written, as an inline [`HeaderText`].
     pub fn into_text(self) -> HeaderText {
         HeaderText::Inline {
@@ -239,6 +244,115 @@ impl std::fmt::Write for InlineBuf {
 
 /// One response header, name then value.
 pub type Header = (HeaderText, HeaderText);
+
+/// How many header lists one thread keeps for the next response, and how many
+/// headers each starts with.
+const SPARE_HEADER_LISTS: usize = 4;
+const HEADER_LIST_START: usize = 16;
+
+thread_local! {
+    /// Header lists whose response has been sent: cleared, capacity kept. A
+    /// service runs one loop on one thread, so this is the service's own
+    /// reusable header list.
+    ///
+    /// Made with room for every spare it keeps, on the thread's first use, so
+    /// putting a list back never allocates.
+    static SPARE_HEADERS: std::cell::RefCell<Vec<Vec<Header>>> =
+        std::cell::RefCell::new(Vec::with_capacity(SPARE_HEADER_LISTS));
+}
+
+/// Make this thread's spare header lists. Start only: a service calls it before
+/// its loop, so the first response sent allocates nothing for them.
+pub fn warm_spare_lists() {
+    SPARE_HEADERS.with(|_| {});
+}
+
+/// A response's header list. It is a `Vec<Header>` that goes back to a spare
+/// list for this thread when the response is dropped, with its capacity, so the
+/// next response pushes into room that already exists and allocates nothing.
+/// It never shrinks.
+#[derive(Default)]
+pub struct Headers(Vec<Header>);
+
+impl Headers {
+    /// An empty list: a spare one if this thread has one, else one with room for
+    /// sixteen headers.
+    pub fn new() -> Self {
+        Headers(
+            SPARE_HEADERS
+                .with(|s| s.borrow_mut().pop())
+                .unwrap_or_else(|| Vec::with_capacity(HEADER_LIST_START)),
+        )
+    }
+
+    /// The headers as an owned `Vec`, which does not go back to the spares.
+    pub fn into_vec(mut self) -> Vec<Header> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Headers {
+    fn drop(&mut self) {
+        if self.0.capacity() == 0 {
+            return;
+        }
+        let mut list = std::mem::take(&mut self.0);
+        list.clear();
+        SPARE_HEADERS.with(|s| {
+            let mut spare = s.borrow_mut();
+            if spare.len() < SPARE_HEADER_LISTS {
+                spare.push(list);
+            }
+        });
+    }
+}
+
+impl std::ops::Deref for Headers {
+    type Target = Vec<Header>;
+    fn deref(&self) -> &Vec<Header> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Headers {
+    fn deref_mut(&mut self) -> &mut Vec<Header> {
+        &mut self.0
+    }
+}
+
+impl Clone for Headers {
+    fn clone(&self) -> Self {
+        Headers(self.0.clone())
+    }
+}
+
+impl std::fmt::Debug for Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Vec<Header>> for Headers {
+    fn from(v: Vec<Header>) -> Self {
+        Headers(v)
+    }
+}
+
+impl<'a> IntoIterator for &'a Headers {
+    type Item = &'a Header;
+    type IntoIter = std::slice::Iter<'a, Header>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for Headers {
+    type Item = Header;
+    type IntoIter = std::vec::IntoIter<Header>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
 
 /// The largest one request header field, counted as its name plus its value.
 ///
@@ -404,6 +518,20 @@ mod tests {
         }
         assert!(HeaderText::inline(&"x".repeat(23)).is_some());
         assert!(HeaderText::inline(&"x".repeat(24)).is_none());
+    }
+
+    /// A response's header list goes back to a spare one when it is dropped,
+    /// empty and with its room, and the next response takes it.
+    #[test]
+    fn a_header_list_is_reused_by_the_next_response() {
+        let mut first = Headers::new();
+        first.push(("A".into(), "1".into()));
+        let buffer = first.as_ptr();
+        drop(first);
+        let second = Headers::new();
+        assert!(second.is_empty(), "nothing of the last response is left");
+        assert!(second.capacity() >= HEADER_LIST_START);
+        assert_eq!(second.as_ptr(), buffer, "the list is the last one's");
     }
 
     #[test]
