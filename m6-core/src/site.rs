@@ -651,10 +651,18 @@ impl Site {
         }
 
         if let Some(route) = route {
-            // A default, not an override: a handler that decided its own
-            // caching did so per request, and a second `Cache-Control` field
-            // would be two answers to one question.
-            if !crate::headers::contains(&resp.headers[..], "cache-control") {
+            // A `cache` the route's config names replaces whatever the handler
+            // set, as a per-location header does in nginx: the operator's word
+            // for this route outranks the handler's default, and a handler such
+            // as m6-file that computes its own value has no other way to be
+            // told. Without one, `cache` is only a default: a handler that
+            // decided its own caching did so per request, and a second
+            // `Cache-Control` field would be two answers to one question.
+            if route.cache_explicit {
+                resp.headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
+                resp = resp.header("Cache-Control", &route.cache);
+            } else if !crate::headers::contains(&resp.headers[..], "cache-control") {
                 resp = resp.header("Cache-Control", &route.cache);
             }
             // Last-Modified, from the route's own inputs. Only on a success:
@@ -1014,6 +1022,9 @@ pub struct CompiledRoute {
     pub params_files: Vec<String>,
     pub status: u16,
     pub cache: String,
+    /// The route's config named `cache`, so it replaces any `Cache-Control` the
+    /// handler set. Without it `cache` is a default the handler may override.
+    pub cache_explicit: bool,
     pub headers: Vec<(String, String)>,
     /// When this route's rendered output last changed, for `Last-Modified`.
     ///
@@ -1535,12 +1546,11 @@ impl FrameworkState {
         for (pattern, method) in code_routes {
             let segs = compile_pattern(pattern);
             // Look for a matching config route to inherit its cache setting.
-            let cache = config
-                .routes
-                .iter()
-                .find(|r| r.path == *pattern)
+            let config_route = config.routes.iter().find(|r| r.path == *pattern);
+            let cache = config_route
                 .map(|r| r.cache.clone())
                 .unwrap_or_else(|| "no-store".to_string());
+            let cache_explicit = config_route.is_some_and(|r| r.cache_explicit);
             routes.push(CompiledRoute {
                 pattern: pattern.clone(),
                 methods: Methods::from(method),
@@ -1549,6 +1559,7 @@ impl FrameworkState {
                 params_files: vec![],
                 status: 200,
                 cache,
+                cache_explicit,
                 headers: vec![],
                 // A code route renders whatever its handler decides at request
                 // time, so there is no input file whose mtime describes it.
@@ -1574,6 +1585,7 @@ impl FrameworkState {
                 params_files: rc.params.clone(),
                 status: rc.status,
                 cache: rc.cache.clone(),
+                cache_explicit: rc.cache_explicit,
                 headers: rc.headers.clone(),
                 last_modified: None,
                 last_modified_http: None, // filled in below, once templates_mtime is known
@@ -3094,6 +3106,7 @@ mod tests {
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            cache_explicit: false,
             headers: vec![],
             last_modified: None,
             last_modified_http: None,
@@ -3125,6 +3138,7 @@ mod tests {
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            cache_explicit: false,
             headers: vec![],
             last_modified: None,
             last_modified_http: None,
@@ -3149,6 +3163,7 @@ mod tests {
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
+                cache_explicit: false,
                 headers: vec![],
                 last_modified: None,
                 last_modified_http: None,
@@ -3164,6 +3179,7 @@ mod tests {
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
+                cache_explicit: false,
                 headers: vec![],
                 last_modified: None,
                 last_modified_http: None,
@@ -3435,6 +3451,7 @@ mod wildcard_route_tests {
             params_files: Vec::new(),
             status: 200,
             cache: String::new(),
+            cache_explicit: false,
             headers: Vec::new(),
             last_modified: None,
             last_modified_http: None,
@@ -3655,6 +3672,58 @@ mod config_route_handler_tests {
             "the route has no `cache` key, so it defaults to no-store: {head}"
         );
         assert!(head.contains("content-encoding: br"), "{head}");
+    }
+
+    /// The head a service sends for one `GET /f` whose handler set `handler_cc`
+    /// itself, on a route declared by `toml`.
+    fn head_for_handler_cache_control(toml: &str, handler_cc: &str) -> String {
+        let (state, _site_dir) = state_from(toml);
+        let raw = RawRequest {
+            version: "HTTP/1.1".to_string(),
+            method: "GET".to_string(),
+            path: "/f".to_string(),
+            query: None,
+            headers: vec![("Host".to_string(), "localhost".to_string())],
+            body: vec![],
+        };
+        let site = crate::site::Site::from_state(state, vec!["files".to_string()]);
+        let response = match site.handle_raw(raw) {
+            crate::site::Handled::Named(0, req) => site.finish(
+                &req,
+                Response::status(200)
+                    .header("Cache-Control", handler_cc)
+                    .body("x"),
+            ),
+            _ => panic!("the config route names `files`, which is registered"),
+        };
+        let mut out = Vec::new();
+        {
+            let mut resp = crate::h1::Responder::new(&mut out, "GET", false);
+            response.send(&mut resp).expect("the response serialises");
+        }
+        let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        String::from_utf8_lossy(&out[..head_end]).to_ascii_lowercase()
+    }
+
+    /// RFC 9111 section 5.2: a route's `cache` replaces the `Cache-Control` the
+    /// handler set, leaving one field. Without the key the handler's own value
+    /// stands, as before.
+    #[test]
+    fn a_route_cache_replaces_the_cache_control_a_handler_set() {
+        let handler = "public, max-age=0, must-revalidate, s-maxage=86400";
+        let head = head_for_handler_cache_control(
+            "[[route]]\npath = \"/f\"\nhandler = \"files\"\ncache = \"no-store\"\n",
+            handler,
+        );
+        assert_eq!(head.matches("cache-control:").count(), 1, "{head}");
+        assert!(head.contains("cache-control: no-store"), "{head}");
+
+        let head = head_for_handler_cache_control(
+            "[[route]]\npath = \"/f\"\nhandler = \"files\"\n",
+            handler,
+        );
+        assert_eq!(head.matches("cache-control:").count(), 1, "{head}");
+        assert!(head.contains("s-maxage=86400"), "{head}");
     }
 
     const FILES: &str = r#"
@@ -4274,6 +4343,7 @@ mod route_rule_tests {
             params: Vec::new(),
             status: 200,
             cache: "public".to_string(),
+            cache_explicit: false,
             methods: methods.map(|m| m.iter().map(|s| s.to_string()).collect()),
             headers: Vec::new(),
             handler: None,
@@ -4301,6 +4371,7 @@ mod route_rule_tests {
             params_files: Vec::new(),
             status: 200,
             cache: String::new(),
+            cache_explicit: false,
             headers: Vec::new(),
             last_modified: None,
             last_modified_http: None,

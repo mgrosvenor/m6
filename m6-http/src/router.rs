@@ -78,6 +78,9 @@ pub struct RouteEntry {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
+    /// The `Cache-Control` this route sets on every backend reply, replacing the
+    /// backend's own. `None` leaves the backend's header alone.
+    pub cache: Option<String>,
     /// The methods this route answers, fixed at load. `Methods::ANY` when the
     /// route lists none, which is the behaviour every route had before the key
     /// existed.
@@ -134,6 +137,7 @@ impl RouteTable {
                 path: route.path.clone(),
                 backend: route.backend.clone(),
                 require: route.require.clone(),
+                cache: route.cache.clone(),
                 methods: crate::config::route_methods(
                     route.methods.as_deref(),
                     &format!("route \"{}\" ([[route]] number {})", route.path, i + 1),
@@ -193,6 +197,7 @@ impl RouteTable {
                     path: url_path.clone(),
                     backend: rg.backend.clone(),
                     require: rg.require.clone(),
+                    cache: rg.cache.clone(),
                     methods,
                 };
 
@@ -288,6 +293,7 @@ impl RouteTable {
                 path: path.to_string(),
                 backend: "bench".to_string(),
                 require: require.map(str::to_string),
+                cache: None,
                 methods: Methods::ANY,
             };
             router

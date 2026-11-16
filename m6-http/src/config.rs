@@ -692,7 +692,10 @@ pub struct RouteConfig {
     pub backend: String,
     /// Auth requirement e.g. "group:editors" or "role:admin"
     pub require: Option<String>,
-    /// Present only so a `cache` key is refused by name, not wired to anything.
+    /// A `Cache-Control` value that replaces the one the backend set, on every
+    /// reply this route gets. It is the route's word over the handler's default,
+    /// so a handler that builds its own header, such as m6-file, can still be
+    /// told `no-store` for one path. Absent leaves the backend's header alone.
     pub cache: Option<String>,
     /// The methods this route answers, or every method when absent.
     ///
@@ -714,10 +717,23 @@ pub struct RouteGroupConfig {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
-    /// See `RouteConfig::cache` — present only to be refused by name.
+    /// See `RouteConfig::cache`.
     pub cache: Option<String>,
     /// See `RouteConfig::methods`.
     pub methods: Option<Vec<String>>,
+}
+
+/// A route's `cache` becomes a response header, so it must be a value a header
+/// can carry. An empty one would send a `Cache-Control` that says nothing, and a
+/// control character would end the header early.
+fn check_route_cache(cache: Option<&str>, what: &str) -> anyhow::Result<()> {
+    let Some(value) = cache else { return Ok(()) };
+    if value.trim().is_empty() || value.bytes().any(|b| b.is_ascii_control()) {
+        anyhow::bail!(
+            "config error: {what}: cache must be a Cache-Control value such as \"no-store\", with no control characters"
+        );
+    }
+    Ok(())
 }
 
 /// The methods a `[[route]]` or `[[route_group]]` answers, or every method
@@ -1234,12 +1250,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         if !seen_paths.insert(route.path.clone()) {
             anyhow::bail!("config error: duplicate route path `{}`", route.path);
         }
-        if route.cache.is_some() {
-            anyhow::bail!(
-                "config error: [[route]] {}: cache is not an m6-http key. Set Cache-Control on the backend's response instead",
-                route.path
-            );
-        }
+        check_route_cache(route.cache.as_deref(), &format!("[[route]] {}", route.path))?;
     }
 
     // Validate route_groups
@@ -1252,12 +1263,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                 rg.backend
             );
         }
-        if rg.cache.is_some() {
-            anyhow::bail!(
-                "config error: [[route_group]] {}: cache is not an m6-http key. Set Cache-Control on the backend's response instead",
-                rg.path
-            );
-        }
+        check_route_cache(rg.cache.as_deref(), &format!("[[route_group]] {}", rg.path))?;
     }
 
     // Validate auth. The misplaced check above has already refused an [auth] in
@@ -3168,15 +3174,34 @@ domain = "test.example.com"
         assert!(e.contains("metrics_token_file"), "{e}");
     }
 
+    /// A route's `cache` is a `Cache-Control` value the edge sends in place of
+    /// the backend's, so it loads on a `[[route]]` and a `[[route_group]]`.
     #[test]
-    fn a_route_cache_key_is_refused_and_named() {
+    fn a_route_cache_key_loads_on_a_route_and_a_route_group() {
         let (_d, r) = load_with(
-            "[[route]]\npath = \"/x\"\nbackend = \"m6-html\"\ncache = \"no-store\"\n",
+            "[[route]]\npath = \"/x\"\nbackend = \"m6-html\"\ncache = \"no-store\"\n\n\
+             [[route_group]]\nglob = \"content/*.md\"\npath = \"/{stem}\"\nbackend = \"m6-html\"\ncache = \"no-cache\"\n",
             "",
         );
-        let e = r.unwrap_err().to_string();
-        assert!(e.contains("[[route]] /x"), "{e}");
-        assert!(e.contains("Cache-Control"), "{e}");
+        let config = r.unwrap();
+        let route = config.routes.iter().find(|r| r.path == "/x").unwrap();
+        assert_eq!(route.cache.as_deref(), Some("no-store"));
+        let group = config.route_groups.iter().find(|g| g.path == "/{stem}");
+        assert_eq!(group.unwrap().cache.as_deref(), Some("no-cache"));
+    }
+
+    /// A value a header cannot carry is refused at load, naming the route.
+    #[test]
+    fn an_unusable_route_cache_is_refused_and_named() {
+        for bad in ["\"\"", "\"no-store\\r\\nX: y\""] {
+            let (_d, r) = load_with(
+                &format!("[[route]]\npath = \"/x\"\nbackend = \"m6-html\"\ncache = {bad}\n"),
+                "",
+            );
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("[[route]] /x"), "{e}");
+            assert!(e.contains("Cache-Control"), "{e}");
+        }
     }
 
     // ── [cache] dir ────────────────────────────────────────────────────────

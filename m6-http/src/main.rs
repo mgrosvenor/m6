@@ -4793,6 +4793,7 @@ fn handle_request_inner(
                     backend_name: upstream.clone(),
                     kind: forward::PendingKind::Url,
                     route_path: None,
+                    route_cache: None,
                     cacheable: false,
                     is_prefetch: false,
                     start: m6_core::platform::now(),
@@ -5076,6 +5077,7 @@ fn handle_request_inner(
             backend_name: backend_name.clone(),
             kind: forward::PendingKind::Url,
             route_path: None,
+            route_cache: route.cache.clone(),
             cacheable,
             is_prefetch,
             start: m6_core::platform::now(),
@@ -5174,6 +5176,7 @@ fn handle_request_inner(
         backend_name,
         kind: forward::PendingKind::Socket,
         route_path: Some(route.path.clone()),
+        route_cache: route.cache.clone(),
         cacheable,
         is_prefetch,
         start: backend_start,
@@ -5363,6 +5366,7 @@ fn dispatch_custom_error_async(
             backend_name: backend_name.clone(),
             kind: forward::PendingKind::Url,
             route_path: None,
+            route_cache: None,
             cacheable: false,
             is_prefetch: false,
             start: m6_core::platform::now(),
@@ -5397,6 +5401,7 @@ fn dispatch_custom_error_async(
         backend_name: backend_name.clone(),
         kind: forward::PendingKind::Socket,
         route_path: None,
+        route_cache: None,
         cacheable: false,
         is_prefetch: false,
         start: m6_core::platform::now(),
@@ -5643,6 +5648,17 @@ fn invalidate_after_unsafe_method(
 /// which is required — restamping a cached response with the current time
 /// would make it look freshly generated and silently defeat the `Age` header
 /// sitting next to it.
+/// A route's `cache` replaces the backend's `Cache-Control`, as a per-location
+/// header does in nginx. It runs before the cache decision, so the stored copy
+/// and the reply to the client carry the same single field, and `no-store`
+/// stops the store. A miss pays one scan of the reply's headers; a hit never
+/// reaches here.
+fn apply_route_cache(headers: &mut Vec<(String, String)>, route_cache: Option<&str>) {
+    let Some(value) = route_cache else { return };
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
+    headers.push(("Cache-Control".to_string(), value.to_string()));
+}
+
 fn set_date(headers: &mut Vec<(String, String)>) {
     if m6_core::headers::contains(&headers[..], "date") {
         return;
@@ -5843,6 +5859,7 @@ fn complete_socket_response(
             // Stamp Date BEFORE the cache decision so the stored entry carries
             // the generation time.
             set_date(&mut http_resp.headers);
+            apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
@@ -6052,6 +6069,7 @@ fn finalize_url_response_inner(
             // Same as the synchronous path: Date is stamped before the cache
             // decision so the stored entry carries the generation time.
             set_date(&mut http_resp.headers);
+            apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
             match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
                 ReplyRule::Store(stored) => {
                     let key = CacheKey::new(&req.path, req.query.as_deref(), enc);

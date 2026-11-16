@@ -557,9 +557,12 @@ Take from it that a route is a path and a backend, with an optional claim.
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | `"group:<name>"` or `"role:<name>"`. A token must satisfy it |
 | `methods` | array of strings | no | The methods the route answers, such as `["POST"]`. Absent adds no restriction |
+| `cache` | string | no | A `Cache-Control` value, such as `"no-store"`, that replaces the one the backend set on every reply this route gets. Absent leaves the backend's header alone |
 
 **Table 10: the `[[route]]` keys.**
 A `{param}` matches one segment, and a `{*rest}` in the last segment matches the rest of the path.
+A route that names `cache` has that value sent in place of the `Cache-Control` the backend set, so one path can be `no-store` whatever its handler decides.
+The edge applies it before it decides whether to store the reply, so `no-store` keeps the reply out of the cache, and a hit replays the stored value.
 A route that lists `methods` answers exactly those: `GET` also answers `HEAD`, and a request with another method gets 405 with `Allow` before the cache or a backend is touched.
 The names m6 accepts are `GET`, `POST`, `PUT`, `PATCH` and `DELETE`.
 A name outside that set, or an empty list, stops the start with exit 2, and `--dump-config` fails the same way.
@@ -578,6 +581,7 @@ Take from it that the glob is a path on disk and `path` is the URL the file is s
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | As `[[route]]` |
 | `methods` | array of strings | no | As `[[route]]` |
+| `cache` | string | no | As `[[route]]` |
 
 **Table 11: the `[[route_group]]` keys.**
 The glob is expanded once at start, so the routes a group adds are fixed until a restart.
@@ -782,7 +786,7 @@ Exit 2 on:
 - Any route `backend` value not declared in `[[backend]]`
 - A `[[backend]]` `sockets` glob that matches no socket
 - Duplicate `path` values across `[[route]]`
-- `cache` on a `[[route]]` or a `[[route_group]]`
+- `cache` on a `[[route]]` or a `[[route_group]]` that is empty or holds a control character
 - A `methods` list naming a method other than `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or an empty list
 - `[errors] mode = "custom"` without `path`
 - `[auth]` declared but `public_key` file not found
