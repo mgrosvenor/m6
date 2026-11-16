@@ -135,6 +135,13 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`bench.sh --mixed` measures hot-hit p50 and p99 while new full TLS handshakes arrive at a set rate.**
+`./bench.sh --mixed [--mixed-rates 0,50,100,200,500] [--mixed-seconds 10]` reuses `m6-bench`'s existing hit client (one kept-alive HTTP/1.1 connection, the same timer and `percentile` rule) and puts a second load generator beside it: one new TCP connection and one fresh full handshake per arrival, scheduled against absolute deadlines (`start + i/rate`), not a sleep between calls.
+Each load handshake builds a new `ClientConfig`, so no ticket is offered and nothing resumes even though the server installs a ticketer; the run prints the load's own `resumed` count (which must be 0) and a shared-config probe that shows the server would resume if a client offered a ticket (1 of 2 handshakes resumed).
+The achieved rate is printed beside the target, `reached=no` when it is more than 2% under, and handshake p50/p99 are measured around the whole `probe::tls_handshake` call so a rate met by queueing shows in them.
+The hit connection is held for the whole window (`bench.sh` raises `[server] max_requests_per_connection` for this suite), and a reconnect on it, a resumed load handshake or a non-hit response fails the run.
+Verified on macOS arm64 (Apple M4, 10 cores, release, ring, ECDSA P-256) with all five rates reached exactly on a quiet-enough window (1-minute load average 4.3 to 4.9): hot-hit p50 was 17.2 to 20.6 us and p99 31.4 to 39.8 us up to 200 handshakes/s, and at 500/s p99 rose to 199.5 us (5.0x the 0/s baseline) while hit throughput fell from 50.5k/s to 27.8k/s (-45%); that rate's handshake p99 was 7.06 ms against 0.53 ms at 50/s, so the generator was queueing, not under-delivering.
+
 **The gate scripts make ECDSA P-256 certificates, the key type production should run.** `tools/conformance.sh`, `bench.sh` and `tools/memcalls-site.sh` made RSA-2048 ones, so the gates measured a handshake about 4 times dearer than production's (about 410 us against 90 us of server CPU, release build on macOS arm64). `BENCH_KEY=rsa` keeps RSA for `bench.sh`.
 Verified by running `bench.sh --handshake` and the conformance resumption stage on the new certificates (below).
 

@@ -15,6 +15,8 @@
 ///                       keep-alive HTTP/1.1 p50 exceeds H1_VS_H2_P50_MAX_RATIO times h2's
 ///   --h2c               include H2C suites alongside the selected protocols
 ///   --url               include URL-backend suites alongside the selected protocols
+///   --mixed-handshake   hot-hit p50/p99 while full TLS handshakes arrive at a set rate
+///                       (--mixed-rates 0,50,100,200,500 --mixed-seconds 10 --mixed-path /)
 ///   --skip-verify       skip TLS certificate verification
 ///   --latency-n N       requests per latency run (default 2000)
 ///   --duration S        throughput run duration in seconds (default 10)
@@ -62,6 +64,14 @@ struct Args {
     /// `full`, `resumed` or `early` (QUIC 0-RTT).
     handshake_kind: String,
     handshake_n: usize,
+    /// Run the mixed hot-hit suite instead of the request suites.
+    mixed_handshake: bool,
+    /// Handshake arrival rates to run, in new full handshakes per second.
+    mixed_rates: Vec<u32>,
+    /// Seconds of hits and handshake load at each rate.
+    mixed_seconds: u64,
+    /// The hot path fetched on the kept-alive connection.
+    mixed_path: String,
 }
 
 impl Args {
@@ -86,6 +96,10 @@ impl Args {
             handshake: false,
             handshake_kind: "full".into(),
             handshake_n: 1000,
+            mixed_handshake: false,
+            mixed_rates: vec![0, 50, 100, 200, 500],
+            mixed_seconds: 10,
+            mixed_path: "/".into(),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -134,6 +148,19 @@ impl Args {
                     a.url = false;
                 }
                 "--handshake" => a.handshake = true,
+                "--mixed-handshake" => a.mixed_handshake = true,
+                "--mixed-rates" => {
+                    i += 1;
+                    a.mixed_rates = parse_rate_list(&raw[i]);
+                }
+                "--mixed-seconds" => {
+                    i += 1;
+                    a.mixed_seconds = raw[i].parse().expect("mixed-seconds");
+                }
+                "--mixed-path" => {
+                    i += 1;
+                    a.mixed_path = raw[i].clone();
+                }
                 "--handshake-kind" => {
                     i += 1;
                     a.handshake_kind = raw[i].clone();
@@ -1824,6 +1851,9 @@ fn main() {
     if args.handshake {
         std::process::exit(run_handshake_suite(&args));
     }
+    if args.mixed_handshake {
+        std::process::exit(run_mixed_handshake_suite(&args));
+    }
     let mut all_pass = true;
 
     let run_latency = !args.throughput_only && !args.path_only;
@@ -2313,6 +2343,369 @@ fn run_handshake_suite(args: &Args) -> i32 {
     }
     println!("HANDSHAKES_SERVED {served}");
     i32::from(failures > 0 || ok == 0 || (kind == "resumed" && resumed == 0))
+}
+
+// ── Mixed hot hits and full-handshake load ───────────────────────────────────
+//
+// The existing hot-hit number is measured on a warm cache with nothing else on
+// the server. A real edge serves those hits while new visitors arrive and do a
+// full TLS handshake. This mode runs the SAME hit client (`H1Client`, one
+// kept-alive connection, the same timer and `percentile` rule) while a second
+// thread opens new TCP connections and does a fresh full handshake at a set
+// arrival rate.
+//
+// What is held constant, so the only difference between rows is the load:
+//
+//   * the hit connection is opened and warmed BEFORE the clock starts, and is
+//     not reconnected during the window. A reconnect would inject a handshake
+//     the arrival rate does not account for, so the server's
+//     `max_requests_per_connection` is raised by bench.sh for this suite and
+//     any reconnect is counted and fails the run.
+//   * every load handshake uses a NEW `probe::tls_config` (and therefore a cold
+//     session store) on a NEW TCP connection. No ticket is offered, so these
+//     are full handshakes even though the server can resume (it installs a
+//     ticketer). The run prints the client's own `resumed` count, which must be
+//     zero, and a shared-config probe that shows the server would resume if a
+//     client offered a ticket.
+//
+// The arrival rate is scheduled against absolute deadlines, not "sleep between
+// calls": arrival i is due at start + i/rate. The achieved rate is the number of
+// completed full handshakes divided by the window, printed BESIDE the target,
+// and `reached=no` when it is more than 2% under. Handshake latency is measured
+// around the whole `probe::tls_handshake` call, so it includes TCP connect and
+// any accept-queue wait; a run that meets its rate only by queueing shows that
+// in the handshake p50/p99. (The server-side handshake figure excludes connect.)
+
+/// One rate's result. Latencies are microseconds for hits and milliseconds for
+/// handshakes, matching the rest of this file.
+struct MixedRate {
+    target: u32,
+    achieved: f64,
+    reached: bool,
+    hs: Vec<Duration>,
+    hs_resumed: usize,
+    hs_failed: usize,
+    hs_late: usize,
+    hs_scheduled: usize,
+    hits: Vec<f64>,
+    hits_with_age: usize,
+    non200: usize,
+    reconnects: usize,
+    window: Duration,
+}
+
+/// The load thread's half of one rate.
+struct MixedLoad {
+    samples: Vec<Duration>,
+    resumed: usize,
+    failed: usize,
+    late: usize,
+    scheduled: usize,
+}
+
+fn parse_rate_list(raw: &str) -> Vec<u32> {
+    raw.split(',')
+        .filter_map(|v| v.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn sleep_until(deadline: Instant) {
+    // The platform layer owns the clock; the gate refuses a direct read here.
+    let now = m6_core::platform::now();
+    if now < deadline {
+        std::thread::sleep(deadline - now);
+    }
+}
+
+/// Is `name` (including its colon) a header in the response head?
+///
+/// A cached hit is the only path that writes `Age`, so this is the hit-ratio
+/// signal. It runs AFTER the hit's latency is recorded and is not on the timed
+/// path.
+fn response_has_header(resp: &[u8], name: &[u8]) -> bool {
+    let head_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(resp.len());
+    let head = &resp[..head_end];
+    let mut at = 0;
+    while let Some(pos) = head[at..]
+        .windows(name.len())
+        .position(|w| w.eq_ignore_ascii_case(name))
+    {
+        let abs = at + pos;
+        if abs == 0 || head[abs - 1] == b'\n' {
+            return true;
+        }
+        at = abs + 1;
+        if at >= head.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Arrival-rate scheduled load: one new TCP connection and one fresh full TLS
+/// handshake per iteration, at most one in flight.
+fn handshake_load(addr: String, target: u32, start: Instant, window: Duration) -> MixedLoad {
+    let scheduled = (u64::from(target) * window.as_secs()) as usize;
+    let mut out = MixedLoad {
+        samples: Vec::with_capacity(scheduled),
+        resumed: 0,
+        failed: 0,
+        late: 0,
+        scheduled,
+    };
+    if target == 0 {
+        return out;
+    }
+    let interval = Duration::from_secs_f64(1.0 / f64::from(target));
+    let deadline = start + window;
+    for i in 0..scheduled {
+        sleep_until(start + interval * i as u32);
+        let issued = m6_core::platform::now();
+        if issued >= deadline {
+            break;
+        }
+        if issued.saturating_duration_since(start + interval * i as u32) > Duration::from_millis(1)
+        {
+            out.late += 1;
+        }
+        // A fresh config per handshake: no session store, so no ticket is
+        // offered and the handshake is full. A new TcpStream is opened inside
+        // `tls_handshake`.
+        let cfg = probe::tls_config(b"http/1.1");
+        let t0 = m6_core::platform::now();
+        match probe::tls_handshake(&addr, cfg) {
+            Ok(h) => {
+                out.resumed += usize::from(h.resumed);
+                // Around the whole call, so this includes TCP connect and any
+                // time the connection waited in the accept queue.
+                out.samples.push(t0.elapsed());
+            }
+            Err(e) => {
+                out.failed += 1;
+                if out.failed <= 3 {
+                    eprintln!("mixed: handshake load failed: {e}");
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_mixed_rate(
+    addr: &str,
+    path: &str,
+    target: u32,
+    seconds: u64,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<MixedRate> {
+    let window = Duration::from_secs(seconds);
+    // The hit connection is opened and warmed before the window. Its handshake
+    // and the first requests fill the cache; neither is in the measurement.
+    let mut client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+    for _ in 0..5 {
+        client.get(path)?;
+    }
+
+    // A short lead so the load thread is running before the first arrival.
+    let start = m6_core::platform::now() + Duration::from_millis(100);
+    let load = if target == 0 {
+        None
+    } else {
+        let addr = addr.to_string();
+        Some(std::thread::spawn(move || {
+            handshake_load(addr, target, start, window)
+        }))
+    };
+
+    sleep_until(start);
+    let deadline = start + window;
+    let mut hits: Vec<f64> = Vec::new();
+    let mut hits_with_age = 0usize;
+    let mut non200 = 0usize;
+    let mut reconnects = 0usize;
+
+    while m6_core::platform::now() < deadline {
+        let t0 = m6_core::platform::now();
+        let resp = match client.get(path) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // A server that closes the kept-alive connection at its default
+                // 100 requests would inject extra handshakes. Count it; refuse
+                // the run rather than measure a rate that is not the target.
+                reconnects += 1;
+                eprintln!("mixed: hit connection closed ({e}); reconnecting");
+                client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+                continue;
+            }
+        };
+        let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
+        hits.push(elapsed);
+        let status = parse_http11_status(&resp);
+        if status == 200 {
+            if response_has_header(&resp, b"age:") {
+                hits_with_age += 1;
+            }
+        } else {
+            non200 += 1;
+        }
+    }
+
+    let load = match load {
+        Some(h) => h
+            .join()
+            .map_err(|_| anyhow::anyhow!("handshake load thread panicked"))?,
+        None => MixedLoad {
+            samples: Vec::new(),
+            resumed: 0,
+            failed: 0,
+            late: 0,
+            scheduled: 0,
+        },
+    };
+
+    let achieved = load.samples.len() as f64 / window.as_secs_f64();
+    // The 2% tolerance applies to the count as well as the rate: the last
+    // scheduled arrival can still be in flight when the window closes.
+    let reached = target == 0
+        || (achieved >= f64::from(target) * 0.98
+            && load.failed == 0
+            && load.samples.len() >= (load.scheduled as f64 * 0.98) as usize);
+
+    Ok(MixedRate {
+        target,
+        achieved,
+        reached,
+        hs: load.samples,
+        hs_resumed: load.resumed,
+        hs_failed: load.failed,
+        hs_late: load.late,
+        hs_scheduled: load.scheduled,
+        hits,
+        hits_with_age,
+        non200,
+        reconnects,
+        window,
+    })
+}
+
+fn print_mixed_rate(r: &MixedRate) {
+    let mut hs = r.hs.clone();
+    let summary = probe::summarise(&mut hs);
+    let (hs_p50, hs_p99) = match summary {
+        Some(s) => (s.p50.as_secs_f64() * 1000.0, s.p99.as_secs_f64() * 1000.0),
+        None => (0.0, 0.0),
+    };
+    let hits_n = r.hits.len();
+    let hit_ratio = if hits_n == 0 {
+        0.0
+    } else {
+        r.hits_with_age as f64 / hits_n as f64
+    };
+    let hit_p50 = percentile(r.hits.clone(), 50);
+    let hit_p99 = percentile(r.hits.clone(), 99);
+    let hit_max = percentile(r.hits.clone(), 100);
+    println!(
+        "MIX target={} achieved={:.1} reached={} hs_n={} hs_scheduled={} hs_resumed={} \
+         hs_failed={} hs_late={} hs_p50_ms={:.3} hs_p99_ms={:.3} \
+         hits_n={} hit_rate={:.1} hit_p50_us={:.1} hit_p99_us={:.1} hit_max_us={:.1} \
+         hit_ratio={:.3} non200={} hit_reconnects={}",
+        r.target,
+        r.achieved,
+        if r.reached { "yes" } else { "no" },
+        r.hs.len(),
+        r.hs_scheduled,
+        r.hs_resumed,
+        r.hs_failed,
+        r.hs_late,
+        hs_p50,
+        hs_p99,
+        hits_n,
+        hits_n as f64 / r.window.as_secs_f64(),
+        hit_p50,
+        hit_p99,
+        hit_max,
+        hit_ratio,
+        r.non200,
+        r.reconnects
+    );
+}
+
+/// Hot-hit p50/p99 at each handshake arrival rate. Returns non-zero if a rate
+/// was not reached, a load handshake resumed or failed, the hit connection had
+/// to reconnect, or the responses were not cache hits.
+fn run_mixed_handshake_suite(args: &Args) -> i32 {
+    if args.mixed_rates.is_empty() {
+        eprintln!("mixed: --mixed-rates is empty");
+        return 2;
+    }
+    if args.mixed_seconds == 0 {
+        eprintln!("mixed: --mixed-seconds must be at least 1");
+        return 2;
+    }
+
+    println!(
+        "MIXED-HANDSHAKE addr={} path={} seconds={} rates={:?}",
+        args.addr, args.mixed_path, args.mixed_seconds, args.mixed_rates
+    );
+
+    // Resumption is configured on the server (http11.rs installs a ticketer), so
+    // prove it empirically with one client that DOES offer its ticket. The load
+    // below never does.
+    let shared = probe::tls_config(b"http/1.1");
+    let (mut proof_full, mut proof_resumed) = (0usize, 0usize);
+    for _ in 0..2 {
+        match probe::tls_handshake(&args.addr, Arc::clone(&shared)) {
+            Ok(h) => {
+                if h.resumed {
+                    proof_resumed += 1;
+                } else {
+                    proof_full += 1;
+                }
+            }
+            Err(e) => eprintln!("mixed: resumption probe failed: {e}"),
+        }
+    }
+    println!(
+        "RESUMPTION server=on ticketer=crypto::ticketer proof_full={proof_full} \
+         proof_resumed={proof_resumed} load=fresh-ClientConfig-per-handshake"
+    );
+
+    let tls_cfg = make_client_config(args.skip_verify);
+    let mut all_ok = true;
+    for &target in &args.mixed_rates {
+        match run_mixed_rate(
+            &args.addr,
+            &args.mixed_path,
+            target,
+            args.mixed_seconds,
+            Arc::clone(&tls_cfg),
+        ) {
+            Ok(r) => {
+                let ok = r.reached
+                    && r.hs_resumed == 0
+                    && r.hs_failed == 0
+                    && r.reconnects == 0
+                    && !r.hits.is_empty()
+                    && r.non200 == 0
+                    && r.hits_with_age == r.hits.len();
+                print_mixed_rate(&r);
+                if !ok {
+                    all_ok = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("mixed: rate {target}: {e}");
+                all_ok = false;
+            }
+        }
+        // Let the server finish closing the last load connections before the
+        // next rate, so a rate does not inherit the previous one's backlog.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    i32::from(!all_ok)
 }
 
 #[cfg(test)]
