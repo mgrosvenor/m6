@@ -524,6 +524,12 @@ Section 4.1 states the same split for the request counters.
 The backend name identifies the three endpoints and the peer address identifies the rest, so no header and no configuration key is involved.
 Every monitor request also moves `monitor_requests_total`, and none of them moves `requests_total` or the hit and miss counters.
 
+`/perf` splits the cache counts four ways.
+`cache_hits_valid_total` counts a hit on an entry inside its freshness lifetime, and `cache_hits_invalid_total` a stale serve under `stale-while-revalidate` or the client's `max-stale`.
+`cache_misses_fetched_total` counts a miss answered by fetching a backend, and `cache_misses_answered_locally_total` a miss m6-http answered itself, such as the route-table 404.
+The valid and invalid hits add up to `cache_hits_total`, and the two misses add up to `cache_misses_total`.
+A response fetched from a backend moves `requests_total`, the response-code table and the miss counts when the fetch completes, and a backend 5xx moves `backend_errors_total`, so the hit rate is a measured one.
+
 | Key | Where | Meaning |
 |---|---|---|
 | `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. An absolute path |
@@ -819,6 +825,10 @@ One thread, one edge-triggered `m6_core::platform::Poll` loop, no async runtime.
 - No `unwrap()` or `expect()`
 - No blocking calls in event loop
 - H2C and H2S client pools driven in the event loop alongside TLS/QUIC listeners
+
+An HTTP/2 connection sends in the same way: `send_until_blocked` frames and writes until the socket would block or no stream has credit left, and the writable edge the loop then waits for runs it again.
+The send queue holds one 16 KiB frame batch at a time, so a body of any size is sent in many passes, and a single pass would stop at 32 KiB because a socket that took every byte never reports a new edge.
+`rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` fetch each size with a client that announces a browser's windows.
 
 The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
 Every connection and every upstream gets its own `Token(k)` in the `Slots` table.

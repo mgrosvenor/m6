@@ -167,10 +167,22 @@ Take from it that `cache` is the one input, and that `headers` does not replace.
 
 An ACME challenge path, a one-time download or a health file takes `cache = "no-store"` on its route.
 Set it in both configs when the file is served through the edge: the edge stops storing the reply, and m6-file stops advertising a day to anything else in front of it.
-It is tracked as issue #126.
 
 So the handler decides the bytes, the encoding and the validator, and a route can override the caching.
 What a route does bound is which files can be reached at all, which is the next section.
+
+### 4.2. Tail mode
+
+A route with `tail = true` serves a file from a byte offset, which is how a browser follows a growing log.
+`GET <path>?offset=N` returns the bytes from `N` to the end of the file, and `X-Log-End` names the byte where the reply ended, so the client asks next from there.
+`GET <path>?n=N` with no offset returns the last `N` lines, and `X-Log-End` is the end of the file.
+The reply is `Cache-Control: no-store`.
+
+One reply reads at most one page, which is `[limits.tail_read] max`, 512 KiB by default (`m6-app-anatomy.md` §4.2, Table 6).
+A client further behind than a page reads the next page from `X-Log-End`, and loses nothing.
+A last-`N`-lines request scans back from the end of the file in a window that starts at `[limits.tail_read] start`, 64 KiB, and doubles until it holds `N` lines.
+When `N` lines do not fit in one page the reply is 413, and its body and the log line name `[limits.tail_read] max` and the file to raise it in.
+The limit is a top-level `[limits.tail_read]` table in `m6-file.conf`.
 
 ## 5. Refusing to serve outside its root
 
@@ -258,7 +270,7 @@ The summary below collects what they imply.
 
 m6-file is a small service with one handler and its own route table.
 The table is the part to remember, because a static file needs a route in `site.toml` to reach m6-file and a route in `m6-file.conf` to reach the disk.
-Its handler owns the whole response, including the ETag and `Cache-Control`, which no route can currently override.
+Its handler owns the whole response, including the ETag and `Cache-Control`, and a route's `cache` replaces that `Cache-Control`.
 Its root bounds what it can serve, which is why the layout document treats that root as a security boundary rather than a convenience.
 Every route's root is walked once at start, and section 6 gives the entries that stop the start and the size budget that warns about a tree grown too large.
 

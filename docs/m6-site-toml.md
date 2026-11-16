@@ -804,6 +804,7 @@ Exit 2 on:
 - `[auth]` in `site.toml`, in a two-file config
 - A system config with no `[node]`
 - `[log] level` unrecognised
+- `[server] reuse_port_processes = 0`, a `process_index` that is not below `reuse_port_processes`, a `status_bind` with no `process_index`, or a `status_bind` port plus `process_index` past 65535
 - `[limits]` with an unknown limit, an unknown key, a value that is not a size, a zero, or a `max` below its `start`
 - Any route missing `path` or `backend`
 - Any route `backend` value not declared in `[[backend]]`

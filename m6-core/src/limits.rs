@@ -116,8 +116,8 @@ pub const NDJSON_PAGE: LimitSpec = bytes("ndjson_page", 4 * MIB, 64 * MIB);
 pub const TAIL_READ: LimitSpec = bytes("tail_read", 64 * KIB, 512 * KIB);
 /// One operational log destination's buffer.
 pub const LOG_BUFFER: LimitSpec = bytes("log_buffer", 16 * KIB, MIB);
-/// The longest string field of one log line. A longer value is cut and ends in
-/// `...`.
+/// The longest string field of one log line. A line with a longer value is
+/// refused whole.
 pub const LOG_FIELD: LimitSpec = bytes("log_field", 8 * KIB, 8 * KIB);
 /// The edge's read buffer for one HTTP/1.1 connection, and so the largest
 /// request it accepts.

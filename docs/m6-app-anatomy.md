@@ -442,7 +442,7 @@ m6-http reads its keys from the `[limits]` table of its system config, and every
 **Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
 Take from it that every limit is one `start` and one `max`, and that a limit past its maximum refuses the work with an error naming the key, except the cache, which evicts by design.
 
-The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 431, and the HTTP/2 reset memory is derived as twice the concurrency cap (200 streams at the cap of 100), so it stays above the cap whatever the cap is and has no key of its own.
+The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 400 (414 for a request line), and the HTTP/2 reset memory is derived as twice the concurrency cap (200 streams at the cap of 100), so it stays above the cap whatever the cap is and has no key of its own.
 
 ```toml
 [limits.render_page]

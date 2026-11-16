@@ -627,7 +627,7 @@ logic of its own. It takes `Write` as well as `Read` because a client that sent
 has to happen before the read that would otherwise deadlock.
 
 Two bounds, guarding different things: `MAX_REQUEST_HEAD` of head through the
-shared parser, then 16 MB of body. It reads in chunks rather than one byte per
+shared parser, then the body up to `[limits.request_body] max`, 16 MiB by default and answered 413 past it. It reads in chunks rather than one byte per
 `read()` call, because `server` hands it a raw `UnixStream` with nothing
 buffering.
 

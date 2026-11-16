@@ -206,7 +206,8 @@ The only process that listens on a public port.
 
 **Performance design:**
 - Zero heap allocation on the hot path (cached responses)
-- Stack-allocated header buffer (8 KiB) for request parsing
+- Every buffer and queue starts small, grows by doubling and never shrinks, and a request past its `[limits]` maximum is refused with an error that names the key (`docs/m6-site-toml.md` §4.14)
+- A request head is bounded at 8 KiB per field and 32 KiB in all, answered 400 past either, or 414 for a request line over 8 KiB
 - `write_decimal` uses a 20-byte stack buffer instead of `format!`
 - `Arc` cache swapped atomically, never mutated in place
 
@@ -741,10 +742,10 @@ The two remaining h3spec failures are QPACK stream errors inside quiche, accepte
 
 **Out of scope (by design):**
 - Windows
-- Rate limiting outside of m6-auth login
+- Rate limiting beyond m6-http's per-address request limit and m6-auth's login limit
 - Built-in OAuth2 / OIDC provider
 - MFA / WebAuthn
-- Horizontal scaling of m6-http itself (it scales vertically via caching, and globally via edge nodes)
+- Horizontal scaling of m6-http itself as the design (it scales vertically via caching, and globally via edge nodes; `[server] reuse_port` lets several processes share the port, and `docs/m6-site-toml.md` §4.2 gives its limits)
 - **HTTP/2 server push** and **103 Early Hints** were both implemented and removed on 2026-09-18.
   See below.
 

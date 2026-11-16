@@ -1483,6 +1483,7 @@ One window of one node stores at most 100 crawler sightings, the ones with the m
 The `/crawlers` key `sightings_dropped` says how many were left out.
 On Unix the monitor creates the directory with mode 0700 and the file with mode 0600, because the file holds client addresses.
 A write that fails is a warning on node `monitor` and never stops polling.
+While the history file is locked the monitor holds the polls in memory, up to `[limits.history_queue] max` (1024 polls, `m6-app-anatomy.md` §4.2), and a poll past that is refused and counted instead of dropping the oldest.
 A prune that fails, or a cap that deleting every earlier poll cannot meet, is its own warning, and the poll is still stored.
 To start fresh, stop the service, delete the file and start it again.
 
