@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{binary, read_response, wait, Service, RESPONSE_BOUND};
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
 
@@ -141,20 +141,22 @@ fn seed_user(site_dir: &Path, username: &str, password: &str) {
 }
 
 /// Send a raw HTTP request over a Unix socket and return the full response bytes.
-fn http_request(socket_path: &Path, request: &str) -> String {
+///
+/// The wait is on the response event or the service's exit, with
+/// [`RESPONSE_BOUND`] as the safety net; a read deadline would guess at the
+/// cost-12 verify the unknown-user path performs.
+fn http_request(svc: &mut Service, socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3).
     let method = request.split(' ').next().unwrap_or("");
-    let resp = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let resp = read_response(svc, stream, method, RESPONSE_BOUND).unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&resp).into_owned()
 }
 
 fn http_request_with_body(
+    svc: &mut Service,
     socket_path: &Path,
     method: &str,
     path: &str,
@@ -169,7 +171,7 @@ fn http_request_with_body(
         body.len(),
         body
     );
-    http_request(socket_path, &req)
+    http_request(svc, socket_path, &req)
 }
 
 fn parse_status(resp: &str) -> u16 {
@@ -204,9 +206,10 @@ fn get_all_headers<'a>(resp: &'a str, name: &str) -> Vec<&'a str> {
 fn failed_form_and_json_login_sets_no_set_cookie() {
     let env = setup_test_env("no-cookie");
     seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let form = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -221,6 +224,7 @@ fn failed_form_and_json_login_sets_no_set_cookie() {
     );
 
     let json = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -245,11 +249,12 @@ fn failed_form_and_json_login_sets_no_set_cookie() {
 fn unknown_user_and_wrong_password_receive_identical_responses() {
     let env = setup_test_env("no-enumeration");
     seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Form: the same 302 to the login error page, whether the user is unknown
     // or the password is wrong.
     let form_wrong = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -257,6 +262,7 @@ fn unknown_user_and_wrong_password_receive_identical_responses() {
         "username=alice&password=wrong_pass",
     );
     let form_ghost = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -271,6 +277,7 @@ fn unknown_user_and_wrong_password_receive_identical_responses() {
 
     // JSON: the same 401 and body.
     let json_wrong = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -278,6 +285,7 @@ fn unknown_user_and_wrong_password_receive_identical_responses() {
         r#"{"username":"alice","password":"wrong_pass"}"#,
     );
     let json_ghost = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",

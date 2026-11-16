@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use m6_core::testkit::{assert_app_lifecycle, binary, spawn_instances, wait, Service};
+use m6_core::testkit::{
+    assert_app_lifecycle, binary, read_response, spawn_instances, wait, Service, RESPONSE_BOUND,
+};
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
 
@@ -189,21 +191,29 @@ fn hold_write_lock(db_path: &Path) -> rusqlite::Connection {
 }
 
 /// Send a raw HTTP request over a Unix socket and return the full response bytes.
-fn http_request(socket_path: &Path, request: &str) -> String {
-    http_request_within(socket_path, request, Duration::from_secs(10))
+fn http_request(svc: &mut Service, socket_path: &Path, request: &str) -> String {
+    http_request_within(svc, socket_path, request, RESPONSE_BOUND)
 }
 
-/// `http_request` with a read deadline, for a response that must arrive while
-/// the service is holding another request.
-fn http_request_within(socket_path: &Path, request: &str, read_timeout: Duration) -> String {
+/// Send one request and wait for its response, or for `svc` to exit.
+///
+/// The wait is [`m6_core::testkit::read_response`]: the response event or the
+/// child's exit, with `RESPONSE_BOUND` as the safety net. `within` lets the two
+/// tests that assert a prompt answer pass their own bound; the silent-service
+/// test calls the testkit waiter directly to prove the bound itself fails.
+fn http_request_within(
+    svc: &mut Service,
+    socket_path: &Path,
+    request: &str,
+    within: Duration,
+) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream.set_read_timeout(Some(read_timeout)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3).
     let method = request.split(' ').next().unwrap_or("");
-    let resp = m6_core::testkit::read_one(&mut stream, method)
-        .unwrap_or_else(|e| panic!("no response within {read_timeout:?}: {e}"));
+    let resp = m6_core::testkit::read_response(svc, stream, method, within)
+        .unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&resp).into_owned()
 }
 
@@ -226,6 +236,7 @@ fn login_json_request(body: &str) -> String {
 }
 
 fn http_request_with_body(
+    svc: &mut Service,
     socket_path: &Path,
     method: &str,
     path: &str,
@@ -233,6 +244,7 @@ fn http_request_with_body(
     body: &str,
 ) -> String {
     http_request(
+        svc,
         socket_path,
         &request_with_body(method, path, content_type, body),
     )
@@ -279,10 +291,11 @@ fn get_all_headers<'a>(resp: &'a str, name: &str) -> Vec<&'a str> {
 fn t01_login_form_valid_credentials_302_cookies() {
     let env = setup_test_env("t01");
     seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = "username=alice&password=correct_pass&next=/dashboard";
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -329,10 +342,11 @@ fn t01_login_form_valid_credentials_302_cookies() {
 fn t02_login_json_valid_credentials_200_no_cookies() {
     let env = setup_test_env("t02");
     seed_user(&env.site_dir, "bob", "pass123");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = r#"{"username":"bob","password":"pass123"}"#;
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -369,10 +383,11 @@ fn t02_login_json_valid_credentials_200_no_cookies() {
 fn t03_login_form_wrong_password_302_error() {
     let env = setup_test_env("t03");
     seed_user(&env.site_dir, "carol", "right_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = "username=carol&password=wrong_pass";
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -393,10 +408,11 @@ fn t03_login_form_wrong_password_302_error() {
 fn t03b_login_json_wrong_password_401() {
     let env = setup_test_env("t03b");
     seed_user(&env.site_dir, "dave", "right_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = r#"{"username":"dave","password":"wrong_pass"}"#;
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -414,7 +430,7 @@ fn t04_login_rate_limited_429() {
     // A real user with a cost-4 hash: a missing user costs a cost-12 verify,
     // CPU work that a loaded host stretches past the read deadline.
     seed_user(&env.site_dir, "mallory", "right");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // The first attempt is an unknown user, so a failure that never reached
     // credential verification still counts. The rest name the seeded user,
@@ -428,6 +444,7 @@ fn t04_login_rate_limited_429() {
     for attempt in 0..5 {
         let body = if attempt == 0 { unknown } else { known };
         let resp = http_request_with_body(
+            &mut guard,
             &env.socket_path,
             "POST",
             "/auth/login",
@@ -450,6 +467,7 @@ fn t04_login_rate_limited_429() {
 
     // 6th attempt must be 429
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -484,12 +502,7 @@ fn limit_failures_to(env: &TestEnv, n: u32) {
 /// Send one wrong JSON login carrying the extra header lines in `forwarded`,
 /// and return its status. `forwarded` is each header line ending in `\r\n`, or
 /// an empty string for none.
-///
-/// The user is seeded at the fixture's cost 4. An unknown name would take the
-/// cost-12 dummy hash path, seconds per attempt in this profile, and the
-/// limiter tests measure the bucket and not that path. The unknown-user path
-/// has its own test in `login_failures.rs`.
-fn failed_login(socket: &Path, forwarded: &str) -> u16 {
+fn failed_login(svc: &mut Service, socket: &Path, forwarded: &str) -> u16 {
     let body = r#"{"username":"mallory","password":"bad"}"#;
     let req = format!(
         "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
@@ -497,7 +510,7 @@ fn failed_login(socket: &Path, forwarded: &str) -> u16 {
         body.len(),
         body,
     );
-    let resp = http_request(socket, &req);
+    let resp = http_request(svc, socket, &req);
     parse_status(&resp)
 }
 
@@ -512,48 +525,49 @@ fn forwarded_addresses_select_the_rate_limit_bucket() {
     let env = setup_test_env("rate-limit-bucket");
     limit_failures_to(&env, 2);
     seed_user(&env.site_dir, "mallory", "right");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
     let socket = &env.socket_path;
 
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.10\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.10, first failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.10\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.10, second failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.10\r\n"),
         429,
         "X-Forwarded-For: 192.0.2.10, third failure, expected 429"
     );
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.11\r\n"),
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.11\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.11, a second address is not blocked, expected 401"
     );
 
     assert_eq!(
-        failed_login(socket, "X-Real-IP: 192.0.2.12\r\n"),
+        failed_login(&mut guard, socket, "X-Real-IP: 192.0.2.12\r\n"),
         401,
         "X-Real-IP: 192.0.2.12, first failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, "X-Real-IP: 192.0.2.12\r\n"),
+        failed_login(&mut guard, socket, "X-Real-IP: 192.0.2.12\r\n"),
         401,
         "X-Real-IP: 192.0.2.12, second failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, "X-Real-IP: 192.0.2.12\r\n"),
+        failed_login(&mut guard, socket, "X-Real-IP: 192.0.2.12\r\n"),
         429,
         "X-Real-IP: 192.0.2.12, third failure, expected 429"
     );
 
     assert_eq!(
         failed_login(
+            &mut guard,
             socket,
             "X-Forwarded-For: 192.0.2.11\r\nX-Real-IP: 192.0.2.10\r\n"
         ),
@@ -571,26 +585,26 @@ fn requests_without_a_forwarded_address_share_one_bucket() {
     let env = setup_test_env("rate-limit-unix-bucket");
     limit_failures_to(&env, 2);
     seed_user(&env.site_dir, "mallory", "right");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
     let socket = &env.socket_path;
 
     assert_eq!(
-        failed_login(socket, ""),
+        failed_login(&mut guard, socket, ""),
         401,
         "no header, first failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, ""),
+        failed_login(&mut guard, socket, ""),
         401,
         "no header, second failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, ""),
+        failed_login(&mut guard, socket, ""),
         429,
         "no header, third failure, expected 429"
     );
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.20\r\n"),
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.20\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.20, a forwarded address is not blocked by the unix bucket, expected 401"
     );
@@ -609,17 +623,17 @@ fn a_restart_forgets_the_failure_counts() {
     let socket = &env.socket_path;
 
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        failed_login(&mut svc, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.30, first failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        failed_login(&mut svc, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.30, second failure, expected 401"
     );
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        failed_login(&mut svc, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
         429,
         "X-Forwarded-For: 192.0.2.30, third failure, expected 429"
     );
@@ -630,12 +644,46 @@ fn a_restart_forgets_the_failure_counts() {
         svc.output()
     );
 
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
     assert_eq!(
-        failed_login(socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
         401,
         "X-Forwarded-For: 192.0.2.30, after restart, expected 401"
     );
+}
+
+/// A service that accepts the request and never answers fails at the bound,
+/// rather than hanging the suite.
+///
+/// The child is a stand-in process because the subject is the wait, and a real
+/// m6-auth-server does not hang on demand. The listener accepts and reads the
+/// request, so the connection is live and silent, which is the case the old
+/// fixed read deadline guessed at. The bound is shortened here so the proof
+/// costs 200 ms; `http_request` uses the full [`RESPONSE_BOUND`].
+#[test]
+fn a_silent_service_fails_at_the_response_bound() {
+    let env = setup_test_env("silent-service");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&env.socket_path).expect("bind the silent listener");
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("accept the request");
+        let mut request = [0u8; 1024];
+        let _ = std::io::Read::read(&mut conn, &mut request);
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let mut svc = Service::spawn("silent-service", Command::new("sleep").arg("2"));
+    let mut stream = UnixStream::connect(&env.socket_path).expect("connect the silent listener");
+    stream
+        .write_all(b"GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the request");
+    let err = read_response(&mut svc, stream, "GET", Duration::from_millis(200))
+        .expect_err("a silent service must not be waited for forever");
+    assert!(
+        err.contains("no response within"),
+        "the wait must name the bound it passed: {err}"
+    );
+    server.join().expect("the silent listener thread");
 }
 
 /// Refresh: valid refresh cookie → 302, new session cookie.
@@ -643,11 +691,12 @@ fn a_restart_forgets_the_failure_counts() {
 fn t05_refresh_valid_cookie_302_new_session() {
     let env = setup_test_env("t05");
     seed_user(&env.site_dir, "eve", "evepw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Login to get tokens
     let body = r#"{"username":"eve","password":"evepw"}"#;
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -668,7 +717,7 @@ fn t05_refresh_valid_cookie_302_new_session() {
         "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nCookie: refresh={}\r\nContent-Length: 0\r\n\r\n",
         refresh_token
     );
-    let resp = http_request(&env.socket_path, &req);
+    let resp = http_request(&mut guard, &env.socket_path, &req);
 
     assert_eq!(
         parse_status(&resp),
@@ -692,10 +741,10 @@ fn t05_refresh_valid_cookie_302_new_session() {
 #[test]
 fn t06_refresh_invalid_token_302_login() {
     let env = setup_test_env("t06");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let req = "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nCookie: refresh=bogus_invalid_token\r\nContent-Length: 0\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
+    let resp = http_request(&mut guard, &env.socket_path, req);
 
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
     let location = get_header(&resp, "Location").unwrap_or("");
@@ -711,11 +760,12 @@ fn t06_refresh_invalid_token_302_login() {
 fn t07_logout_clears_cookies() {
     let env = setup_test_env("t07");
     seed_user(&env.site_dir, "frank", "frankpw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Login via form to get cookies
     let body = "username=frank&password=frankpw";
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -740,7 +790,7 @@ fn t07_logout_clears_cookies() {
         "POST /auth/logout HTTP/1.1\r\nHost: localhost\r\nCookie: refresh={}\r\nContent-Length: 0\r\n\r\n",
         refresh_cookie
     );
-    let logout_resp = http_request(&env.socket_path, &req);
+    let logout_resp = http_request(&mut guard, &env.socket_path, &req);
     assert_eq!(
         parse_status(&logout_resp),
         302,
@@ -771,10 +821,10 @@ fn t07_logout_clears_cookies() {
 #[test]
 fn t08_public_key_returns_pem() {
     let env = setup_test_env("t08");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
+    let resp = http_request(&mut guard, &env.socket_path, req);
 
     assert_eq!(parse_status(&resp), 200, "expected 200\n{}", resp);
     assert!(
@@ -789,11 +839,12 @@ fn t08_public_key_returns_pem() {
 fn t09_jwt_verifiable_with_public_key() {
     let env = setup_test_env("t09");
     seed_user(&env.site_dir, "grace", "gracepw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Get access token
     let body = r#"{"username":"grace","password":"gracepw"}"#;
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -811,7 +862,7 @@ fn t09_jwt_verifiable_with_public_key() {
 
     // Get public key
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let pk_resp = http_request(&env.socket_path, req);
+    let pk_resp = http_request(&mut guard, &env.socket_path, req);
     let pk_body_start = pk_resp
         .find("\r\n\r\n")
         .map(|i| i + 4)
@@ -838,11 +889,12 @@ fn t09_jwt_verifiable_with_public_key() {
 fn t10_next_external_url_falls_back_to_root() {
     let env = setup_test_env("t10");
     seed_user(&env.site_dir, "henry", "henrypw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Attempt to redirect to external URL
     let body = "username=henry&password=henrypw&next=https://evil.example.com/steal";
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -906,10 +958,11 @@ fn issuer_falls_back_to_the_configured_site_toml() {
     std::fs::write(&env.config_path, config).unwrap();
 
     seed_user(&env.site_dir, "ivy", "ivypw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = r#"{"username":"ivy","password":"ivypw"}"#;
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -922,7 +975,7 @@ fn issuer_falls_back_to_the_configured_site_toml() {
     let access_token = json["access_token"].as_str().unwrap();
 
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let pk_resp = http_request(&env.socket_path, req);
+    let pk_resp = http_request(&mut guard, &env.socket_path, req);
     let pk_start = pk_resp.find("\r\n\r\n").map(|i| i + 4).unwrap();
     let decoding_key =
         jsonwebtoken::DecodingKey::from_rsa_pem(pk_resp.split_at(pk_start).1.as_bytes())
@@ -939,9 +992,9 @@ fn issuer_falls_back_to_the_configured_site_toml() {
 }
 
 /// The body of `GET /auth/public-key`.
-fn public_key_body(env: &TestEnv) -> String {
+fn public_key_body(svc: &mut Service, env: &TestEnv) -> String {
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
+    let resp = http_request(svc, &env.socket_path, req);
     let at = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     resp[at..].to_string()
 }
@@ -952,7 +1005,7 @@ fn public_key_body(env: &TestEnv) -> String {
 fn a_rotated_signing_key_signs_after_a_restart() {
     let env = setup_test_env("rotate");
     let mut guard = spawn_server(&env);
-    let key_a = public_key_body(&env);
+    let key_a = public_key_body(&mut guard, &env);
     assert!(key_a.contains("PUBLIC KEY"), "{key_a}");
 
     let (private_b, public_b) = generate_test_rsa_keys();
@@ -966,10 +1019,10 @@ fn a_rotated_signing_key_signs_after_a_restart() {
         status.success(),
         "m6-auth-server did not stop cleanly, got {status}"
     );
-    let guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     assert_eq!(
-        public_key_body(&env),
+        public_key_body(&mut guard, &env),
         public_b,
         "the new key was not served after a restart\n--- output ---\n{}",
         guard.output()
@@ -1024,8 +1077,9 @@ fn instances_opening_an_empty_database_at_once_produce_one_schema() {
     seed_user(&env.site_dir, "alice", "correct_pass");
 
     let login_body = r#"{"username":"alice","password":"correct_pass"}"#;
-    for socket in &sockets {
+    for (svc, socket) in instances.iter_mut().zip(&sockets) {
         let resp = http_request_with_body(
+            svc,
             socket,
             "POST",
             "/auth/login",
@@ -1112,7 +1166,7 @@ fn a_storage_directory_that_cannot_be_created_names_the_path() {
 fn a_locked_database_defers_and_the_service_keeps_serving() {
     let env = setup_test_env("db-busy-defers");
     seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
     let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
 
     // One connection throughout, and a request before the locked one: the
@@ -1120,8 +1174,8 @@ fn a_locked_database_defers_and_the_service_keeps_serving() {
     // loop that is already waiting for them.
     let mut login = UnixStream::connect(&env.socket_path).expect("connect the login");
     login
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set the login's read timeout");
+        .set_read_timeout(Some(RESPONSE_BOUND))
+        .expect("set the login's read bound");
     login
         .write_all(b"GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("send the public-key request");
@@ -1141,6 +1195,7 @@ fn a_locked_database_defers_and_the_service_keeps_serving() {
     // another connection must be answered: a read deadline of one second
     // fails the old five-second busy wait in the loop.
     let public_key = http_request_within(
+        &mut guard,
         &env.socket_path,
         "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n",
         Duration::from_secs(1),
@@ -1188,11 +1243,12 @@ fn a_locked_database_defers_and_the_service_keeps_serving() {
 fn a_database_locked_past_a_second_answers_503() {
     let env = setup_test_env("db-busy-503");
     seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
     let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
 
     let body = r#"{"username":"alice","password":"correct_pass"}"#;
     let answer = http_request_within(
+        &mut guard,
         &env.socket_path,
         &login_json_request(body),
         Duration::from_secs(3),
