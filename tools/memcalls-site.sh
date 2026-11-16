@@ -50,9 +50,12 @@ make_site() {
   rm -rf "$SITE"
   mkdir -p "$SITE/templates" "$SITE/data" "$SITE/configs" "$SITE/assets"
   # A throwaway self-signed certificate, so the run needs no fixture.
-  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  # ECDSA P-256, with a named curve: LibreSSL's `req -newkey ec` writes explicit
+  # parameters, which rustls refuses.
+  openssl ecparam -name prime256v1 -genkey -noout -out "$SITE/key.pem" 2>/dev/null \
+    && openssl req -x509 -new -key "$SITE/key.pem" -days 2 \
     -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
-    -keyout "$SITE/key.pem" -out "$SITE/cert.pem" 2>/dev/null \
+    -out "$SITE/cert.pem" 2>/dev/null \
     || { echo "memcalls: openssl could not make a certificate" >&2; return 1; }
   cat > "$SITE/site.toml" <<TOML
 [site]

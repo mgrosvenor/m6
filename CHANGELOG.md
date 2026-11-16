@@ -135,6 +135,9 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**The gate scripts make ECDSA P-256 certificates, the key type production should run.** `tools/conformance.sh`, `bench.sh` and `tools/memcalls-site.sh` made RSA-2048 ones, so the gates measured a handshake about 4 times dearer than production's (about 410 us against 90 us of server CPU, release build on macOS arm64). `BENCH_KEY=rsa` keeps RSA for `bench.sh`.
+Verified by running `bench.sh --handshake` and the conformance resumption stage on the new certificates (below).
+
 **A handshake benchmark, a breakdown of where a server-side TLS handshake spends its time, and two off-by-default cargo features for m6-http: `aws-lc-rs` and `cert-compression`.**
 `./bench.sh --handshake [--handshake-n N]` times a full handshake, a resumed one and, for h3, a 0-RTT request over h1, h2 (TCP and TLS 1.3) and h3 (QUIC), and reads m6-http's own CPU time before and after each run to report server CPU per handshake. `BENCH_KEY=ec` makes an ECDSA P-256 certificate where the default stays RSA-2048, and `BENCH_FEATURES=aws-lc-rs` builds m6-http on the other crypto provider.
 `cargo bench -p m6-http --bench handshake_parts` runs a rustls client and server in one thread, times only the server's calls, and prints the ClientHello phase and the Finished phase, the key exchange groups, the signature, a ticket encryption and the flight size, for ring and aws-lc-rs and for ECDSA and RSA keys.

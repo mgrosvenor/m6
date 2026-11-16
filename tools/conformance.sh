@@ -289,8 +289,12 @@ start_edge() {
   if [[ ! -f "$WORK/cert.pem" ]] \
      || ! openssl x509 -in "$WORK/cert.pem" -noout -checkend 3600 >/dev/null 2>&1; then
     rm -f "$WORK/cert.pem" "$WORK/key.pem"
-    openssl req -x509 -newkey rsa:2048 -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
-      -days 2 -nodes -subj "/CN=localhost" \
+    # ECDSA P-256, what production should run. The key is made with a named
+    # curve first: LibreSSL's `req -newkey ec` writes explicit parameters, which
+    # rustls and quiche both refuse.
+    openssl ecparam -name prime256v1 -genkey -noout -out "$WORK/key.pem" 2>/dev/null \
+      && openssl req -x509 -new -key "$WORK/key.pem" -out "$WORK/cert.pem" \
+      -days 2 -subj "/CN=localhost" \
       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
   fi
 

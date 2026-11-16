@@ -8,7 +8,7 @@
 #
 # Handshake suite (TLS 1.3 over TCP for h1 and h2, QUIC for h3):
 #   ./bench.sh --handshake [--handshake-n N]
-#   BENCH_KEY=ec|rsa          certificate key type (default rsa, as before)
+#   BENCH_KEY=ec|rsa          certificate key type (default ec: ECDSA P-256, what production should run)
 #   BENCH_FEATURES=aws-lc-rs  build m6-http on aws-lc-rs instead of ring
 # Prints p50 and p99 per handshake and the server's CPU per handshake for a full
 # handshake, a resumed one, and for h3 a 0-RTT request. Server CPU is read from
@@ -132,11 +132,11 @@ mkdir -p \
 
 # TLS certs — a throwaway self-signed certificate, made here. The old fixture
 # files no longer exist, and the tests make theirs the same way (rcgen, in the
-# test). RSA by default; BENCH_KEY=ec makes ECDSA, below.
-# BENCH_KEY=ec makes an ECDSA P-256 certificate instead. The key is made first
+# test). ECDSA P-256 by default, as production should run; BENCH_KEY=rsa makes RSA.
+# ECDSA P-256 unless BENCH_KEY=rsa. The key is made first
 # with a named curve: LibreSSL's `req -newkey ec` writes explicit curve
 # parameters, which rustls and quiche both refuse.
-if [[ "${BENCH_KEY:-rsa}" == ec ]]; then
+if [[ "${BENCH_KEY:-ec}" == ec ]]; then
     openssl ecparam -name prime256v1 -genkey -noout -out "$SITE_DIR/key.pem" 2>/dev/null \
         && openssl req -x509 -new -key "$SITE_DIR/key.pem" -days 2 \
             -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
@@ -446,7 +446,7 @@ cpu_ms() {
 
 run_handshake_suites() {
     echo ""
-    echo "Handshake suite: key=${BENCH_KEY:-rsa}  features=${BENCH_FEATURES:-none (ring)}  profile=$PROFILE  n=$HANDSHAKE_N"
+    echo "Handshake suite: key=${BENCH_KEY:-ec}  features=${BENCH_FEATURES:-none (ring)}  profile=$PROFILE  n=$HANDSHAKE_N"
     printf '%-4s %-8s %6s %8s %9s %9s %9s %14s\n' proto kind n resumed p50_ms p99_ms 'cpu_us/hs' ''
     local row kind before after served line rc=0
     for row in "h1 full --http11-only" "h1 resumed --http11-only" "h2 full --http2-only" \
