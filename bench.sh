@@ -399,6 +399,7 @@ run_suite() {
 # ── Nine suites: H1/H2/H3 × latency/path/throughput ──────────────────────────
 
 run_suite "HTTP/1.1 latency"    --http11-only --latency-only
+run_suite "HTTP/1.1 vs HTTP/2 hit latency (fails if h1 keep-alive p50 > 2x h2)" --h1-vs-h2 --latency-only
 run_suite "HTTP/2  latency"     --http2-only  --latency-only
 run_suite "HTTP/3  latency"     --http3-only  --latency-only
 run_suite "H2C     latency"     --h2c-only    --latency-only

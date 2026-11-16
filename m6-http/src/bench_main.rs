@@ -11,6 +11,8 @@
 ///   --http3-only        only run HTTP/3 suites
 ///   --h2c-only          only run H2C suites (HTTP/2 cleartext, for a private backbone)
 ///   --url-only          only run URL-backend suites (h2 inbound, http/https/h2c/h2s outbound)
+///   --h1-vs-h2          run HTTP/1.1 and HTTP/2 latency in one process and fail if the
+///                       keep-alive HTTP/1.1 p50 exceeds H1_VS_H2_P50_MAX_RATIO times h2's
 ///   --h2c               include H2C suites alongside the selected protocols
 ///   --url               include URL-backend suites alongside the selected protocols
 ///   --skip-verify       skip TLS certificate verification
@@ -115,6 +117,13 @@ impl Args {
                     a.http3 = false;
                     a.h2c = false;
                     a.url = true;
+                }
+                "--h1-vs-h2" => {
+                    a.http11 = true;
+                    a.http2 = true;
+                    a.http3 = false;
+                    a.h2c = false;
+                    a.url = false;
                 }
                 "--h2c" => a.h2c = true,
                 "--url" => a.url = true,
@@ -294,6 +303,125 @@ fn bench_http11_latency_path(
     for _ in 0..n {
         let t0 = m6_core::platform::now();
         let resp = http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
+        let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
+        let status = parse_http11_status(&resp);
+        if status != 200 {
+            eprintln!("HTTP/1.1 non-200 ({path}): {status}");
+        }
+        latencies.push(elapsed);
+    }
+    Ok(latencies)
+}
+
+// ── HTTP/1.1 keep-alive latency ───────────────────────────────────────────────
+
+/// One TLS connection reused for many requests, like a browser. Blocking
+/// sockets with explicit `read_tls`/`write_tls`, as `rustls::Stream` stops
+/// reading once the handshake is done and the response is still in flight.
+struct H1Client {
+    conn: rustls::ClientConnection,
+    stream: TcpStream,
+    requests_done: usize,
+}
+
+/// The server closes a connection after `[server] max_requests_per_connection`
+/// (default 100) requests. Reconnect before that, outside the timed region.
+/// A cache hit over a kept-alive HTTP/1.1 connection costs about what one costs
+/// over HTTP/2 (measured 0.65 times, dev build, loopback). Twice is the bound
+/// above which something on the h1 path, such as Nagle, has regressed. A
+/// connection per request is a handshake, not a hit, and is not compared.
+const H1_VS_H2_P50_MAX_RATIO: f64 = 2.0;
+
+const H1_MAX_REQUESTS_PER_CONN: usize = 90;
+
+impl H1Client {
+    fn connect(addr: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Self> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let server_name: ServerName<'static> = "localhost".try_into().unwrap();
+        let conn = rustls::ClientConnection::new(tls_cfg, server_name)?;
+        let mut c = H1Client {
+            conn,
+            stream,
+            requests_done: 0,
+        };
+        while c.conn.is_handshaking() {
+            c.pump()?;
+        }
+        Ok(c)
+    }
+
+    /// Flush pending TLS output, then read one batch of TLS records if the
+    /// connection wants input.
+    fn pump(&mut self) -> anyhow::Result<()> {
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut &self.stream)?;
+        }
+        if self.conn.wants_read() {
+            if self.conn.read_tls(&mut &self.stream)? == 0 {
+                anyhow::bail!("H1 server closed the connection");
+            }
+            self.conn.process_new_packets()?;
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.requests_done += 1;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        self.conn.writer().write_all(req.as_bytes())?;
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut &self.stream)?;
+        }
+        let mut resp = Vec::new();
+        let mut need: Option<usize> = None; // total bytes, once the head is parsed
+        loop {
+            let mut tmp = [0u8; 8192];
+            match self.conn.reader().read(&mut tmp) {
+                Ok(0) => anyhow::bail!("H1 server closed the connection"),
+                Ok(n) => resp.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+            if need.is_none() {
+                if let Some(end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&resp[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    need = Some(end + 4 + len);
+                }
+            }
+            if need.is_some_and(|n| resp.len() >= n) {
+                return Ok(resp);
+            }
+            self.pump()?;
+        }
+    }
+}
+
+/// HTTP/1.1 over one kept-alive connection: the number to compare with h2,
+/// h3 and h2c, which also reuse their connection.
+fn bench_http11_keepalive_latency_path(
+    addr: &str,
+    path: &str,
+    n: usize,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<Vec<f64>> {
+    let mut latencies = Vec::with_capacity(n);
+    let mut client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+    for _ in 0..5 {
+        client.get(path)?;
+    }
+    for _ in 0..n {
+        if client.requests_done >= H1_MAX_REQUESTS_PER_CONN {
+            client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+        }
+        let t0 = m6_core::platform::now();
+        let resp = client.get(path)?;
         let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
         let status = parse_http11_status(&resp);
         if status != 200 {
@@ -1690,12 +1818,36 @@ fn main() {
 
     // ── Latency ───────────────────────────────────────────────────────────────
     if run_latency {
+        let mut h1_keepalive_p50 = None;
+        let mut h2_p50 = None;
         if args.http11 {
             let tls_cfg = make_client_config(args.skip_verify);
+            match bench_http11_keepalive_latency_path(
+                &args.addr,
+                "/",
+                args.latency_n,
+                Arc::clone(&tls_cfg),
+            ) {
+                Ok(lats) => {
+                    h1_keepalive_p50 = Some(percentile(lats.clone(), 50));
+                    print_result(
+                        &BenchResult::from_latencies("HTTP/1.1 latency (keep-alive)", lats),
+                        f64::INFINITY,
+                        0.0,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("HTTP/1.1 keep-alive latency error: {e}");
+                    all_pass = false;
+                }
+            }
             match bench_http11_latency(&args.addr, args.latency_n, Arc::clone(&tls_cfg)) {
                 Ok(lats) => {
                     print_result(
-                        &BenchResult::from_latencies("HTTP/1.1 latency", lats),
+                        &BenchResult::from_latencies(
+                            "HTTP/1.1 latency (new connection per request, includes TLS handshake)",
+                            lats,
+                        ),
                         f64::INFINITY,
                         0.0,
                     );
@@ -1709,6 +1861,7 @@ fn main() {
         if args.http2 {
             match bench_http2_latency(&args.addr, args.latency_n, args.skip_verify) {
                 Ok(lats) => {
+                    h2_p50 = Some(percentile(lats.clone(), 50));
                     if !print_result(
                         &BenchResult::from_latencies("HTTP/2 latency", lats),
                         args.p99_limit_us,
@@ -1722,6 +1875,15 @@ fn main() {
                     all_pass = false;
                 }
             }
+        }
+        if let (Some(h1), Some(h2)) = (h1_keepalive_p50, h2_p50) {
+            let ratio = h1 / h2;
+            let ok = ratio <= H1_VS_H2_P50_MAX_RATIO;
+            println!(
+                "{}   HTTP/1.1 keep-alive p50 / HTTP/2 p50 = {ratio:.2}  (limit {H1_VS_H2_P50_MAX_RATIO})",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            all_pass &= ok;
         }
         if args.http3 {
             match bench_http3_latency(&args.addr, args.latency_n, args.skip_verify) {
@@ -1926,7 +2088,7 @@ fn main() {
                     let result: anyhow::Result<Vec<f64>> = match proto {
                         1 => {
                             let cfg = make_client_config(args.skip_verify);
-                            bench_http11_latency_path(addr, path, args.latency_n, cfg)
+                            bench_http11_keepalive_latency_path(addr, path, args.latency_n, cfg)
                         }
                         2 => bench_http2_latency_path(addr, path, args.latency_n, args.skip_verify),
                         3 => bench_h3_path_latency(addr, path, args.latency_n, args.skip_verify),
