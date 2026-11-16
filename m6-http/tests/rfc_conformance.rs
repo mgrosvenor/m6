@@ -114,7 +114,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let d = dir.path();
         let cert = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
@@ -693,7 +693,7 @@ struct FileBackend {
 
 impl FileBackend {
     fn start() -> FileBackend {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let d = dir.path();
         std::fs::create_dir_all(d.join("public")).expect("public");
         std::fs::write(d.join("public/open.txt"), b"open\n").expect("file");

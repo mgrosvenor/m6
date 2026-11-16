@@ -585,7 +585,7 @@ mod spawn {
     /// too, and the second `try_lock` below would fail.
     #[test]
     fn a_spawned_child_inherits_no_descriptor_above_stderr() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("lock");
         let held = std::fs::File::create(&path).expect("create");
         held.try_lock().expect("this process takes the lock");
@@ -695,7 +695,7 @@ mod sockets {
     /// U1. Break: a path within the limit refused.
     #[test]
     fn a_unix_listener_binds_within_the_limit() {
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = path_of_len(dir.path(), MAX_SOCKET_PATH - 1);
         let listener = net::bind_unix(&path, 0o600).expect("bind at the limit");
         let bound = listener.local_addr().expect("addr");
@@ -705,12 +705,19 @@ mod sockets {
     /// U2. Break: the OS's own text, or truncation.
     #[test]
     fn a_path_over_the_limit_names_the_path_and_the_limit() {
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = path_of_len(dir.path(), MAX_SOCKET_PATH);
         let err = net::bind_unix(&path, 0o600).expect_err("one byte too long");
         let msg = err.to_string();
         assert!(msg.contains(&path.display().to_string()), "{msg}");
-        assert!(msg.contains(&(MAX_SOCKET_PATH - 1).to_string()), "{msg}");
+        assert!(
+            msg.contains(&format!("is {MAX_SOCKET_PATH} bytes")),
+            "the message names the length: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("at most {}", MAX_SOCKET_PATH - 1)),
+            "the message names the limit: {msg}"
+        );
         let err = net::connect_unix(&path).expect_err("connect is checked too");
         assert!(err.to_string().contains(&path.display().to_string()));
     }
@@ -723,7 +730,7 @@ mod sockets {
     #[test]
     fn a_full_backlog_is_refused_at_once() {
         use socket2::{Domain, SockAddr, Socket, Type};
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("full.sock");
         let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("listener");
         listener
@@ -757,7 +764,7 @@ mod sockets {
     /// U4. Break: a different kind.
     #[test]
     fn a_missing_socket_file_is_not_found() {
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let err = net::connect_unix(&dir.path().join("none.sock")).expect_err("no file");
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     }
@@ -821,7 +828,7 @@ mod sockets {
     /// U8. Break: a stale file refused.
     #[test]
     fn a_stale_socket_file_is_replaced_at_bind() {
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("nested").join("m6.sock");
         drop(net::bind_unix(&path, 0o660).expect("first bind creates the parent"));
         assert!(path.exists(), "the socket file is left behind");
@@ -835,7 +842,7 @@ mod sockets {
     /// instance steals a live listener's socket.
     #[test]
     fn a_live_listeners_socket_is_refused_not_replaced() {
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("live.sock");
         let first = net::bind_unix(&path, 0o600).expect("first bind");
         let err = net::bind_unix(&path, 0o600).expect_err("a live listener is refused");
@@ -852,7 +859,7 @@ mod sockets {
     /// socket.
     #[test]
     fn a_non_socket_at_the_path_is_an_error_naming_it() {
-        let dir = tempfile::tempdir_in(platform::temp_dir()).expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("not-a-socket");
         std::fs::write(&path, b"data").expect("write");
         let err = net::bind_unix(&path, 0o600).expect_err("a file is not replaced");
@@ -1318,14 +1325,19 @@ mod directories {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// D1. Break: a long default path.
+    /// D1. Break: a socket root that is the long `TMPDIR` itself, so the
+    /// path depends on the environment rather than on the platform.
+    ///
+    /// `temp_dir()` must still follow `TMPDIR` (D2), but it is not where a
+    /// socket goes: the root for that is [`platform::socket_scratch_root`],
+    /// which is short whatever `TMPDIR` is.
     #[test]
-    fn the_temp_directory_takes_a_socket() {
-        let dir = platform::temp_dir();
+    fn the_socket_scratch_root_takes_a_socket() {
+        let dir = platform::socket_scratch_root();
         assert!(dir.is_dir());
         let sub = tempfile::tempdir_in(&dir).expect("writable");
         let sock = sub.path().join("m6.sock");
-        platform::check_socket_path(&sock).expect("a socket under the temp directory fits");
+        platform::check_socket_path(&sock).expect("a socket under the socket root fits");
         drop(net::bind_unix(&sock, 0o600).expect("binds"));
     }
 
@@ -1333,7 +1345,7 @@ mod directories {
     #[test]
     fn tmpdir_is_respected() {
         let exe = std::env::current_exe().expect("current_exe");
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let out = std::process::Command::new(exe)
             .args([
                 "--exact",
@@ -1429,7 +1441,7 @@ mod directories {
         fn mode(p: &std::path::Path) -> u32 {
             std::fs::metadata(p).unwrap().permissions().mode() & 0o777
         }
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let file = dir.path().join("private").join("h.sqlite3");
         platform::create_private(&file).expect("create");
         assert_eq!(mode(file.parent().unwrap()), 0o700);

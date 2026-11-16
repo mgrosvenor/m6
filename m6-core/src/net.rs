@@ -124,7 +124,7 @@ mod listener_tests {
     /// asked for, and a missing parent directory is created.
     #[test]
     fn listen_unix_replaces_a_stale_socket_and_sets_the_mode() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).unwrap();
         let path = dir.path().join("nested").join("m6.sock");
 
         // The parent does not exist yet: binding must create it.

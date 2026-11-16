@@ -227,7 +227,7 @@ impl Server {
 ///
 /// m6-http runs at log level `debug` so the `auth check` line is emitted.
 fn start_server() -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();

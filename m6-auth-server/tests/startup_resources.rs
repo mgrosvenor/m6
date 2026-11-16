@@ -25,7 +25,10 @@ use m6_core::testkit::{binary, wait, Service};
 
 /// Generate an RSA key pair with openssl: `(private_pem, public_pem)`.
 fn generate_test_rsa_keys() -> (String, String) {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
     let key_path = dir.path().join("test.key");
     let pub_path = dir.path().join("test.pub");
 
@@ -62,8 +65,14 @@ struct TestSite {
 
 impl TestSite {
     fn new(id: &str) -> TestSite {
-        let temp = tempfile::TempDir::new().unwrap();
-        let key_dir = tempfile::TempDir::new().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("auth-")
+            .tempdir_in(m6_core::testkit::socket_scratch_root())
+            .unwrap();
+        let key_dir = tempfile::Builder::new()
+            .prefix("auth-")
+            .tempdir_in(m6_core::testkit::socket_scratch_root())
+            .unwrap();
         let site_dir = temp.path().to_path_buf();
         let config_path = site_dir.join("m6-auth-test.conf");
         // The socket lives in this test's own temp directory, never a shared one.

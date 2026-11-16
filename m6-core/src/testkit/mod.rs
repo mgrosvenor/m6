@@ -63,6 +63,8 @@ pub mod response;
 pub mod wait;
 
 #[cfg(feature = "testkit")]
+pub use crate::platform::socket_scratch_root;
+#[cfg(feature = "testkit")]
 pub use paths::{binary, exec_scratch_root};
 #[cfg(feature = "testkit")]
 pub use port::{claim_port, PortClaim};

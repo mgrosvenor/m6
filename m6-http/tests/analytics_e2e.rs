@@ -497,7 +497,7 @@ impl Server {
 /// `[analytics].enabled` defaults to `true`, unlike `security_e2e.rs`'s
 /// fixture which explicitly disables it) and a single cacheable public file.
 fn start_server() -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();
@@ -964,7 +964,7 @@ fn spawn_fake_url_backend() -> u16 {
 /// minimal fake URL backend standing in for the error-page renderer.
 #[test]
 fn custom_error_page_fetch_is_logged_to_analytics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();
@@ -1112,7 +1112,7 @@ name = "test-node"
 /// up in the request log, not just an operational warn!().
 #[test]
 fn connection_failure_is_logged_to_analytics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();
@@ -1232,7 +1232,7 @@ name = "test-node"
 #[test]
 fn edge_reuses_origin_session_instead_of_minting_a_second_one() {
     // ── Origin: real content backend (m6-file), analytics enabled ──────────
-    let origin_dir = tempfile::tempdir().unwrap();
+    let origin_dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let origin_site = origin_dir.path();
     // Cert DER unused: the edge talks to origin with tls_skip_verify = true,
     // not by pinning this cert (that's for THIS test's own client, if it
@@ -1335,7 +1335,7 @@ backend = "m6-file"
     _origin_http_proc.wait_for_tcp(origin_port, Duration::from_secs(10));
 
     // ── Edge: its only backend IS the origin's m6-http ─────────────────────
-    let edge_dir = tempfile::tempdir().unwrap();
+    let edge_dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let edge_site = edge_dir.path();
     let (edge_cert_pem, edge_key_pem, edge_cert_der) = generate_tls_cert();
     std::fs::write(edge_site.join("cert.pem"), &edge_cert_pem).unwrap();

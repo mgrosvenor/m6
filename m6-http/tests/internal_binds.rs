@@ -102,7 +102,7 @@ fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i
 fn an_undeclared_h2c_listener_refuses_to_start() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     // Empty certificate files: the refusal fires before TLS is read.
     let config = write_system(
@@ -123,7 +123,7 @@ fn an_undeclared_h2c_listener_refuses_to_start() {
 fn a_public_internal_binding_refuses_to_start() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     let public = format!("0.0.0.0:{}", h2c.port());
     let config = write_system(
@@ -151,7 +151,7 @@ fn a_public_internal_binding_refuses_to_start() {
 fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let declaration = if declare {
@@ -244,7 +244,7 @@ fn an_h2c_listener_declared_public_ignores_the_forwarded_address() {
 fn an_internal_listener_without_internal_peers_refuses_to_start() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     // Empty certificate files: the refusal fires before TLS is read.
     let config = write_system(
@@ -270,7 +270,7 @@ fn an_internal_listener_without_internal_peers_refuses_to_start() {
 fn an_unlisted_peer_is_refused_at_connect() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let config = write_system(

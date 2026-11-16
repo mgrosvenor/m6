@@ -25,7 +25,10 @@ const ISSUER: &str = "test.example.com";
 /// Generate an RSA key pair (2048-bit) for testing.
 /// Returns (private_pem, public_pem).
 fn generate_test_rsa_keys() -> (String, String) {
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
     let key_path = dir.path().join("test.key");
     let pub_path = dir.path().join("test.pub");
 
@@ -59,8 +62,14 @@ struct TestEnv {
 }
 
 fn setup_test_env(id: &str) -> TestEnv {
-    let temp = tempfile::TempDir::new().unwrap();
-    let key_dir = tempfile::TempDir::new().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
+    let key_dir = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
 
     let site_dir = temp.path().to_path_buf();
     let config_path = site_dir.join("m6-auth-test.conf");

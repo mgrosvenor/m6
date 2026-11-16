@@ -143,7 +143,7 @@ impl Stack {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let d = dir.path();
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),

@@ -15,7 +15,6 @@ use criterion::{black_box, criterion_group, Criterion};
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use tempfile::TempDir;
 
 // Helper: build an HTML response from outside the crate (template_name is pub(crate)).
 fn html_response(html: String) -> Response {
@@ -377,7 +376,10 @@ fn bench_parse_cookies(c: &mut Criterion) {
 
 /// Tera template rendering: render a minimal template with one variable.
 fn bench_template_render(c: &mut Criterion) {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
     let tmpl_path = dir.path().join("page.html");
     std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
 
@@ -445,7 +447,10 @@ fn bench_response_write(c: &mut Criterion) {
 /// backend latency that m6-http would observe for a cache-miss forwarded to
 /// m6-render.
 fn bench_socket_round_trip(c: &mut Criterion) {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
 
     // Write template.
     let tmpl_dir = dir.path().join("templates");
@@ -745,7 +750,10 @@ fn main() {
 
     // Template render
     {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6b-")
+            .tempdir_in(m6_core::platform::socket_scratch_root())
+            .unwrap();
         let tmpl_path = dir.path().join("page.html");
         std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
         let mut tera = tera::Tera::default();
@@ -779,7 +787,10 @@ fn main() {
 
     // Socket round-trip
     {
-        let dir2 = TempDir::new().unwrap();
+        let dir2 = tempfile::Builder::new()
+            .prefix("m6b-")
+            .tempdir_in(m6_core::platform::socket_scratch_root())
+            .unwrap();
         let tmpl_dir2 = dir2.path().join("templates");
         std::fs::create_dir_all(&tmpl_dir2).unwrap();
         std::fs::write(tmpl_dir2.join("page.html"), MINIMAL_TEMPLATE).unwrap();

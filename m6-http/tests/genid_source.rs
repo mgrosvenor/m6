@@ -129,7 +129,7 @@ impl Fixture {
     /// system config's `[server]` table. `html` is written as `m6-html`'s own
     /// config when given. `timeout_s` is the socket backend deadline.
     fn new(site_extra: &str, server_extra: &str, html: Option<&str>, timeout_s: u64) -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let d = dir.path();
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),

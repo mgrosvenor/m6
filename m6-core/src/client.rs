@@ -1846,7 +1846,7 @@ mod socket_tests {
     /// accepts once).
     #[test]
     fn a_keep_alive_response_is_reusable() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("keep.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let path2 = path.clone();
@@ -1967,7 +1967,7 @@ mod socket_tests {
     /// reconnects instead of riding the truncated stream.
     #[test]
     fn a_backend_that_answers_without_reading_is_read_while_writing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("early.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let (accept_tx, accept_rx) = std::sync::mpsc::channel();

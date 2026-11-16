@@ -68,7 +68,7 @@ fn no_arguments_exits_2_with_a_usage_message_rather_than_starting() {
 /// message.
 #[test]
 fn site_dir_without_a_system_config_exits_2_with_a_usage_message_rather_than_starting() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
 
@@ -83,7 +83,7 @@ fn site_dir_without_a_system_config_exits_2_with_a_usage_message_rather_than_sta
 /// outcome: the missing node state is silently skipped and the service starts.
 #[test]
 fn a_missing_system_config_exits_2_and_names_the_file_rather_than_starting() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     std::fs::write(
@@ -106,7 +106,7 @@ fn a_missing_system_config_exits_2_and_names_the_file_rather_than_starting() {
 /// failure is swallowed and the service starts with only the site config.
 #[test]
 fn an_unparseable_system_config_exits_2_and_names_the_file_rather_than_starting() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     std::fs::write(
@@ -132,7 +132,7 @@ fn an_unparseable_system_config_exits_2_and_names_the_file_rather_than_starting(
 #[test]
 fn a_key_outside_the_allowed_tables_exits_2_and_names_it() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -165,7 +165,7 @@ fn a_key_outside_the_allowed_tables_exits_2_and_names_it() {
 #[test]
 fn a_misplaced_key_exits_2_and_names_it() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -209,7 +209,7 @@ fn a_misplaced_key_exits_2_and_names_it() {
 #[test]
 fn a_missing_node_exits_2() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -238,7 +238,7 @@ fn a_missing_node_exits_2() {
 #[test]
 fn server_in_the_system_config_only_starts_because_validation_runs_after_the_merge() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -280,7 +280,7 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
 #[test]
 fn dump_config_refuses_routes_that_can_match_one_path() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -327,7 +327,7 @@ fn dump_config_refuses_routes_that_can_match_one_path() {
 #[test]
 fn dump_config_prints_the_merged_server_from_the_system_file_and_exits_0() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -369,7 +369,7 @@ fn dump_config_prints_the_merged_server_from_the_system_file_and_exits_0() {
 #[test]
 fn a_pool_whose_glob_matches_no_socket_exits_2() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -417,7 +417,7 @@ fn a_pool_whose_glob_matches_no_socket_exits_2() {
 /// even though the key file is present in the site directory.
 #[test]
 fn a_relative_tls_key_exits_2_and_names_the_setting() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);
@@ -505,7 +505,7 @@ fn empty_store(dir: &Path) -> (PathBuf, PathBuf) {
 #[test]
 fn a_verifying_url_backend_with_an_empty_system_store_exits_2() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let (site, system) = url_backend_site(
         dir.path(),
         &claim.addr(),
@@ -550,7 +550,7 @@ fn a_verifying_url_backend_with_an_empty_system_store_exits_2() {
 #[test]
 fn a_url_backend_that_skips_verification_starts_with_an_empty_system_store() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let (site, system) = url_backend_site(
         dir.path(),
         &claim.addr(),
@@ -609,7 +609,7 @@ fn analytics_site(dir: &Path, addr: &str, log_path: &Path) -> (PathBuf, PathBuf)
 #[test]
 fn a_missing_analytics_log_directory_exits_2_and_names_the_setting_and_path() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let missing = dir.path().join("missing").join("logs");
     let log_path = missing.join("analytics.ndjson");
     let (site, system) = analytics_site(dir.path(), &claim.addr(), &log_path);
@@ -658,7 +658,7 @@ fn a_missing_analytics_log_directory_exits_2_and_names_the_setting_and_path() {
 #[test]
 fn a_present_analytics_log_directory_starts_and_writes_the_file() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let log_dir = dir.path().join("logs");
     std::fs::create_dir_all(&log_dir).expect("log dir");
     let log_path = log_dir.join("analytics.ndjson");
@@ -689,7 +689,7 @@ fn a_present_analytics_log_directory_starts_and_writes_the_file() {
 #[test]
 fn an_unknown_route_method_name_exits_2_and_names_it() {
     let claim = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     write_cert_key(&site);

@@ -303,7 +303,7 @@ struct Fixture {
 
 impl Fixture {
     fn start(backends: &str, tag: &str) -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let site = dir.path();
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
@@ -411,7 +411,7 @@ fn body(resp: &[u8]) -> String {
 /// closes: the client gets that status and body, not a 502.
 #[test]
 fn rfc9112_9_6_a_socket_backend_that_answers_early_is_forwarded() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let sock = dir.path().join("m6-file-1.sock");
     let glob = dir.path().join("m6-file-*.sock").display().to_string();
     let _backend = SocketBackend::start(sock, Refusal::Answer(EARLY_HEAD));
@@ -459,7 +459,7 @@ fn rfc9112_9_6_an_https_backend_that_answers_early_is_forwarded() {
 /// no reply at all, is a 502.
 #[test]
 fn rfc9112_9_6_a_socket_backend_that_closes_without_a_reply_is_a_502() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let sock = dir.path().join("m6-file-1.sock");
     let glob = dir.path().join("m6-file-*.sock").display().to_string();
     let _backend = SocketBackend::start(sock, Refusal::Silent);

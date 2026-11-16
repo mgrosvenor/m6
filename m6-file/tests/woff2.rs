@@ -43,7 +43,7 @@ fn config_path() -> PathBuf {
 /// socket file before the server calls `listen`, so the file existing proves
 /// nothing.
 fn spawn_server(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join(format!("{id}.sock"));
 
     let mut svc = Service::spawn(

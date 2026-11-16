@@ -509,7 +509,7 @@ fn silent_stub() -> (SocketAddr, Receiver<()>, Receiver<bool>, JoinHandle<()>) {
 // ── the checks ───────────────────────────────────────────────────────────────
 
 fn the_service_answers_while_a_message_is_in_flight() -> Result<(), Failed> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let (relay, accepted, go, peer) = successful_stub();
     let service = Service::start(dir.path(), relay);
     let mut sending = service.send("POST", "/send");
@@ -531,7 +531,7 @@ fn the_service_answers_while_a_message_is_in_flight() -> Result<(), Failed> {
 }
 
 fn a_send_that_fails_is_reported_to_the_client() -> Result<(), Failed> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let (listener, relay) = bind();
     let peer = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
@@ -557,7 +557,7 @@ fn a_send_that_fails_is_reported_to_the_client() -> Result<(), Failed> {
 }
 
 fn a_send_past_its_deadline_answers_504() -> Result<(), Failed> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let (relay, _accepted, eof, peer) = silent_stub();
     let service = Service::start(dir.path(), relay);
     let mut sending = service.send("POST", "/send");
@@ -576,7 +576,7 @@ fn a_send_past_its_deadline_answers_504() -> Result<(), Failed> {
 }
 
 fn a_client_that_leaves_drops_the_delivery() -> Result<(), Failed> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let (relay, accepted, eof, peer) = silent_stub();
     let service = Service::start(dir.path(), relay);
     let sending = service.send("POST", "/send");

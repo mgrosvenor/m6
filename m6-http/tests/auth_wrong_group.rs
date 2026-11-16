@@ -214,7 +214,7 @@ impl Server {
 ///   - `/public/{relpath}`   → open, the readiness probe
 ///   - `/editors/{relpath}`  → `require = "group:editors"`
 fn start_server() -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();

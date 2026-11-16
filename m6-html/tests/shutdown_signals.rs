@@ -45,7 +45,7 @@ fn config_path(name: &str) -> PathBuf {
 
 /// Spawn `m6-html` on its own socket and wait until it answers a request.
 fn spawn(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS.
     let socket_path = dir.path().join(format!("{id}.sock"));
 

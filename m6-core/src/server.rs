@@ -215,14 +215,14 @@ mod tests {
 
     #[test]
     fn a_chmod_that_fails_is_returned() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).unwrap();
         let missing = dir.path().join("no-such-socket");
         assert!(apply_socket_mode(&missing, 0o660).is_err());
     }
 
     #[test]
     fn test_parse_get_request() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).unwrap();
         let sock_path = dir.path().join("test.sock");
 
         let listener = UnixListener::bind(&sock_path).unwrap();
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_parse_post_request() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).unwrap();
         let sock_path = dir.path().join("test2.sock");
 
         let listener = UnixListener::bind(&sock_path).unwrap();

@@ -340,7 +340,7 @@ impl EdgeStack {
             .install_default()
             .ok();
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
         let base = tmp.path();
 
         // ── Ports ─────────────────────────────────────────────────────────

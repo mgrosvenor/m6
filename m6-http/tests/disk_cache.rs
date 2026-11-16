@@ -167,7 +167,7 @@ impl Stack {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let d = dir.path();
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
@@ -779,7 +779,7 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
 /// queue in one call.
 #[test]
 fn a_full_tick_under_load_stops_at_the_time_budget() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let root = dir.path().join("disk-cache");
     let old = root.join("999");
     std::fs::create_dir_all(&old).unwrap();

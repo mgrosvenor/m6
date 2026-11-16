@@ -27,7 +27,10 @@ use serde_json::{json, Map};
 const MINIMAL_HTML: &[u8] = b"<!doctype html><html><body><h1>Hello</h1></body></html>";
 
 fn make_site() -> TempDir {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
     let assets = dir.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
     std::fs::write(assets.join("index.html"), MINIMAL_HTML).unwrap();

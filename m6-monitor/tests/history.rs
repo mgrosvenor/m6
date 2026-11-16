@@ -46,7 +46,7 @@ struct Setup {
 }
 
 fn setup(history: &str) -> Setup {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = dir.path().join("monitor.conf");
     std::fs::write(&config, self::config(history)).expect("write config");
     std::fs::write(dir.path().join("site.toml"), "").unwrap();
@@ -159,7 +159,7 @@ fn history_config(s: &Setup) -> String {
 
 #[test]
 fn a_fresh_install_creates_the_file_and_serves_it_on_the_socket() {
-    let dir_for_path = tempfile::tempdir().unwrap();
+    let dir_for_path = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let s = setup(&format!(
         "history_file = {:?}",
         dir_for_path.path().join("data/history.sqlite3")
@@ -179,7 +179,7 @@ fn a_fresh_install_creates_the_file_and_serves_it_on_the_socket() {
 #[test]
 fn crawlers_answers_on_the_socket() {
     let s = setup("");
-    let hist = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     std::fs::write(
         &s.config,
         config(&format!(
@@ -202,7 +202,7 @@ fn crawlers_answers_on_the_socket() {
 
 #[test]
 fn a_bad_range_or_cursor_is_a_400() {
-    let hist = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let s = setup(&format!(
         "history_file = {:?}",
         hist.path().join("h.sqlite3")
@@ -317,7 +317,7 @@ fn lifecycle_is_clean_with_history_on() {
 
 #[test]
 fn an_unknown_node_is_a_400_and_a_known_one_filters() {
-    let hist = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let s = setup(&format!(
         "history_file = {:?}",
         hist.path().join("h.sqlite3")
@@ -340,7 +340,7 @@ fn an_unknown_node_is_a_400_and_a_known_one_filters() {
 /// The process listens on its unix socket and on nothing else.
 #[test]
 fn no_tcp_listener_is_opened() {
-    let hist = tempfile::tempdir().unwrap();
+    let hist = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let s = setup(&format!(
         "history_file = {:?}",
         hist.path().join("h.sqlite3")
