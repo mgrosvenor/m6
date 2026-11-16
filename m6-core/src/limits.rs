@@ -107,7 +107,7 @@ pub const COMPRESS_OUTPUT: LimitSpec = bytes("compress_output", 64 * KIB, 128 * 
 /// The minified form of one response.
 pub const MINIFY_OUTPUT: LimitSpec = bytes("minify_output", 64 * KIB, 128 * MIB);
 /// The reply of a mail relay to one command.
-pub const SMTP_REPLY: LimitSpec = bytes("smtp_reply", 512, 64 * KIB);
+pub const SMTP_REPLY: LimitSpec = bytes("smtp_reply", 512, 128 * KIB);
 /// A page of an ndjson stream: `start` is the default page size and `max` the
 /// largest page a client can ask for. A row larger than `max` is refused.
 pub const NDJSON_PAGE: LimitSpec = bytes("ndjson_page", 4 * MIB, 64 * MIB);
