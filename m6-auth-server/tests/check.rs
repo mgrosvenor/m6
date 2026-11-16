@@ -3,9 +3,9 @@
 //! The point of the route is that the answer is the database's, not the
 //! token's. `a_role_change_is_seen_without_a_new_token` is the test that proves
 //! it: remove the test's ability to read the database and the token's frozen
-//! role comes back instead. `a_near_expiry_token_gets_a_ttl_within_its_remaining_life`
-//! guards the one way the answer can be wrong: a `ttl_ms` that outlives the
-//! token it describes would let a caller hold a decision past the token's death.
+//! role comes back instead. The answer carries no cache hint, because nothing
+//! caches a decision, so a revocation or a role change counts from the next
+//! request.
 
 #![allow(
     clippy::disallowed_methods,
@@ -16,7 +16,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use m6_auth::jwt::{now_secs, AccessClaims, JwtEngine};
 use m6_core::testkit::{binary, wait, Service};
@@ -208,13 +208,6 @@ fn json_body(resp: &str) -> serde_json::Value {
     serde_json::from_str(&resp[start..]).unwrap_or_else(|e| panic!("no JSON body: {e}\n{resp}"))
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 /// The database decides the roles, the token does not.
@@ -255,66 +248,14 @@ fn a_role_change_is_seen_without_a_new_token() {
         serde_json::json!(["admin"]),
         "the answer must be the database's current role, not the token's frozen `user`"
     );
+    assert!(
+        body.get("ttl_ms").is_none(),
+        "the answer must carry no cache hint, because nothing caches a decision: {body}"
+    );
     assert_eq!(
         engine.decode_access(&token).unwrap().claims.roles,
         vec!["user".to_string()],
         "the token itself must be unchanged, or the test proves nothing"
-    );
-}
-
-/// An answer never outlives the token it describes.
-///
-/// The wrong decision this catches: a constant `ttl_ms` (for example the 5 s
-/// ceiling) returned for a token that has 2 s left. A caller that cached it
-/// would hold the decision 3 s past the token's death.
-#[test]
-fn a_near_expiry_token_gets_a_ttl_within_its_remaining_life() {
-    let env = setup_test_env("check-ttl");
-    seed_user(&env, "bob", "correct_pass");
-    let _guard = spawn_server(&env);
-
-    let user = m6_auth::Db::open(&env.db_path)
-        .unwrap()
-        .user_get("bob")
-        .unwrap()
-        .expect("seeded user");
-    let exp = now_secs() + 2;
-    let token = mint(&env, &user.id, "bob", exp);
-
-    let before = now_ms();
-    let resp = check(&env, &token);
-    assert_eq!(
-        parse_status(&resp),
-        200,
-        "check refused a live token\n{resp}"
-    );
-    let body = json_body(&resp);
-    let ttl = body["ttl_ms"].as_u64().expect("no ttl_ms in the answer");
-    assert!(
-        ttl as i64 <= exp * 1000 - before,
-        "ttl_ms {ttl} outlives the token: {} ms were left at request time",
-        exp * 1000 - before
-    );
-
-    // Relative, not absolute: the answer carries a duration and no timestamp.
-    assert!(
-        body.get("exp").is_none() && body.get("expires_at").is_none(),
-        "the answer must not carry a wall-clock deadline: {body}"
-    );
-
-    // The 5 s ceiling binds a token with 900 s of life, which proves the
-    // short answer above came from the expiry and not from a constant of 0.
-    let fresh = login(&env, "bob", "correct_pass");
-    let resp = check(&env, &fresh);
-    assert_eq!(
-        parse_status(&resp),
-        200,
-        "check refused a fresh token\n{resp}"
-    );
-    assert_eq!(
-        json_body(&resp)["ttl_ms"].as_u64(),
-        Some(5000),
-        "a token with 900 s left should get the 5 s ceiling"
     );
 }
 

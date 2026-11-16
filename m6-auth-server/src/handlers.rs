@@ -465,20 +465,13 @@ fn handle_public_key(state: &AppState) -> RawResponse {
 
 // ─── POST /check ─────────────────────────────────────────────────────────────
 
-/// The longest an answer may be cached for, in milliseconds.
-///
-/// The edge applies its own `[auth] decision_ttl_ms` on top, and the token's
-/// remaining life caps the answer below this. A reload of this service does not
-/// change the value, so an answer is never extended by a restart.
-const CHECK_TTL_MS: u64 = 5_000;
-
 /// Answer the current identity for an access token.
 ///
 /// The token proves which user is asking. The roles and groups come from the
 /// database, so a role change is visible without a new token, which is the
-/// reason this route exists. The answer carries a relative `ttl_ms` and no
-/// timestamp: the edge never compares wall clocks, so a clock step there cannot
-/// extend a decision.
+/// reason this route exists. The answer is the decision for this request only:
+/// it carries no cache hint, because nothing caches a decision, so a revocation
+/// or a role change counts from the next request.
 ///
 /// A locked database is 503 at once. The edge has its own 50 ms deadline and
 /// will have given up long before this service's one-second deferral would
@@ -489,15 +482,15 @@ fn handle_check(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
     let Some(token) = bearer_token(req) else {
         return unauthorised();
     };
-    // Verifies the signature, the issuer and the expiry. The claims are used
-    // only for `sub` and `exp`; the identity itself is the database's.
+    // Verifies the signature, the issuer and the expiry. Only `sub` is read
+    // from the claims; the identity itself is the database's.
     let Ok(data) = state.keys.jwt.decode_access(token) else {
         return unauthorised();
     };
     let user = match db.user_get_by_id(&data.claims.sub) {
         Ok(Some(user)) => user,
-        // A deleted user is a revoked user. An empty role list would be an
-        // answer that the edge could cache and act on, so it is refused.
+        // A deleted user is a revoked user. An empty role list would describe
+        // an identity the database no longer holds, so it is refused.
         Ok(None) => return unauthorised(),
         Err(e) => return db_failure(e),
     };
@@ -506,13 +499,11 @@ fn handle_check(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
         Err(e) => return db_failure(e),
     };
 
-    let ttl_ms = remaining_ms(data.claims.exp).min(CHECK_TTL_MS);
     let body = serde_json::json!({
         "sub":      user.id,
         "username": user.username,
         "roles":    user.roles,
         "groups":   groups,
-        "ttl_ms":   ttl_ms,
     });
     RawResponse::new(200)
         .header("Cache-Control", "no-store")
@@ -530,23 +521,10 @@ fn bearer_token(req: &RawRequest) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// How long the token has left, in milliseconds, rounded down.
-///
-/// Milliseconds on both sides: `exp` is whole seconds, so subtracting whole
-/// seconds first would report up to 999 ms more life than the token has, and an
-/// answer that outlives its token is the one way this design can be wrong.
-fn remaining_ms(exp: i64) -> u64 {
-    let now_ms = m6_core::platform::wall()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    exp.saturating_mul(1_000).saturating_sub(now_ms).max(0) as u64
-}
-
 /// Map a database failure to an answer.
 ///
 /// A lock is transient and the credential may be valid, so it is 503 and never
-/// a 401: the caller caches a 401 and must not cache this.
+/// a 401: a 401 would refuse a credential this service did not judge.
 fn db_failure(error: AuthError) -> RawResponse {
     if error.is_busy() {
         return unavailable();
@@ -693,7 +671,7 @@ mod tests {
     }
 
     /// A lock is transient and the credential may be valid, so `/check` must
-    /// answer 503 and not a 401 the caller would cache as a refusal.
+    /// answer 503 and not a 401 that refuses a credential it did not judge.
     ///
     /// A real lock cannot reach this branch over the wire: every connection is
     /// in WAL mode, where a writer never blocks a reader. The classification

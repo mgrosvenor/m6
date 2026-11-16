@@ -308,14 +308,14 @@ It does not call this route, and the route exists for any other client that need
 ### 5.5. Check
 
 `POST /check` answers the current identity for an access token.
-It takes `Authorization: Bearer <access token>` and returns `sub`, `username`, `roles` and `groups` read from the database, with a relative `ttl_ms`.
-The `ttl_ms` is at most 5000 and at most the token's remaining life, so an answer cannot outlive the token it describes.
+It takes `Authorization: Bearer <access token>` and returns `sub`, `username`, `roles` and `groups` read from the database.
+The answer is the decision for this request only, with no cache hint: nothing caches a decision, so a revocation counts from the next request.
 The route is additive: no m6-http route calls it yet, and local verification is still what decides a request.
 
 A missing, invalid or expired token is 401 `{"error":"unauthorised"}`.
 A user who is not in the database, including a deleted user, is the same 401 rather than an empty role list.
 A locked database is 503 `{"error":"unavailable"}` at once, because the caller's deadline is shorter than this service's one-second deferral.
-The 401 and 503 are distinct: only the 401 is a refusal the caller may cache, and a 503 never is.
+The 401 and 503 are distinct: the 401 refuses this request, and the 503 reports a database the service could not read.
 
 Login, refresh, logout, the public key and check are the whole HTTP surface.
 Section 6 gives the token contents those routes produce, and section 7 gives the m6-http checks that consume them.
