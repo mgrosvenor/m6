@@ -32,6 +32,14 @@ pub enum H2Io<'a> {
     },
 }
 
+impl H2Io<'_> {
+    /// Whether rustls holds encrypted bytes the socket has not taken, which is
+    /// the socket refusing more.
+    fn tls_pending(&self) -> bool {
+        matches!(self, H2Io::Tls { tls, .. } if tls.wants_write())
+    }
+}
+
 // ── Frame type constants ──────────────────────────────────────────────────────
 
 const TYPE_DATA: u8 = 0x0;
@@ -690,11 +698,15 @@ impl Http2Conn {
     /// send queue and continues that stream. A stream whose END_STREAM has gone
     /// out counts too, so the next flush frees its slot.
     pub fn has_pending_send(&self) -> bool {
-        !self.send_buf.is_empty()
-            || self
-                .streams
-                .values()
-                .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent)
+        !self.send_buf.is_empty() || self.more_to_flush()
+    }
+
+    /// Whether a stream still has DATA the windows allow, or has sent its
+    /// END_STREAM and waits to be reaped.
+    fn more_to_flush(&self) -> bool {
+        self.streams
+            .values()
+            .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent)
     }
 
     /// Drive one step: pump I/O, parse frames, dispatch requests. Returns
@@ -753,11 +765,9 @@ impl Http2Conn {
             }
         }
 
-        // Flush any response data that became unblocked this iteration
-        // (e.g. a WINDOW_UPDATE was processed inside the frame loop above).
-        self.flush_pending_streams();
-
-        if let Err(e) = self.flush_io(&mut io) {
+        // Send any response data that became unblocked this iteration (e.g. a
+        // WINDOW_UPDATE was processed inside the frame loop above).
+        if let Err(e) = self.send_until_blocked(&mut io) {
             m6_core::log::trace!("h2 flush_io: {e}");
             self.phase = Phase::Done;
         }
@@ -2302,12 +2312,35 @@ impl Http2Conn {
             },
             method.eq_ignore_ascii_case("HEAD"),
         );
-        if self.flush_io(io).is_err() {
+        if self.send_until_blocked(io).is_err() {
             self.phase = Phase::Done;
         }
     }
 
     // ── Flow-controlled response flusher ─────────────────────────────────────
+
+    /// Frame DATA and write it, again and again, until the socket would block
+    /// or nothing is left that the windows allow.
+    ///
+    /// The send queue is bounded at [SEND_QUEUE_BYTES], so one pass frames one
+    /// queue's worth and a body of any length needs many. The loop is
+    /// edge-triggered: a socket that took everything it was given reports no new
+    /// writable edge, because it never stopped being writable, so a pass that
+    /// frames one queue and returns waits for an event that never comes. Writing
+    /// until the socket refuses is what makes the next edge certain: it arrives
+    /// when the kernel drains below the mark, and that event runs this again.
+    /// On a link slow enough to refuse, the bound and the kernel's own mark are
+    /// what keep the order m6's; on one that never refuses, there is no queue
+    /// for an order to matter in.
+    fn send_until_blocked(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        loop {
+            self.flush_pending_streams();
+            self.flush_io(io)?;
+            if !self.send_buf.is_empty() || io.tls_pending() || !self.more_to_flush() {
+                return Ok(());
+            }
+        }
+    }
 
     /// Frame response DATA for the streams that have some, until the send
     /// queue holds [SEND_QUEUE_BYTES] or nothing is left that the windows
@@ -5472,6 +5505,32 @@ mod tests {
         assert!(
             !sent_frames(&c.send_buf, TYPE_DATA).is_empty(),
             "the flush must still frame the next DATA"
+        );
+    }
+
+    /// The bound frames one queue per pass, so a connection whose socket takes
+    /// everything has to go on framing in the same turn: no writable edge comes
+    /// for a socket that never stopped being writable. A 40 KiB body is the
+    /// smallest that needs a third pass, and fits any socket buffer.
+    #[test]
+    fn send_until_blocked_goes_past_one_queue_when_the_socket_takes_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (_peer, _) = m6_core::platform::net::connect_tcp(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server.set_nonblocking(true).expect("nonblocking");
+        let mut c = request_with_body(1, 40 * 1024);
+        c.conn_send_window = 1 << 20;
+        c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
+        c.send_until_blocked(&mut H2Io::Plain { stream: &server })
+            .expect("the write");
+        assert!(
+            c.send_buf.is_empty() && !c.more_to_flush(),
+            "the socket took it all, so nothing may be left: {} bytes queued, {:?}",
+            c.send_buf.len(),
+            c.streams
+                .get(&1)
+                .map(|s| (s.resp_sent, s.end_stream_sent))
         );
     }
 
