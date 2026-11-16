@@ -177,6 +177,117 @@ fn a_login_on_the_check_socket_is_404() {
     );
 }
 
+/// The reserved path belongs to the login socket.
+///
+/// The wrong decision this catches: `POST /genid` on a check-only process
+/// answered 204 and ran the reload, because `Site` answers the reserved path
+/// before routing and the loop's reload arm had no side test. A process meant
+/// to serve only `/check` could be told to reload.
+#[test]
+fn genid_on_a_check_only_process_is_404() {
+    let env = setup("genid-on-check");
+    let mut svc = spawn(&env, &env.primary, Some(&env.check), &["--check-only"]);
+    svc.wait_for_path(&env.check, BOUND);
+    svc.wait_for_started(BOUND);
+
+    for request in [
+        "POST /genid HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        "POST /genid?x=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        "GET /genid HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ] {
+        let resp = http_request(&env.check, request);
+        assert_eq!(
+            parse_status(&resp),
+            404,
+            "the reserved path answered on the check socket\n{resp}"
+        );
+    }
+}
+
+/// Which path answers on which socket, driven through both sockets.
+///
+/// The list is the point. `/check` answers only on the check socket. The four
+/// login routes and the reserved `/genid` answer only on the login socket.
+/// `/perf`, `/traffic`, `/ready` and `/health` answer on neither, because they
+/// are m6-http's paths and this process has no route for them: their 404 is
+/// routing finding nothing, not the side rule.
+///
+/// Every wrong-socket answer is the house 404. Before the reserved-path fix,
+/// `POST /genid` on the check socket was 204 and ran the reload, and `GET
+/// /genid` was 405.
+#[test]
+fn each_path_answers_on_one_socket_only() {
+    let env = setup("one-side-only");
+    let mut svc = spawn(&env, &env.primary, Some(&env.check), &[]);
+    svc.wait_for_path(&env.primary, BOUND);
+    svc.wait_for_path(&env.check, BOUND);
+    svc.wait_for_started(BOUND);
+
+    let check_requests = [
+        "POST /genid HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        "GET /genid HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        "POST /auth/logout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ];
+    for request in check_requests {
+        let resp = http_request(&env.check, request);
+        assert_eq!(
+            parse_status(&resp),
+            404,
+            "a login-side path answered on the check socket\n{resp}"
+        );
+    }
+
+    // Paths this process does not serve at all: 404 on both sockets.
+    for request in [
+        "GET /perf HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /traffic HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    ] {
+        for socket in [&env.primary, &env.check] {
+            let resp = http_request(socket, request);
+            assert_eq!(
+                parse_status(&resp),
+                404,
+                "a path with no route was not the house 404 on {}\n{resp}",
+                socket.display()
+            );
+        }
+    }
+
+    // The one route the check socket serves, and the login socket's five.
+    let resp = http_request(
+        &env.check,
+        "POST /check HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&resp),
+        401,
+        "the check route did not answer on its own socket\n{resp}"
+    );
+    let resp = http_request(
+        &env.primary,
+        "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&resp),
+        200,
+        "the login routes do not answer on the login socket\n{resp}"
+    );
+    let resp = http_request(
+        &env.primary,
+        "POST /genid HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&resp),
+        204,
+        "the login socket stopped answering the reserved path\n{resp}"
+    );
+}
+
 /// The check socket is derived beside the primary, with the `check-` prefix
 /// that keeps it out of the deployment's login glob.
 #[test]

@@ -41,7 +41,7 @@ use m6_core::platform::Signals;
 use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
-use m6_core::site::RouteMethod;
+use m6_core::site::{RouteMethod, GENID_PATH};
 use m6_core::{genid_failed, genid_ok};
 
 use config::AuthConfig;
@@ -651,7 +651,18 @@ fn turn(
         // after the match, when the borrow has ended.
         let (response, idle) = match read {
             Read::Request(head) => {
-                let response = match site.handle(&head) {
+                // The reserved path is answered by `Site` before routing, so
+                // the side test in `run_route` never sees it. It belongs to
+                // the login side like the four login routes, and a check-only
+                // process serves `/check` and nothing else: without this, a
+                // peer of the check socket can post `/genid` and make the
+                // process run its start path again.
+                let handled = if side == Side::Check && head.path == GENID_PATH {
+                    Handled::Done(site.not_found(&head))
+                } else {
+                    site.handle(&head)
+                };
+                let response = match handled {
                     Handled::Done(response) => response,
                     // This service's four routes, by the index they were given
                     // to `Site::load` in.
