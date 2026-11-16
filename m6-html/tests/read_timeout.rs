@@ -46,10 +46,10 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .arg(fixtures_dir().join("configs").join("m6-html-timeout.conf"))
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         get_root(&socket_path, Duration::from_secs(5)).is_some()
     });
     assert!(

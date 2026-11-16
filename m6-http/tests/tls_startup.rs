@@ -237,7 +237,7 @@ fn start(configured: &Cert, alternate: &Cert) -> Server {
         "m6-http-tls-startup",
         Command::new(binary("m6-http")).arg(&site).arg(&system),
     );
-    proc.wait_for_tcp(port, Duration::from_secs(20));
+    proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     Server {
         port,
@@ -259,7 +259,7 @@ fn run_until_exit(site: &Path, config: &Path) -> (Option<i32>, String) {
             .stderr(Stdio::piped()),
     )
     .expect("spawn m6-http");
-    let exited = testkit::wait::until(Duration::from_secs(10), || {
+    let exited = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         child.child().try_wait().expect("try_wait").is_some()
     });
     if !exited {

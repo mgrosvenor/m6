@@ -480,7 +480,7 @@ impl Server {
     /// already written when it is readable, so nothing is left to arrive after
     /// the truncation.
     fn wait_until_serving(&self) {
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             self.get("/public/probe.html", &[]).status == 200
         });
         assert!(
@@ -618,7 +618,7 @@ metrics_require = "role:monitor"
             .arg(site.join("configs/m6-file.conf"))
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    file_proc.wait_for_path(&sock, Duration::from_secs(10));
+    file_proc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     let mut http_proc = Service::spawn(
         "m6-http",
@@ -626,7 +626,7 @@ metrics_require = "role:monitor"
             .arg(site)
             .arg(site.join("system.toml")),
     );
-    http_proc.wait_for_tcp(port, Duration::from_secs(10));
+    http_proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let srv = Server {
         port,
@@ -649,7 +649,7 @@ fn wait_for_request_lines(srv: &Server, want: usize) {
 }
 
 fn wait_for_request_lines_at(log: &Path, want: usize) {
-    let ok = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         read_analytics_lines(log).len() >= want
     });
     assert!(
@@ -664,7 +664,7 @@ fn wait_for_request_lines_at(log: &Path, want: usize) {
 /// loop enqueues, so its presence means every earlier probe line is flushed
 /// too, and truncating the log after it is safe.
 fn wait_until_probe_logged(log: &Path, path: &str) {
-    let ok = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         read_analytics_lines(log)
             .iter()
             .any(|l| l.path == path && l.status == 200)
@@ -698,7 +698,9 @@ fn sigusr1_reopens_the_analytics_log_and_loses_no_line() {
     srv.http
         .borrow()
         .request(m6_core::platform::Signal::ReopenLogs);
-    let back = m6_core::testkit::wait::until(Duration::from_secs(5), || srv.analytics_log.exists());
+    let back = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        srv.analytics_log.exists()
+    });
     assert!(back, "the live path never reappeared");
 
     for _ in 0..5 {
@@ -729,7 +731,7 @@ fn reopen_signals_never_count_toward_a_forced_shutdown() {
         srv.http
             .borrow()
             .request(m6_core::platform::Signal::ReopenLogs);
-        let reopened = m6_core::testkit::wait::until(Duration::from_secs(5), || {
+        let reopened = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             srv.perf_json()["logging"]["reopen"]["reopens_total"] == want
         });
         assert!(reopened, "reopen {want} should have been handled");
@@ -1061,7 +1063,7 @@ name = "test-node"
             .arg(site.join("configs/m6-file.conf"))
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    _file_proc.wait_for_path(&sock, Duration::from_secs(10));
+    _file_proc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     let mut _http_proc = Service::spawn(
         "m6-http",
@@ -1069,14 +1071,14 @@ name = "test-node"
             .arg(site)
             .arg(site.join("system.toml")),
     );
-    _http_proc.wait_for_tcp(port, Duration::from_secs(10));
+    _http_proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let tls = tls_client_config(&cert_der);
 
     // Wait until the backend pool is actually populated, then clear the log.
     // See Server::wait_until_serving for why a fixed sleep is not enough; this
     // stack has no Server, so the same poll is spelled out.
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         https_get(port, "/public/open.txt", &[], tls.clone()).status == 200
     });
     assert!(
@@ -1185,13 +1187,13 @@ name = "test-node"
             .arg(site)
             .arg(site.join("system.toml")),
     );
-    _http_proc.wait_for_tcp(port, Duration::from_secs(10));
+    _http_proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let tls = tls_client_config(&cert_der);
     // The backend is a dead port, so readiness is the handler answering. Probe
     // /health, which is logged as "monitor" and never pollutes the request-line
     // count this test asserts.
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         https_get(port, "/health", &[], tls.clone()).status != 0
     });
     assert!(
@@ -1324,7 +1326,7 @@ backend = "m6-file"
             .arg(origin_site.join("configs/m6-file.conf"))
             .env("M6_SOCKET_OVERRIDE", &origin_sock),
     );
-    _origin_file_proc.wait_for_path(&origin_sock, Duration::from_secs(10));
+    _origin_file_proc.wait_for_path(&origin_sock, m6_core::testkit::STARTUP_BOUND);
 
     let mut _origin_http_proc = Service::spawn(
         "origin m6-http",
@@ -1332,7 +1334,7 @@ backend = "m6-file"
             .arg(origin_site)
             .arg(origin_site.join("system.toml")),
     );
-    _origin_http_proc.wait_for_tcp(origin_port, Duration::from_secs(10));
+    _origin_http_proc.wait_for_tcp(origin_port, m6_core::testkit::STARTUP_BOUND);
 
     // ── Edge: its only backend IS the origin's m6-http ─────────────────────
     let edge_dir = tempfile::tempdir().unwrap();
@@ -1394,14 +1396,14 @@ backend = "origin"
             .arg(edge_site)
             .arg(edge_site.join("system.toml")),
     );
-    _edge_http_proc.wait_for_tcp(edge_port, Duration::from_secs(10));
+    _edge_http_proc.wait_for_tcp(edge_port, m6_core::testkit::STARTUP_BOUND);
 
     // Both stacks must actually be serving, not merely listening: a backend
     // that has not finished starting answers 502. This was two `sleep(1500)`s
     // and they were not enough on the Linux build box. Probing the edge
     // exercises the whole chain, so it covers the origin too.
     let probe_tls = tls_client_config(&edge_cert_der);
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         https_get(edge_port, "/public/probe.html", &[], probe_tls.clone()).status == 200
     });
     assert!(

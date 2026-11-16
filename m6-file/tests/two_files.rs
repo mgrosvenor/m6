@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use m6_core::testkit::{binary, Service};
 
@@ -156,7 +156,7 @@ fn a_start_with_overlapping_routes_exits_2_and_names_both() {
             .arg(&conf)
             .env("M6_SOCKET_OVERRIDE", root.join("two-files.sock")),
     );
-    let status = svc.wait_for_exit(Instant::now() + Duration::from_secs(30));
+    let status = svc.wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND);
     let text = svc.output();
     assert_eq!(
         status.and_then(|s| s.code()),

@@ -82,7 +82,7 @@ fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i
             .stderr(Stdio::piped()),
     )
     .expect("spawn m6-http");
-    let exited = testkit::wait::until(Duration::from_secs(10), || {
+    let exited = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         child.child().try_wait().expect("try_wait").is_some()
     });
     if !exited {
@@ -173,8 +173,8 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
     let mut svc = testkit::Service::spawn("m6-http-internal-binds", &mut cmd);
-    svc.wait_for_tcp(tls.port(), Duration::from_secs(10));
-    svc.wait_for_tcp(h2c.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(tls.port(), m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_tcp(h2c.port(), m6_core::testkit::STARTUP_BOUND);
 
     let mut conn = H2cClientConn::connect("127.0.0.1", h2c.port()).expect("connect over h2c");
     let settle = Instant::now() + Duration::from_millis(250);
@@ -287,8 +287,8 @@ fn an_unlisted_peer_is_refused_at_connect() {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
     let mut svc = testkit::Service::spawn("m6-http-internal-peers", &mut cmd);
-    svc.wait_for_tcp(tls.port(), Duration::from_secs(10));
-    svc.wait_for_tcp(h2c.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(tls.port(), m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_tcp(h2c.port(), m6_core::testkit::STARTUP_BOUND);
 
     // The TCP handshake completes in the kernel, so connect succeeds and the
     // server then closes the socket without reading a byte.

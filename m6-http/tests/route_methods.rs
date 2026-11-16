@@ -162,7 +162,7 @@ impl Fixture {
             .env("RUST_LOG", "info")
             .current_dir(self._dir.path());
         let mut svc = Service::spawn("m6-http-route-methods", &mut cmd);
-        svc.wait_for_tcp(self.port.port(), Duration::from_secs(15));
+        svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);
         svc
     }
 

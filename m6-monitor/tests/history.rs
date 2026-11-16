@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use m6_core::testkit::{assert_app_lifecycle, binary, response::read_one, wait, Service};
+use m6_core::testkit::{
+    assert_app_lifecycle, binary, read_response_event, wait, Service, RESPONSE_BOUND,
+};
 use m6_core::time_range::rfc3339_utc_ms;
 
 fn config(history: &str) -> String {
@@ -66,8 +68,8 @@ impl Setup {
 
     fn start(&self) -> Service {
         let mut svc = Service::spawn("m6-monitor", &mut self.command());
-        svc.wait_for_path(&self.sock, Duration::from_secs(10));
-        svc.wait_for_started(Duration::from_secs(10));
+        svc.wait_for_path(&self.sock, m6_core::testkit::STARTUP_BOUND);
+        svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
         svc
     }
 }
@@ -96,13 +98,12 @@ impl Answer {
 
 fn get(sock: &Path, target: &str) -> Answer {
     let mut s = UnixStream::connect(sock).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     write!(
         s,
         "GET {target} HTTP/1.1\r\nHost: m6\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
-    let raw = read_one(&mut s, "GET").expect("a response");
+    let raw = read_response_event(s, "GET", RESPONSE_BOUND).expect("a response");
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let status = head

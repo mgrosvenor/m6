@@ -373,7 +373,7 @@ impl Service {
         let path = socket.clone();
         let handle = std::thread::spawn(move || service(&path, relay, flag));
         assert!(
-            wait::for_unix(&socket, Duration::from_secs(5)),
+            wait::for_unix(&socket, m6_core::testkit::STARTUP_BOUND),
             "the service socket never appeared"
         );
         Service {

@@ -147,7 +147,7 @@ impl Fixture {
             .env("M6_TEST_STATS_INTERVAL_SECS", "3600")
             .current_dir(self.dir.path());
         let mut svc = Service::spawn("m6-http-alloc-attribution", &mut cmd);
-        svc.wait_for_tcp(self.port.port(), Duration::from_secs(15));
+        svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);
         svc
     }
 

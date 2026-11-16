@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use m6_core::testkit::{binary, Service};
+use m6_core::testkit::{binary, read_response_event, Service, RESPONSE_BOUND};
 
 /// One route that serves the whole root, so the root is the document root.
 const ROUTE: &str = "[[route]]\npath = \"/{*relpath}\"\nhandler = \"files\"\nroot = \"\"\n";
@@ -49,15 +49,13 @@ fn spawn(root: &Path, config: &Path) -> Service {
 fn get(socket: &Path, path: &str) -> String {
     let mut stream = UnixStream::connect(socket).expect("connect");
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
         .write_all(
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
         )
         .expect("write request");
-    let response = m6_core::testkit::read_one(&mut stream, "GET").expect("read one response");
+    let response =
+        read_response_event(stream, "GET", RESPONSE_BOUND).unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -72,7 +70,7 @@ fn a_document_root_with_git_exits_2_and_names_it() {
     let conf = config(dir.path(), "");
 
     let mut svc = spawn(dir.path(), &conf);
-    let status = svc.wait_for_exit(Instant::now() + Duration::from_secs(30));
+    let status = svc.wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND);
     let text = svc.output();
     assert_eq!(
         status.and_then(|s| s.code()),
@@ -102,8 +100,11 @@ fn a_document_root_with_logs_starts_and_warns() {
     let conf = config(dir.path(), "");
 
     let mut svc = spawn(dir.path(), &conf);
-    svc.wait_for_path(&dir.path().join("m6-file.sock"), Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(
+        &dir.path().join("m6-file.sock"),
+        m6_core::testkit::STARTUP_BOUND,
+    );
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     let response = get(&dir.path().join("m6-file.sock"), "/hello.txt");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let status = svc.terminate(Duration::from_secs(5));
@@ -126,8 +127,11 @@ fn a_root_over_its_budget_starts_and_warns_with_total_and_setting() {
     let conf = config(dir.path(), "site_size_budget_mb = 1\n");
 
     let mut svc = spawn(dir.path(), &conf);
-    svc.wait_for_path(&dir.path().join("m6-file.sock"), Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(
+        &dir.path().join("m6-file.sock"),
+        m6_core::testkit::STARTUP_BOUND,
+    );
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     let response = get(&dir.path().join("m6-file.sock"), "/hello.txt");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let status = svc.terminate(Duration::from_secs(5));
@@ -162,8 +166,11 @@ fn a_build_artifact_outside_the_route_roots_does_not_refuse_the_start() {
     .unwrap();
 
     let mut svc = spawn(dir.path(), &conf);
-    svc.wait_for_path(&dir.path().join("m6-file.sock"), Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(
+        &dir.path().join("m6-file.sock"),
+        m6_core::testkit::STARTUP_BOUND,
+    );
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     let response = get(&dir.path().join("m6-file.sock"), "/assets/site.css");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let status = svc.terminate(Duration::from_secs(5));
@@ -184,8 +191,11 @@ fn a_clean_document_root_starts_without_a_finding() {
     let conf = config(dir.path(), "");
 
     let mut svc = spawn(dir.path(), &conf);
-    svc.wait_for_path(&dir.path().join("m6-file.sock"), Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(
+        &dir.path().join("m6-file.sock"),
+        m6_core::testkit::STARTUP_BOUND,
+    );
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     let response = get(&dir.path().join("m6-file.sock"), "/hello.txt");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.ends_with("hello"), "{response}");

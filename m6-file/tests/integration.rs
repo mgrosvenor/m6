@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
+use m6_core::testkit::{
+    assert_app_lifecycle, binary, read_response_event, wait, Service, RESPONSE_BOUND,
+};
 
 /// A running `m6-file`, its socket, and the directory both live in.
 ///
@@ -57,10 +59,10 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .arg(config_path())
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-file created {} but never accepted a connection",
         socket_path.display()
     );
@@ -72,15 +74,14 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
 fn http_request(socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
 
     // One response, not read-to-EOF. Backends keep the connection open now
-    // (RFC 9112 9.3), so waiting for a close waits for the idle timeout.
+    // (RFC 9112 9.3), so waiting for a close waits for the idle timeout. The
+    // wait is on the response event, with RESPONSE_BOUND as its ceiling.
     let method = request.split(' ').next().unwrap_or("");
-    let response = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let response =
+        read_response_event(stream, method, RESPONSE_BOUND).unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -114,7 +115,7 @@ fn a_thread_pool_section_is_refused_at_start() {
             .env("M6_SOCKET_OVERRIDE", &socket),
     );
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-file did not refuse [thread_pool]\n--- output ---\n{}",
@@ -181,7 +182,7 @@ fn an_access_line_is_logged_at_the_default_level() {
     let resp = http_request(&socket_path, req);
     assert!(resp.contains("200 OK"), "expected 200, got:\n{resp}");
 
-    let logged = wait::until(Duration::from_secs(5), || {
+    let logged = wait::until(m6_core::testkit::STARTUP_BOUND, || {
         let output = guard.svc.output();
         output.contains(r#""level":"INFO""#) && output.contains(r#""message":"request complete""#)
     });
@@ -531,10 +532,10 @@ fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
             .arg(&config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-file never accepted a connection"
     );
 
@@ -552,7 +553,7 @@ fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
     // the server accepted it and is writing. `peek` reads nothing.
     slow.set_nonblocking(true)
         .expect("non-blocking slow reader");
-    let writing = wait::until(Duration::from_secs(10), || {
+    let writing = wait::until(m6_core::testkit::STARTUP_BOUND, || {
         let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
         matches!(socket2::SockRef::from(&slow).peek(&mut byte), Ok(n) if n > 0)
     });
@@ -646,10 +647,10 @@ fn a_request_pipelined_behind_a_streamed_body_waits_for_the_body() {
             .arg(&config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-file never accepted a connection"
     );
 
@@ -731,10 +732,10 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
         .arg(&config)
         .env("M6_SOCKET_OVERRIDE", &socket_path);
     let mut svc = Service::spawn("m6-file", &mut command);
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-file never accepted a connection"
     );
 
@@ -750,7 +751,7 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
 
     // Every held connection must be accepted and its file open: one byte of
     // its body is the signal, and `peek` reads nothing.
-    let started = wait::until(Duration::from_secs(10), || {
+    let started = wait::until(m6_core::testkit::STARTUP_BOUND, || {
         held.iter().all(|client| {
             let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
             matches!(socket2::SockRef::from(client).peek(&mut byte), Ok(n) if n > 0)
@@ -1080,10 +1081,10 @@ fn a_head_on_an_unreadable_file_still_answers() {
             .arg(&config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "never accepted"
     );
 

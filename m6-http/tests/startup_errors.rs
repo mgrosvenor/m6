@@ -265,7 +265,7 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&system);
     let mut svc = Service::spawn("m6-http-server-in-system", &mut cmd);
-    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
 
     let status = svc.terminate(Duration::from_secs(5));
     assert!(
@@ -437,7 +437,7 @@ fn a_relative_tls_key_exits_2_and_names_the_setting() {
     cmd.arg(&site).arg(&system);
     let mut svc = Service::spawn("m6-http", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-http did not exit for a relative [server] tls_key\n--- output ---\n{}",
@@ -520,7 +520,7 @@ fn a_verifying_url_backend_with_an_empty_system_store_exits_2() {
         .env("SSL_CERT_DIR", &empty_dir);
     let mut svc = Service::spawn("m6-http-empty-roots", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-http did not exit for an empty system store\n--- output ---\n{}",
@@ -564,7 +564,7 @@ fn a_url_backend_that_skips_verification_starts_with_an_empty_system_store() {
         .env("SSL_CERT_FILE", &empty_file)
         .env("SSL_CERT_DIR", &empty_dir);
     let mut svc = Service::spawn("m6-http-empty-roots-skip", &mut cmd);
-    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
     let status = svc.terminate(Duration::from_secs(5));
     assert!(
         status.success(),
@@ -618,7 +618,7 @@ fn a_missing_analytics_log_directory_exits_2_and_names_the_setting_and_path() {
     cmd.arg(&site).arg(&system);
     let mut svc = Service::spawn("m6-http-missing-log-dir", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-http did not exit for a missing analytics log directory\n--- output ---\n{}",
@@ -667,7 +667,7 @@ fn a_present_analytics_log_directory_starts_and_writes_the_file() {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&system);
     let mut svc = Service::spawn("m6-http-present-log-dir", &mut cmd);
-    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
     assert!(
         log_path.is_file(),
         "the analytics file {} was not created\n--- output ---\n{}",

@@ -559,7 +559,7 @@ backend = "example"
         // Wait for the edge to answer, rather than sleeping a fixed amount.
         // `wait_for_tcp` fails at once with the edge's exit status and stderr
         // if the edge exits, instead of waiting out the whole deadline.
-        edge.wait_for_tcp(port, Duration::from_secs(20));
+        edge.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
         Some(Stack {
             _backend: backend.child.take().unwrap(),

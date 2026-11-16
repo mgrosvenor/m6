@@ -125,10 +125,10 @@ fn spawn_server(env: &TestEnv) -> Service {
 /// Readiness is a successful connect, not an existing path: `bind` creates the
 /// socket file and `listen` comes after, so the file appearing proves nothing.
 fn wait_until_serving(svc: &mut Service, socket: &Path) {
-    svc.wait_for_path(socket, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(socket, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(socket, Duration::from_secs(10)),
+        wait::for_unix(socket, m6_core::testkit::STARTUP_BOUND),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
         socket.display(),
         svc.output()
@@ -149,7 +149,7 @@ fn start_failure(env: &TestEnv, what: &str) -> String {
             .env("M6_SOCKET_OVERRIDE", &env.socket_path),
     );
     let status = svc
-        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-auth-server did not stop for {what}\n--- output ---\n{}",
@@ -1174,12 +1174,14 @@ fn a_locked_database_defers_and_the_service_keeps_serving() {
     // loop that is already waiting for them.
     let mut login = UnixStream::connect(&env.socket_path).expect("connect the login");
     login
-        .set_read_timeout(Some(RESPONSE_BOUND))
-        .expect("set the login's read bound");
-    login
         .write_all(b"GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("send the public-key request");
-    let warm = m6_core::testkit::read_one(&mut login, "GET").expect("the public key");
+    let warm = m6_core::testkit::read_response_event(
+        login.try_clone().expect("clone the login socket"),
+        "GET",
+        RESPONSE_BOUND,
+    )
+    .expect("the public key");
     assert_eq!(
         parse_status(&String::from_utf8_lossy(&warm)),
         200,

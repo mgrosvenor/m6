@@ -53,7 +53,7 @@ fn the_client_path_allocates_nothing() {
             .arg(&config)
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    svc.wait_for_path(&sock, Duration::from_secs(10));
+    svc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     // A completed poll is the signal its debug line gives. Waiting for it
     // keeps /digest out of the measured window: that route builds its body per
@@ -71,7 +71,7 @@ fn the_client_path_allocates_nothing() {
     // A thousand requests to the page's stored bytes. Each connection carries
     // one request, so the counted client arm is one turn per request.
     for _ in 0..1000 {
-        let (status, _) = support::get(&sock, "/", Duration::from_secs(5));
+        let (status, _) = support::get(&sock, "/");
         assert!(
             status == 200 || status == 503,
             "the page answered {status}\n--- output ---\n{}",

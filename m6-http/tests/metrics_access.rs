@@ -266,9 +266,9 @@ impl Fixture {
     /// status proves serving.
     fn start(self) -> Running {
         let mut svc = Service::spawn("m6-http-metrics", &mut self.command());
-        svc.wait_for_tcp(self.port.port(), Duration::from_secs(10));
+        svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);
         let running = Running { svc, fx: self };
-        let ready = testkit::wait::until(Duration::from_secs(30), || {
+        let ready = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             running.h1("/health", &[]).status != 0
         });
         assert!(
@@ -288,7 +288,7 @@ impl Fixture {
                 .stderr(Stdio::piped()),
         )
         .expect("spawn m6-http");
-        let exited = testkit::wait::until(Duration::from_secs(10), || {
+        let exited = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             child.child().try_wait().expect("try_wait").is_some()
         });
         if !exited {
@@ -1076,7 +1076,8 @@ fn one_auth_check_per_protected_request() {
             r.status
         );
         assert!(
-            testkit::wait::until(Duration::from_secs(10), || run.auth_check_count() > before),
+            testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || run.auth_check_count()
+                > before),
             "{path} logged no `auth check`\n{}",
             run.svc.output()
         );

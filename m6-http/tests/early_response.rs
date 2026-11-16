@@ -335,7 +335,7 @@ impl Fixture {
                 .arg(site)
                 .arg(site.join("system.toml")),
         );
-        service.wait_for_tcp(port, Duration::from_secs(20));
+        service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
         Fixture {
             service,
             _dir: dir,

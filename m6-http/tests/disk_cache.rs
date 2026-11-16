@@ -345,7 +345,7 @@ impl Stack {
         self.html
             .as_mut()
             .unwrap()
-            .wait_for_path(&sock, Duration::from_secs(15));
+            .wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
     }
 
     fn start_source(&mut self) {
@@ -357,9 +357,9 @@ impl Stack {
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-source", &mut cmd);
-        svc.wait_for_tcp(self.source_port.port(), Duration::from_secs(10));
+        svc.wait_for_tcp(self.source_port.port(), m6_core::testkit::STARTUP_BOUND);
         self.source = Some(svc);
-        let ready = wait_until(Duration::from_secs(10), || {
+        let ready = wait_until(m6_core::testkit::STARTUP_BOUND, || {
             self.get_source("/health", &[]).status != 0
         });
         assert!(
@@ -381,9 +381,9 @@ impl Stack {
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-cache", &mut cmd);
-        svc.wait_for_tcp(self.cache_port.port(), Duration::from_secs(10));
+        svc.wait_for_tcp(self.cache_port.port(), m6_core::testkit::STARTUP_BOUND);
         self.cache = Some(svc);
-        let ready = wait_until(Duration::from_secs(10), || {
+        let ready = wait_until(m6_core::testkit::STARTUP_BOUND, || {
             self.get_cache("/health", &[]).status != 0
         });
         assert!(
@@ -726,7 +726,7 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
     // non-zero once a window has covered the slice.
     let startup = stack.longest_loop_work_ns();
     assert!(
-        wait_until(Duration::from_secs(5), || {
+        wait_until(m6_core::testkit::STARTUP_BOUND, || {
             stack.longest_loop_work_ns() > 0
         }),
         "/perf never reported the loop's work_max_ns while the writer worked:\n{}",
@@ -925,7 +925,9 @@ fn a_restart_reads_the_file_the_node_wrote() {
     let served = stack.get_cache("/", &[]);
     assert_eq!(served.text(), "first: one");
     assert!(
-        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
+            .files_for("0")
+            .is_empty()),
         "no file appeared under the generation directory:\n{}",
         stack.cache_output()
     );
@@ -950,7 +952,9 @@ fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
-        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
+            .files_for("0")
+            .is_empty()),
         "the first generation never wrote a file:\n{}",
         stack.cache_output()
     );
@@ -975,7 +979,9 @@ fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     assert_eq!(served.status, 200);
     assert_eq!(served.text(), "first: two");
     assert!(
-        wait_until(Duration::from_secs(10), || !stack.files_for("1").is_empty()),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
+            .files_for("1")
+            .is_empty()),
         "the new generation never wrote a file:\n{}",
         stack.cache_output()
     );
@@ -985,7 +991,7 @@ fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     assert_eq!(&response.body[..], b"first: two");
 
     assert!(
-        wait_until(Duration::from_secs(10), || !stack
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
             .cache_dir
             .join("0")
             .exists()),
@@ -1015,7 +1021,9 @@ fn a_restart_with_the_same_id_starts_warm() {
     assert_eq!(served.status, 200);
     assert_eq!(served.text(), "first: one");
     assert!(
-        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
+            .files_for("0")
+            .is_empty()),
         "no file appeared under the generation directory:\n{}",
         stack.cache_output()
     );
@@ -1023,7 +1031,9 @@ fn a_restart_with_the_same_id_starts_warm() {
     stack.stop_cache();
     stack.start_cache();
     assert!(
-        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .disk_state()
+            .as_deref()
             == Some("kept")),
         "the restart never kept the disk copy: {:?}\n{}",
         stack.disk_block(),
@@ -1052,7 +1062,7 @@ fn a_restart_with_the_same_id_starts_warm() {
          that increments this counter"
     );
     assert!(
-        wait_until(Duration::from_secs(5), || stack
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
             .cache_output()
             .contains("disk cache kept")),
         "the kept decision is logged:\n{}",
@@ -1073,7 +1083,9 @@ fn a_restart_after_a_publish_starts_cold() {
     assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
-        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
+            .files_for("0")
+            .is_empty()),
         "the first generation never wrote a file:\n{}",
         stack.cache_output()
     );
@@ -1093,16 +1105,20 @@ fn a_restart_after_a_publish_starts_cold() {
 
     stack.start_cache();
     assert!(
-        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .disk_state()
+            .as_deref()
             == Some("discarded")),
         "the restart never discarded the old generation: {:?}\n{}",
         stack.disk_block(),
         stack.cache_output()
     );
     assert!(
-        wait_until(Duration::from_secs(5), || stack.cache_output().contains(
-            "disk cache discarded: the site changed while this node was down"
-        )),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .cache_output()
+            .contains(
+                "disk cache discarded: the site changed while this node was down"
+            )),
         "the reason is logged:\n{}",
         stack.cache_output()
     );
@@ -1114,7 +1130,7 @@ fn a_restart_after_a_publish_starts_cold() {
         "the first GET reached the source's new generation"
     );
     assert!(
-        wait_until(Duration::from_secs(10), || !stack
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
             .cache_dir
             .join("0")
             .exists()),
@@ -1137,7 +1153,9 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
     assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
-        wait_until(Duration::from_secs(10), || !stack.files_for("0").is_empty()),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
+            .files_for("0")
+            .is_empty()),
         "the first generation never wrote a file:\n{}",
         stack.cache_output()
     );
@@ -1146,16 +1164,20 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
 
     stack.start_cache();
     assert!(
-        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .disk_state()
+            .as_deref()
             == Some("unverified")),
         "the restart never served the disk copy unverified: {:?}\n{}",
         stack.disk_block(),
         stack.cache_output()
     );
     assert!(
-        wait_until(Duration::from_secs(5), || stack.cache_output().contains(
-            "disk cache served unverified: the upstream did not answer"
-        )),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .cache_output()
+            .contains(
+                "disk cache served unverified: the upstream did not answer"
+            )),
         "the unverified install is logged:\n{}",
         stack.cache_output()
     );
@@ -1166,14 +1188,16 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
     // The source keeps its state directory, so its ID is still 0.
     stack.start_source();
     assert!(
-        wait_until(Duration::from_secs(10), || stack
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
             .genid_block()
             .contains("\"upstream_down\":false")),
         "the cache node never reconnected:\n{}",
         stack.cache_output()
     );
     assert!(
-        wait_until(Duration::from_secs(10), || stack.disk_state().as_deref()
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .disk_state()
+            .as_deref()
             == Some("kept")),
         "the confirmed disk copy is kept: {:?}\n{}",
         stack.disk_block(),

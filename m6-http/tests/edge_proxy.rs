@@ -418,8 +418,8 @@ impl EdgeStack {
         // spawning four processes, and m6-http would come up with an empty
         // backend pool and refuse to start. m6-http reads its pool once at
         // start, so the sockets must exist before it is spawned.
-        html_proc.wait_for_path(&html_sock, Duration::from_secs(15));
-        file_proc.wait_for_path(&file_sock, Duration::from_secs(15));
+        html_proc.wait_for_path(&html_sock, m6_core::testkit::STARTUP_BOUND);
+        file_proc.wait_for_path(&file_sock, m6_core::testkit::STARTUP_BOUND);
 
         // ── Start global m6-http ──────────────────────────────────────────
         let mut global_proc = Service::spawn(
@@ -431,7 +431,7 @@ impl EdgeStack {
                 "warn",
             ]),
         );
-        global_proc.wait_for_tcp(global_port, Duration::from_secs(5));
+        global_proc.wait_for_tcp(global_port, m6_core::testkit::STARTUP_BOUND);
 
         // ── Start edge m6-http ────────────────────────────────────────────
         let mut edge_proc = Service::spawn(
@@ -443,7 +443,7 @@ impl EdgeStack {
                 "warn",
             ]),
         );
-        edge_proc.wait_for_tcp(edge_port, Duration::from_secs(5));
+        edge_proc.wait_for_tcp(edge_port, m6_core::testkit::STARTUP_BOUND);
 
         let edge_tls = trusted_client_config(&ec_der);
 

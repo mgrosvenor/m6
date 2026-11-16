@@ -152,10 +152,10 @@ level = "warn"
             .arg(&path)
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    svc.wait_for_path(&sock, Duration::from_secs(10));
+    svc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     let started = Instant::now();
-    let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
+    let (status, body) = support::get(&sock, "/digest");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "/digest took {:?} while the tunnel probe waited",
@@ -169,7 +169,7 @@ level = "warn"
     // The budget passes and the poll completes with the tunnel lost.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
+        let (status, body) = support::get(&sock, "/digest");
         if status == 200 && body.contains("no answer") {
             break;
         }

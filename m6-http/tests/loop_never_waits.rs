@@ -567,7 +567,7 @@ impl Fixture {
                 .env("M6_TEST_STATS_INTERVAL_SECS", "2"),
         );
         let mut service = service;
-        service.wait_for_tcp(port, Duration::from_secs(20));
+        service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
         Fixture {
             port,
@@ -1133,7 +1133,7 @@ fn a_backend_that_resets_mid_response_answers_502_and_the_next_request_is_served
             .arg(site.join("system.toml")),
     );
     let mut service = service;
-    service.wait_for_tcp(port, Duration::from_secs(20));
+    service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     // The first request takes the resetting member and answers 502: the
     // failure comes after the connect, and only a failed connect moves the
@@ -1394,7 +1394,7 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
             .arg(&site)
             .arg(site.join("system.toml")),
     );
-    service.wait_for_tcp(port, Duration::from_secs(20));
+    service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     // Warm /fast so a later request is a cache hit.
     let (warm, _) = h1_get(port, "/fast", Duration::from_secs(5)).expect("warm /fast");
@@ -1558,7 +1558,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
             .arg(&site)
             .arg(site.join("system.toml")),
     );
-    service.wait_for_tcp(port, Duration::from_secs(20));
+    service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let h2_req = |path: &str| HttpRequest {
         method: "GET".to_string(),
@@ -1713,7 +1713,7 @@ impl UrlFixture {
             Command::new(binary("m6-http")).arg(dir.path()).arg(&system),
         );
         let mut service = service;
-        service.wait_for_tcp(port, Duration::from_secs(20));
+        service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
         UrlFixture {
             _dir: dir,
             _claim: claim,
@@ -2131,7 +2131,7 @@ fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
         Command::new(binary("m6-http")).arg(&site).arg(&system),
     );
     let status = service
-        .wait_for_exit(Instant::now() + Duration::from_secs(15))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .expect("m6-http must exit when a backend host does not resolve");
     let output = service.output();
     assert_eq!(status.code(), Some(2), "exit status: {status}\n{output}");

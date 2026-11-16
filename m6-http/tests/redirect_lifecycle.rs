@@ -64,7 +64,7 @@ fn start() -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
     let mut svc = testkit::Service::spawn("m6-http-redirect", &mut cmd);
-    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
     (svc, claim, dir)
 }
 

@@ -363,8 +363,15 @@ impl DiskWriter {
     /// directory itself.
     fn remove_old(&mut self, started: Instant) -> usize {
         let mut removed = 0usize;
+        // One unit of removal work is always attempted before the budget is
+        // checked. Without this a host that deschedules the process between
+        // `started` and the first check removes nothing, every tick, and a
+        // loaded server never frees a cache generation. The test
+        // `removal_stops_at_the_time_budget_and_continues_next_tick` failed on
+        // exactly that on 2026-11-16 under 16 CPU burners.
+        let mut did_work = false;
         while removed < REMOVE_BUDGET {
-            if over_budget(started, self.time_budget) {
+            if did_work && over_budget(started, self.time_budget) {
                 break;
             }
             let Some(dir) = self.removals.first().cloned() else {
@@ -377,7 +384,7 @@ impl DiskWriter {
                         if removed >= REMOVE_BUDGET {
                             break;
                         }
-                        if over_budget(started, self.time_budget) {
+                        if did_work && over_budget(started, self.time_budget) {
                             break;
                         }
                         let Ok(entry) = entry else { continue };
@@ -386,9 +393,11 @@ impl DiskWriter {
                             Ok(()) => {
                                 removed += 1;
                                 visited += 1;
+                                did_work = true;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 visited += 1;
+                                did_work = true;
                             }
                             Err(_) => break,
                         }
@@ -397,9 +406,11 @@ impl DiskWriter {
                         match std::fs::remove_dir(&dir) {
                             Ok(()) => {
                                 self.removals.remove(0);
+                                did_work = true;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 self.removals.remove(0);
+                                did_work = true;
                             }
                             Err(_) => break,
                         }
@@ -412,6 +423,7 @@ impl DiskWriter {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.removals.remove(0);
+                    did_work = true;
                 }
                 Err(_) => break,
             }
@@ -1111,18 +1123,24 @@ mod tests {
         }
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
+        // A zero budget makes the guarantee exact: one file of progress, then
+        // the budget stops the tick. A wall-clock budget cannot promise that
+        // on a loaded host, which is what made this test fail under 16 CPU
+        // burners on 2026-11-16.
+        w.time_budget = Duration::ZERO;
 
         let first = w.tick(&mut cache).removed;
-        assert!(first > 0, "the tick removes at least one file");
-        assert!(
-            first < 2_000,
-            "the time budget stops the tick before the directory is empty, removed {first}"
-        );
+        assert_eq!(first, 1, "a tick always makes one file of progress");
         let mut ticks = 1u32;
         while old.exists() {
-            w.tick(&mut cache);
+            let removed = w.tick(&mut cache).removed;
             ticks += 1;
-            assert!(ticks < 2_000, "removal stopped making progress");
+            assert!(removed <= 1, "the budget removes one file per tick");
+            assert!(
+                removed == 1 || !old.exists(),
+                "a tick that removed no file must have removed the empty directory"
+            );
+            assert!(ticks <= 2_002, "removal stopped making progress");
         }
         assert!(ticks > 1, "the directory takes more than one tick");
     }

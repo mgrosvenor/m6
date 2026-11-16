@@ -131,7 +131,7 @@ fn missing_private_key_exits_nonzero_names_the_file_and_binds_no_socket() {
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-auth-server did not exit for a missing private key\n--- output ---\n{}",
@@ -182,7 +182,7 @@ fn a_missing_storage_directory_exits_2_and_names_the_setting_and_path() {
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-auth-server did not exit for a missing [storage] directory\n--- output ---\n{}",
@@ -241,10 +241,10 @@ fn a_present_storage_directory_starts_and_accepts_a_connection() {
 
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
-    svc.wait_for_path(&site.socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&site.socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&site.socket_path, Duration::from_secs(10)),
+        wait::for_unix(&site.socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-auth-server never accepted a connection on {}\n--- output ---\n{}",
         site.socket_path.display(),
         svc.output()
@@ -279,7 +279,7 @@ fn a_relative_storage_path_exits_2_and_names_the_setting() {
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-auth-server did not exit for a relative [storage] path\n--- output ---\n{}",
@@ -339,7 +339,7 @@ public_key  = "{}"
     let mut cmd = site.command();
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-auth-server did not exit for a relative [keys] private_key\n--- output ---\n{}",

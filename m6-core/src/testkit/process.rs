@@ -577,8 +577,8 @@ pub fn assert_lifecycle_logged(name: &str, output: &str) {
 /// ```
 pub fn assert_app_lifecycle(name: &str, cmd: &mut Command, socket_path: &Path) {
     let mut svc = Service::spawn(name, cmd);
-    svc.wait_for_path(socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(socket_path, crate::testkit::STARTUP_BOUND);
+    svc.wait_for_started(crate::testkit::STARTUP_BOUND);
 
     let status = svc.terminate(Duration::from_secs(5));
     assert!(

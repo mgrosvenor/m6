@@ -88,6 +88,33 @@ pub fn read_one<R: Read>(r: &mut R, method: &str) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Wait for one response on `stream`, without a service to watch.
+///
+/// The wait is on the response event: a reader thread blocks on the socket and
+/// sends the bytes back, while this thread waits on the channel. `within` is a
+/// safety ceiling for a peer that stays silent, not a read deadline. A caller
+/// that has the [`Service`] should prefer [`read_response`], which also fails
+/// at once when the child exits, and names that exit.
+pub fn read_response_event<R: Read + Send + 'static>(
+    mut stream: R,
+    method: &str,
+    within: Duration,
+) -> Result<Vec<u8>, String> {
+    let method = method.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_one(&mut stream, &method));
+    });
+    match rx.recv_timeout(within) {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(format!("reading the response: {e}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("no response within {within:?}")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the response reader ended without a result".to_string())
+        }
+    }
+}
+
 /// Wait for one response, or for `svc` to exit, under `within`.
 ///
 /// A reader thread blocks on `stream` and sends the response back, while the

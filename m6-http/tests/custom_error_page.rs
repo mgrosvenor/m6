@@ -388,7 +388,7 @@ backend = "fixture"
         // 502; once the fixture's socket is in the pool it answers 200. /ok is
         // a plain 200 that does not run the error machinery, so the probe does
         // not pollute the counts the test asserts on.
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             https_get(port, "/ok", Arc::clone(&tls)).status == 200
         });
         assert!(

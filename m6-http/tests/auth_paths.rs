@@ -187,7 +187,7 @@ impl Server {
 
     /// Wait until a request actually reaches the backend.
     fn wait_until_serving(&self) {
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             https_get(self, "/public/probe.txt", &[], self.tls()).status == 200
         });
         assert!(
@@ -331,7 +331,7 @@ public_key = "{pubkey}"
             .arg(site.join("configs/m6-file.conf"))
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    file_proc.wait_for_path(&sock, Duration::from_secs(10));
+    file_proc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     let mut http_proc = Service::spawn(
         "m6-http",
@@ -339,7 +339,7 @@ public_key = "{pubkey}"
             .arg(site)
             .arg(site.join("system.toml")),
     );
-    http_proc.wait_for_tcp(port, Duration::from_secs(10));
+    http_proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let srv = Server {
         port,

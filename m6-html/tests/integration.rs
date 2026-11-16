@@ -62,8 +62,8 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .arg(config_path())
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
     let mut ready = false;
     for _ in 0..200 {
@@ -92,15 +92,19 @@ fn http_request(socket_path: &Path, request: &str) -> String {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     if stream.write_all(request.as_bytes()).is_err() {
         return String::new();
     }
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3),
-    // so waiting for a close waits for the idle timeout.
+    // so waiting for a close waits for the idle timeout. The wait is on the
+    // response event, with the testkit's response ceiling as its bound.
     stream.shutdown(std::net::Shutdown::Write).ok();
-    let response = m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
-        .unwrap_or_default();
+    let response = m6_core::testkit::read_response_event(
+        stream,
+        request.split(' ').next().unwrap_or(""),
+        m6_core::testkit::RESPONSE_BOUND,
+    )
+    .unwrap_or_default();
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -111,13 +115,16 @@ fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     if stream.write_all(request.as_bytes()).is_err() {
         return Vec::new();
     }
     stream.shutdown(std::net::Shutdown::Write).ok();
-    m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
-        .unwrap_or_default()
+    m6_core::testkit::read_response_event(
+        stream,
+        request.split(' ').next().unwrap_or(""),
+        m6_core::testkit::RESPONSE_BOUND,
+    )
+    .unwrap_or_default()
 }
 
 /// Return just the body bytes from a raw HTTP response bytes (after \r\n\r\n).
@@ -174,7 +181,7 @@ fn an_unknown_log_level_exits_2_before_binding() {
     );
 
     let status = svc
-        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .expect("m6-html should exit on an unknown log level");
     assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
     assert!(
@@ -221,7 +228,7 @@ fn a_site_toml_log_format_exits_2_and_names_it() {
     );
 
     let status = svc
-        .wait_for_exit(std::time::Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .expect("m6-html should exit on a [log] format key");
     assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
     assert!(
@@ -256,8 +263,8 @@ fn a_quiet_service_flushes_within_a_tick() {
             .arg("debug")
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     let response = http_request(
         &socket_path,
         "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -351,12 +358,14 @@ fn a_request_is_served_on_the_accepting_thread() {
     for _ in 0..9 {
         let mut client = UnixStream::connect(&socket_path).expect("connect");
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("client timeout");
-        client
             .write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("send the request");
-        let response = m6_core::testkit::read_one(&mut client, "GET").expect("one response");
+        let response = m6_core::testkit::read_response_event(
+            client.try_clone().expect("clone the client"),
+            "GET",
+            m6_core::testkit::RESPONSE_BOUND,
+        )
+        .expect("one response");
         assert!(
             String::from_utf8_lossy(&response).contains("200 OK"),
             "the request was not served: {}",
@@ -402,9 +411,9 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
         .arg(config_path())
         .env("M6_SOCKET_OVERRIDE", &socket_path);
     let mut svc = Service::spawn("m6-html", &mut command);
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         !http_request(
             &socket_path,
             "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -434,18 +443,17 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
     let mut spare = held.remove(CEILING);
     drop(held.remove(0));
     spare
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("timeout");
-    spare
         .write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .expect("send the request");
-    let response = m6_core::testkit::read_one(&mut spare, "GET").unwrap_or_else(|e| {
-        panic!(
+    let response =
+        m6_core::testkit::read_response_event(spare, "GET", m6_core::testkit::RESPONSE_BOUND)
+            .unwrap_or_else(|e| {
+                panic!(
             "the connection that waited in the backlog was not served after a slot freed: {e}\n\
              --- output ---\n{}",
             svc.output()
         )
-    });
+            });
     assert!(
         String::from_utf8_lossy(&response).contains("200 OK"),
         "the backlog connection was answered with {}",
@@ -464,7 +472,7 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
         .env("M6_SOCKET_OVERRIDE", &socket_path);
     let mut svc = Service::spawn("m6-html", &mut command);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .expect("m6-html should exit when the limit cannot hold a table");
     assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
     assert!(

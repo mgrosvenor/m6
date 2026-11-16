@@ -62,10 +62,10 @@ fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
             .arg(config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty()
     });
     assert!(
@@ -124,7 +124,7 @@ fn two_patterns_on_one_path_refuse_to_start_and_name_both_routes() {
             .arg(config_path("tie.conf"))
             .env("M6_SOCKET_OVERRIDE", dir.path().join("tie.sock")),
     );
-    let status = svc.wait_for_exit(Instant::now() + Duration::from_secs(30));
+    let status = svc.wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND);
     let stderr = svc.output();
 
     assert_eq!(

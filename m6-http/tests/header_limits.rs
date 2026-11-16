@@ -594,7 +594,7 @@ backend = "served"
         );
 
         let tls = trusting_client(&cert_der);
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             https_send(
                 port,
                 &tls,
@@ -1132,7 +1132,7 @@ impl FileBackend {
                 .arg(site.join("configs/m6-file.conf"))
                 .env("M6_SOCKET_OVERRIDE", &socket),
         );
-        file.wait_for_path(&socket, Duration::from_secs(10));
+        file.wait_for_path(&socket, m6_core::testkit::STARTUP_BOUND);
         FileBackend {
             socket,
             _file: file,

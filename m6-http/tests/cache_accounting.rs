@@ -191,7 +191,7 @@ impl Stack {
             "m6-http-cache-accounting",
             Command::new(binary("m6-http")).arg(dir.path()).arg(&system),
         );
-        service.wait_for_tcp(port, Duration::from_secs(20));
+        service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
         Stack {
             _dir: dir,
             _claim: claim,

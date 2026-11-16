@@ -56,8 +56,8 @@ fn spawn(id: &str) -> (Server, PathBuf) {
             .arg(config_path("m6-html-shutdown.conf"))
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
     // Readiness is a real answered request, not the socket file existing:
     // `bind` creates the file before the server can serve.

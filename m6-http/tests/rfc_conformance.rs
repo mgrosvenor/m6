@@ -208,7 +208,7 @@ impl Fixture {
             .env("RUST_LOG", "info")
             .current_dir(self._dir.path());
         let mut svc = Service::spawn("m6-http-same-body", &mut cmd);
-        svc.wait_for_tcp(self.port.port(), Duration::from_secs(15));
+        svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);
         svc
     }
 
@@ -730,7 +730,7 @@ impl FileBackend {
                 .arg(d.join("configs/m6-file.conf"))
                 .env("M6_SOCKET_OVERRIDE", &sock),
         );
-        service.wait_for_path(&sock, Duration::from_secs(15));
+        service.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
         FileBackend {
             _dir: dir,
             sock,

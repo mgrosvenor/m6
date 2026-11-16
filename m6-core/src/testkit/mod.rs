@@ -64,6 +64,18 @@ pub mod response;
 #[cfg(feature = "testkit")]
 pub mod wait;
 
+/// The ceiling for a service to start: its socket or port exists, its started
+/// line is logged, and it accepts a connection.
+///
+/// Every wait that uses it is on the event itself and returns as soon as the
+/// event happens or the child exits, so this is a ceiling, not a sleep and not
+/// the expected wait. It is generous because the suite starts real services
+/// while the host may be running other suites. On 2026-11-16 a 10 second
+/// ceiling turned CPU contention into a startup failure in seven `m6-file`
+/// tests and a response timeout in an `m6-auth-server` test.
+#[cfg(feature = "testkit")]
+pub const STARTUP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(feature = "testkit")]
 pub use paths::{binary, exec_scratch_root};
 #[cfg(feature = "testkit")]
@@ -74,6 +86,6 @@ pub use process::{
     Service,
 };
 #[cfg(feature = "testkit")]
-pub use response::{read_one, read_response, RESPONSE_BOUND};
+pub use response::{read_one, read_response, read_response_event, RESPONSE_BOUND};
 #[cfg(feature = "testkit")]
 pub use wait::{for_path, for_tcp};

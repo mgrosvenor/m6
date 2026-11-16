@@ -227,7 +227,7 @@ impl Fixture {
                 ])
                 .env("M6_SOCKET_OVERRIDE", sock),
         );
-        svc.wait_for_path(&self.html_sock, Duration::from_secs(15));
+        svc.wait_for_path(&self.html_sock, m6_core::testkit::STARTUP_BOUND);
         svc
     }
 
@@ -245,9 +245,9 @@ impl Fixture {
 
     fn start_http(&self) -> Running {
         let mut svc = Service::spawn("m6-http-genid", &mut self.command(true));
-        svc.wait_for_tcp(self.port.port(), Duration::from_secs(10));
+        svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);
         let running = Running { svc };
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             self.h1_wire(&self.h1_get("/health")).status != 0
         });
         assert!(
@@ -268,7 +268,7 @@ impl Fixture {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped()),
         )
         .expect("spawn m6-http");
-        let exited = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+        let exited = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             child.child().try_wait().expect("try_wait").is_some()
         });
         assert!(
@@ -670,7 +670,7 @@ fn a_publish_reaches_the_cache_in_order() {
 
     // The backend writes one access line for its own reload, which is what an
     // operator sees the publish as.
-    let logged = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let logged = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         let out = html_svc.output();
         out.contains("/genid") && out.contains("request complete")
     });
@@ -780,7 +780,7 @@ fn a_failed_member_does_not_stop_the_advance() {
         "the deadline must be the reason the POST took this long"
     );
 
-    let logged = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let logged = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         let out = http.output();
         out.contains("\"failed\":1") && out.contains("genid advanced")
     });

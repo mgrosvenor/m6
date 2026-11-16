@@ -15,7 +15,6 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use m6_core::testkit::{binary, read_response, wait, Service, RESPONSE_BOUND};
 
@@ -117,10 +116,10 @@ fn spawn_server(env: &TestEnv) -> Service {
             .arg(&env.config_path)
             .env("M6_SOCKET_OVERRIDE", &env.socket_path),
     );
-    svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&env.socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&env.socket_path, Duration::from_secs(10)),
+        wait::for_unix(&env.socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
         env.socket_path.display(),
         svc.output()

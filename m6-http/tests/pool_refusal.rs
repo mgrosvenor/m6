@@ -190,8 +190,8 @@ fn a_backend_that_closes_while_the_request_is_written_does_not_take_the_pool_dow
             .arg(&site)
             .arg(site.join("system.toml")),
     );
-    http.wait_for_tcp(port, Duration::from_secs(20));
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(20), || {
+    http.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         status(&send(
             port,
             b"GET /public/probe.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",

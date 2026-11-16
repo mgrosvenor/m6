@@ -58,8 +58,8 @@ fn spawn(dir: &Path, config: &Path, sock: &Path) -> Service {
             .arg(config)
             .env("M6_SOCKET_OVERRIDE", sock),
     );
-    svc.wait_for_path(sock, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(sock, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     svc
 }
 
@@ -139,7 +139,7 @@ fn a_relative_perf_token_file_stops_the_start() {
         .env("M6_SOCKET_OVERRIDE", &sock);
     let mut svc = Service::spawn("m6-monitor", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-monitor did not exit for a relative perf_token_file\n--- output ---\n{}",
@@ -192,7 +192,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     // The poll is outstanding: the answer must come from the loop, not after
     // the node's deadline.
     let started = Instant::now();
-    let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
+    let (status, body) = support::get(&sock, "/digest");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "/digest took {:?} while a node hung",
@@ -206,7 +206,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     // The deadline passes, the poll finishes, and the node reads unreachable.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (status, body) = support::get(&sock, "/digest", Duration::from_secs(2));
+        let (status, body) = support::get(&sock, "/digest");
         if status == 200 && body.contains("\"unreachable\"") {
             break;
         }
@@ -236,7 +236,7 @@ fn a_trailing_or_doubled_slash_still_answers() {
 
     // A completed poll is a 200 from /digest.
     let deadline = Instant::now() + Duration::from_secs(15);
-    while support::get(&sock, "/digest", Duration::from_secs(2)).0 != 200 {
+    while support::get(&sock, "/digest").0 != 200 {
         assert!(
             Instant::now() < deadline,
             "no poll completed\n--- output ---\n{}",
@@ -250,7 +250,7 @@ fn a_trailing_or_doubled_slash_still_answers() {
         ("//", "m6 fleet"),
         ("digest", "\"nodes\""),
     ] {
-        let (status, body) = support::get(&sock, target, Duration::from_secs(2));
+        let (status, body) = support::get(&sock, target);
         assert!(
             status == 200 || status == 503,
             "GET {target} answered {status}\n--- output ---\n{}",
@@ -263,7 +263,7 @@ fn a_trailing_or_doubled_slash_still_answers() {
         );
     }
     // The loop is still serving after all three.
-    let (status, _) = support::get(&sock, "/digest", Duration::from_secs(2));
+    let (status, _) = support::get(&sock, "/digest");
     assert_eq!(status, 200, "the monitor stopped after a slashed path");
     svc.terminate(Duration::from_secs(5));
 }
@@ -366,7 +366,7 @@ fn settled_count(pid: u32) -> usize {
     let (workers_low, workers_high) = m6_core::platform::process::certificate_store_workers();
     let settled = (1 + workers_low)..=(1 + workers_high);
     let mut last = thread_count(pid);
-    wait::until(Duration::from_secs(5), || {
+    wait::until(m6_core::testkit::STARTUP_BOUND, || {
         last = thread_count(pid);
         settled.contains(&last)
     });
@@ -407,7 +407,7 @@ fn an_unresolvable_node_is_a_startup_error() {
         .env("M6_SOCKET_OVERRIDE", &sock);
     let mut svc = Service::spawn("m6-monitor", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(15))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-monitor did not refuse a name that does not resolve\n--- output ---\n{}",

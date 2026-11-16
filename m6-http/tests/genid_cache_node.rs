@@ -313,7 +313,7 @@ impl Stack {
         self.html
             .as_mut()
             .unwrap()
-            .wait_for_path(&sock, Duration::from_secs(15));
+            .wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
     }
 
     fn start_source(&mut self) {
@@ -325,9 +325,9 @@ impl Stack {
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-source", &mut cmd);
-        svc.wait_for_tcp(self.source_port.port(), Duration::from_secs(10));
+        svc.wait_for_tcp(self.source_port.port(), m6_core::testkit::STARTUP_BOUND);
         self.source = Some(svc);
-        let ready = wait_until(Duration::from_secs(10), || {
+        let ready = wait_until(m6_core::testkit::STARTUP_BOUND, || {
             self.get_source("/health", &[]).status != 0
         });
         assert!(
@@ -351,9 +351,9 @@ impl Stack {
             .stdin(Stdio::null())
             .current_dir(self.d());
         let mut svc = Service::spawn("m6-http-cache", &mut cmd);
-        svc.wait_for_tcp(self.cache_port.port(), Duration::from_secs(10));
+        svc.wait_for_tcp(self.cache_port.port(), m6_core::testkit::STARTUP_BOUND);
         self.cache = Some(svc);
-        let ready = wait_until(Duration::from_secs(10), || {
+        let ready = wait_until(m6_core::testkit::STARTUP_BOUND, || {
             self.get_cache("/health", &[]).status != 0
         });
         assert!(
@@ -793,7 +793,7 @@ fn the_cache_recovers_when_the_source_returns() {
     // `info` lines are buffered and flushed once a second, so this polls the
     // absence for a bounded window rather than reading once.
     assert!(
-        !wait_until(Duration::from_secs(2), || stack
+        !wait_until(Duration::from_secs(10), || stack
             .cache_output()
             .contains("genid changed")),
         "a success after down is not a change:\n{}",
@@ -851,7 +851,7 @@ fn background_fetches_wait_for_the_id() {
     // A bounded absence check: `debug` is buffered, so the dispatch line can
     // surface a second after it happens.
     assert!(
-        !wait_until(Duration::from_secs(2), || {
+        !wait_until(Duration::from_secs(10), || {
             let out = stack.cache_output();
             out.contains("url backend dispatch") || out.contains("url backend error")
         }),
@@ -865,7 +865,7 @@ fn background_fetches_wait_for_the_id() {
     // three encodings are the three. Their only trace before a client arrives
     // is the dispatch, because a background fetch has no response to write.
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until(m6_core::testkit::STARTUP_BOUND, || {
             stack.cache_output().matches("url backend dispatch").count() >= 3
         }),
         "the drain never ran once the ID was known:\n{}",
