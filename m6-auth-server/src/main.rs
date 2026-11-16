@@ -1,6 +1,6 @@
 //! The authentication service: one process and one event loop.
 //!
-//! The loop serves four routes, all literal paths, over one SQLite connection
+//! The loop serves five routes, all literal paths, over one SQLite connection
 //! opened at start and kept for the life of the process. The signing keys, the
 //! token lifetimes and the rate limiter are plain fields the loop owns. A login
 //! holds the process for its password verify, which is CPU work with no
@@ -57,8 +57,8 @@ const BUSY_RETRY: Duration = Duration::from_millis(5);
 /// for a long time.
 const BUSY_GIVE_UP: Duration = Duration::from_secs(1);
 
-/// The four routes, in the order `Handled::Code` indexes them.
-const ROUTES: [CodeRoute; 4] = [
+/// The five routes, in the order `Handled::Code` indexes them.
+const ROUTES: [CodeRoute; 5] = [
     CodeRoute {
         pattern: "/auth/login",
         method: RouteMethod::Post,
@@ -74,6 +74,10 @@ const ROUTES: [CodeRoute; 4] = [
     CodeRoute {
         pattern: "/auth/public-key",
         method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/check",
+        method: RouteMethod::Post,
     },
 ];
 
@@ -542,7 +546,8 @@ fn run_route(
         1 => handlers::dispatch_refresh(req.raw(), state, db),
         2 => handlers::dispatch_logout(req.raw(), state, db),
         3 => Ok(handlers::dispatch_public_key(state)),
-        _ => unreachable!("ROUTES has four routes and Handled::Code carries one of their indexes"),
+        4 => Ok(handlers::dispatch_check(req.raw(), state, db)),
+        _ => unreachable!("ROUTES has five routes and Handled::Code carries one of their indexes"),
     }?;
     Ok(site.finish(req, response.into()))
 }
