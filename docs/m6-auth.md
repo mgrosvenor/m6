@@ -451,7 +451,7 @@ A route with `require` sends one `POST /check` per protected request, under a 50
 No credential is 401 with no call, a 401 from this service is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 Nothing caches the answer, so a role change or a revocation counts from the next request.
 
-The same check covers `/perf`, `/traffic` and a source node's `/genid`, so their claims see a role change or a revocation from the next request too.
+The same check covers a source node's `/genid`, so its claims see a role change or a revocation from the next request too.
 The token sources, the `require` forms and the outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
 The header the edge sets carries the identity this service answered, and section 8 shows what a backend does with it.
 

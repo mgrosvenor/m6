@@ -514,6 +514,9 @@ fn h3_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
 struct Fixture {
     port: u16,
     service: Service,
+    /// How many metrics lines the last read consumed, so the next one waits
+    /// for a line it has not seen.
+    perf_lines: std::cell::Cell<usize>,
     _backends: Vec<Backend>,
     slow_seens: Vec<mpsc::Receiver<()>>,
     large_seens: Vec<mpsc::Receiver<()>>,
@@ -573,6 +576,7 @@ impl Fixture {
         Fixture {
             port,
             service,
+            perf_lines: std::cell::Cell::new(0),
             _backends: backends,
             slow_seens,
             large_seens,
@@ -643,16 +647,10 @@ fn check_socket() -> &'static std::path::Path {
     path
 }
 
-/// A `role:monitor` token the authority above answers.
-fn monitor_token() -> String {
-    "monitor-token".to_string()
-}
-
 fn system_toml(port: u16, cert: &std::path::Path, key: &std::path::Path) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
          [auth]\nbackend = \"auth-check\"\n\n\
-         [health]\nmetrics_require = \"role:monitor\"\n\n\
          [node]\nname = \"loop-never-waits\"\n",
         cert.display(),
         key.display(),
@@ -934,20 +932,46 @@ impl H1KeepAlive {
     }
 }
 
-/// The `(name, count)` pairs of the event-loop figures `/perf` reports,
-/// read over the already-open keep-alive connection.
-fn perf_event_loop(conn: &mut H1KeepAlive) -> Vec<(String, u64)> {
-    let auth = format!("Bearer {}", monitor_token());
-    let (status, body) = conn.request("/perf", &[("Authorization", auth.as_str())]);
-    assert_eq!(status, 200, "/perf answered {status}: {body}");
-    let report: m6_core::monitoring::PerfReport =
-        serde_json::from_str(&body).expect("a perf report");
-    report
-        .metrics
-        .event_loop
-        .into_iter()
-        .map(|t| (t.name, t.count))
-        .collect()
+/// The `(name, count)` pairs of the event-loop figures the newest metrics line
+/// carries, waiting for a line this helper has not read before.
+///
+/// The line is the one the removed `/perf` endpoint answered with, on the one
+/// stream the process writes. A line sits in the log buffer until the next
+/// accounting tick flushes it, so this waits rather than reading a stale one:
+/// every caller has already waited for a tick, so the line is there.
+fn perf_event_loop(fx: &Fixture) -> Vec<(String, u64)> {
+    let after = fx.perf_lines.get();
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
+    loop {
+        let output = fx.service.output();
+        let count = output.matches("\"type\":\"perf\"").count();
+        if count > after {
+            fx.perf_lines.set(count);
+            let trigger = output
+                .lines()
+                .rev()
+                .find_map(|line| {
+                    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                    (v["type"] == "perf")
+                        .then(|| v["fields"]["perf"]["metrics"]["event_loop"].clone())
+                })
+                .expect("the newest metrics line");
+            let triggers = trigger.as_array().expect("the event-loop figures");
+            return triggers
+                .iter()
+                .map(|trigger| {
+                    (
+                        trigger["name"].as_str().unwrap_or_default().to_string(),
+                        trigger["count"].as_u64().unwrap_or(0),
+                    )
+                })
+                .collect();
+        }
+        if Instant::now() >= deadline {
+            panic!("no metrics line within the deadline\n--- m6-http ---\n{output}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// One keep-alive connection that sends 100 requests must fire the connection
@@ -971,7 +995,7 @@ fn a_connection_event_never_accepts() {
     let mut accept = None;
     let mut conn_events = None;
     while Instant::now() < deadline {
-        let loops = perf_event_loop(&mut conn);
+        let loops = perf_event_loop(&fx);
         let a = loops.iter().find(|(n, _)| n == "accept").map(|(_, c)| *c);
         let c = loops.iter().find(|(n, _)| n == "conn").map(|(_, c)| *c);
         if let (Some(a), Some(c)) = (a, c) {
@@ -1191,7 +1215,7 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
     // The next tick snapshots the window that held the 50 misses.
     wait_for_periodic(&fx, periodic_lines(&fx));
 
-    let loops = perf_event_loop(&mut conn);
+    let loops = perf_event_loop(&fx);
     let upstream = trigger_count(&loops, "upstream");
     let conn_events = trigger_count(&loops, "conn");
     assert!(
@@ -2156,14 +2180,14 @@ fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
 #[test]
 fn an_idle_m6_http_wakes_about_once_a_second() {
     let fx = Fixture::start(1, 30, "idle");
-    let mut conn = H1KeepAlive::connect(fx.port());
+    let _conn = H1KeepAlive::connect(fx.port());
     // Start at one accounting tick, and read `/perf` after the next: the report
     // then covers one whole idle window.
     let lines = periodic_lines(&fx);
     wait_for_periodic(&fx, lines);
     let lines = periodic_lines(&fx);
     wait_for_periodic(&fx, lines);
-    let loops = perf_event_loop(&mut conn);
+    let loops = perf_event_loop(&fx);
     let timeouts = trigger_count(&loops, "timeout");
     // The report covers a 2 s accounting interval, so two a second is four and
     // half a second is one. The bounds are the same rate the ten-second report

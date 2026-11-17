@@ -1009,7 +1009,7 @@ systemctl restart m6-http
 
 systemd copies the certificate and key into m6-http's credential directory when the unit starts, so the hook restarts m6-http after each renewal, and until then m6-http serves the previous certificate.
 
-`/perf` reports each loaded certificate with its expiry and its SHA-256 fingerprint, and the fingerprint is the identity two certificates with one expiry do not share.
+The metrics line reports each loaded certificate with its expiry and its SHA-256 fingerprint, and the fingerprint is the identity two certificates with one expiry do not share.
 It is the same value `openssl x509 -noout -fingerprint -sha256 -in fullchain.pem` prints, in lower-case hex with no colons, taken over the certificate's DER.
 Every client already receives those bytes in the handshake, so the value discloses nothing a visitor does not have.
 
@@ -1488,7 +1488,7 @@ Every unit logs to stdout, journald holds it, and `systemd-journald` rotates its
 The analytics lines are on the same stream, with `type` `access`, so they rotate with everything else and no signal is involved.
 Section 7.7 lists the reads.
 
-`/traffic` answers from a window in memory and reads no log file, so the journal's rotation leaves its figures alone.
+The traffic line answers from a window in memory and reads no log file, so the journal's rotation leaves its figures alone.
 
 ### 7.9. Monitor history
 
@@ -1504,7 +1504,7 @@ Table 2 gives the two keys, which are read once at start.
 A change to either needs a restart.
 Put `history_file` in `/var/lib/m6-monitor/` and give the unit `StateDirectory=m6-monitor`.
 
-The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per `/traffic` window the response status counts and crawler sightings of each node.
+The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per traffic window the response status counts and crawler sightings of each node.
 When the file passes `history_max_mb`, the oldest polls are deleted, 256 at a time, until it is 5% under the cap.
 Nothing expires by age.
 One window of one node stores at most 100 crawler sightings, the ones with the most requests, and cuts each user agent to 256 bytes.

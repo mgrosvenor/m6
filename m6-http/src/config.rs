@@ -565,65 +565,6 @@ pub struct HealthConfig {
     /// of being silently shadowed by it.
     #[serde(default = "default_health_path")]
     pub path: String,
-    /// Path for the metrics endpoint. Separate from `path` on purpose: the
-    /// health check must stay constant-cost, and percentiles are not.
-    #[serde(default = "default_perf_path")]
-    pub perf_path: String,
-    /// Where the traffic summary is served. Same token as `/perf`.
-    ///
-    /// A third path rather than more fields on `/perf`, for the reason that
-    /// split `/health` from `/perf` in the first place: the cost profiles
-    /// differ. `/perf` sorts a reservoir in memory; this builds the report
-    /// from the window this process keeps of its own logging, which allocates
-    /// a record per retained event on a cache miss. Putting the expensive one
-    /// behind a conditional on a cheaper path leaves the expensive branch one
-    /// misconfigured header away from being taken on every request, so each
-    /// answer's cost stays a property of its path. `docs/m6-http.md` describes
-    /// the window.
-    #[serde(default = "default_traffic_path")]
-    pub traffic_path: String,
-    /// How long a traffic summary is reused before it is rebuilt from the
-    /// window.
-    ///
-    /// Without this a monitor polling every 30 seconds makes every node
-    /// rebuild its report every 30 seconds, forever, to produce an answer
-    /// that changes slowly. The check that consumes this runs hourly.
-    #[serde(default = "default_traffic_cache_s")]
-    pub traffic_cache_s: u64,
-    /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
-    /// a credential for an identity that carries this claim, checked by
-    /// `POST /check` exactly as a route `require` is: 401 for no or a refused
-    /// credential, 403 for the wrong claim, and 503 for a checker that did
-    /// not answer.
-    #[serde(default)]
-    pub metrics_require: Option<String>,
-    /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
-    /// Any other peer gets 404. Unset means no address rule.
-    ///
-    /// Each entry must be an IP address in a local range
-    /// (`m6_core::net::is_private_ip`). Names and ranges are refused. The
-    /// peer address is the one a completed TCP or QUIC handshake proved, and
-    /// the endpoints are refused on an internal h2c listener, where the
-    /// address is a forwarded claim.
-    #[serde(default)]
-    pub metrics_peers: Option<Vec<String>>,
-    /// `metrics_peers`, parsed and canonical (an IPv4-mapped IPv6 address is
-    /// stored as IPv4), filled by `load`. The gate reads only this: `None`
-    /// means no address rule. Compared on the request path with no allocation.
-    #[serde(skip)]
-    pub metrics_peer_ips: Option<Vec<std::net::IpAddr>>,
-}
-
-fn default_perf_path() -> String {
-    "/perf".to_string()
-}
-
-fn default_traffic_path() -> String {
-    "/traffic".to_string()
-}
-
-fn default_traffic_cache_s() -> u64 {
-    60
 }
 
 fn default_health_path() -> String {
@@ -635,12 +576,6 @@ impl Default for HealthConfig {
         HealthConfig {
             enabled: default_true(),
             path: default_health_path(),
-            perf_path: default_perf_path(),
-            traffic_path: default_traffic_path(),
-            traffic_cache_s: default_traffic_cache_s(),
-            metrics_require: None,
-            metrics_peers: None,
-            metrics_peer_ips: None,
         }
     }
 }
@@ -1083,9 +1018,6 @@ struct RawSystemToml {
     /// `[auth]` lives here, so the verify key's path is owned by the same
     /// file as the node's other credentials.
     auth: Option<AuthConfig>,
-    /// Only the access keys: a node's own credentials and peers belong to the
-    /// node, not to the site that is shipped to every node.
-    health: Option<RawSystemHealth>,
     /// The generation-ID endpoint. Node state: a site's content ships to every
     /// node, its publish claims do not.
     genid: Option<RawGenid>,
@@ -1113,16 +1045,6 @@ struct RawGenid {
     upstream: Option<String>,
     token_file: Option<String>,
     heartbeat_secs: Option<u64>,
-}
-
-/// The `[health]` keys the system config may carry. Anything else fails to
-/// parse, so a misplaced key is loud instead of ignored.
-/// `NODE_HEALTH_KEYS` lists the same keys for `misplaced_keys`; change both together.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSystemHealth {
-    metrics_require: Option<String>,
-    metrics_peers: Option<Vec<String>>,
 }
 
 /// Parse a list of peer addresses into canonical form.
@@ -1156,22 +1078,6 @@ fn parse_local_peers(
         ips.push(ip.to_canonical());
     }
     Ok(ips)
-}
-
-/// Parse `[health] metrics_peers` into canonical addresses.
-fn validate_metrics_peers(
-    peers: Option<&[String]>,
-) -> anyhow::Result<Option<Vec<std::net::IpAddr>>> {
-    let Some(peers) = peers else {
-        return Ok(None);
-    };
-    parse_local_peers(
-        "[health].metrics_peers",
-        "a metrics peer",
-        "list the peers allowed to read /perf and /traffic, or remove the key",
-        peers,
-    )
-    .map(Some)
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -1316,12 +1222,11 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // mode, the one file in one-file mode. The system config is parsed strictly
     // only when it is a second file, so a one-file config is not refused for the
     // site-only keys it necessarily carries.
-    let (node_server, node, auth, node_health, raw_genid, raw_cache, raw_limits) = if one_file {
+    let (node_server, node, auth, raw_genid, raw_cache, raw_limits) = if one_file {
         (
             site_parsed.server.clone().unwrap_or_default(),
             site_parsed.node,
             site_parsed.auth,
-            None,
             site_parsed.genid,
             site_parsed.cache,
             site_parsed.limits,
@@ -1333,7 +1238,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             system_parsed.server.clone().unwrap_or_default(),
             system_parsed.node,
             system_parsed.auth,
-            system_parsed.health,
             system_parsed.genid,
             system_parsed.cache,
             system_parsed.limits,
@@ -1504,13 +1408,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     m6_core::log::parse_level(&level).map_err(|e| anyhow::anyhow!("config error: [log] {e}"))?;
     let log = LogConfig { level: Some(level) };
     let analytics = site_parsed.analytics.unwrap_or_default();
-    let mut health = site_parsed.health.unwrap_or_default();
-    // The node's own health keys come from the system config only.
-    if let Some(sys) = node_health {
-        health.metrics_require = sys.metrics_require;
-        health.metrics_peers = sys.metrics_peers;
-    }
-    health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
+    let health = site_parsed.health.unwrap_or_default();
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
@@ -1628,21 +1526,6 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                     rg.path
                 );
             }
-        }
-    }
-
-    if let Some(ref r) = health.metrics_require {
-        if auth.is_none() {
-            anyhow::bail!("config error: [health].metrics_require needs [auth] with a backend");
-        }
-        let named = matches!(
-            m6_core::auth::Require::parse(r),
-            Some(m6_core::auth::Require::Role(n) | m6_core::auth::Require::Group(n)) if !n.is_empty()
-        );
-        if !named {
-            anyhow::bail!(
-                "config error: [health].metrics_require = \"{r}\" must be \"role:<name>\" or \"group:<name>\""
-            );
         }
     }
 
@@ -1848,8 +1731,6 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "served_hosts",
     "redirect_unmatched_to",
 ];
-/// The fields of `RawSystemHealth`; change both together.
-const NODE_HEALTH_KEYS: &[&str] = &["metrics_require", "metrics_peers"];
 /// Whole sections that are node state. They belong in the system config.
 ///
 /// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
@@ -1884,11 +1765,6 @@ pub fn misplaced_keys(
     for &section in NODE_SECTIONS {
         if site.get(section).is_some() {
             out.push(node_state_message(section, None, system_config_path));
-        }
-    }
-    for &key in NODE_HEALTH_KEYS {
-        if in_site("health", key) {
-            out.push(node_state_message("health", Some(key), system_config_path));
         }
     }
     for &key in SITE_SERVER_KEYS {
@@ -3037,93 +2913,9 @@ domain = "test.example.com"
     fn the_removed_metrics_token_file_is_refused_and_named() {
         // The legacy bearer gate is gone; an operator still carrying it gets a
         // start failure that names the key rather than a silently ignored row.
-        let (_d, r) = load_with("", "\n[health]\nmetrics_token_file = \"token\"\n");
+        let (_d, r) = load_with("\n[health]\nmetrics_token_file = \"token\"\n", "");
         let e = r.unwrap_err().to_string();
         assert!(e.contains("metrics_token_file"), "{e}");
-    }
-
-    fn peers_error(entries: &str) -> String {
-        let (_d, r) = load_with("", &format!("\n[health]\nmetrics_peers = [{entries}]\n"));
-        r.expect_err("must refuse").to_string()
-    }
-
-    #[test]
-    fn metrics_peers_accepts_local_addresses() {
-        let (_d, r) = load_with(
-            "",
-            "\n[health]\nmetrics_peers = [\"10.0.0.9\", \"127.0.0.1\", \"fd00::5\", \"100.64.0.1\"]\n",
-        );
-        let h = r.unwrap().health;
-        let ips = h.metrics_peer_ips.expect("peers set");
-        assert_eq!(ips.len(), 4);
-        assert!(ips.contains(&"fd00::5".parse().unwrap()));
-    }
-
-    #[test]
-    fn metrics_peers_are_stored_canonical() {
-        let (_d, r) = load_with("", "\n[health]\nmetrics_peers = [\"::ffff:10.0.0.9\"]\n");
-        let h = r.unwrap().health;
-        assert_eq!(
-            h.metrics_peer_ips,
-            Some(vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()])
-        );
-    }
-
-    #[test]
-    fn metrics_peers_refuses_names_ranges_and_ports() {
-        for entry in ["localhost", "10.0.0.0/24", "10.0.0.9:443"] {
-            let e = peers_error(&format!("\"{entry}\""));
-            assert!(
-                e.contains(&format!(
-                    "metrics_peers entry \"{entry}\" is not an IP address"
-                )),
-                "{entry}: {e}"
-            );
-        }
-    }
-
-    #[test]
-    fn metrics_peers_refuses_public_and_wildcard() {
-        for entry in ["203.0.113.7", "0.0.0.0", "::"] {
-            let e = peers_error(&format!("\"{entry}\""));
-            assert!(e.contains("is not in a local range"), "{entry}: {e}");
-        }
-    }
-
-    #[test]
-    fn an_empty_metrics_peers_is_refused() {
-        assert!(peers_error("").contains("metrics_peers is empty"));
-    }
-
-    #[test]
-    fn metrics_require_needs_auth() {
-        let (_d, r) = load_with("", "\n[health]\nmetrics_require = \"role:monitor\"\n");
-        assert_eq!(
-            r.unwrap_err().to_string(),
-            "config error: [health].metrics_require needs [auth] with a backend"
-        );
-    }
-
-    #[test]
-    fn metrics_require_must_name_a_role_or_group() {
-        for bad in ["admin", "role:", "group:", "user:x"] {
-            let (_d, r) = load_with(
-                "",
-                &format!(
-                    "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"{bad}\"\n"
-                ),
-            );
-            let e = r.unwrap_err().to_string();
-            assert!(
-                e.contains("must be \"role:<name>\" or \"group:<name>\""),
-                "{bad}: {e}"
-            );
-        }
-        let (_d, ok) = load_with(
-            "",
-            "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"group:ops\"\n",
-        );
-        assert!(ok.is_ok());
     }
 
     #[test]
@@ -3402,56 +3194,36 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn health_keys_in_site_toml_are_refused() {
-        let (_d, r) = load_with(
-            "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
-            "\n[health]\nmetrics_require = \"role:system\"\nmetrics_peers = [\"10.0.0.2\"]\n",
-        );
-        let e = r.unwrap_err().to_string();
-        assert!(e.contains("site.toml sets [health].metrics_require"), "{e}");
-        assert!(e.contains("site.toml sets [health].metrics_peers"), "{e}");
-        assert!(e.contains("belongs in the system config"), "{e}");
-    }
-
-    #[test]
-    fn a_system_health_key_alone_keeps_the_other_from_the_site() {
-        let (_d, r) = load_with(
-            "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"role:site\"\n",
-            "\n[health]\nmetrics_peers = [\"10.0.0.2\"]\n",
-        );
-        let e = r.unwrap_err().to_string();
-        assert!(e.contains("site.toml sets [health].metrics_require"), "{e}");
-        assert!(e.contains("belongs in the system config"), "{e}");
-    }
-
-    #[test]
-    fn an_unknown_health_key_in_the_system_config_fails_to_parse() {
-        let (_d, r) = load_with("", "\n[health]\nperf_path = \"/p\"\n");
-        let e = format!("{:#}", r.unwrap_err());
-        assert!(e.contains("perf_path"), "{e}");
-    }
-
-    #[test]
-    fn health_defaults_have_no_require_and_no_peers() {
-        let (_d, r) = load_with("", "");
-        let h = r.unwrap().health;
-        assert_eq!(h.metrics_require, None);
-        assert_eq!(h.metrics_peers, None);
-        assert_eq!(h.metrics_peer_ips, None);
-    }
-
-    #[test]
     fn one_file_given_as_both_is_read_once() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
         let mut site = minimal_site_toml();
-        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"m6-html\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"m6-html\"\n\n[health]\npath = \"/up\"\n");
         write_file(dir.path(), "site.toml", &site);
         let same = dir.path().join("site.toml");
         let cfg = load(dir.path(), &same).expect("one file for both loads");
         assert_eq!(cfg.auth.expect("auth").backend, "m6-html");
-        assert_eq!(cfg.health.perf_path, "/p");
-        assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
+        assert_eq!(cfg.health.path, "/up");
+    }
+
+    /// The five keys `/perf` and `/traffic` needed are gone, and a config that
+    /// still sets one is refused by the unknown-key check that every removed
+    /// key goes through. No per-key message and no shim: the refusal names the
+    /// key and the keys that exist.
+    #[test]
+    fn the_removed_health_keys_are_refused_as_unknown_keys() {
+        for key in [
+            "metrics_require",
+            "metrics_peers",
+            "perf_path",
+            "traffic_path",
+            "traffic_cache_s",
+        ] {
+            let (_d, r) = load_with(&format!("\n[health]\n{key} = 1\n"), "");
+            let e = format!("{:#}", r.unwrap_err());
+            assert!(e.contains("unknown field"), "{key}: {e}");
+            assert!(e.contains(key), "{key}: {e}");
+        }
     }
 
     // --- misplaced_keys and the removed legacy metrics key ---
@@ -3486,13 +3258,13 @@ domain = "test.example.com"
     #[test]
     fn misplaced_keys_names_a_bind_in_site_toml() {
         let m = misplaced(
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[health]\npath = \"/up\"\n",
             "[server]\nbind = \"0.0.0.0:443\"\n",
         );
-        assert_eq!(m.len(), 2, "{m:?}");
+        // `[health]` is site state now, so its `path` is in the right file.
+        assert_eq!(m.len(), 1, "{m:?}");
         assert!(m[0].starts_with("site.toml sets [server].bind, which is this node's own state"));
         assert!(m[0].contains("belongs in the system config "), "{}", m[0]);
-        assert!(m.iter().any(|x| x.contains("sets [health].metrics_peers,")));
     }
 
     #[test]
@@ -3528,8 +3300,8 @@ domain = "test.example.com"
     #[test]
     fn misplaced_keys_is_silent_for_a_clean_pair() {
         let m = misplaced(
-            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"role:monitor\"\n",
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\npath = \"/up\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\nbackend = \"m6-html\"\n",
         );
         assert!(m.is_empty(), "{m:?}");
     }
@@ -3574,7 +3346,6 @@ domain = "test.example.com"
     fn every_placed_key() -> Vec<(&'static str, Option<&'static str>, bool)> {
         let mut all = Vec::new();
         all.extend(NODE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), true)));
-        all.extend(NODE_HEALTH_KEYS.iter().map(|k| ("health", Some(*k), true)));
         all.extend(SITE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), false)));
         all.extend(NODE_SECTIONS.iter().map(|s| (*s, None, true)));
         all
@@ -3583,8 +3354,8 @@ domain = "test.example.com"
     #[test]
     fn every_misplaced_key_is_reported_in_the_wrong_file_and_not_in_the_right_one() {
         let all = every_placed_key();
-        // Every field of `RawServerSection` and `RawSystemHealth` is placed
-        // in one list or another. Dropping a key from a list fails here.
+        // Every field of `RawServerSection` is placed in one list or another.
+        // Dropping a key from a list fails here.
         let mut server: Vec<&str> = NODE_SERVER_KEYS
             .iter()
             .chain(SITE_SERVER_KEYS)
@@ -3614,15 +3385,11 @@ domain = "test.example.com"
                 "warm_on_start",
             ]
         );
-        let mut health = NODE_HEALTH_KEYS.to_vec();
-        health.sort_unstable();
-        assert_eq!(health, ["metrics_peers", "metrics_require"]);
         assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "limits", "node"]);
         // 13 base [server] keys + lock_memory (the mimalloc pin) + served_hosts
         // and redirect_unmatched_to (the unmatched-host policy) = 16, plus the
-        // two site-wide [server] keys, the two [health] keys and the five
-        // node sections.
-        assert_eq!(all.len(), 18 + 2 + 5);
+        // two site-wide [server] keys and the five node sections.
+        assert_eq!(all.len(), 18 + 5);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
@@ -3720,8 +3487,10 @@ domain = "test.example.com"
         let e = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
             .to_string();
-        // Removed, not read: the key is unknown in both files now.
-        assert!(e.contains("metrics_token_file"), "{e}");
+        // Removed, not read: the whole `[health]` table is site state now, so
+        // the system config refuses the table and names it.
+        assert!(e.contains("unknown field `health`"), "{e}");
+        assert!(e.contains("[health]"), "{e}");
     }
 
     /// A route's `cache` is a `Cache-Control` value the edge sends in place of

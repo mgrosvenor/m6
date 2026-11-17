@@ -127,6 +127,8 @@ struct Stack {
     html: Option<Service>,
     source: Option<Service>,
     cache: Option<Service>,
+    /// `metrics.requests_total` of the last document `perf_u64` read.
+    last_requests: std::cell::Cell<u64>,
     dir: tempfile::TempDir,
     source_site: PathBuf,
     source_system: PathBuf,
@@ -274,8 +276,6 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n\n\
                  [node]\nname = \"disk-cache\"\n\n\
-                 [auth]\nbackend = \"auth-check\"\n\n\
-                 [health]\nmetrics_require = \"role:monitor\"\n\n\
                  [genid]\nupstream = \"origin\"\ntoken_file = \"{}/genid-token\"\nheartbeat_secs = 1\n\n\
                  [cache]\ndir = \"{}\"\n",
                 cache_port.addr(),
@@ -291,6 +291,7 @@ impl Stack {
             html: None,
             source: None,
             cache: None,
+            last_requests: std::cell::Cell::new(0),
             dir,
             source_site,
             source_system,
@@ -524,76 +525,107 @@ impl Stack {
         self.post(self.source_port.port(), path, token)
     }
 
-    fn perf(&self) -> Resp {
-        let auth = format!("Bearer {}", "monitor-token");
-        self.get_cache("/perf", &[("Authorization", auth.as_str())])
+    /// The newest metrics document the cache node wrote, or `None` while it
+    /// has written none.
+    ///
+    /// The document is the one the removed `/perf` endpoint answered with, and
+    /// the line is on the one stream the process writes.
+    fn document(&self) -> Option<serde_json::Value> {
+        self.cache_output().lines().rev().find_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            (v["type"] == "perf").then(|| v["fields"]["perf"].clone())
+        })
     }
 
-    /// The cache node's `genid` object from `/perf`.
-    fn genid_block(&self) -> String {
-        let body = self.perf().text();
-        let start = body.find("\"genid\":{").map(|i| i + 8).unwrap_or(0);
-        let rest = &body[start..];
-        let end = rest.find('}').map(|i| i + 1).unwrap_or(rest.len());
-        rest[..end].to_string()
+    /// The newest document whose `requests_total` is above the last one this
+    /// helper read, so a line built before the caller's request cannot answer.
+    ///
+    /// A line can sit in the log buffer for up to a second before its flush.
+    fn document_after_a_request(&self) -> serde_json::Value {
+        let since = self.last_requests.get();
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
+        loop {
+            if let Some(document) = self.document() {
+                if document["metrics"]["requests_total"].as_u64().unwrap_or(0) > since {
+                    self.last_requests.set(
+                        document["metrics"]["requests_total"]
+                            .as_u64()
+                            .unwrap_or(since),
+                    );
+                    return document;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "no metrics line counted a request within the deadline; the last reading was \
+                     {since}\n--- output ---\n{}",
+                    self.cache_output()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
-    /// The cache node's `disk_cache` object from `/perf`.
-    fn disk_block(&self) -> String {
-        let body = self.perf().text();
-        let Some(start) = body.find("\"disk_cache\":{").map(|i| i + 13) else {
-            return String::new();
-        };
-        let rest = &body[start..];
-        let end = rest.find('}').map(|i| i + 1).unwrap_or(rest.len());
-        rest[..end].to_string()
+    /// The cache node's `genid` object, from the newest metrics line.
+    fn genid_block(&self) -> serde_json::Value {
+        self.document()
+            .map(|document| document["genid"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The cache node's `disk_cache` object, from the newest metrics line.
+    fn disk_block(&self) -> serde_json::Value {
+        self.document()
+            .map(|document| document["disk_cache"].clone())
+            .unwrap_or(serde_json::Value::Null)
     }
 
     fn disk_u64(&self, key: &str) -> Option<u64> {
-        let block = self.disk_block();
-        let pat = format!("\"{key}\":");
-        block.split(&pat).nth(1).and_then(|rest| {
-            rest.split(|c: char| !c.is_ascii_digit())
-                .next()
-                .and_then(|n| n.parse().ok())
-        })
+        self.disk_block()[key].as_u64()
     }
 
-    /// The `disk_cache.state` string from `/perf`.
+    /// The `disk_cache.state` string.
     fn disk_state(&self) -> Option<String> {
-        let block = self.disk_block();
-        block
-            .split("\"state\":\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .map(str::to_string)
+        self.disk_block()["state"].as_str().map(str::to_string)
     }
 
-    /// A cumulative counter anywhere in the `/perf` report, such as
-    /// `cache_hits_total`. The cache node counts its own answers, so a hit on
-    /// the restarted node is visible there without reading the source's log.
+    /// A cumulative counter of the metrics block, such as `cache_hits_total`,
+    /// from the newest metrics line.
+    ///
+    /// The reading also moves the baseline `perf_u64_after_a_request` waits
+    /// past, so a delta is measured from the line this call read.
     fn perf_u64(&self, key: &str) -> Option<u64> {
-        let body = self.perf().text();
-        let pat = format!("\"{key}\":");
-        body.split(&pat).nth(1).and_then(|rest| {
-            rest.split(|c: char| !c.is_ascii_digit())
-                .next()
-                .and_then(|n| n.parse().ok())
-        })
+        let document = self.document()?;
+        self.last_requests
+            .set(document["metrics"]["requests_total"].as_u64().unwrap_or(0));
+        document["metrics"][key].as_u64()
     }
 
-    /// The longest loop iteration `/perf` currently reports, in nanoseconds.
+    /// The same counter, from a line the caller's last request is in, for a
+    /// delta across that request.
+    fn perf_u64_after_a_request(&self, key: &str) -> Option<u64> {
+        self.document_after_a_request()["metrics"][key].as_u64()
+    }
+
+    /// The longest loop iteration the metrics line reports, in nanoseconds.
     fn longest_loop_work_ns(&self) -> u64 {
-        loop_work_max_ns(&self.perf().text())
+        let Some(document) = self.document() else {
+            return 0;
+        };
+        document["metrics"]["event_loop"]
+            .as_array()
+            .map(|triggers| {
+                triggers
+                    .iter()
+                    .filter_map(|trigger| trigger["work_max_ns"].as_u64())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
     }
 
     fn perf_id(&self) -> Option<String> {
-        let block = self.genid_block();
-        block
-            .split("\"id\":\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .map(str::to_string)
+        self.genid_block()["id"].as_str().map(str::to_string)
     }
 
     fn wait_perf_id(&self, want: &str, timeout: Duration) -> bool {
@@ -634,19 +666,6 @@ impl Stack {
         files.sort();
         files
     }
-}
-
-/// The longest loop iteration a `/perf` body reports, in nanoseconds.
-fn loop_work_max_ns(body: &str) -> u64 {
-    body.match_indices("\"work_max_ns\":")
-        .filter_map(|(i, pat)| {
-            body[i + pat.len()..]
-                .split(|c: char| !c.is_ascii_digit())
-                .next()
-                .and_then(|n| n.parse().ok())
-        })
-        .max()
-        .unwrap_or(0)
 }
 
 fn no_verify_tls() -> Arc<rustls::ClientConfig> {
@@ -712,18 +731,18 @@ fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
 /// generation directory, and decodes to what the client was served.
 ///
 /// The write must appear within one idle turn, under the accounting tick's
-/// second, and `/perf` must report the loop's `work_max_ns` for the window
+/// second, and the metrics line must report the loop's `work_max_ns` for the window
 /// that covers the slice.
 ///
-/// Break: skip the idle-turn slice, and `/perf` `dir_bytes` stays 0 and no
-/// file appears.
+/// Break: skip the idle-turn slice, and `dir_bytes` stays 0 and no file
+/// appears.
 #[test]
 fn a_cache_node_writes_what_it_serves_to_disk() {
     let mut stack = Stack::new();
     stack.start();
     assert!(
         stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID:\n{}",
+        "the metrics line never showed the source's ID:\n{}",
         stack.cache_output()
     );
 
@@ -738,29 +757,39 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
 
     // The slice runs on an idle turn, not once a second: the file is on disk
     // without waiting for the accounting tick. The deadline is under that
-    // tick, so a regression back to tick-only writes is caught here.
+    // tick, so a regression back to tick-only writes is caught here. The file
+    // is what proves it, because the line that reports the bytes is written on
+    // the tick.
     assert!(
-        wait_until(Duration::from_millis(900), || stack
-            .disk_u64("dir_bytes")
-            .is_some_and(|b| b > 0)),
-        "/perf never showed bytes on disk within one idle slice:\n{}",
+        wait_until(Duration::from_millis(900), || !stack
+            .files_for("0")
+            .is_empty()),
+        "no file appeared within one idle slice:\n{}",
         stack.cache_output()
     );
     assert!(
-        stack.disk_block().contains("\"queued\":0"),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .disk_u64("dir_bytes")
+            .is_some_and(|b| b > 0)),
+        "the metrics line never showed bytes on disk:\n{}",
+        stack.cache_output()
+    );
+    assert_eq!(
+        stack.disk_block()["queued"],
+        0,
         "the tick drained the queue: {}",
         stack.disk_block()
     );
     // The loop's own longest iteration while the writer was busy. The direct
     // load test cannot observe `work_max_ns` without the live loop, so the
-    // reporting claim lives here: `/perf` must serve the field, and it must be
+    // reporting claim lives here: the metrics line must carry the field, and it must be
     // non-zero once a window has covered the slice.
     let startup = stack.longest_loop_work_ns();
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || {
             stack.longest_loop_work_ns() > 0
         }),
-        "/perf never reported the loop's work_max_ns while the writer worked:\n{}",
+        "the metrics line never reported the loop's work_max_ns while the writer worked:\n{}",
         stack.cache_output()
     );
     println!(
@@ -1031,7 +1060,7 @@ fn a_restart_with_the_same_id_starts_warm() {
     stack.start();
     assert!(
         stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID:\n{}",
+        "the metrics line never showed the source's ID:\n{}",
         stack.cache_output()
     );
     let served = stack.get_cache("/", &[]);
@@ -1073,7 +1102,7 @@ fn a_restart_with_the_same_id_starts_warm() {
     );
     assert!(hit.header("age").is_some(), "a cached hit carries its age");
     assert_eq!(
-        stack.perf_u64("cache_hits_total"),
+        stack.perf_u64_after_a_request("cache_hits_total"),
         Some(hits + 1),
         "the first GET after the restart is a hit, and a hit is the only path \
          that increments this counter"
@@ -1216,9 +1245,10 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
     // The source keeps its state directory, so its ID is still 0.
     stack.start_source();
     assert!(
-        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
-            .genid_block()
-            .contains("\"upstream_down\":false")),
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack.genid_block()
+            ["upstream_down"]
+            .as_bool()
+            == Some(false)),
         "the cache node never reconnected:\n{}",
         stack.cache_output()
     );
@@ -1246,7 +1276,7 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
     let unchanged = stack.get_cache("/", &[]);
     assert_eq!(unchanged.text(), "first: one");
     assert_eq!(
-        stack.perf_u64("cache_hits_total"),
+        stack.perf_u64_after_a_request("cache_hits_total"),
         Some(hits + 1),
         "an unchanged site is not flushed"
     );

@@ -1,6 +1,7 @@
 //! The four cache outcomes are four counters, and each path moves exactly one.
 //!
-//! A hit and a miss are one bit each, and `/perf` used to report only those two.
+//! A hit and a miss are one bit each, and the metrics line used to report only
+//! those two.
 //! Four different facts were folded into them: a hit on an entry still inside
 //! its freshness lifetime, a hit on one past it (a stale serve), a miss answered
 //! by fetching a backend, and a miss answered by m6-http itself. This suite
@@ -26,9 +27,6 @@ use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, read_one, PortClaim, Service};
 
-#[path = "support/check.rs"]
-mod check_support;
-use check_support::{identity, Reply, RunningCheck};
 use m6_http_lib::probe;
 
 /// The body every fake-origin answer carries, so a served copy is identifiable.
@@ -110,15 +108,13 @@ fn keypair() -> (String, String) {
 fn system_toml(port: u16, cert: &std::path::Path, key: &std::path::Path) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
-         [auth]\nbackend = \"auth-check\"\n\n\
-         [health]\nmetrics_require = \"role:monitor\"\n\n\
          [node]\nname = \"cache-accounting\"\n",
         cert.display(),
         key.display(),
     )
 }
 
-fn site_toml(origin_port: u16, check: &std::path::Path) -> String {
+fn site_toml(origin_port: u16) -> String {
     format!(
         "[site]\nname = \"cache-accounting\"\ndomain = \"localhost\"\n\n\
          [server]\nbackend_timeout_secs = 5\n\n\
@@ -126,12 +122,10 @@ fn site_toml(origin_port: u16, check: &std::path::Path) -> String {
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
          [[backend]]\nname = \"origin\"\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
-         [[backend]]\nname = \"auth-check\"\nsockets = \"{}\"\n\n\
          [[route]]\npath = \"/fresh\"\nbackend = \"origin\"\n\n\
          [[route]]\npath = \"/stale\"\nbackend = \"origin\"\n\n\
          [[route]]\npath = \"/override-no-store\"\nbackend = \"origin\"\ncache = \"public, max-age=60\"\n\n\
-         [[route]]\npath = \"/fresh-cookie\"\nbackend = \"origin\"\n",
-        check.display()
+         [[route]]\npath = \"/fresh-cookie\"\nbackend = \"origin\"\n"
     )
 }
 
@@ -148,9 +142,13 @@ fn site_toml(origin_port: u16, check: &std::path::Path) -> String {
 /// while something is still using it.
 struct Stack {
     port: u16,
-    token: String,
     service: Service,
-    _check: RunningCheck,
+    /// `metrics.requests_total` of the document the last `counts` read, so the
+    /// next one waits for a line the new requests are in.
+    last_requests: std::cell::Cell<u64>,
+    /// `metrics.monitor_requests_total` of the same document, for a step that
+    /// must move no cache counter at all.
+    last_monitor: std::cell::Cell<u64>,
     _claim: PortClaim,
     _dir: tempfile::TempDir,
 }
@@ -165,35 +163,26 @@ impl Stack {
         let key = dir.path().join("key.pem");
         std::fs::write(&cert, cert_pem).expect("cert");
         std::fs::write(&key, key_pem).expect("key");
-        let check_path = dir.path().join("check.sock");
-        let check = RunningCheck::start(
-            &check_path,
-            vec![(
-                "monitor-token".to_string(),
-                Reply::Identity(identity(&[], &["monitor"])),
-            )],
-        )
-        .unwrap();
-        let token = "monitor-token".to_string();
-        std::fs::write(
-            dir.path().join("site.toml"),
-            site_toml(origin_port, &check_path),
-        )
-        .expect("site.toml");
+        std::fs::write(dir.path().join("site.toml"), site_toml(origin_port)).expect("site.toml");
         let system: PathBuf = dir.path().join("system.toml");
         std::fs::write(&system, system_toml(port, &cert, &key)).expect("system.toml");
         let mut service = Service::spawn(
             "m6-http-cache-accounting",
-            Command::new(binary("m6-http")).arg(dir.path()).arg(&system),
+            Command::new(binary("m6-http"))
+                .arg(dir.path())
+                .arg(&system)
+                // The counters are read from the metrics line, so one second
+                // between lines keeps every wait short.
+                .env("M6_TEST_STATS_INTERVAL_SECS", "1"),
         );
         service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
         Stack {
             _dir: dir,
             _claim: claim,
             port,
-            token,
             service,
-            _check: check,
+            last_requests: std::cell::Cell::new(0),
+            last_monitor: std::cell::Cell::new(0),
         }
     }
 
@@ -206,28 +195,12 @@ impl Stack {
         (status, body)
     }
 
-    /// One request, retried while a gated endpoint answers the design's 503.
-    ///
-    /// A check that misses its 50 ms deadline answers 503 with `Retry-After`.
-    /// `/perf` is a readiness signal here, so it retries under the testkit
-    /// bound and honours that header.
     fn get_with_headers(
         &self,
         path: &str,
         extra: &[(&str, &str)],
     ) -> (u16, Vec<(String, String)>, String) {
-        if check_support::check_gated(path) {
-            check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
-                let (status, headers, body) = self.exchange_with_headers(path, extra);
-                let retry = headers
-                    .iter()
-                    .find(|(name, _)| name == "retry-after")
-                    .and_then(|(_, value)| check_support::retry_after(Some(value.as_str())));
-                (status, retry, (status, headers, body))
-            })
-        } else {
-            self.exchange_with_headers(path, extra)
-        }
+        self.exchange_with_headers(path, extra)
     }
 
     fn exchange_with_headers(
@@ -278,25 +251,73 @@ impl Stack {
         (status, headers, body.to_string())
     }
 
-    /// One `/perf` counter, cumulative.
-    fn counter(&self, key: &str) -> u64 {
-        let auth = format!("Bearer {}", self.token);
-        let (status, body) = self.get_with("/perf", &[("Authorization", auth.as_str())]);
-        assert_eq!(
-            status,
-            200,
-            "/perf refused:\n{body}\n{}",
-            self.service.output()
+    /// Which counter proves the line is new.
+    ///
+    /// A line can sit in the log buffer for up to a second before its flush,
+    /// so the newest line in the output may have been built before the request
+    /// this call is about. Every counter here is cumulative, so waiting for
+    /// the one the step moved is what proves the line is after it.
+    fn counts(&self) -> CacheCounts {
+        self.counts_after(Freshness::Request)
+    }
+
+    /// The counters for a step that must move no cache counter: one `/health`
+    /// poll moves only `monitor_requests_total`, because a monitoring endpoint
+    /// is excluded from every site figure, so a line carrying that poll is a
+    /// line after whatever the step did.
+    fn counts_after_a_refresh(&self) -> CacheCounts {
+        assert_eq!(self.get("/health").0, 200, "{}", self.service.output());
+        self.counts_after(Freshness::MonitorPoll)
+    }
+
+    fn counts_after(&self, freshness: Freshness) -> CacheCounts {
+        let since = match freshness {
+            Freshness::Request => self.last_requests.get(),
+            Freshness::MonitorPoll => self.last_monitor.get(),
+        };
+        let key = match freshness {
+            Freshness::Request => "requests_total",
+            Freshness::MonitorPoll => "monitor_requests_total",
+        };
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
+        let document = loop {
+            let output = self.service.output();
+            if let Some(document) = newest_perf(&output) {
+                if document["metrics"][key].as_u64().unwrap_or(0) > since {
+                    break document;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "no metrics line carried a new {key} within the deadline; the last reading was \
+                     {since}\n--- output ---\n{output}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        self.last_requests.set(
+            document["metrics"]["requests_total"]
+                .as_u64()
+                .unwrap_or(since),
         );
-        let pat = format!("\"{key}\":");
-        body.split(&pat)
-            .nth(1)
-            .and_then(|rest| {
-                rest.split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .and_then(|n| n.parse().ok())
-            })
-            .unwrap_or_else(|| panic!("{key} is not in /perf:\n{body}"))
+        self.last_monitor.set(
+            document["metrics"]["monitor_requests_total"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+        let count = |key: &str| {
+            document["metrics"][key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{key} is not in the metrics document:\n{document}"))
+        };
+        CacheCounts {
+            hits_valid: count("cache_hits_valid_total"),
+            hits_invalid: count("cache_hits_invalid_total"),
+            misses_fetched: count("cache_misses_fetched_total"),
+            misses_local: count("cache_misses_answered_locally_total"),
+            hits_total: count("cache_hits_total"),
+            misses_total: count("cache_misses_total"),
+        }
     }
 }
 
@@ -311,17 +332,19 @@ struct CacheCounts {
     misses_total: u64,
 }
 
-impl Stack {
-    fn counts(&self) -> CacheCounts {
-        CacheCounts {
-            hits_valid: self.counter("cache_hits_valid_total"),
-            hits_invalid: self.counter("cache_hits_invalid_total"),
-            misses_fetched: self.counter("cache_misses_fetched_total"),
-            misses_local: self.counter("cache_misses_answered_locally_total"),
-            hits_total: self.counter("cache_hits_total"),
-            misses_total: self.counter("cache_misses_total"),
-        }
-    }
+/// Which cumulative counter proves a metrics line is newer than the last read.
+#[derive(Clone, Copy)]
+enum Freshness {
+    Request,
+    MonitorPoll,
+}
+
+/// The newest metrics document in the process output, while its line is whole.
+fn newest_perf(output: &str) -> Option<serde_json::Value> {
+    output.lines().rev().find_map(|line| {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        (v["type"] == "perf").then(|| v["fields"]["perf"].clone())
+    })
 }
 
 /// Wait until the fake origin has answered `want` requests, never on a sleep.
@@ -439,7 +462,7 @@ fn each_cache_fact_moves_its_own_counter_once() {
         stack.service.output()
     );
     assert_eq!(
-        stack.counts(),
+        stack.counts_after_a_refresh(),
         CacheCounts {
             hits_valid: 1,
             hits_invalid: 1,

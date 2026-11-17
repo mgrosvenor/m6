@@ -310,8 +310,8 @@ The endpoint that serves the figure reported `hit_samples: 0` with `hit_p50_ns: 
 `m6-monitor` reads zero samples as "not measured" and publishes `null`, so the monitor digest carried no latency, while the `periodic stats` line printed a real `hit_p50_ns` for the same counter in the same minute.
 
 **Cause.**
-`maybe_emit` reset `hit_idx` and `hit_count` to zero every ten seconds, and `snapshot()`, which serves `/perf`, read those same fields.
-`/perf` therefore reported the percentiles of whatever fraction of a ten-second window was open when it was scraped.
+`maybe_emit` reset `hit_idx` and `hit_count` to zero every ten seconds, and `snapshot()`, which builds the metrics document, read those same fields.
+The metrics document therefore reported the percentiles of whatever fraction of a ten-second window was open when it was built.
 A node taking two requests a minute sees most ten-second windows with no cache hit at all.
 The per-channel reservoirs were never cleared, so only the aggregate was zeroed, and it is the only figure `m6-monitor` reads.
 
@@ -322,7 +322,7 @@ One reservoir, run as a ring and never cleared.
 The change costs no extra memory and no extra work per request.
 
 `snapshot()` spans the most recent samples up to `RESERVOIR`, which is 4096 in `m6-http/src/stats.rs`, **a count of samples and not a period of time**.
-On a quiet node it reaches back hours and blends idle and busy traffic, which is why `hit_samples` is reported beside it, in the periodic log, in the monitor digest and in `/perf`.
+On a quiet node it reaches back hours and blends idle and busy traffic, which is why `hit_samples` is reported beside it, on the metrics line and in the monitor digest.
 
 **Verified.**
 `stats::perf_reservoir_tests` holds six tests.
@@ -337,7 +337,7 @@ End to end, the 05-cms example stack with a perf token took 40 requests, then th
 | after 14 s of silence | 81 | 2,250 | 5,625 |
 | after 14 s more | 81 | 2,250 | 5,625 |
 
-**Table 11: `/perf` holding its samples across two emit boundaries.**
+**Table 11: the metrics line holding its samples across two emit boundaries.**
 Take from it that the reported figure no longer depends on when the scrape lands, and that the periodic log still means "this window", reading `cache_hits=39 hit_p50_ns=2208` in the busy window and zeros either side.
 
 ### 4.4. Reading the number correctly
@@ -361,7 +361,7 @@ Their source is `m6-http/src/probe.rs`, and they check the server's figure about
 
 Taken on the build host's loopback, 200 sequential handshakes per channel, against the server's own report of the same connections.
 
-| channel | probe p50 | `/perf` p50 | `/perf` samples |
+| channel | probe p50 | metrics p50 | metrics samples |
 |---|---|---|---|
 | http/1.1 | 0.381 ms | 0.425 ms | 200 of 200 |
 | http/2 | 0.353 ms | 0.423 ms | 270 (200 probe plus 70 warmer) |
@@ -394,7 +394,7 @@ Protocol choice needs a real-path number, so a loopback figure never decides it.
 
 ### 5.3. Resumption
 
-The probes offer a session ticket since 2026-09-19, so a full handshake and a resumed one are measured separately and comparable with `/perf`.
+The probes offer a session ticket since 2026-09-19, so a full handshake and a resumed one are measured separately and comparable on the metrics line.
 A resumed handshake saves the certificate and the signature.
 TLS 1.3 completes in one round trip either way, so the saving is crypto and it is sub-millisecond on a fast path.
 

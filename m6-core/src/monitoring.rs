@@ -120,28 +120,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::telemetry::StatsSnapshot;
 
-/// Backend name tagged onto a `/health` response.
-pub const HEALTH_BACKEND: &str = "health";
-/// Backend name tagged onto a `/perf` response.
-pub const PERF_BACKEND: &str = "perf";
-
-/// Whether a completed response came from the monitoring endpoints.
-///
-/// These must not be counted as site traffic. Both answer from local state
-/// and return `Ready`, so the cache-miss accounting on the serving paths
-/// would otherwise record every health check as a cache miss -- inflating
-/// requests_total with monitor polling, depressing the hit rate, and
-/// poisoning the miss latency percentiles with ~10us samples that never
-/// touched a backend.
-///
-/// That matters most for the signal the endpoint exists to give: if a
-/// 30-second monitor contributes to requests_total, then "the request count
-/// stopped moving" can no longer detect a traffic stall, because the monitor
-/// keeps it moving on its own.
-pub fn is_monitoring_endpoint(backend: &str) -> bool {
-    backend == HEALTH_BACKEND || backend == PERF_BACKEND
-}
-
 /// One socket-backed backend pool's size.
 ///
 /// A node built before the pool lost its health state sent an `active` field

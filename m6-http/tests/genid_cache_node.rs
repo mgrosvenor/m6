@@ -232,6 +232,7 @@ impl Stack {
                  [log]\nlevel = \"debug\"\n\n\
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
+                 [stats]\ninterval_s = 1\n\n\
                  [[backend]]\nname = \"origin\"\nurl = \"https://{}\"\ntls_skip_verify = true\n\n\
                  [[backend]]\nname = \"auth-check\"\nsockets = \"{}/check.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"origin\"\n\n\
@@ -248,8 +249,6 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\nwarm_on_start = {warm_on_start}\n\n\
                  [node]\nname = \"genid-cache\"\n\n\
-                 [auth]\nbackend = \"auth-check\"\n\n\
-                 [health]\nmetrics_require = \"role:monitor\"\n\n\
                  [genid]\nupstream = \"origin\"\ntoken_file = \"{}/genid-token\"\nheartbeat_secs = {heartbeat_secs}\n",
                 cache_port.addr(),
                 d.display(),
@@ -487,50 +486,33 @@ impl Stack {
         self.post(self.cache_port.port(), path, token)
     }
 
-    fn perf(&self) -> Resp {
-        let auth = format!("Bearer {}", "monitor-token");
-        self.get_cache("/perf", &[("Authorization", auth.as_str())])
+    /// The `genid` block the newest metrics line carries, or `None` while the
+    /// cache has written none.
+    ///
+    /// The document is the one the removed `/perf` endpoint answered with, and
+    /// the line is on the one stream the process writes.
+    fn genid(&self) -> Option<serde_json::Value> {
+        self.cache_output().lines().rev().find_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            (v["type"] == "perf").then(|| v["fields"]["perf"]["genid"].clone())
+        })
     }
 
-    /// The cache node's `genid` block from `/perf`, or an empty string.
-    fn genid_block(&self) -> String {
-        let perf = self.perf();
-        let body = perf.text();
-        let start = body.find("\"genid\":{").map(|i| i + 8).unwrap_or(0);
-        let rest = &body[start..];
-        let end = rest.find('}').map(|i| i + 1).unwrap_or(rest.len());
-        rest[..end].to_string()
+    fn genid_id(&self) -> Option<String> {
+        let id = self.genid()?["id"].clone();
+        id.as_str().map(str::to_string)
     }
 
-    fn perf_id(&self) -> Option<String> {
-        let block = self.genid_block();
-        let pat = "\"id\":\"";
-        block
-            .split(pat)
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .map(str::to_string)
-    }
-
-    fn perf_bool(&self, key: &str) -> Option<bool> {
-        let block = self.genid_block();
-        let pat = format!("\"{key}\":");
-        let rest = block.split(&pat).nth(1)?;
-        if rest.starts_with("true") {
-            Some(true)
-        } else if rest.starts_with("false") {
-            Some(false)
-        } else {
-            None
-        }
+    fn genid_bool(&self, key: &str) -> Option<bool> {
+        self.genid()?[key].as_bool()
     }
 
     fn wait_perf_id(&self, want: &str, timeout: Duration) -> bool {
-        wait_until(timeout, || self.perf_id().as_deref() == Some(want))
+        wait_until(timeout, || self.genid_id().as_deref() == Some(want))
     }
 
     fn wait_upstream_down(&self, want: bool, timeout: Duration) -> bool {
-        wait_until(timeout, || self.perf_bool("upstream_down") == Some(want))
+        wait_until(timeout, || self.genid_bool("upstream_down") == Some(want))
     }
 }
 
@@ -594,7 +576,7 @@ fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 /// The cache node learns the source's ID without being asked by a client, and
-/// `/perf` reports it, the upstream, the round trip and that it is up.
+/// the metrics line reports it, the upstream, the round trip and that it is up.
 #[test]
 fn the_cache_learns_the_id_at_start() {
     let mut stack = Stack::new("public, max-age=60", 1, false);
@@ -604,16 +586,15 @@ fn the_cache_learns_the_id_at_start() {
 
     assert!(
         stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID:\n{}",
+        "the metrics line never showed the source's ID:\n{}",
         stack.cache_output()
     );
-    assert_eq!(stack.perf_bool("upstream_down"), Some(false));
-    let block = stack.genid_block();
-    assert!(block.contains("\"role\":\"cache\""), "{block}");
-    assert!(block.contains("\"upstream\":\"origin\""), "{block}");
-    assert!(block.contains("\"upstream_rtt_ms\":"), "{block}");
-    let rest = block.split("\"last_ok_s\":").nth(1).unwrap_or("");
-    assert!(rest.starts_with(|c: char| c.is_ascii_digit()), "{block}");
+    assert_eq!(stack.genid_bool("upstream_down"), Some(false));
+    let block = stack.genid().expect("a metrics line with a genid block");
+    assert_eq!(block["role"], "cache", "{block}");
+    assert_eq!(block["upstream"], "origin", "{block}");
+    assert!(block["upstream_rtt_ms"].is_number(), "{block}");
+    assert!(block["last_ok_s"].is_u64(), "{block}");
 }
 
 /// A cache node that has no ID retries a failed first heartbeat on the next
@@ -626,7 +607,7 @@ fn the_cache_learns_the_id_at_start() {
 /// the retry is what has to find it.
 ///
 /// Break: schedule the retry a whole heartbeat away, and this waits out
-/// `STARTUP_BOUND` with an empty `/perf` genid block.
+/// `STARTUP_BOUND` with an empty genid block in every metrics line.
 #[test]
 fn a_node_with_no_id_retries_a_failed_heartbeat() {
     let mut stack = Stack::new("public, max-age=60", 3600, false);
@@ -644,7 +625,7 @@ fn a_node_with_no_id_retries_a_failed_heartbeat() {
     stack.start_source();
     assert!(
         stack.wait_perf_id("0", m6_core::testkit::STARTUP_BOUND),
-        "/perf never showed the source's ID after one failed heartbeat:\n{}",
+        "the metrics line never showed the source's ID after one failed heartbeat:\n{}",
         stack.cache_output()
     );
 }
@@ -707,7 +688,7 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
     stack.start_cache();
     assert!(
         stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID 0:\n{}",
+        "the metrics line never showed the source's ID 0:\n{}",
         stack.cache_output()
     );
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
@@ -747,7 +728,7 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
 }
 
 /// While the source is down the node serves what it holds, at any age, and the
-/// operator sees it: the `upstream down` log line and `/perf`'s
+/// operator sees it: the `upstream down` log line and the metrics line's
 /// `upstream_down`.
 ///
 /// Break: never set the held flag, and the expired entry becomes a miss that
@@ -766,7 +747,7 @@ fn the_cache_serves_what_it_holds_while_the_source_is_down() {
     stack.stop_source();
     assert!(
         stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND),
-        "/perf never reported the upstream down:\n{}",
+        "the metrics line never reported the upstream down:\n{}",
         stack.cache_output()
     );
     assert!(
@@ -840,11 +821,11 @@ fn the_cache_recovers_when_the_source_returns() {
     stack.start_source();
     assert!(
         stack.wait_upstream_down(false, m6_core::testkit::RESPONSE_BOUND),
-        "/perf never reported the upstream up:\n{}",
+        "the metrics line never reported the upstream up:\n{}",
         stack.cache_output()
     );
     assert_eq!(
-        stack.perf_id().as_deref(),
+        stack.genid_id().as_deref(),
         Some("0"),
         "a restart keeps the ID, so nothing is old"
     );

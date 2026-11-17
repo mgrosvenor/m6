@@ -1,4 +1,4 @@
-//! The `/traffic` window costs no heap allocation per logged request.
+//! The traffic summary's window costs no heap allocation per logged request.
 //!
 //! `harness = false` means no libtest thread shares this binary, so the counter
 //! reads only what the pushes allocated. The window is allocated before the

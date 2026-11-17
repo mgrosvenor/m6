@@ -1,30 +1,29 @@
 //! m6-http's side of the monitoring endpoints.
 //!
-//! The endpoints themselves, and the shape of what they publish, are
+//! The documents themselves, and the shape of what they publish, are
 //! `m6_core::monitoring`. They are an m6 feature rather than this binary's:
 //! every deployment serves them, and an aggregator that reads them needs the
 //! same types the server writes. One definition, shared, rather than a
 //! consumer re-deriving the format by looking at a sample.
 //!
 //! What remains here is the part that is genuinely about this binary: which
-//! backend name a monitoring response is tagged with, and keeping those
-//! responses out of the site traffic counters.
+//! backend name a monitoring response is tagged with, keeping those responses
+//! out of the site traffic counters, and building the metrics and traffic
+//! documents the log lines carry.
 
 use std::net::IpAddr;
 
-use crate::config::{GenidConfig, HealthConfig};
+use crate::config::GenidConfig;
 use crate::stats::Iface;
 
 pub use m6_core::monitoring::{HealthReport, PerfOutcome, PerfReport, PerfSubject, PoolHealth};
 
 /// Backend name tagged onto a `/health` response.
 pub const HEALTH_BACKEND: &str = "health";
-/// Backend name tagged onto a `/perf` response.
-pub const PERF_BACKEND: &str = "perf";
 /// Backend name tagged onto a `/genid` response, for stats and analytics.
 pub const GENID_BACKEND: &str = "genid";
 
-/// Whether a completed response came from the monitoring endpoints.
+/// Whether a completed response came from the health endpoint.
 ///
 /// These must not be counted as site traffic. Both answer from local state
 /// and return `Ready`, so the cache-miss accounting on the serving paths
@@ -38,7 +37,7 @@ pub const GENID_BACKEND: &str = "genid";
 /// stopped moving" can no longer detect a traffic stall, because the monitor
 /// keeps it moving on its own.
 pub fn is_monitoring_endpoint(backend: &str) -> bool {
-    backend == HEALTH_BACKEND || backend == PERF_BACKEND
+    backend == HEALTH_BACKEND
 }
 
 /// Which population a request on a public listener belongs to, from the peer
@@ -190,19 +189,18 @@ mod monitoring_exclusion_tests {
     use super::*;
 
     /// Regression guard. The cache-miss accounting on the serving paths fires
-    /// on any `Ready` outcome, and /health and /perf both return Ready. Left
-    /// uncounted for, every health check was recorded as a cache miss: 10
-    /// checks moved requests_total by 11.
+    /// on any `Ready` outcome, and `/health` returns Ready. Left uncounted
+    /// for, every health check was recorded as a cache miss: 10 checks moved
+    /// requests_total by 11.
     ///
     /// That defeats the counter's purpose. A monitor polling every 30s would
     /// keep requests_total rising through a total traffic stall, so "the
     /// number stopped moving" would never fire.
     #[test]
-    fn monitoring_endpoints_are_excluded_from_traffic_stats() {
+    fn the_health_endpoint_is_excluded_from_traffic_stats() {
         assert!(is_monitoring_endpoint(HEALTH_BACKEND));
-        assert!(is_monitoring_endpoint(PERF_BACKEND));
         assert!(is_monitoring_endpoint("health"));
-        assert!(is_monitoring_endpoint("perf"));
+        assert!(!is_monitoring_endpoint("perf"));
     }
 
     /// Real backends must still be counted. An over-broad match here would
@@ -230,7 +228,7 @@ mod monitoring_exclusion_tests {
 
 // ── /traffic ─────────────────────────────────────────────────────────────────
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use m6_core::monitoring::TrafficReport;
 use m6_core::telemetry::AnalyticsRecord;
@@ -558,7 +556,7 @@ pub(crate) fn unix_micros_now() -> u64 {
         .map_or(0, |d| d.as_micros() as u64)
 }
 
-/// Build the `/traffic` summary from the window.
+/// Build the traffic summary from the window, for the `type=traffic` line.
 ///
 /// The records of the last hour are turned back into the records the log
 /// lines would have parsed to, and `TrafficReport::from_records` builds the
@@ -567,7 +565,7 @@ pub(crate) fn unix_micros_now() -> u64 {
 /// cut field can hide a probe marker. The report also states how long a window
 /// it actually covers and how many events the ring overwrote inside that
 /// window.
-fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
+pub fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
     let now_us = unix_micros_now();
     let cutoff = now_us.saturating_sub(WINDOW_US);
     let mut records: Vec<AnalyticsRecord> = Vec::with_capacity(window.filled);
@@ -595,31 +593,6 @@ fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
     report
 }
 
-/// Serve `/traffic` to a caller [`metrics_gate`] has already let through:
-/// this node's summary of its own traffic, built from the window in memory.
-///
-/// Gate first, then work, as for `/perf`, so an anonymous caller never causes
-/// the report to be built.
-///
-/// The cache keeps the build and its allocation to at most one per `cache_for`,
-/// however often the endpoint is scraped. It is a plain field of the loop's
-/// state: one thread owns the loop, so there is no lock to take.
-pub fn traffic_authorised(
-    node: &str,
-    window: &TrafficWindow,
-    cache: &mut Option<(Instant, TrafficReport)>,
-    cache_for: Duration,
-) -> PerfOutcome {
-    if let Some((built, report)) = cache.as_ref() {
-        if built.elapsed() < cache_for {
-            return PerfOutcome::Traffic(Box::new(report.clone()));
-        }
-    }
-    let report = build_report(node, window);
-    *cache = Some((m6_core::platform::now(), report.clone()));
-    PerfOutcome::Traffic(Box::new(report))
-}
-
 /// The verdict of the metrics gate for one request.
 pub enum Gate {
     /// Serve the report.
@@ -640,39 +613,9 @@ impl Gate {
     }
 }
 
-/// Decide whether `/perf` or `/traffic` may be served to this request.
-///
-/// Two rules, in this order:
-///
-/// 1. `metrics_peers`, when set: the request must not have arrived on an
-///    internal h2c listener (there the client address is a forwarded claim),
-///    and its peer address must be listed. Otherwise the 404 an unconfigured
-///    endpoint gives, before any token is looked at.
-/// 2. `metrics_require`, when set: the one token check decides. It is called
-///    once, here, and its refusal is the answer unchanged. When unset the
-///    endpoint is off, as it is with no token at all.
-///
-/// The address rule allocates nothing: one parse of the peer address and a
-/// scan of a short slice, and only on these two paths.
-pub fn metrics_gate(h: &HealthConfig, client_ip: &str, from_internal: bool) -> Gate {
-    if let Some(peers) = &h.metrics_peer_ips {
-        let listed = !from_internal
-            && client_ip
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| peers.contains(&ip.to_canonical()));
-        if !listed {
-            return Gate::disabled();
-        }
-    }
-    match h.metrics_require.as_deref() {
-        Some(require) => Gate::Check(require.to_string()),
-        None => Gate::disabled(),
-    }
-}
-
 /// Decide whether a `GET` or `POST /genid` may be served to this request.
 ///
-/// Two rules, in this order, the shape [`metrics_gate`] uses:
+/// Two rules, in this order:
 ///
 /// 1. The peer is loopback, or the request arrived on an internal listener.
 ///    Anyone else gets the 404 an unknown path gives, before a token is read.
@@ -802,30 +745,10 @@ fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::V
 #[cfg(test)]
 mod traffic_endpoint_tests {
     use super::*;
-
-    /// No credential configured means the endpoint does not exist: a 404, so
-    /// it does not advertise a door. A configured one asks for a check, and
-    /// the report is built only after that check allows.
-    #[test]
-    fn a_disabled_endpoint_refuses_before_the_report_is_built() {
-        let none = HealthConfig::default();
-        let Gate::Refused(code, _, _) = metrics_gate(&none, "127.0.0.1", false) else {
-            panic!("no claims configured must refuse");
-        };
-        assert_eq!(code, 404);
-
-        let h = HealthConfig {
-            metrics_require: Some("role:monitor".to_string()),
-            ..HealthConfig::default()
-        };
-        let Gate::Check(require) = metrics_gate(&h, "127.0.0.1", false) else {
-            panic!("a configured endpoint must ask for a check");
-        };
-        assert_eq!(require, "role:monitor");
-    }
+    use std::time::Duration;
 
     #[test]
-    fn summarises_the_window_and_serves_it() {
+    fn summarises_the_window_for_the_traffic_line() {
         let mut window = TrafficWindow::new();
         let now = unix_micros_now();
         window.push(
@@ -845,11 +768,8 @@ mod traffic_endpoint_tests {
             Some("Mozilla/5.0 (compatible; ExampleBot/1.0)"),
         );
 
-        let mut cache = None;
-        let out = traffic_authorised("origin", &window, &mut cache, Duration::from_secs(0));
-        let (code, headers, body) = out.into_response();
-        assert_eq!(code, 200);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let report = build_report("origin", &window);
+        let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["node"], "origin");
         assert_eq!(v["total_requests"], 2);
         assert!(v["crawlers"][0]["user_agent"]
@@ -857,10 +777,6 @@ mod traffic_endpoint_tests {
             .unwrap()
             .contains("ExampleBot"));
         assert!(v["logging"].is_object(), "logging health travels with it");
-        // Never cached by anything in between.
-        assert!(headers
-            .iter()
-            .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 
     /// The age filter keeps the window to an hour: 61 minutes old is out,
@@ -1195,77 +1111,5 @@ mod genid_gate_tests {
             panic!("no claims must be refused");
         };
         assert_eq!(code, 404);
-    }
-}
-
-#[cfg(test)]
-mod metrics_gate_tests {
-    use super::*;
-
-    fn health(peers: Option<&[&str]>, require: Option<&str>) -> HealthConfig {
-        HealthConfig {
-            metrics_require: require.map(str::to_string),
-            metrics_peer_ips: peers.map(|p| {
-                p.iter()
-                    .map(|s| s.parse::<IpAddr>().unwrap().to_canonical())
-                    .collect()
-            }),
-            ..HealthConfig::default()
-        }
-    }
-
-    #[test]
-    fn an_unlisted_peer_is_404_before_any_check() {
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        for ip in ["203.0.113.7", "2001:db8::1", "10.0.0.8"] {
-            let Gate::Refused(code, _, _) = metrics_gate(&h, ip, false) else {
-                panic!("{ip} must get 404");
-            };
-            assert_eq!(code, 404);
-        }
-    }
-
-    #[test]
-    fn a_listed_peer_asks_for_a_check() {
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        for ip in ["10.0.0.9", "::ffff:10.0.0.9"] {
-            let Gate::Check(require) = metrics_gate(&h, ip, false) else {
-                panic!("{ip} must ask for a check");
-            };
-            assert_eq!(require, "role:monitor");
-        }
-    }
-
-    #[test]
-    fn an_unparseable_client_address_is_refused() {
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        for ip in ["", "unknown", "10.0.0.9:443", "10.0.0.9, 1.2.3.4"] {
-            let Gate::Refused(code, _, _) = metrics_gate(&h, ip, false) else {
-                panic!("{ip:?} must get 404");
-            };
-            assert_eq!(code, 404, "{ip:?}");
-        }
-    }
-
-    #[test]
-    fn an_internal_request_from_a_listed_peer_is_refused() {
-        // In an internal h2c listener the peer address is a forwarded claim,
-        // so the allow-list cannot trust it.
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        assert!(matches!(
-            metrics_gate(&h, "10.0.0.9", true),
-            Gate::Refused(404, _, _)
-        ));
-    }
-
-    #[test]
-    fn without_a_require_the_endpoint_is_disabled() {
-        let h = health(None, None);
-        for (ip, internal) in [("203.0.113.7", false), ("10.0.0.9", true)] {
-            assert!(matches!(
-                metrics_gate(&h, ip, internal),
-                Gate::Refused(404, _, _)
-            ));
-        }
     }
 }

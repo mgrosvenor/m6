@@ -199,7 +199,7 @@ m6-http "$SITE" "$SITE/configs/m6-http-dev.toml"
 ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 ```
 
-The system config accepts `[server]`, `[node]`, `[auth]` and two `[health]` keys, `metrics_require` and `metrics_peers`.
+The system config accepts `[server]`, `[node]`, `[auth]`, the `[genid]` claims, the cache directory and the named limits.
 Everything else comes from `site.toml` unchanged.
 
 Section 2 shows the two files.
@@ -271,8 +271,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[limits.<name>]` | System config | The start and maximum of this node's buffers and queues, memory a node owns |
-| `[health]` metrics_require, metrics_peers | System config | Which peers may read a node's metrics is a property of the node |
-| `[health]` enabled, path, perf_path, traffic_path, traffic_cache_s | `site.toml` | The endpoint layout every node and the monitor share |
+| `[health]` enabled, path | `site.toml` | The endpoint layout every node shares |
 | `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
 | Service `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | Service config | The service's own state |
@@ -344,8 +343,8 @@ Take from it that the bind, the certificate and the key are required, and every 
 | `reuse_port` | boolean | no | Default `false`. When `true`, only the public 443 port is shared: its TLS listener and QUIC UDP socket on `bind` are bound with `SO_REUSEPORT` in one call, so several m6-http processes serve that port. The redirect port 80, the internal h2c socket and every backend socket are not shared. Linux spreads a new connection by a hash and macOS does not, so the split is not even unless `reuse_port_processes` is set. System config only, read at start |
 | `reuse_port_processes` | integer, at least 1 | no | Unset by default. With `reuse_port`, the number of m6-http processes that share the port. On Linux a socket filter attached to the TLS listener and the QUIC socket sends (a hash of the client's source address) mod this number to one socket, so one client address always reaches the same process, for HTTP/1.1, HTTP/2 and HTTP/3, over IPv4 and IPv6. Every process on the port must set the same number. macOS has no such filter and ignores it. System config only, read at start |
 | `lock_memory` | boolean | no | Default `true`. Pins every page of the process in RAM at start, after the heap reservation and before the first request (`mlockall` on Linux, nothing on macOS), so a hot page is never a page fault and the cache is never swapped out. If the kernel refuses because `RLIMIT_MEMLOCK` is too low, m6-http stops at start with exit 2 and an error that names the limit; it never carries on unpinned when pinning was asked for. Under systemd set `LimitMEMLOCK=infinity` in the unit. Set `false` to run unpinned. System config only, read at start |
-| `process_index` | integer | no | Unset by default. This process's number among the m6-http processes of one node, 0 to N-1, below `reuse_port_processes` when that is set. `/health` and `/perf` report it as `process_index`, and with `status_bind` it picks this process's status port. System config only, read at start |
-| `status_bind` | string, `"<address>:<base port>"` | no | Unset by default. With `reuse_port`, each process also answers `/health`, `/perf` and `/traffic` on a TLS listener of its own at the base port plus its `process_index`, so a monitor reads every process and not whichever one the kernel picked on 443. Every other path on it is 404, and the `[health]` gate applies as on the shared port. Needs `process_index`; a port past 65535 is exit 2. It is not in the `reuse_port` group, so nothing steers to it. Bind it to the node's tunnel address, never a public one. System config only, read at start |
+| `process_index` | integer | no | Unset by default. This process's number among the m6-http processes of one node, 0 to N-1, below `reuse_port_processes` when that is set. `/health` reports it as `process_index`, and with `status_bind` it picks this process's status port. System config only, read at start |
+| `status_bind` | string, `"<address>:<base port>"` | no | Unset by default. With `reuse_port`, each process also answers `/health` on a TLS listener of its own at the base port plus its `process_index`, so a monitor reads the liveness of every process and not whichever one the kernel picked on 443. Every other path on it is 404. Needs `process_index`; a port past 65535 is exit 2. It is not in the `reuse_port` group, so nothing steers to it. Bind it to the node's tunnel address, never a public one. System config only, read at start |
 | `redirect_bind` | string, `"address:port"` | no | Unset by default. Run this process as a plain-HTTP redirector on this address: every request is answered 301 to `https://<Host><path>`, or to `redirect_unmatched_to` when the Host is not in `served_hosts`. No TLS, no QUIC, no backends, no routes and no cache are built. System config only, read at start |
 | `served_hosts` | list of strings | no | `[]` by default. The host names this node serves, matched against `Host` or `:authority` with any port stripped and ASCII case ignored. The list alone changes nothing, because the policy is off until `redirect_unmatched_to` is set. System config only, read at start |
 | `redirect_unmatched_to` | string | no | Unset by default, which turns the policy off. A bare host name, for example `example.com`. A request outside `served_hosts`, including one with no Host, is answered 301 to `https://<redirect_unmatched_to><path>` with the query kept, before the cache and before routing. Refused when `served_hosts` is empty, when it carries a scheme, port, path or wildcard, and when it is an IP address. System config only, read at start |
@@ -396,7 +395,7 @@ The internal h2c listener is for relaying nodes, and a monitor polls a node over
 So `internal_peers` both admits a peer and trusts the client addresses that peer forwards.
 A request on the TLS or QUIC listener from a private network address other than loopback is counted as monitor traffic, so a monitor on the private network does not move the visitor counters.
 A real visitor reaches that listener from a public address.
-A request from a public address is monitor only on `/health`, `/perf` or `/traffic`, and external on every other path.
+A request from a public address is monitor only on `/health`, and external on every other path.
 
 Both lists are read at startup from the system config only, so a change needs a restart.
 A redirect-mode config ignores the keys.
@@ -476,7 +475,7 @@ backend = "m6-html"
 
 The `[auth]` table names the authority m6-http asks about a credential.
 Table 7 gives its one key.
-Take from it that every gated path needs a running checker: a route `require`, `metrics_require`, and a source node's `/genid`.
+Take from it that every gated path needs a running checker: a route `require` and a source node's `/genid`.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
@@ -491,55 +490,23 @@ Every credential check sends one `POST /check`, so a node with any gated path ne
 
 ### 4.6. `[health]`
 
-The `[health]` table configures the monitoring endpoints, which m6-http answers inside itself ahead of routing, the cache and every backend.
+The `[health]` table configures the one monitoring endpoint, which m6-http answers inside itself ahead of routing, the cache and every backend.
 Table 8 gives the keys.
-Take from it that the endpoint layout is site-wide and the two access keys belong to one node.
+The metrics and traffic documents are log lines, not endpoints, so no key here opens a read of them and no credential is involved.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | `true` | Turns all three endpoints off |
+| `enabled` | bool | `true` | Turns `/health` off |
 | `path` | string | `"/health"` | Always public |
-| `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
-| `traffic_path` | string | `"/traffic"` | A summary of the last hour this process served, from memory. See [`m6-http.md`](m6-http.md) |
-| `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. An identity with this claim opens `/perf` and `/traffic`, from the credential a route `require` reads. `POST /check` decides; without this key the endpoints answer 404 |
-| `metrics_peers` | list of strings | none | The IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
 **Table 8: the `[health]` keys.**
-The two `metrics_*` keys are read from the system config only.
 
-A request to `/perf` or `/traffic` is served only when both rules that are set pass, and the checks run in this order:
+`/health` has two answers, 200 `{"status":"ok"}` and 503 `{"status":"degraded"}`, and the status code carries the answer.
+It answers from flags and probes nothing, so its cost is one JSON serialisation.
+Section 11 of [`m6-http.md`](m6-http.md) states both bodies.
 
-1. `metrics_peers`, when set: the request did not arrive on an internal h2c listener, and its peer address is one of the listed addresses.
-   Otherwise the answer is 404 with the body of an endpoint that is not enabled, before any token is read.
-2. `metrics_require`, when set: the request carries a credential, from the Authorization header or the session cookie as a route `require` reads it, and the authority answers an identity that holds the claim.
-   No credential, or one the authority refuses, is 401 with `WWW-Authenticate: Bearer`.
-   An identity without the claim is 403.
-   A checker that does not answer is 503 with `Retry-After: 1`.
-   Without `metrics_require` the endpoints answer 404, so there is no second gate and no legacy bearer file.
-
-The peer address is the one a completed TCP or QUIC handshake proved, never a header.
-That is why the endpoints are refused on an internal h2c listener, where the client address is the `X-Forwarded-For` value the listener believes.
-
-An entry in `metrics_peers` is an IP address in a local range (`m6_core::net::is_private_ip`).
-Names are never resolved, ranges are not accepted, and a public or wildcard address is a startup error.
-An IPv4-mapped IPv6 peer matches the IPv4 entry.
-
-`metrics_peers` composes with the token check.
-`/health` ignores both keys.
-On a host where a public interface could receive packets with a listed source address, filter them with reverse-path filtering, because a peer address that arrives on the wrong interface is still a completed handshake.
-When `metrics_require` and `metrics_peers` are unset, the endpoints answer 404.
-
-The example below gates `/perf` and `/traffic` on a role and one peer address.
-
-```toml
-[auth]
-backend = "auth-check"
-
-[health]
-metrics_require = "role:monitor"
-metrics_peers   = ["10.0.0.5"]
-```
+`[health] metrics_require`, `metrics_peers`, `perf_path`, `traffic_path` and `traffic_cache_s` are removed.
+A config that still names one stops the start with exit 2, naming the unknown key, and the metrics and traffic documents are read from the journal instead.
 
 ### 4.7. `[[backend]]`
 
@@ -835,9 +802,6 @@ Exit 2 on:
 - `[auth]` with no `backend`, or one that is not declared in `[[backend]]`, or that names a `url` backend
 - `require` on a route but no `[auth]` declared
 - `tls_cert` or `tls_key` given as a relative path
-- `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
-- `[health] metrics_peers` entry that is not in a local range
-- `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`
 - `--log-level` unrecognised
 - `internal_binds` entry that is not an IP address and port (names are never resolved)
 - `internal_binds` entry that is not in a local range

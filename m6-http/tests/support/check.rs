@@ -15,8 +15,8 @@
 //!
 //! This module also holds the one place a test distinguishes the design's 503
 //! from a service failure. A check that misses its 50 ms deadline is the
-//! designed answer, so a test waiting for `/perf`, `/traffic` or `/genid`
-//! retries it under the testkit bound and honours `Retry-After`.
+//! designed answer, so a test waiting for `/genid` retries it under the testkit
+//! bound and honours `Retry-After`.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,10 @@ use m6_core::auth::Identity;
     reason = "each test binary uses part of this one helper, and not every binary names Reply"
 )]
 pub use m6_core::testkit::Reply;
+#[allow(
+    unused_imports,
+    reason = "each test binary uses part of this one helper, and not every binary starts a check server"
+)]
 pub use m6_core::testkit::ServingCheck as RunningCheck;
 
 /// The status the edge answers when a check did not answer in time.
@@ -61,7 +65,7 @@ pub fn retry_after(value: Option<&str>) -> Option<Duration> {
 
 /// Whether `path` is answered through the one token check.
 pub fn check_gated(path: &str) -> bool {
-    matches!(path, "/perf" | "/traffic" | "/genid")
+    path == "/genid"
 }
 
 /// An identity answer with the given groups and roles.

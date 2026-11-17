@@ -121,7 +121,7 @@ Two integration suites, `metrics_access` and `loop_never_waits`, assert on the t
 
 A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` and uses that many seconds when it parses as a positive integer.
 
-A developer who runs a debug `m6-http` by hand inherits the hook: exporting the variable shortens that process's tick, and every `/perf` trace window with it.
+A developer who runs a debug `m6-http` by hand inherits the hook: exporting the variable shortens that process's tick, and every metrics line's trace window with it.
 
 A release build does not read the variable, so a released service always ticks at ten seconds.
 

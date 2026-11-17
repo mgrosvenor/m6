@@ -87,7 +87,7 @@ m6-http starts in this order, before it serves a request.
 With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_core::platform::net::listen_shared`, before the TLS configuration is built.
 With `reuse_port_processes` set, Linux also attaches a socket filter to both that picks the process from the client's source address, so one client always reaches one process.
 The redirect listener on port 80, the internal h2c listener and every backend socket are not shared.
-`/health`, `/perf` and `/traffic` are answered on the shared port, so the process the kernel picks answers them.
+`/health` is answered on the shared port, so the process the kernel picks answers it, and each process's metrics line is in the journal under the same node name.
 
 ---
 
@@ -337,7 +337,7 @@ A cached response carries the ID stored with it.
 A response whose dispatch ID is no longer current is not stored, so the cache cannot refill from a backend that is one generation behind.
 A locally built answer, such as a health check or an error page, carries no ID.
 
-The generation is also reported by an authorised `/perf`, under a `genid` object with `role`, `id`, `sequence_running` and the peers that read it.
+The generation is also reported on the metrics line, under a `genid` object with `role`, `id`, `sequence_running` and the peers that read it.
 An operator watching a publish sees one `genid advanced` line at info with `genid`, `members`, `failed` and `elapsed_ms`, and one `genid: member refresh failed` line at error naming the socket path of each member that did not refresh.
 The POST still answers 200 when a member failed, and the `failed` count is what says the generation is not uniform.
 
@@ -366,7 +366,7 @@ It asks that upstream for the ID and follows it.
 4. **Serving while the upstream is down.**
    While the upstream does not answer, an entry past its freshness and stale windows is served as `STALE` with its `Age`.
    A forward that ends in 502, 503 or 504 answers with the held entry for its key when there is one, at any age.
-   The operator sees one `genid: upstream down` line at warn on the transition, and `/perf` reports `upstream_down: true`.
+   The operator sees one `genid: upstream down` line at warn on the transition, and the metrics line reports `upstream_down: true`.
    The first answer after an outage logs `genid: upstream up` at info and clears the flag.
    Old pages keep working while the source is unreachable, and that is better than an error page.
 5. **Background fetches wait.**
@@ -378,7 +378,7 @@ It asks that upstream for the ID and follows it.
    A forwarded POST waits under `backend_timeout_secs` and is answered 504 if the deadline passes while the source is still completing the publish.
    `GET /genid` then shows whether the advance happened.
 
-A cache node reports its own `genid` object from an authorised `/perf`: `role` is `cache`, `id` is the ID it holds or `null`, and `upstream`, `upstream_down`, `upstream_rtt_ms` and `last_ok_s` describe the node it follows.
+A cache node reports its own `genid` object on the metrics line: `role` is `cache`, `id` is the ID it holds or `null`, and `upstream`, `upstream_down`, `upstream_rtt_ms` and `last_ok_s` describe the node it follows.
 A source restart keeps its ID, so a cache node sees no change when it comes back.
 
 ### 8.4 Disk cache (cache nodes)
@@ -440,7 +440,7 @@ The first later success clears the mark, keeps the copy when the ID is unchanged
 The start cost is one directory listing, one read and one SHA-256 per file, up to `max_bytes`.
 The `disk cache loaded` line reports `elapsed_ms` beside the ID, the entry count (`entries`) and the damaged-file count (`bad`).
 
-An authorised `/perf` on a node with a directory adds a `disk_cache` object: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick`, `skipped_full`, `ticks`, `tick_last_ns`, `loaded_entries`, `loaded_bad` and `state`.
+A node with a cache directory adds a `disk_cache` object to the metrics line: `dir_bytes`, `queued`, `written_last_tick`, `written_bytes_last_tick`, `skipped_full`, `ticks`, `tick_last_ns`, `loaded_entries`, `loaded_bad` and `state`.
 `dir_bytes` counts the files in the current generation's directory.
 `queued` counts the entries whose flag is set.
 `written_bytes_last_tick` is the encoded size of the last slice's writes, including a single entry larger than the 4 MiB budget.
@@ -502,14 +502,12 @@ If a route declares `require`, m6-http asks the authority before forwarding:
 A request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
-`/perf` and `/traffic`, and a source node's `GET` and `POST /genid`, take the same path.
-Their requirements keep their names and meanings: `[health] metrics_require`, and `[genid] read_require` and `write_require`.
+A source node's `GET` and `POST /genid` take the same path, under `[genid] read_require` and `write_require`.
 A refusal is the authority's 401 or 403; a checker that does not answer is 503 with `Retry-After: 1`.
-The index's `metrics_require` therefore sees a removed role or a deleted user on the next request, exactly as a route does.
 
 `m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
 `m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
-`[auth]` now needs `backend`. Config validation refuses a `require` route, `metrics_require` or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
+`[auth]` now needs `backend`. Config validation refuses a `require` route or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
 `[auth] public_key` is removed: the edge holds no key and decodes no token.
 
 `[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
@@ -526,8 +524,8 @@ Renderers may perform additional fine-grained checks using the auth claims avail
 
 ## 11. Monitoring Endpoints
 
-m6-http answers `/health`, `/perf` and `/traffic` itself, ahead of routing, the cache and every backend.
-A refusal never reaches routing or the cache, so a catch-all route can never answer `/perf` and a built-in path never enters the cache.
+m6-http answers `/health` itself, ahead of routing, the cache and every backend.
+A refusal never reaches routing or the cache, so a catch-all route can never answer `/health` and a built-in path never enters the cache.
 `/health` is public and has two answers, and the status code carries the answer.
 `200` with `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
 `503` with `{"status":"degraded","node":"<name>"}` says the process is alive and serving its public and cached pages while a dependency is failing.
@@ -548,58 +546,45 @@ The detail goes in the process log instead, one warn line when the origin goes b
 m6-monitor's degraded line says a dependency is not answering and points at that log for which one.
 The lines go through `m6-log`, carry a static reason and allocate nothing on the request path.
 
-`/perf` and `/traffic` are gated by the `[health]` keys in Table 4.
-In two-file mode all four are node state and live in the system config.
-In one-file mode they live in that one file.
+`/health` is the only built-in endpoint.
+The metrics document and the traffic document are log lines, as Table 4 gives, so a monitor reads them from the journal and no request opens them.
+The move is why nothing in m6-http needs a credential for monitoring any more: `[health] metrics_require` and `[health] metrics_peers` are gone, and a config that still names either stops the start with exit 2 as an unknown key.
+`[auth] backend` still names the backend that answers `POST /check` for a route's `require` and for `/genid`.
 
-Each of the three endpoints reports the process that accepted the request.
-With `[server] reuse_port`, the kernel chooses that process on the shared port, so a monitor polling that address reads one front end of N per poll and the report holds that process's share of the node.
-To read every process, set `[server] process_index` and `status_bind` on each: the process then also answers these three paths on a TLS listener of its own at the `status_bind` port plus its index, and nothing else (any other path is 404).
-The listener is another socket in the same event loop and runs the same handler, under the same `[health]` gate, so the request path of the shared port is unchanged and a process allocates nothing more per request.
-`/health` and `/perf` carry `process_index` when it is set.
-In m6-monitor, `processes = N` on a node polls process `i` at `tunnel.address` with its port raised by `i`, over the tunnel, and reports it as `<node>/<i>`, with one `PROCESSES` line in `/check` and `process_groups` in `/digest` adding the node's processes together.
-A process that is down refuses its own port, so the monitor names that index as a fault.
-`processes = 1` or no `processes` polls the node as one address, as before.
-Section 4.1 states the same split for the request counters.
+Table 4: the two monitoring lines.
 
-`/perf` reports three traffic populations and never pools them.
-`http/<version>/external` is a real visitor from a public address on the TLS or QUIC listener, or a loopback client on either.
-`http/<version>/internal` is a cache node's forward on the listener `[server] internal_binds` names.
-`http/<version>/monitor` is a poll of `/health`, `/perf` or `/traffic`, or any request on the TLS or QUIC listener from a private network address other than loopback.
-The backend name identifies the three endpoints and the peer address identifies the rest, so no header and no configuration key is involved.
-Every monitor request also moves `monitor_requests_total`, and none of them moves `requests_total` or the hit and miss counters.
+| line | `type` | target | message | interval key |
+|---|---|---|---|---|
+| the metrics document | `perf` | `m6_http::stats` | `stats` | `[stats].interval_s` |
+| the traffic summary | `traffic` | `m6_http::traffic` | `traffic` | `[stats].traffic_interval_s` |
 
-`/perf` splits the cache counts four ways.
-`cache_hits_valid_total` counts a hit on an entry inside its freshness lifetime, and `cache_hits_invalid_total` a stale serve under `stale-while-revalidate` or the client's `max-stale`.
-`cache_misses_fetched_total` counts a miss answered by fetching a backend, and `cache_misses_answered_locally_total` a miss m6-http answered itself, such as the route-table 404.
-The valid and invalid hits add up to `cache_hits_total`, and the two misses add up to `cache_misses_total`.
-A response fetched from a backend moves `requests_total`, the response-code table and the miss counts when the fetch completes, and a backend 5xx moves `backend_errors_total`, so the hit rate is a measured one.
+Both lines go to stdout, which journald carries, and under systemd each is also one datagram with `M6_TYPE` set to the same word, so a reader filters the journal on `M6_TYPE=perf` or `type=perf` without parsing the document.
+Both carry this process's share of the node, which is what a scrape of the shared port could only ever report while `[server] reuse_port` shares the port between processes.
+`/health` carries `process_index` when it is set, and a monitor reads the metrics line of each process out of the journal.
+`[server] process_index` and `status_bind` still give every process its own status listener, and that listener serves `/health` alone.
 
-| Key | Where | Meaning |
-|---|---|---|
-| `[auth] backend` | system config | The `[[backend]]` whose members answer `POST /check` |
-| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. An identity with the claim is required, from the credential a route `require` reads |
-| `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
+Each of the three request counters' populations still reads as before, and the metrics line carries that table.
+Table 5 lists what a reader selects on.
 
-*Table 4: the keys that decide who reads `/perf` and `/traffic`. Take from it that with none of them set the endpoints do not exist, and that a config that still names the removed `metrics_token_file` stops the start with exit 2.*
+Table 5: what the monitoring reader selects on.
 
-With none of the keys set, both endpoints answer the 404 an unconfigured path gives.
-A config that still names `[health] metrics_token_file` stops the start with exit 2, naming the key, because the legacy gate is removed.
-The checks run in this order, as Table 5 shows.
+| reader | selection |
+|---|---|
+| a metrics reader | `type` `perf` in the JSON line, or `M6_TYPE=perf` in the journal |
+| a traffic reader | `type` `traffic` in the JSON line, or `M6_TYPE=traffic` in the journal |
+| the access reader | `type` `access`, one line per request, the same row the analytics file used to carry |
+| a liveness reader | `GET /health`, the public endpoint |
 
-| Step | Check | Refusal |
-|---|---|---|
-| 1 | `metrics_peers` set: not on an internal h2c listener, and the peer address is listed | 404, the body of a disabled endpoint, before any token is read |
-| 2 | `metrics_require` set: `POST /check` answers the credential (Authorization header or session cookie), and the identity holds the claim | 401 for no credential or a refusal, 403 for the wrong claim, 503 with `Retry-After: 1` for a checker that does not answer. Same status, headers and body as every other token-gated route |
-| 2 | `metrics_require` unset: the endpoint does not exist | 404, the body of a disabled endpoint, before any token is read |
-
-*Table 5: the metrics gate, in order. Take from it that a peer outside `metrics_peers` learns nothing, and that a token is read only when `metrics_require` names the claim it must hold.*
-
-Step 1 in Table 5 reads the peer address a completed TCP or QUIC handshake proved.
-It is never read from a header, so a forged `X-Forwarded-For` does not open the endpoints.
-An internal h2c listener believes `X-Forwarded-For`, so it never serves them.
-The cost is one address parse and a scan of a short list, and only on these two paths.
-The cache-hit path is unchanged.
+The traffic line carries the last 60 minutes this process served, from a window it keeps in memory and reads no log file for.
+The window holds at most 32,768 events and is allocated at start.
+It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
+When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
+A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the access line keeps them whole.
+The notable-client sample is then cut at 160 characters, marked the same way.
+In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
+Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
+The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
+The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
 ---
 
@@ -613,17 +598,6 @@ A second termination signal exits at once.
 | `SIGTERM` or `SIGINT` | Stop accepting, remove the socket if there is one, exit 0, without waiting for requests in progress | Immediate exit |
 
 *Table 6: the signals m6-http handles. Take from it that a second termination signal exits at once.*
-`/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
-The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
-It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
-When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
-A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the access line keeps them whole.
-The notable-client sample is then cut at 160 characters, marked the same way.
-In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
-Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
-The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
-The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
-
 ---
 
 ## 13. Exit Codes
@@ -887,13 +861,13 @@ The operational line carries `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `c
 `pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
 Each line reports the window since the last line, and each percentile carries its sample count beside it so a p50 over one sample cannot be read as a p50 over a thousand.
 
-The `type` `perf` line carries the whole `/perf` document, nested under `fields.perf`, from the same builder the endpoint answers with.
+The `type` `perf` line carries the whole metrics document, nested under `fields.perf`, from the one builder that produces it.
 Its target is `m6_http::stats` and its message is `stats`.
 `[stats].interval_s` sets how often both lines are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides it in a debug build.
 The metrics line goes to stdout with every other line.
 
 A third periodic line is the traffic summary, `type` `traffic`, target `m6_http::traffic`, nested under `fields.traffic`.
-It carries the document `/traffic` answers, from the same builder, at `[stats].traffic_interval_s`, one minute by default.
+It carries the traffic document from the same one builder, at `[stats].traffic_interval_s`, one minute by default.
 Its own interval because the report summarises a sixty-minute window: a minute is the finest resolution at which a new line can say something the last one did not.
 
 The metrics document is the largest line m6 writes: 26,143 bytes measured with every section at its maximum.

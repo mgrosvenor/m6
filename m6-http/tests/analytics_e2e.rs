@@ -33,7 +33,6 @@ use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
 #[path = "support/check.rs"]
 mod check_support;
-use check_support::{identity, Reply, RunningCheck};
 
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
     let ck =
@@ -60,8 +59,6 @@ fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
 struct HttpResponse {
     status: u16,
     headers: String,
-    /// Everything after the final header block.
-    body: String,
 }
 
 impl HttpResponse {
@@ -108,7 +105,6 @@ fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
     HttpResponse {
         status: 0,
         headers: format!("<no response: {reason}>"),
-        body: String::new(),
     }
 }
 
@@ -205,15 +201,7 @@ fn https_exchange(
         }
         break (block.to_string(), code);
     };
-    let body = text
-        .split_once(headers.as_str())
-        .map(|(_, after)| after.trim_start_matches("\r\n\r\n").to_string())
-        .unwrap_or_default();
-    HttpResponse {
-        status,
-        headers,
-        body,
-    }
+    HttpResponse { status, headers }
 }
 
 // ── HTTP/3 client ─────────────────────────────────────────────────────────────
@@ -399,10 +387,6 @@ struct Server {
     /// Where the readiness probe's line ended in the process output, so a test
     /// counts only the lines its own requests produced.
     log_mark: std::cell::Cell<usize>,
-    /// The `role:monitor` token, which `/perf` requires. The legacy bearer
-    /// string is gone: `/perf` is behind the one token check now.
-    token: String,
-    _check: RunningCheck,
     http: std::cell::RefCell<Service>,
     _file: Service,
     _dir: tempfile::TempDir,
@@ -468,29 +452,6 @@ impl Server {
     fn analytics(&self) -> String {
         let out = self.http.borrow().output();
         out[self.log_mark.get().min(out.len())..].to_string()
-    }
-
-    /// `/perf` as JSON. Needs the bearer token the fixture configures.
-    fn traffic_json(&self) -> serde_json::Value {
-        let auth = format!("Bearer {}", self.token);
-        let r = self.get("/traffic", &[("Authorization", auth.as_str())]);
-        assert_eq!(
-            r.status, 200,
-            "/traffic answered {}\n{}",
-            r.status, r.headers
-        );
-        let start = r.body.find('{').expect("a JSON body");
-        let end = r.body.rfind('}').expect("a JSON body");
-        serde_json::from_str(&r.body[start..=end]).expect("/traffic is JSON")
-    }
-
-    fn perf_json(&self) -> serde_json::Value {
-        let auth = format!("Bearer {}", self.token);
-        let r = self.get("/perf", &[("Authorization", auth.as_str())]);
-        assert_eq!(r.status, 200, "/perf answered {}\n{}", r.status, r.headers);
-        let start = r.body.find('{').expect("a JSON body");
-        let end = r.body.rfind('}').expect("a JSON body");
-        serde_json::from_str(&r.body[start..=end]).expect("/perf is JSON")
     }
 
     /// Wait until a request actually reaches the backend, then clear the log.
@@ -561,16 +522,6 @@ fn start_server() -> Server {
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
-    let check_path = dir.path().join("check.sock");
-    let check = RunningCheck::start(
-        &check_path,
-        vec![(
-            "monitor-token".to_string(),
-            Reply::Identity(identity(&[], &["monitor"])),
-        )],
-    )
-    .unwrap();
-    let token = "monitor-token".to_string();
 
     std::fs::write(
         site.join("site.toml"),
@@ -599,16 +550,11 @@ enabled = false
 name    = "m6-file"
 sockets = "{sock_glob}"
 
-[[backend]]
-name    = "auth-check"
-sockets = "{check_path}"
-
 [[route]]
 path    = "/public/{{relpath}}"
 backend = "m6-file"
 "#,
             sock_glob = sock_glob.display(),
-            check_path = check_path.display(),
         ),
     )
     .unwrap();
@@ -637,12 +583,6 @@ tls_key  = "{key}"
 
 [node]
 name = "test-node"
-
-[auth]
-backend = "auth-check"
-
-[health]
-metrics_require = "role:monitor"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
@@ -671,8 +611,6 @@ metrics_require = "role:monitor"
         port,
         cert_der,
         log_mark: std::cell::Cell::new(0),
-        token,
-        _check: check,
         http: std::cell::RefCell::new(http_proc),
         _file: file_proc,
         _dir: dir,
@@ -730,8 +668,9 @@ fn wait_for_perf_lines(srv: &Server, want: usize) -> Vec<serde_json::Value> {
     read_perf_lines(&srv.http.borrow().output())
 }
 
-/// The traffic line is the `/traffic` document: same fields, same JSON, and it
-/// parses as the type the monitor reads.
+/// The traffic line carries the traffic document: it parses as the one type
+/// the monitor reads, and serialising that type gives the line back field for
+/// field, so a field dropped from the line is a test failure.
 #[test]
 fn the_traffic_line_carries_the_traffic_document() {
     let srv = start_server();
@@ -744,27 +683,21 @@ fn the_traffic_line_carries_the_traffic_document() {
     });
     assert!(seen, "no type=traffic line reported the request");
     let lines = read_traffic_lines(&srv.http.borrow().output());
-    let from_line = lines.last().expect("a line");
-    let from_endpoint = srv.traffic_json();
+    let from_line = lines.last().expect("a line").clone();
 
     let parsed: m6_core::monitoring::TrafficReport =
         serde_json::from_value(from_line.clone()).expect("the line parses as a TrafficReport");
-    assert_eq!(parsed.node, from_endpoint["node"]);
+    assert_eq!(parsed.node, "test-node");
     assert_eq!(
-        parsed.window_minutes,
-        from_endpoint["window_minutes"].as_u64().unwrap()
+        serde_json::to_value(&parsed).expect("the report serialises"),
+        from_line,
+        "the line is the document, field for field"
     );
-
-    let keys = |v: &serde_json::Value| -> Vec<String> {
-        v.as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default()
-    };
-    assert_eq!(keys(from_line), keys(&from_endpoint), "traffic fields");
 }
 
-/// The line's document is the endpoint's document: same keys at every level,
-/// same node, same build, and it parses into the same type the monitor reads.
+/// The stats line carries the metrics document: it parses as the one type the
+/// monitor reads, and serialising that type gives the line back field for
+/// field, so a field dropped from the line is a test failure.
 #[test]
 fn the_stats_line_carries_the_perf_document() {
     let srv = start_server();
@@ -783,66 +716,17 @@ fn the_stats_line_carries_the_perf_document() {
     });
     assert!(seen, "no type=perf line reported the request");
     let lines = read_perf_lines(&srv.http.borrow().output());
-    let from_line = lines.last().expect("a line");
-    let from_endpoint = srv.perf_json();
+    let from_line = lines.last().expect("a line").clone();
 
-    // It parses into the type the digest reads, which is the guarantee that
-    // matters to the monitor: a field missing here is a field the monitor
-    // would have had from the endpoint.
     let parsed: m6_core::monitoring::PerfReport =
         serde_json::from_value(from_line.clone()).expect("the line parses as a PerfReport");
-
-    assert_eq!(parsed.node, from_endpoint["node"]);
-    assert_eq!(from_line["build"], from_endpoint["build"]);
-    assert_eq!(from_line["pools"], from_endpoint["pools"]);
-    // `expires_in_seconds` is measured from the moment the document is built,
-    // so two builds one second apart differ by one there and nowhere else.
-    let certificates = |v: &serde_json::Value| -> Vec<(u64, String, i64)> {
-        v["tls"]
-            .as_array()
-            .map(|certs| {
-                certs
-                    .iter()
-                    .map(|c| {
-                        (
-                            c["depth"].as_u64().expect("depth"),
-                            c["fingerprint"].as_str().unwrap_or_default().to_string(),
-                            c["not_after_unix"].as_i64().expect("not_after_unix"),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    assert_eq!(certificates(from_line), certificates(&from_endpoint));
-    assert_eq!(from_line["url_backends"], from_endpoint["url_backends"]);
-
-    let keys = |v: &serde_json::Value| -> Vec<String> {
-        v.as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default()
-    };
-    assert_eq!(keys(from_line), keys(&from_endpoint), "top-level fields");
+    assert_eq!(parsed.node, "test-node");
+    assert!(!parsed.tls.is_empty(), "the served chain is on the line");
     assert_eq!(
-        keys(&from_line["metrics"]),
-        keys(&from_endpoint["metrics"]),
-        "metrics fields"
+        serde_json::to_value(&parsed).expect("the report serialises"),
+        from_line,
+        "the line is the document, field for field"
     );
-    assert_eq!(
-        keys(&from_line["host"]),
-        keys(&from_endpoint["host"]),
-        "host fields"
-    );
-
-    // A count can only have grown between the line and the poll.
-    let line_requests = from_line["metrics"]["requests_total"]
-        .as_u64()
-        .expect("requests_total");
-    let endpoint_requests = from_endpoint["metrics"]["requests_total"]
-        .as_u64()
-        .expect("requests_total");
-    assert!(line_requests <= endpoint_requests);
-    assert!(line_requests >= 1, "the request did not reach the line");
 }
 
 /// The configured interval is honoured: two more lines are at least two

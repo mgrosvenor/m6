@@ -685,7 +685,6 @@ pub enum PendingKind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthGate {
     Route,
-    Metrics,
     Genid,
 }
 

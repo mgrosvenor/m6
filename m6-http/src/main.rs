@@ -401,12 +401,6 @@ struct ServerState {
     /// allocated while serving. `/traffic` builds its report from it, so the
     /// analytics log is not read inside the loop.
     traffic: health::TrafficWindow,
-    /// The last `/traffic` summary and when it was built.
-    ///
-    /// Held so the report is built at most once per `traffic_cache_s`, however
-    /// often the endpoint is scraped. It is a plain field because one thread
-    /// owns the loop.
-    traffic_report: Option<(Instant, m6_core::monitoring::TrafficReport)>,
     /// Reused buffer a cache lookup builds its key into, so a lookup never
     /// allocates. Capacity 512 matches the old stack buffer's bound.
     lookup_key_buf: String,
@@ -1484,18 +1478,23 @@ fn drive_conn_token(
     }
 }
 
-/// Whether `path` is one the status listener answers: the health, perf and
-/// traffic paths this process serves on the shared port.
+/// Whether `path` is the one path the status listener answers: the health path
+/// this process serves on the shared port.
 fn is_status_path(state: &ServerState, path: &str) -> bool {
-    let health = &state.config.health;
-    path == health.path || path == health.perf_path || path == health.traffic_path
+    path == state.config.health.path
 }
 
 /// The answer to any other path on the status listener: the 404 of a disabled
 /// endpoint, which says nothing about the site.
 fn status_refusal() -> RequestOutcome {
     let (code, headers, body) = health::PerfOutcome::Disabled.into_response();
-    RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string(), None)
+    RequestOutcome::Ready(
+        code,
+        headers,
+        body,
+        health::HEALTH_BACKEND.to_string(),
+        None,
+    )
 }
 
 /// Deregister and free a connection token.
@@ -1894,75 +1893,6 @@ fn resolve_check(
         id: UpstreamId::Slot(slot),
         ctx: Box::new(ctx),
     })
-}
-
-/// Apply the `/perf` and `/traffic` gate, parking on the authority if needed.
-///
-/// `Err` is the answer to send. `Ok` means the endpoint may be served. The
-/// refusal is the authority's, unchanged: 401 or 403 from `token_refusal`, and
-/// 503 with `Retry-After: 1` for a checker that did not answer.
-fn metrics_gate_allows(
-    req: &forward::HttpRequest,
-    client_ip: &str,
-    enc: &str,
-    state: &mut ServerState,
-    registry: &m6_core::platform::Registry,
-    from_internal: bool,
-    pre_decided: &mut Option<PreDecided>,
-) -> Result<(), RequestOutcome> {
-    match health::metrics_gate(&state.config.health, client_ip, from_internal) {
-        health::Gate::Refused(code, headers, body) => Err(RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::PERF_BACKEND.to_string(),
-            None,
-        )),
-        health::Gate::Open => Ok(()),
-        health::Gate::Check(require) => {
-            let auth_backend = auth_backend_name(state);
-            let plan = CheckPlan {
-                req,
-                client_ip,
-                enc,
-                auth_backend: auth_backend.clone(),
-                content_backend: health::PERF_BACKEND.to_string(),
-                route_path: req.path.clone(),
-                route_cache: None,
-                cacheable: false,
-                is_prefetch: false,
-                from_internal,
-                gate: forward::AuthGate::Metrics,
-                require,
-            };
-            let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
-                CheckResolution::Decision(decision) => decision,
-                CheckResolution::Pending(outcome) => return Err(outcome),
-            };
-            match decision {
-                core_auth::Decision::Allow(_) => Ok(()),
-                core_auth::Decision::NoDecision => Err(backend_unavailable(
-                    req,
-                    client_ip,
-                    state,
-                    registry,
-                    &req.path,
-                    &auth_backend,
-                    "auth check unavailable",
-                )),
-                refusal => {
-                    let (code, headers, body) = refusal.refusal().expect("a refusal");
-                    Err(RequestOutcome::Ready(
-                        code,
-                        headers,
-                        body,
-                        "auth".to_string(),
-                        None,
-                    ))
-                }
-            }
-        }
-    }
 }
 
 /// The configured authority's backend name, or `[auth]` for an error context.
@@ -3397,15 +3327,8 @@ fn event_loop(
         // sixty-minute window, so it is written once a minute by default
         // rather than at the metrics line's interval.
         if state.stats.maybe_emit_traffic() {
-            let outcome = health::traffic_authorised(
-                &state.config.node.name,
-                &state.traffic,
-                &mut state.traffic_report,
-                std::time::Duration::ZERO,
-            );
-            if let health::PerfOutcome::Traffic(report) = outcome {
-                m6_http_lib::stats::log_traffic(&*report);
-            }
+            let report = health::build_report(&state.config.node.name, &state.traffic);
+            m6_http_lib::stats::log_traffic(&report);
         }
 
         // Drain one background fetch per loop iteration, unless this node has
@@ -5235,86 +5158,6 @@ fn handle_request_inner(
             health::HEALTH_BACKEND.to_string(),
             None,
         );
-    }
-
-    // ── Metrics endpoint, deliberately a separate path from /health ─────────
-    // Percentiles mean sorting a 4096-sample reservoir. Serving them from the
-    // health path behind a conditional would leave the expensive branch one
-    // misconfigured header away from being taken on every check forever, so
-    // the split is what keeps the health answer cheap. `snapshot` is passed
-    // as a closure and is not called until authorisation passes.
-    if state.config.health.enabled && req.path == state.config.health.perf_path {
-        if let Err(outcome) = metrics_gate_allows(
-            req,
-            client_ip,
-            content_encoding,
-            state,
-            registry,
-            from_internal,
-            &mut pre_decided,
-        ) {
-            return outcome;
-        }
-        let (code, headers, body) = {
-            // The endpoint answers the same document the periodic metrics line
-            // carries, built by the one function. The gate has passed, so this
-            // is the authorised path that pays the reservoir sort.
-            let document = state.perf_document();
-            let body = serde_json::to_vec(&document)
-                .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-            (200, m6_core::monitoring::perf_headers(), body)
-        };
-        // Same treatment as /health above. A 401 here is worth seeing: it
-        // means something is probing the metrics endpoint without the token.
-        analytics::log_monitor(
-            state.config.analytics.enabled,
-            &req.headers,
-            &state.config.node.name,
-            &req.path,
-            code,
-            client_ip,
-            None,
-            &mut state.traffic,
-        );
-        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string(), None);
-    }
-
-    // ── Traffic summary, the third monitoring path ──────────────────────────
-    // Its own path for the same reason /perf is not /health: this one builds
-    // a report from the window of events the process kept in memory, so its
-    // cost is a property of the path rather than of a header on a cheaper
-    // one. Cached, so a polling monitor cannot make the node rebuild it on
-    // every scrape.
-    if state.config.health.enabled && req.path == state.config.health.traffic_path {
-        if let Err(outcome) = metrics_gate_allows(
-            req,
-            client_ip,
-            content_encoding,
-            state,
-            registry,
-            from_internal,
-            &mut pre_decided,
-        ) {
-            return outcome;
-        }
-        let (code, headers, body) = health::traffic_authorised(
-            &state.config.node.name,
-            &state.traffic,
-            &mut state.traffic_report,
-            std::time::Duration::from_secs(state.config.health.traffic_cache_s),
-        )
-        .into_response();
-        analytics::log_monitor(
-            state.config.analytics.enabled,
-            &req.headers,
-            &state.config.node.name,
-            &req.path,
-            code,
-            client_ip,
-            None,
-            &mut state.traffic,
-        );
-        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string(), None);
     }
 
     // ── The site generation ID, ahead of routing and the cache ──────────────
@@ -7814,7 +7657,6 @@ fn run(args: Vec<String>) -> i32 {
         error_pages: HashMap::new(),
         started: m6_core::platform::now(),
         traffic: health::TrafficWindow::new(),
-        traffic_report: None,
         lookup_key_buf: String::with_capacity(512),
         alt_svc_line,
         describedby_line,

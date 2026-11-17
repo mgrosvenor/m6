@@ -1112,20 +1112,13 @@ mod tests {
         let mut s = Stats::new();
         let ch = Channel::new(Version::Http11, Iface::External);
         s.record(1_000, CacheOutcome::FetchedMiss, 200, ch, "m6-html");
-        for _ in 0..25 {
+        for _ in 0..50 {
             s.record(
                 9_000,
                 CacheOutcome::FetchedMiss,
                 200,
                 ch,
                 crate::health::HEALTH_BACKEND,
-            );
-            s.record(
-                9_000,
-                CacheOutcome::FetchedMiss,
-                200,
-                ch,
-                crate::health::PERF_BACKEND,
             );
         }
 
@@ -1146,8 +1139,8 @@ mod tests {
         assert_eq!(snap.monitor_requests_total, 50);
         assert_eq!(snap.requests_total, 1);
         assert!(snap.monitor_p50_ns > 0, "monitor latency not sampled");
-        // The three endpoints now also have a channel row, so a reader of
-        // `/perf` alone can see the monitor population.
+        // The polls also have a channel row, so a reader of the metrics
+        // document can see the monitor population.
         let monitor = snap
             .channels
             .iter()
@@ -1255,16 +1248,9 @@ mod tests {
             ch,
             crate::health::HEALTH_BACKEND,
         );
-        s.record(
-            400,
-            CacheOutcome::FetchedMiss,
-            401,
-            ch,
-            crate::health::PERF_BACKEND,
-        );
         assert_eq!(s.backend_errors_total, 0);
         assert_eq!(s.requests_total, 0);
-        assert_eq!(s.monitor_requests_total, 2);
+        assert_eq!(s.monitor_requests_total, 1);
         assert!(
             s.snapshot().status_counts.is_empty(),
             "monitor status codes leaked into the site response-code table"
