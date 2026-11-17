@@ -1491,6 +1491,7 @@ The `/check` report starts with a HEALTH section, one line per node, showing thi
 `[monitor] health_last_ok_max_age_s` sets the age above which the line is flagged, and it defaults to three `poll_interval_s` values.
 A node is ok only when `/health` answers 200 and the body status is `ok`. Every other node is a fault on its line and in the verdict: a 503 whatever its body says, a 200 with any other status, and no answer at all. The last 200 is read from an index that holds only the 200 rows, so reading it does not slow as the history grows.
 A 503 says the node is alive and serving its public and cached pages while a dependency is failing, which on an edge is its origin, and the node stays a fault on this line because a dependency is down.
+The line names no dependency because `/health` does not, and the node's own log names it in the warn line it wrote when the dependency went bad.
 
 `GET /history` and `GET /crawlers` answer on the service's Unix socket and nowhere else.
 Both take `from` and `to` as *RFC 3339* UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.

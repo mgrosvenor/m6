@@ -130,13 +130,17 @@ pub struct Finding {
     pub text: String,
 }
 
-/// Why an older m6-http reports itself degraded.
+/// Why a node reports itself degraded.
 ///
-/// `/health` no longer carries a pool verdict, because a socket pool keeps no
-/// per-member health state. The monitor still prints this reason when a node
-/// answers degraded, which a node older than the change can. The check prints
-/// it beside the code rather than leaving the reader to look it up.
-pub(crate) const DEGRADED_REASON: &str = "a configured socket pool has no live member";
+/// `/health` answers 503 `degraded` for one cause: a dependency this node needs
+/// is failing, which today is an edge's origin. The body names the node and no
+/// dependency, because `/health` is public and unsecured. The node's own log
+/// names the dependency in the warn line it writes on the change, so this
+/// reason names the cause the monitor can know and points at the log for which
+/// one. It names no mechanism of its own: a second reason string here would
+/// claim knowledge the monitor does not have.
+pub(crate) const DEGRADED_REASON: &str =
+    "a dependency is not answering, see the node's log for which one";
 
 /// The whole fleet, summarised.
 #[derive(Debug, Clone, Serialize)]

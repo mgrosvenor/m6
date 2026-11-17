@@ -33,9 +33,14 @@
 //!
 //! A cache node's origin is one such dependency. Its flag is the follower's own
 //! down bit, set where a heartbeat or a forwarded client request already
-//! observes the origin failing and cleared by the next answer. While it is set
-//! `/health` answers 503 `{"status":"degraded","node":"<name>"}`. While it is
-//! clear `/health` answers 200 `{"status":"ok","node":"<name>"}`.
+//! observes the origin failing and cleared by the next heartbeat answer. While
+//! it is set `/health` answers 503 `{"status":"degraded","node":"<name>"}`.
+//! While it is clear `/health` answers 200 `{"status":"ok","node":"<name>"}`.
+//!
+//! So `/health` has two answers plus an absence. A process that is gone, or
+//! whose listener refuses, answers nothing, and `m6-monitor` reads that as
+//! `unreachable`. The two answers and the monitor's four states were designed
+//! to fit.
 //!
 //! Proving the origin reachable inside the check would put a network round trip
 //! on the most frequently hit path on the box, and a warm cache keeps serving

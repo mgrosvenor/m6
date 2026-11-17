@@ -76,17 +76,19 @@ pub fn peer_iface(peer: IpAddr) -> Iface {
 // `/health` answers for the process and for the dependencies whose failure the
 // loop already observes. It reads flags and never probes: each flag is set
 // where a real request's outcome is already known and cleared by the next
-// success. That is what keeps the answer a JSON serialisation on the most
-// frequently hit path on the box.
+// heartbeat answer. That is what keeps the answer a JSON serialisation on the
+// most frequently hit path on the box.
 
 /// Whether this node's origin is failing, which is what a cache node's
 /// `degraded` answer reports.
 ///
 /// The flag is the follower's own `down` bit. `Follower::answered` sets it
 /// where a heartbeat's failure is already observed and clears it on the next
-/// answer, and `Follower::failed` sets it where a forwarded request's failure
-/// is already observed. `/health` reads it and does nothing else, so the cost
-/// is one branch, with no timer, no probe, no clock and no round trip.
+/// heartbeat answer, and `Follower::failed` sets it where a forwarded request's
+/// failure is already observed. A successful client request clears nothing: the
+/// heartbeat observes the recovery, and it is due immediately after a failure.
+/// `/health` reads the flag and does nothing else, so the cost is one branch,
+/// with no timer, no probe, no clock and no round trip.
 ///
 /// A second dependency is one more term at the call site in `main.rs`: AUTH-1
 /// step 5 adds the checker's flag where its `/check` call fails, and ORs it

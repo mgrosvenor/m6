@@ -2495,6 +2495,8 @@ mod health_tests {
 
     /// A degraded node is a fault, and the reason the body's verdict carries is
     /// printed beside the code rather than left to the operator to look up.
+    /// The reason names no mechanism: `/health` names no dependency, so the
+    /// line points at the node's log, which does.
     #[test]
     fn a_degraded_node_prints_fault_with_the_reason() {
         let (h, _dir) = history_with_last_ok("edge-a", 30);
@@ -2502,10 +2504,8 @@ mod health_tests {
         let line = line_of(&out, "edge-a");
         assert!(line.contains("FAULT"), "{out}");
         assert!(line.contains("503 degraded"), "{out}");
-        assert!(
-            line.contains("a configured socket pool has no live member"),
-            "{out}"
-        );
+        assert!(line.contains("a dependency is not answering"), "{out}");
+        assert!(line.contains("see the node's log for which one"), "{out}");
         assert!(line.contains("last 200"), "{out}");
     }
 

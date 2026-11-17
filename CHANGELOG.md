@@ -521,11 +521,11 @@ Comments only.
 **`/health` answers `ok` or `degraded`, and an edge's dependency failure is the 503 (#175).**
 `200` `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
 `503` `{"status":"degraded","node":"<name>"}` says the process is alive and serving its public and cached pages while a dependency is failing, which on an edge is its origin.
-A process that is gone or whose listener refuses gives no answer, which `m6-monitor` reads as `unreachable`.
+A process that is gone or whose listener refuses gives no answer, which `m6-monitor` reads as `unreachable`. So `/health` has two answers plus an absence.
 The degraded body names the node and, when the node sets one, the process index. It names no dependency and no reason, because `/health` is public and unsecured and that detail would tell a stranger which part of the node to wait out.
 The detail is in the process log instead: one warn line when the origin's flag goes bad and one info line when it recovers, on the change only, through `m6-log`, with a static reason and no allocation on the request path.
-The flag is the cache node's follower state, set where a heartbeat or a forwarded request already observes the failure and cleared by the next successful heartbeat, so `/health` reads flags, never probes, and costs one JSON serialisation.
-`m6-monitor` needed no change: it already reads a non-200 as `degraded`, and its four states and these two answers were designed to fit.
+The flag is the cache node's follower state, set where a heartbeat or a forwarded request already observes the failure and cleared by the next successful heartbeat. A successful client request clears nothing, so a recovered origin is reported within one heartbeat interval, and `/health` reads flags, never probes, and costs one JSON serialisation.
+`m6-monitor`'s state mapping needed no change: it already reads a non-200 as `degraded`, and its four states and these two answers were designed to fit. Its printed reason changed from `a configured socket pool has no live member`, which named a mechanism no current m6-http uses, to `a dependency is not answering, see the node's log for which one`, which is true for every cause and points at the line that names the dependency.
 Verified on 2026-11-17 on a macOS sandbox: a real cache node in front of a real source answers 200 `{"status":"ok","node":"genid-cache"}`, then 503 `{"status":"degraded","node":"genid-cache"}` while the source is stopped, then 200 again after it returns, while serving held content throughout. The cache's log holds exactly one `genid: upstream down` warn and exactly one `genid: upstream up` info across 61 requests, counted and asserted, and the degraded body is asserted byte for byte so it cannot start naming a dependency.
 
 **Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
