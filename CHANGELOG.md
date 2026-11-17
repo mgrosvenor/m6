@@ -139,6 +139,26 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**`m6_core::auth` is the one place the credential decision lives.**
+`Identity`, `Require`, `Answer` and `Decision` name the identity a `/check` 200 answers, the `role:<name>` or `group:<name>` matcher, the total parser for the answer, and the decision the edge acts on.
+`parse_check` maps a 200 to the identity, a 401 to `Refused`, and every other status or an unparsable 200 to `NoDecision`, which is answered 503 and never 401.
+`encode_claims_header` writes the four identity keys and no token claim.
+The `testkit` feature gains `CheckServer`, a fake `/check` authority with a token table that answers a 200 identity, a 401, a 403, a 503, a slow answer, a close mid-answer, or a refused connection, and counts the calls it served.
+No edge behaviour changes: `m6-http` keeps its own verifier until steps 5 to 7, and nothing calls these types on a request path yet.
+Verified on 2026-11-17 on a macOS sandbox: 12 unit tests in `m6-core/src/auth.rs`, including `no_decision_is_labelled_as_no_credential`, and 7 tests of the fake server.
+
+**`m6-auth-server` can serve `/check` on its own Unix socket, and a deployment can run the login side as its own process.**
+The check socket is derived beside the primary socket as `<parent>/check-<file name>`, so `/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`, and `M6_CHECK_SOCKET_OVERRIDE` sets it outright.
+The four login routes keep the primary socket, and the new `--login-only` and `--check-only` flags bind one listener each, with neither flag binding both.
+Both flags together stop the start with exit 2.
+The upgrade is additive: the primary path and a deployment's `/run/m6/m6-auth*.sock` glob are unchanged, and the `check-` prefix keeps that glob off the new socket.
+**Two listeners in one process share one event loop and one connection table, so they do not isolate `/check` from a login's bcrypt verify.**
+A `/check` that arrives during a login waits for that login.
+Only a second process removes the tail, because `/auth/login` is absent from the check process's listener.
+`docs/m6-auth.md` and `docs/m6-user-guide.md` give the two units, which use one config each because a unit's credentials live under `/run/credentials/<unit>/`.
+Verified on 2026-11-17 on a macOS sandbox: six tests in `m6-auth-server/tests/listeners.rs` prove the two 404 refusals, the derived path, both single-listener modes and the exit 2, and the four `/check` tests pass on the new socket.
+With a login in flight, `/check` measured p50 1,670 ms and p99 2,820 ms in one process, against p50 5.9 ms and p99 8.6 ms with the login and check sides in two processes (n=7 each, debug build).
+
 **`m6-auth-server` gains a fifth route, `POST /check`, which answers the current identity for an access token.**
 It takes `Authorization: Bearer <access token>` and answers 200 with `sub`, `username`, `roles` and `groups`, all read from the database at that request.
 The token proves which user is asking, and the database supplies what that user may do, so a role change is visible to the next request without a new token.
@@ -344,6 +364,12 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 **A cache node with no generation ID retries a failed heartbeat on the next tick, and a confirmed disk copy writes the `disk cache kept` line.**
 A heartbeat is a request with the backend deadline, so a loaded host or a stalled guest can miss one answer. The node then waited the whole configured interval before asking again. At `heartbeat_secs = 3600` one timeout left a node with no ID for an hour, and a node with no ID cannot serve a request because the store rule needs the ID a reply was dispatched under. A failure now schedules the next heartbeat one loop tick away while the node holds no ID, and the configured interval once it does. A disk copy installed unverified after a timeout is confirmed by the next answer that names the same ID, and that transition now logs `disk cache kept`, the same line the settle path already wrote, so `/perf` and the log agree. No config key and no route changes. Verified: the new `a_node_with_no_id_retries_a_failed_heartbeat` fails at `STARTUP_BOUND` (60 s) without the retry and passes in 1.8 s with it, `a_restart_with_the_source_down_serves_the_disk_copy` asserts the kept line on the confirmation, and three consecutive full workspace runs under 16 CPU burners passed with zero failures.
 **The HTTP/1.1 close path allocated, so `h1_tls_hit` carried a 2,003 budget for a row that makes 2,000 calls.** `http11::advance_tls` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")` when a peer closed a TLS connection, and that constructor boxes its message, so every teardown inside the counted window added calls and the row's figure moved with when the shutdown landed. It builds the error from its kind now, which allocates nothing, so closing a connection costs nothing of ours. The error's text is std's "unexpected end of file" where it was "closed", and no h1 code logs it: the drive loop matches the kind and closes. Verified on macOS against a dev build with `--features count-allocations`: fourteen runs of the row after the change read 2.000 every time, N = 1,000 counted 2,169 calls and 2N = 2,000 counted 4,169, against 2,178 and 4,178 before, so the fixed part of each run fell by nine calls and the budget is 2,000. The request path is unchanged and still allocates none of m6's own.
+**A check-only `m6-auth-server` answers the reserved `/genid` with the house 404, not 204.**
+`Site` answers the reserved path before routing, so the listener test in `run_route` never saw it and the reload arm had no side test: with `--check-only`, `POST /genid` on the check socket answered 204 and ran the start path again, and `GET /genid` answered 405.
+The loop now answers any `/genid` on the check side with the route-less house 404 before `Site` runs, so a process that serves only `/check` cannot be told to reload.
+The other paths are unchanged: `/perf`, `/traffic`, `/ready` and `/health` are not routes of this service and answer 404 on both sockets, the four login routes answer 404 on the check socket, and `/check` answers 404 on the login socket.
+Every wrong-socket answer is the route-less house 404, so it carries no route `Cache-Control` and no route headers and is indistinguishable from an unknown path.
+Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `POST /genid` on a `--check-only` process answered `204 No Content` with `Cache-Control: no-store`, `GET /genid` answered 405, and `POST /auth/login` on the check socket answered 404 with `Cache-Control: no-store` where `POST /nope` carried none. After, all of them are the house 404 with no `Cache-Control`, and `genid_on_a_check_only_process_is_404`, `each_path_answers_on_one_socket_only` and `a_wrong_socket_404_carries_no_route_headers` pin it.
 
 **`h2_tls_hit` read 3.002 on Linux and failed a budget of 3,001 because the HTTP/2 close path allocated, and it reads 3,000 now.** `Http2Conn::fill_recv` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")`, and that constructor boxes its message, so every connection torn down inside the counted window added a call to `tests/allocations.rs`'s stop count. How many teardowns land in a window moves with when the shutdown arrives: dhat between two 1,100-request runs of the same binary differed by 3 calls at that site and by 1 at rustls's received-plaintext copy, which is how a row that makes 3,000 calls per 1,000 requests read 3.002 and failed on a host where the same row had read 2.999 to 3.001. Both close paths, `H2Io::Tls` and `H2Io::Plain`, now build the error from its kind, which allocates nothing, and the line a trace log prints for it reads std's "unexpected end of file". The request path is unchanged and still allocates none of m6's own. Verified on macOS against a dev build with `--features count-allocations`: fourteen runs of the row read 3,000 twelve times, 3,001 once and 2,999 once, and the fixed part of each run fell by exactly 3 calls (N = 1,000 read 3,222 before and 3,219 after, 2N = 2,000 read 6,222 before and 6,219 after). The call the 3,001 budget allows is one more TLS record received in a run than that run's baseline, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue. That corrects the 1.15.0 entry's account of the same call as a chunk-queue growth seen only in the 2N run: the growth is one call in the 100-request and the 1,100-request profiles of both runs, so it cancels in the difference, and the call above 3,000 is a record boundary.
 
@@ -525,6 +551,38 @@ Comments only.
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
 ### Changed
+
+**A `--check-only` `m6-auth-server` starts without the private signing key and cannot write the authority database.**
+The check unit answers `/check`, which decodes a token and reads users, so it now reads only `[keys] public_key` and opens the database through `m6_core::sqlite::open_read_only`.
+That opener creates no file, applies no schema and sets `PRAGMA query_only`, so a write through it fails with `SQLITE_READONLY`.
+It opens the file read-write without `SQLITE_OPEN_CREATE` and sets `PRAGMA query_only`, because a strict read-only connection cannot read a WAL database whose `-shm` file is absent, which is the state after the login side's clean shutdown.
+The login side still reads both keys, applies the schema and opens read-write.
+`[keys] private_key` is optional in the config and required only on the login side.
+A check process needs the database the login side created, and a missing file or schema stops it at start with exit 2.
+`docs/m6-auth.md` and `docs/m6-user-guide.md` give the check unit only `auth.pub` and say what each side loads.
+Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `--check-only` with the private key file removed exited 2 with "cannot read private key" and bound no socket, and `--check-only` on an empty data directory created `auth.db` with the five tables. After, the same missing key starts and answers 401 to `POST /check`, and the empty data directory exits 2 naming `[storage] path` and creates nothing. `check_only_starts_without_the_private_key`, `check_only_does_not_create_the_database`, `check_only_refuses_a_database_without_the_schema`, `a_check_only_process_needs_only_the_public_key` and four `m6-auth` unit tests pin it.
+
+**A route with `require` now asks m6-auth-server instead of verifying the token in m6-http.**
+Each protected request sends one `POST /check` with the caller's credential over the `[auth] backend` socket, under a 50 ms deadline, and applies the route's `require` to the identity in the answer.
+The check's deadline is its own `Timeouts` table, so it holds at 50 ms while another request is parked on a slow content backend (measured: 0.053 s beside a 30 s backend request, against 29.78 s when the two shared one table).
+A request with no credential is answered 401 locally and makes no call.
+A 401 from the authority is 401, an identity without the requirement is 403, and a timeout, a connect failure, a 500 or an unparsable answer is 503 with `Retry-After: 1`.
+No decision is cached, so a role change or a revocation counts from the next request.
+The edge decodes no token and holds no key on a protected route, and `X-Auth-Claims` now carries `sub`, `username`, `roles` and `groups` and no token claim.
+The credential is refused before the hand-built `POST /check` is written if it carries CR, LF or NUL or is longer than one header line, so an HTTP/2 or HTTP/3 client cannot inject a field or a request line into that request.
+A check that does not answer at all, through a transport failure or the 50 ms deadline, logs one warn naming the `auth-checker` dependency, and the next check that answers logs one info. A checker that answers 403, 500 or 503 is present and answering, so it logs neither.
+A config with a `require` route now needs `[auth] backend`, and the start fails without it.
+Public routes are unchanged and reach no authority.
+Three gates still decide locally until step 6: `/perf`, `/traffic` and a source node's `POST /genid` call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token the authority would refuse still opens them until it expires.
+
+**`[auth] backend` now names the backend whose members answer `POST /check`, and every member is probed at start.**
+The key keeps its name and stays optional.
+It must name a `[[backend]]` with `sockets`, and a `url` backend is refused by name.
+The probe sends one `POST /check` with no credential: 401 or 503 passes, 404 stops the start and names the setting, the backend and the socket, and a refused connection or timeout warns and the node starts.
+The probe's 2 s is one wall deadline across the write and every read, so a peer that answers one byte every 100 ms times out at 2 s instead of holding the start for 8192 reads.
+When every member answered something other than 401, 503 or 404, the start stops and names the backend.
+Nothing on a request path calls `/check` yet, so `public_key` alone still verifies a token.
+A config that named a content backend, such as `backend = "m6-file"`, now stops at start with exit 2, which is the probe doing its job.
 
 **Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
 `m6_core::alloc::M6Alloc` wraps mimalloc and is the one allocator type: m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor declare it in `main.rs`, and every allocation-counting test and example declares the same type, so counts are taken against the allocator production runs. Under `alloc-count` (the `testkit` and `count-allocations` features) it counts exactly as `testkit::alloc_count::Counting` did, and without them the counting is not compiled. `Counting` is removed. A library crate declares no allocator. m6-auth-cli is a one-shot command and keeps the system allocator.

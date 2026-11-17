@@ -31,7 +31,10 @@ use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
 use m6_core::platform::{Events, Poll, Token};
-use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+use m6_core::testkit::{binary, claim_port, PortClaim, Reply, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
 use m6_http_lib::forward::{HttpRequest, HttpResponse as H2Response};
 use m6_http_lib::h2s_client::H2sTlsClientConn;
 use m6_http_lib::probe;
@@ -509,6 +512,7 @@ struct Server {
     cert_der: Vec<u8>,
     /// JWT signed for a member of `admins`.
     admin_jwt: String,
+    _check: check_support::RunningCheck,
     http: std::cell::RefCell<Service>,
     file: Service,
     _dir: tempfile::TempDir,
@@ -596,6 +600,15 @@ fn start_server(rate_limit_per_min: u32) -> Server {
     let (jwt_priv, jwt_pub) = generate_jwt_keypair();
     std::fs::write(site.join("auth-public.pem"), &jwt_pub).unwrap();
     let admin_jwt = mint_jwt(&jwt_priv, "admin-user", &["admins"]);
+    let check_path = dir.path().join("check.sock");
+    let check = check_support::RunningCheck::start(
+        &check_path,
+        vec![(
+            admin_jwt.clone(),
+            Reply::Identity(check_support::identity(&["admins"], &["admin"])),
+        )],
+    )
+    .unwrap();
 
     // Content.
     std::fs::create_dir_all(site.join("public")).unwrap();
@@ -634,6 +647,10 @@ requests_per_min = {rate_limit_per_min}
 name    = "m6-file"
 sockets = "{sock_glob}"
 
+[[backend]]
+name    = "auth-check"
+sockets = "{check}"
+
 [[route]]
 path    = "/public/{{relpath}}"
 backend = "m6-file"
@@ -644,6 +661,7 @@ backend = "m6-file"
 require = "group:admins"
 "#,
             sock_glob = sock_glob.display(),
+            check = check_path.display(),
         ),
     )
     .unwrap();
@@ -679,7 +697,7 @@ tls_key  = "{key}"
 name = "test-node"
 
 [auth]
-backend    = "m6-file"
+backend    = "auth-check"
 public_key = "{pubkey}"
 "#,
             cert = site.join("cert.pem").display(),
@@ -712,6 +730,7 @@ public_key = "{pubkey}"
         admin_jwt,
         http: std::cell::RefCell::new(http_proc),
         file: file_proc,
+        _check: check,
         _dir: dir,
         _port: claim,
     };

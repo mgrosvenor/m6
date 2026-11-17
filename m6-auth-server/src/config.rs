@@ -25,7 +25,9 @@ struct TokensConfig {
 
 #[derive(Debug, Deserialize)]
 struct KeysConfig {
-    private_key: String,
+    /// Required only by a process that serves the login routes, which sign.
+    /// The check side reads the public key and never this one.
+    private_key: Option<String>,
     public_key: String,
 }
 
@@ -51,8 +53,9 @@ pub struct AuthConfig {
     pub access_ttl: u64,  // seconds
     pub refresh_ttl: u64, // seconds
     pub issuer: String,
-    /// Absolute, as db_path is.
-    pub private_key_path: PathBuf,
+    /// Absolute, as db_path is. `None` when the config names no private key,
+    /// which only the check side may do.
+    pub private_key_path: Option<PathBuf>,
     pub public_key_path: PathBuf,
     /// Failed logins allowed per IP per `rate_limit_window_secs`.
     pub rate_limit_max_attempts: u32,
@@ -92,8 +95,12 @@ impl AuthConfig {
             try_issuer_from_site_toml(site_toml).unwrap_or_else(|| "localhost".to_string())
         });
 
-        let private_key_path =
-            m6_core::config::secret_path("[keys] private_key", &raw.keys.private_key)?;
+        let private_key_path = raw
+            .keys
+            .private_key
+            .as_deref()
+            .map(|path| m6_core::config::secret_path("[keys] private_key", path))
+            .transpose()?;
         let public_key_path =
             m6_core::config::secret_path("[keys] public_key", &raw.keys.public_key)?;
 

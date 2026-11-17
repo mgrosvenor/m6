@@ -17,6 +17,7 @@ use m6_core::log::{debug, error, info, warn};
 use quiche::h3::NameValue;
 use rand::RngCore;
 
+use m6_core::auth as core_auth;
 use m6_core::client::Upstream;
 use m6_http_lib::analytics;
 use m6_http_lib::analytics::H3Headers;
@@ -344,6 +345,22 @@ struct ServerState {
     h2_idle_timeouts: Timeouts,
     /// Socket-backend request deadlines, as deadlines.
     upstream_timeouts: Timeouts,
+    /// The `POST /check` deadline, in its own table.
+    ///
+    /// `Timeouts` keeps one duration per table and finds the earliest expiry
+    /// at its head, so a 50 ms check token in `upstream_timeouts` would sit
+    /// behind a 30 s backend token and fire only when that token expired. The
+    /// two bounds are different, so they are two tables.
+    auth_timeouts: Timeouts,
+    /// Whether the last `POST /check` answered at all.
+    ///
+    /// The `auth-checker` dependency's state. It is set from the outcome the
+    /// request path already has: `false` when the check did not answer (a
+    /// transport failure, or the 50 ms deadline) and `true` on any answer,
+    /// including a 401, a 403 and a 500. A checker that answers is present,
+    /// and naming its internal answer in a public body would leak it. It is
+    /// one bool and one log line per change, with no timer and no probe.
+    auth_check_answered: bool,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -988,6 +1005,7 @@ fn on_request_impl(
                 false,
                 h2c && state.h2c_iface == Iface::Internal,
                 registry,
+                None,
             );
             finish_miss(state, outcome, start, version, iface, quic_port)
         }
@@ -1044,6 +1062,7 @@ fn on_request_h2(
                 false,
                 h2c && state.h2c_iface == Iface::Internal,
                 registry,
+                None,
             );
             finish_miss(state, outcome, start, version, iface, quic_port)
         }
@@ -1095,7 +1114,7 @@ fn on_request_head(
             // h1 and h2 paths do.
             forward::strip_untrusted_inbound(&mut req.headers);
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-            let outcome = handle_request(&req, client_ip, enc, state, false, false, registry);
+            let outcome = handle_request(&req, client_ip, enc, state, false, false, registry, None);
             finish_miss(state, outcome, start, version, iface, quic_port)
         }
     }
@@ -1143,6 +1162,7 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
         state.read_timeouts.grow(n);
         state.h2_idle_timeouts.grow(n);
         state.upstream_timeouts.grow(n);
+        state.auth_timeouts.grow(n);
         state.generations.resize(n, 0);
     }
     let gen = &mut state.generations[taken.key];
@@ -1424,6 +1444,7 @@ fn close_conn_token(
     state.read_timeouts.clear(token);
     state.h2_idle_timeouts.clear(token);
     state.upstream_timeouts.clear(token);
+    state.auth_timeouts.clear(token);
 }
 
 /// Store a parked request's waiter and context in the upstream slot it named.
@@ -1573,6 +1594,13 @@ fn complete_waiter(
     waiter: Waiter,
     cx: &mut CompletionCtx<'_>,
 ) {
+    // A check's answer is not a client response. Parse it into a decision and
+    // re-enter the request path with it, so the answer the client receives is
+    // produced by `handle_request` and its post-processing runs once.
+    if ctx.kind == forward::PendingKind::Auth {
+        complete_auth(result, ctx, waiter, cx);
+        return;
+    }
     // A member's answer to a change sequence's `POST /genid` is not a client
     // response: it is a verdict on that member. 204 is done, 404 and 405 say
     // the backend has nothing to refresh, and anything else is a failure the
@@ -1686,6 +1714,124 @@ fn complete_waiter(
         }
         Completion::Pending { id, ctx } => {
             park(cx.state, id, ctx, waiter);
+        }
+    }
+}
+
+/// Record whether the authority answered, with one log line per change.
+///
+/// `answered` is false only when the check did not answer at all: a transport
+/// failure or the 50 ms deadline. A checker that answers 401, 403, 500 or 503
+/// is present and answering, so those leave the flag set. The flag is the
+/// `auth-checker` dependency's state for `/health`, and it is read and written
+/// here only: one bool, no timer and no probe.
+fn note_check_reachability(state: &mut ServerState, answered: bool) {
+    if state.auth_check_answered == answered {
+        return;
+    }
+    state.auth_check_answered = answered;
+    if answered {
+        info!(
+            dependency = "auth-checker",
+            "the check backend answered again"
+        );
+    } else {
+        warn!(
+            dependency = "auth-checker",
+            "the check backend did not answer"
+        );
+    }
+}
+
+/// Finish a check: apply the route's `require` to the identity, then re-enter
+/// `handle_request` with the decision.
+///
+/// A 200 with a complete identity is `Allow`, a 401 is `NoCredential`, and every
+/// other status, an unparsable 200, a timeout and a connect failure are
+/// `NoDecision`. The re-entry is `handle_request`, not `handle_request_inner`,
+/// because the Vary, Date, describedby and invalidation step runs only there
+/// and must run once, on the answer the client receives.
+fn complete_auth(
+    result: std::io::Result<forward::HttpResponse>,
+    ctx: Box<forward::PendingUrlContext>,
+    waiter: Waiter,
+    cx: &mut CompletionCtx<'_>,
+) {
+    note_check_reachability(cx.state, result.is_ok());
+    let decision = match (ctx.auth_require.as_deref(), &result) {
+        (Some(require), Ok(response)) => {
+            core_auth::parse_check(response.status, &response.body).decide(require)
+        }
+        // No require string can only mean the context was built by something
+        // other than the gate. Fail closed with the same 503 the authority's
+        // silence gets.
+        _ => core_auth::Decision::NoDecision,
+    };
+    let outcome = handle_request(
+        &ctx.req,
+        &ctx.client_ip,
+        &ctx.enc,
+        cx.state,
+        ctx.is_prefetch,
+        ctx.from_internal,
+        cx.registry,
+        Some(decision),
+    );
+    let priority = if matches!(waiter, Waiter::H3 { .. }) {
+        priority::from_headers(
+            ctx.req
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+        )
+    } else {
+        priority::Priority::default()
+    };
+    match outcome {
+        RequestOutcome::Ready(status, mut headers, body, backend, genid) => {
+            // The re-entry writes its answer here, not through `finish_miss`,
+            // so it runs the two steps that tail runs. Without them the
+            // authority's 401, the browser's 302, the 403 and the 503 are the
+            // only answers this release writes without `Alt-Svc`, and none of
+            // them is counted as answered locally.
+            set_alt_svc(&mut headers, cx.quic_port);
+            if let Some(chan) = waiter_channel(&waiter, cx.state) {
+                cx.state.stats.record(
+                    ctx.start.elapsed().as_nanos() as u64,
+                    CacheOutcome::AnsweredLocally,
+                    status,
+                    chan,
+                    &backend,
+                );
+            }
+            write_waiter(
+                waiter,
+                status,
+                headers,
+                body,
+                &ctx.req.method,
+                priority,
+                genid,
+                cx,
+            );
+        }
+        // Allowing the request dispatches it to its own backend. The same
+        // waiter waits for that reply, and this is the one place it is
+        // re-parked, exactly as a custom error page does.
+        RequestOutcome::Pending { id, ctx: next } => park(cx.state, id, next, waiter),
+        // A `require` route never reads the shared cache. If one arrives, write
+        // it rather than dropping the request.
+        RequestOutcome::Cached { entry, .. } => {
+            write_waiter(
+                waiter,
+                entry.status,
+                entry.headers.to_pairs(),
+                entry.body.to_vec(),
+                &ctx.req.method,
+                priority,
+                Some(entry.genid),
+                cx,
+            );
         }
     }
 }
@@ -2354,6 +2500,7 @@ fn retire_upstream(
         cx.state.sources.free(token.0);
     }
     cx.state.upstream_timeouts.clear(token);
+    cx.state.auth_timeouts.clear(token);
     (waiter, ctx)
 }
 
@@ -2382,6 +2529,7 @@ fn drop_idle_url(
     *state.sources.get_mut(token.0) = Source::Vacant;
     state.sources.free(token.0);
     state.upstream_timeouts.clear(token);
+    state.auth_timeouts.clear(token);
     debug!(
         backend = %state.pool_manager.url_backend(backend_idx).name,
         "idle url connection dropped"
@@ -2633,6 +2781,7 @@ fn event_loop(
         let mut poll_timeout = state.read_timeouts.timeout(now0, tick);
         poll_timeout = poll_timeout.min(state.h2_idle_timeouts.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.upstream_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.auth_timeouts.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.h2c_pool.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.h2s_pool.timeout(now0, tick));
         let quic_timeout = connections
@@ -2819,7 +2968,7 @@ fn event_loop(
         }
 
         // Close connections past their read or h2 idle deadline, and socket
-        // upstreams past their backend deadline.
+        // upstreams past their backend or check deadline.
         while let Some(token) = state.read_timeouts.expired(m6_core::platform::now()) {
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
@@ -2827,6 +2976,19 @@ fn event_loop(
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
         while let Some(token) = state.upstream_timeouts.expired(m6_core::platform::now()) {
+            let mut cx = CompletionCtx::new(
+                &mut *state,
+                &mut tcp,
+                &mut h2c,
+                poll.registry(),
+                quic_port,
+                &udp,
+                &mut connections,
+                now,
+            );
+            expire_upstream(token, &mut cx);
+        }
+        while let Some(token) = state.auth_timeouts.expired(m6_core::platform::now()) {
             let mut cx = CompletionCtx::new(
                 &mut *state,
                 &mut tcp,
@@ -2968,6 +3130,7 @@ fn event_loop(
                         true,
                         /* from_internal */ false,
                         poll.registry(),
+                        None,
                     ) {
                         RequestOutcome::Ready(..) => {
                             debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
@@ -3793,6 +3956,7 @@ fn handle_h3_request(
         false, /* from_internal */
         false,
         h3.registry,
+        None,
     ) {
         RequestOutcome::Ready(status, mut resp_headers, body, backend_name, genid) => {
             // Add alt-svc header.
@@ -4105,6 +4269,10 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
 /// inserts into the cache itself, so `should_cache` still inspects the exact
 /// `Vary` the backend sent, and a response varying on anything beyond encoding
 /// stays uncacheable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request path's fixed inputs, plus the decision a check re-entry carries"
+)]
 fn handle_request(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -4113,6 +4281,9 @@ fn handle_request(
     is_prefetch: bool,
     from_internal: bool,
     registry: &m6_core::platform::Registry,
+    // A decision the auth check already produced, for the re-entry after
+    // `POST /check`. `None` on every first pass.
+    pre_decided: Option<core_auth::Decision>,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(
@@ -4123,6 +4294,7 @@ fn handle_request(
         is_prefetch,
         from_internal,
         registry,
+        pre_decided,
     );
     if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
         let compresses = state.config.backend_compresses(backend);
@@ -4348,11 +4520,23 @@ fn begin_url_slot(
 /// Why a socket-upstream launch failed, so the two callers can answer it their
 /// own way: the main socket branch answers 502 or 503, the custom-error-page
 /// branch falls back to the internal page.
+#[derive(Debug)]
 enum SocketLaunchError {
     UnknownBackend,
     BacklogFull,
     Connect(std::io::Error),
     Register(std::io::Error),
+}
+
+/// What one socket dispatch sends on its upstream slot.
+///
+/// A forwarded request is encoded the ordinary way. A check is the hand-built
+/// `POST /check`, because it is not a route on this node and has no
+/// `HttpRequest` of its own.
+#[derive(Clone, Copy)]
+enum UpstreamSend<'a> {
+    Forward(&'a forward::HttpRequest),
+    Check { credential: &'a str },
 }
 
 /// Encode the request into the slot's buffer, take the next pool member, start
@@ -4366,7 +4550,7 @@ enum SocketLaunchError {
 fn launch_socket_upstream(
     state: &mut ServerState,
     registry: &m6_core::platform::Registry,
-    req: &forward::HttpRequest,
+    send: UpstreamSend<'_>,
     client_ip: &str,
     backend_name: &str,
     timeout: std::time::Duration,
@@ -4387,8 +4571,16 @@ fn launch_socket_upstream(
     // keeps its capacity.
     let encoded = {
         let entry = state.upstreams.get_mut(owner.key);
-        let original_host = origin_host(req, &state.config);
-        forward::encode_request(entry.upstream.request_buf(), req, client_ip, original_host)
+        match send {
+            UpstreamSend::Forward(req) => {
+                let original_host = origin_host(req, &state.config);
+                forward::encode_request(entry.upstream.request_buf(), req, client_ip, original_host)
+            }
+            UpstreamSend::Check { credential } => {
+                auth::encode_check_request(entry.upstream.request_buf(), Some(credential));
+                Ok(())
+            }
+        }
     };
     if let Err(e) = encoded {
         state.upstreams.free(owner.key);
@@ -4437,7 +4629,7 @@ fn launch_socket_upstream(
         }
         let started_result = {
             let entry = state.upstreams.get_mut(owner.key);
-            let method_is_head = req.method.eq_ignore_ascii_case("HEAD");
+            let method_is_head = matches!(send, UpstreamSend::Forward(req) if req.method.eq_ignore_ascii_case("HEAD"));
             entry
                 .upstream
                 .start(&entry.addr, None, method_is_head, deadline)
@@ -4484,9 +4676,14 @@ fn launch_socket_upstream(
         }
         interest
     };
-    state
-        .upstream_timeouts
-        .touch(token, m6_core::platform::now());
+    // The check's deadline is 50 ms and a backend's is `backend_timeout_secs`,
+    // so the two go in two tables, each of one duration.
+    let now = m6_core::platform::now();
+    if matches!(send, UpstreamSend::Check { .. }) {
+        state.auth_timeouts.touch(token, now);
+    } else {
+        state.upstream_timeouts.touch(token, now);
+    }
     *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
     let entry = state.upstreams.get_mut(owner.key);
     entry.kind = UpstreamKind::Member;
@@ -4574,6 +4771,10 @@ fn route_refusal(
     (!route.methods.contains(method)).then(|| method_refusal(route.methods))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request path's fixed inputs, plus the decision a check re-entry carries"
+)]
 fn handle_request_inner(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -4586,6 +4787,7 @@ fn handle_request_inner(
     // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
     registry: &m6_core::platform::Registry,
+    pre_decided: Option<core_auth::Decision>,
 ) -> RequestOutcome {
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
@@ -4901,6 +5103,8 @@ fn handle_request_inner(
                     backend_name: upstream.clone(),
                     kind: forward::PendingKind::Url,
                     route_path: None,
+                    auth_require: None,
+                    from_internal,
                     route_cache: None,
                     cacheable: false,
                     is_prefetch: false,
@@ -5086,25 +5290,141 @@ fn handle_request_inner(
         return outcome;
     }
 
-    // Verified JWT claims — populated during auth check, forwarded to backend.
-    let mut verified_claims: Option<auth::Claims> = None;
+    // The identity the authority answered, forwarded to the backend.
+    let mut verified_identity: Option<core_auth::Identity> = None;
 
-    // Auth check — only if route has `require`.
+    // The route gate. It no longer verifies a token: with a `require` it asks
+    // `POST /check` on `[auth] backend` and parks the request until the answer
+    // arrives. The completion re-enters `handle_request` with the decision in
+    // `pre_decided`, so this block runs a second time with the authority's
+    // answer and no second check is sent.
     //
-    // One call, to the one token check. It decides; this block only chooses a
-    // representation. An API caller gets the check's refusal unchanged, the
-    // same status, headers and body `/perf`, `/traffic` and `/genid` answer.
-    // A browser is a route-level choice made on top of that decision: no
-    // credential redirects to login (or to the refresh path, when it still
-    // holds a refresh cookie), and a credential lacking the role gets the
-    // site's own 403 page rather than JSON.
+    // The representation is this block's only choice. An API caller gets the
+    // check's refusal unchanged, the same status, headers and body `/perf`,
+    // `/traffic` and `/genid` answer. A browser is a route-level choice made
+    // on top of that decision: no credential redirects to login (or to the
+    // refresh path, when it still holds a refresh cookie), and a credential
+    // lacking the role gets the site's own 403 page rather than JSON.
     if let Some(ref require) = route.require {
-        match auth::check(state.public_key.as_ref(), &req.headers, require) {
-            auth::Decision::Allow(claims) => verified_claims = Some(claims),
-            refusal @ (auth::Decision::NoCredential | auth::Decision::Deny) => {
+        // The authority's backend, for the 503's error context and the warn
+        // line. A check failure is the authority's, and naming the route's
+        // content backend in the page told a reader the wrong service failed.
+        let auth_backend = state
+            .config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.backend.clone())
+            .unwrap_or_else(|| "[auth]".to_string());
+        let decision = match pre_decided {
+            Some(decision) => decision,
+            None => {
+                debug!("auth check");
+                let auth_header = m6_core::headers::get(&req.headers[..], "authorization");
+                let cookie_header = auth::combined_cookie_header(&req.headers);
+                match auth::extract_token(auth_header, cookie_header.as_deref()) {
+                    // No credential is answered here. An anonymous request
+                    // never reaches the authority, so an auth outage cannot
+                    // touch it.
+                    None => core_auth::Decision::NoCredential,
+                    Some(credential) => {
+                        let Some(backend) = state
+                            .config
+                            .auth
+                            .as_ref()
+                            .and_then(|auth| auth.backend.as_deref())
+                            .map(str::to_string)
+                        else {
+                            return backend_unavailable(
+                                req,
+                                client_ip,
+                                state,
+                                registry,
+                                &route.path,
+                                &auth_backend,
+                                "[auth] backend is not configured",
+                            );
+                        };
+                        let slot = match launch_socket_upstream(
+                            state,
+                            registry,
+                            UpstreamSend::Check { credential },
+                            client_ip,
+                            &backend,
+                            auth::CHECK_DEADLINE,
+                        ) {
+                            Ok(slot) => slot,
+                            // Every launch failure is the authority being
+                            // unreachable, so it answers the same 503 as an
+                            // unreachable backend. Never a 502, never a 401.
+                            Err(e) => {
+                                note_check_reachability(state, false);
+                                warn!(
+                                    backend = %auth_backend,
+                                    route = %route.path,
+                                    error = ?e,
+                                    "auth check dispatch failed"
+                                );
+                                return backend_unavailable(
+                                    req,
+                                    client_ip,
+                                    state,
+                                    registry,
+                                    &route.path,
+                                    &auth_backend,
+                                    "auth check unavailable",
+                                );
+                            }
+                        };
+                        let ctx = forward::PendingUrlContext {
+                            req: req.clone(),
+                            client_ip: client_ip.to_string(),
+                            enc: content_encoding.to_string(),
+                            backend_name: route.backend.clone(),
+                            kind: forward::PendingKind::Auth,
+                            route_path: Some(route.path.clone()),
+                            auth_require: Some(require.clone()),
+                            from_internal,
+                            route_cache: route.cache.clone(),
+                            cacheable: false,
+                            is_prefetch,
+                            start: m6_core::platform::now(),
+                            error_status_override: None,
+                            extra_headers: Vec::new(),
+                            genid: state.genid.dispatched(),
+                            genid_forward: false,
+                        };
+                        return RequestOutcome::Pending {
+                            id: UpstreamId::Slot(slot),
+                            ctx: Box::new(ctx),
+                        };
+                    }
+                }
+            }
+        };
+        match decision {
+            core_auth::Decision::Allow(identity) => verified_identity = Some(identity),
+            // The authority could not decide. That is a 503, never a 401: a
+            // 401 would tell a user with a valid credential to log in again.
+            core_auth::Decision::NoDecision => {
+                warn!(
+                    backend = %auth_backend,
+                    route = %route.path,
+                    "auth check returned no decision"
+                );
+                return backend_unavailable(
+                    req,
+                    client_ip,
+                    state,
+                    registry,
+                    &route.path,
+                    &auth_backend,
+                    "auth check unavailable",
+                );
+            }
+            refusal @ (core_auth::Decision::NoCredential | core_auth::Decision::Deny) => {
                 let accept_header = m6_core::headers::get(&req.headers[..], "accept");
                 if auth::is_browser_request(accept_header) {
-                    if matches!(refusal, auth::Decision::NoCredential) {
+                    if matches!(refusal, core_auth::Decision::NoCredential) {
                         warn!(path = %req.path, "auth: no token");
                         let cookie_header_owned = auth::combined_cookie_header(&req.headers);
                         let cookie_header = cookie_header_owned.as_deref();
@@ -5145,10 +5465,12 @@ fn handle_request_inner(
         }
     }
 
-    // Build request with X-Auth-Claims injected if claims were verified.
+    // Build request with X-Auth-Claims injected when the authority answered an
+    // identity. The header carries the four documented fields and no token
+    // claim.
     let req_with_claims;
-    let req = if let Some(ref claims) = verified_claims {
-        let encoded = auth::encode_claims_header(claims);
+    let req = if let Some(ref identity) = verified_identity {
+        let encoded = core_auth::encode_claims_header(identity);
         let mut headers = req.headers.clone();
         headers.push(("X-Auth-Claims".to_string(), encoded));
         req_with_claims = forward::HttpRequest {
@@ -5185,6 +5507,8 @@ fn handle_request_inner(
             backend_name: backend_name.clone(),
             kind: forward::PendingKind::Url,
             route_path: None,
+            auth_require: None,
+            from_internal,
             route_cache: route.cache.clone(),
             cacheable,
             is_prefetch,
@@ -5230,8 +5554,14 @@ fn handle_request_inner(
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
     let backend_start = m6_core::platform::now();
 
-    let slot = match launch_socket_upstream(state, registry, req, client_ip, &backend_name, timeout)
-    {
+    let slot = match launch_socket_upstream(
+        state,
+        registry,
+        UpstreamSend::Forward(req),
+        client_ip,
+        &backend_name,
+        timeout,
+    ) {
         Ok(slot) => slot,
         Err(SocketLaunchError::UnknownBackend) => {
             warn!(backend = %backend_name, "unknown backend");
@@ -5284,6 +5614,8 @@ fn handle_request_inner(
         backend_name,
         kind: forward::PendingKind::Socket,
         route_path: Some(route.path.clone()),
+        auth_require: None,
+        from_internal,
         route_cache: route.cache.clone(),
         cacheable,
         is_prefetch,
@@ -5474,6 +5806,8 @@ fn dispatch_custom_error_async(
             backend_name: backend_name.clone(),
             kind: forward::PendingKind::Url,
             route_path: None,
+            auth_require: None,
+            from_internal: false,
             route_cache: None,
             cacheable: false,
             is_prefetch: false,
@@ -5495,7 +5829,7 @@ fn dispatch_custom_error_async(
     let slot = launch_socket_upstream(
         state,
         registry,
-        &error_req,
+        UpstreamSend::Forward(&error_req),
         client_ip,
         &backend_name,
         timeout,
@@ -5509,6 +5843,8 @@ fn dispatch_custom_error_async(
         backend_name: backend_name.clone(),
         kind: forward::PendingKind::Socket,
         route_path: None,
+        auth_require: None,
+        from_internal: false,
         route_cache: None,
         cacheable: false,
         is_prefetch: false,
@@ -6517,6 +6853,170 @@ fn urlencoded(s: &str) -> String {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// How long one `[auth] backend` member has to answer the start probe.
+const AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Probe every member of the `[auth] backend` pool, once, before a listener
+/// binds.
+///
+/// A member that answers 401 or 503 serves checks, so the node may start. A
+/// member that answers 404 is something else behind the socket, and every
+/// protected request would be refused by it, so that stops the start. A member
+/// that cannot be reached or times out is a warning: a check process
+/// mid-restart is transient, and a node that carries public traffic must not
+/// fail to start because its checker is being replaced.
+///
+/// `Err` is a message for `main` to print on stderr and exit 2 with.
+fn probe_auth_backend(pool: &m6_http_lib::pool::BackendPool) -> Result<(), String> {
+    let mut any_checker = false;
+    let mut answered_other: Vec<(String, u16)> = Vec::new();
+    for member in pool.members() {
+        match probe_check_member(member) {
+            Ok(401 | 503) => {
+                info!(backend = %pool.name, socket = %member.display(), "auth backend member answers checks");
+                any_checker = true;
+            }
+            Ok(404) => {
+                return Err(format!(
+                    "m6-http: [auth] backend \"{}\": {} answered 404 to POST /check; that socket is not an m6-auth-server, and [auth] backend must name the backend that answers /check",
+                    pool.name,
+                    member.display()
+                ));
+            }
+            Ok(status) => {
+                eprintln!(
+                    "m6-http: [auth] backend \"{}\": {} answered {status} to POST /check, which is not 401 or 503; ignoring this member",
+                    pool.name,
+                    member.display()
+                );
+                answered_other.push((member.display().to_string(), status));
+            }
+            Err(e) => {
+                eprintln!(
+                    "m6-http: [auth] backend \"{}\": {} is not reachable at start ({e}); starting anyway, a check process mid-restart is transient",
+                    pool.name,
+                    member.display()
+                );
+            }
+        }
+    }
+    if any_checker {
+        return Ok(());
+    }
+    if answered_other.is_empty() {
+        // Every member refused the connection or timed out. Each is already
+        // warned about, and the node starts before its checker.
+        return Ok(());
+    }
+    let statuses: Vec<String> = answered_other
+        .iter()
+        .map(|(socket, status)| format!("{socket} answered {status}"))
+        .collect();
+    Err(format!(
+        "m6-http: [auth] backend \"{}\": no member answered 401 or 503 to POST /check ({}); [auth] backend must name the m6-auth-server that answers /check",
+        pool.name,
+        statuses.join(", ")
+    ))
+}
+
+/// One probe request to one socket, returning its status.
+///
+/// Start only, so a blocking connect and a socket deadline are the point. The
+/// request path never calls this: it uses the reactor.
+///
+/// The deadline is one wall clock for the write and every read, set from what
+/// is left of it before each operation. A peer that sends one byte every
+/// 100 ms cannot extend it. Before, `AUTH_PROBE_TIMEOUT` was a per-read socket
+/// timeout, so that peer held the start for 8192 bytes at 100 ms each.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "start-only probe: a blocking connect and a socket deadline are deliberate here"
+)]
+fn probe_check_member(member: &std::path::Path) -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+
+    let deadline = m6_core::platform::now() + AUTH_PROBE_TIMEOUT;
+    let mut stream = m6_core::platform::net::connect_unix(member)?;
+    // `connect_unix` is the reactor's non-blocking connect. This probe reads
+    // one answer and exits, so it needs the blocking mode for the socket
+    // timeouts to mean anything.
+    stream.set_nonblocking(false)?;
+    let mut request = Vec::with_capacity(128);
+    auth::encode_check_request(&mut request, None);
+    // The read timeout is set before the write. macOS refuses `SO_RCVTIMEO`
+    // on a Unix socket whose peer has already closed, with EINVAL, and a fast
+    // checker can answer and close between the write and the first read.
+    let first = probe_remaining(deadline)?;
+    stream.set_read_timeout(Some(first))?;
+    stream.set_write_timeout(Some(first))?;
+    stream.write_all(&request)?;
+
+    let mut head = Vec::with_capacity(256);
+    let mut buf = [0u8; 256];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > 8192 {
+            break;
+        }
+        let left = probe_remaining(deadline)?;
+        match stream.set_read_timeout(Some(left)) {
+            Ok(()) => {}
+            // The peer closed before this read. Stop and parse what arrived.
+            // A complete head is still an answer, and an incomplete one is the
+            // same "no HTTP status" warning a peer that closed early gets.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => break,
+            Err(e) => return Err(e),
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            // `SO_RCVTIMEO` reports the timeout as `WouldBlock` on one target
+            // and as `TimedOut` on the other. Both are this probe's deadline.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(probe_deadline_error());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    let mut parts = line
+        .split(|byte| *byte == b' ')
+        .filter(|part| !part.is_empty());
+    let _version = parts.next();
+    let status = parts
+        .next()
+        .and_then(|status| std::str::from_utf8(status).ok()?.parse().ok());
+    status.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "no HTTP status in {:?}",
+            String::from_utf8_lossy(&head)
+        ))
+    })
+}
+
+/// What is left of the probe's one deadline, as an error once it has passed.
+///
+/// `AUTH_PROBE_TIMEOUT` is a wall clock for the whole probe. A socket timeout
+/// is per operation, so every operation gets the time that is left rather than
+/// the whole bound.
+fn probe_remaining(deadline: std::time::Instant) -> std::io::Result<std::time::Duration> {
+    let left = deadline.saturating_duration_since(m6_core::platform::now());
+    if left.is_zero() {
+        return Err(probe_deadline_error());
+    }
+    Ok(left)
+}
+
+/// The probe's one deadline, as the error `probe_auth_backend` warns about.
+fn probe_deadline_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the auth probe deadline passed",
+    )
+}
+
 fn main() {
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
@@ -6739,6 +7239,25 @@ fn run(args: Vec<String>) -> i32 {
     if let Err(e) = pool_manager.resolve() {
         eprintln!("config error: {e}");
         return 2;
+    }
+
+    // Probe the auth backend before any listener binds. A socket that is not a
+    // checker would make every protected request a 503, so a 404 stops the
+    // start. A member that is down only warns, so a node can start while its
+    // check process is being replaced.
+    if let Some(ref auth_cfg) = config.auth {
+        if let Some(ref backend) = auth_cfg.backend {
+            let Some(pool) = pool_manager.get_pool(backend) else {
+                eprintln!(
+                    "m6-http: [auth] backend \"{backend}\" names no socket backend; [auth] backend must name a [[backend]] with `sockets`"
+                );
+                return 2;
+            };
+            if let Err(message) = probe_auth_backend(pool) {
+                eprintln!("{message}");
+                return 2;
+            }
+        }
     }
 
     // A cache node's heartbeat: the backend it asks, and the request bytes it
@@ -7044,6 +7563,8 @@ fn run(args: Vec<String>) -> i32 {
             initial_connections,
             std::time::Duration::from_secs(backend_timeout_secs),
         ),
+        auth_timeouts: Timeouts::new(initial_connections, auth::CHECK_DEADLINE),
+        auth_check_answered: true,
         h2c_pool: H2cClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         h2s_pool: H2sTlsClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         tls_iface,

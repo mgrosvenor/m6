@@ -499,6 +499,24 @@ impl Site {
         self.handle_raw(raw_from_head(head))
     }
 
+    /// The house 404 for a borrowed head: no route, so no route's
+    /// `Cache-Control` and no route headers, and the same body, date and
+    /// housekeeping an unmatched path gets.
+    ///
+    /// A service whose listeners answer different paths uses it for a path
+    /// that belongs to the other listener. Finishing that answer through
+    /// [`Site::finish`] finds the route again from the path and attaches the
+    /// route's headers, so the refusal says the path exists somewhere.
+    pub fn not_found(&self, head: &RequestHead<'_>) -> Response {
+        let started = crate::platform::now();
+        self.finish_raw(head, None, None, started, Response::not_found())
+    }
+
+    /// The same house 404 for a caller that already owns a [`Request`].
+    pub fn not_found_owned(&self, req: &Request) -> Response {
+        self.finish_raw(req.raw(), None, None, req.started(), Response::not_found())
+    }
+
     /// Answer a config template route from the borrowed head: build the
     /// dictionary, render, finish. The same steps `handle_raw` runs for the
     /// same route, without the owned request it would build and drop.

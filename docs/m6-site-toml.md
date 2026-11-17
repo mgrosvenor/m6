@@ -76,6 +76,10 @@ name    = "m6-auth"
 sockets = "/run/m6/m6-auth-*.sock"
 
 [[backend]]
+name    = "m6-auth-check"
+sockets = "/run/m6/check-m6-auth-*.sock"
+
+[[backend]]
 name    = "render-contact"
 sockets = "/run/m6/render-contact-*.sock"
 
@@ -163,7 +167,7 @@ tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 
 [auth]
-backend    = "m6-auth"           # the backend declared above
+backend    = "m6-auth-check"     # the backend declared above
 public_key = "/etc/m6/auth.pub"  # m6-auth's public key, used to verify tokens locally
 ```
 
@@ -467,11 +471,13 @@ Take from it that a site that only verifies tokens needs `public_key` alone.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `backend` | string | no | The name of a declared `[[backend]]`, checked when given. Verification does not use it |
+| `backend` | string | no | The name of a declared `[[backend]]` with `sockets`. It is the backend whose members answer `POST /check`, and each member is probed once at start. A `url` backend is refused by name |
 | `public_key` | string | yes | Absolute path to m6-auth's public key for local JWT verification |
 
 **Table 7: the `[auth]` keys.**
-The name in `backend` is checked against the declared backends, and the key in `public_key` verifies every token.
+The name in `backend` must be a socket backend, and its members are probed at start: 401 or 503 passes, 404 stops the start, and a refused connection warns.
+The key in `public_key` verifies every token.
+No request path calls `/check` yet.
 
 `[auth]` sits in the system config only.
 
@@ -816,7 +822,7 @@ Exit 2 on:
 - A `methods` list naming a method other than `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or an empty list
 - `[errors] mode = "custom"` without `path`
 - `[auth]` declared but `public_key` file not found
-- `[auth]` declared with a `backend` that is not declared in `[[backend]]`
+- `[auth]` declared with a `backend` that is not declared in `[[backend]]`, or that names a `url` backend
 - `require` on a route but no `[auth]` declared
 - `tls_cert`, `tls_key` or `[auth] public_key` given as a relative path
 - `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)

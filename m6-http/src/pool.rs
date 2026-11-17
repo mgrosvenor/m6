@@ -62,6 +62,12 @@ impl BackendPool {
     pub fn total_count(&self) -> usize {
         self.members.len()
     }
+
+    /// Every member socket, in glob order. The start probe visits each one and
+    /// bypasses the round-robin on purpose.
+    pub fn members(&self) -> &[PathBuf] {
+        &self.members
+    }
 }
 
 /// A URL-based backend (remote HTTP/HTTPS upstream).

@@ -568,7 +568,10 @@ pub fn metrics_gate(
     };
     match auth::check(key, headers, require) {
         Decision::Allow(_) => Gate::Open,
-        refusal => Gate::refusal(refusal),
+        // Spelled out, not a catch-all. When this return type becomes the core
+        // four-variant `Decision`, `NoDecision` must be a compile error here,
+        // and its answer is a 503 rather than `Gate::refusal`'s panic.
+        refusal @ (Decision::NoCredential | Decision::Deny) => Gate::refusal(refusal),
     }
 }
 
@@ -603,7 +606,9 @@ pub fn genid_gate(
     };
     match auth::check(key, headers, require) {
         Decision::Allow(_) => Gate::Open,
-        refusal => Gate::refusal(refusal),
+        // Spelled out for the same reason as `metrics_gate`: a fourth variant
+        // must be a compile error here and must never reach the `expect`.
+        refusal @ (Decision::NoCredential | Decision::Deny) => Gate::refusal(refusal),
     }
 }
 

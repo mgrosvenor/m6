@@ -363,3 +363,127 @@ public_key  = "{}"
         "the socket appeared despite a relative [keys] private_key"
     );
 }
+
+/// The check side signs nothing, so it starts without the private key file.
+///
+/// The wrong outcome this catches: a check process refuses to start because a
+/// key it never uses is absent, so a deployment that delivers only the public
+/// key to the check unit cannot run it.
+#[test]
+fn check_only_starts_without_the_private_key() {
+    let site = TestSite::new("check-only-no-private-key");
+    let (_, public_pem) = generate_test_rsa_keys();
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&public, &public_pem).unwrap();
+    // Named in the config and never written. The login side refuses this
+    // config, which the test above pins.
+    let missing = site.key_dir.path().join("missing-auth.pem");
+    let data = site.site_dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db_path = data.join("auth.db");
+    // The login side owns the schema. Create it as that side does.
+    drop(m6_auth::Db::open(&db_path).expect("create the database"));
+    site.write_config(&missing, &public, &db_path.display().to_string());
+
+    let check = site.site_dir.join("check.sock");
+    let mut cmd = site.command();
+    cmd.arg("--check-only")
+        .env("M6_CHECK_SOCKET_OVERRIDE", &check);
+    let mut svc = Service::spawn("m6-auth-server", &mut cmd);
+    svc.wait_for_path(&check, Duration::from_secs(10));
+    svc.wait_for_started(Duration::from_secs(10));
+    assert!(
+        !missing.exists(),
+        "the test wrote the private key it says is missing"
+    );
+    assert!(
+        wait::for_unix(&check, Duration::from_secs(10)),
+        "the check-only process never accepted a connection on {}\n--- output ---\n{}",
+        check.display(),
+        svc.output()
+    );
+    let status = svc.terminate(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "the check-only process should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
+        svc.output()
+    );
+}
+
+/// The check side never creates the database file. A file the login side has
+/// not created stops the check process at start, and the start creates nothing.
+#[test]
+fn check_only_does_not_create_the_database() {
+    let site = TestSite::new("check-only-no-database");
+    let (_, public_pem) = generate_test_rsa_keys();
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&public, &public_pem).unwrap();
+    let missing = site.key_dir.path().join("missing-auth.pem");
+    let data = site.site_dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db_path = data.join("auth.db");
+    site.write_config(&missing, &public, &db_path.display().to_string());
+    let check = site.site_dir.join("check.sock");
+
+    let mut cmd = site.command();
+    cmd.arg("--check-only")
+        .env("M6_CHECK_SOCKET_OVERRIDE", &check);
+    let mut svc = Service::spawn("m6-auth-server", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "the check-only process did not exit for a missing database\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    let output = svc.output();
+    assert_eq!(status.code(), Some(2), "output:\n{output}");
+    assert!(
+        output.contains("[storage] path") && output.contains(&db_path.display().to_string()),
+        "the error did not name the setting and the database it could not open\n--- output ---\n{output}"
+    );
+    assert!(
+        !db_path.exists(),
+        "the check-only process created {}\n--- output ---\n{output}",
+        db_path.display()
+    );
+    assert!(!check.exists(), "the check socket appeared anyway");
+}
+
+/// A database file with no auth schema stops the check process at start with a
+/// message that names the side that owns the schema.
+#[test]
+fn check_only_refuses_a_database_without_the_schema() {
+    let site = TestSite::new("check-only-no-schema");
+    let (_, public_pem) = generate_test_rsa_keys();
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&public, &public_pem).unwrap();
+    let missing = site.key_dir.path().join("missing-auth.pem");
+    let data = site.site_dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db_path = data.join("auth.db");
+    std::fs::write(&db_path, b"").unwrap();
+    site.write_config(&missing, &public, &db_path.display().to_string());
+    let check = site.site_dir.join("check.sock");
+
+    let mut cmd = site.command();
+    cmd.arg("--check-only")
+        .env("M6_CHECK_SOCKET_OVERRIDE", &check);
+    let mut svc = Service::spawn("m6-auth-server", &mut cmd);
+    let status = svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| {
+            panic!(
+                "the check-only process did not exit for a database without a schema\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    let output = svc.output();
+    assert_eq!(status.code(), Some(2), "output:\n{output}");
+    assert!(
+        output.contains("[storage] path") && output.contains("no auth schema"),
+        "the error did not name the setting and the missing schema\n--- output ---\n{output}"
+    );
+    assert!(!check.exists(), "the check socket appeared anyway");
+}

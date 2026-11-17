@@ -123,7 +123,7 @@ tunnel = {{ address = "127.0.0.1:1", public_key = "{KEY_A}" }}
 fn a_tunnel_probe_does_not_hold_the_loop() {
     use std::time::{Duration, Instant};
 
-    use m6_core::testkit::Service;
+    use m6_core::testkit::{wait, Service};
 
     let config = r#"
 poll_interval_s = 60
@@ -153,6 +153,15 @@ level = "warn"
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
     svc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
+    // The socket file appears at bind, before listen. A connect in that
+    // window fails with ConnectionRefused. Wait on a connect that succeeds,
+    // under one bound, so the first request below is not the readiness probe.
+    assert!(
+        wait::for_unix(&sock, m6_core::testkit::STARTUP_BOUND),
+        "m6-monitor created {} but never accepted a connection\n--- output ---\n{}",
+        sock.display(),
+        svc.output()
+    );
 
     let started = Instant::now();
     let (status, body) = support::get(&sock, "/digest");

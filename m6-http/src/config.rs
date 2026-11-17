@@ -706,8 +706,10 @@ impl SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Optional. When given it must name a `[[backend]]`. Nothing reads it
-    /// beyond that check: verification needs only `public_key`.
+    /// Optional. When given it must name a `[[backend]]` with `sockets`.
+    /// It is the backend the edge will send `POST /check` to, and its members
+    /// are probed once at start. It has no effect on request verification
+    /// until the check path lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     pub public_key: String,
@@ -1399,27 +1401,55 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             );
         }
         if let Some(ref b) = a.backend {
-            if !backend_names.contains(b.as_str()) {
+            let Some(backend) = backends.iter().find(|backend| backend.name == *b) else {
                 anyhow::bail!("config error: [auth].backend `{}` not in [[backend]]", b);
+            };
+            // The check path is the socket-backend dispatch, so a URL backend
+            // cannot serve it: that would be a different transport and a
+            // different round trip. Refuse it by name at load, where
+            // --dump-config sees it too.
+            if backend.sockets.is_none() {
+                anyhow::bail!(
+                    "config error: [auth].backend `{}` is a URL backend: the check path is a Unix socket on this host, so [auth].backend must name a backend with `sockets`",
+                    b
+                );
             }
         }
     }
 
-    // Validate require on routes needs [auth]
+    // Validate require on routes needs [auth], and [auth] needs the check
+    // backend that answers POST /check.
+    let auth_backend = auth.as_ref().and_then(|auth| auth.backend.as_deref());
     for route in &routes {
-        if route.require.is_some() && auth.is_none() {
-            anyhow::bail!(
-                "config error: route {} has `require` but no [auth] declared",
-                route.path
-            );
+        if route.require.is_some() {
+            if auth.is_none() {
+                anyhow::bail!(
+                    "config error: route {} has `require` but no [auth] declared",
+                    route.path
+                );
+            }
+            if auth_backend.is_none() {
+                anyhow::bail!(
+                    "config error: route {} has `require` but [auth] has no `backend`; the edge asks POST /check, so [auth] backend must name a [[backend]] with `sockets`",
+                    route.path
+                );
+            }
         }
     }
     for rg in &route_groups {
-        if rg.require.is_some() && auth.is_none() {
-            anyhow::bail!(
-                "config error: route_group {} has `require` but no [auth] declared",
-                rg.path
-            );
+        if rg.require.is_some() {
+            if auth.is_none() {
+                anyhow::bail!(
+                    "config error: route_group {} has `require` but no [auth] declared",
+                    rg.path
+                );
+            }
+            if auth_backend.is_none() {
+                anyhow::bail!(
+                    "config error: route_group {} has `require` but [auth] has no `backend`; the edge asks POST /check, so [auth] backend must name a [[backend]] with `sockets`",
+                    rg.path
+                );
+            }
         }
     }
 

@@ -67,16 +67,22 @@ m6-http starts in this order, before it serves a request.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
 4. If `[auth]` is declared, load the public key for local JWT verification.
-   `backend` is optional.
+   `backend` is optional and names the socket backend that answers `/check`.
 5. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
 6. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
 7. Resolve every URL backend host once.
    A name that does not resolve is exit 2.
-8. Bind the TLS and QUIC sockets on `[server].bind`.
+8. Probe every member of the `[auth] backend` pool, when that key is set.
+   The probe sends one `POST /check` with no credential.
+   A 401 or 503 passes, because a checker that refuses or is busy is there.
+   A 404 is exit 2, naming the setting, the backend and the socket, because that address is not an auth server.
+   A connect failure or a timeout warns and the start continues, so a node can start while its checker is replaced.
+   When every member answered something other than 401, 503 or 404, the start is exit 2 and names the backend.
+9. Bind the TLS and QUIC sockets on `[server].bind`.
    If `h2c_bind` is set, bind the H2C (plain-TCP HTTP/2) listener on that address.
    The listener is internal when `internal_binds` names it, and then accepts only the peers in `internal_peers`.
-9. Start the event loop.
+10. Start the event loop.
 
 With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_core::platform::net::listen_shared`, before the TLS configuration is built.
 With `reuse_port_processes` set, Linux also attaches a socket filter to both that picks the process from the client's source address, so one client always reaches one process.
@@ -126,7 +132,7 @@ m6-http decides a request's path through a fixed order, and each step can answer
 3. **www redirect:** with `[site] redirect_www` set (the default), a `www.` host is answered 301 on the apex host.
 4. **Cache lookup:** a route with no `require` and a method that may read the cache is served from memory on a fresh hit, with no backend contact.
 5. **Route lookup:** a path that matches no route is answered 404 per `[errors] mode`.
-6. **Auth check:** when the route declares `require`, the JWT is verified locally, with 401 when it is absent and 403 when the claims are insufficient.
+6. **Auth check:** when the route declares `require`, the credential is sent to `POST /check` on `[auth] backend` under a 50 ms deadline. No credential is 401 locally with no call, a 401 from the authority is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 7. **Forward:** the request is forwarded to the backend pool.
 
 Route matching: a fixed route (every segment a literal) beats a pattern route (any `{param}` or `{*rest}`).
@@ -474,20 +480,36 @@ m6-http has no static fallback file.
 
 ## 10. Auth Enforcement
 
-If a route declares `require`, m6-http enforces it before forwarding:
+If a route declares `require`, m6-http asks the authority before forwarding:
 
-1. Extract the JWT from the `Authorization: Bearer <token>` header, or if absent from the `session` cookie.
+1. Extract the credential from the `Authorization: Bearer <token>` header, or if absent from the `session` cookie.
    The header takes precedence: API clients use it, and browsers use the cookie.
-2. Verify the signature locally using m6-auth's public key, with no network call.
-3. Check token expiry.
-4. Check claims against the `require` declaration (`group:<n>` or `role:<n>`).
-5. Reject with 401 (no token or invalid token) or 403 (insufficient claims).
+2. Send one `POST /check` over the `[auth] backend` socket, carrying that credential, under a 50 ms deadline.
+   The token is opaque to the edge. It is not decoded and its signature is not checked here.
+3. A 200 answers `sub`, `username`, `roles` and `groups`. Check the route's `require` (`group:<n>` or `role:<n>`) against those lists.
+4. A 401 is the authority refusing the credential, and the client gets 401.
+   A 200 whose identity lacks the requirement is 403.
+5. A timeout, a connect failure, a 500 or a body that does not parse is 503 with `Retry-After: 1`.
+   It is never a 401: the authority did not refuse the credential, so the client is not told to log in again.
 
-One function, `auth::check`, does steps 1 to 4 for route `require`, `/perf`, `/traffic` and `/genid`, once per request, so all four accept the same tokens and refuse the same ways.
-It decides `Allow(claims)`, `NoCredential` (401) or `Deny` (403). `m6_core::http::token_refusal` is the one definition of the refusal, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
-A missing `[auth] public_key` fails closed as 401. Config validation refuses `require` without `[auth]`, so a running node does not reach that state.
+A request with no credential is answered 401 locally, and no check is sent.
+No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
-Valid requests are forwarded with the verified token intact.
+Three gates still verify locally in this release: `/perf`, `/traffic` and a source node's `POST /genid` call `m6_http_lib::auth::check` with `[auth] public_key`.
+That verifier checks the signature and `exp`, does not compare `iss`, and reads roles and groups from the token.
+A token with a foreign `iss`, or a role removed in the database, still opens those three gates until the token expires.
+AUTH-1 step 6 converts them to `POST /check`.
+
+`m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
+`m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
+A missing `[auth] public_key` is still a start error. Config validation refuses `require` without `[auth]`, and without `[auth] backend`, so a running node cannot reach a protected route with no authority.
+
+`[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
+Its `sockets` glob must match at least one socket, and a `url` backend is refused by name.
+The members are probed once at start (section 2 step 8).
+
+Valid requests are forwarded with the identity the authority answered, base64 JSON in `X-Auth-Claims`.
+That header carries `sub`, `username`, `roles` and `groups` and no token claim.
 Renderers may perform additional fine-grained checks using the auth claims available in the request dictionary.
 
 **401 handling:** A browser (`Accept: text/html`) sent to a protected route with no credential, an invalid one or an expired one is redirected: to `/auth/refresh` when a `refresh` cookie is present, otherwise to `/login?next=<original-path>`. A browser whose credential verifies but lacks the role gets the site's own 403 error page, keeping the check's status. API clients (non-`text/html` Accept) receive the JSON refusal directly.

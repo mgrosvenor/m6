@@ -278,6 +278,40 @@ pub fn open_reader(path: &Path) -> Result<Connection, SqliteError> {
     Ok(conn)
 }
 
+/// Open an existing file for reading without changing it, beside a writer in
+/// WAL mode.
+///
+/// A service that shares a WAL database with a writer process needs a reader
+/// that starts on its own. [`open_reader`] opens read-only, and a read-only
+/// connection cannot read a WAL database while its `-shm` file is absent, which
+/// is the state after the writer's clean shutdown. This opens with
+/// [`SQLITE_OPEN_READ_WRITE`](rusqlite::OpenFlags) and without
+/// [`SQLITE_OPEN_CREATE`](rusqlite::OpenFlags), so a missing file is still an
+/// error and SQLite can build the WAL index. It then sets `PRAGMA query_only`
+/// and reads it back, so every write through this connection fails with
+/// `SQLITE_READONLY`.
+///
+/// It sets only the [`BUSY_TIMEOUT`], read back, as [`open_reader`] does. It
+/// leaves the journal mode and the schema alone.
+pub fn open_read_only(path: &Path) -> Result<Connection, SqliteError> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|source| SqliteError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let ms: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+    if u128::try_from(ms).ok() != Some(BUSY_TIMEOUT.as_millis()) {
+        return Err(SqliteError::BusyTimeout);
+    }
+    conn.pragma_update(None, "query_only", true)?;
+    let query_only: bool = conn.pragma_query_value(None, "query_only", |r| r.get(0))?;
+    if !query_only {
+        return Err(SqliteError::QueryOnly);
+    }
+    Ok(conn)
+}
+
 /// One step of a schema. `version` counts 1, 2, 3 down the list.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
@@ -508,6 +542,8 @@ pub enum SqliteError {
     BusyTimeout,
     #[error("recursive_triggers did not take effect")]
     RecursiveTriggers,
+    #[error("query_only did not take effect")]
+    QueryOnly,
     #[error("migration list entry {index} has version {version}, expected {}", index + 1)]
     MigrationList { index: usize, version: u32 },
     #[error("database is at schema version {db}, this code knows up to {code}")]

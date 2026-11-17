@@ -441,7 +441,7 @@ What covers the window instead is a mode: a status code with an empty body, the 
 
 ## 5. Why authentication sits where it does
 
-Authentication is enforced at the edge, verified without a network call, and costs a public route almost nothing.
+Authentication is enforced at the edge, which asks the auth service for the identity on each protected request, and costs a public route almost nothing.
 Each of those was a decision and none is obvious.
 
 ### 5.1 Why a public route costs almost nothing
@@ -467,15 +467,14 @@ That is the price of one route table instead of two, and at one branch against a
 A site with no route requiring authentication therefore needs no auth section in `site.toml`, no public key on disk, and no auth process running.
 Authentication is an absent feature for that site, and absence has no configuration to get wrong.
 
-### 5.2 Why verification is local
+### 5.2 Why the check is one network call
 
-**A network call per authenticated request would add latency to every protected route, and signature verification needs no network.**
-The edge holds the auth service's public key and checks the signature, expiry and issuer itself, which is local arithmetic with no I/O.
-The auth service is contacted only for operations that change state: login, refresh and logout.
+**One checker is the owner's rule: m6-http decodes no token and holds no key, and every credential check asks m6-auth-server.**
+A protected request makes one `POST /check` on a Unix socket under a 50 ms deadline, and the answer is used once.
+The measured parts of one check add to about 111 µs, far below the deadline, and a request with no credential makes no call at all.
 
-Key rotation therefore needs no coordination.
-The signing service starts using a new key immediately after a restart, the edge reads the public key when it restarts, and tokens signed with the old key expire within their lifetime.
-Nothing has to be sequenced, because nothing holds a cached decision.
+Nothing caches the answer, so a revocation or a role change counts from the next request.
+Key rotation needs no coordination at the edge: the service is the only holder of the key, and the next check uses the key it has.
 
 ### 5.3 Why enforcement happens twice
 
@@ -484,7 +483,7 @@ An unauthenticated request to a protected route never reaches a backend, and the
 
 **Resource-level checks stay in the backend because a route cannot express them.**
 Whether this user may read this document depends on the document, not on the path that addressed it.
-Verified claims are forwarded so the backend can answer that without re-verifying the token, which is why that header is the one that matters most in §4.4.
+The identity the check answered is forwarded so the backend can answer that without its own check, which is why that header is the one that matters most in §4.4.
 
 ---
 

@@ -3,6 +3,13 @@ use base64::Engine;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
+/// How long a `require` route waits for `POST /check` before answering 503.
+///
+/// The measured parts of one check add to about 111 µs, so this fires only on
+/// an authority that has stopped answering. A page carrying one protected
+/// request stalls at most this long on a refused credential.
+pub const CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Reconstruct the logical `Cookie` header from a request's header list.
 ///
 /// HTTP/2 (and HTTP/3) clients are RFC-compliant to send multiple separate
@@ -122,6 +129,26 @@ pub fn check_require(claims: &Claims, require: &str) -> bool {
     list.as_ref().is_some_and(|l| l.iter().any(|v| v == name))
 }
 
+/// The most a credential can be and still fit one request header line:
+/// [`m6_core::headers::MAX_HEADER_LINE`] counts the field's name and value,
+/// and the field and scheme this edge writes are `Authorization: Bearer `.
+pub const MAX_CREDENTIAL: usize =
+    m6_core::headers::MAX_HEADER_LINE - "Authorization: Bearer ".len();
+
+/// Whether a credential is safe to write into an HTTP/1.1 field value.
+///
+/// The forward path refuses a field value with CR, LF or NUL through
+/// `forward::h1_field_value_is_safe`, but the check request is written by hand
+/// before that serializer runs. A credential that would inject a header or a
+/// request line is refused here, at the one place a client string enters the
+/// hand-built request.
+fn credential_is_safe(credential: &str) -> bool {
+    credential.len() <= MAX_CREDENTIAL
+        && !credential
+            .bytes()
+            .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+}
+
 /// Extract JWT token from Authorization header or session cookie.
 /// Returns None if not found.
 pub fn extract_token<'a>(
@@ -132,7 +159,7 @@ pub fn extract_token<'a>(
     if let Some(auth) = auth_header {
         if let Some(token) = auth.strip_prefix("Bearer ") {
             let token = token.trim();
-            if !token.is_empty() {
+            if !token.is_empty() && credential_is_safe(token) {
                 return Some(token);
             }
         }
@@ -143,7 +170,7 @@ pub fn extract_token<'a>(
             let cookie = cookie.trim();
             if let Some(val) = cookie.strip_prefix("session=") {
                 let val = val.trim();
-                if !val.is_empty() {
+                if !val.is_empty() && credential_is_safe(val) {
                     return Some(val);
                 }
             }
@@ -208,6 +235,26 @@ pub fn check(key: Option<&PublicKey>, headers: &[(String, String)], require: &st
 pub fn encode_claims_header(claims: &Claims) -> String {
     let json = serde_json::to_string(claims).unwrap_or_default();
     base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+}
+
+/// The bytes of one `POST /check`, written into `buf`.
+///
+/// Hand-built: a check is one small request on the socket-backend dispatch, so
+/// it costs no `HttpRequest` and no allocation once `buf` has capacity. No
+/// credential sends no `Authorization`, which is the start probe's request.
+pub fn encode_check_request(buf: &mut Vec<u8>, credential: Option<&str>) {
+    buf.clear();
+    buf.extend_from_slice(b"POST /check HTTP/1.1\r\nHost: localhost\r\n");
+    // The one second line of defence: `extract_token` already refuses an
+    // unsafe credential, and this is the place every caller passes through.
+    // An unsafe one writes no `Authorization`, so the checker answers 401 and
+    // the request is refused rather than a header or a request line injected.
+    if let Some(credential) = credential.filter(|credential| credential_is_safe(credential)) {
+        buf.extend_from_slice(b"Authorization: Bearer ");
+        buf.extend_from_slice(credential.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
 /// Check if Accept header indicates a browser (text/html).
@@ -301,6 +348,61 @@ mod tests {
         assert_eq!(extract_token(None, None), None);
         assert_eq!(extract_token(None, Some("other=val")), None);
         assert_eq!(extract_token(Some("Basic abc"), None), None);
+    }
+
+    /// A credential with a line break is not a credential. An h2 or h3 field
+    /// value is length-delimited and can carry one, and the check request is
+    /// hand-built before the forward path's field validator runs.
+    #[test]
+    fn a_credential_with_a_line_break_is_not_extracted() {
+        assert_eq!(
+            extract_token(Some("Bearer a\r\nX-Injected: yes"), None),
+            None
+        );
+        assert_eq!(extract_token(Some("Bearer a\nX-Injected: yes"), None), None);
+        assert_eq!(
+            extract_token(None, Some("session=a\r\nX-Injected: yes")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_credential_with_a_nul_is_not_extracted() {
+        assert_eq!(extract_token(Some("Bearer a\0b"), None), None);
+        assert_eq!(extract_token(None, Some("session=a\0b")), None);
+    }
+
+    #[test]
+    fn an_overlong_credential_is_not_extracted() {
+        let long = "a".repeat(MAX_CREDENTIAL + 1);
+        let header = format!("Bearer {long}");
+        assert_eq!(extract_token(Some(&header), None), None);
+        let cookie = format!("session={long}");
+        assert_eq!(extract_token(None, Some(&cookie)), None);
+        // One byte under the cap still extracts.
+        let ok = "a".repeat(MAX_CREDENTIAL);
+        let header = format!("Bearer {ok}");
+        assert_eq!(extract_token(Some(&header), None), Some(ok.as_str()));
+    }
+
+    /// The hand-built request never carries an injected field: the unsafe
+    /// credential writes no `Authorization` line at all, so the checker
+    /// answers 401 and the edge refuses the request.
+    #[test]
+    fn an_unsafe_credential_writes_no_authorization_line() {
+        let mut buf = Vec::new();
+        encode_check_request(&mut buf, Some("a\r\nX-Injected: yes"));
+        let text = String::from_utf8_lossy(&buf);
+        assert!(!text.contains("Authorization"), "{text}");
+        assert!(!text.contains("X-Injected"), "{text}");
+
+        encode_check_request(&mut buf, Some("safe-token"));
+        let text = String::from_utf8_lossy(&buf);
+        assert_eq!(
+            text.matches("Authorization: Bearer safe-token").count(),
+            1,
+            "{text}"
+        );
     }
 
     #[test]
