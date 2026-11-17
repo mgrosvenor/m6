@@ -91,14 +91,6 @@ fn main() -> ExitCode {
         }
     };
 
-    let listener = match bind(&sock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot listen on {sock_path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     // Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
     // socket, exit 0. A second signal exits immediately.
     //
@@ -107,26 +99,44 @@ fn main() -> ExitCode {
     // listening fd so the blocked `accept` returns. `rust-m6core` gets all of
     // this from core.
     //
-    // The fd is published BEFORE the handlers are installed: a SIGTERM arriving
-    // between the two would otherwise find -1 and leave the process blocked in
-    // accept forever. That is not hypothetical, it is what the first version of
-    // this file did, and the shared conformance test for clean shutdown is what
-    // found it.
-    LISTEN_FD.store(listener.as_raw_fd(), Ordering::SeqCst);
+    // The handlers go in BEFORE the socket exists. Its existence is how a
+    // caller knows the backend is ready (spec §8.1), so a caller that waits for
+    // it and then sends SIGTERM must find a handler installed. Installing after
+    // `bind` leaves a window in which the socket exists and SIGTERM still has
+    // its default disposition, so the process is killed instead of shutting
+    // down.
     install_signal_handlers();
+
+    let listener = match bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot listen on {sock_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The fd is published after the bind, so the handler has something to close
+    // and a blocked `accept` returns at once. Before the first accept the flag
+    // is checked: a stop that arrived between installing the handler and this
+    // line skips the loop instead of blocking in `accept` on a live socket. A
+    // stop that arrives after the check closes the fd, so `accept` returns an
+    // error and the loop breaks.
+    LISTEN_FD.store(listener.as_raw_fd(), Ordering::SeqCst);
 
     // Protocol §7 permits a fixed pool; this file keeps one: bounded queue, 503 when full.
     let workers = thread::available_parallelism().map_or(4, |n| n.get());
     let pool = Pool::new(workers, workers * 8, Arc::clone(&status_body));
 
-    for conn in listener.incoming() {
-        if SIGNALLED.load(Ordering::SeqCst) {
-            break;
-        }
-        match conn {
-            Ok(stream) => pool.submit(stream),
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break, // the listener was shut down by the signal handler
+    if !SIGNALLED.load(Ordering::SeqCst) {
+        for conn in listener.incoming() {
+            if SIGNALLED.load(Ordering::SeqCst) {
+                break;
+            }
+            match conn {
+                Ok(stream) => pool.submit(stream),
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break, // the listener was shut down by the signal handler
+            }
         }
     }
     // The handler closed the listening descriptor to wake `accept`, but
@@ -134,7 +144,8 @@ fn main() -> ExitCode {
     // the number a second time, and std detects that as an IO-safety violation
     // and aborts: "owned file descriptor already closed". A debug build aborts
     // here, and a release build happens not to. Forget the owner so the
-    // descriptor is closed exactly once, by the handler.
+    // descriptor is closed exactly once, by the handler. A stop that arrived
+    // before the fd was published left it open, which the process exit closes.
     std::mem::forget(listener);
     // Finish what is in flight before removing the socket (spec §8.2).
     pool.shutdown();

@@ -217,26 +217,50 @@ def main() -> int:
         print(f"cannot read status payload {status_path}: {e}", file=sys.stderr)
         return 2
 
+    # Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
+    # socket, exit 0. A second signal exits immediately.
+    #
+    # The handlers go in BEFORE the socket exists. Its existence is how a
+    # caller knows the backend is ready (spec §8.1), so a caller that waits for
+    # it and then sends SIGTERM must find a handler installed. Installing after
+    # the bind leaves a window in which the socket exists and SIGTERM still has
+    # its default disposition, so the process is killed instead of shutting
+    # down.
+    stopping = threading.Event()
+    server = None
+
+    def on_signal(signum, frame):  # noqa: ARG001
+        if stopping.is_set():
+            os._exit(0)
+        stopping.set()
+        srv = server
+        # The signal arrived before the socket was created. The flag is enough:
+        # main() sees it before serving, closes the socket and returns 0.
+        if srv is None:
+            return
+        # shutdown() must not run on the signal handler's stack: it waits for
+        # serve_forever to return, which is this thread.
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
     try:
         server = Server(sock_path, status_body)
     except OSError as e:
         print(f"cannot listen on {sock_path}: {e}", file=sys.stderr)
         return 1
 
-    # Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
-    # socket, exit 0. A second signal exits immediately.
-    stopping = threading.Event()
-
-    def on_signal(signum, frame):  # noqa: ARG001
-        if stopping.is_set():
-            os._exit(0)
-        stopping.set()
-        # shutdown() must not run on the signal handler's stack: it waits for
-        # serve_forever to return, which is this thread.
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
+    if stopping.is_set():
+        # A stop arrived between installing the handler and the socket being
+        # ready. Close and remove the socket rather than serve on a server that
+        # was never asked to run.
+        server.server_close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        return 0
 
     try:
         server.serve_forever(poll_interval=0.05)

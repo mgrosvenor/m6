@@ -134,9 +134,14 @@ fn main() -> std::io::Result<()> {
     // itself full: `Slots::is_full` would stay false past the kernel's limit.
     let initial = INITIAL_CONNECTIONS.min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
+    // The signal descriptor opens BEFORE the socket exists, so a caller that
+    // waits for the socket and then sends SIGTERM finds the handler ready. The
+    // `block()` above already keeps SIGTERM from killing the process, and
+    // opening the descriptor first makes the readiness rule hold in the order
+    // it is written rather than as a consequence of the mask.
+    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
-    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));

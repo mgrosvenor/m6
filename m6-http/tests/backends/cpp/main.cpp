@@ -48,18 +48,21 @@ constexpr size_t kMaxBody = 1u * 1024 * 1024;
 char g_sock_path[512];
 int g_listen_fd = -1;
 volatile sig_atomic_t g_shutting_down = 0;
+volatile sig_atomic_t g_listening = 0;
 
 // Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
 // socket, exit 0. A second signal exits immediately.
 //
 // Closing the listening fd from the handler is what makes accept() return, so
-// the loop notices without polling.
+// the loop notices without polling. It closes only once listen() has returned:
+// a stop between bind() and listen(), when the socket file already exists,
+// would otherwise make listen() fail and the process exit 1 rather than 0.
 void OnSignal(int) {
     if (g_shutting_down) {
         _exit(0);
     }
     g_shutting_down = 1;
-    if (g_listen_fd >= 0) {
+    if (g_listening && g_listen_fd >= 0) {
         ::close(g_listen_fd);
     }
 }
@@ -354,6 +357,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "listen: %s\n", std::strerror(errno));
         return 1;
     }
+
+    // From here the handler may close the fd to wake a blocked accept(). A stop
+    // that arrived earlier set the flag, so the loop below is skipped.
+    g_listening = 1;
 
     // Spec §7 requires only that a new connection can be accepted while another
     // is handled, and allows threads, processes or an event loop. A detached
