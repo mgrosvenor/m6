@@ -14,9 +14,10 @@ Section 1 states the rules the rest of the document follows.
 3. [Allocation on the static file path](#3-allocation-on-the-static-file-path)
 4. [Cache-hit latency, and why it is load dependent](#4-cache-hit-latency-and-why-it-is-load-dependent)
 5. [Connection setup, per channel](#5-connection-setup-per-channel)
-6. [Certificate compression and the QUIC amplification limit](#6-certificate-compression-and-the-quic-amplification-limit)
-7. [Reproducing these measurements](#7-reproducing-these-measurements)
-8. [What is not measured](#8-what-is-not-measured)
+6. [Where a TLS handshake goes](#6-where-a-tls-handshake-goes)
+7. [Certificate compression and the QUIC amplification limit](#7-certificate-compression-and-the-quic-amplification-limit)
+8. [Reproducing these measurements](#8-reproducing-these-measurements)
+9. [What is not measured](#9-what-is-not-measured)
 
 ---
 
@@ -492,14 +493,133 @@ One part of it, the size of the server's first flight, was large enough to cost 
 
 ---
 
-## 6. Certificate compression and the QUIC amplification limit
+## 6. Where a TLS handshake goes
+
+A TLS 1.3 handshake on a web front end is often read as one cost.
+This section splits it into crypto, kernel and m6's own code, prices the loopback method that produced the figure, compares the cipher suites and the two providers, follows the hit path under handshake load, and prices a system call.
+Every figure was taken on a 4-vCPU x86-64 cloud VM (Skylake) whose hypervisor hides ADX and SHA-NI, running Linux 7.0.0-43-generic at load 0.36 to 0.49, with an ECDSA P-256 certificate, TLS 1.3, a release build and the client on the same host.
+The VM is a test guest.
+The finding is that m6's own code is 9 us of a 372 us handshake, and the rest needs a CPU exposing ADX and SHA-NI before it can fall much further.
+
+*ADX* is an x86 instruction set for integer arithmetic, and *SHA-NI* is the x86 extension that accelerates SHA-256 and SHA-1.
+A hypervisor can hide both from a guest, and this one does.
+The default provider is the crypto provider rustls installs when the application does not name one.
+The alternative is a second provider with a faster X25519 implementation on this hardware.
+The records are in the batch's `work-queue/out/` tree, outside this repository.
+`TLS-records/` holds the handshake suite and the parts bench, `PROFILE-records/` the profile and the syscall bench, and `MIXED-records/` the hit-under-load run, and each table names its file under those roots.
+
+### 6.1. The split
+
+A full handshake with the default provider read 0.372 ms at p50 from the client over 3,000 connections, and the server's own CPU per handshake was 400.0 us.
+A profile of 1,000 of those handshakes attributes the server's CPU by leaf frame.
+
+| share | us | of 372 us | what it is |
+|---|---:|---:|---|
+| crypto, of which: | 158 | 42.5% | key exchange, signature, hash, record encryption |
+| X25519 key exchange | 83 | 22.3% | the server's key share and shared secret |
+| P-256 signature | 32 | 8.6% | the ECDSA signature over the handshake transcript |
+| SHA-384 compression | 29 | 7.8% | the transcript hash |
+| other crypto | 14 | 3.8% | record encryption, HKDF and ticket encryption |
+| kernel | 144 | 38.7% | system calls, TCP and the socket layer |
+| m6's own code | 9 | 2.4% | accept, the event loop and TLS glue |
+| libc, rustls, allocator and other user code | 61 | 16.4% | wrappers, `memcpy`, heap and std |
+| total | 372 | 100% | the client's p50 |
+
+**Table 15: where a 372 us TLS 1.3 handshake with the default provider goes on the VM, by server CPU (`TLS-records/handshake-ec.log` for the p50 and the CPU per handshake, the full-handshake profile in `PROFILE-records/`, partitioned by `PROFILE-records/an.py` for the shares, `TLS-records/parts.log` and `TLS-records/job6/res/parts-default.log` for the primitives).**
+Take from it that crypto and the kernel are 81% of the handshake and m6 is 2.4%, and that the single largest item is the 83 us X25519 key exchange.
+The crypto sub-rows sum to 158, and the percentages are those microseconds over 372.
+The profile's SHA-512 compression frames are 7.58% of its self time, 28 us, and the parts bench's finish phase, which includes that hash, reads 29.9 us, so the table row is 29.
+
+### 6.2. The loopback price
+
+The same handshake reads 0.372 ms in the first run and a 0.410 ms median in the repeat, 10% apart, on a host at load 0.36 to 0.49.
+Both ends share the four vCPUs on loopback, so each end's work sits inside the other's wall time.
+Read a loopback handshake as an upper bound on CPU cost.
+A real path moves the client's CPU to another machine and adds the round trips that Table 12 prices.
+
+### 6.3. The suites and the two providers
+
+Seven rounds of each combination, 3,000 handshakes a round, compare the two cipher suites the client offers and the two providers.
+
+| client suite | provider | full p50, median (range) | resumed p50, median |
+|---|---|---:|---:|
+| AES-256-GCM | the default | 0.410 ms (0.373 to 0.441) | 0.360 ms |
+| AES-256-GCM | the alternative | 0.422 ms (0.337 to 0.447) | 0.403 ms |
+| AES-128-GCM | the default | 0.387 ms (0.360 to 0.419) | 0.345 ms |
+| AES-128-GCM | the alternative | 0.380 ms (0.360 to 0.441) | 0.337 ms |
+
+**Table 16: whole-handshake p50 by client suite and provider, seven rounds each, 3,000 handshakes a round (`TLS-records/job6/rep/local.txt`).**
+Take from it that the ranges overlap in every row and the ordering flips between the two suites, so the whole handshake does not measurably change.
+
+The primitive does change.
+The in-memory parts bench reads X25519 at 83.4 to 83.7 us with the default provider and 46.7 to 62.9 us with the alternative, and the P-256 signature at 29.4 to 32.3 us in both (`TLS-records/job6/res/parts-default.log` and `TLS-records/job6/res/parts-browser.log`).
+A saving of 20 to 36 us on the key exchange is 5% to 10% of the 372 us handshake, and the run-to-run spread in Table 16 is 10%.
+The primitive difference is real and the whole-handshake difference is below what this method resolves.
+The suite makes less difference than either, which is why the two suites' rows sit inside one another.
+
+### 6.4. Hits under handshake load
+
+A cache hit does not pay the handshake, and it can wait behind one.
+One kept-alive connection served hits while a second generator opened new full handshakes at 0, 50, 100, 200 and 500 a second, in 10 second windows.
+
+| new handshakes/s | achieved/s | hits/s | hit p50 us | hit p99 us | handshake p50 ms |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.0 | 15,659.9 | 57.4 | 126.9 | - |
+| 50 | 50.0 | 15,471.0 | 58.0 | 138.1 | 0.826 |
+| 100 | 100.0 | 14,491.1 | 60.5 | 175.5 | 0.867 |
+| 200 | 200.0 | 13,403.0 | 58.3 | 327.8 | 0.777 |
+| 500 | 500.0 | 13,658.8 | 58.2 | 300.6 | 0.645 |
+
+**Table 17: cache hits while new full handshakes arrive, one run per rate, 10 second windows (`MIXED-records/mixed.log`).**
+Take from it that the hit p50 stays flat at 57.4 to 60.5 us, the hit p99 rises to 327.8 us at 200 handshakes a second and holds at 300.6 us at 500, and hit throughput falls 15% from 15.7k to 13.4k a second.
+
+The p99 plateau is 300 us, which is 158 us of crypto plus 144 us of kernel from Table 15, 302 us.
+The hit tail is one handshake deep.
+The handshake p50 in this run is 0.65 to 0.87 ms, above the 0.372 ms of section 6.1, because the same four vCPUs now run the hit client, the handshake generator and the server together.
+
+### 6.5. The system call
+
+A bare system call costs 1.20 us on this VM, measured with `getppid` over five million calls, and a write plus a read through a pipe costs 1.54 us per pair.
+The section uses 1.32 us, between the two readings.
+
+| operation | per call |
+|---|---:|
+| `getppid`, 5,000,000 calls | 1.20 us |
+| pipe write plus read, 2,000,000 pairs | 1.54 us |
+| figure used here | 1.32 us |
+
+**Table 18: bare system call cost on the VM (`PROFILE-records/getppid.txt`).**
+Take from it that a call costs about 1.3 us, and that most of the kernel share in Table 15 is the TCP work behind the calls, with 34 us of it the entry and exit.
+
+A default-provider handshake makes about 26 system calls: `strace` counted 26,184 for 1,000 handshakes (the `strace` of the same run in `PROFILE-records/`).
+At 1.32 us that is 34 us of the kernel's 144 us, and the remaining 110 us is the TCP stack that the profile shows in `tcp_*` and `ip_*` frames.
+The default provider made nine `getrandom` calls per handshake in that record and the alternative made none, worth about 12 us of the 372.
+A syscall reduction can reach the 34 us of entry and exit at most, and that work is parked until after the release.
+
+### 6.6. What was tried, and what it means
+
+Four measurements were tried: the whole-handshake suite with both providers and both suites, the in-memory parts bench, the profile of the server, and the mixed hit and handshake load.
+The first found no whole-handshake difference, the second found the X25519 primitive 20 to 36 us faster with the alternative, the profile put m6's own share at 9 us, and the fourth put the hit tail at one handshake's CPU.
+A fifth idea, cutting the 26 system calls a handshake, was priced at 34 us and parked.
+
+The conclusion is that m6's own share is small.
+Of 372 us, 9 us is m6, 144 us is the kernel and 158 us is crypto, and the largest single item is the 83 us X25519 key exchange.
+The rest of the crypto needs a CPU that exposes ADX and SHA-NI, and those two instructions are what this hypervisor hides.
+A 100 us handshake is not reachable on this hardware, and it is not pursued further.
+The section stays so the next attempt starts from the split.
+Every figure here is the VM's.
+The development Mac did not reproduce the provider comparison, and its attempt is `NOT MEASURED` for that effect because the shared host's run-to-run spread was larger than the difference.
+
+---
+
+## 7. Certificate compression and the QUIC amplification limit
 
 *QUIC* is the transport underneath HTTP/3.
 A QUIC server may send only `factor x bytes received` before it has validated the client's address, under RFC 9000 section 8.1, so that it cannot be used as a reflection amplifier.
 m6's uncompressed handshake flight exceeded that budget, stalled, and waited a full round trip.
 Certificate compression removed the excess and the server now runs at quiche's conforming default factor of 3.
 
-### 6.1. The stall
+### 7.1. The stall
 
 A client's opening Initial is padded to 1200 bytes, so at a factor of 3 the budget is 3600 bytes.
 The uncompressed handshake flight was 4082 bytes, of which the certificate chain is 3429.
@@ -516,7 +636,7 @@ The uncompressed handshake flight was 4082 bytes, of which the certificate chain
 **Figure 1: the server exhausting its amplification budget mid-flight.**
 Take from it that the final datagram arrives one full round trip after the previous one, and that the ratio at the moment the server stopped was 3.00x.
 
-### 6.2. This is the ordinary case
+### 7.2. This is the ordinary case
 
 The first two explanations written for this assumed the opposite, so the general position is stated plainly.
 [Fastly's study](https://www.fastly.com/blog/quic-handshake-tls-compression-certificates-extension-study) measured 40-44% of uncompressed chains exceeding the budget, and certificate compression taking that to 1-9%.
@@ -533,7 +653,7 @@ About half of the QUIC internet pays this round trip.
 | www.google.com | 3 | 3755 |
 | www.mozilla.org | 3 | 4051 |
 
-**Table 15: measured certificate chain sizes, for scale.**
+**Table 19: measured certificate chain sizes, for scale.**
 Take from it that a 3429-byte chain is unremarkable and that two of the seven are larger, so chain size alone does not explain which servers stall.
 
 **Two diagnoses were stated as fact and withdrawn.**
@@ -560,10 +680,10 @@ Disabling pacing changed the stall not at all.
 | Cloudflare | 4198 in one flight | 3.50x |
 | Fastly, serving www.mozilla.org | 5360 in one flight | 4.47x |
 
-**Table 16: what other edges appear to run at, measured with `m6-probe-h3` on a 1200-byte client Initial.**
+**Table 20: what other edges appear to run at, measured with `m6-probe-h3` on a 1200-byte client Initial.**
 Take this as our own measurement rather than established fact: the byte accounting counts QUIC payload, and no public source corroborates servers exceeding the limit.
 
-### 6.3. The fix that shipped
+### 7.3. The fix that shipped
 
 Releases 1.2.0 and 1.3.0 carried `set_max_amplification_factor(4)`, which raised the budget to 4800 and let the whole flight go out at once.
 It was marked temporary from the day it shipped, because it deviates from RFC 9000 rather than satisfying it.
@@ -579,7 +699,7 @@ The compression runs in m6's own quiche fork, pinned by revision in `m6-http/Car
 | zstd | 2308 | 67% |
 | zlib | 2359 | 69% |
 
-**Table 17: the certificate chain under each compression algorithm.**
+**Table 21: the certificate chain under each compression algorithm.**
 Take from it that any of the three fits the budget, and that brotli is the one m6 offers.
 
 **m6 offers brotli and accepts zlib without offering it.**
@@ -592,7 +712,7 @@ The whole server flight went from 4081 bytes to 2859 with brotli, a saving of 12
 The handshake completes in one round trip: four datagrams with a 5.07 ms stall became three datagrams with none.
 Third parties verified that our client advertises compression instead of merely accepting it: Cloudflare's flight went from 4198 to 3388 bytes for the same probe, and a Fastly edge did not change at all.
 
-### 6.4. 0-RTT
+### 7.4. 0-RTT
 
 0-RTT was held back on 2026-09-15 and **enabled on 2026-09-16**, once m6's quiche fork carried the three changes it needed.
 Enabling it costs no conformance: h3spec reads 47/49 with early data on, which is the recorded floor in `tools/conformance-scores.txt`.
@@ -614,22 +734,22 @@ Every figure above can be re-taken, and the commands are next.
 
 ---
 
-## 7. Reproducing these measurements
+## 8. Reproducing these measurements
 
 Every measurement in this document can be re-run.
 The commands below are grouped by the section they support.
 
-### 7.1. The render figures the earlier gate recorded
+### 8.1. The render figures the earlier gate recorded
 
 The earlier gate recorded absolute render figures in a baseline file, which this change deletes.
-Table 18 keeps the two dated readings, both taken on the 4-core Linux build host, so they stay recoverable as history.
+Table 22 keeps the two dated readings, both taken on the 4-core Linux build host, so they stay recoverable as history.
 
 | date | method | render:minimal median ns | render:blog-index median ns | conditions |
 |---|---:|---:|---:|---|
 | 2026-09-14 | three runs, medians of round minimums | 201827 | 1784823 | load 0.20 |
 | 2026-09-27 | three runs of five rounds, medians | 174101 | 1454253 | load 0.12, after the release profile |
 
-**Table 18: the render figures the earlier gate recorded.**
+**Table 22: the render figures the earlier gate recorded.**
 Take from it that these were absolute numbers on content that has since changed, so they are history and no longer a gate.
 
 **Per-request copy cost, sections 2.2 and 2.5:**
@@ -671,7 +791,7 @@ The probes take any host, which is how Tables 15 and 16 were measured against th
 
 ---
 
-### 7.2. The mimalloc A/B on the build host
+### 8.2. The mimalloc A/B on the build host
 
 Run on the idle build host, holding the host lock, the base (`ce6c29c`) against the branch (`perf/mimalloc`).
 Build both with the release profile, which this is one of the two places for.
@@ -718,7 +838,7 @@ tools/perfcheck.sh --base-bin $HOME/build/base/target/release/m6-html \
 **RSS after warm-up** is the `rss` row of both scripts above.
 Record the binary sizes (`ls -l target/release/m6-http`) and the release build time beside it.
 
-## 8. What is not measured
+## 9. What is not measured
 
 A performance document that implies more coverage than it has is how the next reader is misled, so the gaps are listed plainly.
 
@@ -726,10 +846,10 @@ A performance document that implies more coverage than it has is how the next re
 |---|---|
 | throughput and concurrency | `m6-file` moved from an unbounded channel and a fixed worker set to `App`'s bounded pool with 503 backpressure, and `m6-auth-server` from a thread per connection to the same pool. Both are better shapes under overload and neither has a number |
 | conformance-side timing | h2spec and h3spec are correctness gates. h3spec must never be used as a load generator, because it deliberately opens stalled and malformed connections, which is what produced the 113 ms figure in section 5.4 |
-| the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%. Those absolute numbers are recorded as history in section 7.1, and the gate now compares the candidate against a base build |
+| the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%. Those absolute numbers are recorded as history in section 8.1, and the gate now compares the candidate against a base build |
 | magnitude on small hosts | Table 3 is a laptop figure. A single-core VM differs in magnitude, though the direction is a property of the code |
 
-**Table 19: what this document does not cover.**
+**Table 23: what this document does not cover.**
 Take from it that throughput has no number at all, and that Table 3 is superseded for any gating purpose by the A/B gate `tools/perfcheck.sh`.
 
 The measured position is that core's per-request copying fell by a factor of 280 and the static file path no longer allocates what it does not send.
