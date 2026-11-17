@@ -2,10 +2,10 @@
 
 m6 is a platform for building and deploying fast websites.
 It covers the full stack from auth to rendering to delivery.
-Start with a single `site.toml` and get *TLS* (Transport Layer Security), routing, in-process caching, and *JWT* (JSON Web Token) authentication out of the box.
+Start with a single `site.toml` and get *TLS* (Transport Layer Security), routing, in-process caching, and *JWT* (JSON Web Token) authentication through one checker.
 Add Tera templates, static files, or custom renderers in any language as your site grows.
+Publish a change with one `POST /genid`, and read `/health` from a monitor.
 Deploy to a single machine, scale to multiple processes, or fan out to a global edge fleet.
-Either way, pages load in sub-millisecond time.
 The install comes first, then the architecture and components, and the document closes with the reference map.
 
 ## Contents
@@ -44,8 +44,7 @@ export PATH="$PWD/target/release:$PATH"
 
 Rust 1.89 or newer.
 Linux is the production target (epoll).
-macOS works for development.
-Example 11's admin dashboard needs Linux because its shipped config sets `bench_bin` and the bench child is reaped from a pidfd.
+macOS works for development, and Example 11's admin dashboard runs on both.
 
 **2. A development certificate.** m6-http's public listener is TLS only, and its `h2c_bind` listener is for a private backbone, so a site needs a certificate.
 [mkcert](https://github.com/FiloSottile/mkcert) issues one your browser already trusts:
@@ -68,7 +67,7 @@ cargo build --release      # the custom renderers
 
 ```sh
 cd examples/05-cms
-./dev.sh                   # in one terminal: six services come up
+./dev.sh                   # in one terminal: five services come up
 ./test.sh                  # in another
 ```
 
@@ -108,8 +107,8 @@ Take from it that only m6-http listens on a public port, and that every other pr
   Browser / API client   │                  m6-http                     │
 ─────────────────────►   │  - TLS termination (HTTP/3 + HTTP/2 + H1.1)  │
   HTTPS (any port)       │  - Routing (site.toml)                       │
-                         │  - Response cache (path × encoding)          │
-                         │  - JWT auth enforcement (local verify)       │
+                         │  - Response cache (path × query × encoding)  │
+                         │  - Credential gates ask POST /check          │
                          │  - Backend pool management (round robin)     │
                          │  - Config, certs and pools at start          │
                          └────┬──────────────┬──────────────┬───────────┘
@@ -127,8 +126,8 @@ Take from it that only m6-http listens on a public port, and that every other pr
     │ template │       │ files      │     │ JWT issue    │   │             │
     │ renderer │       │ Brotli/    │     │ JWT refresh  │   │ Rust:       │
     │          │       │ gzip       │     │ Login/logout │   │ m6-core     │
-    │          │       │ Symlink    │     │ Rate limit   │   │ library     │
-    │          │       │ guard      │     │ Key rotation │   │             │
+    │          │       │ Symlink    │     │ POST /check  │   │ library     │
+    │          │       │ guard      │     │ Rate limit   │   │             │
     └────┬─────┘       └────────────┘     └──────┬───────┘   └─────────────┘
          │  m6-core   library (Rust)             │  m6-auth library (Rust)
          └───────────────────────────────────────┘
@@ -141,17 +140,17 @@ Take from it that only m6-http listens on a public port, and that every other pr
 ```
 
 **Figure 1: the m6 process family and how a request reaches it.**
-m6-http terminates TLS and routes, and m6-html, m6-file and a custom renderer answer it over Unix sockets while a URL backend reaches a remote node.
+m6-http terminates TLS and routes. m6-html, m6-file and a custom renderer answer it over Unix sockets, m6-auth-server issues tokens and answers the identity check, and a URL backend reaches a remote node.
 
 ### 2.1 Request Flow (cache miss)
 
 Figure 2 follows one cache-miss request through m6-http.
-Take from it that the JWT check, the route choice and the cache store all happen in the one process that terminates TLS.
+Take from it that the credential decision, the route choice and the cache store all happen in the one process that terminates TLS.
 
 ```
 Client → m6-http (one event loop, single thread)
            │
-           ├─ JWT check (local RSA/EC verify, no network hop)
+           ├─ Credential present: POST /check on the auth socket
            │
            ├─ Route → backend pool (round robin, Unix socket or URL)
            │
@@ -161,7 +160,8 @@ Client → m6-http (one event loop, single thread)
 ```
 
 **Figure 2: a cache-miss request through m6-http.**
-The JWT check, the route choice and the cache store run in the same event loop, so the backend call is the only network hop on the path.
+A protected request makes two network hops, one to the checker and one to the backend, and a public request makes one.
+The credential decision, the route choice and the cache store run in the same event loop.
 
 ### 2.2 Deployment Tiers
 
@@ -182,8 +182,9 @@ Tier 4 repeats tier 3 across N nodes and reaches the origin through `h2s://` URL
 
 ## 3. Components
 
-m6 ships four services, two libraries and one command.
-Sections 3.1 to 3.7 take them in the order a request meets them: the edge, the HTML and file backends, the auth service, the libraries those backends share, and the command that manages the auth database.
+m6 ships seven binaries and four libraries.
+Sections 3.1 to 3.7 take the components a request meets: the edge, the HTML and file backends, the auth service, two of the libraries, and the command that manages the auth database.
+The other binaries are `m6-monitor` and `m6-md`, and the other libraries are `m6-log` and `m6-platform`.
 Each entry names what the process owns and what it costs.
 
 ### 3.1 m6-http
@@ -194,8 +195,9 @@ The only process that listens on a public port.
 **Architecture:**
 - One thread and one edge-triggered event loop over `m6_core::platform`
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
-- Response cache keyed by `(path, content-encoding)`, with each encoding variant cached independently
-- Every credential check asks m6-auth-server's `POST /check` under a 50 ms deadline, so a role change or a revocation counts from the next request
+- Response cache keyed by `(path, query, content-encoding)`, with each encoding variant cached independently
+- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline: a route `require`, `/perf`, `/traffic` and a source node's `/genid`.
+  m6-http decodes no token and holds no key
 - Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
 - Backend sockets are found once at start from each pool's glob, and a change takes a restart
 - `site.toml` and the system config are read once at start.
@@ -203,13 +205,15 @@ The only process that listens on a public port.
 - `Cache-Control: public` responses cached.
   `no-store` and `private` responses skipped
 - Error pages fetched from configured `[errors] path` backend on 4xx/5xx
+- `/health`, `/perf`, `/traffic` and `/genid` answered ahead of routing, the cache and every backend
 
 **Performance design:**
 - Zero heap allocation on the hot path (cached responses)
 - Every buffer and queue starts small, grows by doubling and never shrinks, and a request past its `[limits]` maximum is refused with an error that names the key (`docs/m6-site-toml.md` §4.14)
 - A request head is bounded at 8 KiB per field and 32 KiB in all, answered 400 past either, or 414 for a request line over 8 KiB
 - `write_decimal` uses a 20-byte stack buffer instead of `format!`
-- `Arc` cache swapped atomically, never mutated in place
+- Every binary installs `m6_core::alloc::M6Alloc`, which is mimalloc, and m6-http takes `[limits.heap_reserve]` from the OS once at start
+- The response cache is an `AHashMap` behind `Arc<RwLock<..>>`, and a generation change replaces the whole map in one assignment
 
 **Benchmark results (release, Apple M4, loopback, n=2000):**
 
@@ -281,7 +285,7 @@ Handles all HTML routes.
 - JSON params loaded from disk at startup.
   Static params are stored as `Arc<Map>`, so a request clones a pointer and copies no Map
 - Dynamic `{stem}`-keyed params resolved and LRU-cached
-- Accept-Encoding checked with zero-alloc byte windowing (`ae_contains`)
+- Accept-Encoding negotiated by `m6_core::negotiate`, which parses the q-values and allocates nothing
 - Minification pipeline (applied before compression): HTML (`minify-html`), CSS (in-house), JSON (`serde_json`), JS (`minify-js` / parse-js engine, falls back to original bytes on parse failure)
 - Brotli and gzip compression with configurable levels per MIME type
 
@@ -364,8 +368,8 @@ Serves assets, downloads, and any file from the site directory.
 - One event loop and a connection table sized from the open-file limit
 - Route matching with `{relpath}` (catchall) and `{stem}` (single segment) params
 - Param validation: alphanumeric plus `-_.` for a stem, subdirectories allowed for a relpath, and `..` answered 404
-- Fast symlink guard: a `symlink_metadata` check only.
-  `canonicalize` is called only when a symlink is found, which avoids a ~15 µs syscall on every request for normal files
+- Symlink guard: every request path goes through `m6_core::path::resolve_within`, which canonicalises the root and the resolved prefix.
+  A symlink escaping `site_dir` is answered 404
 - Brotli and gzip compression applied per request.
   m6-http caches the compressed response
 - No cache in m6-file: all caching is m6-http's responsibility
@@ -389,10 +393,14 @@ A disk read and a compression pass cost 10.6 µs at p50, and the socket round tr
 ### 3.4 m6-auth-server
 
 Auth service.
-Issues and verifies JWTs, manages sessions.
+Issues tokens, answers the identity check, and manages sessions.
 
 **Architecture:**
-- Four HTTP endpoints: `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/public-key`
+- Five routes: `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/public-key`, and `POST /check`
+- The four login routes answer on the primary socket.
+  `POST /check` answers on the check socket, derived beside it as `<parent>/check-<file name>`, so `/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`
+- `POST /check` verifies the access token's signature, issuer and expiry, then reads `sub`, `username`, `roles` and `groups` from the database for that request.
+  A role change or a deleted user counts from the next request
 - RS256 or ES256 JWT signing (EC recommended).
   Access token TTL 15 min, refresh token TTL 30 days
 - Key pair read at start, so a key rotation is a restart.
@@ -424,6 +432,7 @@ It supplies the loop parts, routing, configuration, the request dictionary and t
 - Code routes as `CodeRoute` values, answered from one `match` on `Handled`
 - `ServerConn`, `Signals`, `Timeouts`, `Slots` and the reactor as the parts a service's own loop uses
 - `Request` / `Response` / `Error` types
+- `alloc::M6Alloc`, the mimalloc global allocator every service binary installs, which never returns freed memory to the OS
 - Configuration read once at start, and a change takes a restart
 
 `docs/m6-app-anatomy.md` walks through the loop a service writes.
@@ -483,7 +492,7 @@ All processes log structured JSON to stdout, which systemd captures via journald
 
 A site is described by two files.
 `site.toml` holds the state every node shares: the site's name and domain, the backends, the routes, the error mode and the log level.
-The system config holds this node's own state: its name, the listener, the certificate, its private key, and the public key that verifies tokens.
+The system config holds this node's own state: its name, the listener, the certificate, its private key, and the name of the backend that answers `POST /check`.
 m6-http reads both, and a key written in the wrong file stops the start with exit 2, as does a system config with no `[node]`.
 
 `site.toml`:
@@ -505,6 +514,10 @@ sockets = "/run/m6/m6-file-*.sock"
 [[backend]]
 name = "origin"
 url  = "h2s://origin.example.com:443"
+
+[[backend]]
+name    = "auth-check"
+sockets = "/run/m6/check-m6-auth*.sock"
 
 [[route]]
 path    = "/"
@@ -543,6 +556,11 @@ tls_key  = "/etc/m6/key.pem"
 backend = "auth-check"
 ```
 
+`[auth] backend` names a `[[backend]]` with `sockets`.
+It is required once a route has `require`, and once `[health] metrics_require` or either `[genid]` claim is set, because every one of those gates asks `POST /check`.
+A `[auth] public_key` key from an earlier release is refused at load.
+The login routes keep their own backend: `/auth/login`, `/auth/logout` and `/auth/refresh` reach the login socket, and `[auth] backend` names the check socket.
+
 Every path in the system config is absolute, and a relative one is a startup error.
 [`docs/m6-site-toml.md`](docs/m6-site-toml.md) gives every key and names the one file that owns it.
 
@@ -568,8 +586,36 @@ m6-http finds each pool's sockets once at start, so a new instance joins its poo
 
 **Global deployment:** run m6-http at each edge location.
 Configure it with a `h2s://` URL backend pointing to the origin.
-Each edge node caches independently.
-See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment) and the multi-region deployment walkthrough.
+Each cache node follows the origin's generation ID, so it flushes its own cache when a publish advances the ID.
+See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment).
+
+### 6.1 Health and metrics
+
+`/health` has three answers.
+`200` with `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
+`503` with `{"status":"degraded","node":"<name>"}` says the process is alive and a dependency is failing.
+A process that is gone, or whose listener refuses, gives no answer at all.
+The degraded body names the node and no dependency, because `/health` is public and unsecured.
+The dependency is in the warn line the process logs when it fails and the info line when it recovers.
+`/perf` and `/traffic` answer behind `[health] metrics_require`, and answer 404 without it.
+The public `GET /ready` endpoint was removed: it answered readiness from the age of the origin's last success, and nothing consumed it.
+
+### 6.2 Publishing a generation
+
+A publish sends `POST /genid` to the source node's m6-http.
+The source reloads every backend on a Unix socket, flushes its cache, advances the generation ID and answers with the new ID.
+A member that fails the reload is logged and counted, and the POST still answers 200.
+A cache node follows the ID: its `[genid] upstream` names a URL backend and its `token_file` holds a read token, and it asks with `GET /genid` at start and every `heartbeat_secs` (10 by default).
+A cache node with no ID retries a failed heartbeat after one second.
+[`docs/m6-site-toml.md`](docs/m6-site-toml.md) §4.11 gives the keys and [`docs/m6-http.md`](docs/m6-http.md) §8 gives the change sequence.
+
+### 6.3 Memory locking
+
+On Linux, m6-http pins its pages as they are faulted.
+`[server] lock_memory` defaults true, and the unit sets `LimitMEMLOCK=infinity`.
+A finite soft `RLIMIT_MEMLOCK` stops the start with exit 2, and the error names `LimitMEMLOCK=infinity` and `ulimit -l unlimited`.
+`lock_memory = false` runs unpinned.
+The reservation and the pin are in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) and [`docs/m6-site-toml.md`](docs/m6-site-toml.md) §4.2.
 
 ---
 
@@ -606,6 +652,11 @@ Browser                  m6-http                  m6-auth-server
 **Figure 4: a browser login and token refresh.**
 An expired session cookie is answered 302 to the refresh endpoint, the new token becomes a session cookie, and m6-http forwards the identity the authority answered to the backend.
 
+Every credential gate takes this path: a route `require`, `/perf`, `/traffic` and a source node's `GET` and `POST /genid`.
+A node with `[auth] backend` therefore needs a running checker for those three endpoints as well as for a protected route.
+A request with no credential sends no check and is refused 401, except a protected browser route, which is answered 302 to `/login` or `/auth/refresh`.
+A checker that does not answer within the 50 ms deadline turns the request into 503 with `Retry-After: 1`.
+
 ---
 
 ## 8. Error Handling
@@ -635,10 +686,14 @@ The last is a rule about what `site.toml` may hold.
 
 - TLS always required, and m6-http terminates it.
   Internal communication runs over Unix sockets or TLS URL backends
-- Every protected request asks m6-auth-server's `POST /check` under a 50 ms deadline, and the answer is used once.
+- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline, and the answer is used once: a route `require`, `/perf`, `/traffic` and a source node's `/genid`.
   Login, refresh, logout and check reach m6-auth-server, and nothing caches a decision
-- Path traversal: `..` in any URL path answered 404, and `..` in a route param answered 400
-- Symlink guard: resolves symlinks at request time, and a symlink escaping `site_dir` is answered 404
+- m6-http holds no key and decodes no token, so a revoked credential or a role change counts from the next request
+- `/health` is public and unsecured.
+  Its degraded body names the node and no dependency, and the dependency appears in the process log
+- Path traversal: `..` in any URL path is answered 404, and `..` in a route param is answered 404 too.
+  A param with invalid characters is answered 400
+- Symlink guard: m6-file resolves every request path through `m6_core::path::resolve_within`, which canonicalises the root and the resolved prefix, and a symlink escaping `site_dir` is answered 404
 - Rate limiting on login: 5 attempts / 15 min / IP
 - `site.toml` contains no secrets.
   Secrets live in the system config or a `secrets_file`
@@ -652,11 +707,11 @@ Table 11 lists the exit codes.
 | Code | Meaning |
 |------|---------|
 | 0 | Clean shutdown (SIGTERM / SIGINT) |
-| 1 | Runtime error |
-| 2 | Config or usage error (before bind) |
+| 1 | Runtime error, including a configured TLS or h2c listener that fails to bind |
+| 2 | Config or usage error, including a QUIC or shared-port bind failure |
 
 **Table 11: the exit codes every m6 process uses.**
-A supervisor tells a bad config from a crash by the code alone.
+A deploy validates a new binary by exit 2 for a refused config, and the bind split decides whether a configured listener failed (1) or the config was refused (2).
 
 ---
 
@@ -731,7 +786,9 @@ The two remaining h3spec failures are QPACK stream errors inside quiche, accepte
 ## 12. Known Limitations
 
 **m6-http:**
-- The HTTP/2 error codes the server does not send, tracked as issue #163 in [`docs/m6-http.md`](docs/m6-http.md)
+- The server sends eight of the fourteen HTTP/2 error codes.
+  It has no path that sends `INTERNAL_ERROR`, `SETTINGS_TIMEOUT`, `CANCEL`, `CONNECT_ERROR`, `INADEQUATE_SECURITY` or `HTTP_1_1_REQUIRED`.
+  [`docs/m6-http.md`](docs/m6-http.md) §16.5 records each one
 
 **m6-auth-server:**
 - m6-auth-server runs as one process per site, and its login failure counts live in memory.
@@ -745,49 +802,47 @@ The two remaining h3spec failures are QPACK stream errors inside quiche, accepte
 - Rate limiting beyond m6-http's per-address request limit and m6-auth's login limit
 - Built-in OAuth2 / OIDC provider
 - MFA / WebAuthn
-- Horizontal scaling of m6-http itself as the design (it scales vertically via caching, and globally via edge nodes; `[server] reuse_port` lets several processes share the port, and `docs/m6-site-toml.md` §4.2 gives its limits)
+- Horizontal scaling of m6-http itself as the design.
+  It scales through caching and globally via edge nodes.
+  `[server] reuse_port` lets several processes share the port, and `docs/m6-site-toml.md` §4.2 gives its limits
 - **HTTP/2 server push** and **103 Early Hints** were both implemented and removed on 2026-09-18.
   See below.
 
 ### 12.1 Why there is no server push or 103 Early Hints
 
-Both existed in m6 until 1.9.0 and were removed.
+Both existed in m6 through 1.9.0 and were removed in 1.10.0.
 
 **HTTP/2 push is a dead feature.**
 The server cannot see the client's cache, so it sends bytes to a returning visitor who already has them.
 Cache digests were proposed to close that gap and never shipped.
-Chrome removed push in 106, Firefox disabled it, and RFC 9113 dropped it from the specification.
+Chrome removed push in 106, and Firefox disabled it.
 Receipt of a `PUSH_PROMISE` from a client is still refused as a connection error, per RFC 9113 8.4.
-That is required and stays.
 
 **103 Early Hints has nothing to fill in a server shaped like this.**
 Its value is the gap between a request arriving and the response being ready, so a browser can start fetching subresources during backend think-time.
-m6 caches server side: on a cache hit the response is ready immediately, and the 103 and the final response go out microseconds apart.
-Measured on a production fleet, the origin answered in about 7ms and an edge hit from memory.
+m6 caches server side: on a cache hit the response is ready immediately, and Table 3 measures a hit at 29 to 48 µs at p50, so the 103 and the final response leave microseconds apart.
 There is no dead time to exploit.
 The secondary argument, that a 103 beats the HTML parser to the subresources, does not hold either: `<link>` lives in `<head>`, so a browser's preload scanner reaches it in the first kilobyte.
 
 **The implementation also had to guess.**
 It derived the hint list by scanning the response body for `href=` and `src=` and filtering on file extension, which cannot distinguish an `<img src>` from an `<a href>`, or from text inside a `<script>`, `<template>` or comment.
 It preloaded images the page had explicitly marked `loading=lazy`, overriding the author.
-A cache node emitted every hint twice, 89 `Link` headers for 45 distinct values.
-It ordered them by directory name, so a render-blocking stylesheet was announced behind seventeen logos.
+A cache node emitted every hint twice.
+It ordered them by directory name, so a render-blocking stylesheet was announced behind the logos.
 None of that was measurable, because there was no switch to turn the feature off and compare.
 
 **If you need this, build a relay, not an oracle.**
 The standard answer is for the author to declare what the page needs, using `<link rel=preload>` and `rel=modulepreload` with their own `as=`, `type` and `crossorigin`, and for the server to promote those existing declarations into `Link` response headers or a 103.
 That is what Cloudflare and Fastly do.
-It requires no guessing, cannot contradict the page, and is a much smaller piece of code than the one removed.
-It is worth building only where there is genuine backend think-time to fill, which a cache-first server usually does not have.
-
-See issue #93 for the full reasoning and the measurements.
+It needs no guessing, cannot contradict the page, and is a much smaller piece of code than the one removed.
+It is worth building only where there is backend think-time to fill, which a cache-first server usually does not have.
 
 ---
 
 ## 13. Comparative positioning
 
 m6-http is a **single-threaded, in-process-cached, TLS-terminating reverse proxy**.
-The response cache is an `Arc<Bytes>` LRU in the same heap as the TLS stack.
+The response cache is an `AHashMap` behind `Arc<RwLock<..>>` in the same heap as the TLS stack.
 A cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal.
 A cache held in a separate process, or in shared memory, adds an IPC round trip or a lock to that path.
 This one has neither, and the cached body reaches the TLS writer without an intermediate copy.
