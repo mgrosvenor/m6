@@ -1472,6 +1472,15 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 Every m6 log line is JSON, so `journalctl -u m6-http -o cat | jq .` parses every one.
 
+Under systemd each line is also one datagram on journald's native socket, carrying four fields beside the JSON: `PRIORITY` from the level, `M6_TYPE` from the line's `type`, `SYSLOG_IDENTIFIER` from the program's name and `MESSAGE` with the whole line.
+So the journal filters natively, and the JSON is still self-describing:
+
+```bash
+journalctl -u m6-http M6_TYPE=perf
+journalctl -u m6-http M6_TYPE=access --since -1h
+journalctl -u m6-http -o json M6_TYPE=perf | jq -r .MESSAGE | jq .
+```
+
 ### 7.8. Rotating the logs
 
 There is nothing to rotate in m6.

@@ -3,6 +3,7 @@
 //!
 //! Everything a service needs from the kernel is here, stated in the service's
 //! terms: readiness ([`Poll`]), the clock ([`now`] and [`wall`]),
+//! whether systemd owns stdout ([`journal_stream`]),
 //! a shutdown or reload request ([`Signals`]), a child's exit
 //! ([`ChildExit`]), sockets with the right options ([`net`]), facts about a
 //! process and the host ([`process`], [`host`]), the open-file limit, the
@@ -209,6 +210,22 @@ pub fn now() -> Instant {
 #[inline]
 pub fn wall() -> SystemTime {
     SystemTime::now()
+}
+
+// ── The service manager ──────────────────────────────────────────────────────
+
+/// Whether systemd started this process with its stdout on the journal.
+///
+/// systemd sets `JOURNAL_STREAM` to `<device>:<inode>` of the descriptor it
+/// wired stdout to, so a process answers this without asking the manager
+/// anything and without reading `/proc`. A launchd plist, a shell and a test
+/// harness set nothing, so the answer is `false` there.
+///
+/// The variable is a platform fact, so only this layer reads it: the gate
+/// refuses the name anywhere else in the workspace.
+#[inline]
+pub fn journal_stream() -> bool {
+    std::env::var_os("JOURNAL_STREAM").is_some_and(|value| !value.is_empty())
 }
 
 // ── Signals: a shutdown or reload request ────────────────────────────────────
@@ -526,6 +543,21 @@ pub fn create_private(file: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// systemd's own answer, and the empty value systemd never sets.
+    ///
+    /// The variable is spelled here and nowhere else outside this file, which
+    /// is what the gate enforces: a platform fact is read in the layer.
+    #[test]
+    fn the_journal_stream_variable_is_the_detection() {
+        std::env::remove_var("JOURNAL_STREAM");
+        assert!(!journal_stream(), "nothing set means no journal");
+        std::env::set_var("JOURNAL_STREAM", "9:1");
+        assert!(journal_stream(), "a device and inode mean the journal");
+        std::env::set_var("JOURNAL_STREAM", "");
+        assert!(!journal_stream(), "an empty value is not a journal");
+        std::env::remove_var("JOURNAL_STREAM");
+    }
 
     /// A candidate that exists but cannot be used is skipped.
     ///

@@ -92,11 +92,34 @@ Every line goes to the one Sink, stdout, which `m6_core::log::with_operational` 
 The access line is written with `Line` field by field, has no target, and its `type` is `access`.
 The metrics line and the traffic line are written the same way, with `type` `perf` and `traffic` and the targets `m6_http::stats` and `m6_http::traffic`.
 
-## One destination
+## The journal
 
-m6-log writes to stdout, and nothing else.
-Under systemd, stdout is the journal, and the journal rotates, so there is no file to rename and no signal to send.
+Under systemd, m6-log writes each line to journald's own socket instead of to stdout.
+The journal is still the destination, and the journal rotates, so there is no file to rename and no signal to send.
 A service that needs a file sets `StandardOutput=append:` in its unit and lets the journal own the rotation.
+
+Table 3 lists what one datagram carries.
+The wire format is the one `sd_journal_send` writes: the fields of one datagram, each `KEY=value`, separated by a newline, with a newline inside a value written as a backslash and an `n`.
+m6 writes that format directly and links no journal library.
+
+Table 3: the fields of one journal datagram.
+
+| field | value |
+|---|---|
+| `PRIORITY` | the level as a syslog priority: `3` error, `4` warning, `6` info, else `7` |
+| `M6_TYPE` | the line's `type`: `event`, `perf`, `access` or `traffic` |
+| `SYSLOG_IDENTIFIER` | the program's own name, from `argv[0]` |
+| `MESSAGE` | the whole JSON line, `type` included, as stdout would carry it |
+
+`journalctl M6_TYPE=perf` therefore reads the metrics lines without parsing JSON, and `journalctl -o json` carries the same fields to a remote journal.
+
+Detection is one platform fact, `m6_platform::journal_stream()`: systemd sets `JOURNAL_STREAM` on a unit whose stdout it wired to the journal, and nothing else sets it, so a shell, a launchd plist and a test harness all take the stdout path.
+A socket that cannot be opened at start prints one line on stderr and the process writes to stdout.
+A send that fails leaves that line to stdout, which under systemd is the same journal, and the process writes to stdout from then on: no line is dropped and none is sent twice.
+
+A datagram is capped at 64 KiB, the size a unix datagram carries on every supported kernel.
+A line that would need more is refused the way a line over the buffer maximum is refused: it counts as dropped and one line on stderr names the limit.
+`sd_journal_send` sends such a message through a `memfd` instead. m6 refuses it, because a refused line is visible in the dropped count and a second transport is not.
 
 ## Dropped-line counting
 
@@ -114,9 +137,9 @@ A terminal and a regular file never return `EAGAIN`, so neither is ever register
 ## The loop's calls
 
 A service's loop makes five calls: three while it runs and two at its edges.
-Table 3 lists them.
+Table 4 lists them.
 
-Table 3: the calls a service makes.
+Table 4: the calls a service makes.
 
 | call | where |
 |---|---|
@@ -133,9 +156,9 @@ A registration failure is logged and the loop serves on.
 
 ## What it copies
 
-Table 4 lists the behaviour m6-log borrows and the reason for each.
+Table 5 lists the behaviour m6-log borrows and the reason for each.
 
-Table 4: the behaviour m6-log copies from nginx and HAProxy.
+Table 5: the behaviour m6-log copies from nginx and HAProxy.
 
 | behaviour | taken from | reason |
 |---|---|---|

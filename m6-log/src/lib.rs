@@ -34,6 +34,7 @@
 
 #![deny(unsafe_code)]
 
+mod journal;
 mod line;
 mod macros;
 mod sink;
@@ -44,6 +45,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
+pub use journal::DATAGRAM_MAX;
 pub use line::{line_at, Field, Level, Line, Type};
 pub use sink::{set_limits, LogLimits, Sink, BUFFER_BYTES, BUFFER_MAX_BYTES, FIELD_MAX_BYTES};
 
@@ -64,7 +66,10 @@ static ANY_INIT: AtomicBool = AtomicBool::new(false);
 /// The Sink writes to stdout, non-blocking unless stdout is a terminal.
 /// Called once at start, before the loop.
 pub fn init(level: Level) -> io::Result<()> {
-    let operational = Sink::stdout()?;
+    let operational = match journal::Journal::open() {
+        Some(journal) => Sink::stdout()?.with_journal(journal),
+        None => Sink::stdout()?,
+    };
     LEVEL.with(|slot| slot.set(level));
     INITIALISED_HERE.with(|here| here.set(true));
     ANY_INIT.store(true, Ordering::Relaxed);
@@ -109,6 +114,13 @@ pub fn stop() -> io::Result<()> {
 /// large for a macro's, which is the metrics line and nothing else so far.
 pub fn with_operational(f: impl FnOnce(&mut Sink)) -> bool {
     __with_operational(f)
+}
+
+/// Whether this process writes native journal fields, for a test that has to
+/// say what it measured.
+#[doc(hidden)]
+pub fn writes_journal() -> bool {
+    journal::under_journal()
 }
 
 /// The operational Sink's descriptor, for a loop that watches it for

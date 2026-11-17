@@ -10,6 +10,7 @@ use std::io::{self, IsTerminal};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 
+use crate::journal::{Journal, Outcome, DATAGRAM_MAX};
 use crate::line::write_dropped_line;
 
 /// The default size of one Sink's buffer at start, in bytes.
@@ -56,6 +57,13 @@ impl LogLimits {
             "m6-log: the log buffer needs at least {needed} B, over [limits.log_buffer] max = {} in {}; raise max to fix this. A log line was refused.",
             kib(self.buffer_max),
             self.file
+        )
+    }
+
+    /// The error for a line whose journal datagram is over the socket's limit.
+    pub fn datagram_refusal(&self, needed: usize) -> String {
+        format!(
+            "m6-log: a log line needs a {needed} B journal datagram, over the {DATAGRAM_MAX} B socket limit; the line was refused and counted as dropped. Shorten the line."
         )
     }
 
@@ -148,6 +156,9 @@ pub struct Sink {
     fd: RawFd,
     /// The file behind `fd`, when this sink is a file.
     file: Option<File>,
+    /// The journal's socket, when this process writes native journal fields.
+    /// A failed send clears it, and the bytes go to stdout from then on.
+    journal: Option<Journal>,
     /// The flags `fd` had before `Sink::stdout` changed them, restored by
     /// [`Sink::finish`].
     original_nonblocking: Option<bool>,
@@ -188,6 +199,7 @@ impl Sink {
             commit: 0,
             fd: 1,
             file: None,
+            journal: None,
             original_nonblocking: original,
             blocked: false,
             dropped: 0,
@@ -241,6 +253,7 @@ impl Sink {
             commit: 0,
             fd,
             file: Some(file),
+            journal: None,
             original_nonblocking: None,
             blocked: false,
             dropped: 0,
@@ -250,6 +263,16 @@ impl Sink {
             lines: 0,
             written: 0,
         })
+    }
+
+    /// Write the lines to the journal's native socket, one datagram each.
+    ///
+    /// Returns the sink, with the journal attached, when this process is
+    /// under systemd. stdout keeps the flags [`Sink::stdout`] set, because a
+    /// failed send falls back to it in the same process.
+    pub(crate) fn with_journal(mut self, journal: Journal) -> Sink {
+        self.journal = Some(journal);
+        self
     }
 
     /// The descriptor to watch for writability while [`Sink::wants_write`].
@@ -290,6 +313,12 @@ impl Sink {
     pub fn finish(&mut self) -> io::Result<()> {
         if let Some(was) = self.original_nonblocking.take() {
             m6_platform::fd::set_nonblocking(&std::io::stdout(), was)?;
+        }
+        if self.journal.is_some() {
+            // One non-blocking pass. A line the journal would not take is
+            // written to stdout below, where blocking is allowed.
+            self.try_write();
+            self.journal = None;
         }
         let mut result = self.write_all_blocking();
         if result.is_ok() && self.dropped > self.reported {
@@ -455,6 +484,9 @@ impl Sink {
             self.blocked = false;
             return;
         }
+        if self.journal.is_some() && self.write_journal() {
+            return;
+        }
         let mut written = 0;
         let mut failed = false;
         let mut full = false;
@@ -494,6 +526,67 @@ impl Sink {
         if self.commit == 0 {
             self.refusal_noted = false;
         }
+    }
+
+    /// One pass over the complete lines as journal datagrams.
+    ///
+    /// Answers true when every complete line left the buffer. Answers false
+    /// when a send failed, after switching the sink to stdout: the lines that
+    /// were not sent are still buffered, and the caller writes them to stdout
+    /// as bytes.
+    fn write_journal(&mut self) -> bool {
+        let mut sent = 0;
+        let mut lost = 0u64;
+        let mut refused = 0usize;
+        while sent < self.commit {
+            let Some(end) = self.buf[sent..self.commit]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map(|at| sent + at + 1)
+            else {
+                break;
+            };
+            let outcome = {
+                let journal = self
+                    .journal
+                    .as_mut()
+                    .expect("write_journal runs with a journal");
+                journal.send(&self.buf[sent..end - 1])
+            };
+            match outcome {
+                Outcome::Sent => sent = end,
+                Outcome::Refused { needed } => {
+                    lost += 1;
+                    refused = needed;
+                    sent = end;
+                }
+                Outcome::Failed => {
+                    // The same bytes go to stdout, which under systemd is the
+                    // same journal. Nothing is dropped and nothing is sent
+                    // twice: the lines already sent leave the buffer here.
+                    self.move_front(sent);
+                    self.dropped += lost;
+                    self.journal = None;
+                    self.note_datagram_refusal(refused);
+                    return false;
+                }
+            }
+        }
+        self.move_front(sent);
+        self.dropped += lost;
+        self.note_datagram_refusal(refused);
+        self.blocked = false;
+        true
+    }
+
+    /// One line on stderr the first time a datagram is too long, naming the
+    /// limit, as an oversized buffer names its own.
+    fn note_datagram_refusal(&mut self, needed: usize) {
+        if needed == 0 || self.refusal_noted {
+            return;
+        }
+        self.refusal_noted = true;
+        eprintln!("{}", self.limits.datagram_refusal(needed));
     }
 
     /// Advance `reported` once the bytes of a dropped-count line have drained.

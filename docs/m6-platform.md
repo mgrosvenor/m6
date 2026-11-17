@@ -84,7 +84,8 @@ Table 2 lists them.
 Table 2: what a service needs from its manager and how each one provides it.
 
 m6 never talks to a service manager and never relies on one to create anything.
-No binary reads `CREDENTIALS_DIRECTORY`, `NOTIFY_SOCKET`, `LISTEN_FDS`, `WATCHDOG_USEC`, `INVOCATION_ID`, `JOURNAL_STREAM`, `STATE_DIRECTORY` or `RUNTIME_DIRECTORY`, and the gate refuses a read of any of them.
+No binary reads `CREDENTIALS_DIRECTORY`, `NOTIFY_SOCKET`, `LISTEN_FDS`, `WATCHDOG_USEC`, `INVOCATION_ID`, `STATE_DIRECTORY` or `RUNTIME_DIRECTORY`, and the gate refuses a read of any of them.
+`JOURNAL_STREAM` is the one exception, read here and nowhere else: `journal_stream()` answers whether systemd wired stdout to the journal, and m6-log writes journald's native socket when it did.
 A path a service needs comes from its config, and the rule above is what makes the same binary run under either manager.
 
 ## 4. Future ports
