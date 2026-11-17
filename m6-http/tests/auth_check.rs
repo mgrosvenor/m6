@@ -35,9 +35,9 @@ fn identity(groups: &[&str]) -> Identity {
 // ── TLS client, copied from auth_paths ────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .ok();
+    // No provider is named. The workspace enables one, so the automatic
+    // builder installs it. Naming one here would fail to compile on the
+    // feature set that enables the other.
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();

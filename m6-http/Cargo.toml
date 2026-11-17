@@ -165,7 +165,11 @@ rcgen         = "0.13"
 # dev-dependencies, so the bench is a [[bench]] and they live here.
 h2             = "0.4"
 tokio          = { version = "1", features = ["rt", "net", "io-util", "macros"] }
-tokio-rustls   = "0.26"
+# The provider comes from this crate's rustls features, not from tokio-rustls.
+# Its defaults enable `aws_lc_rs`, which with the `ring` this tree names would
+# give rustls two providers and make `ClientConfig::builder()` panic. On the
+# aws-lc-rs tree the same line leaves exactly one, its own.
+tokio-rustls   = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 http           = "1"
 
 [[bench]]
