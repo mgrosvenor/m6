@@ -6881,6 +6881,11 @@ fn probe_auth_backend(pool: &m6_http_lib::pool::BackendPool) -> Result<(), Strin
 ///
 /// Start only, so a blocking connect and a socket deadline are the point. The
 /// request path never calls this: it uses the reactor.
+///
+/// The deadline is one wall clock for the write and every read, set from what
+/// is left of it before each operation. A peer that sends one byte every
+/// 100 ms cannot extend it. Before, `AUTH_PROBE_TIMEOUT` was a per-read socket
+/// timeout, so that peer held the start for 8192 bytes at 100 ms each.
 #[allow(
     clippy::disallowed_methods,
     reason = "start-only probe: a blocking connect and a socket deadline are deliberate here"
@@ -6888,15 +6893,20 @@ fn probe_auth_backend(pool: &m6_http_lib::pool::BackendPool) -> Result<(), Strin
 fn probe_check_member(member: &std::path::Path) -> std::io::Result<u16> {
     use std::io::{Read, Write};
 
+    let deadline = m6_core::platform::now() + AUTH_PROBE_TIMEOUT;
     let mut stream = m6_core::platform::net::connect_unix(member)?;
     // `connect_unix` is the reactor's non-blocking connect. This probe reads
     // one answer and exits, so it needs the blocking mode for the socket
     // timeouts to mean anything.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(AUTH_PROBE_TIMEOUT))?;
-    stream.set_write_timeout(Some(AUTH_PROBE_TIMEOUT))?;
     let mut request = Vec::with_capacity(128);
     auth::encode_check_request(&mut request, None);
+    // The read timeout is set before the write. macOS refuses `SO_RCVTIMEO`
+    // on a Unix socket whose peer has already closed, with EINVAL, and a fast
+    // checker can answer and close between the write and the first read.
+    let first = probe_remaining(deadline)?;
+    stream.set_read_timeout(Some(first))?;
+    stream.set_write_timeout(Some(first))?;
     stream.write_all(&request)?;
 
     let mut head = Vec::with_capacity(256);
@@ -6905,9 +6915,26 @@ fn probe_check_member(member: &std::path::Path) -> std::io::Result<u16> {
         if head.len() > 8192 {
             break;
         }
+        let left = probe_remaining(deadline)?;
+        match stream.set_read_timeout(Some(left)) {
+            Ok(()) => {}
+            // The peer closed before this read. Stop and parse what arrived.
+            // A complete head is still an answer, and an incomplete one is the
+            // same "no HTTP status" warning a peer that closed early gets.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => break,
+            Err(e) => return Err(e),
+        }
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => head.extend_from_slice(&buf[..n]),
+            // `SO_RCVTIMEO` reports the timeout as `WouldBlock` on one target
+            // and as `TimedOut` on the other. Both are this probe's deadline.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(probe_deadline_error());
+            }
             Err(e) => return Err(e),
         }
     }
@@ -6925,6 +6952,27 @@ fn probe_check_member(member: &std::path::Path) -> std::io::Result<u16> {
             String::from_utf8_lossy(&head)
         ))
     })
+}
+
+/// What is left of the probe's one deadline, as an error once it has passed.
+///
+/// `AUTH_PROBE_TIMEOUT` is a wall clock for the whole probe. A socket timeout
+/// is per operation, so every operation gets the time that is left rather than
+/// the whole bound.
+fn probe_remaining(deadline: std::time::Instant) -> std::io::Result<std::time::Duration> {
+    let left = deadline.saturating_duration_since(m6_core::platform::now());
+    if left.is_zero() {
+        return Err(probe_deadline_error());
+    }
+    Ok(left)
+}
+
+/// The probe's one deadline, as the error `probe_auth_backend` warns about.
+fn probe_deadline_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the auth probe deadline passed",
+    )
 }
 
 fn main() {

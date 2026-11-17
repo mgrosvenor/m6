@@ -574,6 +574,7 @@ Three gates still decide locally until step 6: `/perf`, `/traffic` and a source 
 The key keeps its name and stays optional.
 It must name a `[[backend]]` with `sockets`, and a `url` backend is refused by name.
 The probe sends one `POST /check` with no credential: 401 or 503 passes, 404 stops the start and names the setting, the backend and the socket, and a refused connection or timeout warns and the node starts.
+The probe's 2 s is one wall deadline across the write and every read, so a peer that answers one byte every 100 ms times out at 2 s instead of holding the start for 8192 reads.
 When every member answered something other than 401, 503 or 404, the start stops and names the backend.
 Nothing on a request path calls `/check` yet, so `public_key` alone still verifies a token.
 A config that named a content backend, such as `backend = "m6-file"`, now stops at start with exit 2, which is the probe doing its job.

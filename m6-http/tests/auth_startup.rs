@@ -9,6 +9,13 @@
 //! process, so the test serves one probe connection with `serve_one` while the
 //! child starts.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: the dribbling peer sleeps between bytes and its listener blocks, while a child process is driven from outside"
+)]
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -261,4 +268,92 @@ fn a_403_from_the_check_backend_exits_2() {
         "output:\n{output}"
     );
     assert!(output.contains("403"), "output:\n{output}");
+}
+
+/// The time of day, in seconds, of the first log line carrying `needle`.
+fn seconds_of_day(output: &str, needle: &str) -> f64 {
+    let line = output
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no line carrying {needle:?}\n--- output ---\n{output}"));
+    let stamp = line
+        .split("\"timestamp\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("no timestamp on {line}"));
+    let time = stamp
+        .split('T')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no time in {stamp}"))
+        .trim_end_matches('Z');
+    let mut parts = time.split(':');
+    let hours: f64 = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let minutes: f64 = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let seconds: f64 = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+    hours * 3600.0 + minutes * 60.0 + seconds
+}
+
+/// A peer that answers one byte every 100 ms and never completes the head.
+fn dribbling_peer(path: &Path) -> std::thread::JoinHandle<()> {
+    let listener = UnixListener::bind(path).expect("bind the dribbling peer");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        if stream.write_all(b"HTTP/1.1 200 OK\r\nX-Pad: ").is_err() {
+            return;
+        }
+        // One byte every 100 ms, never completing the head. The read that
+        // returns when the edge closes is what ends this loop.
+        for _ in 0..200 {
+            if stream.write_all(b"a").is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+}
+
+/// One byte every 100 ms must not hold the start.
+///
+/// The wrong outcome this catches: `AUTH_PROBE_TIMEOUT` as a per-read socket
+/// timeout. Before, this peer held the start for 8192 bytes at 100 ms each,
+/// which is why the deadline is now one wall clock across the write and every
+/// read. The probe cannot complete an answer, so it times out and takes the
+/// warn-and-start path: a checker mid-restart is transient, and the node still
+/// serves public and cached traffic.
+#[test]
+fn a_dribbling_peer_does_not_extend_the_probe_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = check_socket(dir.path());
+    let dribbler = dribbling_peer(&path);
+    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+
+    let mut svc = spawn(&configs);
+    svc.wait_for_started(STARTED);
+    let output = svc.output();
+    assert!(
+        output.contains("not reachable at start"),
+        "the probe did not warn and start\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("deadline passed"),
+        "the warning did not name the deadline\n--- output ---\n{output}"
+    );
+    // The service's own two timestamps, so a slow process start on a loaded
+    // host is not counted as probe time. The pool line is written before the
+    // probe, the started line after the listeners bind.
+    let found = seconds_of_day(&output, "socket found");
+    let started = seconds_of_day(&output, "m6-http started");
+    let probe_s = started - found;
+    assert!(
+        probe_s < 4.0,
+        "the probe took {probe_s:.3}s for a peer that answers one byte per 100 ms, with a 2 s deadline\n--- output ---\n{output}"
+    );
+    let status = stop(svc);
+    assert_eq!(status.code(), Some(0), "the node did not stop cleanly");
+    dribbler.join().expect("the dribbling peer");
 }
