@@ -147,11 +147,10 @@ impl Version {
 ///
 ///   internal  the listener `[server] internal_binds` names. The socket decides
 ///             this, whatever peer address it carries.
-///   monitor   a response from `/health`, `/perf` or `/traffic` (the backend
-///             name says so), or a request on the TLS or QUIC listener whose
-///             peer is on the private network. A real visitor reaches that listener
-///             from a public address after NAT, and the monitor runs on the
-///             private network.
+///   monitor   a response from `/health` (the backend name says so), or a
+///             request on the TLS or QUIC listener whose peer is on the private
+///             network. A real visitor reaches that listener from a public
+///             address after NAT, and the monitor runs on the private network.
 ///   external  every other request.
 ///
 /// `crate::health::peer_iface` applies the peer half at the call site, where the
@@ -418,7 +417,7 @@ impl ChannelStats {
     /// A monitor poll touches no cache and has no hit or miss, so only
     /// `requests` moves. The per-channel display skips a channel whose hit and
     /// miss counts are both zero, which keeps the monitor out of the visitor
-    /// rows while `/perf` still carries the count.
+    /// rows while the metrics document still carries the count.
     fn record_monitor(&mut self) {
         self.requests += 1;
     }
@@ -506,9 +505,10 @@ pub struct Stats {
     // ── These are NOT reset on emit, and that is the fix for a real defect ──
     //
     // They used to be. `maybe_emit` set every `_idx` and `_count` back to 0
-    // every ten seconds, and `snapshot()` -- which is what `/perf` serves --
-    // read those same fields. So `/perf` reported the percentiles of whatever
-    // fraction of a ten-second window happened to be open when it was scraped.
+    // every ten seconds, and `snapshot()`, which is what the metrics line
+    // carries, read those same fields. So `/perf` reported the percentiles of
+    // whatever fraction of a ten-second window happened to be open when it was
+    // scraped.
     //
     // **On a site taking a couple of requests a minute that is almost always
     // nothing.** Observed on origin, 2026-09-14: `cache_hits_total: 338` beside
@@ -574,15 +574,16 @@ pub struct Stats {
     pub rps_peak: u64,
     window_start: Instant,
     last_emit: Instant,
-    /// How often the periodic line is emitted and `/perf`'s loop trace is
-    /// refreshed. `EMIT_INTERVAL_SECS` in production.
+    /// How often the periodic line is emitted and the metrics document's loop
+    /// trace is refreshed. `EMIT_INTERVAL_SECS` in production.
     emit_interval: std::time::Duration,
     /// How often the traffic summary line is written, and when the last one
     /// was. Its own cadence because that report describes an hour and this
     /// line reports a ten-second window.
     traffic_interval: std::time::Duration,
     last_traffic_emit: Instant,
-    /// The loop trace, copied on the accounting tick and served by `/perf`.
+    /// The loop trace, copied on the accounting tick and carried in the
+    /// metrics document.
     event_loop: [m6_core::event::TriggerReport; 16],
     event_loop_len: usize,
 }
@@ -679,8 +680,8 @@ impl Stats {
         // nothing below touches the traffic counters. Two signals make a
         // request a monitor poll and both are already in hand:
         //
-        //   the path    `/health`, `/perf` and `/traffic` answer from local
-        //               state and are tagged with a monitoring backend name.
+        //   the path    `/health` answers from local state and is tagged with
+        //               a monitoring backend name.
         //   the peer    a request on the TLS or QUIC listener from a local
         //               address arrived on the monitor network, and the
         //               serving path classified it `Iface::Monitor` before it
@@ -870,9 +871,9 @@ impl Stats {
             miss_p50_ns = mp50,
             miss_p99_ns = mp99,
             miss_max_ns = mp100,
-            // Monitoring endpoints, deliberately outside every counter above.
-            // Reported so a monitor that stops polling, or one that starts
-            // flooding, is visible; a reader can tell those apart from a
+            // The monitoring population, deliberately outside every counter
+            // above. Reported so a monitor that stops polling, or one that
+            // starts flooding, is visible. A reader can tell those apart from a
             // traffic change because these never move the traffic figures.
             monitor_requests = self.window_monitor_requests,
             monitor_p50_ns = kp50,
@@ -1067,8 +1068,9 @@ fn percentiles_n(samples: &[u64], n: usize) -> (u64, u64, u64, u64) {
 ///
 /// Returns `(p0, p50, p99, p100)`, and `(0, 0, 0, 0)` when there is nothing to
 /// measure. The caller reports the sample count beside these, which is what
-/// distinguishes "0 ns" from "not measured" -- a distinction this endpoint
-/// needs, because it had been reporting the first while meaning the second.
+/// distinguishes "0 ns" from "not measured". This report needs that
+/// distinction, because it had been reporting the first while meaning the
+/// second.
 fn percentiles_ring(
     samples: &[u64; RESERVOIR],
     idx: usize,
@@ -1691,15 +1693,16 @@ mod backend_error_attribution_tests {
     }
 }
 
-/// `/perf` must report the latency it measured, not the latency of whichever
-/// ten-second window happened to be open when it was scraped.
+/// The metrics document must report the latency it measured, not the latency of
+/// whichever ten-second window happened to be open when it was scraped.
 ///
 /// ## The defect these cover
 ///
 /// `maybe_emit` reset `hit_idx` and `hit_count` to 0 every ten seconds, and
-/// `snapshot()` -- which is what `/perf` serves -- read those same fields. On a
-/// site taking a couple of requests a minute, almost every ten-second window
-/// holds no cache hit at all, so `/perf` reported zeros essentially always.
+/// `snapshot()`, which is what the metrics line carries, read those same
+/// fields. On a site taking a couple of requests a minute, almost every
+/// ten-second window holds no cache hit at all, so `/perf` reported zeros
+/// essentially always.
 ///
 /// Observed on origin, 2026-09-14: `cache_hits_total: 338` beside `hit_samples: 0,
 /// hit_p50_ns: 0, hit_p99_ns: 0`. m6-monitor turned zero samples into `null`,
@@ -1708,8 +1711,8 @@ mod backend_error_attribution_tests {
 ///
 /// Nothing caught it because every existing test recorded samples and read them
 /// back **without an emit in between**, which is the one ordering where the old
-/// code was correct. `an_emit_does_not_erase_what_perf_reports` is the test that
-/// was missing, and it fails against the old implementation.
+/// code was correct. `an_emit_does_not_erase_what_the_document_reports` is the
+/// test that was missing, and it fails against the old implementation.
 #[cfg(test)]
 mod perf_reservoir_tests {
     use super::*;
@@ -1727,7 +1730,7 @@ mod perf_reservoir_tests {
     /// The regression test. An emit between the traffic and the scrape used to
     /// leave `/perf` with nothing.
     #[test]
-    fn an_emit_does_not_erase_what_perf_reports() {
+    fn an_emit_does_not_erase_what_the_document_reports() {
         let mut s = Stats::new();
         for ns in [1_000, 2_000, 3_000, 4_000, 5_000] {
             hit(&mut s, ns);
@@ -1740,8 +1743,9 @@ mod perf_reservoir_tests {
         let snap = s.snapshot();
         assert_eq!(
             snap.hit_samples, 5,
-            "the emit cleared the reservoir /perf reads. This is the defect: \
-             m6-monitor showed null latency on every node because of it."
+            "the emit cleared the reservoir the metrics document reads. This \
+             is the defect: m6-monitor showed null latency on every node \
+             because of it."
         );
         assert!(
             snap.hit_p50_ns > 0,
@@ -1781,11 +1785,13 @@ mod perf_reservoir_tests {
             s.hit_window_added, 1,
             "new traffic belongs to the new window"
         );
-        // And the ring kept everything, which is what /perf now reads.
+        // And the ring kept everything, which is what the metrics document
+        // now reads.
         assert_eq!(s.snapshot().hit_samples, 4);
     }
 
-    /// The window view and the `/perf` view genuinely differ after an emit.
+    /// The window view and the metrics document's view genuinely differ after
+    /// an emit.
     ///
     /// Both are computed from one reservoir now, so this is what proves the two
     /// readers are not accidentally sharing an answer.
@@ -1809,7 +1815,10 @@ mod perf_reservoir_tests {
             "the window should see only the slow samples"
         );
         let snap = s.snapshot();
-        assert_eq!(snap.hit_samples, 20, "/perf should see both windows");
+        assert_eq!(
+            snap.hit_samples, 20,
+            "the metrics document should see both windows"
+        );
         assert!(
             snap.hit_p50_ns >= 1_000 && snap.hit_p50_ns <= 9_000,
             "lifetime p50 {} should sit between the two regimes",

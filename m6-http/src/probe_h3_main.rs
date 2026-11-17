@@ -1,7 +1,7 @@
 //! m6-probe-h3 -- N sequential QUIC handshakes, timed to `is_established()`.
 //!
-//! One job. Comparable to the `http/3/*` channel on m6-http's `/perf`, which
-//! times the same span.
+//! One job. Comparable to the `http/3/*` channel in m6-http's metrics document,
+//! which times the same span.
 //!
 //! This figure is NOT comparable to the h1 and h2 probes, and the difference is
 //! not a detail. QUIC folds transport and crypto together, so this includes the

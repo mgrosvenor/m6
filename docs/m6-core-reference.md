@@ -841,16 +841,18 @@ state, so a dead member is found when a request connects to it and that request
 takes the next member.
 
 `PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`,
-`is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.
+`is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`.
 
-`PerfReport::build_authorised` builds the report with no access check, for a
-caller that has already passed the one token check.
+`PerfReport::build_authorised` builds the report with no access check, for the
+periodic metrics line.
 `PerfOutcome::Unauthorised` and `PerfOutcome::Forbidden` answer with
 `m6_core::http::token_refusal`, the one definition of a token check's refusal:
 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` for no or a bad
 credential, 403 `{"error":"forbidden"}` for the wrong role or group.
-m6-http uses these for `[health] metrics_require` and `metrics_peers`, described
-in `docs/m6-http.md`.
+No m6-http route serves the metrics document, so only the tests construct these
+two variants.
+m6-http uses `is_monitoring_endpoint` to keep a `/health` poll out of the site
+counters, described in `docs/m6-http.md`.
 
 `PerfReport.tls` carries the served certificate chain, how long each
 certificate has left, and each certificate's SHA-256 fingerprint, from
@@ -970,7 +972,7 @@ A path on disk and the certificate a running process is serving are different
 facts, and a renewal that wrote a new file without restarting the server is
 exactly the case where they disagree.
 `record_loaded` is therefore called by whatever loads the certificate, and
-`loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
+`loaded()` opens nothing, so building the metrics document cannot be made to do
 disk work.
 
 | behaviour | why |

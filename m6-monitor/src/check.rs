@@ -566,11 +566,11 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
 
         // The firewall, which this report has been receiving and discarding.
         //
-        // `/traffic` has carried `firewall: Option<FirewallState>` all along and
-        // nothing rendered it. That was reasonable until 2026-09-15: the collector
-        // that writes /var/lib/m6/firewall.json was written, tested and deployed
-        // nowhere, so every node returned `firewall: null` and there was nothing
-        // to print. It is installed now.
+        // The traffic document has carried `firewall: Option<FirewallState>`
+        // all along and nothing rendered it. That was reasonable until
+        // 2026-09-15: the collector that writes /var/lib/m6/firewall.json was
+        // written, tested and deployed nowhere, so every node returned
+        // `firewall: null` and there was nothing to print. It is installed now.
         //
         // Blocks that have dropped NOTHING are not printed individually. A block
         // at zero has done its job -- whoever it was aimed at stopped coming -- and
@@ -835,7 +835,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             }
         }
         // The kernel's own count of what the tunnel interface refused to carry,
-        // from each node's /perf, when the node reported it.
+        // from each node's metrics document, when the node reported it.
         for (n, r) in d.nodes.iter().zip(readings) {
             let Some(p) = &r.perf else { continue };
             for dev in p.host.net.iter().filter(|dev| dev.name.starts_with("wg")) {
@@ -1395,7 +1395,7 @@ mod tests {
     #[test]
     fn no_traffic_data_is_unknown_not_ok() {
         let mut r = reading("edge-b", None);
-        r.traffic_error = Some("404: /traffic not available on this node".into());
+        r.traffic_error = Some("no traffic line in the journal for this node".into());
         let out = render(&digest(), &[r]);
         assert!(out.contains("unknown"), "{out}");
         assert!(!out.contains("edge-b   ok"), "{out}");

@@ -36,11 +36,11 @@
 //! # Where this lives
 //!
 //! In core because core is the only crate a service links. **`m6-http` must
-//! never call it.** A monitoring endpoint that performs a network round trip
-//! is a monitoring endpoint that learns to hang, which is why `/perf` reports
-//! URL backends by presence and never by reachability. The one caller is
-//! `m6-monitor`, whose own loop is a monitor's job: it already talks to every
-//! node with a deadline, and going to look is the point of it.
+//! never call it.** A monitoring path that performs a network round trip is a
+//! monitoring path that learns to hang, which is why the metrics document
+//! reports URL backends by presence and never by reachability. The one caller
+//! is `m6-monitor`, whose own loop is a monitor's job: it already talks to
+//! every node with a deadline, and going to look is the point of it.
 //!
 //! [`Ptr`] is re-exported here because callers name `resolve::Ptr` and this
 //! page states the rule.

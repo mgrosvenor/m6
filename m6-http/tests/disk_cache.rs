@@ -367,8 +367,8 @@ impl Stack {
             .arg(&self.cache_system)
             .env("RUST_LOG", "debug")
             // Test instrumentation: a debug build may shorten the stats
-            // interval, so `/perf` has a loop trace to report while a test
-            // runs. A release build ignores the variable.
+            // interval, so the metrics document has a loop trace to report
+            // while a test runs. A release build ignores the variable.
             .env("M6_TEST_STATS_INTERVAL_SECS", "1")
             .stdin(Stdio::null())
             .current_dir(self.d());

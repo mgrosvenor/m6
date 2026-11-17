@@ -193,8 +193,8 @@ fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
         Some(TOKEN_UDP) => 3,
         Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) | Some(TOKEN_STATUS_LISTENER) => 0,
         Some(TOKEN_SIGNAL) => 4,
-        // A log drain is the loop's own bookkeeping, named so /perf does not
-        // report it as a timeout that did not happen.
+        // A log drain is the loop's own bookkeeping, named so the metrics
+        // document does not report it as a timeout that did not happen.
         Some(TOKEN_LOG) => 6,
         Some(Token(k)) => match sources.get(k) {
             Source::TlsConn(_) | Source::H2cConn(_) => 1,
@@ -312,10 +312,11 @@ struct ServerState {
     /// answers. `None` once it is kept, discarded or installed unverified.
     pending_disk: Option<disk_cache::Loaded>,
     /// How many entries the start-time load inserted, and how many files it
-    /// deleted, for `/perf`.
+    /// deleted, for the metrics document.
     loaded_entries: usize,
     loaded_bad: usize,
-    /// What the first heartbeat decided about the load, for `/perf`.
+    /// What the first heartbeat decided about the load, for the metrics
+    /// document.
     disk_state: disk_cache::LoadState,
     error_mode: ErrorMode,
     stats: Stats,
@@ -390,16 +391,16 @@ struct ServerState {
     ///
     /// Keyed by status, so at most a handful of entries ever.
     error_pages: HashMap<u16, CachedErrorPage>,
-    /// When this process began serving, for the health endpoint's uptime.
+    /// When this process began serving, for the metrics document's uptime.
     ///
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
     /// correction, a VM resuming) cannot make uptime jump or go negative.
     started: std::time::Instant,
-    /// The last events this process logged, for `/traffic`.
+    /// The last events this process logged, for the traffic report.
     ///
     /// A ring allocated at start, pushed once per logged event and never
-    /// allocated while serving. `/traffic` builds its report from it, so the
-    /// analytics log is not read inside the loop.
+    /// allocated while serving. The report builds from it, so the analytics log
+    /// is not read inside the loop.
     traffic: health::TrafficWindow,
     /// Reused buffer a cache lookup builds its key into, so a lookup never
     /// allocates. Capacity 512 matches the old stack buffer's bound.
@@ -460,7 +461,8 @@ impl ServerState {
 }
 
 impl ServerState {
-    /// The disk-cache block `/perf` reports, when this node has a directory.
+    /// The disk-cache block the metrics document reports, when this node has a
+    /// directory.
     fn disk_perf(&self) -> Option<health::DiskPerf<'_>> {
         self.disk.as_ref().map(|writer| health::DiskPerf {
             writer,
@@ -471,18 +473,17 @@ impl ServerState {
         })
     }
 
-    /// The `/perf` document, exactly as the endpoint answers it.
+    /// The metrics document, exactly as the metrics line carries it.
     ///
-    /// One builder for the endpoint and for the periodic metrics line, so a
-    /// metric added to either is on both. That is the reason the line carries
-    /// this document rather than a second list of fields: two copies of a
-    /// metric list is how a metric gets added to one and not the other.
+    /// One builder, so a metric added to it is on the line. That is the reason
+    /// the line carries this document rather than a second list of fields: two
+    /// copies of a metric list is how a metric gets added to one and not the
+    /// other.
     ///
     /// Allocation: the report build sorts the reservoirs, reads the host and
     /// the TLS registry, and this path also builds one JSON value so the
     /// generation and disk blocks can join the report's own object. It runs on
-    /// the accounting tick and on an authorised `/perf` request, and never on
-    /// an ordinary request.
+    /// the accounting tick and never on an ordinary request.
     fn perf_document(&self) -> serde_json::Value {
         let pools: Vec<health::PoolHealth> = self
             .pool_manager
@@ -2504,7 +2505,8 @@ fn follower_answered(
             // the ID is unchanged, so nothing is flushed. The operator saw the
             // "served unverified" warning when the first answer timed out, so
             // this transition writes the same "kept" line the settle path
-            // writes. Without it `/perf` says kept and the log never does.
+            // writes. Without it the metrics document says kept and the log
+            // never does.
             if state.disk_state == disk_cache::LoadState::Unverified {
                 state.disk_state = disk_cache::LoadState::Kept;
                 if let Some(id) = state.genid.cache().and_then(|f| f.current()) {
@@ -3311,7 +3313,7 @@ fn event_loop(
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
         // On the emit, copy the loop trace into the snapshot, then write the
-        // metrics line: the whole document `/perf` answers, to stdout, which
+        // metrics line: the whole metrics document, to stdout, which
         // journald carries like every other operational line.
         //
         // Order matters once: the event-loop figures are copied into the
@@ -4211,8 +4213,8 @@ fn handle_h3_request(
             set_alt_svc(&mut resp_headers, h3.quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
-            // /health and /perf are separated inside `Stats::record`, and a
-            // poll on any other path is separated here by the peer address.
+            // /health is separated inside `Stats::record`, and a poll on any
+            // other path is separated here by the peer address.
             let chan = Channel::new(
                 HttpVersion::Http3,
                 health::peer_iface(qconn.client_addr.ip()),
@@ -5038,7 +5040,7 @@ fn handle_request_inner(
     // True when this request arrived on the h2c listener and [server]
     // internal_binds names it, meaning one of our own nodes over the backbone
     // rather than a public client. Granted by the listener, never by a header, so a public
-    // client cannot claim it. The error-path guard and the metrics gate read it.
+    // client cannot claim it. The error-path guard and the genid gate read it.
     from_internal: bool,
     registry: &m6_core::platform::Registry,
     pre_decided: Option<PreDecided>,
@@ -5460,11 +5462,11 @@ fn handle_request_inner(
     // answer and no second check is sent.
     //
     // The representation is this block's only choice. An API caller gets the
-    // check's refusal unchanged, the same status, headers and body `/perf`,
-    // `/traffic` and `/genid` answer. A browser is a route-level choice made
-    // on top of that decision: no credential redirects to login (or to the
-    // refresh path, when it still holds a refresh cookie), and a credential
-    // lacking the role gets the site's own 403 page rather than JSON.
+    // check's refusal unchanged, the same status, headers and body `/genid`
+    // answers. A browser is a route-level choice made on top of that decision:
+    // no credential redirects to login (or to the refresh path, when it still
+    // holds a refresh cookie), and a credential lacking the role gets the
+    // site's own 403 page rather than JSON.
     if let Some(ref require) = route.require {
         let auth_backend = auth_backend_name(state);
         let plan = CheckPlan {

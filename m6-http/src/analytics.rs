@@ -213,7 +213,7 @@ fn extract_features<'a>(headers: &'a (impl HeaderSource + ?Sized)) -> RequestFea
     }
 }
 
-/// Push one served request into `/traffic`'s window.
+/// Push one served request into the traffic window.
 ///
 /// `record` and `finish_proxied_response` log the same request shape, so they
 /// read the time and the fields in one place.
@@ -398,11 +398,11 @@ fn write_request_line(
         .end();
 }
 
-/// Record a poll of `/health` or `/perf`.
+/// Record a `/health` poll.
 ///
-/// They short-circuit inside `handle_request` and return before the analytics
-/// call further down, and the stats counters skip them at three separate call
-/// sites. Without a row of their own they appear nowhere at all, which keeps
+/// It short-circuits inside `handle_request` and returns before the analytics
+/// call further down, and the stats counters skip it inside `Stats::record`.
+/// Without a row of its own it appears nowhere at all, which keeps
 /// site traffic honest but makes the monitoring itself invisible: a check that
 /// has silently stopped looks exactly like a check that is passing, and a flood
 /// aimed at `/health` is recorded nowhere.

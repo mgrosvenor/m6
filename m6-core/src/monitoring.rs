@@ -1,8 +1,15 @@
-//! The `/health` and `/perf` endpoints: what they publish, and why so little.
+//! The `/health` endpoint and the two documents a monitor reads: what they
+//! carry, and why so little.
 //!
-//! Answered inside m6-http before routing, the cache and any backend, so it
-//! costs a JSON serialisation and nothing else. It exists so that an uptime
-//! monitor has something better to hit than a real page.
+//! `/health` is answered inside m6-http before routing, the cache and any
+//! backend, so it costs a JSON serialisation and nothing else. It exists so
+//! that an uptime monitor has something better to hit than a real page.
+//!
+//! The metrics and traffic documents are built by the same process and written
+//! on its operational log lines, one line each, with `M6_TYPE` set to `perf` or
+//! `traffic`. A monitor reads them from mon's journal. This module holds their
+//! types because the node that writes a document and the monitor that reads it
+//! must agree on the shape.
 //!
 //! # Why not just monitor `/`
 //!
@@ -55,11 +62,11 @@
 //! change the answer. A request that connects to a dead member takes the next
 //! member, and that is where the failure is found.
 //!
-//! # Two endpoints, because they have opposite requirements
+//! # Why the figures are not on `/health`
 //!
-//! `/health` answers `ok` or `degraded`. `/perf` answers counters and latency
-//! percentiles. They are separate paths rather than one path with a richer
-//! response for authorised callers, and the reason is cost.
+//! `/health` answers `ok` or `degraded`. The metrics document carries counters
+//! and latency percentiles. They are separate surfaces rather than one answer
+//! that grows richer for authorised callers, and the reason is cost.
 //!
 //! **A health check has to be constant-cost by construction.** It is the most
 //! frequently hit path on the box, it runs when the machine is already in
@@ -67,10 +74,10 @@
 //! alive. Percentiles mean sorting a 4096-sample reservoir and serialising a
 //! larger payload. Put that behind a conditional on the same path and the
 //! expensive branch is one misconfigured header away from being taken on
-//! every check, on every node, forever. Splitting the paths makes the cheap
-//! answer cheap because there is no other answer it can give.
+//! every check, on every node, forever. Keeping the figures on their own line
+//! makes the cheap answer cheap because there is no other answer it can give.
 //!
-//! **`/perf` is token-gated, and not out of modesty about traffic volume.**
+//! **The figures are not public, and not out of modesty about traffic volume.**
 //! Live latency and error counters are a feedback channel for whoever is
 //! attacking you. An attacker probing for a resource-exhaustion path is
 //! normally blind: they cannot tell whether a request is expensive or whether
@@ -79,8 +86,8 @@
 //! between a cache hit and a backend miss runs to three orders of magnitude,
 //! so the ranking is unambiguous. `backend_errors_total` then confirms in real
 //! time when they have found something that hurts. That turns a blind probe into a
-//! tuning loop. Gating it also means an anonymous scrape loop can never reach
-//! the sort.
+//! tuning loop. Keeping the document off the public listener also means an
+//! anonymous scrape loop can never reach the sort.
 //!
 //! **`/health` exposes no version or build string.** It is unauthenticated, and a
 //! version on a public URL tells a scanner which vulnerabilities are worth trying.
@@ -93,28 +100,30 @@
 //! usefulness argument does not: **a hash on its own tells a reader nothing at
 //! all.** It could be a hash of anything. An identity is a hash keyed to the
 //! name and version of the thing it identifies, and the place those already live
-//! is `/perf`. Owner's decision. See `BuildId`.
+//! is the metrics document. Owner's decision. See `BuildId`.
 //!
-//! `/perf` does report the release, from 2026-09-16. This reverses "no version at
-//! any tier", so the reasoning is recorded rather than left as a silent edit.
+//! The metrics document does report the release, from 2026-09-16. This reverses
+//! "no version at any tier", so the reasoning is recorded rather than left as a
+//! silent edit.
 //!
-//! The disclosure argument applies to an anonymous reader, and `/perf` has none:
-//! with no token configured it is a 404, and with one it is a 401 without the
-//! credential. An attacker holding the perf token already reads live latency
-//! percentiles and error counters, which is a far better tuning signal than a
-//! version string. So the marginal disclosure is small, and it is bounded by a
-//! secret we already treat as sensitive.
+//! The disclosure argument applies to an anonymous reader. The metrics document
+//! is not on a public route. It is written to the operational log, which the
+//! node's own monitor receives over the journal, and it answers no request. An
+//! attacker who can read that log already reads live latency percentiles and
+//! error counters, which is a far better tuning signal than a version string. So
+//! the marginal disclosure is small, and it is bounded by access to the log we
+//! already treat as sensitive.
 //!
 //! Against that: with no version anywhere, "every node runs the release we think
 //! it does" is an invariant nothing can check without ssh. Four written records
 //! can disagree about one fleet while every node serves something none of them
 //! names, and nothing in the system is able to say so. An operator cannot act on
 //! a fleet they cannot observe, and a silent version turns a deploy defect into
-//! months of plausible-looking bookkeeping. The version goes behind the token, not on
-//! `/health`, which keeps the public surface exactly as it was.
+//! months of plausible-looking bookkeeping. The version goes in the metrics
+//! document, not on `/health`, which keeps the public surface exactly as it was.
 //!
-//! With no token configured `/perf` does not exist at all (404, not 401), so
-//! forgetting to configure it fails closed and does not advertise a door.
+//! The document is read from the log rather than fetched over a route, so there
+//! is no door to configure and none to forget.
 
 use serde::{Deserialize, Serialize};
 
@@ -148,7 +157,7 @@ pub struct PoolHealth {
 /// restarted, and, by polling, exactly when a deploy or a crash happened and
 /// whether a pool was losing members. None of that helps a monitor decide
 /// whether the node can serve, and all of it helps someone deciding what to
-/// aim at. It lives on `/perf` now, which is token-gated.
+/// aim at. It lives in the metrics document, which is written to the log.
 ///
 /// The degraded answer names no dependency for the same reason. The dependency
 /// is in the warn and info lines the process logs on the change.
@@ -244,9 +253,9 @@ pub fn build_id() -> &'static BuildId {
 /// event loop about to start.
 ///
 /// Empty on any failure, which is a real possibility under confinement and must
-/// never take `/perf` down: a node that cannot say what it is running is still a
-/// node that can report its latency. The monitor reads an empty hash as unknown
-/// and counts it as drift rather than as agreement.
+/// never take the metrics document down: a node that cannot say what it is
+/// running is still a node that can report its latency. The monitor reads an
+/// empty hash as unknown and counts it as drift rather than as agreement.
 fn executable_md5() -> String {
     use md5::{Digest, Md5};
     use std::io::Read;
@@ -287,7 +296,7 @@ impl HealthReport {
     /// signal for a human or a dashboard to act on, not grounds for a node
     /// to declare itself down and be pulled from rotation while it is
     /// still serving every request correctly. That is also why the numbers
-    /// live on `/perf` and not here.
+    /// live in the metrics document and not here.
     pub fn build(node: &str) -> (u16, HealthReport) {
         (
             200,
@@ -346,7 +355,7 @@ impl HealthReport {
     }
 }
 
-/// The `/perf` payload: the numbers, plus the detail `/health` must not leak.
+/// The metrics document: the numbers, plus the detail `/health` must not leak.
 ///
 /// Carries `node` and `uptime_s` so a dashboard scraping several nodes can
 /// attribute a sample without correlating two requests, and so a counter reset
@@ -355,7 +364,7 @@ impl HealthReport {
 ///
 /// `pools` and `url_backends` moved here from `/health`. They are genuinely
 /// useful for diagnosing a degraded node, which is why they are kept rather
-/// than dropped, and they are behind the token for the same reason the
+/// than dropped, and they are kept out of `/health` for the same reason the
 /// latency percentiles are: they describe the shape of the thing being served.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfReport {
@@ -389,8 +398,8 @@ pub struct PerfReport {
     /// Socket-backed pools. Empty on a cache node, which has none.
     pub pools: Vec<PoolHealth>,
     /// Names of URL backends. Presence only: proving one reachable would mean
-    /// a network round trip inside a monitoring endpoint, which is how a
-    /// monitoring endpoint learns to hang.
+    /// a network round trip on the accounting tick, which would stall the
+    /// serving loop that builds the document.
     pub url_backends: Vec<String>,
     /// The TLS chain this process loaded, how long each certificate has
     /// left, and each certificate's SHA-256 fingerprint. Leaf first, so
@@ -429,36 +438,33 @@ pub struct PerfReport {
     pub metrics: StatsSnapshot,
     /// The machine underneath: load, memory, disk, temperature, uptime.
     ///
-    /// Here rather than on a separate endpoint because an aggregator wants one
-    /// request per node, and because these are the numbers you want *next to*
-    /// the latency figures: a p99 that moved is a different conversation
+    /// Here rather than in a document of its own because an aggregator wants
+    /// one document per node, and because these are the numbers you want *next
+    /// to* the latency figures: a p99 that moved is a different conversation
     /// depending on whether load also moved. Every field is optional, and a
     /// field a platform cannot answer is absent rather than zero.
     pub host: crate::platform::host::HostSnapshot,
 }
 
-/// Outcome of a `/perf` request.
+/// Outcome of a metrics document build.
 pub enum PerfOutcome {
-    /// A traffic summary from `/traffic`. Same gate as `/perf`.
+    /// A traffic document. The traffic line is written from `TrafficReport`
+    /// directly, so nothing builds this variant now.
     ///
-    /// Its own path rather than more fields on `/perf`, for the reason that
-    /// split `/health` from `/perf`: the cost profiles differ. `/perf` sorts a
-    /// reservoir in memory. This builds the report from the window of events
-    /// `m6-http` logged itself, which allocates a record per retained event on
-    /// a cache miss. Putting the expensive one behind a conditional on the
-    /// cheaper path leaves the expensive branch one misconfigured header away
-    /// from being taken on every request, and splitting the paths is what keeps
-    /// each answer's cost a property of the path rather than of the caller.
+    /// The report is built from the window of events `m6-http` logged itself,
+    /// which allocates a record per retained event on a cache miss. It is kept
+    /// out of the metrics document for the same reason the metrics are kept
+    /// off `/health`: the cost profiles differ, and a reader that wants the
+    /// traffic summary asks for it by name.
     /// Boxed: `TrafficReport` is far larger than every other variant here, so
     /// carrying it inline made the whole enum that size even when the outcome
     /// was a one-word error.
     Traffic(Box<TrafficReport>),
-    /// No token configured: the endpoint is switched off and answers 404, so
-    /// it does not advertise a door that cannot be opened.
+    /// No document. The answer is a 404, with no credential challenge.
     Disabled,
-    /// Configured, but the caller presented no or wrong credentials.
+    /// A refusal: no credential, or one that does not verify.
     Unauthorised,
-    /// The token is valid but lacks the required claim.
+    /// A refusal: the credential verifies but lacks the required claim.
     Forbidden,
     /// Boxed for the same reason as `Traffic`: `PerfReport` is 608 bytes
     /// against the 24 of the largest error variant, and an inline copy made
@@ -478,8 +484,8 @@ pub struct PerfSubject<'a> {
 }
 
 impl PerfReport {
-    /// The report itself, for a caller that has already been authorised by
-    /// the token check. Nothing here checks access.
+    /// The report itself, for the caller that writes the metrics line.
+    /// Nothing here checks access.
     pub fn build_authorised(
         subject: PerfSubject<'_>,
         snapshot: impl FnOnce() -> StatsSnapshot,
@@ -492,10 +498,10 @@ impl PerfReport {
             url_backends,
             host_path,
         } = subject;
-        // `snapshot` is a closure so the reservoir sort happens only
-        // after authorisation passes, never for an anonymous caller.
-        // Read after authorisation, like the reservoir sort: an
-        // anonymous caller never causes a /proc read either.
+        // `snapshot` is a closure so the reservoir sort happens once, here,
+        // when the document is built.
+        // Read at build time, like the reservoir sort: an ordinary request
+        // never causes a /proc read either.
         PerfOutcome::Ok(Box::new(PerfReport {
             process_index,
             node: node.to_string(),
@@ -505,8 +511,8 @@ impl PerfReport {
             url_backends,
             // Read from the registry the TLS loader wrote, not from
             // the certificate file: no path is opened to answer this,
-            // so a monitoring endpoint cannot be made to do disk work
-            // by being polled.
+            // so building a document cannot be made to do disk work
+            // by a request.
             tls: crate::tls::loaded(),
             tls_unreadable: crate::tls::unreadable(),
             logging: Some(LoggingHealth::read()),
@@ -518,9 +524,9 @@ impl PerfReport {
 
 /// The headers a metrics answer carries.
 ///
-/// One definition, because the endpoint and the periodic metrics line serve
-/// the same document, and a second copy of these three is a second thing to
-/// keep in step with it.
+/// One definition, because the 404 a disabled gate gives and a serialised
+/// document carry the same three headers, and a second copy is a second thing
+/// to keep in step with it.
 pub fn perf_headers() -> Vec<(String, String)> {
     vec![
         (
@@ -611,14 +617,14 @@ mod tests {
     }
 
     /// An empty snapshot. The collector that fills one in lives in m6-http;
-    /// these tests are about the endpoint's shape, not about how the numbers
+    /// these tests are about the document's shape, not about how the numbers
     /// are gathered.
     fn snap() -> StatsSnapshot {
         StatsSnapshot::default()
     }
 
     #[test]
-    fn a_disabled_endpoint_is_a_404_with_no_door() {
+    fn a_disabled_outcome_is_a_404_with_no_door() {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
         let (code, _, body) = PerfOutcome::Disabled.into_response();
@@ -631,7 +637,7 @@ mod tests {
     /// question: which binary, which release it claims to be, which build it
     /// actually is.
     #[test]
-    fn perf_reports_the_running_build_identity() {
+    fn the_report_carries_the_running_build_identity() {
         let out = PerfReport::build_authorised(
             PerfSubject {
                 process_index: None,
@@ -710,7 +716,7 @@ mod tests {
     /// node at a time and an aggregator that cannot read an older node learns
     /// nothing about the node it most needs to ask about.
     #[test]
-    fn a_perf_payload_without_a_build_still_parses() {
+    fn a_metrics_document_without_a_build_still_parses() {
         // A real payload with the field taken out, rather than a hand-written
         // fixture: a fixture only proves the fixture parses, and the first attempt
         // at one failed on unrelated required fields of StatsSnapshot.
@@ -736,7 +742,7 @@ mod tests {
         );
     }
 
-    fn authorised_perf_json() -> serde_json::Value {
+    fn metrics_document_json() -> serde_json::Value {
         let out = PerfReport::build_authorised(
             PerfSubject {
                 process_index: None,
@@ -753,16 +759,16 @@ mod tests {
     }
 
     #[test]
-    fn perf_carries_logging_state() {
-        let v = authorised_perf_json();
+    fn the_document_carries_logging_state() {
+        let v = metrics_document_json();
         let p: PerfReport = serde_json::from_value(v.clone()).unwrap();
         assert!(p.logging.is_some());
         assert!(v["logging"].get("events_total").is_some());
     }
 
     #[test]
-    fn a_perf_payload_from_a_node_older_than_logging_still_parses() {
-        let mut v = authorised_perf_json();
+    fn a_metrics_document_from_a_node_older_than_logging_still_parses() {
+        let mut v = metrics_document_json();
         assert!(v.as_object_mut().unwrap().remove("logging").is_some());
         let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
         assert!(p.logging.is_none());
@@ -772,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn build_authorised_reports_without_a_token() {
+    fn the_report_builds_with_no_credential() {
         let out = PerfReport::build_authorised(
             PerfSubject {
                 process_index: None,
@@ -804,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
+    fn an_unauthorised_outcome_is_a_401_with_a_scheme_hint() {
         let (code, headers, body) = PerfOutcome::Unauthorised.into_response();
         assert_eq!(code, 401);
         assert_eq!(body, br#"{"error":"unauthorised"}"#);
@@ -814,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_returns_metrics_when_authorised() {
+    fn a_built_report_carries_the_metrics() {
         let out = PerfReport::build_authorised(
             PerfSubject {
                 process_index: None,
@@ -843,7 +849,7 @@ mod tests {
         // request and can read latency next to the load that produced it.
         assert!(
             parsed["host"].is_object(),
-            "/perf carries the host snapshot"
+            "the metrics document carries the host snapshot"
         );
         assert!(parsed["host"]["cpus"].as_u64().unwrap_or(0) >= 1);
         assert!(parsed["host"]["disk"]["total_bytes"].as_u64().unwrap_or(0) > 0);
@@ -875,26 +881,27 @@ mod tests {
             assert!(
                 !object.contains_key("host"),
                 "/health must not publish load, memory or disk either: it is the \
-                 same class of thing as the pool topology that was moved to /perf"
+                 same class of thing as the pool topology that was moved to the \
+                 metrics document"
             );
             assert_eq!(
                 keys,
                 ["node", "status"],
                 "/health is unauthenticated and public: every field here is \
                  published to anyone who asks. Topology, worker counts, uptime \
-                 and the failing dependency belong on token-gated /perf or in \
+                 and the failing dependency belong in the metrics document or in \
                  the process log."
             );
         }
     }
 }
 
-// ── /traffic ─────────────────────────────────────────────────────────────────
+// ── The traffic document ─────────────────────────────────────────────────────
 
-/// What `/traffic` publishes: the node's own view of who has been asking it
-/// for things, and whether its logging is alive.
+/// What the traffic document carries: the node's own view of who has been
+/// asking it for things, and whether its logging is alive.
 ///
-/// This is the endpoint that lets a fleet report be assembled without ssh. The
+/// This is the document that lets a fleet report be assembled without ssh. The
 /// alternative was shipping the analytics log to a central box, and the size
 /// says not to: a busy node's log runs to tens of megabytes, one request is
 /// about 350 bytes, and the summary a human reads is about 1KB. Roughly
@@ -1015,11 +1022,11 @@ pub struct HeavyHitter {
     /// reader wanted did not exist.
     ///
     /// The WIRE name stays `user_agents`, because the count has been published
-    /// under it since this struct existed and an aggregator reads `/traffic`
-    /// from nodes on other versions. Giving the strings that key instead would
-    /// make a payload from any node on the other side of this change a type
-    /// error rather than a partly readable report, which is the treatment
-    /// `firewall` and `PerfReport.tls` are documented as avoiding.
+    /// under it since this struct existed and an aggregator reads the traffic
+    /// document from nodes on other versions. Giving the strings that key
+    /// instead would make a payload from any node on the other side of this
+    /// change a type error rather than a partly readable report, which is the
+    /// treatment `firewall` and `PerfReport.tls` are documented as avoiding.
     #[serde(rename = "user_agents")]
     pub distinct_user_agents: usize,
     /// A heavy hitter carries the COUNT and no sample, deliberately.
@@ -1060,11 +1067,11 @@ pub struct CrawlerReport {
 impl TrafficReport {
     /// Summarise records that are already parsed.
     ///
-    /// `/traffic` keeps its records in memory and never reads the log, so the
-    /// report a window produces and the report the same lines would produce
-    /// from the file run through this one body. A caller with records from a
-    /// file leaves [`events_dropped`](Self::events_dropped) at zero, because a
-    /// log keeps every event in its window.
+    /// The traffic window keeps its records in memory and never reads the log,
+    /// so the report a window produces and the report the same lines would
+    /// produce from the file run through this one body. A caller with records
+    /// from a file leaves [`events_dropped`](Self::events_dropped) at zero,
+    /// because a log keeps every event in its window.
     pub fn from_records(
         node: &str,
         records: &[crate::telemetry::AnalyticsRecord],
@@ -1231,9 +1238,9 @@ mod traffic_tests {
         );
     }
 
-    /// A `/traffic` payload from a node on another version still parses.
+    /// A traffic document from a node on another version still parses.
     ///
-    /// The aggregator reads this endpoint over the network, and a rollout has
+    /// The aggregator reads this document from the journal, and a rollout has
     /// nodes on both sides of a field change at once. A node that publishes
     /// `user_agents` as the COUNT must stay readable here, and the count must
     /// keep that wire name so an aggregator older than the sample reads it
@@ -1280,7 +1287,7 @@ mod traffic_tests {
     }
 }
 
-/// The periodic metrics line carries the whole `/perf` document, so the
+/// The periodic metrics line carries the whole metrics document, so the
 /// document's size is a log-budget fact: a line past `[limits.log_buffer] max`
 /// is refused whole, and a refused metrics line is a node that stops reporting.
 ///
@@ -1428,7 +1435,7 @@ mod perf_line_size_tests {
         // is a field that should not be in a log line.
         assert!(
             bytes.len() < 256 * 1024,
-            "the maximal /perf document is {} bytes, past the quarter-megabyte \
+            "the maximal metrics document is {} bytes, past the quarter-megabyte \
              budget this test keeps; the log buffer refuses a line past 1 MiB, \
              and a refused metrics line is a node that stops reporting",
             bytes.len()
@@ -1440,7 +1447,7 @@ mod perf_line_size_tests {
             .map(|v| v.len())
             .unwrap_or(0);
         eprintln!(
-            "maximal /perf document: {} bytes (host {}, metrics {})",
+            "maximal metrics document: {} bytes (host {}, metrics {})",
             bytes.len(),
             host,
             metrics
@@ -1453,7 +1460,7 @@ mod perf_line_size_tests {
 mod tests_support {
     use super::*;
 
-    /// The report as the endpoint serialises it, with no generation or disk
+    /// The report as the metrics line serialises it, with no generation or disk
     /// block: those are m6-http's own and are added to the value there.
     pub fn perf_document_of(report: &PerfReport) -> serde_json::Value {
         serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({"error": "x"}))

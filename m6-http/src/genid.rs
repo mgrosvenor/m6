@@ -235,7 +235,7 @@ impl Follower {
         self.unverified = true;
     }
 
-    /// Seconds since the last successful answer, for `/perf`.
+    /// Seconds since the last successful answer, for the metrics document.
     pub fn last_ok_s(&self, now: Instant) -> Option<u64> {
         self.last_ok
             .map(|at| now.saturating_duration_since(at).as_secs())
@@ -419,7 +419,7 @@ impl Genid {
         self.state_path.as_deref()
     }
 
-    /// Whether a change sequence is running. `/perf` reports it.
+    /// Whether a change sequence is running. The metrics document reports it.
     pub fn sequence_running(&self) -> bool {
         self.running.is_some()
     }
@@ -538,7 +538,8 @@ impl Genid {
     }
 
     /// The peers that read the ID and how long ago, sorted by address. Built
-    /// only for an authorised `/perf`, which already allocates its report.
+    /// only when the metrics document is built, which already allocates its
+    /// report.
     pub fn peers(&self, now: Instant) -> Vec<(IpAddr, u64)> {
         let mut out: Vec<(IpAddr, u64)> = self
             .peers

@@ -275,7 +275,8 @@ fn percentile(mut v: Vec<f64>, pct: usize) -> f64 {
     }
     // Same rule as stats.rs: index (n-1)*pct/100 with integer arithmetic,
     // truncating. Rounding the same fraction shifts p50 of ten samples from
-    // index 4 to 5, so the bench would disagree with the server's own /perf.
+    // index 4 to 5, so the bench would disagree with the server's own
+    // metrics document.
     let idx = (v.len() - 1) * pct / 100;
     v[idx.min(v.len() - 1)]
 }
@@ -2180,7 +2181,8 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The bench percentiles must match the server's own `/perf` figures.
+    /// The bench percentiles must match the server's own metrics document
+    /// figures.
     /// stats.rs (`percentiles_n`) takes index `(n-1)*pct/100` with integer
     /// arithmetic, truncating. Rounding the same fraction, as this bench did,
     /// shifts p50 of ten samples from index 4 to 5, which reads as a false

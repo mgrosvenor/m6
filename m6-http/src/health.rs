@@ -1,8 +1,9 @@
-//! m6-http's side of the monitoring endpoints.
+//! m6-http's side of monitoring: the `/health` endpoint and the two documents
+//! a monitor reads.
 //!
-//! The documents themselves, and the shape of what they publish, are
+//! The documents themselves, and the shape of what they carry, are
 //! `m6_core::monitoring`. They are an m6 feature rather than this binary's:
-//! every deployment serves them, and an aggregator that reads them needs the
+//! every deployment writes them, and an aggregator that reads them needs the
 //! same types the server writes. One definition, shared, rather than a
 //! consumer re-deriving the format by looking at a sample.
 //!
@@ -54,8 +55,7 @@ pub fn is_monitoring_endpoint(backend: &str) -> bool {
 /// Loopback is external on purpose. It is the address of a shell on this host,
 /// a development client and every loopback test, so counting it as monitor
 /// would hide the traffic of the machine the server runs on. A health check on
-/// loopback is classified by its path instead, which every monitoring endpoint
-/// already is.
+/// loopback is classified by its path instead, which `/health` already is.
 ///
 /// The internal h2c listener is classified by the socket instead, before this
 /// is called. Classification is one address parse and a range check: no
@@ -226,7 +226,7 @@ mod monitoring_exclusion_tests {
     }
 }
 
-// ── /traffic ─────────────────────────────────────────────────────────────────
+// ── The traffic document ────────────────────────────────────────────────────
 
 use std::time::Instant;
 
@@ -239,10 +239,10 @@ use m6_core::telemetry::USER_AGENT_TRUNCATED as TRUNCATED;
 /// Where the privileged collector leaves `nft -j list ruleset` output.
 const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 
-/// The most events `/traffic` keeps. Allocated once at start.
+/// The most events the traffic window keeps. Allocated once at start.
 const TRAFFIC_SLOTS: usize = 32_768;
 
-/// How far back `/traffic` reports, in minutes.
+/// How far back the traffic report covers, in minutes.
 ///
 /// The ring holds far more than an hour at the busiest rate observed (about
 /// 1,000 lines in an hour), so the hour is applied when the report is built
@@ -356,7 +356,7 @@ impl<const N: usize> Field<N> {
     }
 }
 
-/// One logged event, as `/traffic` needs it.
+/// One logged event, as the traffic window needs it.
 ///
 /// Fixed size, so the ring is one allocation and a push is one copy. The
 /// fields are the ones the report reads, plus the time, the kind and whether a
@@ -392,7 +392,8 @@ impl TrafficSlot {
     }
 }
 
-/// The last events this process logged, for `/traffic`. Allocated at start.
+/// The last events this process logged, for the traffic report. Allocated at
+/// start.
 ///
 /// A ring of fixed slots and a write index. A logged request copies a few
 /// hundred bytes into the next slot, overwriting the oldest when the ring is
@@ -593,9 +594,9 @@ pub fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
     report
 }
 
-/// The verdict of the metrics gate for one request.
+/// The verdict of the genid gate for one request.
 pub enum Gate {
-    /// Serve the report.
+    /// Serve the request.
     Open,
     /// Answer with this exact status, headers and body and do nothing else:
     /// the 404 a disabled endpoint gives.
@@ -650,9 +651,9 @@ pub fn genid_address_ok(client_ip: &str, from_internal: bool) -> bool {
     from_internal || loopback
 }
 
-/// The disk-cache figures `/perf` adds, gathered so the document keeps one
-/// argument for them: the writer's counters, the load's counts, and the first
-/// heartbeat's decision.
+/// The disk-cache figures the metrics document adds, gathered so the document
+/// keeps one argument for them: the writer's counters, the load's counts, and
+/// the first heartbeat's decision.
 pub struct DiskPerf<'a> {
     pub writer: &'a crate::disk_cache::DiskWriter,
     pub queued: usize,
@@ -661,12 +662,11 @@ pub struct DiskPerf<'a> {
     pub state: crate::disk_cache::LoadState,
 }
 
-/// The document `/perf` answers, with this node's generation and disk blocks
-/// added, as JSON.
+/// The metrics document, with this node's generation and disk blocks added, as
+/// JSON.
 ///
-/// One definition for the endpoint and for the periodic metrics line, which
-/// carries exactly this document in `fields.perf`. A field added here is on
-/// both, and neither can drift from the other because there is one builder.
+/// One definition for the metrics line, which carries exactly this document in
+/// `fields.perf`.
 ///
 /// The blocks are inserted into the report this node already built, so
 /// `m6-core` keeps no notion of a generation or a disk cache: it hands over the
@@ -676,7 +676,7 @@ pub struct DiskPerf<'a> {
 /// upstream is answering.
 ///
 /// `None` is a node with no `[genid]` table: the report alone, which is what
-/// such a node's `/perf` has always answered.
+/// such a node's metrics document has always carried.
 pub fn perf_document(
     report: &PerfReport,
     genid: Option<(&crate::genid::Role, &GenidConfig, Option<DiskPerf<'_>>)>,
@@ -710,7 +710,7 @@ pub fn perf_document(
     value
 }
 
-/// The `genid` object `/perf` adds, by role.
+/// The `genid` object the metrics document adds, by role.
 fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::Value {
     match role {
         crate::genid::Role::Source(g) => {
@@ -743,7 +743,7 @@ fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::V
 }
 
 #[cfg(test)]
-mod traffic_endpoint_tests {
+mod traffic_document_tests {
     use super::*;
     use std::time::Duration;
 
