@@ -19,23 +19,14 @@ pub const TRAFFIC_LOG_MESSAGE: &str = "traffic";
 /// the monitor's copy is never more than a minute behind the window.
 pub const DEFAULT_TRAFFIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Write the periodic metrics line: the whole document the `/perf` endpoint
-/// answers, nested under `fields.perf`, into the operational Sink.
-///
-/// stdout, and journald behind it, like every other operational line. The
-/// analytics file carries per-request rows and is shipped separately, so the
-/// metrics line does not depend on analytics being enabled.
-///
-/// The document comes from the same builder the endpoint uses, so a metric
-/// added to one is on the other. The nested value is written by `serde_json`
-/// through `Line::json`: bounded by the line's buffer, not by the string
-/// field cap.
-///
-/// Write the periodic traffic line: the document the `/traffic` endpoint
-/// answers, nested under `fields.traffic`, from the report the endpoint built.
+/// Write the periodic traffic line: the traffic report, nested under
+/// `fields.traffic`, into the operational Sink.
 ///
 /// The report is serialised from its own `Serialize` impl, so the line carries
 /// the same fields in the same JSON and there is no second list to keep.
+///
+/// The monitor reads the line from mon's journal, where its `M6_TYPE` is
+/// `traffic`.
 pub fn log_traffic(report: &impl serde::Serialize) -> bool {
     m6_core::log::with_operational(|sink| {
         m6_core::log::Line::begin(sink, m6_core::log::Level::Info, TRAFFIC_LOG_MESSAGE)
@@ -46,6 +37,21 @@ pub fn log_traffic(report: &impl serde::Serialize) -> bool {
     })
 }
 
+/// Write the periodic metrics line: the whole metrics document, nested under
+/// `fields.perf`, into the operational Sink.
+///
+/// stdout, and journald behind it, like every other operational line. The
+/// analytics file carries per-request rows and is shipped separately, so the
+/// metrics line does not depend on analytics being enabled.
+///
+/// The document comes from this service's own builder, `perf_document`, so a
+/// metric added there is on the line. The nested value is written by
+/// `serde_json` through `Line::json`: bounded by the line's buffer, not by the
+/// string field cap.
+///
+/// The monitor reads the line from mon's journal, where its `M6_TYPE` is
+/// `perf`.
+///
 /// Answers whether the Sink was open. It is open after start and before stop,
 /// so the caller ignores it.
 pub fn log_perf(document: &serde_json::Value) -> bool {
@@ -535,22 +541,17 @@ pub struct Stats {
 
     // ── The monitor population, accounted separately ──────────────────────
     //
-    // /health, /perf and /traffic are not site traffic, but they are not
-    // nothing either. They used to be dropped on the floor at three call
-    // sites, which kept the traffic counters honest and made the monitor itself
-    // invisible: you could not tell a working uptime check from a monitor that
-    // had silently stopped, and a flood aimed at /health showed up nowhere at
-    // all.
+    // A `/health` poll is not site traffic, and it is not nothing either. It
+    // gets its own totals so that a working uptime check is visible as one: a
+    // monitor that has silently stopped and a monitor that is polling both
+    // leave `requests_total` alone, and this count tells them apart. A flood
+    // aimed at `/health` shows up here.
     //
-    // Counted here instead of discarded. A monitor poll on ANY path is
-    // counted here: `Stats::record` recognises the three endpoints by backend
-    // name, and a poll on another path arrives on a channel already classified
-    // `Monitor` from the peer address. Nothing that follows is mixed into
-    // requests_total, the hit rate, or the latency reservoirs above, so "the
-    // request count stopped moving" still detects a traffic stall even while a
-    // 30-second monitor keeps polling. That property is the whole reason the
-    // exclusion existed, and separate accounting preserves it without
-    // throwing the data away.
+    // `Stats::record` recognises `/health` by backend name, and a monitor poll
+    // on any other path arrives on a channel already classified `Monitor` from
+    // the peer address. Nothing below is mixed into requests_total, the hit
+    // rate, or the latency reservoirs above, so "the request count stopped
+    // moving" still detects a traffic stall while a monitor keeps polling.
     pub monitor_requests_total: u64,
     window_monitor_requests: u64,
     monitor_samples: Box<[u64; RESERVOIR]>,

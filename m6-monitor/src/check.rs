@@ -6,11 +6,13 @@
 //! `health_last_ok_max_age_s`, which defaults to three poll intervals, is
 //! flagged there and in the verdict.
 //!
-//! Apart from section H's tunnel check, this takes every figure from the
-//! nodes' own HTTP endpoints. It does not log in
-//! to any node or run `journalctl`, `systemctl`, `df` or `curl` there, and it
-//! does not parse an analytics log over the wire. Each figure is a field on
-//! `/perf` or `/traffic`, computed by the node that owns the data.
+//! Apart from section H's tunnel check, every figure comes from one of two
+//! places: the node's own `/health`, and mon's journal. Each node streams its
+//! metrics and traffic lines there, and each line carries `perf` or `traffic`
+//! on `M6_TYPE` with the node named in the document. This process runs no
+//! command on a node, and it does not read an analytics log over the wire. The
+//! one command it runs is `journalctl`, here, against mon's copy of the
+//! journals.
 //!
 //! A health check that measures its own effect on the nodes gives wrong
 //! answers. Three ways it goes wrong: it flags its own load generator as a

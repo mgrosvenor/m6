@@ -1,14 +1,14 @@
 //! Fetching one node's view of itself, as steps an event loop drives.
 //!
-//! Three requests per node: `/health` for the verdict, `/perf` for everything
-//! else and `/traffic` for the node's own view of its visitors. They are
-//! separate endpoints on purpose (see `m6_core::monitoring`), and an
-//! aggregator is exactly the caller that wants all three.
+//! `/health` and each declared `[[monitor.header_check]]` are the requests. A
+//! header check asks the node's public address, because it asserts what a
+//! visitor receives. `/health` asks the status port of a process entry and the
+//! public address otherwise.
 //!
-//! `/health` and the header checks always use the node's public URL.
-//! `/perf` and `/traffic` use it too, unless the node sets
-//! `metrics_over_tunnel`, which sends them to its tunnel address with the
-//! same token.
+//! The metrics and traffic documents are steps too, and they read mon's
+//! journal, where the line carries `perf` or `traffic` on `M6_TYPE` and names
+//! its node in the document's own `node` field. Nothing is asked of a node for
+//! them.
 //!
 //! # A poll is a table of steps, not a thread per node
 //!

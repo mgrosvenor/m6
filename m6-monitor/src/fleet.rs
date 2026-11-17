@@ -27,9 +27,11 @@ pub struct Node {
     pub name: String,
     /// Base URL, scheme and authority.
     ///
-    /// The node's public address. `/health` and the header checks are fetched
-    /// from here, because what a visitor receives is what they assert on, and
-    /// its host name is the name the node's certificate is checked against.
+    /// The node's public address. A header check is fetched from here, because
+    /// what a visitor receives is what the check asserts on, and the URL's host
+    /// name is the name the node's certificate is checked against. `/health` is
+    /// fetched from here for a node polled as one address, and from the
+    /// process's own status port for a node polled as several.
     /// The metrics and traffic documents are read from the journal, so they
     /// never travel over the public interface. Polling a node through its own
     /// public edge also measures the edge rather than the node.
@@ -45,13 +47,6 @@ pub struct Node {
     /// never counts as a fault.
     #[serde(default)]
     pub tunnel: Option<Tunnel>,
-    /// Fetch `/perf` and `/traffic` through `tunnel.address` instead of the
-    /// public address. Default false.
-    ///
-    /// `tunnel.address` must then be the node's HTTPS port on its tunnel
-    /// address, because the request is TLS to that socket. The URL's host name
-    /// still names the certificate, so the node's public certificate is checked
-    /// as usual. The node answers these paths only to peers it lists
     /// How many m6-http processes this node runs on its shared port, each with
     /// `[server] process_index` and `status_bind` set. Absent means the node is
     /// polled as one address, as always. Present, the node is polled as that
