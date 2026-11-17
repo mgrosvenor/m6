@@ -186,7 +186,7 @@ Reverse proxy, cache, and router.
 - One thread and one edge-triggered event loop over `m6_core::platform`
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, query, content-encoding)`, with each encoding variant cached independently
-- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline: a route `require`, `/perf`, `/traffic` and a source node's `/genid`.
+- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline: a route `require` and a source node's `/genid`.
   m6-http decodes no token and holds no key
 - Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
 - Backend sockets are found once at start from each pool's glob, and a change takes a restart
@@ -194,7 +194,7 @@ Reverse proxy, cache, and router.
   Restart m6-http after renewing a certificate
 - `Cache-Control: public` responses are cached, and `no-store` and `private` responses are skipped
 - Error pages fetched from configured `[errors] path` backend on 4xx/5xx
-- `/health`, `/perf`, `/traffic` and `/genid` answered ahead of routing, the cache and every backend
+- `/health` and `/genid` answered ahead of routing, the cache and every backend
 
 **Performance design:**
 - No heap allocation on the hot path (cached responses)
@@ -451,7 +451,7 @@ backend = "m6-auth-check"
 ```
 
 `[auth] backend` names a `[[backend]]` with `sockets`, and `[auth]` does not load without that key.
-`[auth]` is also needed by a route with `require`, by `[health] metrics_require`, and by either `[genid]` claim, because every one of those gates asks `POST /check`.
+`[auth]` is also needed by a route with `require` and by either `[genid]` claim, because both of those gates ask `POST /check`.
 A `[auth] public_key` key from an earlier release is refused at load.
 The login routes keep their own backend: `/auth/login`, `/auth/logout` and `/auth/refresh` reach the login socket, and `[auth] backend` names the check socket.
 
@@ -489,7 +489,7 @@ See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment).
 `503` carries the same body with `status` set to `degraded`.
 A process that is gone, or whose listener refuses, gives no answer.
 The degraded body names the node, because `/health` is public and unsecured, and the process logs the failed dependency in a warn line and its recovery in an info line.
-`/perf` and `/traffic` answer behind `[health] metrics_require`, and answer 404 without it.
+The metrics and traffic documents are `type` `perf` and `type` `traffic` log lines, so no HTTP path serves them and no credential is involved.
 
 ### 6.2 Publishing a generation
 
@@ -542,7 +542,7 @@ Browser                  m6-http                  m6-auth-server
 **Figure 4: a browser login and token refresh.**
 An expired session cookie is answered 302 to the refresh endpoint, the new token becomes a session cookie, and m6-http forwards the identity the authority answered to the backend.
 
-Every credential gate sends one `POST /check`: a route `require`, `/perf`, `/traffic` and a source node's `GET` and `POST /genid`.
+Every credential gate sends one `POST /check`: a route `require` and a source node's `GET` and `POST /genid`.
 A node with `[auth] backend` therefore needs a running checker for those endpoints as well as for a protected route.
 A request with no credential sends no check and is refused 401, except a protected browser route, which is answered 302 to `/login` or `/auth/refresh`.
 A checker that does not answer within the 50 ms deadline turns the request into 503 with `Retry-After: 1`.
@@ -574,7 +574,7 @@ A backend 4xx or 5xx is rendered from the configured error route, and an empty p
 Each item below is enforced by the process that owns that step.
 
 - TLS on the public listener, terminated by m6-http
-- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline, and the answer is used once: a route `require`, `/perf`, `/traffic` and a source node's `/genid`.
+- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline, and the answer is used once: a route `require` and a source node's `/genid`.
   Nothing caches a decision
 - A revoked credential or a role change counts from the next request
 - `/health` is public, and its degraded body names the node only
