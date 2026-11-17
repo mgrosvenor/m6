@@ -2076,7 +2076,7 @@ cd examples/11-admin-dashboard
 # open https://localhost:8444/
 ```
 
-Example 11 runs on Linux and macOS.
+Example 11 runs on Linux 5.3 or newer and on macOS.
 The bench child's exit is a pidfd on Linux and a kqueue filter on macOS, so `render-admin` starts on both.
 
 The dashboard is served by m6-file at `https://localhost:8444/` and refreshes every 10 seconds.
