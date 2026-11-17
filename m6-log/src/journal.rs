@@ -7,9 +7,11 @@
 //! JSON line.
 //!
 //! The wire format is the one `sd_journal_send` uses, written here directly:
-//! the fields of one datagram, each `KEY=value`, separated by a newline, and a
-//! newline inside a value written as a backslash and an `n`. That format has
-//! needed no library since it was fixed, which is why m6 links nothing for it.
+//! the fields of one datagram, each ending with a newline, and a value that
+//! contains a newline written in the binary form, which is the field name, a
+//! newline, an eight-byte little-endian length, the value and a newline. That
+//! format has needed no library since it was fixed, which is why m6 links
+//! nothing for it.
 //!
 //! A line longer than [`DATAGRAM_MAX`] is refused the way a line longer than
 //! the buffer is refused: it counts as dropped and one line on stderr names
@@ -105,17 +107,13 @@ impl Journal {
         let (level, kind) = header(line);
         self.datagram.clear();
         let fields: [(&[u8], &[u8]); 4] = [
-            (b"PRIORITY=", priority(level)),
-            (b"M6_TYPE=", kind.text().as_bytes()),
-            (b"SYSLOG_IDENTIFIER=", self.identifier.as_bytes()),
-            (b"MESSAGE=", line),
+            (b"PRIORITY", priority(level)),
+            (b"M6_TYPE", kind.text().as_bytes()),
+            (b"SYSLOG_IDENTIFIER", self.identifier.as_bytes()),
+            (b"MESSAGE", line),
         ];
-        for (index, (key, value)) in fields.iter().enumerate() {
-            if index > 0 {
-                self.datagram.push(b'\n');
-            }
-            self.datagram.extend_from_slice(key);
-            push_escaped(&mut self.datagram, value);
+        for (name, value) in fields.iter() {
+            push_field(&mut self.datagram, name, value);
         }
         if self.datagram.len() > DATAGRAM_MAX {
             return Outcome::Refused {
@@ -164,17 +162,25 @@ fn identifier() -> String {
         .unwrap_or_else(|| "m6".to_string())
 }
 
-/// Append a field value, with every newline written as a backslash and an
-/// `n`, which is the format's one escape.
-fn push_escaped(out: &mut Vec<u8>, value: &[u8]) {
-    for &byte in value {
-        if byte == b'\n' {
-            out.push(b'\\');
-            out.push(b'n');
-        } else {
-            out.push(byte);
-        }
+/// Append one field, terminated by a newline, as journald reads it.
+///
+/// A value with no newline is the text form, `NAME=value\n`. A value with a
+/// newline is the binary form, `NAME\n`, an eight-byte little-endian length,
+/// the value and `\n`, because the text form cannot carry a newline and
+/// journald does not decode a backslash escape. Every field ends with the
+/// newline, including the last, because journald discards an unterminated
+/// last field.
+fn push_field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    out.extend_from_slice(name);
+    if value.contains(&b'\n') {
+        out.push(b'\n');
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value);
+    } else {
+        out.push(b'=');
+        out.extend_from_slice(value);
     }
+    out.push(b'\n');
 }
 
 /// The syslog priority of a level. `TRACE` is `DEBUG`, because syslog has no
@@ -306,10 +312,47 @@ mod tests {
     }
 
     #[test]
-    fn a_newline_in_a_value_is_the_format_escape() {
+    fn every_field_ends_with_a_newline_including_the_last() {
+        let mut datagram = Vec::new();
+        for (name, value) in [
+            (b"PRIORITY".as_slice(), b"6".as_slice()),
+            (b"M6_TYPE", b"event"),
+            (b"SYSLOG_IDENTIFIER", b"m6"),
+            (b"MESSAGE", b"{\"fields\":{}}"),
+        ] {
+            push_field(&mut datagram, name, value);
+        }
+        assert_eq!(
+            datagram,
+            b"PRIORITY=6\nM6_TYPE=event\nSYSLOG_IDENTIFIER=m6\nMESSAGE={\"fields\":{}}\n"
+        );
+        assert_eq!(
+            datagram.last(),
+            Some(&b'\n'),
+            "the last field must end with a newline or journald discards it"
+        );
+    }
+
+    #[test]
+    fn a_value_with_a_newline_uses_the_length_prefixed_form() {
         let mut out = Vec::new();
-        push_escaped(&mut out, b"a\nb");
-        assert_eq!(out, b"a\\nb");
+        push_field(&mut out, b"MESSAGE", b"a\nb");
+        let mut expected = Vec::from(*b"MESSAGE\n");
+        expected.extend_from_slice(&3u64.to_le_bytes());
+        expected.extend_from_slice(b"a\nb");
+        expected.push(b'\n');
+        assert_eq!(out, expected);
+        assert!(
+            !out.windows(2).any(|pair| pair == b"\\n"),
+            "a newline in a value is not a backslash and an n: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_without_a_newline_is_the_text_form() {
+        let mut out = Vec::new();
+        push_field(&mut out, b"PRIORITY", b"4");
+        assert_eq!(out, b"PRIORITY=4\n");
     }
 
     #[test]
