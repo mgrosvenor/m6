@@ -205,9 +205,12 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # THIS LIST IS WHY CI WENT RED AND THE BUILD HOST DID NOT. Repointing m6-http at
 # the fork changed the source and nothing updated this, so `cargo deny` failed on
 # every push from 2026-09-13 06:41 onwards while `deploy/run-tests.sh` kept
-# saying everything passed. cargo-deny runs ONLY in CI: the build host has no
-# cargo-deny and run-tests.sh does not call it. A gate that runs in one place
-# only is the third time this project has been caught by that shape.
+# saying everything passed. That script has since been deleted. The build host
+# now runs `cargo deny check` too: `tools/build-host-tests.sh:304-316` runs it
+# when cargo-deny is installed, and the report at line 618 fails the run on any
+# status other than 0, so a missing binary reports DENY_STATUS=127 and fails
+# rather than skips. A gate that runs in one place only is the third time this
+# project has been caught by that shape.
 #
 # Listed explicitly so that adding another git dependency is a decision somebody
 # makes rather than something that arrives with a transitive update.
