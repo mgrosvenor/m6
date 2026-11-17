@@ -879,3 +879,126 @@ fn background_fetches_wait_for_the_id() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// `/health` on an edge answers `ok`, then 503 `degraded` while the origin is
+/// down, then `ok` again when it returns. The degraded body names the node and
+/// nothing a stranger can aim at, and the cache's log holds exactly one warn on
+/// the loss and one info on the recovery across many requests.
+///
+/// Break: name the dependency in the public body, and the exact-body assertion
+/// fails. Break: log on each failed request, and the warn count exceeds one.
+#[test]
+fn health_goes_ok_degraded_ok_and_logs_each_change_once() {
+    let mut stack = Stack::new("public, max-age=60", 1, false);
+    stack.start_html();
+    stack.start_source();
+    stack.start_cache();
+    assert!(stack.wait_perf_id("0", Duration::from_secs(10)));
+
+    // `ok` while the origin answers, across many requests.
+    for _ in 0..20 {
+        let r = stack.get_cache("/", &[]);
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.text(), "first: one");
+    }
+    let up = stack.get_cache("/health", &[]);
+    assert_eq!(up.status, 200, "{}", up.text());
+    assert_eq!(up.text(), r#"{"status":"ok","node":"genid-cache"}"#);
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream down").count(),
+        0,
+        "an origin that answered is not logged as lost"
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream up").count(),
+        0
+    );
+
+    // The origin goes away. The edge learns it from the heartbeat it already
+    // sends, and /health answers while the origin cannot be reached, because
+    // the answer is a flag read and never a probe.
+    stack.stop_source();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            stack.get_cache("/health", &[]).status == 503
+        }),
+        "/health never answered degraded:\n{}",
+        stack.cache_output()
+    );
+    let down = stack.get_cache("/health", &[]);
+    assert_eq!(down.status, 503, "{}", down.text());
+    assert_eq!(
+        down.text(),
+        r#"{"status":"degraded","node":"genid-cache"}"#,
+        "the public body names no dependency and no reason"
+    );
+    for forbidden in ["origin", "auth", "reason", "dependency", "down"] {
+        assert!(
+            !down.text().contains(forbidden),
+            "the degraded body says {forbidden}: {}",
+            down.text()
+        );
+    }
+
+    // Many requests while the origin is down: held content is served, a miss
+    // fails, and neither adds a line.
+    for _ in 0..20 {
+        let r = stack.get_cache("/", &[]);
+        assert_eq!(r.status, 200, "held content must be served: {}", r.text());
+        assert_eq!(r.text(), "first: one", "the old body");
+    }
+    let never = stack.get_cache("/never", &[]);
+    assert!(
+        matches!(never.status, 502 | 504),
+        "a path the node never held is an error, got {}",
+        never.status
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream down").count(),
+        1,
+        "exactly one warn on the loss, never one per request:\n{}",
+        stack.cache_output()
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream up").count(),
+        0
+    );
+
+    // The origin returns on the same port and the next heartbeat clears the
+    // flag. `info` lines flush on the one-second log tick, so wait on the line
+    // rather than reading once.
+    stack.start_source();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            stack.get_cache("/health", &[]).status == 200
+        }),
+        "/health never recovered:\n{}",
+        stack.cache_output()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            stack.cache_output().matches("genid: upstream up").count() == 1
+        }),
+        "exactly one info on the recovery:\n{}",
+        stack.cache_output()
+    );
+    for _ in 0..20 {
+        let r = stack.get_cache("/", &[]);
+        assert_eq!(r.status, 200, "{}", r.text());
+    }
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream down").count(),
+        1,
+        "no warn after the recovery:\n{}",
+        stack.cache_output()
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream up").count(),
+        1,
+        "no second info on the requests that follow:\n{}",
+        stack.cache_output()
+    );
+    let back = stack.get_cache("/health", &[]);
+    assert_eq!(back.status, 200, "{}", back.text());
+    assert_eq!(back.text(), r#"{"status":"ok","node":"genid-cache"}"#);
+}
