@@ -253,8 +253,6 @@ pub struct Setup {
     /// The fleet's timeout for one step.
     pub timeout: Duration,
     pub header_checks: Vec<HeaderCheck>,
-    /// Each node's `/perf` bearer token, read once at start.
-    pub tokens: Vec<Option<String>>,
     pub nameserver: SocketAddr,
     pub wg_file: Option<String>,
     pub wg_max_age_s: u64,
@@ -273,8 +271,8 @@ pub struct Poller {
     /// The fleet's timeout for one step.
     timeout: Duration,
     header_checks: Vec<HeaderCheck>,
-    /// Each node's `/perf` bearer token, read once at start.
-    tokens: Vec<Option<String>>,
+    /// The newest metrics and traffic document the journal carried, by node.
+    latest: crate::journal::Latest,
     cache: VerdictCache,
     nameserver: SocketAddr,
     wg_file: Option<String>,
@@ -297,6 +295,33 @@ pub struct Poller {
 }
 
 impl Poller {
+    /// Keep one line the journal carried.
+    pub fn ingest_journal(&mut self, entry: &[u8]) {
+        self.latest.ingest(entry);
+    }
+
+    /// Why the journal reader is not running, or `None` while it is.
+    pub fn set_journal_state(&mut self, unavailable: Option<String>) {
+        self.latest.unavailable = unavailable;
+    }
+
+    /// Read the journal once for `--check`. `None` means the directory could
+    /// not be opened, and the reason is reported against every node.
+    pub fn read_journal_once(
+        &mut self,
+        dir: Result<std::path::PathBuf, String>,
+        limit: &m6_core::limits::Limit,
+    ) {
+        match dir {
+            Ok(dir) => {
+                let mut reader = crate::journal::Reader::once(&dir, limit);
+                reader.drain(|line| self.latest.ingest(line));
+                self.latest.unavailable = reader.stopped.clone();
+            }
+            Err(reason) => self.latest.unavailable = Some(reason),
+        }
+    }
+
     /// At start: the reading table, the lookup cache and every deadline, all
     /// sized once. The fleet is already read and resolved.
     pub fn new(setup: Setup) -> Poller {
@@ -304,7 +329,6 @@ impl Poller {
             nodes,
             timeout,
             header_checks,
-            tokens,
             nameserver,
             wg_file,
             wg_max_age_s,
@@ -354,7 +378,7 @@ impl Poller {
             readings,
             timeout,
             header_checks,
-            tokens,
+            latest: crate::journal::Latest::new(),
             cache: VerdictCache::with_cap(lookup_cap),
             nameserver,
             wg_file,
@@ -581,6 +605,15 @@ impl Poller {
     ) -> io::Result<Progress> {
         let mut step = step;
         loop {
+            // The two documents come from the journal, not from a request.
+            if matches!(step, Step::Perf | Step::Traffic) {
+                let next = self.record_journal(node, step);
+                if next == Step::Done {
+                    return self.after(node, next, poll, out, now);
+                }
+                step = next;
+                continue;
+            }
             match self.begin_step(poll, out, node, step, now) {
                 Ok(()) => return Ok(Progress::Working),
                 Err(e) => {
@@ -598,19 +631,56 @@ impl Poller {
         }
     }
 
+    /// Record one document from the journal, and answer what follows it.
+    ///
+    /// A node with no line says so instead of showing nothing: a monitor that
+    /// quietly reports a healthy quiet node when the journal is empty is the
+    /// failure this exists to avoid.
+    fn record_journal(&mut self, node: usize, step: Step) -> Step {
+        let name = self.nodes[node].name.clone();
+        let perf = self.latest.perf(&name).cloned();
+        let traffic = self.latest.traffic(&name).cloned();
+        let unavailable = self.latest.unavailable.clone();
+        let r = &mut self.readings[node];
+        match step {
+            Step::Perf => match perf {
+                Some(document) => match serde_json::from_value::<PerfReport>(document) {
+                    Ok(report) => r.perf = Some(report),
+                    Err(e) => r.perf_error = Some(format!("unreadable metrics line: {e}")),
+                },
+                None => {
+                    r.perf_error = Some(match &unavailable {
+                        Some(reason) => {
+                            format!("no metrics line: the journal reader is not running: {reason}")
+                        }
+                        None => "no metrics line in the journal for this node".to_string(),
+                    })
+                }
+            },
+            Step::Traffic => match traffic {
+                Some(document) => match serde_json::from_value::<TrafficReport>(document) {
+                    Ok(report) => r.traffic = Some(report),
+                    Err(e) => r.traffic_error = Some(format!("unreadable traffic line: {e}")),
+                },
+                None => {
+                    r.traffic_error = Some(match &unavailable {
+                        Some(reason) => {
+                            format!("no traffic line: the journal reader is not running: {reason}")
+                        }
+                        None => "no traffic line in the journal for this node".to_string(),
+                    })
+                }
+            },
+            _ => {}
+        }
+        self.next_step(node, step)
+    }
+
     /// What follows `step` for this node, recorded or not.
     fn next_step(&mut self, node: usize, step: Step) -> Step {
         match step {
             Step::Health => {
                 if self.readings[node].unreachable.is_some() {
-                    Step::Done
-                } else if self.tokens[node].is_none() {
-                    // Both gated endpoints are out of reach, and both must say
-                    // so. The header checks need no token, and are skipped
-                    // here exactly as the blocking poll skipped them.
-                    self.readings[node].perf_error = Some("no perf token configured".to_string());
-                    self.readings[node].traffic_error =
-                        Some("no perf token configured".to_string());
                     Step::Done
                 } else {
                     Step::Perf
@@ -666,15 +736,14 @@ impl Poller {
     }
 
     /// The address, request path, authority and token of one step.
-    fn step_target(&self, node: usize, step: Step) -> (Addr, String, String, Option<String>) {
+    fn step_target(&self, node: usize, step: Step) -> (Addr, String, String) {
         let n = &self.nodes[node];
-        let (path, token) = match step {
-            Step::Health => (format!("{}/health", n.base_path), None),
-            Step::Perf => (format!("{}/perf", n.base_path), self.tokens[node].clone()),
-            Step::Traffic => (
-                format!("{}/traffic", n.base_path),
-                self.tokens[node].clone(),
-            ),
+        let path = match step {
+            Step::Health => format!("{}/health", n.base_path),
+            // The two documents come from the journal, so neither is a request.
+            Step::Perf | Step::Traffic => {
+                unreachable!("a journal step starts no request")
+            }
             Step::Header(i) => {
                 let hc = &self.header_checks[i];
                 let sep = if hc.path.contains('?') { '&' } else { '?' };
@@ -692,7 +761,7 @@ impl Poller {
                 } else {
                     format!("{}{}", n.base_path, hc.path)
                 };
-                (path, None)
+                path
             }
             Step::Done => unreachable!("a done step starts no request"),
         };
@@ -700,10 +769,9 @@ impl Poller {
             // A header check asks the public face, whatever the process.
             (Step::Header(_), _) => Addr::Tcp(n.addr),
             (_, Some(status)) => Addr::Tcp(status),
-            (Step::Perf | Step::Traffic, None) => Addr::Tcp(n.metrics_addr()),
             _ => Addr::Tcp(n.addr),
         };
-        (addr, path, n.authority.clone(), token)
+        (addr, path, n.authority.clone())
     }
 
     /// The URL a step is asked for, for an error line. The cache-bust value of
@@ -712,8 +780,7 @@ impl Poller {
         let n = &self.nodes[node];
         let path = match step {
             Step::Health => "/health".to_string(),
-            Step::Perf => "/perf".to_string(),
-            Step::Traffic => "/traffic".to_string(),
+            Step::Perf | Step::Traffic => unreachable!("a journal step asks for no URL"),
             Step::Header(i) => self.header_checks[i].path.clone(),
             Step::Done => String::new(),
         };
@@ -729,7 +796,7 @@ impl Poller {
         step: Step,
         now: Instant,
     ) -> io::Result<()> {
-        let (addr, path, authority, token) = self.step_target(node, step);
+        let (addr, path, authority) = self.step_target(node, step);
         let tls = self.nodes[node].tls.clone();
         self.close_slot(poll, out, node);
         let Out::Node {
@@ -741,7 +808,7 @@ impl Poller {
             unreachable!("a node slot holds its node's Upstream");
         };
         *slot_step = step;
-        write_request(up, &authority, &path, token.as_deref());
+        write_request(up, &authority, &path);
         #[cfg(test)]
         if let Some((starts, kind)) = self.step_start_failure.get() {
             if starts == 0 {
@@ -809,43 +876,7 @@ impl Poller {
                     }
                 }
             }
-            Step::Perf => match reply.status {
-                200 => match serde_json::from_slice::<PerfReport>(reply.body) {
-                    Ok(p) => r.perf = Some(p),
-                    Err(e) => r.perf_error = Some(format!("unparseable: {e}")),
-                },
-                401 => r.perf_error = Some("401: token rejected by this node".to_string()),
-                403 => r.perf_error = Some("403: token lacks the required role".to_string()),
-                404 => {
-                    r.perf_error = Some(
-                        "404: /perf not enabled on this node, or not served to this address"
-                            .to_string(),
-                    )
-                }
-                code => r.perf_error = Some(format!("unexpected status {code}")),
-            },
-            Step::Traffic => {
-                match reply.status {
-                    200 => match serde_json::from_slice::<TrafficReport>(reply.body) {
-                        Ok(t) => r.traffic = Some(t),
-                        Err(e) => r.traffic_error = Some(format!("unparseable: {e}")),
-                    },
-                    401 => r.traffic_error = Some("401: token rejected by this node".to_string()),
-                    403 => r.traffic_error = Some("403: token lacks the required role".to_string()),
-                    404 => r.traffic_error = Some(
-                        "404: /traffic not available on this node, or not served to this address"
-                            .to_string(),
-                    ),
-                    503 => {
-                        let why = serde_json::from_slice::<serde_json::Value>(reply.body)
-                            .ok()
-                            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| "unreadable".to_string());
-                        r.traffic_error = Some(format!("503: {why}"));
-                    }
-                    code => r.traffic_error = Some(format!("unexpected status {code}")),
-                }
-            }
+            Step::Perf | Step::Traffic => unreachable!("a journal step has no reply"),
             Step::Header(i) => {
                 let hc = &self.header_checks[i];
                 let actual = reply
@@ -872,8 +903,7 @@ impl Poller {
         let r = &mut self.readings[node];
         match step {
             Step::Health => r.unreachable = Some(text),
-            Step::Perf => r.perf_error = Some(text),
-            Step::Traffic => r.traffic_error = Some(text),
+            Step::Perf | Step::Traffic => unreachable!("a journal step starts no request"),
             Step::Header(i) => {
                 let hc = &self.header_checks[i];
                 r.header_checks.push(HeaderCheckResult {
@@ -1238,8 +1268,8 @@ impl Poller {
     }
 }
 
-/// The poller a one-shot run builds: the fleet resolved, its tokens read, its
-/// timeout, header checks and lookup cap. `--check` and the poll's own tests
+/// The poller a one-shot run builds: the fleet resolved, its timeout, header
+/// checks and lookup cap. `--check` and the poll's own tests
 /// both use it, so the two cannot drift.
 pub fn one_shot_poller(
     fleet: &crate::fleet::Fleet,
@@ -1248,19 +1278,10 @@ pub fn one_shot_poller(
     lookup_cap: usize,
 ) -> anyhow::Result<Poller> {
     let nodes = fleet.resolve(tls)?;
-    let tokens = {
-        let fallback = fleet.perf_token();
-        fleet
-            .nodes
-            .iter()
-            .map(|n| n.perf_token(fallback.as_deref()))
-            .collect::<Vec<_>>()
-    };
     Ok(Poller::new(Setup {
         nodes,
         timeout: Duration::from_millis(fleet.timeout_ms),
         header_checks: fleet.header_check.clone(),
-        tokens,
         nameserver,
         wg_file: fleet.wg_handshakes_file.clone(),
         wg_max_age_s: fleet.tunnel_handshake_max_age_s,
@@ -1331,15 +1352,12 @@ pub fn drive_to_end(
 /// `Content-Length`. No `Accept-Encoding` is sent, so the answer is the bytes
 /// the node would serve a client that takes the identity encoding: this client
 /// decodes nothing.
-fn write_request(up: &mut Upstream, authority: &str, path: &str, token: Option<&str>) {
+fn write_request(up: &mut Upstream, authority: &str, path: &str) {
     let w = up.request_buf();
     let _ = write!(
         w,
         "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n"
     );
-    if let Some(t) = token {
-        let _ = write!(w, "Authorization: Bearer {t}\r\n");
-    }
     w.extend_from_slice(b"\r\n");
 }
 
@@ -1423,7 +1441,9 @@ mod tests {
         crate::fleet::Fleet {
             nodes: vec![node],
             poll_interval_s: crate::DEFAULT_POLL_SECS,
-            perf_token_file: None,
+            history_file: None,
+            history_max_mb: None,
+            journal_dir: "/var/log/journal/remote".to_string(),
             timeout_ms: 5_000,
             one_certificate: false,
             header_check: Vec::new(),
@@ -1445,16 +1465,24 @@ mod tests {
         token: Option<&str>,
         nameserver: std::net::SocketAddr,
     ) -> Polled {
+        run_with_journal(fleet, token, nameserver, &[])
+    }
+
+    /// The same, with whole journal lines fed to the poller as the journal
+    /// would.
+    fn run_with_journal(
+        fleet: &crate::fleet::Fleet,
+        token: Option<&str>,
+        nameserver: std::net::SocketAddr,
+        lines: &[serde_json::Value],
+    ) -> Polled {
         let tls = tls();
-        let mut fleet = fleet.clone();
-        let token_file = token.map(|t| {
-            let f = tempfile::NamedTempFile::new().unwrap();
-            std::fs::write(f.path(), format!("{t}\n")).unwrap();
-            fleet.perf_token_file = Some(f.path().to_string_lossy().into_owned());
-            f
-        });
+        let fleet = fleet.clone();
         let mut poller =
             one_shot_poller(&fleet, &tls, nameserver, crate::check::MAX_LOOKUPS_PER_POLL).unwrap();
+        for line in lines {
+            poller.ingest_journal(&journal_line(line.clone()));
+        }
         let mut out = poller.out();
         let polled = drive_to_end(
             &mut poller,
@@ -1462,7 +1490,7 @@ mod tests {
             Some(m6_core::platform::now() + Duration::from_secs(20)),
         )
         .unwrap();
-        drop(token_file);
+        let _ = token;
         polled
     }
 
@@ -1509,22 +1537,6 @@ mod tests {
         (port, handle)
     }
 
-    fn tunnel_node(public: u16, tunnel: u16) -> Node {
-        Node {
-            name: "origin".into(),
-            url: format!("http://127.0.0.1:{public}"),
-            role: "origin".into(),
-            perf_token_file: None,
-            tunnel: Some(crate::fleet::Tunnel {
-                address: format!("127.0.0.1:{tunnel}"),
-                public_key: None,
-            }),
-            metrics_over_tunnel: true,
-            processes: None,
-            process: None,
-        }
-    }
-
     fn process_node(status_port: u16, index: u32) -> Node {
         Node {
             name: format!("edge/{index}"),
@@ -1532,12 +1544,10 @@ mod tests {
             // instead of the status port would read the node as unreachable.
             url: "http://127.0.0.1:1".into(),
             role: "cache".into(),
-            perf_token_file: None,
             tunnel: Some(crate::fleet::Tunnel {
                 address: format!("127.0.0.1:{status_port}"),
                 public_key: None,
             }),
-            metrics_over_tunnel: true,
             processes: None,
             process: Some(index),
         }
@@ -1547,24 +1557,17 @@ mod tests {
     /// `/traffic`, and nothing else: no header check, no public address. Break:
     /// `/health` sent to the public address, which reads unreachable here.
     #[test]
-    fn a_process_entry_asks_its_status_port_for_all_three_paths() {
-        let (port, seen) = serve(3, |path| match path {
+    fn a_process_entry_asks_its_status_port_for_health() {
+        let (port, seen) = serve(1, |path| match path {
             "/health" => (200, r#"{"status":"ok","node":"edge","process_index":1}"#),
             _ => (404, r#"{"error":"not found"}"#),
         });
-        let polled = run(&fleet_of(process_node(port, 1)), Some("tok"));
+        let polled = run(&fleet_of(process_node(port, 1)), None);
         let r = &polled.readings[0];
         assert_eq!(r.unreachable, None);
         assert_eq!(r.health.as_ref().map(|h| h.status.as_str()), Some("ok"));
         let lines: Vec<String> = seen.join().unwrap().into_iter().map(|(l, _)| l).collect();
-        assert_eq!(
-            lines,
-            [
-                "GET /health HTTP/1.1",
-                "GET /perf HTTP/1.1",
-                "GET /traffic HTTP/1.1"
-            ]
-        );
+        assert_eq!(lines, ["GET /health HTTP/1.1"]);
     }
 
     /// A status port that answers as another process is a fault that names
@@ -1591,6 +1594,170 @@ mod tests {
 
     /// A process that is down refuses its own port, and is reported as that
     /// index. This is what the shared port hides.
+    /// A traffic document wrapped as the line the journal carries it in.
+    fn traffic_line(document: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "traffic",
+            "fields": {"traffic": serde_json::from_str::<serde_json::Value>(document)
+                .expect("a test document")},
+        })
+    }
+
+    /// One line as `journalctl --output=json` prints it: the line's own JSON in
+    /// `MESSAGE`.
+    fn journal_line(document: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "MESSAGE": document.to_string(),
+            "M6_TYPE": document["type"],
+            "_HOSTNAME": "build",
+        }))
+        .unwrap()
+    }
+
+    fn perf_document(node: &str, uptime_s: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "perf",
+            "fields": {"perf": {"node": node, "uptime_s": uptime_s,
+                "build": {"name": "m6-http", "version": "1.0.0", "hash": "h"},
+                "host": {"cpus": 1, "load": {"one": 0.0, "five": 0.0, "fifteen": 0.0, "running": 0, "total": 0},
+                    "memory": {"available_bytes": 1, "total_bytes": 2, "source": "Host"},
+                    "disk": {"available_bytes": 1, "total_bytes": 2}, "disks": [], "fds": {"open": 1, "soft_limit": 2, "hard_limit": 3},
+                    "net": [], "tcp": null, "thermal": [], "cpu_pressure": null, "io_pressure": null, "memory_pressure": null,
+                    "uptime_s": 1},
+                "metrics": {"requests_total": 0, "cache_hits_total": 0, "cache_misses_total": 0,
+                    "cache_hits_valid_total": 0, "cache_hits_invalid_total": 0,
+                    "cache_misses_fetched_total": 0, "cache_misses_answered_locally_total": 0,
+                    "backend_errors_total": 0, "backend_errors_by_name": {}, "monitor_requests_total": 0,
+                    "rps_peak": 0, "hit_samples": 0, "hit_p0_ns": 0, "hit_p50_ns": 0, "hit_p99_ns": 0, "hit_max_ns": 0,
+                    "miss_samples": 0, "miss_p0_ns": 0, "miss_p50_ns": 0, "miss_p99_ns": 0, "miss_max_ns": 0,
+                    "monitor_samples": 0, "monitor_p50_ns": 0, "monitor_p99_ns": 0,
+                    "status_counts": {}, "channels": [], "event_loop": []},
+                "pools": [], "url_backends": [], "tls": [], "tls_unreadable": 0, "logging": null}},
+        })
+    }
+
+    fn traffic_document(node: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "traffic",
+            "fields": {"traffic": {"node": node, "window_minutes": 60, "events_dropped": 0,
+                "total_requests": 0, "status": {}, "notable": [], "heavy_hitters": [],
+                "crawlers": [], "forged_bot_requests": 0, "forgers": [], "probe_noise": [],
+                "logging": {"events_total": 10, "seconds_since_last": 1}, "firewall": null}},
+        })
+    }
+
+    /// The two documents come from the journal, and the only request a node
+    /// sees is `/health`: no monitor poll asks it for metrics.
+    #[test]
+    fn the_documents_come_from_the_journal_and_health_from_the_url() {
+        let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            tunnel: None,
+            processes: None,
+            process: None,
+        };
+        let fleet = fleet_of(n);
+        let mut poller = one_shot_poller(
+            &fleet,
+            &tls(),
+            "127.0.0.1:53".parse().unwrap(),
+            crate::check::MAX_LOOKUPS_PER_POLL,
+        )
+        .unwrap();
+        poller.ingest_journal(&journal_line(perf_document("origin", 5)));
+        poller.ingest_journal(&journal_line(traffic_document("origin")));
+        let mut out = poller.out();
+        let polled = drive_to_end(
+            &mut poller,
+            &mut out,
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
+        )
+        .unwrap();
+        let r = &polled.readings[0];
+        assert_eq!(r.perf.as_ref().map(|p| p.uptime_s), Some(5), "{r:?}");
+        assert_eq!(
+            r.traffic.as_ref().map(|t| t.window_minutes),
+            Some(60),
+            "{r:?}"
+        );
+        assert_eq!(r.perf_error, None);
+        let seen = public_seen.join().unwrap();
+        assert_eq!(seen.len(), 1, "one request: {seen:?}");
+        assert_eq!(seen[0].0, "GET /health HTTP/1.1");
+    }
+
+    /// A node the journal has no line for says so, and the reason names the
+    /// journal rather than leaving the figures blank.
+    #[test]
+    fn a_node_with_no_journal_line_says_so() {
+        let (public, _seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            tunnel: None,
+            processes: None,
+            process: None,
+        };
+        let polled = run(&fleet_of(n), None);
+        let r = &polled.readings[0];
+        assert_eq!(
+            r.perf_error.as_deref(),
+            Some("no metrics line in the journal for this node")
+        );
+        assert_eq!(
+            r.traffic_error.as_deref(),
+            Some("no traffic line in the journal for this node")
+        );
+    }
+
+    /// A reader that is not running is named, not reported as a node with no
+    /// figures.
+    #[test]
+    fn a_stopped_reader_is_named() {
+        let (public, _seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
+        let n = Node {
+            name: "origin".into(),
+            url: format!("http://127.0.0.1:{public}"),
+            role: "origin".into(),
+            tunnel: None,
+            processes: None,
+            process: None,
+        };
+        let fleet = fleet_of(n);
+        let mut poller = one_shot_poller(
+            &fleet,
+            &tls(),
+            "127.0.0.1:53".parse().unwrap(),
+            crate::check::MAX_LOOKUPS_PER_POLL,
+        )
+        .unwrap();
+        poller.set_journal_state(Some("journalctl could not start".to_string()));
+        let mut out = poller.out();
+        let polled = drive_to_end(
+            &mut poller,
+            &mut out,
+            Some(m6_core::platform::now() + Duration::from_secs(20)),
+        )
+        .unwrap();
+        let r = &polled.readings[0];
+        assert!(
+            r.perf_error
+                .as_deref()
+                .is_some_and(|e| e.contains("the journal reader is not running")),
+            "{r:?}"
+        );
+        assert!(
+            r.perf_error
+                .as_deref()
+                .is_some_and(|e| e.contains("journalctl could not start")),
+            "{r:?}"
+        );
+    }
+
     #[test]
     fn a_process_that_is_down_is_unreachable_under_its_own_name() {
         let port = {
@@ -1600,49 +1767,6 @@ mod tests {
         let polled = run(&fleet_of(process_node(port, 1)), Some("tok"));
         assert_eq!(polled.readings[0].name, "edge/1");
         assert!(polled.readings[0].unreachable.is_some());
-    }
-
-    #[test]
-    fn perf_and_traffic_go_to_the_tunnel_and_health_to_the_url() {
-        let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
-        let (tunnel, tunnel_seen) = serve(2, |_| (404, r#"{"error":"not found"}"#));
-        let n = tunnel_node(public, tunnel);
-        let polled = run(&fleet_of(n), Some("tok"));
-        let r = &polled.readings[0];
-        assert_eq!(r.health.as_ref().map(|h| h.status.as_str()), Some("ok"));
-
-        let public_seen = public_seen.join().unwrap();
-        assert_eq!(public_seen.len(), 1);
-        assert_eq!(public_seen[0].0, "GET /health HTTP/1.1");
-        assert_eq!(public_seen[0].1, "", "/health carries no token");
-
-        let tunnel_seen = tunnel_seen.join().unwrap();
-        assert_eq!(tunnel_seen[0].0, "GET /perf HTTP/1.1");
-        assert_eq!(tunnel_seen[1].0, "GET /traffic HTTP/1.1");
-        assert!(tunnel_seen.iter().all(|(_, a)| a == "Bearer tok"));
-        assert_eq!(
-            r.perf_error.as_deref(),
-            Some("404: /perf not enabled on this node, or not served to this address")
-        );
-    }
-
-    #[test]
-    fn a_403_says_the_token_lacks_the_role() {
-        let (public, public_seen) = serve(1, |_| (200, r#"{"status":"ok","node":"origin"}"#));
-        let (tunnel, tunnel_seen) = serve(2, |_| (403, r#"{"error":"forbidden"}"#));
-        let n = tunnel_node(public, tunnel);
-        let polled = run(&fleet_of(n), Some("tok"));
-        public_seen.join().unwrap();
-        tunnel_seen.join().unwrap();
-        let r = &polled.readings[0];
-        assert_eq!(
-            r.perf_error.as_deref(),
-            Some("403: token lacks the required role")
-        );
-        assert_eq!(
-            r.traffic_error.as_deref(),
-            Some("403: token lacks the required role")
-        );
     }
 
     /// A hung node's step fails at the deadline and reads unreachable, with the
@@ -1663,9 +1787,7 @@ mod tests {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{port}"),
             role: "origin".into(),
-            perf_token_file: None,
             tunnel: None,
-            metrics_over_tunnel: false,
             processes: None,
             process: None,
         };
@@ -1690,7 +1812,7 @@ mod tests {
     /// base as every other request: `GET /path`, never `GET //path`.
     #[test]
     fn a_trailing_slash_url_builds_header_check_urls_without_a_double_slash() {
-        let (port, seen) = serve(4, |path| {
+        let (port, seen) = serve(2, |path| {
             if path == "/health" {
                 (200, r#"{"status":"ok","node":"origin"}"#)
             } else {
@@ -1701,9 +1823,7 @@ mod tests {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{port}/"),
             role: "origin".into(),
-            perf_token_file: None,
             tunnel: None,
-            metrics_over_tunnel: false,
             processes: None,
             process: None,
         };
@@ -1718,11 +1838,9 @@ mod tests {
         fleet.header_check = checks;
         let polled = run(&fleet, Some("tok"));
         let seen = seen.join().unwrap();
-        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen.len(), 2, "{seen:?}");
         assert_eq!(seen[0].0, "GET /health HTTP/1.1");
-        assert_eq!(seen[1].0, "GET /perf HTTP/1.1");
-        assert_eq!(seen[2].0, "GET /traffic HTTP/1.1");
-        assert_eq!(seen[3].0, "GET /capabilities HTTP/1.1");
+        assert_eq!(seen[1].0, "GET /capabilities HTTP/1.1");
         assert!(
             seen.iter().all(|(line, _)| !line.contains("//")),
             "a request line carries a double slash: {seen:?}"
@@ -1802,19 +1920,17 @@ mod tests {
     /// is gone.
     #[test]
     fn the_dns_stage_drives_a_real_confirm() {
-        let (public, seen) = serve(3, health_traffic);
+        let (public, seen) = serve(1, health_traffic);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
             role: "origin".into(),
-            perf_token_file: None,
             tunnel: None,
-            metrics_over_tunnel: false,
             processes: None,
             process: None,
         };
         let (nameserver, server) = scripted_nameserver();
-        let polled = run_with(&fleet_of(n), Some("tok"), nameserver);
+        let polled = run_with_journal(&fleet_of(n), None, nameserver, &[traffic_line(TRAFFIC)]);
         server.join().unwrap();
         seen.join().unwrap();
         assert_eq!(
@@ -1830,28 +1946,32 @@ mod tests {
     /// does: its deadline is dropped and its slot marked done, so the finished
     /// node cannot fail a second time.
     ///
+    /// The steps that follow `/health` are the journal's, so the one network
+    /// step left after it is a header check, and that is the one made to fail.
     /// The failure is injected: a TCP connect that refuses at once on one
     /// platform reaches its readiness event on another, so the platform is not
     /// a sound trigger for this path.
     #[test]
     fn a_later_step_that_cannot_connect_finishes_the_node_once() {
-        let (public, seen) = serve(2, health_traffic);
+        let (public, seen) = serve(1, health_traffic);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
             role: "origin".into(),
-            perf_token_file: None,
             tunnel: None,
-            metrics_over_tunnel: false,
             processes: None,
             process: None,
         };
         let mut fleet = fleet_of(n);
         fleet.timeout_ms = 100;
+        fleet.header_check = vec![HeaderCheck {
+            path: "/".into(),
+            header: "x-test".into(),
+            expect: "yes".into(),
+            roles: Vec::new(),
+            cache_bust: false,
+        }];
         let tls = tls();
-        let token = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(token.path(), "tok\n").unwrap();
-        fleet.perf_token_file = Some(token.path().to_string_lossy().into_owned());
         let mut poller = one_shot_poller(
             &fleet,
             &tls,
@@ -1859,9 +1979,9 @@ mod tests {
             crate::check::MAX_LOOKUPS_PER_POLL,
         )
         .unwrap();
-        // `/health` and `/perf` start; `/traffic` is the node's last step and
-        // fails at start, as a connect that cannot open a socket fails.
-        poller.fail_step_start_after(2, io::ErrorKind::AddrNotAvailable);
+        // `/health` starts; the header check after it fails at start, as a
+        // connect that cannot open a socket fails.
+        poller.fail_step_start_after(1, io::ErrorKind::AddrNotAvailable);
         let mut out = poller.out();
         let polled = drive_to_end(
             &mut poller,
@@ -1871,11 +1991,13 @@ mod tests {
         .unwrap();
         seen.join().unwrap();
         let r = &polled.readings[0];
-        assert!(r.perf.is_some() || r.perf_error.is_some(), "{r:?}");
-        assert!(r.traffic_error.is_some(), "{r:?}");
+        assert_eq!(r.health_status, Some(200), "{r:?}");
+        assert_eq!(r.header_checks.len(), 1, "{r:?}");
+        assert!(r.header_checks[0].error.is_some(), "{r:?}");
+        assert!(r.perf_error.is_some(), "no line was fed to this poller");
         assert_eq!(r.unreachable, None, "{r:?}");
 
-        // The perf step's deadline is still armed in the old code. It fires
+        // The failed step's deadline is still armed in the old code. It fires
         // now, on a finished node, and must find nothing.
         let poll = Poll::new().unwrap();
         let later = m6_core::platform::now() + Duration::from_secs(1);
@@ -1897,24 +2019,19 @@ mod tests {
     /// decide, and this test is about the tally.
     #[test]
     fn a_tunnel_address_that_cannot_connect_is_reported_not_fatal() {
-        let (public, seen) = serve(3, health_traffic);
+        let (public, seen) = serve(1, health_traffic);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
             role: "origin".into(),
-            perf_token_file: None,
             tunnel: Some(crate::fleet::Tunnel {
                 address: "192.0.2.1:9".into(),
                 public_key: None,
             }),
-            metrics_over_tunnel: false,
             processes: None,
             process: None,
         };
-        let mut fleet = fleet_of(n);
-        let token = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(token.path(), "tok\n").unwrap();
-        fleet.perf_token_file = Some(token.path().to_string_lossy().into_owned());
+        let fleet = fleet_of(n);
         let mut poller = one_shot_poller(
             &fleet,
             &tls(),
@@ -1952,12 +2069,10 @@ mod tests {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
             role: "origin".into(),
-            perf_token_file: None,
             tunnel: Some(crate::fleet::Tunnel {
                 address: closed.to_string(),
                 public_key: None,
             }),
-            metrics_over_tunnel: false,
             processes: None,
             process: None,
         };
@@ -1971,24 +2086,5 @@ mod tests {
             t.probe.outcome
         );
         assert!(!t.probe.samples.is_empty(), "{t:?}");
-    }
-
-    #[test]
-    fn a_401_says_the_token_was_rejected_for_perf_and_traffic() {
-        let (public, public_seen) = serve(1, |_| (200, HEALTH));
-        let (tunnel, tunnel_seen) = serve(2, |_| (401, r#"{"error":"unauthorized"}"#));
-        let n = tunnel_node(public, tunnel);
-        let polled = run(&fleet_of(n), Some("tok"));
-        public_seen.join().unwrap();
-        tunnel_seen.join().unwrap();
-        let r = &polled.readings[0];
-        assert_eq!(
-            r.perf_error.as_deref(),
-            Some("401: token rejected by this node")
-        );
-        assert_eq!(
-            r.traffic_error.as_deref(),
-            Some("401: token rejected by this node")
-        );
     }
 }

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// One node to poll.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Node {
     /// Short name for the report. Not necessarily the node's own `node.name`,
     /// which is whatever that node calls itself and is reported separately so
@@ -29,28 +30,15 @@ pub struct Node {
     /// The node's public address. `/health` and the header checks are fetched
     /// from here, because what a visitor receives is what they assert on, and
     /// its host name is the name the node's certificate is checked against.
-    /// `/perf` and `/traffic` come from here too unless `metrics_over_tunnel`
-    /// moves them to the tunnel, so `/perf` no longer has to face the
-    /// internet. Polling a node through its own public edge also measures the
-    /// edge rather than the node.
+    /// The metrics and traffic documents are read from the journal, so they
+    /// never travel over the public interface. Polling a node through its own
+    /// public edge also measures the edge rather than the node.
     pub url: String,
     /// Role, for the report only. A cache node legitimately has no socket
     /// pools and a low hit rate relative to origin, and reporting it next to
     /// origin without saying which is which invites the wrong conclusion.
     #[serde(default)]
     pub role: String,
-    /// This node's `/perf` bearer token, if it has its own.
-    ///
-    /// **The nodes need not share a token.** Each node can have its own
-    /// `/etc/m6/perf-token`. The failure when they differ is quiet: the
-    /// monitor polls with one token and the nodes that do not accept it
-    /// answer 401 with nothing to say why.
-    ///
-    /// Distinct tokens are the better property, so this follows reality
-    /// rather than changing it: a leaked token exposes one node's `/perf`,
-    /// not the fleet's.
-    #[serde(default)]
-    pub perf_token_file: Option<String>,
     /// The WireGuard tunnel from this host to the node, if there is one.
     ///
     /// Absent means "no tunnel configured", which the report says out loud and
@@ -64,10 +52,6 @@ pub struct Node {
     /// address, because the request is TLS to that socket. The URL's host name
     /// still names the certificate, so the node's public certificate is checked
     /// as usual. The node answers these paths only to peers it lists
-    /// (`[health] metrics_peers`) and only for an API token, so this is the
-    /// supported way to keep them off the public interface.
-    #[serde(default)]
-    pub metrics_over_tunnel: bool,
     /// How many m6-http processes this node runs on its shared port, each with
     /// `[server] process_index` and `status_bind` set. Absent means the node is
     /// polled as one address, as always. Present, the node is polled as that
@@ -105,35 +89,8 @@ pub struct Tunnel {
     pub public_key: Option<String>,
 }
 
-impl Node {
-    /// This node's token, falling back to the fleet-wide one.
-    pub fn perf_token(&self, fallback: Option<&str>) -> Option<String> {
-        match &self.perf_token_file {
-            Some(path) => read_token(path),
-            None => fallback.map(|s| s.to_string()),
-        }
-    }
-}
-
-fn read_token(path: &str) -> Option<String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let t = s.trim().to_string();
-            if t.is_empty() {
-                m6_core::log::warn!(path = %path, "perf token file is empty");
-                None
-            } else {
-                Some(t)
-            }
-        }
-        Err(e) => {
-            m6_core::log::warn!(path = %path, error = %e, "perf token file unreadable");
-            None
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fleet {
     pub nodes: Vec<Node>,
     /// The seconds between polls, read at load from the top level.
@@ -142,19 +99,25 @@ pub struct Fleet {
     /// same number the poller uses.
     #[serde(skip)]
     pub(crate) poll_interval_s: u64,
-    /// Fallback `/perf` bearer token, for nodes that do not name their own.
-    ///
-    /// Read from a file, never inlined: this config is in git and the token is
-    /// not. Absent means `/perf` is not polled, and the report says so rather
-    /// than showing an empty fleet.
-    ///
-    /// A fleet whose nodes each have a distinct token names one per node and
-    /// leaves this unset. It is the convenience for a fleet that does share.
-    #[serde(default)]
-    pub perf_token_file: Option<String>,
     /// How long to wait for one node before giving up on it.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// `[monitor] history_file`. Validated by `history`, and named here so
+    /// the table's key list is complete: every other key under `[monitor]` is
+    /// one of these fields, so an unknown one, a removed one included, stops
+    /// the start.
+    #[serde(default)]
+    pub history_file: Option<String>,
+    /// `[monitor] history_max_mb`, validated by `history` for the same reason.
+    #[serde(default)]
+    pub history_max_mb: Option<u64>,
+    /// The directory mon's `systemd-journal-remote` writes each node's journal
+    /// to. A relative path resolves against the monitor's site directory.
+    ///
+    /// The metrics and traffic documents are read from it, so this is the one
+    /// source of a node's figures. The default is stock journal-remote's.
+    #[serde(default = "default_journal_dir")]
+    pub journal_dir: String,
     /// Whether this fleet is meant to serve one certificate. Default false.
     ///
     /// Read from `[monitor] one_certificate`. A fleet that runs one
@@ -328,7 +291,6 @@ fn expand_processes(nodes: Vec<Node>) -> anyhow::Result<Vec<Node>> {
             entry.name = format!("{}/{i}", n.name);
             entry.processes = None;
             entry.process = Some(i);
-            entry.metrics_over_tunnel = true;
             if let Some(t) = entry.tunnel.as_mut() {
                 t.address = SocketAddr::new(base.ip(), port).to_string();
             }
@@ -338,7 +300,33 @@ fn expand_processes(nodes: Vec<Node>) -> anyhow::Result<Vec<Node>> {
     Ok(out)
 }
 
+/// Where `systemd-journal-remote` keeps per-node journals by default.
+fn default_journal_dir() -> String {
+    "/var/log/journal/remote".to_string()
+}
+
 impl Fleet {
+    /// The journal directory, resolved against the monitor's site directory.
+    ///
+    /// A missing directory is refused at start: a monitor that silently reads
+    /// an empty journal reports every node as having no metrics, which reads
+    /// like a fleet-wide fault instead of a misconfigured path.
+    pub fn journal_path(&self, site_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(&self.journal_dir);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            site_dir.join(path)
+        };
+        if !path.is_dir() {
+            anyhow::bail!(
+                "[monitor] journal_dir {} is not a directory: create it, or point the key at the directory systemd-journal-remote writes each node's journal to",
+                path.display()
+            );
+        }
+        Ok(path)
+    }
+
     /// Load from the service's own config file.
     ///
     /// The fleet lives under `[monitor]` in the ordinary m6 config, so a
@@ -352,9 +340,6 @@ impl Fleet {
         let mut fleet: Fleet = section.clone().try_into()?;
         if fleet.nodes.is_empty() {
             anyhow::bail!("[monitor] lists no nodes");
-        }
-        if let Some(p) = &fleet.perf_token_file {
-            m6_core::config::secret_path("[monitor] perf_token_file", p)?;
         }
         // The top-level key, through the function the poller uses.
         let poll_interval_s = poll_interval_s(|k| {
@@ -382,15 +367,6 @@ impl Fleet {
         }
         fleet.nodes = expand_processes(std::mem::take(&mut fleet.nodes))?;
         for n in &fleet.nodes {
-            if let Some(p) = &n.perf_token_file {
-                m6_core::config::secret_path(&format!("node {:?}: perf_token_file", n.name), p)?;
-            }
-            if n.metrics_over_tunnel && n.tunnel.is_none() {
-                anyhow::bail!(
-                    "node {:?}: metrics_over_tunnel needs tunnel.address, the node's HTTPS port on its tunnel address",
-                    n.name
-                );
-            }
             if let Some(t) = &n.tunnel {
                 if t.address.parse::<std::net::SocketAddr>().is_err() {
                     anyhow::bail!(
@@ -403,11 +379,6 @@ impl Fleet {
         }
         fleet.poll_interval_s = poll_interval_s;
         Ok(fleet)
-    }
-
-    /// The fleet-wide fallback token, if one is configured and readable.
-    pub fn perf_token(&self) -> Option<String> {
-        read_token(self.perf_token_file.as_ref()?)
     }
 
     /// Seconds a node's last `/health` 200 may be old before the check flags
@@ -438,8 +409,6 @@ pub struct ResolvedNode {
     /// Where every step but a header check goes for a process entry: its
     /// status port. `None` for an ordinary node.
     pub status_addr: Option<SocketAddr>,
-    /// Whether `/perf` and `/traffic` go over the tunnel.
-    pub metrics_over_tunnel: bool,
     /// The TLS client for an `https` URL. The name is the URL's host in both
     /// cases: the tunnel carries TLS for the same certificate.
     pub tls: Option<TlsClient>,
@@ -447,17 +416,6 @@ pub struct ResolvedNode {
     pub base_path: String,
     /// The authority as the URL writes it, for the `Host` header.
     pub authority: String,
-}
-
-impl ResolvedNode {
-    /// Where `/perf` and `/traffic` go: the tunnel when the node asks for it,
-    /// the public address otherwise.
-    pub fn metrics_addr(&self) -> SocketAddr {
-        match (&self.tunnel, self.metrics_over_tunnel) {
-            (Some(t), true) => t.addr,
-            _ => self.addr,
-        }
-    }
 }
 
 /// A node's tunnel address, parsed once at start.
@@ -523,7 +481,6 @@ impl Fleet {
                 process: n.process,
                 status_addr: n.process.and(tunnel.as_ref()).map(|t| t.addr),
                 tunnel,
-                metrics_over_tunnel: n.metrics_over_tunnel,
                 tls: tls_client,
                 base_path: u.base_path,
                 authority: u.authority,
@@ -618,7 +575,6 @@ role = "cache"
         assert_eq!(fleet.nodes[0].name, "origin");
         assert_eq!(fleet.nodes[0].role, "origin");
         assert_eq!(fleet.timeout_ms, 2000);
-        assert!(fleet.perf_token().is_none());
     }
 
     #[test]
@@ -628,74 +584,34 @@ role = "cache"
         assert!(Fleet::from_config(f.path()).is_err());
     }
 
+    /// The journal directory is the one source of a node's figures, so its
+    /// default is stock journal-remote's and a relative path resolves against
+    /// the site directory.
     #[test]
-    fn the_token_is_read_from_a_file_never_from_the_config() {
-        let mut tok = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tok, "s3cret").unwrap();
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            "[monitor]\nperf_token_file = {:?}\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\n",
-            tok.path()
+    fn the_journal_directory_defaults_to_the_stock_remote_path() {
+        let fleet =
+            load("[[monitor.nodes]]\nname = \"a\"\nurl = \"http://origin.example.com\"\n").unwrap();
+        assert_eq!(fleet.journal_dir, "/var/log/journal/remote");
+        let relative = load(
+            "[monitor]\njournal_dir = \"journal\"\n\n[[monitor.nodes]]\nname = \"a\"\nurl = \"http://origin.example.com\"\n",
         )
         .unwrap();
-        let fleet = Fleet::from_config(f.path()).unwrap();
-        assert_eq!(fleet.perf_token().as_deref(), Some("s3cret"));
-        // And the token itself is not a field anyone could set inline.
-        let raw = std::fs::read_to_string(f.path()).unwrap();
-        assert!(!raw.contains("s3cret"));
+        assert_eq!(relative.journal_dir, "journal");
     }
 
-    /// The nodes do not share a token, so a per-node file must win over the
-    /// fleet-wide one. Getting this wrong is a quiet failure: the monitor
-    /// polls with the wrong token and the node answers 401.
+    /// A directory that is not there is an error naming the key, which the
+    /// service reports as a fault rather than refusing to start the monitor.
     #[test]
-    fn a_node_token_overrides_the_fleet_token() {
-        let mut per_node = tempfile::NamedTempFile::new().unwrap();
-        writeln!(per_node, "node-token").unwrap();
-
-        let n = Node {
-            name: "edge-a".into(),
-            url: "https://edge-a.example.com".into(),
-            role: "cache".into(),
-            perf_token_file: Some(per_node.path().to_string_lossy().to_string()),
-            tunnel: None,
-            metrics_over_tunnel: false,
-            processes: None,
-            process: None,
-        };
-        assert_eq!(
-            n.perf_token(Some("fleet-token")).as_deref(),
-            Some("node-token")
-        );
-
-        let bare = Node {
-            name: "origin".into(),
-            url: "https://origin.example.com".into(),
-            role: "origin".into(),
-            perf_token_file: None,
-            tunnel: None,
-            metrics_over_tunnel: false,
-            processes: None,
-            process: None,
-        };
-        assert_eq!(
-            bare.perf_token(Some("fleet-token")).as_deref(),
-            Some("fleet-token")
-        );
-        assert_eq!(bare.perf_token(None), None);
-    }
-
-    #[test]
-    fn a_missing_token_file_is_a_warning_not_a_crash() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            "[monitor]\nperf_token_file = \"/no/such/file\"\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\n"
+    fn a_missing_journal_directory_names_the_key() {
+        let fleet = load(
+            "[monitor]\njournal_dir = \"/no/such/journal\"\n\n[[monitor.nodes]]\nname = \"a\"\nurl = \"http://origin.example.com\"\n",
         )
         .unwrap();
-        let fleet = Fleet::from_config(f.path()).unwrap();
-        assert!(fleet.perf_token().is_none());
+        let error = fleet
+            .journal_path(std::path::Path::new("/tmp"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[monitor] journal_dir"), "{error}");
     }
 
     fn load(text: &str) -> anyhow::Result<Fleet> {
@@ -795,9 +711,10 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
     fn the_handshake_check_reads_the_same_poll_interval_as_the_poller() {
         let node = "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://x.example.com\"\n\
                     tunnel = { address = \"192.0.2.2:443\", public_key = \"K\" }\n";
-        // The poller reads the top-level key, so a `[monitor]` one changes nothing:
-        // the poll is 30 s and the default limit of 600 s is enough.
-        load(&format!("[monitor]\npoll_interval_s = 600\n{node}")).unwrap();
+        // The poller reads the top-level key, so a `[monitor]` one is refused
+        // as an unknown key rather than silently ignored.
+        let e = load(&format!("[monitor]\npoll_interval_s = 600\n{node}")).unwrap_err();
+        assert!(e.to_string().contains("poll_interval_s"), "{e}");
         // The top-level key is the one the poller uses, so the check uses it too.
         let e = load(&format!("poll_interval_s = 600\n[monitor]\n{node}")).unwrap_err();
         assert!(e.to_string().contains("785"), "{e}");
@@ -847,50 +764,6 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         assert_eq!(default.health_last_ok_limit_s(), 180);
         let stock = load(node).unwrap();
         assert_eq!(stock.health_last_ok_limit_s(), 90);
-    }
-
-    #[test]
-    fn metrics_over_tunnel_defaults_off() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://a.example.com\"\n\
-             tunnel = {{ address = \"192.0.2.2:443\" }}\n"
-        )
-        .unwrap();
-        let fleet = Fleet::from_config(f.path()).unwrap();
-        assert!(!fleet.nodes[0].metrics_over_tunnel);
-    }
-
-    #[test]
-    fn metrics_over_tunnel_needs_a_tunnel() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            "[[monitor.nodes]]\nname = \"a\"\nurl = \"http://a.example.com\"\n\
-             metrics_over_tunnel = true\n"
-        )
-        .unwrap();
-        let e = Fleet::from_config(f.path()).unwrap_err().to_string();
-        assert!(
-            e.contains("metrics_over_tunnel needs tunnel.address"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn a_relative_perf_token_file_is_refused_and_named() {
-        let fleet = load(
-            "[monitor]\nperf_token_file = \"token\"\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\n",
-        );
-        let err = fleet.unwrap_err().to_string();
-        assert!(err.contains("[monitor] perf_token_file"), "{err}");
-
-        let node = load(
-            "[monitor]\n\n[[monitor.nodes]]\nname=\"a\"\nurl=\"http://origin.example.com\"\nperf_token_file = \"token\"\n",
-        );
-        let err = node.unwrap_err().to_string();
-        assert!(err.contains("node \"a\": perf_token_file"), "{err}");
     }
 
     #[test]
@@ -948,7 +821,6 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
         let want: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert_eq!(resolved[0].addr, want);
         assert!(resolved[0].tls.is_none());
-        assert_eq!(resolved[0].metrics_addr(), want);
         assert_eq!(resolved[0].name, "a");
     }
 
@@ -996,7 +868,8 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
                 ),
             ]
         );
-        assert!(fleet.nodes.iter().all(|n| n.metrics_over_tunnel));
+        // Every process entry polls its own status port for `/health`.
+        assert!(fleet.nodes.iter().all(|n| n.process.is_some()));
     }
 
     /// One process is the node as it always was: same name, same address.
@@ -1010,7 +883,6 @@ tunnel = { address = "192.0.2.2:443", public_key = "KEY" }
             assert_eq!(n.name, "edge-a");
             assert_eq!(n.tunnel.as_ref().unwrap().address, "192.0.2.2:9440");
             assert_eq!((n.processes, n.process), (None, None));
-            assert!(!n.metrics_over_tunnel);
         }
     }
 

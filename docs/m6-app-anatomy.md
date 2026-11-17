@@ -428,6 +428,7 @@ m6-http reads its keys from the `[limits]` table of its system config, and every
 | `log_buffer` | bytes | 16 KiB | 1 MiB | every process | one log destination's buffer | the line is refused |
 | `log_field` | bytes | 8 KiB | 8 KiB | every process | one string field of a log line | the line is refused |
 | `history_queue` | polls | 8 | 1024 | m6-monitor | polls held while the history file is locked | the new poll is refused |
+| `journal_line` | bytes | 64 KiB | 4 MiB | m6-monitor | one line read from the journal, a whole metrics or traffic document with its JSON wrapper | the line is dropped and counted |
 | `edge_request` | bytes | 4 KiB | 32 MiB | m6-http | one HTTP/1.1 connection's read buffer, so the largest request | 413 |
 | `edge_response` | bytes | 512 B | 128 MiB | m6-http | one HTTP/1.1 connection's write buffer, so the largest response held | 500 |
 | `h2_recv` | bytes | 16 KiB | 4 MiB | m6-http | one HTTP/2 connection's read buffer | the connection closes |

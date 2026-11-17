@@ -124,9 +124,11 @@ fn check_without_config_fails_loudly() {
     );
 }
 
-/// A relative `perf_token_file` is refused at start, before the poll runs.
+/// A removed `[monitor]` key stops the start, naming the key. The monitor's
+/// perf tokens went with the endpoints they opened, and a config that still
+/// names one is refused the way every removed key is.
 #[test]
-fn a_relative_perf_token_file_stops_the_start() {
+fn a_removed_monitor_key_stops_the_start() {
     let config_text = CONFIG.replace(
         "timeout_ms = 200",
         "timeout_ms = 200\nperf_token_file = \"token\"",
@@ -142,7 +144,7 @@ fn a_relative_perf_token_file_stops_the_start() {
         .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
-                "m6-monitor did not exit for a relative perf_token_file\n--- output ---\n{}",
+                "m6-monitor did not exit for a removed perf_token_file\n--- output ---\n{}",
                 svc.output()
             )
         });
@@ -156,6 +158,11 @@ fn a_relative_perf_token_file_stops_the_start() {
     assert!(
         svc.output().contains("perf_token_file"),
         "the error did not name perf_token_file\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        svc.output().contains("unknown field"),
+        "the refusal is the unknown-key one\n--- output ---\n{}",
         svc.output()
     );
 }

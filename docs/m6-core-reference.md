@@ -144,7 +144,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
 | **Observability** | `log` | `init`, `tick`, `watch`, `flush`, `stop`, `Line`, the five macros and `LogPulse`. The buffered JSONL logger every service loop drives, re-exported from `m6-log`. |
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
-| | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
+| | `monitoring` | `/health`, and the metrics and traffic documents: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
 | | `platform` | The platform layer, the one crate that knows the operating system: readiness, the clock, signals, a child's exit, sockets, limits, directories, host and process facts. `docs/m6-platform.md`. Its `host` module is what the machine is doing: load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
 | | `tls` | How long the loaded certificate has left and its fingerprint: `not_after_unix`, `Fingerprint`, `record_loaded`, `loaded` and `TlsCertificate`. |
@@ -802,7 +802,7 @@ exactly like a quiet hour.
 as well as `Deserialize` so the write side can adopt them.
 `AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)`
 builds the record the analytics line with those values parses to, which is how
-`/traffic` turns its in-memory window back into records.
+the traffic document turns the in-memory window back into records.
 `truncated` is the window's own fact that a cap cut the path or user agent, and
 it is not part of the line.
 `parse_analytics(...)` reads a stream. `PeriodicStats::parse(line)` reads the
@@ -827,13 +827,9 @@ it is a fault.
 
 ### 8.3. `monitoring`
 
-`/health` answers `ok` or `degraded` and is constant-cost by construction. `/perf`
-answers counters and percentiles and is token-gated, **and not out of modesty
-about traffic volume**: live latency and error counters tell an attacker
-which requests cost 2.8us and which cost 7.8ms, about 2800 to 1 on this
-deployment, which turns a blind probe into a tuning loop. With no token
-configured `/perf` is a 404, not a 401, so forgetting to configure it fails
-closed and does not advertise a door.
+`/health` answers `ok` or `degraded` and is constant-cost by construction.
+The metrics and traffic documents are `type` `perf` and `type` `traffic` log lines, which a reader takes from the journal rather than from an HTTP endpoint, so no credential opens them and there is no door to advertise.
+The figures stay off the public interface because the journal is not public: a node ships its journal to the monitor over the tunnel.
 
 `HealthReport::build(node)` and `HealthReport::degraded(node)` return
 `(u16, HealthReport)` and `into_response(code)`. `build` is 200 `ok` and
@@ -864,12 +860,12 @@ which is the treatment `build` already gets.
 The fingerprint is what tells two certificates with one expiry apart, and
 `TlsCertificate.fingerprint` is `serde(default)` for the same reason.
 
-`PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
+`PerfReport.logging` carries `LoggingHealth`, which is also on the traffic document.
 It is the line count the level let through and the age of the last line, and it is `serde(default)`, so a node older than the field still parses.
 
 `TrafficReport::from_records(node, records, window_minutes)` summarises records
-that are already parsed, which is how `m6-http` answers `/traffic` from its
-in-memory window. `events_dropped` says how many events that window overwrote
+that are already parsed, which is how `m6-http` builds its traffic document from
+the in-memory window. `events_dropped` says how many events that window overwrote
 before they left it, so a short window is not read as a quiet hour. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
@@ -903,7 +899,7 @@ text these files contain and are tested on any platform; the readers are thin
 and platform-gated.
 
 **`snapshot(disk_path) -> HostSnapshot`** is the one most callers want: it
-assembles every reading below into the struct `/perf` publishes.
+assembles every reading below into the struct the metrics document publishes.
 
 Readers, each platform-gated with a degraded fallback that returns `None` or an
 empty `Vec` rather than failing: `load_average`, `memory`, `disk`, `cpu_count`,

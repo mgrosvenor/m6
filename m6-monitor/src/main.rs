@@ -1,7 +1,8 @@
 //! `m6-monitor`: one page that says how the fleet is.
 //!
-//! Runs at origin, polls every node's `/health` and `/perf` over the backbone,
-//! and serves the digest. These routes:
+//! Runs at origin, polls every node's `/health` over the backbone, reads every
+//! node's metrics and traffic documents from mon's own journal, and serves the
+//! digest. These routes:
 //!
 //!   GET /          the page
 //!   GET /digest    the same thing as JSON, for anything that is not a person
@@ -18,10 +19,11 @@
 //! The monitor's `main` is start, run and stop, the shape every service has
 //! since the event-loop refactor: `m6_core::event` supplies the signals, the deadlines and the
 //! connection table, and `m6_core::platform` the reactor. The fleet poll is not a thread.
-//! It is a table of steps in this loop (`poll.rs`): each node's `/health`,
-//! `/perf` and `/traffic` requests, each tunnel connect and each crawler
-//! lookup is a descriptor the loop waits on, so a node that hangs holds only
-//! its own step and never the monitor.
+//! It is a table of steps in this loop (`poll.rs`): each node's `/health`
+//! request, each tunnel connect and each crawler lookup is a descriptor the
+//! loop waits on, and so is the one `journalctl --follow` pipe `journal.rs`
+//! reads the two documents from, so a node that hangs holds only its own step
+//! and never the monitor.
 //!
 //! Nothing blocks while serving. The fleet, every node's host name, the
 //! history file and the host's certificate store are read at start, and a
@@ -34,12 +36,12 @@
 //!
 //! # Why this is not a script over ssh
 //!
-//! `/health` and `/perf` are HTTP endpoints and the analytics stream is a file
-//! m6 writes, so the data was always reachable without a shell. What was
-//! missing was the host's own numbers, which are now on `/perf`. Polling over
-//! the backbone rather than shelling in means the monitor needs no credentials
-//! on the boxes, measures the path it actually cares about, and fails the way a
-//! service fails rather than the way a script does.
+//! `/health` is an HTTP endpoint and each node ships its journal to mon over
+//! the tunnel, so the data is reachable without a shell. What was missing was
+//! the host's own numbers, which the metrics line now carries. Polling and
+//! reading a journal rather than shelling in means the monitor needs no
+//! credentials on the boxes, measures the path it actually cares about, and
+//! fails the way a service fails rather than the way a script does.
 
 #![deny(unsafe_code)]
 
@@ -47,6 +49,7 @@ mod check;
 mod digest;
 mod fleet;
 mod history;
+mod journal;
 mod poll;
 mod tunnel;
 
@@ -77,6 +80,8 @@ const SIGNALS: Token = Token(usize::MAX - 1);
 /// The operational log's stdout, registered while it holds bytes a full
 /// destination would not take.
 const LOG: Token = Token(usize::MAX - 2);
+/// The journal reader's pipe: the one long-lived `journalctl --follow` child.
+const JOURNAL: Token = Token(usize::MAX - 3);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -193,14 +198,6 @@ fn run_service() -> Result<()> {
     let nodes = fleet
         .resolve(&tls)
         .unwrap_or_else(|e| fail("resolving the fleet", format!("{e:#}")));
-    let tokens = {
-        let fallback = fleet.perf_token();
-        fleet
-            .nodes
-            .iter()
-            .map(|n| n.perf_token(fallback.as_deref()))
-            .collect::<Vec<_>>()
-    };
     m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
     let nameserver = m6_core::dns::nameserver()
         .unwrap_or_else(|e| fail("reading the resolver configuration", e));
@@ -221,7 +218,6 @@ fn run_service() -> Result<()> {
         nodes,
         timeout: Duration::from_millis(fleet.timeout_ms),
         header_checks: fleet.header_check.clone(),
-        tokens,
         nameserver,
         wg_file: fleet.wg_handshakes_file.clone(),
         wg_max_age_s: fleet.tunnel_handshake_max_age_s,
@@ -232,6 +228,19 @@ fn run_service() -> Result<()> {
             .get(&m6_core::limits::UPSTREAM_REQUEST)
             .clone(),
     });
+
+    // The journal is where a node's metrics and traffic lines are read from.
+    // A directory that is not there is said once and reported as a fault,
+    // never a refusal to start: the monitor's own page and check still run.
+    let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
+    let mut journal = match fleet.journal_path(site.site_dir()) {
+        Ok(dir) => journal::Reader::open(&dir, &journal_limit, m6_core::platform::now()),
+        Err(e) => {
+            m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
+            journal::Reader::unavailable(format!("{e:#}"), &journal_limit)
+        }
+    };
+    poller.set_journal_state(journal.stopped.clone());
 
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
@@ -284,6 +293,17 @@ fn run_service() -> Result<()> {
     #[cfg(feature = "count-allocations")]
     let mut client_allocs = 0u64;
 
+    // The journal's pipe joins the loop as one more descriptor, when there is
+    // one. It leaves again when the child stops, after the reactor has let the
+    // descriptor go.
+    let mut journal_fd = None;
+    if let Some(fd) = journal.fd() {
+        poll.registry()
+            .register_fd(fd, JOURNAL, Interest::READABLE)
+            .unwrap_or_else(|e| fail("registering the journal", e));
+        journal_fd = Some(fd);
+    }
+
     // The first poll starts with the service, so the page and the check have a
     // reading before the first interval passes.
     let first = poller
@@ -313,6 +333,7 @@ fn run_service() -> Result<()> {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 5,
             Some(LOG) => 6,
+            Some(JOURNAL) => 6,
             Some(Token(t)) if t < poll::CLIENT_BASE => 1,
             Some(Token(t)) => {
                 let slot = t - poll::CLIENT_BASE;
@@ -387,6 +408,18 @@ fn run_service() -> Result<()> {
                     }
                 }
                 LOG => m6_core::log::flush(),
+                JOURNAL => {
+                    let now = m6_core::platform::now();
+                    if journal.read(now, |line| poller.ingest_journal(line))
+                        == journal::Event::Exited
+                    {
+                        if let Some(fd) = journal_fd.take() {
+                            let _ = poll.registry().deregister_fd(fd);
+                        }
+                        journal.retire();
+                    }
+                    poller.set_journal_state(journal.stopped.clone());
+                }
                 // One connection's turn: answer from the snapshot, or from
                 // the history for the two paged routes.
                 Token(k) if k < poll::CLIENT_BASE => {
@@ -426,6 +459,18 @@ fn run_service() -> Result<()> {
                 }
             }
         }
+
+        // The journal's child is started again on its backoff, and its pipe
+        // joins the loop again when it does.
+        journal.restart_if_due(m6_core::platform::now());
+        if journal_fd.is_none() {
+            if let Some(fd) = journal.fd() {
+                poll.registry()
+                    .register_fd(fd, JOURNAL, Interest::READABLE)?;
+                journal_fd = Some(fd);
+            }
+        }
+        poller.set_journal_state(journal.stopped.clone());
 
         // A full stdout holds its bytes in the Sink. Watch it for writability
         // only while it does, so the loop never waits on the log.
@@ -487,6 +532,9 @@ fn run_service() -> Result<()> {
     history.flush();
     #[cfg(feature = "count-allocations")]
     eprintln!("{client_allocs} allocation(s) in the client arm outside table growth");
+    // The journal's child is killed by its own Drop, so no `journalctl
+    // --follow` outlives the monitor.
+    drop(journal);
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();
@@ -864,6 +912,16 @@ fn run_check(config_path: &Path) -> Result<()> {
         m6_core::dns::nameserver()?,
         check::MAX_LOOKUPS_PER_CHECK,
     )?;
+    // The metrics and traffic documents are read from the journal before the
+    // poll, until every node has both or the settle bound passes. A one-shot
+    // tool may wait here, so this is a bounded read rather than a loop turn.
+    let limit = m6_core::limits::Limit::builtin(&m6_core::limits::JOURNAL_LINE);
+    poller.read_journal_once(
+        fleet
+            .journal_path(config_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| format!("{e:#}")),
+        &limit,
+    );
     let mut out = poller.out();
     let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
     let d = digest::build(&polled.readings, &thresholds, now_iso8601());

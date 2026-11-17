@@ -935,7 +935,7 @@ Example 06 runs the Example 05 CMS blog under systemd.
 The example holds only the unit files in `examples/06-systemd/systemd/`.
 It reuses the Example 05 site directory, with a production `site.toml` and a production system config written on the server.
 This section prepares the server, deploys the site directory and writes the units.
-Sections 7.5 to 7.12 install them, verify the stack and cover logs, scaling and recovery.
+Sections 7.5 to 7.13 install them, verify the stack and cover logs, scaling and recovery.
 
 ### 7.1. Server preparation
 
@@ -1030,7 +1030,6 @@ Table 1 lists the settings, the file each sits in and the program that reads it.
 | `[storage] path` | m6-auth config | m6-auth-server and m6-auth-cli |
 | `[keys] private_key` | m6-auth config | m6-auth-server with the login side, and m6-auth-cli |
 | `[keys] public_key` | m6-auth config | m6-auth-server on both sides, and m6-auth-cli |
-| `perf_token_file` | `[monitor]` | m6-monitor |
 
 **Table 1: the settings that name a secret, key or certificate, the file each sits in and the program that reads it. Each takes an absolute path.**
 
@@ -1490,7 +1489,20 @@ Section 7.7 lists the reads.
 
 The traffic line answers from a window in memory and reads no log file, so the journal's rotation leaves its figures alone.
 
-### 7.9. Monitor history
+### 7.9. What the monitor reads
+
+m6-monitor polls each node's public `/health` for liveness, and reads every node's metrics and traffic documents from mon's own journal.
+Each node streams its journal to mon with `systemd-journal-upload`, and `systemd-journal-remote` keeps it under `/var/log/journal/remote`, one file per peer address.
+`[monitor] journal_dir` names that directory and defaults to `/var/log/journal/remote`.
+
+The monitor starts one `journalctl --follow` child at start and reads its output as one more descriptor in its event loop, so it never runs `journalctl` per poll and never waits on the child.
+Each line is attributed by the `node` field inside the JSON it carries, which is the name the node's own config gives it, and never by `_HOSTNAME`: a host that runs three nodes writes one `_HOSTNAME` for all three, and the three must stay three.
+A line whose document names no node is counted and dropped rather than guessed at.
+If the child stops, the monitor reports the reason against every node and starts it again on a growing backoff, up to thirty seconds.
+
+No credentials are involved: nothing in m6-http answers metrics or traffic over HTTP any more, so the monitor needs no token and there is no `perf_token_file`.
+
+### 7.10. Monitor history
 
 m6-monitor keeps a history of every poll when `[monitor] history_file` is set, and serves it as *JSON Lines* (one JSON object per line).
 Table 2 gives the two keys, which are read once at start.
@@ -1557,7 +1569,7 @@ It has no channels, reachability, host figures or tunnel, and it disappears whil
 Only the history keeps those, and it keeps them through an outage.
 Channel counters separate the monitor's own polls and header checks (issue #107) into `http/<version>/monitor`, and `monitor_requests` on each node row says how many.
 
-### 7.10. Deploy updates
+### 7.11. Deploy updates
 
 Deploy code and template changes with rsync, then restart m6-http so it reads the new `site.toml`:
 
@@ -1584,7 +1596,7 @@ For certificate renewal, certbot renews and its deploy hook restarts m6-http, an
 certbot renew
 ```
 
-### 7.11. Horizontal scaling
+### 7.12. Horizontal scaling
 
 The template unit replaces the plain one: the plain unit's `/run/m6/m6-html.sock` matches the same `/run/m6/m6-html*.sock` pool glob, so leaving it running beside `m6-html@1` and `m6-html@2` puts three processes behind one pool.
 Add two m6-html instances with it, then restart m6-http so it reads the pool again:
@@ -1606,7 +1618,7 @@ systemctl disable --now m6-html@2
 
 The socket disappears and m6-http keeps the member in its rotation. Each request that lands on it tries the next member, and the instance serves again on its next turn once a listener is bound there.
 
-### 7.12. Crash recovery
+### 7.13. Crash recovery
 
 systemd restarts a failed unit with `Restart=on-failure` and `RestartSec=2`.
 During the brief restart window, a request that lands on the missing socket tries the next member and is served. If every member of the pool is down, the affected routes answer 502 until one is back.
@@ -1872,7 +1884,7 @@ The stack is three processes: m6-http, m6-html and m6-file.
 `site.toml` sets `level = "debug"`, and routes `/logs/tail/{relpath}` straight to m6-file.
 The route is direct, so m6-http forwards the request without requiring the log files to exist at startup.
 The example leaves the tail route unauthenticated, and `level = "debug"` logs can carry request detail.
-A production deployment protects the route with `require = "role:..."`, the way section 7.9 protects the monitor history.
+A production deployment protects the route with `require = "role:..."`, the way section 7.10 protects the monitor history.
 
 `configs/m6-file.conf` turns on tail mode for the log files:
 

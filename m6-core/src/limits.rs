@@ -144,6 +144,10 @@ pub const RATE_LIMIT_ADDRESSES: LimitSpec = count("rate_limit_addresses", 1024, 
 pub const CACHE_BYTES: LimitSpec = bytes("cache_bytes", 128 * MIB, 128 * MIB);
 /// Polls the monitor holds in memory while its history file catches up.
 pub const HISTORY_QUEUE: LimitSpec = count("history_queue", 8, 1024);
+/// One line read from the journal: a whole metrics or traffic document with
+/// the journal's JSON wrapper around it, and room for the line to be cut in
+/// two by a read. Past `max` the line is dropped and counted, never cut.
+pub const JOURNAL_LINE: LimitSpec = bytes("journal_line", 64 * KIB, 4 * MIB);
 /// The heap a service reserves from the OS once at start, committed, so a warm
 /// service makes no kernel memory call. `start` is the reservation; past it the
 /// heap still grows, logged once, and is never an error. `max` is a ceiling on
@@ -176,6 +180,7 @@ pub const KNOWN: &[LimitSpec] = &[
     RATE_LIMIT_ADDRESSES,
     CACHE_BYTES,
     HISTORY_QUEUE,
+    JOURNAL_LINE,
     HEAP_RESERVE,
 ];
 

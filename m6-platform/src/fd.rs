@@ -14,6 +14,13 @@ pub fn write(fd: &impl AsFd, bytes: &[u8]) -> io::Result<usize> {
     Ok(nix::unistd::write(fd, bytes)?)
 }
 
+/// One `read(2)` on `fd`: the bytes the kernel gave, `WouldBlock` when a
+/// non-blocking descriptor has none, `Interrupted` when a signal cut the call.
+/// So a loop that reads another process's pipe never waits on it.
+pub fn read(fd: &impl AsFd, bytes: &mut [u8]) -> io::Result<usize> {
+    Ok(nix::unistd::read(fd, bytes)?)
+}
+
 /// Set or clear `O_NONBLOCK` on `fd` and return whether it was set before, so
 /// the caller can put it back.
 pub fn set_nonblocking(fd: &impl AsFd, on: bool) -> io::Result<bool> {
