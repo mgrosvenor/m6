@@ -1,11 +1,10 @@
 # m6-core, component reference
 
 **Status: reference.**
-This document describes every module in m6-core.
 Where it and the code disagree, the code is right and this document is a defect.
 
 m6-core is the crate every m6 service links.
-It supplies the loop parts, routing, configuration, the request dictionary and the response helpers, so a service that wants one of those does not write it again.
+It supplies the loop parts, routing, configuration, the request dictionary and the response helpers.
 
 This document is the reference for that crate: every module and the interface it exposes.
 Table 1 gives the two m6-core documents and the job each one does.
@@ -18,7 +17,6 @@ Table 1 gives the two m6-core documents and the job each one does.
 **Table 1: the two m6-core documents and the job each one does.**
 Take from it that a question about why a module exists belongs in the design document, and a question about a function's name or argument belongs here.
 
-The document follows the shape of a service.
 Sections 1 to 3 cover the ways into the crate, its feature flags and its module list.
 Sections 4 and 5 cover the modules that build a service and the modules that read a request and write a response.
 Sections 6 to 11 cover HTTP semantics, content, observability, errors, the test kit and the gaps this crate still has.
@@ -57,58 +55,51 @@ fn main() -> anyhow::Result<()> {
 
 `docs/m6-app-anatomy.md` §2 has that loop in full.
 
-The prelude is deliberately small.
-It exports `Site`, `Handled`, `CodeRoute` and `RouteMethod`, `Dict`, `Error` and `Result`, `Request` and `Response`, `ServerConn`, `Read`, `Flush` and `head_slots`, the event module's `Timeouts`, `Slots` and `LoopTrace`, the platform layer's `Signals`, `Signal`, `Poll`, `Events`, `Interest` and `Token`, `listen_unix`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
-Feature-gated additions appear in it only when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, `Message`, `Relay`, `RelayConfig`, `Smtp` and `Endpoint`, and `rusqlite`.
+The prelude exports `Site`, `Handled`, `CodeRoute` and `RouteMethod`, `Dict`, `Error` and `Result`, `Request` and `Response`, `ServerConn`, `Read`, `Flush` and `head_slots`, the event module's `Timeouts`, `Slots` and `LoopTrace`, the platform layer's `Signals`, `Signal`, `Poll`, `Events`, `Interest` and `Token`, `listen_unix`, the three helpers `now_iso8601`, `slugify` and `today_iso8601` from `util`, `NoTemplates`, and `serde_json`'s `json!`, `Map` and `Value`.
+Feature-gated additions, present when the feature is on: `Upload`, `TeraFactory` and `TeraRenderer`, `Message`, `Relay`, `RelayConfig`, `Smtp` and `Endpoint`, and `rusqlite`.
 
-A service that renders no templates says so, and takes core with `default-features = false` to stop linking Tera.
+A service that renders no templates passes `NoTemplates` and takes core with `default-features = false`, which stops it linking Tera.
 
-```rust
-use m6_core::prelude::*;
-
-let site = Site::load("my-service", ROUTES, &[], &NoTemplates);
-```
-
-Every module is public, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all, so m6-core is a library of parts.
-The loop belongs to the service, and `docs/m6-app-anatomy.md` is the shape it follows.
+Every module is public, so a tool can use the parsers in `telemetry` and `ndjson` without a server.
 
 ## 2. Feature flags
 
-Features and modules are different axes, and `flash` and `csrf` have no module at all.
+`flash` and `csrf` have no module.
 They gate code inside `site` and one method each, `Response::flash` and `Request::verify_csrf`.
-A reader who greps for a `csrf` module finds nothing and wrongly concludes the feature is missing.
-Table 2 gives the nine features.
+Table 2 gives the eleven features.
 
 | feature | default | what it adds |
 |---|---|---|
 | `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. Without it a service passes `NoTemplates`. |
 | `minify` | **on** | `minify` module, and the minification step in `site`. Pulls minify-html, which brings a CSS engine, and minify-js. Without it a config that turns minification on fails to load and names this feature. |
-| `testkit` | off | The `testkit` module. Enable from `[dev-dependencies]` only. |
-| `multipart` | off | `multipart` module, `Request::file`. Pulls multer, tokio, bytes, futures-util. |
-| `flash` | off | `Response::flash` and *HMAC* (hash-based message authentication code) signed one-shot messages. Pulls hmac, sha2. |
+| `testkit` | off | The `testkit` module, and `alloc-count`. Enable from `[dev-dependencies]` only. |
+| `alloc-count` | off | The counting allocator on its own, so a service binary can count its loop's allocations. |
+| `alloc-trace` | off | A backtrace per allocation, for the `alloc_sites` diagnostic target. |
+| `multipart` | off | `multipart` module, `Request::file`. Pulls multer, bytes, futures-util, futures-executor. |
+| `flash` | off | `Response::flash` and *HMAC* (hash-based message authentication code) signed one-shot messages. Pulls hmac. |
 | `csrf` | off | *CSRF* (cross-site request forgery) token generation in the request dictionary, and `Request::verify_csrf`. No new dependencies. |
-| `email` | off | `email` module: an SMTP client a service's loop drives (`Relay`, `Smtp`), and lettre for building messages. Pulls lettre without its transport. |
+| `email` | off | `email` module: an SMTP client a service's loop drives (`Relay`, `Smtp`), and lettre for building messages. Pulls lettre. |
 | `http-client` | off | `client::Endpoint`: a form POST to a URL resolved at start, driven by the service's loop on `client::Upstream`. Pulls url. |
 | `sqlite` | off | `sqlite` module: `open`, `open_reader`, `migrate`, `append_only`, `used_bytes`, `prune_oldest`, and `rusqlite` in the prelude. Pulls rusqlite with bundled SQLite. |
 
-**Table 2: the nine features, their defaults and what each one compiles.**
-Take from it that `templates` and `minify` are on by default, seven features pull a dependency and two add code only.
+**Table 2: the eleven features, their defaults and what each one compiles.**
+Take from it that `templates` and `minify` are on by default, and that `csrf`, `alloc-count` and `alloc-trace` add no dependency.
 
-`templates` and `minify` are on by default because a feature that hides code from `cargo test --workspace` is how two `csrf` tests stayed broken from Phase 4 to Phase 5.
-`chrono` and `lru` are unconditional dependencies for the same reason.
-A service that uses neither takes core with `default-features = false` and names only the features it uses, and then, built on its own (`cargo build -p`, `cargo install`), links no template engine, Markdown engine or CSS engine.
-Cargo unifies features across one build, so in a `cargo build --workspace` `m6-html` turns both features on for every crate.
-`m6-http`, `m6-monitor`, `m6-auth` and `m6-auth-server` do this, and `m6-file` names `minify` alone.
+`templates` and `minify` are on by default so that `cargo test --workspace` covers their code.
+`chrono` and `lru` are unconditional dependencies.
+A service that uses neither default takes core with `default-features = false` and names only the features it uses.
+Built on its own (`cargo build -p`, `cargo install`), it then links no template engine, Markdown engine or CSS engine.
+Cargo unifies features across one build, so in a `cargo build --workspace` `m6-html` turns both on for every crate.
+`m6-http`, `m6-monitor`, `m6-auth`, `m6-auth-cli` and `m6-auth-server` take `default-features = false`, and `m6-file` names `minify` alone.
 
-Every off-by-default feature is invisible to `cargo test --workspace`: `testkit`, `multipart`, `flash`, `csrf`, `email`, `http-client` and `sqlite`.
+No workspace crate enables `multipart`, `flash`, `csrf`, `email` or `http-client`, so `cargo test --workspace` skips them.
 A *CI* (continuous integration) step builds and tests m6-core with `--all-features` to cover them.
 
-The two defaults are the whole of the choice: templating arrives without asking, and every other block is opt-in.
 Section 3 lists the modules those features compile.
 
 ## 3. Component index
 
-The component modules, five of them behind features, are grouped by the task that sends a reader to one.
+The component modules, six of them behind features, are grouped by the task that sends a reader to one.
 The prelude in section 1 is a `pub mod` in `lib.rs` that re-exports the items the other modules implement.
 Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer Protocol), *RFC* (Request for Comments), *TCP* (Transmission Control Protocol), *JSON* (JavaScript Object Notation), *UTC* (Coordinated Universal Time) and *CSPRNG* (cryptographically secure pseudorandom number generator).
 
@@ -117,6 +108,8 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Building a service** | `site` | `Site`, `CodeRoute`, `Handled` and `RouteMethod`, the route table, the request dictionary and the site-wide finish. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `socket_path_from_config` and the blocking request and response adapters the benchmarks use. |
+| | `event` | `Timeouts`, `Slots` and `LoopTrace`, the deadlines, connection table and accounting of a service's loop. |
+| | `alloc` | `M6Alloc`, the allocator every m6 binary installs, with `never_return`, `reserve` and `note_growth`. |
 | | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
 | | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `BoundedBuf`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
@@ -141,11 +134,12 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Content** | `compress` | brotli and gzip, compress and decompress. |
 | | `minify` | The four minifiers: markup, JavaScript, stylesheets and JSON. Feature `minify`. |
 | | `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago` and `html_escape`. |
-| | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
+| | `random` | `random_hex_token::<N>()`. One CSPRNG token generator. |
 | **Observability** | `log` | `init`, `tick`, `watch`, `flush`, `reopen`, `stop`, `Line`, the five macros and `LogPulse`. The buffered JSONL logger every service loop drives, re-exported from `m6-log`. |
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
+| | `dns` | `Confirm`, `Query`, `Ptr` and `nameserver`: one DNS question on its own non-blocking UDP socket. |
 | | `platform` | The platform layer, the one crate that knows the operating system: readiness, the clock, signals, a child's exit, sockets, limits, directories, host and process facts. `docs/m6-platform.md`. Its `host` module is what the machine is doing: load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
 | | `tls` | How long the loaded certificate has left and its fingerprint: `not_after_unix`, `Fingerprint`, `record_loaded`, `loaded` and `TlsCertificate`. |
 | | `firewall` | `FirewallState` from nftables' own JSON. |
@@ -159,7 +153,6 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 **Table 3: the component modules, their group and one line on what each holds.**
 Take from it that the group names the task, and the module name is the string to search for in the section that follows.
 
-The index is the map for the rest of the document.
 Sections 4 and 5 take the two largest groups in turn, and sections 6 to 10 take the rest.
 
 ## 4. Building a service
@@ -186,9 +179,6 @@ Table 4 names them, and `docs/m6-app-anatomy.md` §2 is the loop in full.
 **Table 4: the parts a service's loop builds from.**
 Take from it that every part is a plain type with methods, and that none of them calls the service back.
 
-`m6-http` is a proxy with its own loop and datagram sockets, and a tool can use the parsers in `telemetry` and `ndjson` without a server at all.
-Every module is public, so the parts are usable one at a time.
-
 ### 4.2. `config`
 
 `config::load(config_path, site_dir) -> anyhow::Result<RendererConfig>`.
@@ -204,7 +194,9 @@ pub struct RendererConfig {
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled, inline_js
     pub log:           LogConfig,            // level
+    pub limits:        Limits,               // [limits.<name>], start and max per buffer
     pub site_toml:     Option<PathBuf>,      // the reserved key site_toml
+    pub site_size_budget_mb: Option<u64>,    // top-level key, read by m6-file
 }
 ```
 
@@ -214,9 +206,9 @@ A non-string or empty value fails `config::load`.
 `Site::site_toml` carries the resolved path, set whether or not the file exists.
 A service that names a `site_toml` that does not exist, cannot be read or is not valid TOML exits 2 at start.
 
-A `RouteConfig` carries nine fields: `path`, `template`, `params`, `status`, `cache`, `methods`, `headers`, `handler` and `settings`.
+A `RouteConfig` carries ten fields: `path`, `template`, `params`, `status`, `cache`, `cache_explicit`, `methods`, `headers`, `handler` and `settings`.
 `handler` names a handler the service passes to `Site::load`, and `settings` keeps the per-route keys core does not define.
-`MinificationConfig::is_enabled(mime)` answers the per-type question, and `toml_to_json` is the conversion used throughout.
+`MinificationConfig::is_enabled(mime)` answers the per-type question, and `toml_to_json` converts a TOML value to JSON.
 
 `[server] read_timeout_s` is the read deadline applied to every accepted connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30).
 `0` means no timeout.
@@ -226,45 +218,44 @@ It is read once at startup and applied at accept time.
 It is an **octal string**, as systemd writes it, because TOML has no octal literal and `660` as a decimal integer is `0o1224`.
 A chmod that fails stops the service at start with exit 2.
 
-Neither key silently falls back.
-A value that cannot be understood, a negative timeout or a mode above `0777` fails `config::load` and the service does not start.
-A service that will not start says so on the first line of its journal, and a service running at a socket mode nobody chose looks exactly like one running at the right mode.
-A service answers `--dump-config` too, so a deploy can validate its config before starting it, and it exits 2 when the config is refused.
+A value that cannot be parsed, a negative timeout or a mode above `0777` fails `config::load` and the service does not start.
+Every service answers `--dump-config`, so a deploy can validate a config before starting it, and it exits 2 when the config is refused.
 
 ### 4.3. `server`
 
-`socket_path_from_config(config_path)` derives the socket path so that services and deploy scripts agree without a second convention, and `M6_SOCKET_OVERRIDE` replaces it.
+`socket_path_from_config(config_path)` derives the socket path from the config path, and `M6_SOCKET_OVERRIDE` replaces it.
 
 `apply_socket_mode(path, mode)`, `bind_tcp_reuseaddr(addr)` and `DEFAULT_SOCKET_MODE`, `DEFAULT_READ_TIMEOUT_SECS` and `MAX_REQUESTS_PER_CONN` are the start-time helpers and limits shared by every service and `m6-http`.
 
 `serve_connection(stream, handler)` is the blocking per-connection loop, and `parse_request` and `write_response` are its companions.
-They remain for the benchmarks and tests that drive a socket directly.
-A service's loop uses `h1::ServerConn` instead.
+Benchmarks and tests that drive a socket directly use them.
+A service's loop uses `h1::ServerConn`.
 
 ### 4.4. `signal`
 
 **`signal::block()` must be the first statement of every `main`.**
 Blocking a signal is per-thread and threads inherit the mask at creation, so a `main` that starts a thread before blocking has a thread with SIGTERM unblocked.
-The kernel delivers process-directed SIGTERM there, and the default disposition kills the process instead of the loop reading the shutdown request.
-A service that started that way could lose its shutdown line invisibly, because systemd counts death by the signal it sent as a clean stop.
+The kernel delivers process-directed SIGTERM there, and the default disposition kills the process before the loop reads the shutdown request.
+The shutdown line is then lost, and systemd counts a death by the signal it sent as a clean stop.
 
 `Signals::new()` asserts that the mask is set and refuses to start otherwise.
 `Lifecycle::on_signal` decides what each signal means and `complete()` ends the lifecycle.
 
 The reload signal is SIGUSR1 (`platform::Signal::ReopenLogs`).
 `block()` blocks it with SIGTERM and SIGINT, and a service's loop reads it from the same descriptor.
-The loop calls `log::reopen()` and logs what happened. The call flushes the buffered lines first, then opens the path again, so once the path exists every new line reaches the new file and none reaches the renamed one.
+The loop calls `log::reopen()` and logs what happened.
+The call flushes the buffered lines first, then opens the path again, so once the path exists every new line reaches the new file and none reaches the renamed one.
 If the open fails, the previous file stays in place, the process keeps writing to it and an error is logged.
 A reopen never counts toward a forced exit.
 SIGHUP is not handled.
 
 ### 4.5. `render` and `template`
 
-`render` is the seam.
+`render` holds the interface between `Site` and a template engine.
 A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one at start.
 `Renderer::render` writes the page into a `BoundedBuf`, the one page area a service makes at the `render_page` limit's start and reuses for every page.
 A page past the limit's maximum is `RenderError::TooLarge`, and the client gets 500.
-`NoTemplates` implements both traits and errors if anything asks it to render, which is how a service that renders nothing links no template engine.
+`NoTemplates` implements both traits and errors if anything asks it to render.
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
 
@@ -318,34 +309,9 @@ pub fn genid_failed(cause: &str) -> Response;
 `Code` and `Named` carry the request, and the service calls `finish` on the response its handler returned.
 `Reload` is `POST /genid`: the loop runs the start path again with `reload`, assigns the new `Site` when that is `Ok`, and answers `genid_ok()` or `genid_failed(&e)`.
 A method other than POST on `/genid` is a 405 and a route on `/genid` is refused at start.
-The service's dispatch is a plain `match` on that index.
+The service's dispatch is a plain `match` on that index, written out in the turn loop in section 6.1.
 
-```rust
-let resp = match site.handle(&head) {
-    Handled::Done(resp) => resp,
-    Handled::Code(FILES, req) => {
-        let r = handler::serve(&req).unwrap_or_else(|e| error_response(&e));
-        site.finish(&req, r)
-    }
-    Handled::Named(FILES, req) => {
-        let r = handler::serve(&req).unwrap_or_else(|e| error_response(&e));
-        site.finish(&req, r)
-    }
-    Handled::Reload(reload) => {
-        let response = match site.reload(ROUTES, &[], &NoTemplates) {
-            Ok(next) => {
-                *site = next;
-                genid_ok()
-            }
-            Err(e) => genid_failed(&e),
-        };
-        finish_reload(&reload, response)
-    }
-    Handled::Named(..) | Handled::Code(..) => unreachable!("load checked every route and name"),
-};
-```
-
-`finish` renders a template the response names, then applies the route's `Cache-Control`, `Last-Modified` and headers, the CSRF and flash cookies, minification and compression, in the order the request path requires.
+`finish` renders a template the response names, then applies the route's `Cache-Control`, `Last-Modified` and headers, the CSRF and flash cookies, minification and compression.
 
 **Routing.** `compile_pattern` turns `/blog/{stem}` into `Vec<Segment>`, and `match_route` returns `PathParams` as a `Vec<(String, String)>` because order is meaningful and duplicates are possible.
 `find_route` picks the winner.
@@ -354,7 +320,7 @@ let resp = match site.handle(&head) {
 `Methods` is the set of methods a route answers, so a conflict needs the sets to meet and `find_route` tests one bit.
 m6-http builds `RouteDecl`s from `site.toml` and calls the same check.
 
-**The request dictionary.** `FrameworkState::build_dict` is where the real knowledge lives, and `Site` is the one way a service reaches it.
+**The request dictionary.** `FrameworkState::build_dict` builds the dictionary, and a service reaches it through `Site`.
 Three layers do not run per request: config keys, global params files and a route's static params files are merged once at start into `route.base_dict`.
 The per-request order is:
 
@@ -375,10 +341,6 @@ The per-request order is:
 
 Error keys need no step, because they arrive as query parameters at the query step.
 
-**Allocation.** `Site` allocates on the start and stop paths freely.
-The page path allocates on every request today: the owned `Request` and its dictionary, Tera and compression.
-EL-6a measures that count in `site_allocs` and ALLOC-3 reduces it.
-
 ### 4.7. `email` and `client::Endpoint`
 
 A service that sends mail or posts a form does both as work its own loop drives.
@@ -397,14 +359,12 @@ An outgoing event for a slot that is no longer sending is ignored: the client ca
 `Ok(None)` reregisters and returns to the loop, `Ok(Some(()))` means the relay accepted the message, and `Err` names the step, the relay's code and its first line.
 The service answers 504 when its deadline passes first, and `close()` drops the connection and frees the slot.
 The connection's state is one `enum` of steps inside the slot, so the service's loop has one arm per outgoing token.
-Plain SMTP is accepted only to a relay on the same host.
 
 **client::Endpoint.** `Endpoint::new(url, tls)` runs at start: it parses an `http` or `https` URL, resolves the host once, and keeps the `Host` header, path and query.
 `post_form(&mut up, fields, deadline)` encodes `application/x-www-form-urlencoded` straight into the `Upstream`'s request buffer and starts it, and the service drives the `Upstream` as it drives an `Smtp`.
 One connection per call, with `Connection: close`, so there is no idle list.
 `m6_core::rustls` re-exports the TLS library, so a service names `m6_core::rustls::ClientConfig` and takes no `rustls` dependency of its own.
 
-These two modules sit beside the loop, not in it.
 Section 5 turns to the objects a handler receives and returns.
 
 ---
@@ -421,20 +381,21 @@ It ends with the rules each helper enforces, and section 6 turns to the parsers 
 `field(name)` reads a form or query field.
 `get(key)` and `Index<&str>` read the dictionary, and `dict()` borrows the whole thing.
 
-File I/O is on `Request` on purpose, relative to the site directory: `site_path(rel)` joins a path to it, and `read_json`, `write_json`, `write_json_atomic` and `list_json` read and write there.
+File I/O on `Request` is relative to the site directory: `site_path(rel)` joins a path to it, and `read_json`, `write_json`, `write_json_atomic` and `list_json` read and write there.
 `write_bytes` does the same and needs the `multipart` feature.
-The readers and writers refuse a `..` component but not an absolute path, which replaces the site directory, and `site_path` checks nothing, so a handler that builds a path from request input validates it first with `path::validate_path_param`.
+The readers and writers refuse a `..` component and accept an absolute path, which replaces the site directory.
+`site_path` checks nothing.
+A handler that builds a path from request input validates it first with `path::validate_path_param`.
 `write_json_atomic` is the one to reach for when a reader may be running.
 
-`verify_csrf()` (feature `csrf`) and `file(name) -> Upload` (feature `multipart`).
+`verify_csrf()` needs feature `csrf`, and `file(name) -> Upload` needs feature `multipart`.
 
-Free functions, all used by `site` and all worth knowing: `parse_query_string`, `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`, `parse_cookies`, `parse_auth_claims`, `validate_path_param` and `single_query_value`.
+Free functions used by `site`: `parse_query_string`, `parse_form_body`, `url_decode`, `url_encode`, `url_encode_path`, `cookie`, `parse_cookies`, `parse_auth_claims`, `validate_path_param` and `single_query_value`.
 
 `single_query_value(query, key)` returns the raw value of a key that may appear once: `None` when absent, `RepeatedKey` when repeated.
 `time_range`, `ndjson::Cursor` and a service's own filter parameters all read through it, so one query string follows one rule.
 
-The *URL* (Uniform Resource Locator) coders `url_encode` and `url_decode` exist because core could percent-decode and not encode, so callers wrote their own encoder.
-Encoding and decoding are two halves of one block.
+`url_encode` and `url_decode` are the percent coders for a *URL* (Uniform Resource Locator).
 
 ### 5.2. `response`
 
@@ -452,21 +413,20 @@ Builders: `body`, `with_status`, `header`, `cookie` and `flash` (feature `flash`
 `RawRequest` is the parsed wire request: `method()`, `path()`, `query()`, `header()`, `content_type()` and `accept()`.
 `RawResponse::new(status)` with `.header()`, `.body()`, `.content_type()`, then `send` or `to_bytes`.
 
-`Method` is a newtype over `&'static str` with the six constants.
+`Method` is a newtype over `&'static str` with the constants `GET`, `POST`, `PUT`, `DELETE`, `PATCH` and `HEAD`.
 
-`HeaderSource` is the trait that lets header lookup work over `[(String, String)]`, `Vec<(String, String)>` and a `Response`'s `Vec<Header>`, whose `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline or owns a `String`, and `header(headers, name)` is the case-insensitive first-match lookup.
+`HeaderSource` lets header lookup work over `[(String, String)]`, `Vec<(String, String)>` and a `Response`'s `Vec<Header>`.
+`HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline or owns a `String`.
+`header(headers, name)` is the case-insensitive first-match lookup.
 
 `is_same_origin_path(candidate)` is the redirect guard: it answers whether a path is safe to redirect to without leaving the origin.
 
 ### 5.4. `headers`
 
-Use this module when the question is harder than first-match.
-Eight or more sites across the workspace wrote `.find(|(k, _)| k.eq_ignore_ascii_case(name))` inline, several of them inside core, and that idiom hides two real questions.
-
-`get`, `get_all`, `contains`, `set`, `append`, `set_if_absent` and `remove`.
+This module reads and writes a header list once: `get`, `get_all`, `contains`, `set`, `append`, `set_if_absent` and `remove`.
 
 `combine(headers, name)` folds repeated field lines into one comma-separated value and **refuses when the field must not be folded**.
-`NEVER_COMBINED` is the list and `set-cookie` is on it: *RFC* (Request for Comments) 6265 3 is explicit that cookie values may contain commas, so joining two `Set-Cookie` lines produces one malformed cookie and silently loses the other.
+`NEVER_COMBINED` is the list and `set-cookie` is on it: *RFC* (Request for Comments) 6265 3 allows commas in cookie values, so joining two `Set-Cookie` lines produces one malformed cookie and loses the other.
 `may_combine(name)` asks in advance.
 
 The module also defines the two request-head limits every protocol and service shares.
@@ -478,9 +438,6 @@ Both are the numbers nginx, Varnish and Apache use, and the module doc names eac
 
 `Cookie::new(name, value)` then `.max_age()`, `.path()`, `.domain()`, `.secure()`, `.http_only()`, `.same_site(SameSite::...)`, then `to_header_value()` or `to_header()`.
 `Cookie::removal(name)` builds an expiry.
-
-This module builds and parses cookies.
-Before it, four `format!` calls with different attribute sets were the implementation, and none of them could answer "which of our cookies are HttpOnly?".
 
 ### 5.6. `time_range`
 
@@ -502,7 +459,6 @@ It says which parameter to fix and never repeats the value the client sent.
 `rfc3339_utc_ms(unix_ms)` formats a millisecond timestamp as `2026-01-01T00:00:00.123Z`.
 It returns a value that formats when displayed, so a row can carry it without a `String` per line, and a negative or out-of-range input gives the epoch.
 
-Those six modules are the handler's whole surface: one request, one response, the wire types they are built from, and the three helpers for headers, cookies and time ranges.
 Section 5.7 adds the credential decision that runs before a handler, and section 6 turns to the parsers and the HTTP rules those objects implement.
 
 ### 5.7. `auth`
@@ -520,8 +476,8 @@ It does no I/O and starts no thread.
   `NoDecision` returns `None` and is answered 503, so a caller must match it before reading `None` as permission.
 - `encode_claims_header(identity)` writes the four keys as base64 JSON for `X-Auth-Claims`, and no token claim survives.
 
-The rule that matters: a 401 is the authority's decision, and a 503 is its absence.
-`NoDecision` never becomes `NoCredential`, because a 401 tells a user with a valid credential to log in again.
+A 401 is the authority's decision, and a 503 is its absence.
+`NoDecision` is never mapped to `NoCredential`, because a 401 tells a user with a valid credential to log in again.
 
 ---
 
@@ -529,25 +485,21 @@ The rule that matters: a 401 is the authority's decision, and a 503 is its absen
 
 Section 6 covers the modules on the wire: the *HTTP* (Hypertext Transfer Protocol) parser and connection slot, the blocking stream adapter, conditional requests, content-coding negotiation, MIME types, path parameters and the network helpers.
 It uses *RFC* (Request for Comments) for the specifications it names.
-The parser comes first because every other module in the section works on what it accepts.
 
 ### 6.1. `h1`
 
 **`parse_request(buf) -> ParseResult` is the one HTTP/1.1 parser, and it is pure.**
-It strips no proxy-owned headers, because stripping is ingress policy and a backend has none to strip (`m6-core/src/h1.rs:25`).
+It leaves proxy-owned headers in place, because stripping them is ingress policy (`m6-core/src/h1.rs:25`).
 `ParseResult` is `Complete(RawRequest)`, `Incomplete` or `Error(HeadError)`.
 
-Four parsers existed.
-Measured against h1spec, the independent RFC 9112 tester, this one scored 27/32, two scored 15/32 and one scored 14/32 (`m6-core/src/h1.rs:3`).
-The migration plan named the 14/32 parser as the consolidation target, and measuring the candidate before moving anything onto it is what caught the mistake.
-The four h1 conformance targets now score 32/32, and `tools/conformance.sh` holds them there (`tools/conformance-scores.txt`).
+The four h1 conformance targets score 32/32 on h1spec, the independent RFC 9112 tester, and `tools/conformance.sh` holds them there (`tools/conformance-scores.txt`).
 
 `Expectation` and `expectation(buf)` handle `Expect: 100-continue`, and `CONTINUE_RESPONSE` is the reply.
 `keep_alive(&req)` decides connection reuse, and `status_reason(status)` maps a code to its phrase.
 
 `Responder::new(w, method, keep_alive)` is the write side.
 It writes with `send`, `send_with_length`, `send_stream` and `error`, and `keeps_alive()` and `body_bytes()` answer the connection decision and the bytes written (`m6-core/src/h1.rs:1042`).
-It omits the body on a HEAD, and m6-file's writer applied that rule on the success path only, so m6-file answered every 404, 405 and 400 to a HEAD with a body (`m6-core/src/h1.rs:1030`).
+It omits the body on a HEAD at every status (`m6-core/src/h1.rs:1030`).
 `write_head_to` is the same head written straight into a caller's buffer, for a caller whose writer is already a buffer.
 
 **`ServerConn`** is one HTTP/1.1 connection slot for a service's own loop.
@@ -562,7 +514,7 @@ A `Body::Stream` body is pumped 64 KiB per writable turn, one `read(2)` of the f
 A request past the input buffer grows it by doubling, clamped at the `request_body` maximum plus `MAX_REQUEST_HEAD`, and the buffer keeps the grown size (`m6-core/src/h1.rs:1591`).
 
 The header slots are `MaybeUninit` and made with `head_slots()`.
-The head borrows them for one call, which is why the array is made where it is used and costs no writes.
+The head borrows them for one call, so the array is made where it is used and costs no writes.
 
 The turn loop:
 
@@ -629,8 +581,7 @@ loop {
 The service's own loop registers the token with `conn.interest()` after every turn, so a turn that ends waiting for the socket to be readable leaves a READABLE registration, and a turn that owes output leaves a WRITABLE one.
 When a WRITABLE event arrives, the loop calls `conn.flush()` and re-registers with `conn.interest()` again, which is what continues a `Flush::More`.
 
-**Allocation.** `ServerConn` allocates nothing per request.
-Its buffers are made at start, and a request past the input buffer or a streamed body past the output buffer is the one case that grows one.
+**Allocation.** `ServerConn` allocates nothing per request, and a request past the input buffer or a streamed body past the output buffer is the one case that grows a buffer.
 
 ### 6.2. `parse`
 
@@ -640,12 +591,10 @@ Its buffers are made at start, and a request past the input buffer or a streamed
 It reads into a buffer and asks `h1::parse_request` whether the message is complete, so it has no framing logic of its own.
 It takes `Write` as well as `Read`, because a client that sent `Expect: 100-continue` will not send its body until told to, and answering that has to happen before the read that would otherwise deadlock.
 
-Two bounds guard different things.
 The head is capped at `MAX_REQUEST_HEAD` by the shared parser, and the body at `[limits.request_body] max`, 16 MiB by default, answered 413 past it (`m6-core/src/parse.rs:15`).
-It reads 1024-byte chunks, because `server` hands it a raw `UnixStream` with nothing buffering.
+It reads 1024-byte chunks.
 
-The benchmarks and `m6-file`'s `query_of` test drive it.
-A service's loop frames requests with `h1::ServerConn`.
+Benchmarks and tests drive it.
 
 `ParseError::status()` and `.reason()` give the response for a parse failure, including 414 for a request line over `MAX_HEADER_LINE` and 400 for a field or a head over its limit.
 
@@ -653,17 +602,13 @@ A service's loop frames requests with `h1::ServerConn`.
 
 `evaluate_preconditions(...) -> Precondition`, `is_not_modified(...)`, `not_modified_headers(cached)`.
 
-RFC 9110 13.2, implemented once.
-It was implemented twice, and the second copy was five inline lines that did strong comparison for `If-None-Match` and implemented neither `If-Match` nor `If-Unmodified-Since`.
-The symptom came and went with cache state, because a hit was answered correctly by the good copy and only a miss reached the bad one.
-A defect that correlates with cache state reads as noise.
+RFC 9110 13.2 preconditions, including `If-Match` and `If-Unmodified-Since`, evaluated in one place.
 
 ### 6.4. `negotiate`
 
 `coding_quality(accept_encoding, coding) -> Option<f32>`, `preferred_coding(accept_encoding, candidates)`, `canonical_coding(accept_encoding) -> &'static str`.
 
-Real q-values.
-`q=0` means "not acceptable" (RFC 9110 12.4.2), which a substring match gets wrong in the direction that matters: brotli sent to a client that explicitly refused it.
+The `Accept-Encoding` q-values are parsed, and `q=0` means "not acceptable" (RFC 9110 12.4.2).
 `canonical_coding` narrows a header to the one coding this server will serve, and it is the intended cache-key form.
 `m6-http` keys its response cache on the raw `Accept-Encoding` text today, so `gzip` and `gzip, deflate, br, zstd` remain two entries for one byte-identical response (`m6-core/src/negotiate.rs:120`).
 
@@ -671,9 +616,7 @@ Real q-values.
 
 `mime_from_path(path)`, `should_compress_default(mime)`.
 
-`validate_path_param(value, allow_slash) -> Result<&str, PathParamError>`.
-This is a security boundary and it existed three times, with three behaviours.
-There is one now (`m6-core/src/path.rs:57`).
+`validate_path_param(value, allow_slash) -> Result<&str, PathParamError>` is a security boundary (`m6-core/src/path.rs:57`).
 
 ### 6.6. `net`
 
@@ -692,12 +635,11 @@ Table 6 lists the ranges `is_private_ip` treats as private.
 Take from it that loopback, link-local, unique-local and the carrier-grade NAT range all count, and that the unspecified addresses do not.
 
 An IPv4-mapped IPv6 address is classified by its IPv4 form.
-`0.0.0.0` and `::` are not private.
 A check on a peer address only means something on a socket that faces the client directly, and behind a proxy the peer is the proxy.
 
 `listen_unix(path, mode)` removes a stale socket file, creates the parent directory, binds non-blocking and sets the mode.
 `listen_tcp(addr)` binds non-blocking with `SO_REUSEADDR`, so a restart can rebind a port whose connections are in `TIME_WAIT` while a live listener on it is still refused.
-Both are start only and return `Err`, because a socket with a mode nobody chose or a port someone else holds is a start failure (`m6-core/src/net.rs:105`).
+Both are for start only and return `Err` on failure (`m6-core/src/net.rs:105`).
 
 Section 6 covers the parser through the network helpers, and section 7 turns to content: compression, minification, the utility helpers and SQLite.
 
@@ -715,9 +657,7 @@ The four small modules come first, and SQLite has the rest of the section.
 
 `util` provides `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago` and `html_escape`.
 
-`random` provides `random_hex_token::<N>()` and `random_hex_token_into`, one CSPRNG token generator.
-There were two byte-identical copies at two lengths.
-Both were correct, and the hazard is the third copy, written by someone reaching for `rand::random()` and producing something that looks identical at a glance (`m6-core/src/random.rs:1`).
+`random` provides `random_hex_token::<N>()` and `random_hex_token_into`, the one CSPRNG token generator.
 
 ### 7.1. `sqlite`
 
@@ -772,12 +712,10 @@ The section runs from the loop's own log line to the certificate a client is ser
 
 `m6_core::log` re-exports the `m6-log` crate and adds `watch`.
 `init(level, analytics)` sets the level and opens the two Sinks at start: the operational Sink on stdout and, when `analytics` is given, the analytics Sink on that path (`m6-log/src/lib.rs:67`).
-It returns nothing to hold.
 The Sinks and the level are thread-local, and a process has one loop thread.
 `read_site_log_config(site_toml)` reads `[log] level` from `site.toml`, and `parse_level(s)` turns a level name into a `Level`.
 `Site` applies the precedence: the command line, then the service's `[log]`, then `site.toml`'s `[log]` (`m6-core/src/site.rs:2676`).
 
-A service's loop calls the logger in plain sight.
 `tick(now)` flushes both Sinks on the one-second accounting tick.
 `watch(registry, token)` registers stdout for writability while the operational Sink holds bytes a full destination would not take, and removes it when they drain.
 The `LOG` arm calls `flush()`.
@@ -787,17 +725,14 @@ A `Signal::ReopenLogs` calls `reopen()`.
 
 `pulse() -> &'static LogPulse` is the liveness signal: `events()` counts the lines the level let through, and `seconds_since_last()` answers "has anything been logged recently", so a silent log reads as a fault (`m6-log/src/lib.rs:255`).
 
-`reopen()` flushes the analytics file and opens its path afresh.
 `reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
 `writes_log_file()` says whether this process has a file to reopen.
 `read_tail(path, max_bytes)` reads the end of one file.
 
 ### 8.2. `telemetry`
 
-The write side had no struct: `m6-http` emits analytics through `m6_core::log`'s `Line`, and every consumer re-derived the format from a sample.
-Consumers came to read `ts` and `user_agent` where the line has `timestamp` and `fields.user_agent`, which yields an empty result that looks exactly like a quiet hour (`m6-core/src/telemetry.rs:12`).
-
-`AnalyticsRecord` and `AnalyticsFields` are that missing definition, `Serialize` as well as `Deserialize` so the write side can adopt them.
+`m6-http` emits analytics through `m6_core::log`'s `Line`, and the line has the keys `timestamp` and `fields.user_agent` (`m6-core/src/telemetry.rs:12`).
+`AnalyticsRecord` and `AnalyticsFields` define that line, `Serialize` as well as `Deserialize` so the write side can adopt them.
 `AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)` builds the record the analytics line with those values parses to, which is how `/traffic` turns its in-memory window back into records (`m6-core/src/telemetry.rs:118`).
 `truncated` is the window's own fact that a cap cut the path or user agent, and `serde` skips it.
 `parse_analytics(...)` reads a stream.
@@ -806,35 +741,29 @@ Consumers came to read `ts` and `user_agent` where the line has `timestamp` and 
 
 The heuristics and thresholds are named constants: `claims_to_be_bot`, `looks_like_probe`, `looks_like_injection`, `BOT_MARKERS`, `PROBE_MARKERS`, `INJECTION_MARKERS`, `PROBE_PATHS_FOR_CONCERN` (3), `REFUSED_REQUESTS_FOR_CONCERN` (10), `UA_ROTATION_THRESHOLD` (10) and `UA_ROTATION_MIN_REQUESTS` (20) (`m6-core/src/telemetry.rs:783`).
 
-`UA_ROTATION_THRESHOLD` exists because one IP rotating 526 user agents would otherwise be reported as a dozen well-known crawlers politely visiting, and none had (`m6-core/src/telemetry.rs:795`).
-
 `ClientSummary::is_notable()` and `error_ratio()`, `CrawlerSighting`, and `TrafficSummary::from_records(...)` assemble the picture.
-Volume alone earns no fault.
-The rule once flagged 185 requests from the operator's own address, 178 of them the health check's own load generation (`m6-core/src/telemetry.rs:718`).
-A single 404 to `/.git/config` is background noise, and a fault list works only when everything on it is a fault.
+Volume alone earns no fault, and a single 404 to `/.git/config` is background noise (`m6-core/src/telemetry.rs:718`).
 
 ### 8.3. `monitoring`
 
 `/health` answers `ok` or `degraded` and is constant-cost by construction.
-`/perf` answers counters and percentiles and is token-gated, because live latency and error counters are a feedback channel for an attacker.
-An attacker probing for a resource-exhaustion path is normally blind, and hit and miss percentiles tell them which requests are cheap and which are expensive.
-The ratio between a cache hit and a backend miss runs to three orders of magnitude, so the ranking is unambiguous, and `backend_errors_total` confirms when they have found something that hurts (`m6-core/src/monitoring.rs:75`).
-With no token configured, `/perf` answers 404 with `{"error":"not found"}`, and with a token but no credential it answers 401, so a forgotten token leaves nothing to try (`m6-core/src/monitoring.rs:559`).
+`/perf` answers counters and percentiles and is token-gated, because hit and miss percentiles show an attacker which requests are cheap and which are expensive.
+A cache hit and a backend miss differ by three orders of magnitude, and `backend_errors_total` shows when a request hurts (`m6-core/src/monitoring.rs:75`).
+With no token configured, `/perf` answers 404 with `{"error":"not found"}`, and with a token but no credential it answers 401 (`m6-core/src/monitoring.rs:559`).
 
 `HealthReport::build(node)` and `HealthReport::degraded(node)` return `(u16, HealthReport)` and `into_response(code)` (`m6-core/src/monitoring.rs:313`).
 `build` is 200 `ok`, and `degraded` is 503 with the status `degraded`, whose body names no dependency.
 The answer covers the m6-http process and the dependency flags the process already holds: an edge's origin is the follower's own `down` bit, so the answer reads a flag and makes no probe.
 A socket pool keeps no per-member health state, so a dead member is found when a request connects to it and that request takes the next member.
 
-`PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`, `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND` and `PERF_BACKEND`.
+The module also exports `PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`, `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND` and `PERF_BACKEND`.
 
 `PerfReport::build_authorised` returns the report with no access check, for a caller that has already passed the one token check (`m6-core/src/monitoring.rs:506`).
 `PerfOutcome::Unauthorised` and `PerfOutcome::Forbidden` answer with `m6_core::http::token_refusal`, the one definition of a token check's refusal: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` for no or a bad credential, and 403 `{"error":"forbidden"}` for the wrong role or group.
 m6-http uses these for `[health] metrics_require` and `metrics_peers`, described in `docs/m6-http.md`.
 
 `PerfReport.tls` carries the served certificate chain, how long each certificate has left, and each certificate's SHA-256 fingerprint, from `tls::loaded()`.
-It is `serde(default)`, so an aggregator can still parse a payload from an older node, which is the treatment `build` already gets.
-The fingerprint is what tells two certificates with one expiry apart, and `TlsCertificate.fingerprint` is `serde(default)` for the same reason.
+It is `serde(default)`, so an aggregator can parse a payload from an older node, and `TlsCertificate.fingerprint` is `serde(default)` for the same reason.
 
 `PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
 Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the age of the last reopen, its unix time and the age of the last failure.
@@ -842,7 +771,7 @@ Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the
 Both fields are optional, so a payload from an older node still parses (`m6-core/src/monitoring.rs:1009`).
 
 `TrafficReport::from_records(node, records, window_minutes)` summarises records that are already parsed, which is how `m6-http` answers `/traffic` from its in-memory window (`m6-core/src/monitoring.rs:1134`).
-`events_dropped` says how many events that window overwrote before they left it, so a short window is read as a short window.
+`events_dropped` says how many events that window overwrote before they left it, so a reader knows when the window was short.
 `LoggingHealth::read()` with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter` and `CrawlerReport` are its parts.
 `CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.
@@ -850,7 +779,7 @@ Both fields are optional, so a payload from an older node still parses (`m6-core
 ### 8.4. `resolve`
 
 `resolve` checks a claim against its source with reverse DNS.
-A lookup is a network round trip, so it runs in a monitor's own loop and never in a serving path.
+A lookup is a network round trip, so it runs in a monitor's own loop, outside the serving path.
 
 The rule lives in `dns` (`m6-core/src/dns.rs:347`).
 `Confirm::start(ip, ns)` asks the *PTR* (pointer) question for an address on one UDP socket, then asks the name it gets forward, and answers `Ptr` only after that second answer.
@@ -869,36 +798,33 @@ Take from it that a missing record and a failed lookup are different answers, an
 `Confirm` never waits.
 `fd()` gives the descriptor to register, `drive()` moves the current question as far as it goes without waiting and changes `fd()` when the PTR step ends, and the outcome arrives once.
 A query dropped at its deadline closes its socket, and the caller records `Failed`.
-A truncated reply is a failure, because an A, AAAA or PTR answer fits in UDP and a TCP fallback would be a second mechanism.
+A truncated reply is a failure, because an A, AAAA or PTR answer fits in UDP.
 `dns::nameserver()` reads the first nameserver in `/etc/resolv.conf` once, at start.
 
 `Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com` (`m6-core/src/dns.rs:455`).
 `telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
 
-This module re-exports `Ptr`, because callers name `resolve::Ptr` and this section states the rule.
-The one caller is `m6-monitor`'s fleet poll, which drives `Confirm` on its own loop and keeps the answers.
+`resolve` re-exports `Ptr`.
+`m6-monitor`'s fleet poll drives `Confirm` on its own loop and keeps the answers.
 
 ### 8.5. `platform::host`
 
-Parsing is separated from reading.
-The `parse_*` functions are pure over the text these files contain and are tested on any platform, and the readers are platform-gated (`m6-platform/src/host.rs:37`).
-
-**`snapshot(disk_path) -> HostSnapshot`** is the one most callers want: it assembles every reading below into the struct `/perf` publishes (`m6-platform/src/host.rs:551`).
+**`snapshot(disk_path) -> HostSnapshot`** assembles every reading below into the struct `/perf` publishes (`m6-platform/src/host.rs:551`).
 
 Readers are platform-gated and degrade to `None`, an empty `Vec` or a `1` core count, so a missing reading leaves the rest of the snapshot intact: `load_average`, `memory`, `disk`, `cpu_count`, `thermal_zones`, `uptime`, `net_devices`, `disk_io`, `pressure(resource)`, `tcp_health` and `file_descriptors`.
 
-Pure parsers, tested on any platform: `parse_loadavg`, `parse_meminfo`, `parse_cgroup_memory`, `parse_thermal_millidegrees`, `parse_uptime`, `parse_net_dev`, `parse_diskstats`, `parse_pressure`, `parse_netstat` and `parse_sockstat_into`.
+Pure parsers over the text these files contain, tested on any platform (`m6-platform/src/host.rs:37`): `parse_loadavg`, `parse_meminfo`, `parse_cgroup_memory`, `parse_thermal_millidegrees`, `parse_uptime`, `parse_net_dev`, `parse_diskstats`, `parse_pressure`, `parse_netstat` and `parse_sockstat_into`.
 
 Types: `HostSnapshot`, `LoadAverage`, `Memory`, `MemorySource`, `Disk`, `ThermalZone`, `NetDevice`, `DiskIo`, `Pressure`, `TcpHealth` and `FileDescriptors`.
 
-A VPS commonly has no thermal zone, so a missing reading is an ordinary `None` (`m6-platform/src/host.rs:516`).
+A VPS commonly has no thermal zone, so `thermal_zones` returns an empty `Vec` (`m6-platform/src/host.rs:516`).
 
-Two readings are easy to get wrong and invisible when wrong:
+Two readings carry a rule:
 
 - **A container's memory limit is the one that applies.** `/proc/meminfo` reports the machine, and `memory()` prefers the cgroup limit when one applies and says which it used in `Memory::source` (`m6-platform/src/host.rs:168`).
 - **The space a service can use is `f_bavail`.** `f_bfree` counts the blocks reserved for root, typically 5%, and `disk()` reports `f_bavail` (`m6-platform/src/host.rs:208`).
 
-The module reports numbers and sets no threshold: a monitoring service decides what 80% means (`m6-platform/src/host.rs:1`).
+The module sets no threshold: a monitoring service decides what 80% means (`m6-platform/src/host.rs:1`).
 
 ### 8.6. `tls`
 
@@ -907,21 +833,18 @@ The module reports numbers and sets no threshold: a monitoring service decides w
 **`loaded()`** and **`loaded_at(now_unix)`** return the stored chain as `Vec<TlsCertificate>`, leaf first, each carrying `depth`, `not_after_unix`, `expires_in_seconds` and `fingerprint`.
 **`Fingerprint::of(der)`** is SHA-256 over a certificate's DER, printed as 64 lower-case hex characters.
 
-**The fingerprint is the identity an expiry cannot give.**
-Two certificates can expire on the same day, and then `not_after_unix` alone cannot tell them apart while a client validating against them sees two.
+**The fingerprint tells apart two certificates that expire on the same day.**
 SHA-256 covers the whole certificate, so a renewal that reissues with the same key pair changes the serial number, the validity and the signature, and the fingerprint moves with all three.
-Hashing the key would report one identity for two certificates, which is the distinction a monitor exists to see.
+A hash of the key would give one identity for two certificates.
 The digest is the one `openssl x509 -noout -fingerprint -sha256` reports, printed here in lower-case hex with no colons (`m6-core/src/tls.rs:88`).
 `fingerprint` is `None` on a certificate that arrived from a node older than the field, and a reader must treat that as "cannot say" (`m6-core/src/tls.rs:187`).
 
-This module exists because certificate renewal fails silently.
-Renewal is done by an *ACME* client on a timer outside m6, and a timer that fails keeps firing and keeps failing.
-Nothing looks, so the first signal is the server refusing connections on the day the certificate expires.
-A server already holds the answer, which makes it the cheapest place to ask.
+Renewal is done by an *ACME* client on a timer outside m6, and a failed renewal gives no signal before the certificate expires.
+The server already holds the certificate, so this module reads it there.
 
-**It reports the material the process loaded.**
-A path on disk and the certificate a running process serves are different facts, and a renewal that wrote a new file without restarting the server is exactly the case where they disagree.
-`record_loaded` is therefore called by whatever loads the certificate, and `loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do disk work (`m6-core/src/tls.rs:369`).
+**It reports the certificate the process loaded.**
+A renewal that wrote a new file without restarting the server leaves the file and the served certificate different.
+`record_loaded` is called by whatever loads the certificate, and `loaded()` opens no file, so polling a monitoring endpoint does no disk work (`m6-core/src/tls.rs:369`).
 
 Table 9 lists the four behaviours that matter in a loaded chain.
 
@@ -933,27 +856,23 @@ Table 9 lists the four behaviours that matter in a loaded chain.
 | a later `record_loaded` replaces the earlier one | so a load at start corrects it, and the registry holds what every protocol serves |
 
 **Table 9: what the loaded chain reports, and why.**
-Take from it that an absence and a measured number must not look alike, and that a stale number is worse than either.
+Take from it that an unreadable certificate is reported as absent, and that `expires_in_seconds` goes negative after expiry.
 
-The module reports seconds left and sets no threshold, for the reason `host` gives.
-A monitoring service decides what is too few.
+The module sets no threshold, as `host` sets none.
 
-**The parse is written out here.**
-`rustls` hands over `CertificateDer` and parses no validity from it, and `rustls-webpki` keeps its own parse private, so one integer field meant either a general ASN.1 dependency of eight crates or a walk over a known shape.
+**`not_after_unix` parses the DER by hand.**
 `notAfter` sits at a fixed structural position in every X.509 certificate, so the walk steps over six elements by length and reads the seventh.
 Every length is checked against the buffer, and a test runs every truncation of a generated certificate through it (`m6-core/src/tls.rs:637`).
-The dates go through `chrono`, because civil-from-days arithmetic is the mistake `util::iso_date_from` records: `m6-md` got it wrong for 7,281 days out of 29,200.
+The dates go through `chrono`.
 
 ### 8.7. `firewall`
 
 `FirewallState::from_nft_json(text)`, `from_file(path)`, `blocked_addresses()`, `active()` and `Block` (`m6-core/src/firewall.rs:75`).
 
-nftables emits JSON natively, so there is no format to invent and no log to scrape.
-It reads a file because `nft list ruleset` needs `CAP_NET_ADMIN`, and the process answering public requests must not have it.
-A systemd timer writes `/var/lib/m6/firewall.json` and m6 reads it as ordinary data (`m6-core/src/firewall.rs:8`).
+nftables emits JSON natively.
+`nft list ruleset` needs `CAP_NET_ADMIN`, which the process answering public requests must not hold, so a systemd timer writes `/var/lib/m6/firewall.json` and m6 reads the file (`m6-core/src/firewall.rs:8`).
 
-It reports the deliberate per-address blocks and whether they are still being hit, which is the actionable half.
-The hourly kernel-log count, "180 packets from 10 sources", never changed and never prompted an action.
+It reports the per-address blocks and whether they are still being hit.
 
 ### 8.8. `wireguard`
 
@@ -974,9 +893,9 @@ An age is therefore the slow signal, and a probe over the tunnel is the fast one
 
 `read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`, `write_one`, `write_all` and `to_string` (`m6-core/src/ndjson.rs:47`).
 
-**Torn lines are ordinary.**
-An NDJSON file is usually being appended to while it is read, so the last line can be half-written, and a reader that fails the whole stream on one bad line fails whenever it reads during a write.
-Readers skip what they cannot parse, and `skipped()` counts them.
+**Torn lines.**
+An NDJSON file is usually being appended to while it is read, so its last line can be half-written.
+Readers skip lines they cannot parse, and `skipped()` counts them.
 
 **Pages for responses.**
 A service that answers with rows builds a `Page` from `PageLimits` and calls `push(&row)` for each row.
@@ -1045,4 +964,4 @@ This section records what the crate and its migration still leave undone.
 - **Ad-hoc case-insensitive header lookups remain outside core.** They are in `m6-http`: `cache.rs`, `http2.rs`, `redirect.rs`, `security.rs` and `main.rs`, and each is a local lookup standing in for the one `headers` module (`m6-http/src/cache.rs:84`).
 
 This is the end of the reference.
-A question about why a module exists belongs in `m6-architecture.md`, and what changed in each release is in `CHANGELOG.md`.
+`m6-architecture.md` explains why each module exists, and `CHANGELOG.md` lists what changed in each release.
