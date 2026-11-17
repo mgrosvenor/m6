@@ -65,7 +65,8 @@ pub struct ProbeResult {
 /// How a probe sequence is doing: the samples, and the outcomes so far.
 ///
 /// The decision rule lives in [`Tally::outcome`] and both drivers use it: the
-/// loop-driven probe in `poll.rs`, and [`probe_with`]'s scripted tests. One
+/// loop-driven probe in `poll.rs`, and `probe_with`'s scripted tests (`probe_with`
+/// is private, so named here in backticks). One
 /// home for the rule, so a change cannot make the real probe and its tests
 /// disagree.
 pub struct Tally {

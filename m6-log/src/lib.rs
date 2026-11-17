@@ -70,7 +70,7 @@ pub fn init(level: Level, analytics: Option<&Path>) -> io::Result<()> {
 
 /// Open the log, naming the setting that named the analytics path.
 ///
-/// A missing analytics directory is refused by [`Sink::file_setting`]. The
+/// A missing analytics directory is refused by [`Sink::file`]. The
 /// error then names `setting`, the directory and the remedy in one line, which
 /// is what a service prints before exiting 2.
 pub fn init_with_setting(level: Level, analytics: Option<(&str, &Path)>) -> io::Result<()> {

@@ -137,11 +137,14 @@ M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 | unit + integration tests | the whole workspace, zero failures | `cargo test --workspace` |
 | compiler warnings | **zero**, release and test builds, pre-existing included | Linux |
 | clippy | **silent. `-D warnings`, no ceiling**, from 2026-09-13 | `tools/clippy.sh` |
+| rustdoc | **silent. a broken intra-doc link is a warning and `-D warnings` makes it an error**, pre-existing included | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
 | h1, h2, h3 conformance | at or above the recorded scores | `tools/conformance.sh` |
 | performance | no consistent slowdown against the base build, interleaved A/B on the build host | `tools/perfcheck.sh` |
 | cargo-deny | advisories, licences and sources | `cargo deny check` |
 | the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
+
+Rustdoc runs a second time with `--all-features`, because `testkit`, `sqlite`, `email`, `multipart` and the allocation counters are off by default and the docs behind them are built by nothing else.
 
 **CI runs all of it on the pull request**, and on every push to `main` and
 `develop` and on release tags, so a merge and a force-push are both built.
