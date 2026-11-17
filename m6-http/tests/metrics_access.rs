@@ -48,6 +48,11 @@ impl Resp {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// The `Retry-After` a 503 carries, for a retry that honours it.
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        check_support::retry_after(self.header("retry-after"))
+    }
 }
 
 fn no_response(reason: impl std::fmt::Display) -> Resp {
@@ -373,8 +378,29 @@ impl Running {
             .count()
     }
 
+    /// Retry an answer from `/perf`, `/traffic` or `/genid` while it is the
+    /// design's 503 for a check that missed its 50 ms deadline.
+    ///
+    /// Those three are readiness signals in this suite: a slow check is not
+    /// the property under test, so the call is repeated under the testkit
+    /// bound and honours `Retry-After`. Any other path is answered once.
+    fn retry_gated(&self, path: &str, mut attempt: impl FnMut() -> Resp) -> Resp {
+        if check_support::check_gated(path) {
+            check_support::retry_unavailable(testkit::RESPONSE_BOUND, || {
+                let r = attempt();
+                (r.status, r.retry_after(), r)
+            })
+        } else {
+            attempt()
+        }
+    }
+
     /// One GET on the internal h2c listener, claiming `client_ip`.
     fn h2c(&self, path: &str, extra: &[(&str, &str)], client_ip: &str) -> Resp {
+        self.retry_gated(path, || self.exchange_h2c(path, extra, client_ip))
+    }
+
+    fn exchange_h2c(&self, path: &str, extra: &[(&str, &str)], client_ip: &str) -> Resp {
         let mut conn = match H2cClientConn::connect("127.0.0.1", self.fx.h2c.port()) {
             Ok(c) => c,
             Err(e) => return no_response(format!("h2c connect: {e}")),
@@ -404,6 +430,10 @@ impl Running {
 
     /// One HTTP/1.1 GET over TLS on a fresh connection.
     fn h1(&self, path: &str, extra: &[(&str, &str)]) -> Resp {
+        self.retry_gated(path, || self.exchange_h1(path, extra))
+    }
+
+    fn exchange_h1(&self, path: &str, extra: &[(&str, &str)]) -> Resp {
         let tcp = match TcpStream::connect(("127.0.0.1", self.port())) {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
@@ -469,6 +499,10 @@ impl Running {
     /// One HTTP/2 GET over TLS. `client_ip` goes to the `x-forwarded-for`
     /// header that the client helper always adds.
     fn h2(&self, path: &str, extra: &[(&str, &str)], client_ip: &str) -> Resp {
+        self.retry_gated(path, || self.exchange_h2(path, extra, client_ip))
+    }
+
+    fn exchange_h2(&self, path: &str, extra: &[(&str, &str)], client_ip: &str) -> Resp {
         let cfg = tls_config(&self.fx.cert_der, &[b"h2"]);
         let mut conn = match H2sTlsClientConn::connect("localhost", self.port(), cfg) {
             Ok(c) => c,
@@ -494,6 +528,10 @@ impl Running {
 
     /// One HTTP/3 GET over QUIC.
     fn h3(&self, path: &str, extra: &[(&str, &str)]) -> Resp {
+        self.retry_gated(path, || self.exchange_h3(path, extra))
+    }
+
+    fn exchange_h3(&self, path: &str, extra: &[(&str, &str)]) -> Resp {
         match h3_get(self.port(), path, extra) {
             Ok(r) => r,
             Err(e) => no_response(format!("h3: {e}")),
@@ -1064,6 +1102,11 @@ fn the_route_block_keeps_its_browser_redirect_and_error_page() {
 ///
 /// Break: add a second call in the route block after the first, and the count
 /// for `/private/x` becomes two while every other assertion still passes.
+///
+/// The request is not retried on the design's 503 here. The count is per
+/// request, so a retry would count a second request's one check and look like
+/// a second check on this one. A 503 from a missed deadline still logs one
+/// `auth check`, which is the fact this test asserts.
 #[test]
 fn one_auth_check_per_protected_request() {
     let run = Fixture::new(PRIVATE_ROUTE, "", &all_gated())
@@ -1072,7 +1115,7 @@ fn one_auth_check_per_protected_request() {
     let good = bearer(&run.token(&["monitor"]));
     for path in ["/private/x", "/perf", "/traffic", "/genid"] {
         let before = run.auth_check_count();
-        let r = run.h1(path, &[("Authorization", &good)]);
+        let r = run.exchange_h1(path, &[("Authorization", &good)]);
         assert!(
             r.status != 401 && r.status != 403,
             "{path} refused a valid token: {}",

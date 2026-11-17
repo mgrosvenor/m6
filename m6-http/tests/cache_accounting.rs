@@ -185,6 +185,39 @@ impl Stack {
     }
 
     fn get_with(&self, path: &str, extra: &[(&str, &str)]) -> (u16, String) {
+        let (status, _headers, body) = self.get_with_headers(path, extra);
+        (status, body)
+    }
+
+    /// One request, retried while a gated endpoint answers the design's 503.
+    ///
+    /// A check that misses its 50 ms deadline answers 503 with `Retry-After`.
+    /// `/perf` is a readiness signal here, so it retries under the testkit
+    /// bound and honours that header.
+    fn get_with_headers(
+        &self,
+        path: &str,
+        extra: &[(&str, &str)],
+    ) -> (u16, Vec<(String, String)>, String) {
+        if check_support::check_gated(path) {
+            check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+                let (status, headers, body) = self.exchange_with_headers(path, extra);
+                let retry = headers
+                    .iter()
+                    .find(|(name, _)| name == "retry-after")
+                    .and_then(|(_, value)| check_support::retry_after(Some(value.as_str())));
+                (status, retry, (status, headers, body))
+            })
+        } else {
+            self.exchange_with_headers(path, extra)
+        }
+    }
+
+    fn exchange_with_headers(
+        &self,
+        path: &str,
+        extra: &[(&str, &str)],
+    ) -> (u16, Vec<(String, String)>, String) {
         let tcp = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
         // No socket read timeout: the read is waited for as an event under one
         // generous bound. A read timeout fires on a loaded host while the
@@ -215,20 +248,23 @@ impl Stack {
             };
         let text = String::from_utf8_lossy(&raw).to_string();
         let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
-        let status = head
-            .split_whitespace()
-            .nth(1)
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| panic!("no status in:\n{head}"));
-        (status, body.to_string())
+        let headers = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        (status, headers, body.to_string())
     }
 
     /// One `/perf` counter, cumulative.
     fn counter(&self, key: &str) -> u64 {
-        let (status, body) = self.get_with(
-            "/perf",
-            &[("Authorization", &format!("Bearer {}", self.token))],
-        );
+        let auth = format!("Bearer {}", self.token);
+        let (status, body) = self.get_with("/perf", &[("Authorization", auth.as_str())]);
         assert_eq!(
             status,
             200,

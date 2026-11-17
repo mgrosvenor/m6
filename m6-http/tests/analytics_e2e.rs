@@ -78,6 +78,11 @@ impl HttpResponse {
             .map(|l| l[want.len()..].trim())
             .collect()
     }
+
+    /// The `Retry-After` a 503 carries, for a retry that honours it.
+    fn retry_after(&self) -> Option<Duration> {
+        check_support::retry_after(self.header_values("retry-after").first().copied())
+    }
 }
 
 /// A response that never arrived, carrying the reason in place of headers.
@@ -438,10 +443,23 @@ impl Server {
     }
 
     /// One HTTP/1.1-over-TLS GET against this server.
+    ///
+    /// A check that misses its 50 ms deadline answers 503 with `Retry-After`,
+    /// which is the design. A gated endpoint used as a readiness signal is
+    /// retried under the testkit bound, because a slow check is not the
+    /// property under test.
     fn get(&self, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
-        match self.tcp() {
+        let exchange = || match self.tcp() {
             Some(tcp) => https_exchange(tcp, self.port, path, extra, self.tls()),
             None => no_response("tcp connect refused while m6-http was alive"),
+        };
+        if check_support::check_gated(path) {
+            check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+                let r = exchange();
+                (r.status, r.retry_after(), r)
+            })
+        } else {
+            exchange()
         }
     }
 

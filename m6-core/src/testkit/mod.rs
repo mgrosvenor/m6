@@ -79,7 +79,7 @@ pub mod wait;
 pub const STARTUP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(feature = "testkit")]
-pub use check::{CheckServer, Reply};
+pub use check::{CheckServer, Reply, ServingCheck};
 #[cfg(feature = "testkit")]
 pub use paths::{binary, exec_scratch_root};
 #[cfg(feature = "testkit")]

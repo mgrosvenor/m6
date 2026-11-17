@@ -96,6 +96,11 @@ impl HttpResponse {
             field.eq_ignore_ascii_case(name).then_some(value.trim())
         })
     }
+
+    /// The `Retry-After` a 503 carries, for a retry that honours it.
+    fn retry_after(&self) -> Option<Duration> {
+        check_support::retry_after(self.header("retry-after"))
+    }
 }
 
 /// One HTTP/1.1-over-TLS GET. A fresh connection each call (the server sends
@@ -726,13 +731,19 @@ fn finding_1_e2e_anonymous_client_must_not_read_protected_content_from_cache() {
         String::from_utf8_lossy(&cold.body)
     );
 
-    // An authorised user fetches it, warming the cache.
-    let authed = https_get(
-        &srv,
-        "/private/secret.txt",
-        &[("Cookie", &format!("session={}", srv.admin_jwt))],
-        srv.tls(),
-    );
+    // An authorised user fetches it, warming the cache. A check that missed
+    // its 50 ms deadline under load answers the design's 503 with
+    // `Retry-After`, which is not this finding, so the warm request is
+    // repeated under the testkit bound until it gets an answer.
+    let authed = check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+        let r = https_get(
+            &srv,
+            "/private/secret.txt",
+            &[("Cookie", &format!("session={}", srv.admin_jwt))],
+            srv.tls(),
+        );
+        (r.status, r.retry_after(), r)
+    });
     assert_eq!(
         authed.status, 200,
         "authorised request should succeed; headers:\n{}",
