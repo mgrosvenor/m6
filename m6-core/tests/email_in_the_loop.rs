@@ -468,7 +468,8 @@ fn successful_stub() -> (
         sock.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
         accepted_tx.send(()).expect("accepted");
-        go.recv_timeout(m6_core::testkit::STARTUP_BOUND).expect("go");
+        go.recv_timeout(m6_core::testkit::STARTUP_BOUND)
+            .expect("go");
         sock.write_all(b"220 test\r\n").expect("greeting");
         let mut log = Vec::new();
         for (expect, reply) in [

@@ -925,7 +925,10 @@ fn sigterm_shuts_down_rather_than_killing() {
     let s = start_server_at_log_level("info");
     s.assert_still_healthy("before shutdown");
 
-    let status = s.http.borrow_mut().terminate(m6_core::testkit::STARTUP_BOUND);
+    let status = s
+        .http
+        .borrow_mut()
+        .terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-http should exit 0 on SIGTERM, got {status}. A signal exit status here \

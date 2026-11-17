@@ -792,7 +792,10 @@ fn held_backend_does_not_delay_a_cache_hit(tag: &str, get: GetFn) {
     let slow_handle = std::thread::spawn(move || get(slow_port, "/slow", Duration::from_secs(20)));
 
     // Wait until the backend reports it received /slow.
-    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let seen = await_slow_seen(
+        &fx.slow_seens[0],
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
+    );
     assert!(
         seen,
         "the backend never received /slow\n--- m6-http ---\n{}",
@@ -1034,7 +1037,10 @@ fn a_large_response_to_a_slow_reader_is_resumed_by_write_readiness() {
         .expect("write");
     stream.flush().expect("flush");
     // Wait until the backend has written the whole response, then drain it.
-    let seen = await_slow_seen(&fx.large_seens[0], Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let seen = await_slow_seen(
+        &fx.large_seens[0],
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
+    );
     assert!(seen, "the backend never wrote /large");
     let mut body = Vec::new();
     let _ = stream.read_to_end(&mut body);
@@ -1254,7 +1260,10 @@ fn a_closed_client_does_not_leak_its_upstream() {
         .write_all(b"GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .expect("write");
     stream.flush().expect("flush");
-    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let seen = await_slow_seen(
+        &fx.slow_seens[0],
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
+    );
     assert!(
         seen,
         "member A never received /slow\n--- m6-http ---\n{}",
@@ -1411,7 +1420,10 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
     });
 
     // Wait until the backend reports the /errors fetch.
-    let seen = await_slow_seen(&error_seen_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let seen = await_slow_seen(
+        &error_seen_rx,
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
+    );
     assert!(
         seen,
         "the backend never received /errors\n--- m6-http ---\n{}",
@@ -1581,7 +1593,10 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         a.dispatch(&h2_req("/slow"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
             .expect("dispatch /slow");
         a.drive();
-        let seen = await_slow_seen(&slow_seen_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
+        let seen = await_slow_seen(
+            &slow_seen_rx,
+            Instant::now() + m6_core::testkit::STARTUP_BOUND,
+        );
         assert!(
             seen,
             "the backend never received /slow\n--- m6-http ---\n{}",
@@ -1606,7 +1621,10 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         .dispatch(&h2_req("/slow2"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
         .expect("dispatch /slow2");
     b.drive();
-    let seen = await_slow_seen(&slow2_seen_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let seen = await_slow_seen(
+        &slow2_seen_rx,
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
+    );
     assert!(
         seen,
         "the backend never received /slow2\n--- m6-http ---\n{}",
