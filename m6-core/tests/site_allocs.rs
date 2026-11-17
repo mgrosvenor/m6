@@ -42,9 +42,9 @@ const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 /// compression candidate `Vec` and two of the `ETag`'s four, cached
 /// `Last-Modified`, made the dictionary's built-in keys borrow their
 /// `&'static str` and made the template name an `Arc<str>`: 50 here. The
-/// target is zero, and the remaining 13 are listed in
-/// `work-queue/out/ALLOC-RENDER-ZERO.md`; a change that raises this is
-/// refused, and one that lowers it records the new number in that commit.
+/// target is zero, and the remaining 13 were each attributed to a call site by
+/// a dhat profile of this test's page-path requests. A change that raises this
+/// is refused, and one that lowers it records the new number in that commit.
 /// The borrowed response head took nine of the 13 and the page copy one more:
 /// 41. The reusable page context took the last four: 36. A traced run shows all
 /// 36 are the libraries': minify-html's 21 and Tera's 15, and none is ours. A

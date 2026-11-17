@@ -48,11 +48,12 @@ use m6_core::testkit::{claim_port, PortClaim, Service};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::h2s_client::H2sTlsClientConn;
 
-// The budgets, in calls per 1,000 requests, measured on macOS on 2026-11-15 by
-// ALLOC-0 with the difference of two runs: N = 1,000 and 2N = 2,000 on one warm
-// connection, per-request figure `(2N - N) / N`. The plan is
-// `work-queue/batch-9/ALLOC-0.md`. Each ALLOC job (ALLOC-1 rustls, ALLOC-2 the
-// cache, ALLOC-3 rendering) lowers the row it attacks. The only calls allowed
+// The budgets, in calls per 1,000 requests, measured on macOS on 2026-11-15
+// with the difference of two runs: N = 1,000 and 2N = 2,000 on one warm
+// connection, per-request figure `(2N - N) / N`. Each change that removes an
+// allocation lowers the row it attacks, in calls per 1,000 requests on the four
+// rows this test drives: rustls's buffers, the cache and the rendering path.
+// The only calls allowed
 // above a row's own per-request calls are the two named TLS-buffer allowances,
 // one on the h1 hit and one on the h2 hit. Any other count above its budget is
 // the defect the guard exists for.

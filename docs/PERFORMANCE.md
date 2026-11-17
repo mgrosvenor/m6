@@ -199,7 +199,8 @@ Resident memory was measured on the build host, a Linux machine:
 **Table 7: resident memory of m6-http with the on-fault pin, against the base build.**
 Take from it that the pin costs 33 to 49 MiB over the base, and that most of the pinned build's memory sits on transparent huge pages.
 
-`m6-http/tests/heap_resident.rs` returns before its assertions on macOS, so the Linux run behind these figures is the build host's, recorded in `work-queue/out/RSS-records/results3/` and `work-queue/out/RSS3-records/`, with the fix's proof in `work-queue/out/MIMALLOC-RSS.md`.
+`m6-http/tests/heap_resident.rs` returns before its assertions on macOS, so the Linux run behind these figures is the build host's.
+`tools/memcalls.sh` reports the resident set after the window, `tools/hwcounters.sh` reads `AnonHugePages` and `Hugetlb` from `/proc/<pid>/smaps_rollup`, and `cargo nextest run -p m6-http --test heap_resident` asserts the bound.
 
 ---
 
@@ -419,14 +420,14 @@ The finding is that m6's own code is 9 us of a 372 us handshake, and the rest ne
 *ADX* is an x86 instruction set for integer arithmetic, and *SHA-NI* is the x86 extension that accelerates SHA-256 and SHA-1.
 The default provider is the crypto provider rustls installs when the application does not name one.
 The alternative is a second provider with a faster X25519 implementation on this hardware.
-The records are in the batch's `work-queue/out/` tree, outside this repository.
-`TLS-records/` holds the handshake suite and the parts bench, `PROFILE-records/` the profile and the syscall bench, and `MIXED-records/` the hit-under-load run, and each table names its file under those roots.
+The handshake times come from the probe clients in `m6-http`, the split from `perf record` on the server, the system-call count from `strace`, and the bare call costs from a loop of the system call itself.
+Section 8.1 gives each command, and every table names its method and constants.
 
 ### 6.1. The split
 
 A full handshake with the default provider read 0.372 ms at p50 from the client over 3,000 connections, and the server's own CPU per handshake was 400.0 us.
 A profile of 1,000 of those handshakes attributes the server's CPU by leaf frame.
-The profiled run read 0.490 ms p50 and 580.0 us of server CPU per handshake (`PROFILE-records/ring-h1-full-perf.bench.log`), so the shares below are the profile's proportions applied to the 372 us.
+The profiled run read 0.490 ms p50 and 580.0 us of server CPU per handshake, so the shares below are the profile's proportions applied to the 372 us.
 
 | share | us | of 372 us | what it is |
 |---|---:|---:|---|
@@ -440,7 +441,7 @@ The profiled run read 0.490 ms p50 and 580.0 us of server CPU per handshake (`PR
 | libc, rustls, allocator and other user code | 61 | 16.4% | wrappers, `memcpy`, heap and std |
 | total | 372 | 100% | the client's p50 |
 
-**Table 15: where a 372 us TLS 1.3 handshake with the default provider goes on the VM, by server CPU (`TLS-records/handshake-ec.log` for the p50 and the CPU per handshake, the full-handshake profile in `PROFILE-records/`, partitioned by `PROFILE-records/an.py` for the shares, `TLS-records/parts.log` and `TLS-records/job6/res/parts-default.log` for the primitives).**
+**Table 15: where a 372 us TLS 1.3 handshake with the default provider goes on the VM, by server CPU. The p50 is `m6-probe-h1 --n 3000`'s full row, the server's CPU per handshake is its process CPU time across that run, the shares are a `perf record -F 20000 -e cpu-clock -g --call-graph dwarf` of 1,000 handshakes partitioned by leaf frame, and the X25519 and P-256 rows are a 2,000-iteration in-memory bench of each primitive.**
 Take from it that crypto and the kernel are 81% of the handshake and m6 is 2.4%, and that the single largest item is the 83 us X25519 key exchange.
 The crypto sub-rows sum to 158, and the percentages are those microseconds over 372.
 The profile's SHA-512 compression frames are 7.58% of its self time, 28 us, and the parts bench's finish phase, which includes that hash, reads 29.9 us, so the table row is 29.
@@ -463,10 +464,10 @@ Seven rounds of each combination, 3,000 handshakes a round, compare the two ciph
 | AES-128-GCM | the default | 0.387 ms (0.360 to 0.419) | 0.345 ms |
 | AES-128-GCM | the alternative | 0.380 ms (0.360 to 0.441) | 0.337 ms |
 
-**Table 16: whole-handshake p50 by client suite and provider, seven rounds each, 3,000 handshakes a round on the VM (`TLS-records/job6/rep/local.txt`).**
+**Table 16: whole-handshake p50 by client suite and provider, seven rounds each, 3,000 handshakes a round on the VM (`m6-probe-h1 --addr HOST:PORT --n 3000`, with the client's cipher-suite list fixed to one suite per round, against a server release build of each provider).**
 Take from it that the ranges overlap in every row and the ordering flips between the two suites, so the whole handshake does not measurably change.
 
-The in-memory parts bench reads X25519 at 83.4 to 83.7 us with the default provider and 46.7 to 62.9 us with the alternative, and the P-256 signature at 26.0 to 33.6 us across both (`TLS-records/job6/res/parts-default.log` and `TLS-records/job6/res/parts-browser.log`).
+The in-memory parts bench reads X25519 at 83.4 to 83.7 us with the default provider and 46.7 to 62.9 us with the alternative, and the P-256 signature at 26.0 to 33.6 us across both (a 2,000-iteration in-memory bench of each primitive, p50).
 A saving of 20 to 36 us on the key exchange is 5% to 10% of the 372 us handshake, and the run-to-run spread in Table 16 is 10%, so the whole-handshake difference is below what this method resolves.
 
 ### 6.4. Hits under handshake load
@@ -482,7 +483,7 @@ One kept-alive connection served hits while a second generator opened new full h
 | 200 | 200.0 | 13,403.0 | 58.3 | 327.8 | 0.777 |
 | 500 | 500.0 | 13,658.8 | 58.2 | 300.6 | 0.645 |
 
-**Table 17: cache hits while new full handshakes arrive, one run per rate, 10 second windows on the VM (`MIXED-records/mixed.log`).**
+**Table 17: cache hits while new full handshakes arrive, one run per rate, 10 second windows on the VM (`m6-bench`'s cache-hit client on one kept-alive connection while `m6-probe-h1` connections open at each rate).**
 Take from it that the hit p50 stays flat at 57.4 to 60.5 us, the hit p99 rises to 327.8 us at 200 handshakes a second and holds at 300.6 us at 500, and hit throughput falls 15% from 15.7k to 13.4k a second.
 
 The p99 plateau is 300 us, which matches the 158 us of crypto plus 144 us of kernel from Table 15, 302 us, so the hit tail is one handshake deep.
@@ -493,13 +494,13 @@ The handshake p50 in this run is 0.65 to 0.87 ms, above the 0.372 ms of section 
 | operation | per call |
 |---|---:|
 | `getppid`, 5,000,000 calls | 1.20 us |
-| pipe write plus read, 2,000,000 pairs | 1.54 us |
+| pipe write plus read, 2,000,000 calls | 1.54 us |
 
-**Table 18: the two bare system call costs the record holds (`PROFILE-records/getppid.txt`).**
+**Table 18: the two bare system call costs on the VM (a `getppid` loop of 5,000,000 calls and a pipe write and read loop of 1,000,000 pairs, section 8.1).**
 Take from it that most of the kernel share in Table 15 is the TCP work behind the calls.
 
 A single per-call figure for the handshake's syscall mix is `NOT MEASURED`.
-The handshake makes 26,184 calls per 1,000 handshakes, of `writev`, `recvfrom`, `close`, `accept4`, `epoll_wait`, `epoll_ctl`, `setsockopt` and `ioctl` (`PROFILE-records/ring-h1-full-strace.strace`), and `strace`'s average per call carries its own overhead.
+The handshake makes 26,184 calls per 1,000 handshakes, of `writev`, `recvfrom`, `close`, `accept4`, `epoll_wait`, `epoll_ctl`, `setsockopt` and `ioctl` (`strace -c -f` attached to the server over the same 1,000 handshakes), and `strace`'s average per call carries its own overhead.
 Pricing it needs a bench on the same VM, with the profiler off, that times the mix the `strace` shows.
 The default provider made nine `getrandom` calls per handshake in that record and the alternative made two calls in 1,000 handshakes, and their cost is `NOT MEASURED` for the same reason.
 A syscall reduction is unpriced and parked until after the release.
@@ -614,7 +615,7 @@ Section 8 gives the commands to re-take every figure above.
 
 ## 8. Reproducing these measurements
 
-The method behind every measurement in this document is below.
+The measurements that can be re-run are described below, with the command where the tree carries one.
 A re-run measures the tree it runs on, so the figures here stay the record of the builds they name.
 The commands are grouped by the section they support.
 
@@ -656,6 +657,22 @@ cargo build --release --bin m6-probe-h1 --bin m6-probe-h2 --bin m6-probe-h3
 ```
 
 The probes take any host, which is how Tables 19 and 20 were measured against third-party edges.
+
+**The TLS handshake figures, section 6.**
+Start a release m6-http on a loopback port with an ECDSA P-256 certificate, then drive it with `m6-probe-h1`:
+
+```sh
+cargo build --release -p m6-http --bins
+./target/release/m6-probe-h1 --addr 127.0.0.1:8443 --n 3000
+```
+
+The probe reports full and resumed handshakes separately with their percentiles, and a shared client config measures resumption while `--no-resume` measures full handshakes alone.
+The split in Table 15 comes from a `perf record -F 20000 -e cpu-clock -g --call-graph dwarf -p <server pid>` of 1,000 handshakes, read with `perf report --stdio --no-children -g none --sort dso,sym` and partitioned by leaf frame.
+The system-call count is `strace -c -f -p <server pid>` over the same run.
+The bare call costs are a C loop of 200,000 warm-up `getppid` calls, then 5,000,000 timed with `clock_gettime(CLOCK_MONOTONIC)`, and 1,000,000 pipe write and read pairs.
+The parts bench is an in-memory loop of 2,000 full handshakes per primitive, reading the key exchange and the signature alone and reporting p50.
+The hit-under-load run holds `m6-bench`'s cache hit on one kept-alive connection while `m6-probe-h1` opens full handshakes at 0, 50, 100, 200 and 500 a second, one 10 second window per rate.
+This tree builds one of the two providers Table 16 compares, so the other rows need a build that selects the second provider.
 
 ### 8.2. The mimalloc A/B on the build host
 
