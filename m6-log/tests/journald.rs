@@ -43,12 +43,12 @@ fn receiver(dir: &Path) -> (UnixDatagram, PathBuf) {
 }
 
 /// One datagram, or `None` when none arrives within the bound.
-fn recv(socket: &UnixDatagram) -> Option<String> {
+fn recv(socket: &UnixDatagram) -> Option<Vec<u8>> {
     let deadline = Instant::now() + m6_core_bound();
     let mut buf = vec![0u8; m6_log::DATAGRAM_MAX];
     loop {
         match socket.recv(&mut buf) {
-            Ok(n) => return Some(String::from_utf8_lossy(&buf[..n]).into_owned()),
+            Ok(n) => return Some(buf[..n].to_vec()),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("the test journal socket failed: {error}"),
         }
@@ -64,16 +64,100 @@ fn m6_core_bound() -> Duration {
     Duration::from_secs(2)
 }
 
-/// The `KEY=value` field named `key` of one datagram.
-fn field<'a>(datagram: &'a str, key: &str) -> Option<&'a str> {
-    let start = format!("{key}=");
-    let at = datagram
-        .split('\n')
-        .position(|part| part.starts_with(&start))?;
-    datagram
-        .split('\n')
-        .nth(at)
-        .map(|part| &part[start.len()..])
+/// One field of a journal datagram.
+#[derive(Debug)]
+struct Field {
+    name: String,
+    value: Vec<u8>,
+}
+
+/// Parse a datagram with journald's own rules.
+///
+/// A field starts with its name up to the next newline. A name followed by
+/// `=` is the text form, and its value runs to that newline. A name with no
+/// `=` is the binary form: eight bytes of little-endian length follow, then
+/// exactly that many value bytes, then a newline. Every field, the last one
+/// included, must end with a newline, because journald discards a field that
+/// does not. Refusing here is the assertion that catches a datagram journald
+/// would read differently from this test.
+fn parse(datagram: &[u8]) -> Result<Vec<Field>, String> {
+    if datagram.is_empty() {
+        return Err("the datagram is empty".to_string());
+    }
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while at < datagram.len() {
+        let Some(offset) = datagram[at..].iter().position(|&byte| byte == b'\n') else {
+            return Err(format!(
+                "the last field is unterminated: no newline after byte {at}"
+            ));
+        };
+        let head = &datagram[at..at + offset];
+        if head.is_empty() {
+            return Err(format!("the field at byte {at} has no name"));
+        }
+        at += offset + 1;
+        if let Some(equals) = head.iter().position(|&byte| byte == b'=') {
+            let name = std::str::from_utf8(&head[..equals])
+                .map_err(|error| format!("a field name is not UTF-8: {error}"))?;
+            fields.push(Field {
+                name: name.to_string(),
+                value: head[equals + 1..].to_vec(),
+            });
+            continue;
+        }
+        let name = std::str::from_utf8(head)
+            .map_err(|error| format!("a binary field name is not UTF-8: {error}"))?;
+        let length_end = at + 8;
+        if length_end > datagram.len() {
+            return Err(format!("the binary field {name} has no eight-byte length"));
+        }
+        let mut length = [0u8; 8];
+        length.copy_from_slice(&datagram[at..length_end]);
+        let length = u64::from_le_bytes(length) as usize;
+        let value_end = length_end + length;
+        if value_end + 1 > datagram.len() {
+            return Err(format!(
+                "the binary field {name} names {length} value bytes, more than the datagram carries"
+            ));
+        }
+        if datagram[value_end] != b'\n' {
+            return Err(format!(
+                "the binary field {name} is not followed by a newline"
+            ));
+        }
+        fields.push(Field {
+            name: name.to_string(),
+            value: datagram[length_end..value_end].to_vec(),
+        });
+        at = value_end + 1;
+    }
+    Ok(fields)
+}
+
+/// The fields of one received datagram, checked first for the trailing
+/// newline journald requires.
+fn datagram(bytes: &[u8]) -> Vec<Field> {
+    assert_eq!(
+        bytes.last(),
+        Some(&b'\n'),
+        "the datagram's last field is unterminated, so journald would discard it: {bytes:?}"
+    );
+    parse(bytes).unwrap_or_else(|reason| panic!("not a journald datagram: {reason}: {bytes:?}"))
+}
+
+/// The value of the field named `name`, or `None` when absent.
+fn field<'a>(fields: &'a [Field], name: &str) -> Option<&'a [u8]> {
+    fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| field.value.as_slice())
+}
+
+/// The UTF-8 value of the field named `name`.
+fn text<'a>(fields: &'a [Field], name: &str) -> &'a str {
+    let value = field(fields, name).unwrap_or_else(|| panic!("no {name} field: {fields:?}"));
+    std::str::from_utf8(value).unwrap_or_else(|error| panic!("{name} is not UTF-8: {error}"))
 }
 
 fn fields_and_one_datagram_per_line() {
@@ -94,25 +178,43 @@ fn fields_and_one_datagram_per_line() {
     });
     m6_log::flush();
 
-    let first = recv(&socket).expect("the warning's datagram");
-    assert_eq!(field(&first, "PRIORITY"), Some("4"), "{first}");
-    assert_eq!(field(&first, "M6_TYPE"), Some("event"), "{first}");
-    let identifier = field(&first, "SYSLOG_IDENTIFIER").expect("SYSLOG_IDENTIFIER");
+    let first_bytes = recv(&socket).expect("the warning's datagram");
+    let first = datagram(&first_bytes);
+    assert_eq!(
+        field(&first, "PRIORITY"),
+        Some(b"4".as_slice()),
+        "{first_bytes:?}"
+    );
+    assert_eq!(
+        field(&first, "M6_TYPE"),
+        Some(b"event".as_slice()),
+        "{first_bytes:?}"
+    );
+    let identifier = text(&first, "SYSLOG_IDENTIFIER");
     assert!(
         identifier.starts_with("journald"),
         "the program's own name, with the hash cargo gives a test binary: {identifier}"
     );
-    let message = field(&first, "MESSAGE").expect("MESSAGE");
-    let value: serde_json::Value = serde_json::from_str(message).expect("MESSAGE is one JSON line");
+    let value: serde_json::Value =
+        serde_json::from_str(text(&first, "MESSAGE")).expect("MESSAGE is one JSON line");
     assert_eq!(value["level"], "WARN");
     assert_eq!(value["type"], "event");
     assert_eq!(value["fields"]["message"], "warning");
 
-    let second = recv(&socket).expect("the metrics datagram");
-    assert_eq!(field(&second, "PRIORITY"), Some("6"), "{second}");
-    assert_eq!(field(&second, "M6_TYPE"), Some("perf"), "{second}");
-    let message = field(&second, "MESSAGE").expect("MESSAGE");
-    let value: serde_json::Value = serde_json::from_str(message).expect("MESSAGE is JSON");
+    let second_bytes = recv(&socket).expect("the metrics datagram");
+    let second = datagram(&second_bytes);
+    assert_eq!(
+        field(&second, "PRIORITY"),
+        Some(b"6".as_slice()),
+        "{second_bytes:?}"
+    );
+    assert_eq!(
+        field(&second, "M6_TYPE"),
+        Some(b"perf".as_slice()),
+        "{second_bytes:?}"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(text(&second, "MESSAGE")).expect("MESSAGE is JSON");
     assert_eq!(value["type"], "perf");
     assert_eq!(value["fields"]["perf"]["requests_total"], 7);
 
@@ -146,8 +248,9 @@ fn an_oversized_datagram_is_refused_and_counted() {
 
     // The wide line is not sent. The dropped-count line that follows it is a
     // line like any other, so it arrives as its own datagram.
-    let report = recv(&socket).expect("the dropped-count line");
-    let message = field(&report, "MESSAGE").expect("MESSAGE");
+    let report_bytes = recv(&socket).expect("the dropped-count line");
+    let report = datagram(&report_bytes);
+    let message = text(&report, "MESSAGE");
     assert!(
         !message.contains("\"message\":\"wide\""),
         "the refused line reached the journal: {message}"
@@ -262,4 +365,30 @@ fn a_real_journald_carries_the_fields() {
         serde_json::from_str(entry["MESSAGE"].as_str().expect("MESSAGE is a string"))
             .expect("MESSAGE is the JSON line");
     assert_eq!(message["fields"]["marker"], marker);
+}
+
+/// The parser above is the phases' oracle, so it has to be shown to refuse
+/// what journald refuses and to decode the binary form journald decodes. A
+/// parser that accepted the old datagram would have let the defect through.
+#[test]
+fn the_parser_refuses_an_unterminated_field_and_decodes_the_binary_form() {
+    let old = b"PRIORITY=4\nM6_TYPE=event\nSYSLOG_IDENTIFIER=test\nMESSAGE={}";
+    let reason = parse(old).expect_err("journald discards an unterminated last field");
+    assert!(reason.contains("unterminated"), "{reason}");
+
+    let text_fields = parse(b"MESSAGE=hello\n").expect("the text form");
+    assert_eq!(field(&text_fields, "MESSAGE"), Some(b"hello".as_slice()));
+
+    let mut binary = Vec::from(*b"MESSAGE\n");
+    binary.extend_from_slice(&5u64.to_le_bytes());
+    binary.extend_from_slice(b"a\nb\nc");
+    binary.push(b'\n');
+    let fields = parse(&binary).expect("the binary form");
+    assert_eq!(field(&fields, "MESSAGE"), Some(b"a\nb\nc".as_slice()));
+
+    binary.pop();
+    assert!(
+        parse(&binary).is_err(),
+        "a binary value without its newline is refused"
+    );
 }

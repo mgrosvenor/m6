@@ -99,7 +99,9 @@ The journal is still the destination, and the journal rotates, so there is no fi
 A service that needs a file sets `StandardOutput=append:` in its unit and lets the journal own the rotation.
 
 Table 3 lists what one datagram carries.
-The wire format is the one `sd_journal_send` writes: the fields of one datagram, each `KEY=value`, separated by a newline, with a newline inside a value written as a backslash and an `n`.
+The wire format is the one `sd_journal_send` writes: every field ends with a newline, the last included, and a field whose value contains a newline uses the binary form.
+The binary form is the field name, a newline, an eight-byte little-endian length, the value and a newline.
+journald discards an unterminated last field and does not decode a backslash escape, so both parts are required for the journal to store the line.
 m6 writes that format directly and links no journal library.
 
 Table 3: the fields of one journal datagram.
