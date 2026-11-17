@@ -723,7 +723,7 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
         started.elapsed(),
         stack.cache_output()
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < m6_core::testkit::RESPONSE_BOUND);
 
     let after = stack.get_cache("/", &[]);
     assert_eq!(after.text(), "first: two", "the change emptied the cache");
@@ -1039,14 +1039,14 @@ fn health_goes_ok_degraded_ok_and_logs_each_change_once() {
     // rather than reading once.
     stack.start_source();
     assert!(
-        wait_until(Duration::from_secs(15), || {
+        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
             stack.get_cache("/health", &[]).status == 200
         }),
         "/health never recovered:\n{}",
         stack.cache_output()
     );
     assert!(
-        wait_until(Duration::from_secs(5), || {
+        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
             stack.cache_output().matches("genid: upstream up").count() == 1
         }),
         "exactly one info on the recovery:\n{}",
