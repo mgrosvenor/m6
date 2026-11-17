@@ -88,14 +88,18 @@ fn handle_login(
         let rl = state.rate_limiter.borrow();
         if rl.is_blocked(peer_ip) {
             warn!(ip = %peer_ip, "rate limit exceeded on login");
+            // The wait comes from the limiter's window, not a constant, so a
+            // client is told a value it can act on. The floor of one second
+            // covers the window ending between the check and this read.
+            let retry_after = rl.retry_after_secs(peer_ip).max(1).to_string();
             if is_json {
                 return Ok(RawResponse::new(429)
-                    .header("Retry-After", "60")
+                    .header("Retry-After", retry_after.as_str())
                     .content_type("application/json")
                     .body(r#"{"error":"rate_limited"}"#));
             } else {
                 return Ok(RawResponse::new(429)
-                    .header("Retry-After", "60")
+                    .header("Retry-After", retry_after.as_str())
                     .body("Too Many Requests"));
             }
         }

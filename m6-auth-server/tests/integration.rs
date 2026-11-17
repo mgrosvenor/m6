@@ -424,9 +424,16 @@ fn t03b_login_json_wrong_password_401() {
 }
 
 /// Login: 6th attempt within 15 minutes → 429 with Retry-After.
+///
+/// The header must be a wait the client can act on, so it is checked against
+/// the configured window rather than a literal. The block follows five
+/// failures, so the window restarted at the fifth and almost all of it is
+/// left. A header that ignores `window_secs` fails the half-window bound.
 #[test]
 fn t04_login_rate_limited_429() {
+    const WINDOW_SECS: u64 = 900;
     let env = setup_test_env("t04");
+    set_rate_limit(&env, 5, WINDOW_SECS);
     // A real user with a cost-4 hash: a missing user costs a cost-12 verify,
     // CPU work that a loaded host stretches past the read deadline.
     seed_user(&env.site_dir, "mallory", "right");
@@ -440,7 +447,8 @@ fn t04_login_rate_limited_429() {
     let unknown = r#"{"username":"nobody","password":"bad"}"#;
     let known = r#"{"username":"mallory","password":"bad"}"#;
 
-    // First 5 attempts (fail with 401)
+    // First 5 attempts must fail with 401. A 429 here would mean the budget was
+    // already spent, and returning early would skip the header check.
     for attempt in 0..5 {
         let body = if attempt == 0 { unknown } else { known };
         let resp = http_request_with_body(
@@ -451,18 +459,13 @@ fn t04_login_rate_limited_429() {
             "application/json",
             body,
         );
-        let status = parse_status(&resp);
-        assert!(
-            status == 401 || status == 429,
-            "expected 401 or 429, got {}",
-            status
+        assert_eq!(
+            parse_status(&resp),
+            401,
+            "failure {} of 5 must not be throttled\n{}",
+            attempt + 1,
+            resp
         );
-        if status == 429 {
-            // We already got rate-limited early, test passes
-            let retry_after = get_header(&resp, "Retry-After").unwrap_or("");
-            assert!(!retry_after.is_empty(), "expected Retry-After header");
-            return;
-        }
     }
 
     // 6th attempt must be 429
@@ -480,23 +483,113 @@ fn t04_login_rate_limited_429() {
         "6th attempt should be rate-limited\n{}",
         resp
     );
-    let retry_after = get_header(&resp, "Retry-After").unwrap_or("");
+    retry_after_secs(&resp, WINDOW_SECS);
+}
+
+/// The header follows `window_secs`, so two configurations answer differently.
+///
+/// Each server is driven to a block with the same five failures. A hard-coded
+/// 60 fails the half-window bound at 120 seconds, where 60 is not greater than
+/// 60, and again at 900. The two answers would also be equal.
+#[test]
+fn t04b_retry_after_follows_the_configured_window() {
+    let mut answered = Vec::new();
+    for window_secs in [120u64, 900u64] {
+        let env = setup_test_env(&format!("t04b-{window_secs}"));
+        set_rate_limit(&env, 5, window_secs);
+        seed_user(&env.site_dir, "mallory", "right");
+        let mut guard = spawn_server(&env);
+
+        let known = r#"{"username":"mallory","password":"bad"}"#;
+        for attempt in 0..5 {
+            let resp = http_request_with_body(
+                &mut guard,
+                &env.socket_path,
+                "POST",
+                "/auth/login",
+                "application/json",
+                known,
+            );
+            assert_eq!(
+                parse_status(&resp),
+                401,
+                "failure {} of 5 with window_secs {window_secs} must not be throttled\n{}",
+                attempt + 1,
+                resp
+            );
+        }
+        let resp = http_request_with_body(
+            &mut guard,
+            &env.socket_path,
+            "POST",
+            "/auth/login",
+            "application/json",
+            known,
+        );
+        assert_eq!(
+            parse_status(&resp),
+            429,
+            "the 6th attempt with window_secs {window_secs} should be rate-limited\n{}",
+            resp
+        );
+        answered.push(retry_after_secs(&resp, window_secs));
+    }
     assert!(
-        !retry_after.is_empty(),
-        "expected Retry-After header on 429"
+        answered[0] < answered[1],
+        "Retry-After did not follow window_secs: 120s answered {}, 900s answered {}",
+        answered[0],
+        answered[1]
     );
 }
 
-/// Append a `[rate_limit]` table with `max_attempts = n` to the test config.
+/// Parse the `Retry-After` on a blocked login and check what a client can do
+/// with it.
+///
+/// The block follows five failures, so the window restarted at the fifth and
+/// nearly all of it remains. A value at or below half of `window_secs` means
+/// the header is not derived from the configured window. A value above
+/// `window_secs` would overstate the wait beyond the whole window, and zero
+/// would invite an immediate retry.
+fn retry_after_secs(resp: &str, window_secs: u64) -> u64 {
+    let raw = get_header(resp, "Retry-After")
+        .unwrap_or_else(|| panic!("a blocked login must carry Retry-After\n{resp}"));
+    let secs: u64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("Retry-After must be whole seconds, got {raw:?}\n{resp}"));
+    assert!(
+        secs >= 1,
+        "Retry-After must name a positive wait, got {secs}\n{resp}"
+    );
+    assert!(
+        secs <= window_secs,
+        "Retry-After {secs} exceeds window_secs {window_secs}\n{resp}"
+    );
+    assert!(
+        secs > window_secs / 2,
+        "Retry-After {secs} is not close to window_secs {window_secs}, so it is not derived from it\n{resp}"
+    );
+    secs
+}
+
+/// Append a `[rate_limit]` table to the test config.
 ///
 /// Call it before `spawn_server`. `setup_test_env` writes no `[rate_limit]`
 /// table, so appending one is valid TOML and the server reads it at start.
-fn limit_failures_to(env: &TestEnv, n: u32) {
+fn set_rate_limit(env: &TestEnv, max_attempts: u32, window_secs: u64) {
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&env.config_path)
         .expect("open the test config for appending");
-    writeln!(file, "\n[rate_limit]\nmax_attempts = {n}").expect("append the rate limit table");
+    writeln!(
+        file,
+        "\n[rate_limit]\nmax_attempts = {max_attempts}\nwindow_secs = {window_secs}"
+    )
+    .expect("append the rate limit table");
+}
+
+/// [`set_rate_limit`] with the service's default window.
+fn limit_failures_to(env: &TestEnv, n: u32) {
+    set_rate_limit(env, n, 900);
 }
 
 /// Send one wrong JSON login carrying the extra header lines in `forwarded`,

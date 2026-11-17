@@ -264,7 +264,7 @@ Take from it that the two credential outcomes are redirects, and a blocked addre
 |---|---|---|
 | valid credentials | 302 | `Location: <next>`, `Set-Cookie: session=...`, `Set-Cookie: refresh=...` |
 | wrong username or password | 302 | `Location: /login?error=invalid&next=<encoded next>` |
-| blocked address | 429 | `Retry-After: 60`, body `Too Many Requests` |
+| blocked address | 429 | `Retry-After: <seconds left in the window>`, body `Too Many Requests` |
 
 **Table 4: the three form login outcomes.**
 
@@ -485,7 +485,8 @@ Take from it that the throttle is configuration, and a restart clears it.
 
 Only a failed credential check counts.
 A correct password clears the address's count.
-A blocked address gets 429 with `Retry-After: 60` before the password is checked.
+A blocked address gets 429 with `Retry-After: <seconds left in the window>` before the password is checked.
+The value is the whole seconds until the window ends, rounded up, so it is never below the true wait and never above `window_secs`.
 The window is measured from the most recent failure, so five failures each inside the window use up the budget however long the series takes.
 A block lifts after `window_secs` with no further failure.
 
