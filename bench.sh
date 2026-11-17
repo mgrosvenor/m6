@@ -6,6 +6,12 @@
 #   ./bench.sh [--skip-verify] [--latency-n N] [--duration S] [--concurrency C]
 #              [--p99-limit-us F] [--rps-min F] [--addr HOST:PORT]
 #
+# Mixed hot hits and new full handshakes:
+#   ./bench.sh --mixed [--mixed-rates 0,50,100,200,500] [--mixed-seconds 10]
+# Reports hot-hit p50/p99 and hit rate while new full TLS handshakes arrive at
+# each rate, with the achieved rate beside the target and the handshake
+# percentiles. The hit connection is kept alive for the whole window.
+#
 # Handshake suite (TLS 1.3 over TCP for h1 and h2, QUIC for h3):
 #   ./bench.sh --handshake [--handshake-n N]
 #   BENCH_KEY=ec|rsa          certificate key type (default ec: ECDSA P-256, what production should run)
@@ -59,6 +65,13 @@ URL_H2S_PID=""
 # (bench.sh controls those itself).
 HANDSHAKE=0
 HANDSHAKE_N=1000
+MIXED=0
+MIXED_RATES="0,50,100,200,500"
+MIXED_SECONDS=10
+# In mixed mode the hit connection must live for the whole window. A reconnect
+# would add a handshake the arrival rate does not count, so the server's
+# per-connection request cap is raised for this suite only.
+MIXED_SERVER_LINE=""
 BENCH_PASS=("--skip-verify")   # bench uses a self-signed cert; TLS validity is not the test
 i=0
 args=("$@")
@@ -70,6 +83,18 @@ while [[ $i -lt ${#args[@]} ]]; do
             ;;
         --handshake)
             HANDSHAKE=1
+            ;;
+        --mixed)
+            MIXED=1
+            MIXED_SERVER_LINE="max_requests_per_connection = 10000000"
+            ;;
+        --mixed-rates)
+            MIXED_RATES="${args[$((i+1))]}"
+            i=$(( i + 1 ))
+            ;;
+        --mixed-seconds)
+            MIXED_SECONDS="${args[$((i+1))]}"
+            i=$(( i + 1 ))
             ;;
         --handshake-n)
             HANDSHAKE_N="${args[$((i+1))]}"
@@ -243,6 +268,7 @@ internal_binds = ["$H2C_BENCH_ADDR"]
 internal_peers = ["$H2C_BENCH_PEER"]
 tls_cert = "$SITE_DIR/cert.pem"
 tls_key  = "$SITE_DIR/key.pem"
+$MIXED_SERVER_LINE
 EOF
 
 # m6-html config:
@@ -468,6 +494,30 @@ run_handshake_suites() {
     done
     return $rc
 }
+
+# ── Mixed hot-hit and handshake-load suite ───────────────────────────────────
+
+run_mixed_suite() {
+    echo ""
+    echo "Mixed hot hits + new full TLS handshakes: rates=${MIXED_RATES}/s  seconds=${MIXED_SECONDS}  key=${BENCH_KEY:-ec}  features=${BENCH_FEATURES:-none (ring)}  profile=$PROFILE"
+    stop_all
+    start_backends
+    start_http
+    local rc=0
+    "$M6_BENCH" \
+        --addr     "$BENCH_ADDR" \
+        --h2c-addr "$H2C_BENCH_ADDR" \
+        --mixed-handshake \
+        --mixed-rates "$MIXED_RATES" \
+        --mixed-seconds "$MIXED_SECONDS" \
+        --skip-verify || rc=$?
+    return $rc
+}
+
+if (( MIXED )); then
+    run_mixed_suite
+    exit $?
+fi
 
 if (( HANDSHAKE )); then
     run_handshake_suites
