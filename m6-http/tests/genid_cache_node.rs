@@ -705,7 +705,7 @@ fn a_publish_through_the_cache_node_reaches_it() {
     .unwrap();
     let token = stack.write_token();
     let posted = stack.post_cache("/genid", Some(&token));
-    assert_eq!(posted.status, 200, "{}", posted.text());
+    assert_eq!(posted.status, 200, "{}", stack.served_message(&posted));
     assert_eq!(posted.genid(), "1", "the source's new ID comes back");
 
     assert!(
@@ -714,7 +714,7 @@ fn a_publish_through_the_cache_node_reaches_it() {
         stack.cache_output()
     );
     let after = stack.get_cache("/", &[]);
-    assert_eq!(after.status, 200);
+    assert_eq!(after.status, 200, "{}", stack.served_message(&after));
     assert_eq!(after.text(), "first: two");
     assert_eq!(after.header("m6-genid"), Some("1"));
 }
@@ -747,7 +747,7 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
     .unwrap();
     let token = stack.write_token();
     let posted = stack.post_source("/genid", Some(&token));
-    assert_eq!(posted.status, 200, "{}", posted.text());
+    assert_eq!(posted.status, 200, "{}", stack.served_message(&posted));
     assert_eq!(posted.genid(), "1");
 
     let started = Instant::now();
@@ -767,7 +767,12 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
     assert!(started.elapsed() < m6_core::testkit::RESPONSE_BOUND);
 
     let after = stack.get_cache("/", &[]);
-    assert_eq!(after.text(), "first: two", "the change emptied the cache");
+    assert_eq!(
+        after.text(),
+        "first: two",
+        "the change emptied the cache: {}",
+        stack.served_message(&after)
+    );
     let again = stack.get_cache("/", &[]);
     assert_eq!(again.text(), "first: two");
     assert!(again.header("age").is_some(), "and it refills on demand");
@@ -902,7 +907,7 @@ fn the_cache_recovers_when_the_source_returns() {
     assert_eq!(stack.post_source("/genid", Some(&token)).status, 200);
     assert!(stack.wait_perf_ready("1", m6_core::testkit::RESPONSE_BOUND));
     let after = stack.get_cache("/", &[]);
-    assert_eq!(after.status, 200);
+    assert_eq!(after.status, 200, "{}", stack.served_message(&after));
     assert_eq!(after.text(), "first: two");
     assert_eq!(after.header("m6-genid"), Some("1"));
 }
