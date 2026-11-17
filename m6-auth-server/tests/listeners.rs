@@ -243,6 +243,10 @@ fn each_path_answers_on_one_socket_only() {
             404,
             "a login-side path answered on the check socket\n{resp}"
         );
+        assert!(
+            !resp.to_ascii_lowercase().contains("cache-control"),
+            "a wrong-socket 404 carried a route's cache policy\n{resp}"
+        );
     }
 
     // Paths this process does not serve at all: 404 on both sockets.
@@ -290,6 +294,57 @@ fn each_path_answers_on_one_socket_only() {
         parse_status(&resp),
         204,
         "the login socket stopped answering the reserved path\n{resp}"
+    );
+}
+
+/// The header names of a response, lower-cased and sorted, for comparing two
+/// answers without their values (the `Date` is per second).
+fn header_names(resp: &str) -> Vec<String> {
+    let head = resp.split("\r\n\r\n").next().unwrap_or("");
+    let mut names: Vec<String> = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The wrong-socket 404 is the house 404.
+///
+/// The wrong decision this catches: finishing the answer through `Site::finish`
+/// re-finds the route from the path and attaches its `Cache-Control: no-store`
+/// and any route headers, so a client can tell a path that exists on the other
+/// socket from one that exists nowhere. The two answers must have the same
+/// header names.
+#[test]
+fn a_wrong_socket_404_carries_no_route_headers() {
+    let env = setup("wrong-side-house-404");
+    let mut svc = spawn(&env, &env.primary, Some(&env.check), &[]);
+    svc.wait_for_path(&env.primary, BOUND);
+    svc.wait_for_path(&env.check, BOUND);
+    svc.wait_for_started(BOUND);
+
+    let known = http_request(
+        &env.check,
+        "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    let unknown = http_request(
+        &env.check,
+        "POST /nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(parse_status(&known), 404, "{known}");
+    assert_eq!(parse_status(&unknown), 404, "{unknown}");
+    let names = header_names(&known);
+    assert!(
+        !names.iter().any(|name| name == "cache-control"),
+        "the wrong-socket 404 carried a route's cache policy\n{known}"
+    );
+    assert_eq!(
+        names,
+        header_names(&unknown),
+        "a path on the other socket is distinguishable from an unknown path\n--- known ---\n{known}\n--- unknown ---\n{unknown}"
     );
 }
 

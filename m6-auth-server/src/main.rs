@@ -766,7 +766,11 @@ fn run_route(
     side: Side,
 ) -> std::result::Result<Response, Busy> {
     if ROUTE_SIDE[index] != side {
-        return Ok(site.finish(req, Response::not_found()));
+        // Finished with no route, so the answer carries no route
+        // `Cache-Control` and no route headers. `site.finish` would find the
+        // route again from the path and make this 404 distinguishable from an
+        // unknown path, which says the path exists on the other socket.
+        return Ok(site.not_found_owned(req));
     }
     let response = match index {
         0 => handlers::dispatch_login(
