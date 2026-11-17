@@ -1,7 +1,7 @@
 //! The allocator every m6 binary and every allocation-counting test installs.
 //!
 //! [`M6Alloc`] is mimalloc. Under the `alloc-count` feature it also counts each
-//! call the way [`crate::testkit::alloc_count`] reads them. Without the feature
+//! call the way `crate::testkit::alloc_count` reads them. Without the feature
 //! the counting is not compiled, so a service pays nothing for it. A test counts
 //! against the allocator production runs, not against another one.
 //!
