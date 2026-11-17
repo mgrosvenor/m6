@@ -495,6 +495,11 @@ If a route declares `require`, m6-http asks the authority before forwarding:
 A request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
+Three gates still verify locally in this release: `/perf`, `/traffic` and a source node's `POST /genid` call `m6_http_lib::auth::check` with `[auth] public_key`.
+That verifier checks the signature and `exp`, does not compare `iss`, and reads roles and groups from the token.
+A token with a foreign `iss`, or a role removed in the database, still opens those three gates until the token expires.
+AUTH-1 step 6 converts them to `POST /check`.
+
 `m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
 `m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
 A missing `[auth] public_key` is still a start error. Config validation refuses `require` without `[auth]`, and without `[auth] backend`, so a running node cannot reach a protected route with no authority.

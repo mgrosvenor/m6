@@ -568,6 +568,7 @@ No decision is cached, so a role change or a revocation counts from the next req
 The edge decodes no token and holds no key on a protected route, and `X-Auth-Claims` now carries `sub`, `username`, `roles` and `groups` and no token claim.
 A config with a `require` route now needs `[auth] backend`, and the start fails without it.
 Public routes are unchanged and reach no authority.
+Three gates still decide locally until step 6: `/perf`, `/traffic` and a source node's `POST /genid` call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token the authority would refuse still opens them until it expires.
 
 **`[auth] backend` now names the backend whose members answer `POST /check`, and every member is probed at start.**
 The key keeps its name and stays optional.

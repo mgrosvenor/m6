@@ -433,6 +433,10 @@ m6-http probes each member once at start: 401 or 503 passes, 404 stops the start
 A route with `require` sends one `POST /check` per protected request, under a 50 ms deadline, and applies the route's requirement to the identity in the answer.
 No credential is 401 with no call, a 401 from this service is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 Nothing caches the answer, so a role change or a revocation counts from the next request.
+
+Three gates in m6-http still decide locally in this release: `/perf`, `/traffic` and a source node's `POST /genid`.
+They call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token this service would refuse still opens them until it expires.
+AUTH-1 step 6 converts those three gates to `POST /check`.
 The token sources, the `require` forms and the outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
 The header the edge sets carries the identity this service answered, and section 8 shows what a backend does with it.
 
