@@ -75,11 +75,11 @@ sockets = "/run/m6/m6-file-*.sock"
 
 [[backend]]
 name    = "m6-auth"
-sockets = "/run/m6/m6-auth-*.sock"
+sockets = "/run/m6/m6-auth.sock"
 
 [[backend]]
 name    = "m6-auth-check"
-sockets = "/run/m6/check-m6-auth-*.sock"
+sockets = "/run/m6/check-m6-auth.sock"
 
 [[backend]]
 name    = "render-contact"
@@ -160,9 +160,14 @@ path    = "/api/{rest}"
 backend = "remote-api"
 ```
 
+The socket path comes from the config file's stem, so `configs/m6-auth.conf` gives the primary socket `/run/m6/m6-auth.sock`, and the check socket adds `check-` in front of that file name to give `/run/m6/check-m6-auth.sock`.
+
 The system config:
 
 ```toml
+[node]
+name = "edge-a"
+
 [server]
 bind     = "0.0.0.0:443"
 tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
@@ -172,6 +177,7 @@ tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 backend = "m6-auth-check"  # the backend whose members answer POST /check
 ```
 
+The example keeps the node name, the bind address, the certificate and key, and the `[auth]` section in the system config.
 Section 3 states how the two files merge at start.
 
 ## 3. Config layering
@@ -272,7 +278,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 | `[cache] dir` | System config | The disk cache directory is one node's state |
 | `[limits.<name>]` | System config | The start and maximum of this node's buffers and queues, memory a node owns |
 | `[health]` enabled, path | `site.toml` | The endpoint layout every node shares |
-| `[log]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
+| `[log]`, `[stats]`, `[analytics]`, `[rate_limit]`, `[errors]`, `[security]` | `site.toml` | Identical on every node |
 | `[[backend]]`, `[[route]]`, `[[route_group]]` | `site.toml` | Identical in development and production |
 | Service `[params_cache]`, `[server]`, `[compression]`, `[minification]`, `[[route]]`, `global_params` | Service config | The service's own state |
 | Service `[limits.<name>]` | Service config | The start and maximum of the service's own buffers, `m6-app-anatomy.md` §4.2 |
@@ -721,22 +727,43 @@ max   = "32MiB"
 
 Take from the example that a limit is two sizes, and that a request past `max` is refused with an error that names `[limits.edge_request] max` and the file to raise it in.
 
-### 4.15. `[node]`
+### 4.15. `[stats]`
+
+The `[stats]` table sets how often m6-http writes its periodic log lines.
+The table lives in `site.toml`, because the cadence is the same on every node.
+Table 16 gives the keys.
+Take from it that both intervals are whole seconds and that zero stops the start.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `interval_s` | integer | `10` | Seconds between the accounting tick, which writes the operational `periodic stats` line and the `type` `perf` line. `0` stops the start with exit 2 |
+| `traffic_interval_s` | integer | `60` | Seconds between the `type` `traffic` lines. `0` stops the start with exit 2 |
+
+**Table 16: the `[stats]` keys.**
+The `type` `perf` line and the `type` `traffic` line go to stdout, or to journald's native socket under systemd, where `M6_TYPE=perf` and `M6_TYPE=traffic` select them.
+
+The `type` `perf` line carries the whole metrics document under `fields.perf`, from `perf_document` in `m6-http/src/health.rs`.
+The document holds the request, cache and latency figures, the pool and TLS state, the build identity and the host facts.
+The `type` `traffic` line carries the traffic summary under `fields.traffic`, from `build_report` in the same file, over a window of up to the last 60 minutes.
+
+A zero for either key is refused at start with exit 2, because the line would then be written on every pass of the event loop.
+
+### 4.16. `[node]`
 
 The `[node]` table names this process's node.
-Table 16 gives its key.
+Table 17 gives its key.
 Take from it that the name is required, and that it comes from the config of one node.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line and the analytics record. System config only |
 
-**Table 16: the `[node]` key.**
+**Table 17: the `[node]` key.**
 
-### 4.16. `[security]`
+### 4.17. `[security]`
 
 The `[security]` table sets the response headers m6-http adds to what it serves.
-Table 17 gives the keys.
+Table 18 gives the keys.
 Take from it that `csp_mode` chooses which `Content-Security-Policy` header is sent, and every other key is a header value.
 An empty value omits that header, and a backend's own value wins.
 
@@ -752,20 +779,20 @@ An empty value omits that header, and a backend's own value wins.
 | `cross_origin_opener_policy` | string | `same-origin` | `Cross-Origin-Opener-Policy` |
 | `cross_origin_resource_policy` | string | `same-origin` | `Cross-Origin-Resource-Policy` |
 
-**Table 17: the `[security]` keys.**
+**Table 18: the `[security]` keys.**
 The headers reach cache hits, error pages and rate-limit refusals as well as backend responses.
 
-### 4.17. `[analytics]`
+### 4.18. `[analytics]`
 
 The `[analytics]` table turns the per-request access lines on and off.
-Table 18 gives the one key.
+Table 19 gives the one key.
 Take from it that the lines are on by default, and that they go to the same log stream as every other line with `type` `access`.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Turns the per-request access lines off |
 
-**Table 18: the `[analytics]` key.**
+**Table 19: the `[analytics]` key.**
 `[log]` controls the level and destination of the stream these lines share, and `[stats]` sets how often the metrics line is written.
 
 Section 5 follows one request through the route table.
@@ -827,6 +854,7 @@ Exit 2 on:
 - `[auth]` in `site.toml`, in a two-file config
 - A system config with no `[node]`
 - `[log] level` unrecognised
+- `[stats].interval_s = 0` or `[stats].traffic_interval_s = 0`
 - `[server] reuse_port_processes = 0`, a `process_index` that is not below `reuse_port_processes`, a `status_bind` with no `process_index`, or a `status_bind` port plus `process_index` past 65535
 - `[server] served_hosts` entry that is not a bare host name
 - `[server] redirect_unmatched_to` empty, carrying a scheme, port, path or wildcard, or naming an IP address
@@ -910,7 +938,7 @@ The page gives the two files m6-http reads.
 The system config holds one node's state: the node name, the bind address, the certificate and the credential paths.
 A key in the other file stops the start with exit 2, so a key has one owner.
 
-Table 19 gives the pages that own the behaviour behind these keys.
+Table 20 gives the pages that own the behaviour behind these keys.
 Take from it that the server's internals, the renderer's own keys and the site layout each have a page of their own.
 
 | document | covers |
@@ -921,6 +949,6 @@ Take from it that the server's internals, the renderer's own keys and the site l
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) | The renderer config, which is the process config of a service |
 | [`m6-site-layout.md`](m6-site-layout.md) | One root per app, which a `[[route_group]]` glob has to account for |
 
-**Table 19: further reading, and what each document covers.**
+**Table 20: further reading, and what each document covers.**
 
 A site that runs with these two files and the keys in the tables is a site whose configuration m6-http has read and accepted.
