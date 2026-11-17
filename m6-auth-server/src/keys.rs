@@ -26,6 +26,7 @@ impl KeyMaterial {
         private_key_path: &std::path::Path,
         public_key_path: &std::path::Path,
         issuer: String,
+        audience: String,
     ) -> anyhow::Result<Self> {
         let private_pem = std::fs::read_to_string(private_key_path).map_err(|e| {
             anyhow::anyhow!(
@@ -42,7 +43,7 @@ impl KeyMaterial {
             )
         })?;
 
-        let jwt = JwtEngine::new(&private_pem, &public_pem, issuer.clone())?;
+        let jwt = JwtEngine::new(&private_pem, &public_pem, issuer.clone(), audience)?;
         check_pair(&jwt, &issuer)?;
         Ok(KeyMaterial {
             jwt,
@@ -59,6 +60,7 @@ impl KeyMaterial {
     pub fn load_verify_only(
         public_key_path: &std::path::Path,
         issuer: String,
+        audience: String,
     ) -> anyhow::Result<Self> {
         let public_pem = std::fs::read_to_string(public_key_path).map_err(|e| {
             anyhow::anyhow!(
@@ -67,7 +69,7 @@ impl KeyMaterial {
                 e
             )
         })?;
-        let jwt = JwtEngine::verify_only(&public_pem, issuer)?;
+        let jwt = JwtEngine::verify_only(&public_pem, issuer, audience)?;
         Ok(KeyMaterial {
             jwt,
             public_key_pem: public_pem,
@@ -85,9 +87,11 @@ fn check_pair(jwt: &JwtEngine, issuer: &str) -> anyhow::Result<()> {
     let now = crate::jwt::now_secs();
     let claims = crate::jwt::AccessClaims {
         iss: issuer.to_string(),
+        aud: jwt.audience.clone(),
         sub: "key-pair-check".to_string(),
         exp: now + 60,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: String::new(),
         groups: Vec::new(),
         roles: Vec::new(),
@@ -133,6 +137,11 @@ pub(crate) fn test_key_material() -> KeyMaterial {
         String::from_utf8_lossy(&exported.stderr)
     );
 
-    KeyMaterial::load(&private, &public, "test.example.com".to_string())
-        .expect("load the test keys")
+    KeyMaterial::load(
+        &private,
+        &public,
+        "test.example.com".to_string(),
+        "test.example.com".to_string(),
+    )
+    .expect("load the test keys")
 }

@@ -487,3 +487,49 @@ fn check_only_refuses_a_database_without_the_schema() {
     );
     assert!(!check.exists(), "the check socket appeared anyway");
 }
+
+/// A config with no `[tokens] issuer` and a `site.toml` with no `[site] domain`
+/// stops the start with exit 2, and the error names the key.
+///
+/// The wrong outcome this catches: a default issues every token with one name,
+/// so a token minted for one deployment verifies at another that shares the
+/// signing key. The service takes the deployment's name from `[site] domain`
+/// when the token section leaves it out, and refuses when neither names one.
+#[test]
+fn a_config_without_an_issuer_stops_the_start_naming_the_key() {
+    let site = TestSite::new("no-issuer");
+    let (private_pem, public_pem) = generate_test_rsa_keys();
+    let private = site.key_dir.path().join("auth.pem");
+    let public = site.key_dir.path().join("auth.pub");
+    std::fs::write(&private, &private_pem).unwrap();
+    std::fs::write(&public, &public_pem).unwrap();
+    let data = site.site_dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let db_path = data.join("auth.db");
+    // The site.toml `TestSite::new` wrote is empty, so there is no [site] domain
+    // to fall back to.
+    let config = format!(
+        "[storage]\npath = \"{}\"\n\n[keys]\nprivate_key = \"{}\"\npublic_key = \"{}\"\n",
+        db_path.display(),
+        private.display(),
+        public.display(),
+    );
+    std::fs::write(&site.config_path, config).unwrap();
+
+    let mut svc = Service::spawn("m6-auth-server", &mut site.command());
+    let status = svc
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
+        .unwrap_or_else(|| {
+            panic!(
+                "the service did not exit for a config with no issuer\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    let output = svc.output();
+    assert_eq!(status.code(), Some(2), "output:\n{output}");
+    assert!(
+        output.contains("[tokens] issuer") && output.contains("site.toml"),
+        "the error did not name the key and the file it looked in\n--- output ---\n{output}"
+    );
+    assert!(!site.socket_path.exists(), "the socket appeared anyway");
+}

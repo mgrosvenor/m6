@@ -227,14 +227,21 @@ fn mint_refresh_token(
     issuer: &str,
     user: &m6_auth::User,
 ) -> String {
-    let engine = m6_auth::jwt::JwtEngine::new(private_pem, public_pem, issuer.to_string())
-        .expect("build engine");
+    let engine = m6_auth::jwt::JwtEngine::new(
+        private_pem,
+        public_pem,
+        issuer.to_string(),
+        issuer.to_string(),
+    )
+    .expect("build engine");
     let now = m6_auth::jwt::now_secs();
     let claims = m6_auth::jwt::RefreshClaims {
         iss: issuer.to_string(),
+        aud: issuer.to_string(),
         sub: user.id.clone(),
         exp: now + 3600,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: user.username.clone(),
         token_type: "refresh".to_string(),
     };

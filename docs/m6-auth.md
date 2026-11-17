@@ -129,14 +129,15 @@ The config path decides the socket name.
 
 The service's own configuration is one *TOML* (Tom's Obvious, Minimal Language) file.
 Table 3 gives its keys, including the two *PEM* (Privacy-Enhanced Mail) key paths.
-Take from it that `[storage]` and `[keys]` are the required sections, and that the token and rate-limit defaults make a minimal config work.
+Take from it that `[storage]` and `[keys]` are the required sections, that the issuer must come from the config or from `[site] domain`, and that the lifetimes, audience and rate limit have defaults.
 
 | section | key | type | default | notes |
 |---|---|---|---|---|
 | `[storage]` | `path` | string | required | SQLite database path, absolute |
 | `[tokens]` | `access_ttl` | integer | `900` | access token lifetime in seconds |
 | `[tokens]` | `refresh_ttl` | integer | `2592000` | refresh token lifetime in seconds |
-| `[tokens]` | `issuer` | string | `[site] domain`, then `localhost` | the `iss` claim |
+| `[tokens]` | `issuer` | string | `[site] domain` | the `iss` claim. The start stops with exit 2 when neither names one |
+| `[tokens]` | `audience` | string | the issuer | the `aud` claim |
 | `[keys]` | `private_key` | string | required on the login side | path to the PEM private key, absolute. A `--check-only` process does not read it and may leave it out |
 | `[keys]` | `public_key` | string | required | path to the PEM public key, absolute |
 | `[rate_limit]` | `max_attempts` | integer | `5` | failed logins allowed per address per window |
@@ -149,10 +150,13 @@ A relative path stops the service at startup with exit 2, and the error names th
 The check is `secret_path` in `m6-core/src/config.rs`.
 
 The `issuer` falls back to `[site] domain` in the `site.toml` that the optional `site_toml` key names.
-When that file has no domain, the fallback is `localhost`.
+When neither the config nor that file names one, the start stops with exit 2 and the error names `[tokens] issuer`.
 The `site_toml` key is core's, and it defaults to `<site-dir>/site.toml`.
 
-The service reads the database path, the token lifetimes, the issuer and the rate limit once at startup.
+The audience is the deployment's name, and it is the issuer when `[tokens] audience` is unset.
+A token minted for one deployment is refused at another even when the two share the signing key.
+
+The service reads the database path, the token lifetimes, the issuer, the audience and the rate limit once at startup.
 A change to any of them after startup is logged with the text "restart m6-auth-server to apply it", and the running value stays.
 
 The two-listener split adds no config key.
@@ -370,15 +374,20 @@ Section 6 gives the token contents those routes produce, and section 7 gives the
 ## 6. Tokens
 
 The service issues two kinds of *JWT* (JSON Web Token): an access token for a request and a refresh token for a new access token.
+`m6-auth-cli token create` mints a third kind, an API token.
+Every token names its kind in the header `typ`: `at+jwt` for an access token, `m6-api+jwt` for an API token and `m6-refresh+jwt` for a refresh token.
+A token with no `typ`, or any other value including the library's default `JWT`, is refused.
 Table 7 gives the claims.
 Take from it that the access token carries the identity, groups and roles, and the refresh token carries enough to find the user.
 
 | claim | access token | refresh token | meaning |
 |---|---|---|---|
 | `iss` | yes | yes | issuer, from `[tokens] issuer` |
+| `aud` | yes | yes | audience, from `[tokens] audience`, the issuer when unset |
 | `sub` | yes | yes | user id |
 | `exp` | yes | yes | expiry, in seconds since the Unix epoch |
 | `iat` | yes | yes | issue time, in seconds since the Unix epoch |
+| `jti` | yes | yes | a fresh identifier for this mint |
 | `username` | yes | yes | login name |
 | `groups` | yes | no | group names at issue time |
 | `roles` | yes | no | role names at issue time |
@@ -386,13 +395,15 @@ Take from it that the access token carries the identity, groups and roles, and t
 
 **Table 7: the claims in each token.**
 
-The `type` claim marks a refresh token, and no decoder checks its value.
-Each decoder instead requires fields the other kind lacks: the access decoder needs `groups` and `roles`, and the refresh decoder needs `type`.
-m6-http ignores `type`, so a refresh token presented as a bearer token is refused with 403 for having no groups or roles.
+The `type` claim marks a refresh token for a reader that does not look at the header.
+The `typ` header is what the service checks, and `POST /check` accepts `at+jwt` and `m6-api+jwt` and refuses `m6-refresh+jwt` before it reads the claims.
+The `jti` is new at every mint and unique per mint. At this tip it names no row: the table that can end a token by its `jti` is part of the shelved token-rules work.
+`sid` is absent for the same reason, because it names a session row this schema does not have.
 
 The algorithm follows the key: an EC P-256 key gives ES256, and an RSA key gives RS256.
 The `alg` header is set from the key at startup.
-The service checks the signature, `iss` and `exp` in `POST /check`, and on refresh and the JSON logout path.
+The service checks the signature, `typ`, `iss`, `aud`, `exp` and the presence of `iss`, `aud`, `sub`, `exp`, `iat` and `jti` in `POST /check`, and on refresh and the JSON logout path.
+The leeway is zero, so a token is refused at the second `exp` names.
 m6-http no longer decodes the token, so the algorithm and the key are this service's business.
 
 The access token's groups and roles are a snapshot at issue time.

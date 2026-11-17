@@ -967,6 +967,8 @@ fn t09_jwt_verifiable_with_public_key() {
         .expect("parse public key from PEM");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["test.example.com"]);
+    // The config names no audience, so the issuer is the audience.
+    validation.set_audience(&["test.example.com"]);
 
     let result =
         jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
@@ -1075,6 +1077,8 @@ fn issuer_falls_back_to_the_configured_site_toml() {
             .expect("parse public key from PEM");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["site.example.com"]);
+    // The audience falls back to the same name the issuer took.
+    validation.set_audience(&["site.example.com"]);
     let result =
         jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
     assert!(

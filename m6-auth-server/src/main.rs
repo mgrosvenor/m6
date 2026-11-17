@@ -219,9 +219,18 @@ fn build_state(site: &Site, bind: Bind) -> Result<(AppState, m6_auth::Db)> {
                 "[keys] private_key is required because this process serves the login routes, which sign tokens: add it to the config, or run with --check-only"
             )
         })?;
-        KeyMaterial::load(private_key_path, &cfg.public_key_path, cfg.issuer.clone())
+        KeyMaterial::load(
+            private_key_path,
+            &cfg.public_key_path,
+            cfg.issuer.clone(),
+            cfg.audience.clone(),
+        )
     } else {
-        KeyMaterial::load_verify_only(&cfg.public_key_path, cfg.issuer.clone())
+        KeyMaterial::load_verify_only(
+            &cfg.public_key_path,
+            cfg.issuer.clone(),
+            cfg.audience.clone(),
+        )
     }
     .context("loading key material")?;
 
@@ -257,7 +266,7 @@ fn build_state(site: &Site, bind: Bind) -> Result<(AppState, m6_auth::Db)> {
         )
     })?;
 
-    m6_core::log::info!(issuer = %cfg.issuer, "auth config loaded");
+    m6_core::log::info!(issuer = %cfg.issuer, audience = %cfg.audience, "auth config loaded");
 
     Ok((
         AppState {
@@ -265,6 +274,7 @@ fn build_state(site: &Site, bind: Bind) -> Result<(AppState, m6_auth::Db)> {
             access_ttl: cfg.access_ttl,
             refresh_ttl: cfg.refresh_ttl,
             issuer: cfg.issuer.clone(),
+            audience: cfg.audience.clone(),
             rate_limiter: RefCell::new(RateLimiter::with_limits(
                 cfg.rate_limit_max_attempts,
                 cfg.rate_limit_window_secs,

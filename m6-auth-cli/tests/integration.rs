@@ -702,7 +702,7 @@ fn a_relative_private_key_exits_2() {
     std::fs::write(
         env.dir.path().join("m6-auth.conf"),
         format!(
-            "[storage]\npath = \"{db}\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"{pubkey}\"\n"
+            "[storage]\npath = \"{db}\"\n\n[tokens]\nissuer = \"test.example.com\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"{pubkey}\"\n"
         ),
     )
     .expect("write config");
@@ -710,6 +710,35 @@ fn a_relative_private_key_exits_2() {
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("[keys] private_key"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// A config with no `[tokens] issuer` exits 2 and names the key.
+///
+/// This tool reads no site.toml, so there is no deployment name to fall back to
+/// and it refuses rather than inventing `localhost`. The wrong outcome this
+/// catches: every token from a config that names no issuer carries the same
+/// default name, so a token minted for one deployment verifies at another that
+/// shares the signing key.
+#[test]
+fn a_config_without_an_issuer_exits_2_naming_the_key() {
+    let env = TestEnv::new();
+    let db = env.dir.path().join("data/auth.db").display().to_string();
+    let pubkey = env.dir.path().join("keys/auth.pub").display().to_string();
+    std::fs::write(
+        env.dir.path().join("m6-auth.conf"),
+        format!(
+            "[storage]\npath = \"{db}\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\n\n[keys]\nprivate_key = \"{}\"\npublic_key = \"{pubkey}\"\n",
+            env.dir.path().join("keys/auth.pem").display(),
+        ),
+    )
+    .expect("write config");
+    let out = env.run(&["user", "ls"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[tokens] issuer"),
         "stderr: {}",
         stderr(&out)
     );

@@ -20,6 +20,9 @@ pub struct AppState {
     pub access_ttl: u64,
     pub refresh_ttl: u64,
     pub issuer: String,
+    /// The deployment every minted token is for. It travels in each token's
+    /// `aud`, and a token for another audience is refused at the check route.
+    pub audience: String,
     /// Borrowed only for the length of one call. The loop is one thread, and no
     /// borrow is held across a call that returns to it, so a borrow cannot fail
     /// at run time.
@@ -383,9 +386,11 @@ fn do_refresh(state: &AppState, db: &Db, token: &str) -> anyhow::Result<(String,
     let now = now_secs();
     let access_claims = AccessClaims {
         iss: state.issuer.clone(),
+        aud: state.audience.clone(),
         sub: user.id.clone(),
         exp: now + state.access_ttl as i64,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: user.username.clone(),
         groups: user.groups.clone(),
         roles: user.roles.clone(),
@@ -445,7 +450,7 @@ fn handle_logout_api(req: &RawRequest, state: &AppState, db: &Db) -> Result<RawR
             .trim_start_matches("Bearer ")
             .trim_start_matches("bearer ");
         let decode_result = state.keys.jwt.decode_access(token).ok();
-        if let Some(data) = decode_result {
+        if let Some((_, data)) = decode_result {
             let user_id = &data.claims.sub;
             if let Err(e) = db.refresh_tokens_revoke_all(user_id) {
                 if e.is_busy() {
@@ -486,9 +491,9 @@ fn handle_check(req: &RawRequest, state: &AppState, db: &Db) -> RawResponse {
     let Some(token) = bearer_token(req) else {
         return unauthorised();
     };
-    // Verifies the signature, the issuer and the expiry. Only `sub` is read
-    // from the claims; the identity itself is the database's.
-    let Ok(data) = state.keys.jwt.decode_access(token) else {
+    // Verifies the signature, the kind, the issuer, the audience and the expiry.
+    // Only `sub` is read from the claims; the identity itself is the database's.
+    let Ok((_, data)) = state.keys.jwt.decode_access(token) else {
         return unauthorised();
     };
     let user = match db.user_get_by_id(&data.claims.sub) {
@@ -603,9 +608,11 @@ fn issue_tokens(
 
     let access_claims = AccessClaims {
         iss: state.issuer.clone(),
+        aud: state.audience.clone(),
         sub: user_id.to_string(),
         exp: now + state.access_ttl as i64,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: username.to_string(),
         groups: groups.to_vec(),
         roles: roles.to_vec(),
@@ -613,9 +620,11 @@ fn issue_tokens(
 
     let refresh_claims = RefreshClaims {
         iss: state.issuer.clone(),
+        aud: state.audience.clone(),
         sub: user_id.to_string(),
         exp: now + state.refresh_ttl as i64,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: username.to_string(),
         token_type: "refresh".to_string(),
     };
@@ -652,6 +661,7 @@ mod tests {
             access_ttl: 900,
             refresh_ttl: 2592000,
             issuer: "test.example.com".to_string(),
+            audience: "test.example.com".to_string(),
             rate_limiter: RefCell::new(RateLimiter::with_limits(5, 900)),
         };
         let req = RawRequest {

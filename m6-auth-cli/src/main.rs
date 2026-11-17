@@ -24,6 +24,7 @@ struct StorageConfig {
 #[derive(Deserialize, Default)]
 struct TokensConfig {
     issuer: Option<String>,
+    audience: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -35,6 +36,7 @@ struct KeysConfig {
 struct ParsedConfig {
     db_path: PathBuf,
     issuer: String,
+    audience: String,
     private_key_path: Option<PathBuf>,
     public_key_path: Option<PathBuf>,
 }
@@ -54,10 +56,20 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
     }
     let db_path = m6_core::config::secret_path("[storage] path", &cfg.storage.path)?;
 
-    let issuer = cfg
+    // The issuer is the deployment's name and it has no default: a token minted
+    // for one deployment must not verify at another. This tool reads no
+    // site.toml, so the fallback to `[site] domain` is the service's alone and
+    // the config must name the issuer here.
+    let Some(issuer) = cfg.tokens.as_ref().and_then(|t| t.issuer.clone()) else {
+        bail!(
+            "[tokens] issuer: no issuer is set, and this tool reads no site.toml: set [tokens] issuer to the deployment's name"
+        );
+    };
+    let audience = cfg
         .tokens
-        .and_then(|t| t.issuer)
-        .unwrap_or_else(|| "localhost".to_string());
+        .as_ref()
+        .and_then(|t| t.audience.clone())
+        .unwrap_or_else(|| issuer.clone());
 
     let (private_key_path, public_key_path) = match cfg.keys {
         Some(k) if !k.private_key.is_empty() => (
@@ -76,6 +88,7 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
     Ok(ParsedConfig {
         db_path,
         issuer,
+        audience,
         private_key_path,
         public_key_path,
     })
@@ -471,8 +484,13 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
     let public_pem = std::fs::read_to_string(public_key_path)
         .with_context(|| format!("reading public key: {}", public_key_path.display()))?;
 
-    let engine = JwtEngine::new(&private_pem, &public_pem, cfg.issuer.clone())
-        .context("loading JWT keys")?;
+    let engine = JwtEngine::new(
+        &private_pem,
+        &public_pem,
+        cfg.issuer.clone(),
+        cfg.audience.clone(),
+    )
+    .context("loading JWT keys")?;
 
     let user = db
         .user_get(username)?
@@ -484,15 +502,17 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
 
     let claims = AccessClaims {
         iss: cfg.issuer.clone(),
+        aud: cfg.audience.clone(),
         sub: user.id.clone(),
         exp,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: user.username.clone(),
         groups: user.groups.clone(),
         roles: user.roles.clone(),
     };
 
-    let token = engine.encode_access(&claims).context("encoding JWT")?;
+    let token = engine.encode_api(&claims).context("encoding JWT")?;
     let token_hash = hash_token(&token);
 
     db.api_token_create(&user.id, &user.username, name, &token_hash, exp)?;

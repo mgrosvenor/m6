@@ -76,7 +76,8 @@ Take from it that the user and group commands need only `[storage]`.
 | key | required | default | used for |
 |---|---|---|---|
 | `[storage] path` | yes | none | the SQLite file |
-| `[tokens] issuer` | no | `localhost` | the `iss` claim of a minted token |
+| `[tokens] issuer` | yes | none | the `iss` claim of a minted token. This tool reads no `site.toml`, so it exits 2 when the config omits it |
+| `[tokens] audience` | no | the issuer | the `aud` claim of a minted token |
 | `[keys] private_key` | `token create` only | none | signing the token |
 | `[keys] public_key` | `token create` only | none | loading the key pair |
 
@@ -180,11 +181,12 @@ The name defaults to `api-token`.
 The *TTL* (time to live) defaults to 365 days.
 `--ttl-days` takes a whole number of days, and a value that is not a number exits 1.
 
-m6-http allows 60 seconds of leeway past `exp`.
-`--ttl-days 0` sets `exp` to the current second, so that token is accepted for about a minute.
+m6-auth-server refuses a token at `POST /check` with zero leeway past `exp`.
+`--ttl-days 0` sets `exp` to the current second, so that token is refused at once.
 
-The claims in the token carry the user id, username, roles and groups as they stood at that moment.
-A later role change does not alter an issued token, because m6-http reads the token and never the database.
+The claims in the token carry the user id, username, roles and groups as they stood at that moment, and the configured issuer and audience.
+A later role change does not alter an issued token, because `POST /check` answers the database's current roles and groups.
+The token's `jti` is a fresh identifier for this mint, and at this tip it names no row.
 The database stores a SHA-256 hash of the token, so the token text cannot be recovered after the command ends.
 
 `token ls` lists every record the user has, ordered by `created_at`, newest first.
@@ -192,8 +194,8 @@ The list includes a token whose `exp` has passed.
 The table columns are ID, NAME, CREATED and EXPIRES, and `--json` gives the fields `id`, `user_id`, `username`, `name`, `created_at` and `expires_at`.
 An empty list prints the header and a note on stderr.
 
-`token revoke` deletes the record, and the JWT keeps working until its `exp` plus that leeway, because verification is local.
-`--ttl-days 1` limits that window to a day plus the leeway, and the row that `token ls` shows is the only record of the token afterwards.
+`token revoke` deletes the record, and the JWT keeps working until its `exp`, because the token is checked by its signature and claims.
+`--ttl-days 1` limits that window to a day, and the row that `token ls` shows is the only record of the token afterwards.
 
 The sequence from minting a token to guarding a route with it is example 10 in [`m6-user-guide.md`](m6-user-guide.md).
 Section 8 gives the exit codes these commands return.
