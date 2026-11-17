@@ -122,8 +122,8 @@ fn main() -> anyhow::Result<()> {
     let site = Site::load("my-service", ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let mut poll = Poll::new()?;
-    let mut listener = listen_unix(site.socket_path(), site.socket_mode())?;
     let mut signals = Signals::new()?;
+    let mut listener = listen_unix(site.socket_path(), site.socket_mode())?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
     poll.registry()
@@ -609,6 +609,10 @@ The ordering is the rule.
 A thread inherits the signal mask as it stands when the thread is created.
 A service that started a thread before blocking would have a thread with SIGTERM unblocked, the kernel would deliver the process-directed signal there, and the default disposition would kill the process.
 `Signals::new()` refuses to open without the mask and says so.
+
+The descriptor opens before the socket exists.
+The socket is how a caller knows the service is ready, so a caller that waits for it and then sends SIGTERM must find the descriptor open.
+A stop that arrives while the mask is blocked and no descriptor is open is discarded on macOS, and the service would then ignore the stop that followed its own bind.
 
 The first signal stops accepting, removes the socket and exits 0.
 It does not wait for a request in progress, so a request cut off by a restart is lost.

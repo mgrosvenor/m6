@@ -319,6 +319,12 @@ fn main() -> Result<()> {
     let ceiling = ceiling.min(table.max());
     let initial = table.start().min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
+    // The signal descriptor opens before either socket exists. A caller that
+    // waits for a socket and then sends SIGTERM must find the handler armed. A
+    // stop that arrives while the mask is blocked and no descriptor is open is
+    // discarded on macOS, and the service would then ignore the stop that
+    // followed its own bind.
+    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     let primary_socket = site.socket_path().to_path_buf();
     let check_socket = check_socket_path(&primary_socket);
     let mut login_listener = bind.login.then(|| {
@@ -329,7 +335,6 @@ fn main() -> Result<()> {
         listen_unix(&check_socket, site.socket_mode())
             .unwrap_or_else(|e| fail(&format!("binding {}", check_socket.display()), e))
     });
-    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     if let Some(listener) = login_listener.as_mut() {
         poll.registry()
             .register(listener, LOGIN_LISTENER, Interest::READABLE)

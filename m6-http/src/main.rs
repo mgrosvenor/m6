@@ -7486,6 +7486,20 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
+    // The signal descriptor opens before any socket exists. The mask was
+    // blocked as the first statement of `main`, and this descriptor is what
+    // turns that block into a request the loop reads. A stop that arrives while
+    // the mask is blocked and no descriptor is open is discarded on macOS, so a
+    // caller that waits for this process's port and then sends SIGTERM could
+    // have the stop lost between the bind below and the open.
+    let signals = match Signals::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("signal init failed: {e}");
+            return 2;
+        }
+    };
+
     // Bind the QUIC UDP socket. With [server] reuse_port the TLS listener is
     // bound in the same call, so the two sockets that share the public port
     // both carry SO_REUSEPORT: the option is set before bind, which is the only
@@ -7519,15 +7533,6 @@ fn run(args: Vec<String>) -> i32 {
         return 2;
     }
 
-    // Signals, first so a signal can never arrive with nothing listening. The
-    // mask was blocked as the first statement of `main`.
-    let signals = match Signals::new() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("signal init failed: {e}");
-            return 2;
-        }
-    };
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http", None);
     lifecycle.started();
 

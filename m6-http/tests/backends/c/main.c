@@ -48,6 +48,7 @@ static char *g_status_body = NULL;
 static size_t g_status_len = 0;
 static int g_listen_fd = -1;
 static volatile sig_atomic_t g_shutting_down = 0;
+static volatile sig_atomic_t g_listening = 0;
 
 /* ── Shutdown, spec §8.2 ──────────────────────────────────────────────────
  *
@@ -64,7 +65,12 @@ static void on_signal(int sig) {
         _exit(0); /* second signal: immediate */
     }
     g_shutting_down = 1;
-    if (g_listen_fd >= 0) {
+    /* Close the listener only once it is listening. A stop can arrive between
+     * bind() and listen(), when the socket file already exists but the fd is
+     * still being set up. Closing it there makes listen() fail with EBADF and
+     * the process exit 1 instead of 0. The accept loop's condition reads the
+     * flag and leaves without ever accepting in that case. */
+    if (g_listening && g_listen_fd >= 0) {
         close(g_listen_fd);
     }
 }
@@ -352,6 +358,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "listen: %s\n", strerror(errno));
         return 1;
     }
+
+    /* From here the handler may close the fd to wake a blocked accept(). A stop
+     * that arrived earlier set the flag, so the loop below is skipped. */
+    g_listening = 1;
 
     while (!g_shutting_down) {
         int fd = accept(g_listen_fd, NULL, NULL);
