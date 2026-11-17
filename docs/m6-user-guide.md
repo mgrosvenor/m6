@@ -1494,7 +1494,9 @@ This logrotate stanza rotates the file every hour and keeps the last 48 files, t
 }
 ```
 
-Choose a `rotate` count that fits the disk at your traffic, because every kept file uses disk.
+`rotate 48` with no `maxage` makes the file count the only bound, and every kept file uses disk.
+A rotation can set `rotate -1` and no `maxage`, so nothing in the logrotate config deletes a log by age.
+That design bounds the directory with a size cap of its own, run after every rotation and oldest file first, and 1 GB per node is that cap.
 
 `hourly` takes effect only when logrotate itself runs every hour, and logrotate's default schedule is once a day.
 Run it hourly with a systemd timer override:
