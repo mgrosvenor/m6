@@ -527,54 +527,42 @@ The rule that matters: a 401 is the authority's decision, and a 503 is its absen
 
 ## 6. HTTP semantics
 
+Section 6 covers the modules on the wire: the *HTTP* (Hypertext Transfer Protocol) parser and connection slot, the blocking stream adapter, conditional requests, content-coding negotiation, MIME types, path parameters and the network helpers.
+It uses *RFC* (Request for Comments) for the specifications it names.
+The parser comes first because every other module in the section works on what it accepts.
+
 ### 6.1. `h1`
 
-`parse_request(buf) -> ParseResult` is the one HTTP/1.1 parser, and it is
-**pure**: it does not strip proxy-owned headers, because that is ingress policy
-rather than parsing, and a backend has no proxy headers to strip.
-`ParseResult` is `Complete(RawRequest)`, `Incomplete` or `Error`.
+**`parse_request(buf) -> ParseResult` is the one HTTP/1.1 parser, and it is pure.**
+It strips no proxy-owned headers, because stripping is ingress policy and a backend has none to strip (`m6-core/src/h1.rs:25`).
+`ParseResult` is `Complete(RawRequest)`, `Incomplete` or `Error(HeadError)`.
 
-There were four parsers. Measured against h1spec, the independent RFC 9112
-tester, this one scored 27/32 and the others 15, 15 and 14. The plan named the
-14 as the consolidation target. Measuring the candidate before moving anything
-onto it is what caught that. All four targets now score 32/32 and
-`tools/conformance.sh` holds them there.
+Four parsers existed.
+Measured against h1spec, the independent RFC 9112 tester, this one scored 27/32, two scored 15/32 and one scored 14/32 (`m6-core/src/h1.rs:3`).
+The migration plan named the 14/32 parser as the consolidation target, and measuring the candidate before moving anything onto it is what caught the mistake.
+The four h1 conformance targets now score 32/32, and `tools/conformance.sh` holds them there (`tools/conformance-scores.txt`).
 
-`Expectation` and `expectation(buf)` handle `Expect: 100-continue`;
-`CONTINUE_RESPONSE` is the reply. `keep_alive(&req)` decides connection reuse.
-`status_reason(status)` maps a code to its phrase.
+`Expectation` and `expectation(buf)` handle `Expect: 100-continue`, and `CONTINUE_RESPONSE` is the reply.
+`keep_alive(&req)` decides connection reuse, and `status_reason(status)` maps a code to its phrase.
 
-`Responder::new(w, method, keep_alive)` is the write side: `send`,
-`send_with_length`, `error`, with `keeps_alive()` and `body_bytes()`. It omits
-the body on a HEAD, which the three hand-written writers it replaced did not
-reliably do, so every 404, 405, 400 and 412 answering a HEAD went out with one.
-`write_head_to` is the same head written straight into a caller's buffer, for a
-caller whose writer is already a buffer.
+`Responder::new(w, method, keep_alive)` is the write side.
+It writes with `send`, `send_with_length`, `send_stream` and `error`, and `keeps_alive()` and `body_bytes()` answer the connection decision and the bytes written (`m6-core/src/h1.rs:1042`).
+It omits the body on a HEAD, and m6-file's writer applied that rule on the success path only, so m6-file answered every 404, 405 and 400 to a HEAD with a body (`m6-core/src/h1.rs:1030`).
+`write_head_to` is the same head written straight into a caller's buffer, for a caller whose writer is already a buffer.
 
 **`ServerConn`** is one HTTP/1.1 connection slot for a service's own loop.
-`new(read_cap, write_cap)` makes it at start, `attach` takes an accepted
-`m6_core::platform::net::UnixStream` and `detach` gives it back, and `stream()` is what the
-reactor registers.
-`read` reads until the socket would block and frames what is buffered. A whole
-request is then parsed with `parse_head_uninit` into the caller's fixed header
-slots and returned as `Read::Request(head)`, or `read` reports `Read::More` or
-`Read::Closed`. It keeps the request's method, the keep-alive decision and the
-served count on the slot, so `respond` needs no request argument.
-`respond(status, headers, body)` queues a short answer and
-`respond_response(Response)` queues a handler's. `flush` writes until the socket
-would block and reports `Done` (everything written, connection keeping alive),
-`More` (the socket would block with output still queued, so write again when it
-is writable) or `Close` (everything written and the connection closes).
-A `Body::Stream` body is pumped 64 KiB per writable turn, one `read(2)` of the
-file per turn.
-A request or a response larger than the slot's buffers grows that buffer and it
-is cut back to the configured size afterwards.
-The parser is edge-triggered, so one turn reads and writes until the socket
-would block.
+`new(read_cap, write_cap)` makes it at start, `attach` takes an accepted `m6_core::platform::net::UnixStream`, `detach` gives it back, and `stream()` is what the reactor registers.
+`read` reads until the socket would block and frames what is buffered.
+A whole request is then parsed with `parse_head_uninit` into the caller's fixed header slots and returned as `Read::Request(head)`, or `read` reports `Read::More` or `Read::Closed`.
+It keeps the request's method, the keep-alive decision and the served count on the slot, so `respond` needs no request argument.
+
+`respond(status, headers, body)` queues a short answer, and `respond_response(Response)` queues a handler's.
+`flush` writes until the socket would block and reports `Done` (everything written, connection keeping alive), `More` (the socket would block with output still queued, so write again when it is writable) or `Close` (everything written and the connection closes).
+A `Body::Stream` body is pumped 64 KiB per writable turn, one `read(2)` of the file per turn.
+A request past the input buffer grows it by doubling, clamped at the `request_body` maximum plus `MAX_REQUEST_HEAD`, and the buffer keeps the grown size (`m6-core/src/h1.rs:1591`).
 
 The header slots are `MaybeUninit` and made with `head_slots()`.
-The head borrows them for one call, which is why the array is made where it is
-used and costs no writes.
+The head borrows them for one call, which is why the array is made where it is used and costs no writes.
 
 The turn loop:
 
@@ -596,6 +584,16 @@ loop {
                     let response = service_route(index, &req);
                     site.finish(&req, response)
                 }
+                Handled::Reload(reload) => {
+                    let response = match site.reload(ROUTES, &[], &NoTemplates) {
+                        Ok(next) => {
+                            *site = next;
+                            genid_ok()
+                        }
+                        Err(e) => genid_failed(&e),
+                    };
+                    finish_reload(&reload, response)
+                }
             };
             (Some(response), false)
         }
@@ -612,14 +610,14 @@ loop {
         // Everything is written and this turn has nothing more to read.
         Flush::Done => {
             let interest = conn.interest();
-            reregister(&mut conn, interest, token);
+            reregister(conn, interest, token);
             break;
         }
         // The socket would block with output still queued: register with
         // `conn.interest()` (WRITABLE here) and flush again when it is.
         Flush::More => {
             let interest = conn.interest();
-            reregister(&mut conn, interest, token);
+            reregister(conn, interest, token);
             break;
         }
         // Everything is written and this connection closes.
@@ -628,157 +626,156 @@ loop {
 }
 ```
 
-The service's own loop registers the token with `conn.interest()` after every turn, so a turn that ends waiting for the socket to be readable leaves a READABLE registration and a turn that owes output leaves a WRITABLE one.
+The service's own loop registers the token with `conn.interest()` after every turn, so a turn that ends waiting for the socket to be readable leaves a READABLE registration, and a turn that owes output leaves a WRITABLE one.
 When a WRITABLE event arrives, the loop calls `conn.flush()` and re-registers with `conn.interest()` again, which is what continues a `Flush::More`.
 
-**Allocation.** `ServerConn` allocates nothing per request: its buffers are made
-at start and a request or response larger than them is the one case that grows
-one.
+**Allocation.** `ServerConn` allocates nothing per request.
+Its buffers are made at start, and a request past the input buffer or a streamed body past the output buffer is the one case that grows one.
 
 ### 6.2. `parse`
 
 `parse_request(stream) -> Result<RawRequest, ParseError>`.
 
-**This is a stream adapter, not a second parser.** It reads into a buffer and
-asks `h1::parse_request` whether the message is complete, so it has no framing
-logic of its own. It takes `Write` as well as `Read` because a client that sent
-`Expect: 100-continue` will not send its body until told to, and answering that
-has to happen before the read that would otherwise deadlock.
+**This is a stream adapter over `h1`.**
+It reads into a buffer and asks `h1::parse_request` whether the message is complete, so it has no framing logic of its own.
+It takes `Write` as well as `Read`, because a client that sent `Expect: 100-continue` will not send its body until told to, and answering that has to happen before the read that would otherwise deadlock.
 
-Two bounds, guarding different things: `MAX_REQUEST_HEAD` of head through the
-shared parser, then the body up to `[limits.request_body] max`, 16 MiB by default and answered 413 past it. It reads in chunks rather than one byte per
-`read()` call, because `server` hands it a raw `UnixStream` with nothing
-buffering.
+Two bounds guard different things.
+The head is capped at `MAX_REQUEST_HEAD` by the shared parser, and the body at `[limits.request_body] max`, 16 MiB by default, answered 413 past it (`m6-core/src/parse.rs:15`).
+It reads 1024-byte chunks, because `server` hands it a raw `UnixStream` with nothing buffering.
 
-The benchmarks and `m6-file`'s `query_of` test drive it. A service's loop frames
-requests with `h1::ServerConn`.
+The benchmarks and `m6-file`'s `query_of` test drive it.
+A service's loop frames requests with `h1::ServerConn`.
 
-`ParseError::status()` and `.reason()` give the response for a parse failure,
-including 414 for a request line over `MAX_HEADER_LINE` and 400 for a field or
-a head over its limit.
+`ParseError::status()` and `.reason()` give the response for a parse failure, including 414 for a request line over `MAX_HEADER_LINE` and 400 for a field or a head over its limit.
 
 ### 6.3. `conditional`
 
-`evaluate_preconditions(...) -> Precondition`, `is_not_modified(...)`,
-`not_modified_headers(cached)`.
+`evaluate_preconditions(...) -> Precondition`, `is_not_modified(...)`, `not_modified_headers(cached)`.
 
-RFC 9110 13.2, implemented once. It was implemented twice, and the second copy
-was five inline lines that did strong comparison for `If-None-Match` and
-implemented neither `If-Match` nor `If-Unmodified-Since`. The symptom came and
-went with cache state, because a hit was answered correctly by the good copy
-and only a miss reached the bad one. A defect that correlates with cache state
-reads as noise.
+RFC 9110 13.2, implemented once.
+It was implemented twice, and the second copy was five inline lines that did strong comparison for `If-None-Match` and implemented neither `If-Match` nor `If-Unmodified-Since`.
+The symptom came and went with cache state, because a hit was answered correctly by the good copy and only a miss reached the bad one.
+A defect that correlates with cache state reads as noise.
 
 ### 6.4. `negotiate`
 
-`coding_quality(accept_encoding, coding) -> Option<f32>`,
-`preferred_coding(accept_encoding, candidates)`,
-`canonical_coding(accept_encoding) -> &'static str`.
+`coding_quality(accept_encoding, coding) -> Option<f32>`, `preferred_coding(accept_encoding, candidates)`, `canonical_coding(accept_encoding) -> &'static str`.
 
-Real q-values. `q=0` means "not acceptable" (RFC 9110 12.4.2), which a
-substring match gets wrong in the direction that matters: brotli sent to a
-client that explicitly refused it. `canonical_coding` is what makes a cache key
-out of a header, so that `gzip` and `gzip, deflate, br, zstd` stop being two
-entries for one byte-identical response.
+Real q-values.
+`q=0` means "not acceptable" (RFC 9110 12.4.2), which a substring match gets wrong in the direction that matters: brotli sent to a client that explicitly refused it.
+`canonical_coding` narrows a header to the one coding this server will serve, and it is the intended cache-key form.
+`m6-http` keys its response cache on the raw `Accept-Encoding` text today, so `gzip` and `gzip, deflate, br, zstd` remain two entries for one byte-identical response (`m6-core/src/negotiate.rs:120`).
 
 ### 6.5. `mime` and `path`
 
 `mime_from_path(path)`, `should_compress_default(mime)`.
 
-`validate_path_param(value, allow_slash) -> Result<&str, PathParamError>`. This
-is a security boundary and it existed three times, with three behaviours. There
-is one now.
+`validate_path_param(value, allow_slash) -> Result<&str, PathParamError>`.
+This is a security boundary and it existed three times, with three behaviours.
+There is one now (`m6-core/src/path.rs:57`).
 
 ### 6.6. `net`
 
 `is_private_ip(ip)` is the one answer to "is this on a private network".
-`bind_ip(bind)` pulls the address out of `ip:port`, `[v6]:port` or a bare
-address, and gives `None` for a host name. Names are never resolved.
+`bind_ip(bind)` pulls the address out of `ip:port`, `[v6]:port` or a bare address, and gives `None` for a host name.
+Names are never resolved.
+
+Table 6 lists the ranges `is_private_ip` treats as private.
 
 | family | private |
 |---|---|
 | IPv4 | `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10` |
 | IPv6 | `::1`, `fc00::/7`, `fe80::/10` |
 
-An IPv4-mapped IPv6 address is classified by its IPv4 form. `0.0.0.0` and `::`
-are not private. A check on a peer address only means something on a socket
-that faces the client directly; behind a proxy the peer is the proxy.
+**Table 6: the address ranges `is_private_ip` treats as private.**
+Take from it that loopback, link-local, unique-local and the carrier-grade NAT range all count, and that the unspecified addresses do not.
 
-`listen_unix(path, mode)` removes a stale socket file, creates the parent
-directory, binds non-blocking and sets the mode. `listen_tcp(addr)` binds
-non-blocking with `SO_REUSEADDR`, so a restart can rebind a port whose
-connections are in `TIME_WAIT` and a live listener on it is still refused.
-Both are start only and return `Err` rather than recovering, because a socket
-with a mode nobody chose or a port someone else holds is a start failure.
+An IPv4-mapped IPv6 address is classified by its IPv4 form.
+`0.0.0.0` and `::` are not private.
+A check on a peer address only means something on a socket that faces the client directly, and behind a proxy the peer is the proxy.
+
+`listen_unix(path, mode)` removes a stale socket file, creates the parent directory, binds non-blocking and sets the mode.
+`listen_tcp(addr)` binds non-blocking with `SO_REUSEADDR`, so a restart can rebind a port whose connections are in `TIME_WAIT` while a live listener on it is still refused.
+Both are start only and return `Err`, because a socket with a mode nobody chose or a port someone else holds is a start failure (`m6-core/src/net.rs:105`).
+
+Section 6 covers the parser through the network helpers, and section 7 turns to content: compression, minification, the utility helpers and SQLite.
 
 ---
 
 ## 7. Content
 
-`compress`: `brotli_compress(data, quality)`, `brotli_decompress`,
-`gzip_compress(data, level)`, `gzip_decompress`.
+Section 7 covers the content helpers a response path uses: compression, minification, the utility and random helpers, and the one SQLite file a service keeps.
+It uses *JSON* (JavaScript Object Notation), *WAL* (write-ahead log) and *CSPRNG* (cryptographically secure pseudorandom number generator).
+The four small modules come first, and SQLite has the rest of the section.
 
-`minify` (feature `minify`): `minify_html(data, minify_inline_js)`, `minify_js`, `minify_css`,
-`minify_json`.
+`compress` provides `brotli_compress(data, quality)`, `brotli_decompress(data)`, `gzip_compress(data, level)` and `gzip_decompress(data)`.
 
-`util`: `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago`, `html_escape`.
+`minify` (feature `minify`) provides `minify_html(data, minify_inline_js)`, `minify_js(data)`, `minify_css(data)` and `minify_json(data)`.
 
-`random`: `random_hex_token::<N>()`. There were two byte-identical copies at
-two lengths. Both were correct; the hazard is the third one, written by someone
-who reaches for `rand::random()` and produces something that looks identical at
-a glance.
+`util` provides `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago` and `html_escape`.
+
+`random` provides `random_hex_token::<N>()` and `random_hex_token_into`, one CSPRNG token generator.
+There were two byte-identical copies at two lengths.
+Both were correct, and the hazard is the third copy, written by someone reaching for `rand::random()` and producing something that looks identical at a glance (`m6-core/src/random.rs:1`).
 
 ### 7.1. `sqlite`
 
-Feature `sqlite`. Re-exports `rusqlite`. `open(path)` opens one database file
-with the settings in Table 7.1. `migrate(&mut conn, &[Migration])` applies a
-versioned list kept in `PRAGMA user_version`, and `schema_version` reads it.
-`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE, and
-`is_append_only` reports them. `used_bytes` and `prune_oldest` keep a table
-under a size cap. The cap counts the whole file, and `prune_oldest` returns
-`Pruned { rows_deleted, cap_met }`. `OpenOptions` changes the busy timeout, the journal mode
-(`Journal::Rollback` or `Journal::Wal`) and foreign keys.
+Feature `sqlite`.
+Re-exports `rusqlite`.
+`open(path)` opens one database file with the settings in Table 7 (`m6-core/src/sqlite.rs:257`).
+`migrate(&mut conn, &[Migration])` applies a versioned list kept in `PRAGMA user_version`, and `schema_version` reads it.
+`append_only(&conn, table)` adds triggers that refuse UPDATE and DELETE, and `is_append_only` reports them.
+`used_bytes` and `prune_oldest` keep a table under a size cap.
+The cap counts the whole file, and `prune_oldest` returns `Pruned { rows_deleted, cap_met }`.
+`OpenOptions` changes the busy timeout, the journal mode (`Journal::Rollback` or `Journal::Wal`) and foreign keys.
 `open_reader(path)` opens an existing file read-only with the busy timeout and nothing else, for a reader beside the writer.
+`open_read_only(path)` opens an existing WAL database for reading beside a writer, sets `query_only`, and leaves the journal mode and schema alone (`m6-core/src/sqlite.rs:296`).
 
 | setting | value | reason |
 |---|---|---|
 | `journal_mode` | `DELETE` | The database is one file at rest. WAL leaves `-wal` and `-shm` beside it, and a copy of the main file alone can miss committed work. |
-| `busy_timeout` | 5 s | A second connection waits for a lock instead of failing with `SQLITE_BUSY`. Set explicitly, because rusqlite documents its own default as subject to change. |
+| `busy_timeout` | 5 s | A second connection waits for a lock. Set explicitly, because rusqlite documents its own default as subject to change. |
 | `foreign_keys` | on | SQLite has them off in every new connection. The value is read back. |
 | `recursive_triggers` | on | `INSERT OR REPLACE` fires DELETE triggers only with this on, so the append-only rule needs it. |
 
-*Table 7.1: the settings `open` applies, and why. Each is read back, and a
-setting that does not take effect is an error.*
+**Table 7: the settings `open` applies, and why.**
+Take from it that the file is one file at rest.
+Each setting is read back, and a setting that does not take effect is an error.
 
-**Migrations** number 1, 2, 3 in order, and the list is checked before anything
-runs. Each runs in its own `BEGIN IMMEDIATE` transaction with the version
-re-read inside it, so connections that open at once apply each migration once.
-A failing migration rolls back. A file newer than the list is refused with
-`NewerThanCode`, before the first migration and again inside each transaction.
-`migrate` switches `foreign_keys` off before each migration, so a migration can
-rebuild a table that others point at. It runs `PRAGMA foreign_key_check` before
-the commit, rolls back with `ForeignKeyCheck` on any dangling row, and restores
-the setting afterwards. A released migration is never edited. Use one journal
-mode for every connection to a file, because SQLite cannot leave WAL while
-another connection is using it.
+**Migrations** number 1, 2, 3 in order, and the list is checked before anything runs.
+Each runs in its own `BEGIN IMMEDIATE` transaction with the version re-read inside it, so connections that open at once apply each migration once.
+A failing migration rolls back.
+A file newer than the list is refused with `NewerThanCode`, before the first migration and again inside each transaction.
+`migrate` switches `foreign_keys` off before each migration, so a migration can rebuild a table that others point at.
+It runs `PRAGMA foreign_key_check` before and after the migration's SQL inside the transaction, compares the dangling references, and rolls back with `ForeignKeyCheck` when the migration adds one (`m6-core/src/sqlite.rs:329`).
+A released migration is never edited.
+Use one journal mode for every connection to a file, because SQLite cannot leave WAL while another connection is using it.
 
-**Append-only** triggers are named `<table>_append_only_update` and
-`<table>_append_only_delete`. Call `append_only` after `migrate` on every open,
-and it restores triggers that were dropped. The triggers guard against mistakes
-in code. Anyone who can write the file can drop them. A table that is pruned
-must not be append-only.
+**Append-only** triggers are named `<table>_append_only_update` and `<table>_append_only_delete`.
+Call `append_only` after `migrate` on every open, and it restores triggers that were dropped.
+The triggers guard against mistakes in code.
+Anyone who can write the file can drop them.
+A table that is pruned must not be append-only.
+
+Section 7 covers the content helpers and the one database module, and section 8 turns to observability.
 
 ---
 
 ## 8. Observability
 
+Section 8 covers observability: logging, telemetry, the monitoring endpoints, reverse DNS, host readings, TLS, firewall, WireGuard and NDJSON.
+It uses *TLS* (Transport Layer Security), *DNS* (Domain Name System), *NDJSON* (newline-delimited JSON), *ACME* (Automatic Certificate Management Environment) and *VPS* (virtual private server).
+The section runs from the loop's own log line to the certificate a client is served.
+
 ### 8.1. `log`
 
 `m6_core::log` re-exports the `m6-log` crate and adds `watch`.
-`init(level, analytics)` sets the level and opens the two Sinks at start: the operational Sink on stdout and, when `analytics` is given, the analytics Sink on that path.
-It returns nothing to hold. The Sinks and the level are thread-local, and a process has one loop thread.
+`init(level, analytics)` sets the level and opens the two Sinks at start: the operational Sink on stdout and, when `analytics` is given, the analytics Sink on that path (`m6-log/src/lib.rs:67`).
+It returns nothing to hold.
+The Sinks and the level are thread-local, and a process has one loop thread.
 `read_site_log_config(site_toml)` reads `[log] level` from `site.toml`, and `parse_level(s)` turns a level name into a `Level`.
-`Site` applies the precedence: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
+`Site` applies the precedence: the command line, then the service's `[log]`, then `site.toml`'s `[log]` (`m6-core/src/site.rs:2676`).
 
 A service's loop calls the logger in plain sight.
 `tick(now)` flushes both Sinks on the one-second accounting tick.
@@ -788,9 +785,7 @@ A `Signal::ReopenLogs` calls `reopen()`.
 `stop()` runs after the loop: it restores stdout's flags, writes everything buffered, then the dropped-count line.
 `Line` and the `error!`, `warn!`, `info!`, `debug!` and `trace!` macros build one line into a Sink without allocating.
 
-`pulse() -> &'static LogPulse` is the liveness signal: `events()` counts the lines the level let through, and
-`seconds_since_last()` answers "has anything been logged recently", which is how
-a silent log becomes a fault rather than a zero.
+`pulse() -> &'static LogPulse` is the liveness signal: `events()` counts the lines the level let through, and `seconds_since_last()` answers "has anything been logged recently", so a silent log reads as a fault (`m6-log/src/lib.rs:255`).
 
 `reopen()` flushes the analytics file and opens its path afresh.
 `reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
@@ -799,96 +794,67 @@ a silent log becomes a fault rather than a zero.
 
 ### 8.2. `telemetry`
 
-The write side had no struct: `m6-http` emits analytics through
-`m6_core::log`'s `Line` and the JSON comes out of the line builder, so every
-consumer re-derived the format by looking at a sample. That is how it came to be read as `ts` and `user_agent` rather than
-`timestamp` and `fields.user_agent`, which yields an empty result that looks
-exactly like a quiet hour.
+The write side had no struct: `m6-http` emits analytics through `m6_core::log`'s `Line`, and every consumer re-derived the format from a sample.
+Consumers came to read `ts` and `user_agent` where the line has `timestamp` and `fields.user_agent`, which yields an empty result that looks exactly like a quiet hour (`m6-core/src/telemetry.rs:12`).
 
-`AnalyticsRecord` and `AnalyticsFields` are that missing definition, `Serialize`
-as well as `Deserialize` so the write side can adopt them.
-`AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)`
-builds the record the analytics line with those values parses to, which is how
-`/traffic` turns its in-memory window back into records.
-`truncated` is the window's own fact that a cap cut the path or user agent, and
-it is not part of the line.
-`parse_analytics(...)` reads a stream. `PeriodicStats::parse(line)` reads the
-`periodic stats` log line, `strip_ansi` first because the journal carries
-colour. `aggregate_windows(...) -> StatsAggregate` sums them.
+`AnalyticsRecord` and `AnalyticsFields` are that missing definition, `Serialize` as well as `Deserialize` so the write side can adopt them.
+`AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)` builds the record the analytics line with those values parses to, which is how `/traffic` turns its in-memory window back into records (`m6-core/src/telemetry.rs:118`).
+`truncated` is the window's own fact that a cap cut the path or user agent, and `serde` skips it.
+`parse_analytics(...)` reads a stream.
+`PeriodicStats::parse(line)` reads the `periodic stats` log line, `strip_ansi` first because the journal carries colour.
+`aggregate_windows(...) -> StatsAggregate` sums them.
 
-The heuristics, and their thresholds as named constants rather than magic
-numbers: `claims_to_be_bot`, `looks_like_probe`, `looks_like_injection`,
-`BOT_MARKERS`, `PROBE_MARKERS`, `INJECTION_MARKERS`,
-`PROBE_PATHS_FOR_CONCERN` (3), `REFUSED_REQUESTS_FOR_CONCERN` (10),
-`UA_ROTATION_THRESHOLD` (10), `UA_ROTATION_MIN_REQUESTS` (20).
+The heuristics and thresholds are named constants: `claims_to_be_bot`, `looks_like_probe`, `looks_like_injection`, `BOT_MARKERS`, `PROBE_MARKERS`, `INJECTION_MARKERS`, `PROBE_PATHS_FOR_CONCERN` (3), `REFUSED_REQUESTS_FOR_CONCERN` (10), `UA_ROTATION_THRESHOLD` (10) and `UA_ROTATION_MIN_REQUESTS` (20) (`m6-core/src/telemetry.rs:783`).
 
-`UA_ROTATION_THRESHOLD` exists because one IP rotating 526 user agents would
-otherwise be reported as a dozen AI crawlers politely visiting. Read the full
-user-agent list; a keyword list invents crawlers.
+`UA_ROTATION_THRESHOLD` exists because one IP rotating 526 user agents would otherwise be reported as a dozen well-known crawlers politely visiting, and none had (`m6-core/src/telemetry.rs:795`).
 
-`ClientSummary::is_notable()` and `error_ratio()`, `CrawlerSighting`, and
-`TrafficSummary::from_records(...)` assemble the picture. Volume alone is not a
-fault: the same rule once fired on 185 requests from the operator's own address
-and on a single 404 to `/.git/config`. A fault list only works if everything on
-it is a fault.
+`ClientSummary::is_notable()` and `error_ratio()`, `CrawlerSighting`, and `TrafficSummary::from_records(...)` assemble the picture.
+Volume alone earns no fault.
+The rule once flagged 185 requests from the operator's own address, 178 of them the health check's own load generation (`m6-core/src/telemetry.rs:718`).
+A single 404 to `/.git/config` is background noise, and a fault list works only when everything on it is a fault.
 
 ### 8.3. `monitoring`
 
-`/health` answers `ok` or `degraded` and is constant-cost by construction. `/perf`
-answers counters and percentiles and is token-gated, **and not out of modesty
-about traffic volume**: live latency and error counters tell an attacker
-which requests cost 2.8us and which cost 7.8ms, about 2800 to 1 on this
-deployment, which turns a blind probe into a tuning loop. With no token
-configured `/perf` is a 404, not a 401, so forgetting to configure it fails
-closed and does not advertise a door.
+`/health` answers `ok` or `degraded` and is constant-cost by construction.
+`/perf` answers counters and percentiles and is token-gated, because live latency and error counters are a feedback channel for an attacker.
+An attacker probing for a resource-exhaustion path is normally blind, and hit and miss percentiles tell them which requests are cheap and which are expensive.
+The ratio between a cache hit and a backend miss runs to three orders of magnitude, so the ranking is unambiguous, and `backend_errors_total` confirms when they have found something that hurts (`m6-core/src/monitoring.rs:75`).
+With no token configured, `/perf` answers 404 with `{"error":"not found"}`, and with a token but no credential it answers 401, so a forgotten token leaves nothing to try (`m6-core/src/monitoring.rs:559`).
 
-`HealthReport::build(node)` and `HealthReport::degraded(node)` return
-`(u16, HealthReport)` and `into_response(code)`. `build` is 200 `ok` and
-`degraded` is 503 with the status `degraded`, whose body names no dependency.
-The answer covers the m6-http process and the dependency flags the process
-already holds: an edge's origin is the follower's own `down` bit, so the answer
-reads a flag and makes no probe. A socket pool keeps no per-member health
-state, so a dead member is found when a request connects to it and that request
-takes the next member.
+`HealthReport::build(node)` and `HealthReport::degraded(node)` return `(u16, HealthReport)` and `into_response(code)` (`m6-core/src/monitoring.rs:313`).
+`build` is 200 `ok`, and `degraded` is 503 with the status `degraded`, whose body names no dependency.
+The answer covers the m6-http process and the dependency flags the process already holds: an edge's origin is the follower's own `down` bit, so the answer reads a flag and makes no probe.
+A socket pool keeps no per-member health state, so a dead member is found when a request connects to it and that request takes the next member.
 
-`PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`,
-`is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.
+`PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`, `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND` and `PERF_BACKEND`.
 
-`PerfReport::build_authorised` builds the report with no access check, for a
-caller that has already passed the one token check.
-`PerfOutcome::Unauthorised` and `PerfOutcome::Forbidden` answer with
-`m6_core::http::token_refusal`, the one definition of a token check's refusal:
-401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` for no or a bad
-credential, 403 `{"error":"forbidden"}` for the wrong role or group.
-m6-http uses these for `[health] metrics_require` and `metrics_peers`, described
-in `docs/m6-http.md`.
+`PerfReport::build_authorised` returns the report with no access check, for a caller that has already passed the one token check (`m6-core/src/monitoring.rs:506`).
+`PerfOutcome::Unauthorised` and `PerfOutcome::Forbidden` answer with `m6_core::http::token_refusal`, the one definition of a token check's refusal: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` for no or a bad credential, and 403 `{"error":"forbidden"}` for the wrong role or group.
+m6-http uses these for `[health] metrics_require` and `metrics_peers`, described in `docs/m6-http.md`.
 
-`PerfReport.tls` carries the served certificate chain, how long each
-certificate has left, and each certificate's SHA-256 fingerprint, from
-`tls::loaded()`. It is `serde(default)`, so a node older than the field stays
-parseable to an aggregator rather than making the whole payload unreadable,
-which is the treatment `build` already gets.
-The fingerprint is what tells two certificates with one expiry apart, and
-`TlsCertificate.fingerprint` is `serde(default)` for the same reason.
+`PerfReport.tls` carries the served certificate chain, how long each certificate has left, and each certificate's SHA-256 fingerprint, from `tls::loaded()`.
+It is `serde(default)`, so an aggregator can still parse a payload from an older node, which is the treatment `build` already gets.
+The fingerprint is what tells two certificates with one expiry apart, and `TlsCertificate.fingerprint` is `serde(default)` for the same reason.
 
 `PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
 Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the age of the last reopen, its unix time and the age of the last failure.
 `reopen` is `None` for a process that writes no log file, and `seconds_since_last_reopen` is `None` until the first reopen.
-Both are `serde(default)`, so a node older than the fields still parses.
+Both fields are optional, so a payload from an older node still parses (`m6-core/src/monitoring.rs:1009`).
 
-`TrafficReport::from_records(node, records, window_minutes)` summarises records
-that are already parsed, which is how `m6-http` answers `/traffic` from its
-in-memory window. `events_dropped` says how many events that window overwrote
-before they left it, so a short window is not read as a quiet hour. `LoggingHealth::read()`
-with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
-`NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.
+`TrafficReport::from_records(node, records, window_minutes)` summarises records that are already parsed, which is how `m6-http` answers `/traffic` from its in-memory window (`m6-core/src/monitoring.rs:1134`).
+`events_dropped` says how many events that window overwrote before they left it, so a short window is read as a short window.
+`LoggingHealth::read()` with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
+`NotableClient`, `HeavyHitter` and `CrawlerReport` are its parts.
 `CrawlerReport` carries `first_seen` and `last_seen`, both `serde(default)`.
 
 ### 8.4. `resolve`
 
-Reverse DNS, for checking a claim against its source. A lookup is a network round trip, so it runs in a monitor's own loop and never in a serving path.
+`resolve` checks a claim against its source with reverse DNS.
+A lookup is a network round trip, so it runs in a monitor's own loop and never in a serving path.
 
-The rule lives in [`crate::dns`]. `Confirm::start(ip, ns)` asks the PTR question for an address on one UDP socket, then asks the name it gets forward, and answers `Ptr` only after that second answer. The caller owns the deadline and reads [`Ptr`], whose four outcomes are Table 8.4.
+The rule lives in `dns` (`m6-core/src/dns.rs:347`).
+`Confirm::start(ip, ns)` asks the *PTR* (pointer) question for an address on one UDP socket, then asks the name it gets forward, and answers `Ptr` only after that second answer.
+The caller owns the deadline and reads `Ptr`, whose four outcomes are Table 8 (`m6-core/src/dns.rs:421`).
 
 | `Ptr` | meaning |
 |---|---|
@@ -897,141 +863,105 @@ The rule lives in [`crate::dns`]. `Confirm::start(ip, ns)` asks the PTR question
 | `None` | the address has no PTR record, unverified |
 | `Failed` | the lookup did not complete: a socket error, a truncated reply or the deadline, unverified |
 
-*Table 8.4: the outcomes of a confirmed reverse lookup.*
+**Table 8: the four outcomes of a confirmed reverse lookup.**
+Take from it that a missing record and a failed lookup are different answers, and that only `Name` is a confirmed claim.
 
-`Confirm` never waits. `fd()` gives the descriptor to register, `drive()` moves the current question as far as it goes without waiting and changes `fd()` when the PTR step ends, and the outcome arrives once. A query dropped at its deadline closes its socket, which reads as `Failed`. A truncated reply is a failure, because an A, AAAA or PTR answer fits in UDP and a TCP fallback would be a second mechanism. `dns::nameserver()` reads the first nameserver in `/etc/resolv.conf` once, at start.
+`Confirm` never waits.
+`fd()` gives the descriptor to register, `drive()` moves the current question as far as it goes without waiting and changes `fd()` when the PTR step ends, and the outcome arrives once.
+A query dropped at its deadline closes its socket, and the caller records `Failed`.
+A truncated reply is a failure, because an A, AAAA or PTR answer fits in UDP and a TCP fallback would be a second mechanism.
+`dns::nameserver()` reads the first nameserver in `/etc/resolv.conf` once, at start.
 
-`Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com`. `telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
+`Ptr::verifies(domain)` matches a name against a domain on a dot boundary, so `example.com.attacker.net` does not match `example.com` (`m6-core/src/dns.rs:455`).
+`telemetry::verify_crawler(user_agent, &ptr)` turns a `Ptr` into a `CrawlerVerdict` using the operator's documented method.
 
-This module re-exports `Ptr`, because callers name `resolve::Ptr` and this section states the rule. The one caller is `m6-monitor`'s fleet poll, which drives `Confirm` on its own loop and keeps the answers.
+This module re-exports `Ptr`, because callers name `resolve::Ptr` and this section states the rule.
+The one caller is `m6-monitor`'s fleet poll, which drives `Confirm` on its own loop and keeps the answers.
 
 ### 8.5. `platform::host`
 
-Parsing is separated from reading. The `parse_*` functions are pure over the
-text these files contain and are tested on any platform; the readers are thin
-and platform-gated.
+Parsing is separated from reading.
+The `parse_*` functions are pure over the text these files contain and are tested on any platform, and the readers are platform-gated (`m6-platform/src/host.rs:37`).
 
-**`snapshot(disk_path) -> HostSnapshot`** is the one most callers want: it
-assembles every reading below into the struct `/perf` publishes.
+**`snapshot(disk_path) -> HostSnapshot`** is the one most callers want: it assembles every reading below into the struct `/perf` publishes (`m6-platform/src/host.rs:551`).
 
-Readers, each platform-gated with a degraded fallback that returns `None` or an
-empty `Vec` rather than failing: `load_average`, `memory`, `disk`, `cpu_count`,
-`thermal_zones`, `uptime`, `net_devices`, `disk_io`, `pressure(resource)`,
-`tcp_health`, `file_descriptors`.
+Readers are platform-gated and degrade to `None`, an empty `Vec` or a `1` core count, so a missing reading leaves the rest of the snapshot intact: `load_average`, `memory`, `disk`, `cpu_count`, `thermal_zones`, `uptime`, `net_devices`, `disk_io`, `pressure(resource)`, `tcp_health` and `file_descriptors`.
 
-Pure parsers, tested on any platform: `parse_loadavg`, `parse_meminfo`,
-`parse_cgroup_memory`, `parse_thermal_millidegrees`, `parse_uptime`,
-`parse_net_dev`, `parse_diskstats`, `parse_pressure`, `parse_netstat`,
-`parse_sockstat_into`.
+Pure parsers, tested on any platform: `parse_loadavg`, `parse_meminfo`, `parse_cgroup_memory`, `parse_thermal_millidegrees`, `parse_uptime`, `parse_net_dev`, `parse_diskstats`, `parse_pressure`, `parse_netstat` and `parse_sockstat_into`.
 
-Types: `HostSnapshot`, `LoadAverage`, `Memory`, `MemorySource`, `Disk`,
-`ThermalZone`, `NetDevice`, `DiskIo`, `Pressure`, `TcpHealth`,
-`FileDescriptors`.
+Types: `HostSnapshot`, `LoadAverage`, `Memory`, `MemorySource`, `Disk`, `ThermalZone`, `NetDevice`, `DiskIo`, `Pressure`, `TcpHealth` and `FileDescriptors`.
 
-A VPS frequently has no thermal zone at all, so "no reading" is an ordinary
-answer and is `None`, not an error.
+A VPS commonly has no thermal zone, so a missing reading is an ordinary `None` (`m6-platform/src/host.rs:516`).
 
 Two readings are easy to get wrong and invisible when wrong:
 
-- **Memory inside a container is not the host's memory.** `/proc/meminfo`
-  reports the machine, not the cgroup limit. `memory()` prefers the cgroup limit
-  when one applies and says which it used in `Memory::source`.
-- **Free disk is not available disk.** The difference between `f_bfree` and
-  `f_bavail` is the blocks reserved for root, typically 5%. `disk()` reports
-  `f_bavail`, the space a service can actually use.
+- **A container's memory limit is the one that applies.** `/proc/meminfo` reports the machine, and `memory()` prefers the cgroup limit when one applies and says which it used in `Memory::source` (`m6-platform/src/host.rs:168`).
+- **The space a service can use is `f_bavail`.** `f_bfree` counts the blocks reserved for root, typically 5%, and `disk()` reports `f_bavail` (`m6-platform/src/host.rs:208`).
 
-There is no threshold anywhere in this module. Core says what the number is; a
-monitoring service decides what 80% means.
+The module reports numbers and sets no threshold: a monitoring service decides what 80% means (`m6-platform/src/host.rs:1`).
 
 ### 8.6. `tls`
 
-**`not_after_unix(der) -> Result<i64, CertificateError>`** reads `notAfter` out
-of a DER certificate as seconds since the Unix epoch.
-**`record_loaded(chain)`** stores a loaded chain and returns the certificates it
-could not read, by depth and reason.
-**`loaded()`** and **`loaded_at(now_unix)`** return the stored chain as
-`Vec<TlsCertificate>`, leaf first, each carrying `depth`, `not_after_unix`,
-`expires_in_seconds` and `fingerprint`.
-**`Fingerprint::of(der)`** is SHA-256 over a certificate's DER, printed as 64
-lower-case hex characters.
+**`not_after_unix(der) -> Result<i64, CertificateError>`** reads `notAfter` out of a DER certificate as seconds since the Unix epoch (`m6-core/src/tls.rs:214`).
+**`record_loaded(chain)`** stores a loaded chain and returns the certificates it could not read, by depth and reason.
+**`loaded()`** and **`loaded_at(now_unix)`** return the stored chain as `Vec<TlsCertificate>`, leaf first, each carrying `depth`, `not_after_unix`, `expires_in_seconds` and `fingerprint`.
+**`Fingerprint::of(der)`** is SHA-256 over a certificate's DER, printed as 64 lower-case hex characters.
 
 **The fingerprint is the identity an expiry cannot give.**
-Two certificates can expire on the same day, and then `not_after_unix` alone
-cannot tell them apart while a client validating against them sees two.
-The value is SHA-256 over the whole certificate, and not over its
-`SubjectPublicKeyInfo`.
-A renewal that reissues with the same key pair changes the serial number, the
-validity and the signature, and the fingerprint moves with all three.
-Hashing the key would report one identity for two certificates, which is the
-distinction a monitor exists to see.
-The value is the one `openssl x509 -noout -fingerprint -sha256` prints, in
-lower-case hex with no colons, and the DER is public bytes every client
-receives in the handshake.
-`fingerprint` is `None` on a certificate that arrived from a node older than
-the field, and `None` reads as "cannot say" and never as agreement.
+Two certificates can expire on the same day, and then `not_after_unix` alone cannot tell them apart while a client validating against them sees two.
+SHA-256 covers the whole certificate, so a renewal that reissues with the same key pair changes the serial number, the validity and the signature, and the fingerprint moves with all three.
+Hashing the key would report one identity for two certificates, which is the distinction a monitor exists to see.
+The digest is the one `openssl x509 -noout -fingerprint -sha256` reports, printed here in lower-case hex with no colons (`m6-core/src/tls.rs:88`).
+`fingerprint` is `None` on a certificate that arrived from a node older than the field, and a reader must treat that as "cannot say" (`m6-core/src/tls.rs:187`).
 
 This module exists because certificate renewal fails silently.
-Renewal is done by an *ACME* (Automatic Certificate Management Environment)
-client on a timer outside m6, and a timer that fails keeps firing and keeps
-failing.
-Nothing looks, so the first signal is the server refusing connections on the day
-the certificate expires.
+Renewal is done by an *ACME* client on a timer outside m6, and a timer that fails keeps firing and keeps failing.
+Nothing looks, so the first signal is the server refusing connections on the day the certificate expires.
 A server already holds the answer, which makes it the cheapest place to ask.
 
-**It reports the loaded material, never a file.**
-A path on disk and the certificate a running process is serving are different
-facts, and a renewal that wrote a new file without restarting the server is
-exactly the case where they disagree.
-`record_loaded` is therefore called by whatever loads the certificate, and
-`loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do
-disk work.
+**It reports the material the process loaded.**
+A path on disk and the certificate a running process serves are different facts, and a renewal that wrote a new file without restarting the server is exactly the case where they disagree.
+`record_loaded` is therefore called by whatever loads the certificate, and `loaded()` opens nothing, so polling a monitoring endpoint cannot be made to do disk work (`m6-core/src/tls.rs:369`).
+
+Table 9 lists the four behaviours that matter in a loaded chain.
 
 | behaviour | why |
 |---|---|
 | a chain, leaf first | `depth` 0 is what an *ACME* client renews, and intermediates expire too. A chain is good until its soonest expiry |
 | `expires_in_seconds` goes negative | how long ago separates a renewal that failed last night from one that stopped running in March |
-| an unreadable certificate is returned, not recorded | rustls accepted it or there would be no server, so refusing to serve is the worse failure. A reported absence lets a monitor say "cannot say" |
+| an unreadable certificate comes back in the return value | rustls accepted it or there would be no server, so refusing to serve is the worse failure. A reported absence lets a monitor say "cannot say" |
 | a later `record_loaded` replaces the earlier one | so a load at start corrects it, and the registry holds what every protocol serves |
 
-The last two rows are the ones to keep: an absence and a measured number must
-not look alike, and a stale number is worse than either.
+**Table 9: what the loaded chain reports, and why.**
+Take from it that an absence and a measured number must not look alike, and that a stale number is worse than either.
 
-There is no threshold here, for the reason `host` gives.
-Core reports how many seconds are left and a monitoring service decides what is
-too few.
+The module reports seconds left and sets no threshold, for the reason `host` gives.
+A monitoring service decides what is too few.
 
-**The parse is written out rather than imported.** `rustls` hands over
-`CertificateDer` and parses no validity from it, and `rustls-webpki` keeps its
-own parse private, so one integer field meant either eight crates of general
-ASN.1 or a walk over a known shape. `notAfter` sits at a fixed structural
-position in every X.509 certificate, so the walk steps over six elements by
-length and reads the seventh. Every length is checked against the buffer and a
-test runs every truncation of a real certificate through it. The dates go
-through `chrono`, because civil-from-days arithmetic is the mistake
-`util::iso_date_from` records.
+**The parse is written out here.**
+`rustls` hands over `CertificateDer` and parses no validity from it, and `rustls-webpki` keeps its own parse private, so one integer field meant either a general ASN.1 dependency of eight crates or a walk over a known shape.
+`notAfter` sits at a fixed structural position in every X.509 certificate, so the walk steps over six elements by length and reads the seventh.
+Every length is checked against the buffer, and a test runs every truncation of a generated certificate through it (`m6-core/src/tls.rs:637`).
+The dates go through `chrono`, because civil-from-days arithmetic is the mistake `util::iso_date_from` records: `m6-md` got it wrong for 7,281 days out of 29,200.
 
 ### 8.7. `firewall`
 
-`FirewallState::from_nft_json(text)`, `from_file(path)`,
-`blocked_addresses()`, `active()`, and `Block`.
+`FirewallState::from_nft_json(text)`, `from_file(path)`, `blocked_addresses()`, `active()` and `Block` (`m6-core/src/firewall.rs:75`).
 
-nftables emits JSON natively, so there is no format to invent and no log to
-scrape. It reads a file rather than shelling out because `nft list ruleset`
-needs `CAP_NET_ADMIN` and the process answering public requests must not have
-it: a systemd timer writes `/var/lib/m6/firewall.json` and m6 reads it as
-ordinary data.
+nftables emits JSON natively, so there is no format to invent and no log to scrape.
+It reads a file because `nft list ruleset` needs `CAP_NET_ADMIN`, and the process answering public requests must not have it.
+A systemd timer writes `/var/lib/m6/firewall.json` and m6 reads it as ordinary data (`m6-core/src/firewall.rs:8`).
 
-It reports the deliberate blocks and whether they are still being hit. It does
-not report "180 packets from 10 sources", which never changed and never prompted
-an action.
+It reports the deliberate per-address blocks and whether they are still being hit, which is the actionable half.
+The hourly kernel-log count, "180 packets from 10 sources", never changed and never prompted an action.
 
 ### 8.8. `wireguard`
 
-`Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)`, and `PeerHandshake`.
+`Handshakes::parse_latest_handshakes(text)`, `from_file(path)`, `find(key)` and `PeerHandshake` (`m6-core/src/wireguard.rs:56`).
 
 It reads a file because WireGuard state needs `CAP_NET_ADMIN`.
 A systemd timer writes the output of `wg show <if> latest-handshakes`, and m6 reads it as ordinary data.
-A time of 0 means the peer never completed a handshake.
+A time of 0 means the peer never completed a handshake, and `latest_unix` is `None`.
 A missing file is `Ok(None)`, and a malformed line is an error naming the line.
 
 Do not use `wg show <if> dump`, because it carries the interface private key.
@@ -1042,82 +972,77 @@ An age is therefore the slow signal, and a probe over the tunnel is the fast one
 
 ### 8.9. `ndjson`
 
-`read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`,
-`write_one`, `write_all`, `to_string`.
+`read_str(text)`, `Reader::new(r)` with `skipped()` and `read_count()`, `write_one`, `write_all` and `to_string` (`m6-core/src/ndjson.rs:47`).
 
-**Torn lines are ordinary, not exceptional.** An NDJSON file is usually being
-appended to while it is read, so the last line can be half-written and a reader
-that fails the whole stream on one bad line fails whenever it reads during a
-write. Readers skip what they cannot parse; `skipped()` is how you find out.
+**Torn lines are ordinary.**
+An NDJSON file is usually being appended to while it is read, so the last line can be half-written, and a reader that fails the whole stream on one bad line fails whenever it reads during a write.
+Readers skip what they cannot parse, and `skipped()` counts them.
 
-**Pages for responses.** A service that answers with rows builds a `Page` from
-`PageLimits` and calls `push(&row)` for each row. A row must serialise to a JSON
-object. `push` returns `Pushed::Full`, without writing, when the row would pass
-the byte or row limit. The service then makes a `Cursor` from the key of that
-row and calls `page.into_response(req.query(), next.as_ref())`.
+**Pages for responses.**
+A service that answers with rows builds a `Page` from `PageLimits` and calls `push(&row)` for each row.
+A row must serialise to a JSON object.
+`push` returns `Pushed::Full` and leaves the page as it was when the row would pass the byte or row limit: the row is serialised into the buffer and truncated again, so peak memory is the byte limit plus the largest single row (`m6-core/src/ndjson.rs:258`).
+The service then makes a `Cursor` from the key of that row and calls `page.into_response(req.query(), next.as_ref())`.
 
-- The defaults are 4 MiB and 10,000 rows (`DEFAULT_PAGE_BYTES`,
-  `DEFAULT_PAGE_ROWS`). `PageLimits::new` clamps the bytes to at most
-  `MAX_PAGE_BYTES`, 64 MiB.
+- The defaults are 4 MiB and 10,000 rows (`DEFAULT_PAGE_BYTES`, `DEFAULT_PAGE_ROWS`).
+  `PageLimits::new` clamps the bytes to at most `MAX_PAGE_BYTES`, 64 MiB.
 - That maximum is half of the 128 MiB that m6-http will buffer from a backend.
-  m6-http holds every backend body in memory, so a page is one complete response
-  body that is sent whole. A test in m6-http keeps the maximum under that cap.
-- The first row of a page is kept even when it is bigger than `max_bytes`, so a
-  client can always make progress. A row bigger than `MAX_PAGE_BYTES` is an
-  `InvalidData` error.
-- The response is 200 with `Content-Type: application/x-ndjson`, `no-store` and
-  `nosniff`. It is framed with `Content-Length`, has no ETag and is not
-  compressed.
-- With a next cursor, the response has `Link: <?QUERY>; rel="next"`. QUERY is the
-  request's query with any `cursor` removed and the new one added, and bytes
-  outside the URI query set are percent-encoded. A client follows the link until
-  a response has none.
-- `Cursor::new(s)` takes 1 to 128 bytes of `A-Za-z0-9-._~`, so it needs no
-  encoding. `Cursor::from_query(query)` gives `None` when the key is absent, and
-  a `CursorError` when it is repeated, empty or malformed. `to_response()` is a
-  400 that does not repeat the value.
+  m6-http holds every backend body in memory, so a page is one complete response body that is sent whole.
+  A const assertion in `client` keeps a full page under the `MAX_BODY` cap (`m6-core/src/client.rs:1465`).
+- The first row of a page is kept even when it is bigger than `max_bytes`, so a client can always make progress.
+  A row bigger than `MAX_PAGE_BYTES` is an `InvalidData` error.
+- The response is 200 with `Content-Type: application/x-ndjson`, `no-store` and `nosniff`.
+  It is framed with `Content-Length`, has no ETag and is not compressed.
+- With a next cursor, the response has `Link: <?QUERY>; rel="next"`.
+  QUERY is the request's query with any `cursor` removed and the new one added, and bytes outside the URI query set are percent-encoded.
+  A client follows the link until a response has none.
+- `Cursor::new(s)` takes 1 to 128 bytes of `A-Za-z0-9-._~`, so it needs no encoding.
+  `Cursor::from_query(query)` gives `None` when the key is absent, and a `CursorError` when it is repeated, empty or malformed.
+  `to_response()` is a 400 that carries no copy of the value.
+
+Section 8 covers what the process and the machine report, and section 9 turns to the error type a handler returns.
 
 ---
 
 ## 9. Errors
 
-`error` is eighteen lines: an `Error` enum and
-`Result<T> = std::result::Result<T, Error>`. `response::error_to_response` maps
-one to a response.
+Section 9 covers the error type a handler returns and the one place it becomes a response.
+
+`error` holds an `Error` enum and `Result<T> = std::result::Result<T, Error>`, and `response::error_to_response` maps a variant to a status: `NotFound` is 404, `Forbidden` is 403, `BadRequest` is 400, and `Other` is 500 with the detail logged (`m6-core/src/response.rs:601`).
+
+A path parameter containing `..` is a `NotFound`, so a refusal does not confirm that the traversal was recognised (`m6-core/src/error.rs:7`).
+
+Section 10 turns to the test kit that drives these answers.
+
+---
 
 ## 10. Test kit
 
-Feature `testkit`, from `[dev-dependencies]` only, so no production binary
-links it.
+Section 10 covers the shared integration harness a test uses to drive a real service: the process, port, wait, path, response and check helpers.
 
-- `testkit::process::Service`: `spawn`, `kill`, `terminate(timeout)`,
-  `output()`, `assert_alive`, `wait_for_tcp`, `wait_for_path`.
-  `assert_lifecycle_logged(name, output)` checks a service logged its start and
-  stop.
-- `testkit::port::claim_port() -> PortClaim`, which holds the port until dropped
-  so two tests cannot race for it.
-- `testkit::wait`: `for_path`, `for_tcp`, `for_unix`, `until`. 25 ms poll.
-- `testkit::paths::binary(name)` builds the release binary from the current source, once per name per test process, and returns its path.
-- `testkit::response::read_one(r, method)` reads exactly one response, HEAD
-  included.
+Feature `testkit`, from `[dev-dependencies]` only, so no production binary links it (`m6-core/Cargo.toml`).
+
+- `testkit::process::Service`: `spawn`, `kill`, `terminate(timeout)`, `output()`, `assert_alive`, `wait_for_started`, `wait_for_tcp` and `wait_for_path` (`m6-core/src/testkit/process.rs:81`).
+  `assert_lifecycle_logged(name, output)` checks a service logged its start and stop.
+- `testkit::port::claim_port() -> PortClaim`, which holds the port until dropped so two tests cannot race for it.
+- `testkit::wait`: `for_path`, `for_tcp`, `for_unix` and `until`, on a 25 ms poll (`m6-core/src/testkit/wait.rs:19`).
+- `testkit::paths::binary(name)` returns the path of a workspace binary this test run built, without running cargo, and panics with the command to run when the binary is absent (`m6-core/src/testkit/paths.rs:108`).
+- `testkit::response::read_one(r, method)` reads exactly one response, HEAD included.
 - `testkit::check::CheckServer` is a fake `/check` authority on a Unix socket.
-  `answer(token, Reply)` sets the table, `serve_one()` accepts and answers one
-  queued connection with no thread, and `calls()` counts check requests.
-  `Reply` can answer a 200 identity, a 401, a 403, a 503, any other status, a
-  slow answer, or a close in the middle of an answer.
-  `close()` stops listening and leaves the socket file with no listener, so the
-  next connect is refused.
+  `answer(token, Reply)` sets the table, `serve_one()` accepts and answers one queued connection with no thread, and `calls()` counts check requests (`m6-core/src/testkit/check.rs:60`).
+  `Reply` can answer a 200 identity, a 401, a 403, a 503, any other status, a slow answer, a hold, or a close in the middle of an answer.
+  `close()` stops listening and leaves the socket file with no listener, so the next connect is refused.
+
+`STARTUP_BOUND` and `RESPONSE_BOUND` are 60-second ceilings on a start and a response (`m6-core/src/testkit/mod.rs:79`).
+The harness waits on the event or the process exit, and section 11 records what the crate still lacks.
 
 ---
 
 ## 11. Known gaps in this crate
 
-Recorded here because a reference that only describes the good parts is a
-brochure.
+This section records what the crate and its migration still leave undone.
 
-- **`h1`'s module doc calls `parse.rs` "(deleted)".** The file exists and is on
-  the production path of every socket backend. What was deleted is the parser
-  that used to be in it; it is now the stream adapter described in §6.
-- **A small number of ad-hoc case-insensitive header lookups remain outside
-  core**, in `m6-http`: `cache.rs`, `http2.rs`, `redirect.rs`, `security.rs`,
-  `main.rs`.
+- **Ad-hoc case-insensitive header lookups remain outside core.** They are in `m6-http`: `cache.rs`, `http2.rs`, `redirect.rs`, `security.rs` and `main.rs`, and each is a local lookup standing in for the one `headers` module (`m6-http/src/cache.rs:84`).
+
+This is the end of the reference.
+A question about why a module exists belongs in `m6-architecture.md`, and what changed in each release is in `CHANGELOG.md`.
