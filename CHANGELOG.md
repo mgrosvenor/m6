@@ -423,6 +423,14 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 
 ### Fixed
 
+**`m6-monitor --dump-config` now reads and validates its fleet, so a config that names a removed key in `[[monitor.nodes]]` fails the dump with the start's exit 2 and message.**
+The monitor answered `--dump-config` in m6-core's shared parser, which reads the framework table and the routes and never builds the `Fleet`.
+A rendered config carrying `perf_token_file` under a node entry therefore dumped clean and exit 2 came at start, so a coherence check that runs the dump called the deployment accepted while the monitor refused to start.
+m6-core gains one deferred mode: `Site::load_deferring_dump` records the flag, the service reads its own config with the statements the start reads, and `Site::dump` prints from the `Site` it built.
+`m6-monitor` stops in that sequence after the fleet and the history keys, and before it resolves a name, opens the history file or binds the socket.
+`m6-auth-server` uses the same mode and stops after `[storage]`, `[tokens]`, `[keys]` and the key files, before the database opens, where its dump previously read none of them.
+Verified on a macOS sandbox: `dump_config_refuses_a_removed_node_key` makes the dump and the start print the same `unknown field` message and exit 2, `dump_config_accepts_a_valid_config` reads the `ok:` line a deploy's check reads, and `m6-auth-server --dump-config` on a config with no `[keys]` refuses with the start's `missing field` message where it printed `ok` before.
+
 **`h1_tls_hit` read 2,003 on the build host against a budget of 2,001, and the three calls were in the fixed part of the 2N run, in its one TLS handshake. The row reads its counter after the warm-up now.**
 The request path makes exactly two calls per request, both rustls's record buffers: dhat over K = 1,000 and K = 2,000 on this host put +1,000 on those two stacks and 0 on every other site.
 The build host's N = 1,000 run counted 2,188 calls, which is this host's own N figure, and its 2N = 2,000 run counted 4,191, three calls above this host's 4,188, so the three extra calls were in that run's fixed part and none was in a request.

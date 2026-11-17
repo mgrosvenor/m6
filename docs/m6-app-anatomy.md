@@ -308,6 +308,7 @@ Take from it that `--dump-config` is the only one that reads the configuration, 
 **`--dump-config` exits 0 when this binary can serve this configuration and 2 when it cannot**, which makes it a validation step a deploy can run against a new binary before installing it.
 It names every route that nothing can serve, and a route that nothing can serve is invisible at runtime because it answers 404 like any other unmatched path.
 Every service loads its configuration through the same function, so the check covers all of them.
+A service that also reads a table of its own takes the dump after those reads, through `Site::load_deferring_dump`, so a key that table refuses fails the dump the way it fails the start.
 
 Table 4 gives the exit codes, which are `m6-backend-protocol.md` §8.3, "exit codes", and the same for every backend in any language.
 

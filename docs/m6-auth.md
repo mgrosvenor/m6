@@ -100,7 +100,7 @@ Take from it that every flag is optional and the two positional arguments are re
 | `<site-dir>` | the site root, used to find the default `site.toml` |
 | `<config-path>` | the service config, normally `configs/m6-auth.conf` |
 | `--log-level <level>` | overrides the configured log level for this run |
-| `--dump-config` | prints the core configuration and any routes declared in the config, then exits |
+| `--dump-config` | prints the core configuration and any routes declared in the config, validates the auth table and the key files, then exits |
 | `--version` or `-V` | prints the binary name and version, then exits |
 | `--login-only` | binds the primary socket and serves the four login routes |
 | `--check-only` | binds the check socket and serves `/check` |
@@ -108,8 +108,8 @@ Take from it that every flag is optional and the two positional arguments are re
 **Table 2: the two positional arguments and the five flags.**
 
 For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
-It does not include the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the five routes the service registers.
-It exits 0 before the service validates those sections.
+The output does not list the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the five routes the service registers.
+The dump reads those sections with the same code the start reads, including the key material, so a config the start refuses exits 2 here too.
 
 A missing positional argument prints the usage line and exits 2.
 `--login-only` and `--check-only` together print one line naming both and exit 2.
