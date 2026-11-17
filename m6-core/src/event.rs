@@ -54,16 +54,9 @@ impl Timeouts {
 
     /// The token's deadline becomes `now + after`, replacing any earlier one.
     pub fn touch(&mut self, token: Token, now: Instant) {
-        self.touch_for(token, now, self.after);
-    }
-
-    /// The token's deadline becomes `now + after` for one caller that carries
-    /// its own bound, such as the check's 50 ms, while the table's default
-    /// stays the backend timeout for every other dispatch.
-    pub fn touch_for(&mut self, token: Token, now: Instant, after: Duration) {
         self.clear(token);
         let k = token.0;
-        self.at[k] = Some(now + after);
+        self.at[k] = Some(now + self.after);
         self.prev[k] = self.tail;
         self.next[k] = NONE;
         if self.tail == NONE {

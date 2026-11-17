@@ -345,6 +345,13 @@ struct ServerState {
     h2_idle_timeouts: Timeouts,
     /// Socket-backend request deadlines, as deadlines.
     upstream_timeouts: Timeouts,
+    /// The `POST /check` deadline, in its own table.
+    ///
+    /// `Timeouts` keeps one duration per table and finds the earliest expiry
+    /// at its head, so a 50 ms check token in `upstream_timeouts` would sit
+    /// behind a 30 s backend token and fire only when that token expired. The
+    /// two bounds are different, so they are two tables.
+    auth_timeouts: Timeouts,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -1146,6 +1153,7 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
         state.read_timeouts.grow(n);
         state.h2_idle_timeouts.grow(n);
         state.upstream_timeouts.grow(n);
+        state.auth_timeouts.grow(n);
         state.generations.resize(n, 0);
     }
     let gen = &mut state.generations[taken.key];
@@ -1427,6 +1435,7 @@ fn close_conn_token(
     state.read_timeouts.clear(token);
     state.h2_idle_timeouts.clear(token);
     state.upstream_timeouts.clear(token);
+    state.auth_timeouts.clear(token);
 }
 
 /// Store a parked request's waiter and context in the upstream slot it named.
@@ -2435,6 +2444,7 @@ fn retire_upstream(
         cx.state.sources.free(token.0);
     }
     cx.state.upstream_timeouts.clear(token);
+    cx.state.auth_timeouts.clear(token);
     (waiter, ctx)
 }
 
@@ -2463,6 +2473,7 @@ fn drop_idle_url(
     *state.sources.get_mut(token.0) = Source::Vacant;
     state.sources.free(token.0);
     state.upstream_timeouts.clear(token);
+    state.auth_timeouts.clear(token);
     debug!(
         backend = %state.pool_manager.url_backend(backend_idx).name,
         "idle url connection dropped"
@@ -2714,6 +2725,7 @@ fn event_loop(
         let mut poll_timeout = state.read_timeouts.timeout(now0, tick);
         poll_timeout = poll_timeout.min(state.h2_idle_timeouts.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.upstream_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.auth_timeouts.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.h2c_pool.timeout(now0, tick));
         poll_timeout = poll_timeout.min(state.h2s_pool.timeout(now0, tick));
         let quic_timeout = connections
@@ -2900,7 +2912,7 @@ fn event_loop(
         }
 
         // Close connections past their read or h2 idle deadline, and socket
-        // upstreams past their backend deadline.
+        // upstreams past their backend or check deadline.
         while let Some(token) = state.read_timeouts.expired(m6_core::platform::now()) {
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
@@ -2908,6 +2920,19 @@ fn event_loop(
             close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
         }
         while let Some(token) = state.upstream_timeouts.expired(m6_core::platform::now()) {
+            let mut cx = CompletionCtx::new(
+                &mut *state,
+                &mut tcp,
+                &mut h2c,
+                poll.registry(),
+                quic_port,
+                &udp,
+                &mut connections,
+                now,
+            );
+            expire_upstream(token, &mut cx);
+        }
+        while let Some(token) = state.auth_timeouts.expired(m6_core::platform::now()) {
             let mut cx = CompletionCtx::new(
                 &mut *state,
                 &mut tcp,
@@ -4595,9 +4620,14 @@ fn launch_socket_upstream(
         }
         interest
     };
-    state
-        .upstream_timeouts
-        .touch_for(token, m6_core::platform::now(), timeout);
+    // The check's deadline is 50 ms and a backend's is `backend_timeout_secs`,
+    // so the two go in two tables, each of one duration.
+    let now = m6_core::platform::now();
+    if matches!(send, UpstreamSend::Check { .. }) {
+        state.auth_timeouts.touch(token, now);
+    } else {
+        state.upstream_timeouts.touch(token, now);
+    }
     *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
     let entry = state.upstreams.get_mut(owner.key);
     entry.kind = UpstreamKind::Member;
@@ -7409,6 +7439,7 @@ fn run(args: Vec<String>) -> i32 {
             initial_connections,
             std::time::Duration::from_secs(backend_timeout_secs),
         ),
+        auth_timeouts: Timeouts::new(initial_connections, auth::CHECK_DEADLINE),
         h2c_pool: H2cClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         h2s_pool: H2sTlsClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         tls_iface,

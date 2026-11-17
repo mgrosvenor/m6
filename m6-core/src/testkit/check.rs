@@ -48,6 +48,10 @@ pub enum Reply {
     /// Wait, then answer with `answer`. The wait is the scenario under test,
     /// such as the edge's 50 ms deadline.
     Slow { after: Duration, answer: Box<Reply> },
+    /// Read the check and never answer it, until the edge closes the
+    /// connection. For a test that needs one check outstanding while another
+    /// upstream is in flight.
+    Hold,
     /// Write a 200 head that promises a body and close after a prefix of it.
     CloseMidAnswer,
 }
@@ -236,6 +240,17 @@ fn write_reply(stream: &mut UnixStream, reply: &Reply) -> std::io::Result<()> {
         Reply::Slow { after, answer } => {
             wait(*after);
             write_reply(stream, answer)
+        }
+        // No answer. The read returns when the edge closes the connection,
+        // which is its deadline firing, so the call is bounded by the peer.
+        Reply::Hold => {
+            let mut byte = [0u8; 1];
+            while let Ok(n) = stream.read(&mut byte) {
+                if n == 0 {
+                    break;
+                }
+            }
+            Ok(())
         }
         Reply::CloseMidAnswer => {
             let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"sub\":\"user-1\"";

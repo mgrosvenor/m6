@@ -84,6 +84,29 @@ fn https_get(
             };
         }
     };
+    https_get_on(tcp, port, path, extra, tls)
+}
+
+/// The same request without the service liveness check, for a thread that
+/// cannot borrow the `RefCell<Service>`.
+fn https_get_raw(
+    port: u16,
+    path: &str,
+    extra: &[(&str, &str)],
+    tls: Arc<rustls::ClientConfig>,
+) -> HttpResponse {
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("the parked client could not connect: {e}"));
+    https_get_on(tcp, port, path, extra, tls)
+}
+
+fn https_get_on(
+    tcp: TcpStream,
+    port: u16,
+    path: &str,
+    extra: &[(&str, &str)],
+    tls: Arc<rustls::ClientConfig>,
+) -> HttpResponse {
     tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
     let conn = rustls::ClientConnection::new(tls, name).unwrap();
@@ -121,6 +144,8 @@ struct TestServer {
     check: CheckServer,
     /// `check.calls()` after the start probe, so a test counts request checks.
     base_calls: usize,
+    /// Fires when the parked backend accepts a connection.
+    slow_ready: std::sync::mpsc::Receiver<()>,
     _dir: tempfile::TempDir,
     _port: PortClaim,
 }
@@ -149,6 +174,22 @@ impl TestServer {
         let check_path = site.join("check.sock");
         let mut check = CheckServer::bind(&check_path).unwrap();
 
+        // A content backend that accepts and never answers. One request parked
+        // on it is the other upstream the check's deadline must not wait for.
+        let slow_path = site.join("slow.sock");
+        let slow_listener = std::os::unix::net::UnixListener::bind(&slow_path).unwrap();
+        let (slow_tx, slow_ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Hold every accepted connection open, so the parked request stays
+            // parked until m6-http's backend timeout closes it.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = slow_listener.accept() {
+                let _ = slow_tx.send(());
+                held.push(stream);
+            }
+            drop(held);
+        });
+
         let file_sock = site.join("m6-file-1.sock");
         let file_glob = site.join("m6-file-*.sock");
         std::fs::write(
@@ -168,6 +209,9 @@ mode = "internal"
 [analytics]
 enabled = false
 
+[server]
+backend_timeout_secs = 3
+
 [[backend]]
 name = "m6-file"
 sockets = "{file_glob}"
@@ -176,13 +220,22 @@ sockets = "{file_glob}"
 name = "auth-check"
 sockets = "{check}"
 
+[[backend]]
+name = "slow"
+sockets = "{slow}"
+
 [[route]]
 path = "/private/{{relpath}}"
 backend = "m6-file"
 require = "group:admins"
+
+[[route]]
+path = "/slow"
+backend = "slow"
 "#,
                 file_glob = file_glob.display(),
                 check = check_path.display(),
+                slow = slow_path.display(),
             ),
         )
         .unwrap();
@@ -250,6 +303,7 @@ public_key = "{pubkey}"
             _file: file,
             check,
             base_calls,
+            slow_ready,
             _dir: dir,
             _port: claim,
         }
@@ -484,4 +538,48 @@ fn a_check_that_is_503_is_503_not_200() {
         "{}",
         response.headers
     );
+}
+
+/// A parked backend must not delay the check's 50 ms deadline.
+///
+/// The wrong outcome this catches: the check token in the shared upstream
+/// deadline table, behind the parked request's `backend_timeout_secs`, so a
+/// protected request waits for another request's upstream to expire. Here
+/// that is 3 s, and the default is 30 s. Before the check had its own table
+/// this test measured about 3 s and failed its one-second bound.
+#[test]
+fn a_parked_backend_does_not_delay_the_check_deadline() {
+    let mut srv = TestServer::start();
+    srv.check.unknown_answer(Reply::Hold);
+    let tls = tls_client_config(&srv.cert_der);
+    let port = srv.port;
+    std::thread::scope(|scope| {
+        let parked = scope.spawn(move || https_get_raw(port, "/slow", &[], tls));
+        srv.slow_ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the slow backend was never reached");
+        let started = std::time::Instant::now();
+        let response = srv.request(
+            "/private/secret.txt",
+            &[("Authorization", "Bearer opaque-token")],
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(response.status, 503, "{}", response.headers);
+        assert_eq!(
+            response.header_value("retry-after").as_deref(),
+            Some("1"),
+            "{}",
+            response.headers
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the check waited {elapsed:?} behind another request's backend"
+        );
+        let slow = parked.join().expect("the parked request");
+        assert_eq!(
+            slow.status, 502,
+            "the parked backend did not time out\n{}",
+            slow.headers
+        );
+    });
 }

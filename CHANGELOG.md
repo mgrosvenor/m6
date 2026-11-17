@@ -561,6 +561,7 @@ Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `--ch
 
 **A route with `require` now asks m6-auth-server instead of verifying the token in m6-http.**
 Each protected request sends one `POST /check` with the caller's credential over the `[auth] backend` socket, under a 50 ms deadline, and applies the route's `require` to the identity in the answer.
+The check's deadline is its own `Timeouts` table, so it holds at 50 ms while another request is parked on a slow content backend (measured: 0.053 s beside a 30 s backend request, against 29.78 s when the two shared one table).
 A request with no credential is answered 401 locally and makes no call.
 A 401 from the authority is 401, an identity without the requirement is 403, and a timeout, a connect failure, a 500 or an unparsable answer is 503 with `Retry-After: 1`.
 No decision is cached, so a role change or a revocation counts from the next request.
