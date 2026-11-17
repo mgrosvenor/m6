@@ -899,6 +899,10 @@ Its target is `m6_http::stats` and its message is `stats`.
 `[stats].interval_s` sets how often both lines are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides it in a debug build.
 The metrics line goes to stdout with the operational line, so it does not depend on the analytics file, which a deployment ships separately.
 
+A third periodic line is the traffic summary, `type` `traffic`, target `m6_http::traffic`, nested under `fields.traffic`.
+It carries the document `/traffic` answers, from the same builder, at `[stats].traffic_interval_s`, one minute by default.
+Its own interval because the report summarises a sixty-minute window: a minute is the finest resolution at which a new line can say something the last one did not.
+
 The metrics document is the largest line m6 writes: 26,143 bytes measured with every section at its maximum.
 `metrics.status_counts` is 8,501 bytes of that, `host` 3,572, `metrics.channels` 3,453 and `metrics.event_loop` 3,255.
 The log buffer's maximum is 1 MiB and its start is 16 KiB, so the first metrics line grows the sink to 32 KiB once and keeps it.

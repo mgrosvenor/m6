@@ -8,6 +8,17 @@ use std::time::Instant;
 pub const PERF_LOG_TARGET: &str = "m6_http::stats";
 pub const PERF_LOG_MESSAGE: &str = "stats";
 
+/// The periodic traffic line's target and message, named once.
+pub const TRAFFIC_LOG_TARGET: &str = "m6_http::traffic";
+pub const TRAFFIC_LOG_MESSAGE: &str = "traffic";
+
+/// One minute between traffic lines.
+///
+/// The report summarises a sixty-minute window, so a minute is the finest
+/// resolution at which a new line can say something the last one did not, and
+/// the monitor's copy is never more than a minute behind the window.
+pub const DEFAULT_TRAFFIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Write the periodic metrics line: the whole document the `/perf` endpoint
 /// answers, nested under `fields.perf`, into the operational Sink.
 ///
@@ -20,6 +31,21 @@ pub const PERF_LOG_MESSAGE: &str = "stats";
 /// through `Line::json`: bounded by the line's buffer, not by the string
 /// field cap.
 ///
+/// Write the periodic traffic line: the document the `/traffic` endpoint
+/// answers, nested under `fields.traffic`, from the report the endpoint built.
+///
+/// The report is serialised from its own `Serialize` impl, so the line carries
+/// the same fields in the same JSON and there is no second list to keep.
+pub fn log_traffic(report: &impl serde::Serialize) -> bool {
+    m6_core::log::with_operational(|sink| {
+        m6_core::log::Line::begin(sink, m6_core::log::Level::Info, TRAFFIC_LOG_MESSAGE)
+            .kind(m6_core::log::Type::Traffic)
+            .json("traffic", report)
+            .target(TRAFFIC_LOG_TARGET)
+            .end();
+    })
+}
+
 /// Answers whether the Sink was open. It is open after start and before stop,
 /// so the caller ignores it.
 pub fn log_perf(document: &serde_json::Value) -> bool {
@@ -550,6 +576,11 @@ pub struct Stats {
     /// How often the periodic line is emitted and `/perf`'s loop trace is
     /// refreshed. `EMIT_INTERVAL_SECS` in production.
     emit_interval: std::time::Duration,
+    /// How often the traffic summary line is written, and when the last one
+    /// was. Its own cadence because that report describes an hour and this
+    /// line reports a ten-second window.
+    traffic_interval: std::time::Duration,
+    last_traffic_emit: Instant,
     /// The loop trace, copied on the accounting tick and served by `/perf`.
     event_loop: [m6_core::event::TriggerReport; 16],
     event_loop_len: usize,
@@ -603,6 +634,8 @@ impl Stats {
             window_start: now,
             last_emit: now,
             emit_interval,
+            traffic_interval: DEFAULT_TRAFFIC_INTERVAL,
+            last_traffic_emit: now,
             event_loop: [m6_core::event::TriggerReport::default(); 16],
             event_loop_len: 0,
         }
@@ -740,6 +773,26 @@ impl Stats {
                 .or_insert(0) += 1;
             self.window_backend_errors += 1;
         }
+    }
+
+    /// Set the traffic line's interval, from `[stats].traffic_interval_s`.
+    pub fn with_traffic_interval(mut self, interval: std::time::Duration) -> Self {
+        self.traffic_interval = interval;
+        self
+    }
+
+    /// Whether this pass of the loop is the traffic line's turn.
+    ///
+    /// Separate from [`Stats::maybe_emit`] because the two describe different
+    /// windows: the metrics line reports the ten seconds since the last one and
+    /// the traffic summary reports an hour.
+    pub fn maybe_emit_traffic(&mut self) -> bool {
+        let now = m6_core::platform::now();
+        if now.duration_since(self.last_traffic_emit) < self.traffic_interval {
+            return false;
+        }
+        self.last_traffic_emit = now;
+        true
     }
 
     #[inline]

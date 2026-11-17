@@ -464,6 +464,19 @@ impl Server {
     }
 
     /// `/perf` as JSON. Needs the bearer token the fixture configures.
+    fn traffic_json(&self) -> serde_json::Value {
+        let auth = format!("Bearer {}", self.token);
+        let r = self.get("/traffic", &[("Authorization", auth.as_str())]);
+        assert_eq!(
+            r.status, 200,
+            "/traffic answered {}\n{}",
+            r.status, r.headers
+        );
+        let start = r.body.find('{').expect("a JSON body");
+        let end = r.body.rfind('}').expect("a JSON body");
+        serde_json::from_str(&r.body[start..=end]).expect("/traffic is JSON")
+    }
+
     fn perf_json(&self) -> serde_json::Value {
         let auth = format!("Bearer {}", self.token);
         let r = self.get("/perf", &[("Authorization", auth.as_str())]);
@@ -574,6 +587,7 @@ log_path = "{log_path}"
 # default is ten, and the key is what this exercises.
 [stats]
 interval_s = 1
+traffic_interval_s = 1
 
 [rate_limit]
 enabled = false
@@ -687,6 +701,21 @@ fn read_perf_lines(output: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The `type=traffic` lines in the service's stdout, newest last.
+fn read_traffic_lines(output: &str) -> Vec<serde_json::Value> {
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("type")?.as_str()? != "traffic" {
+                return None;
+            }
+            Some(v["fields"]["traffic"].clone())
+        })
+        .collect()
+}
+
 fn wait_for_perf_lines(srv: &Server, want: usize) -> Vec<serde_json::Value> {
     let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         read_perf_lines(&srv.http.borrow().output()).len() >= want
@@ -697,6 +726,39 @@ fn wait_for_perf_lines(srv: &Server, want: usize) -> Vec<serde_json::Value> {
         read_perf_lines(&srv.http.borrow().output()).len()
     );
     read_perf_lines(&srv.http.borrow().output())
+}
+
+/// The traffic line is the `/traffic` document: same fields, same JSON, and it
+/// parses as the type the monitor reads.
+#[test]
+fn the_traffic_line_carries_the_traffic_document() {
+    let srv = start_server();
+    assert_eq!(srv.get("/public/plain.html", &[]).status, 200);
+
+    let seen = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        read_traffic_lines(&srv.http.borrow().output())
+            .last()
+            .is_some_and(|document| document["total_requests"].as_u64().is_some_and(|n| n >= 1))
+    });
+    assert!(seen, "no type=traffic line reported the request");
+    let lines = read_traffic_lines(&srv.http.borrow().output());
+    let from_line = lines.last().expect("a line");
+    let from_endpoint = srv.traffic_json();
+
+    let parsed: m6_core::monitoring::TrafficReport =
+        serde_json::from_value(from_line.clone()).expect("the line parses as a TrafficReport");
+    assert_eq!(parsed.node, from_endpoint["node"]);
+    assert_eq!(
+        parsed.window_minutes,
+        from_endpoint["window_minutes"].as_u64().unwrap()
+    );
+
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(keys(from_line), keys(&from_endpoint), "traffic fields");
 }
 
 /// The line's document is the endpoint's document: same keys at every level,

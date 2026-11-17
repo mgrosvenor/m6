@@ -3393,6 +3393,21 @@ fn event_loop(
             m6_http_lib::stats::log_perf(&document);
         }
 
+        // The traffic summary has its own cadence: its report describes a
+        // sixty-minute window, so it is written once a minute by default
+        // rather than at the metrics line's interval.
+        if state.stats.maybe_emit_traffic() {
+            let outcome = health::traffic_authorised(
+                &state.config.node.name,
+                &state.traffic,
+                &mut state.traffic_report,
+                std::time::Duration::ZERO,
+            );
+            if let health::PerfOutcome::Traffic(report) = outcome {
+                m6_http_lib::stats::log_traffic(&*report);
+            }
+        }
+
         // Drain one background fetch per loop iteration, unless this node has
         // no ID yet or its upstream is down. A cache node with nothing to
         // compare a reply against would store none of it, and a fetch while
@@ -7764,6 +7779,7 @@ fn run(args: Vec<String>) -> i32 {
     // Read before the config moves into the state, because the stats tick is
     // built from it and the line is written for the life of the process.
     let stats_interval_s = config.stats.interval_s;
+    let traffic_interval_s = config.stats.traffic_interval_s;
     let mut state = ServerState {
         config,
         route_table,
@@ -7775,7 +7791,7 @@ fn run(args: Vec<String>) -> i32 {
         loaded_bad,
         disk_state,
         error_mode,
-        stats: initial_stats(stats_interval_s),
+        stats: initial_stats(stats_interval_s, traffic_interval_s),
         sources: Slots::new(initial_connections, ceiling, || Source::Vacant),
         generations: vec![0; initial_connections],
         prefetch_queue: m6_core::limits::BoundedQueue::new(
@@ -7884,16 +7900,18 @@ fn run(args: Vec<String>) -> i32 {
 /// cannot reach them. A debug build may shorten the tick through
 /// `M6_TEST_STATS_INTERVAL_SECS`, which also overrides the config key for those
 /// suites, and a release build does not read the variable at all.
-fn initial_stats(interval_s: u64) -> Stats {
+fn initial_stats(interval_s: u64, traffic_interval_s: u64) -> Stats {
     #[cfg(debug_assertions)]
     if let Some(secs) = std::env::var("M6_TEST_STATS_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
     {
-        return Stats::with_interval(std::time::Duration::from_secs(secs));
+        return Stats::with_interval(std::time::Duration::from_secs(secs))
+            .with_traffic_interval(std::time::Duration::from_secs(secs));
     }
     Stats::with_interval(std::time::Duration::from_secs(interval_s))
+        .with_traffic_interval(std::time::Duration::from_secs(traffic_interval_s))
 }
 
 #[cfg(test)]

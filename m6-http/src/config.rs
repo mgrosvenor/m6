@@ -529,11 +529,22 @@ pub struct StatsConfig {
     /// own per-window figures describe, and the default it has always had.
     #[serde(default = "default_stats_interval_s")]
     pub interval_s: u64,
+    /// Seconds between two traffic summary lines. One minute, because the
+    /// report summarises a sixty-minute window.
+    #[serde(default = "default_traffic_interval_s")]
+    pub traffic_interval_s: u64,
 }
 
 fn default_stats_interval_s() -> u64 {
     DEFAULT_STATS_INTERVAL_S
 }
+
+fn default_traffic_interval_s() -> u64 {
+    DEFAULT_TRAFFIC_INTERVAL_S
+}
+
+/// One minute, the traffic summary's own default.
+pub const DEFAULT_TRAFFIC_INTERVAL_S: u64 = 60;
 
 /// Ten seconds: the interval m6-http emitted its stats line at before the key
 /// existed, and the window those per-window figures describe.
@@ -543,6 +554,7 @@ impl Default for StatsConfig {
     fn default() -> Self {
         StatsConfig {
             interval_s: default_stats_interval_s(),
+            traffic_interval_s: default_traffic_interval_s(),
         }
     }
 }
@@ -1352,6 +1364,11 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             "config error: [stats].interval_s must be at least 1, because 0 would write the stats line on every pass of the event loop"
         );
     }
+    if stats.traffic_interval_s == 0 {
+        anyhow::bail!(
+            "config error: [stats].traffic_interval_s must be at least 1, because 0 would write the traffic line on every pass of the event loop"
+        );
+    }
     let site_server = site_parsed.server.unwrap_or_default();
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
@@ -2039,11 +2056,17 @@ tls_key  = "{DIR}/key.pem"
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.stats.interval_s, DEFAULT_STATS_INTERVAL_S);
         assert_eq!(cfg.stats.interval_s, 10);
+        assert_eq!(cfg.stats.traffic_interval_s, DEFAULT_TRAFFIC_INTERVAL_S);
+        assert_eq!(cfg.stats.traffic_interval_s, 60);
 
-        let with_stats = format!("{}\n[stats]\ninterval_s = 2\n", minimal_site_toml());
+        let with_stats = format!(
+            "{}\n[stats]\ninterval_s = 2\ntraffic_interval_s = 5\n",
+            minimal_site_toml()
+        );
         write_file(dir.path(), "site.toml", &with_stats);
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.stats.interval_s, 2);
+        assert_eq!(cfg.stats.traffic_interval_s, 5);
     }
 
     /// Zero would write the line on every pass of the event loop: refused at
@@ -2058,6 +2081,15 @@ tls_key  = "{DIR}/key.pem"
         let text = format!("{error}");
         assert!(
             text.contains("[stats].interval_s"),
+            "the error did not name the key: {text}"
+        );
+
+        let with_traffic = format!("{}\n[stats]\ntraffic_interval_s = 0\n", minimal_site_toml());
+        write_file(dir.path(), "site.toml", &with_traffic);
+        let error = load(dir.path(), &dir.path().join("system.toml")).unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            text.contains("[stats].traffic_interval_s"),
             "the error did not name the key: {text}"
         );
     }

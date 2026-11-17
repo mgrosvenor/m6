@@ -13,14 +13,13 @@ use crate::sink::Sink;
 
 /// What kind of line this is, written to the top-level `type` key.
 ///
-/// Three kinds, because a reader filters on one key rather than on a target
+/// Four kinds, because a reader filters on one key rather than on a target
 /// and a message that a refactor can rename. `level` keeps the severity, so a
 /// reader asks for `type` `event` with `level` `WARN` rather than for a `warn`
 /// kind that would duplicate it.
 ///
-/// A fourth kind arrives only with a line that is genuinely another kind. The
-/// traffic summary that replaces `/traffic` is one, and it comes with the code
-/// that writes it.
+/// A kind is added only with a line that is genuinely another kind. The traffic
+/// summary that replaces `/traffic` is the fourth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
     /// An operational message, at any level.
@@ -30,6 +29,9 @@ pub enum Type {
     Perf,
     /// A per-request analytics line: the request row or the monitor row.
     Access,
+    /// The periodic traffic summary, which carries the document the old
+    /// `/traffic` endpoint answered.
+    Traffic,
 }
 
 impl Type {
@@ -39,6 +41,7 @@ impl Type {
             Type::Event => "event",
             Type::Perf => "perf",
             Type::Access => "access",
+            Type::Traffic => "traffic",
         }
     }
 }

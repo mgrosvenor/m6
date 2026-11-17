@@ -21,7 +21,7 @@ Table 1: the keys of one line.
 | `level` | `ERROR`, `WARN`, `INFO`, `DEBUG` or `TRACE` |
 | `fields` | the event's message and its fields |
 | `target` | the operational line's module, the metrics line's `m6_http::stats`, absent from the access line |
-| `type` | `event`, `perf` or `access` (see below) |
+| `type` | `event`, `perf`, `traffic` or `access` (see below) |
 
 The timestamp cache holds `YYYY-MM-DDTHH:MM:SS` for one second in a 20-byte array.
 Each line reads `SystemTime::now()` once and appends that second's cached text and its own six fractional digits, so the civil date is formatted once per second at most.
@@ -37,12 +37,13 @@ A line past `[limits.log_buffer] max`, 1 MiB by default, is refused the same way
 A message, a `%display` field and a `?debug` field are formatted straight into the buffer through the escaping adapter, with no `String`.
 
 The `type` key names what kind of line it is, so a reader filters on one key rather than on a target and a message that a refactor can rename.
-Its three values are below.
+Its four values are below.
 `level` keeps the severity: a warning is `type` `event` with `level` `WARN`.
 
 - `event`: an operational message, at any level.
 - `perf`: the periodic metrics line, which carries the document the old `/perf` endpoint answered.
 - `access`: a per-request analytics line, the request row or the monitor row.
+- `traffic`: the periodic traffic summary, which carries the document the old `/traffic` endpoint answered.
 
 The type is a static word written into the buffer, so a line's type costs no allocation.
 
@@ -89,7 +90,7 @@ A call site that needs more than that writes its fields with `Line` directly.
 
 The analytics line is written with `Line` field by field into the analytics Sink, which `with_analytics` reaches.
 That line has no target, and its `type` is `access`.
-The metrics line is written with `Line` into the operational Sink, which `m6_core::log::with_operational` reaches, with `type` `perf` and the target `m6_http::stats`.
+The metrics line and the traffic line are written with `Line` into the operational Sink, which `m6_core::log::with_operational` reaches, with `type` `perf` and `traffic` and the targets `m6_http::stats` and `m6_http::traffic`.
 
 ## Reopen
 
