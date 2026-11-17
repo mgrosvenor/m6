@@ -135,13 +135,24 @@ fn site_toml(origin_port: u16, check: &std::path::Path) -> String {
     )
 }
 
+/// The fake origin, the fake check authority and one `m6-http`, plus the port
+/// claim and temporary directory they use.
+///
+/// Fields drop in this order, which is the order the lifetimes require. The
+/// service goes first, so its child has released the port and stopped dialling
+/// the check socket before either owner goes away. The check authority goes
+/// next. The port claim goes after the service, because its `Drop` binds the
+/// port to prove it is free and the service still holds it until it stops: a
+/// claim declared before the service spent the full five seconds of its bind
+/// retry in every test. The directory goes last, so no path in it is removed
+/// while something is still using it.
 struct Stack {
-    _dir: tempfile::TempDir,
-    _claim: PortClaim,
     port: u16,
     token: String,
     service: Service,
     _check: RunningCheck,
+    _claim: PortClaim,
+    _dir: tempfile::TempDir,
 }
 
 impl Stack {

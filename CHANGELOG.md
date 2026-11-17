@@ -402,6 +402,14 @@ A handshake's counted calls move with the number of reads its flight arrives in:
 The budget stays 2,001 and no request path changed.
 Verified on macOS against a dev build with `--features count-allocations`: twenty runs of the row before the mark read 2.001 four times, 2.000 eleven times and 1.999 five times, with the variation in the fixed part of one run and never in a request, and ten runs after it read 2.000 every time, with the N = 1,000 window at 2,001 calls and the 2N = 2,000 window at 4,001. A break that adds one allocation per cached hit makes those windows 3,001 and 6,001 and the row fails against the budget.
 
+**Three `cache_accounting` tests each took exactly 10 seconds to pass, and the time was two fixed waits in the fixture's teardown.**
+`ServingCheck::drop` woke its worker by connecting to the check socket, and `Stack` dropped its `TempDir` first, so the socket file was gone, the connect failed, and the worker sat out the rest of `SERVE_BOUND`, the ten-second accept deadline.
+The fixture also declared its `PortClaim` before its `Service`, so the claim's `Drop` spent all five seconds of its bind retry while the service still held the port.
+The five-second wait overlapped the ten-second deadline, which is why the visible constant was ten seconds rather than fifteen.
+`ServingCheck` owns a socket pair now: the worker waits on the listener and on one end of the pair in one reactor, and `Drop` writes a byte to the other end, so the teardown waits on an event rather than on the deadline.
+`Stack` declares the service first, then the check authority, then the port claim, with the directory last, which is the order their lifetimes need.
+Verified on macOS: the four tests in that binary read 10.762 s, 10.762 s, 10.769 s and 11.608 s before, and 0.833 s, 0.861 s, 0.862 s and 1.615 s after.
+
 **`h1_tls_hit` read 2.001 in five of twenty runs against a budget of 2,000, and its budget is 2,001 for one call of TLS handshake variation that is aws-lc-rs's.**
 The request path still makes exactly two calls per request. dhat over a 2.001 run and a 2.000 run differs at one stack and nowhere else: `EVP_PKEY::sign`'s `vec![0u8; sig_len]` in aws-lc-rs, through `ec::key_pair::EcdsaKeyPair::sign` and rustls's `emit_certificate_verify_tls13` in the TLS 1.3 CertificateVerify.
 `EVP_PKEY::sign` allocates the signature buffer at the maximum DER length and shrinks it to the length the signature took, so a handshake whose DER signature is shorter than 72 bytes makes one more call than one whose signature is exactly 72.
