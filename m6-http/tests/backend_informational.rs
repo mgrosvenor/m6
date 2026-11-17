@@ -93,7 +93,7 @@ fn drive_upstream(
 }
 
 fn fetch(informational: usize) -> std::io::Result<forward::HttpResponse> {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let sock = dir.path().join("backend.sock");
     let handle = backend(&sock, informational);
     let req = HttpRequest {

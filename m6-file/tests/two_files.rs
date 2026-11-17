@@ -22,7 +22,7 @@ const ROUTE: &str =
 /// a readable `<site_dir>/site.toml` even when no key names the one at the
 /// top.
 fn tree(site_toml_body: &str) -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     std::fs::create_dir_all(tmp.path().join("apps/file/assets")).unwrap();
     std::fs::write(tmp.path().join("site.toml"), site_toml_body).unwrap();
     std::fs::write(tmp.path().join("apps/file/site.toml"), "").unwrap();

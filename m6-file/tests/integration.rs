@@ -47,7 +47,7 @@ fn config_path() -> PathBuf {
 /// `bind` creates the socket file, but the server does not accept until it has
 /// called `listen`, so the file appearing proves nothing.
 fn spawn_server(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS, and
     // the temp directory already spends most of that.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -101,7 +101,7 @@ fn l1_valid_config_starts_and_socket_appears() {
 /// operator hears about it with exit 2, and no socket is left behind.
 #[test]
 fn a_thread_pool_section_is_refused_at_start() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     std::fs::write(dir.path().join("site.toml"), "").unwrap();
     let config = dir.path().join("m6-file.conf");
     std::fs::write(&config, "[thread_pool]\nsize = 4\n").unwrap();
@@ -512,7 +512,7 @@ fn l5_concurrent_requests() {
 /// writer would fill 64 KiB and stop the process there.
 #[test]
 fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path();
     std::fs::create_dir_all(site.join("assets")).unwrap();
     std::fs::write(site.join("site.toml"), "").unwrap();
@@ -629,7 +629,7 @@ fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
 #[test]
 fn a_request_pipelined_behind_a_streamed_body_waits_for_the_body() {
     const BIG: usize = 1024 * 1024;
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path();
     std::fs::create_dir_all(site.join("assets")).unwrap();
     std::fs::write(site.join("site.toml"), "").unwrap();
@@ -713,7 +713,7 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
     /// descriptors already in use.
     const HELD: usize = 20;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path();
     std::fs::create_dir_all(site.join("assets")).unwrap();
     std::fs::write(site.join("site.toml"), "").unwrap();
@@ -1055,7 +1055,7 @@ fn head_reports_exactly_what_get_would() {
 fn a_head_on_an_unreadable_file_still_answers() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path();
     std::fs::create_dir_all(site.join("assets")).unwrap();
     std::fs::write(site.join("site.toml"), "").unwrap();
@@ -1183,7 +1183,7 @@ const ASSETS_ROUTE: &str =
     "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
 
 fn site_with_two_trees() -> tempfile::TempDir {
-    let site = tempfile::tempdir().unwrap();
+    let site = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     std::fs::create_dir_all(site.path().join("assets")).unwrap();
     std::fs::create_dir_all(site.path().join("files/deep")).unwrap();
     std::fs::write(site.path().join("assets/a.txt"), b"asset").unwrap();
@@ -1204,7 +1204,7 @@ fn lifecycle() {
     let site = site_with_two_trees();
     let config = site.path().join("m6-file.conf");
     write_config(&config, ASSETS_ROUTE);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let socket = dir.path().join("lifecycle.sock");
 
     assert_app_lifecycle(

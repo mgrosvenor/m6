@@ -52,7 +52,7 @@ fn config_path(name: &str) -> PathBuf {
 /// same reason the older suite does it that way: `bind` creates the file before
 /// `listen`, so a path check can pass while a connect would still fail.
 fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join(format!("{id}.sock"));
 
     let mut svc = Service::spawn(
@@ -114,7 +114,7 @@ fn http_request(socket_path: &Path, request: &str) -> String {
 /// refuse and name both routes.
 #[test]
 fn two_patterns_on_one_path_refuse_to_start_and_name_both_routes() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     // Spawned, not `output()`: a service that wrongly starts never exits, and
     // the test must fail on the deadline rather than hang.
     let mut svc = Service::spawn(
@@ -249,7 +249,7 @@ fn global_params_change_picked_up_after_restart() {
     // Write only the three files this scenario needs into a fresh temp site, so
     // the global params file can be rewritten without dirtying committed
     // fixtures. This is the socket_mode.rs shape, not a whole-tree copy.
-    let site = tempfile::tempdir().expect("tempdir");
+    let site = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = site.path().join("m6-html.conf");
     let global = site.path().join("data").join("site.json");
     std::fs::create_dir_all(site.path().join("templates")).expect("templates dir");

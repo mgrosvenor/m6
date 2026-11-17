@@ -57,7 +57,7 @@ fn main() {
 }
 
 fn a_thousand_plain_requests_allocate_nothing() -> usize {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let path = dir.path().join("up.sock");
     let listener = UnixListener::bind(&path).expect("bind");
     let addr = Addr::Unix(path);

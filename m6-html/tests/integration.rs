@@ -50,7 +50,7 @@ fn config_path() -> PathBuf {
 /// failed against `""`. It passed in isolation every time, which is what made
 /// it look like noise.
 fn spawn_server(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS, and
     // the temp directory already spends most of that.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -167,7 +167,7 @@ fn l1_valid_config_starts_and_socket_appears() {
 /// exits 2, and never binds its socket.
 #[test]
 fn an_unknown_log_level_exits_2_before_binding() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join("verbose.sock");
 
     let mut svc = Service::spawn(
@@ -201,7 +201,7 @@ fn an_unknown_log_level_exits_2_before_binding() {
 /// and to service configs.
 #[test]
 fn a_site_toml_log_format_exits_2_and_names_it() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir(&site).expect("the site directory");
     for entry in std::fs::read_dir(fixtures_dir()).expect("the fixtures") {
@@ -252,7 +252,7 @@ fn a_site_toml_log_format_exits_2_and_names_it() {
 /// here: a line waiting for the tick is not a full destination.
 #[test]
 fn a_quiet_service_flushes_within_a_tick() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join("tick.sock");
     let mut svc = Service::spawn(
         "m6-html",
@@ -403,7 +403,7 @@ fn a_request_is_served_on_the_accepting_thread() {
 /// A hard limit below the reserved descriptors is a start failure, exit 2.
 #[test]
 fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join("limit.sock");
     let mut command = m6_core::testkit::lowered_fd_limit_command(64, 0, binary("m6-html"));
     command
@@ -463,7 +463,7 @@ fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
 
     // A hard limit that cannot hold a table is a start failure, exit 2, and
     // nothing is bound.
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join("none.sock");
     let mut command = m6_core::testkit::lowered_fd_limit_command(16, 0, binary("m6-html"));
     command

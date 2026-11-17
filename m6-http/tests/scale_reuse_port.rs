@@ -109,7 +109,7 @@ struct Site {
 
 impl Site {
     fn start(backends: usize) -> Site {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
             "127.0.0.1".to_string(),

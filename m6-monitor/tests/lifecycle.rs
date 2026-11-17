@@ -40,7 +40,7 @@ level  = "info"
 "#;
 
 fn setup(config: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let path = dir.path().join("monitor.conf");
     std::fs::write(&path, config).expect("write config");
     std::fs::write(dir.path().join("site.toml"), "").unwrap();

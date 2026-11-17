@@ -429,11 +429,42 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from("/run/m6")
 }
 
-/// The temporary directory: `TMPDIR` when set, else the system's. Short enough
-/// on every supported target for a socket under a fresh subdirectory to fit
-/// [`MAX_SOCKET_PATH`].
+/// The temporary directory: `TMPDIR` when set, else the system's.
+///
+/// Not a safe place for a unix socket path. `TMPDIR` may be long enough on its
+/// own to leave no room under [`MAX_SOCKET_PATH`] for a file name, and the
+/// length is the environment's, not the caller's. Use [`socket_scratch_root`]
+/// for a scratch directory that will hold one.
 pub fn temp_dir() -> PathBuf {
     std::env::temp_dir()
+}
+
+/// The shortest writable temporary root for a scratch directory that will hold
+/// a unix socket.
+///
+/// `/tmp` is tried first because its absolute path is short on every supported
+/// target; [`temp_dir`] (which honours `TMPDIR`) is the fallback when `/tmp`
+/// cannot be written. A test or service that puts a socket under here gets a
+/// path that fits, whatever `TMPDIR` is set to.
+///
+/// This is a root, not a path: the caller joins a file name and the socket
+/// constructor validates the result with [`check_socket_path`]. A name that
+/// still cannot fit is an `Err` naming its length and the limit, never a
+/// silently shortened path.
+pub fn socket_scratch_root() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE: AtomicU64 = AtomicU64::new(0);
+    let tmp = PathBuf::from("/tmp");
+    let probe = tmp.join(format!(
+        ".m6-socket-probe-{}-{}",
+        std::process::id(),
+        PROBE.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::create_dir(&probe).is_ok() {
+        let _ = std::fs::remove_dir(&probe);
+        return tmp;
+    }
+    temp_dir()
 }
 
 /// The unit's `StateDirectory=`, when the service manager set one.

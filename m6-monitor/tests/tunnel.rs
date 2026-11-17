@@ -140,7 +140,7 @@ tunnel = { address = "192.0.2.1:9" }
 [log]
 level = "warn"
 "#;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let path = dir.path().join("monitor.conf");
     std::fs::write(&path, config).unwrap();
     std::fs::write(dir.path().join("site.toml"), "").unwrap();

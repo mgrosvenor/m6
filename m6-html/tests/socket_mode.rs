@@ -23,7 +23,7 @@ fn fixtures_dir() -> PathBuf {
 /// Spawn `m6-html` with `body` as the whole of its `[server]` section and
 /// return the mode the socket ended up with.
 fn socket_mode_for(id: &str, server_section: &str) -> u32 {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = dir.path().join("m6-html.conf");
     std::fs::write(
         &config,
@@ -83,7 +83,7 @@ fn a_configured_socket_mode_is_applied() {
 /// socket open at a mode nobody chose.
 #[test]
 fn a_nonsense_socket_mode_stops_the_service() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = dir.path().join("m6-html.conf");
     std::fs::write(&config, "[server]\nsocket_mode = \"rw-rw----\"\n").expect("write config");
     let socket_path = dir.path().join("bad.sock");

@@ -74,7 +74,7 @@ fn header_values(raw: &str, name: &str) -> Vec<String> {
 
 /// Forward `req` to a throwaway backend and return the raw bytes it received.
 fn forward_and_capture(req: &HttpRequest, client_ip: &str) -> String {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let sock = dir.path().join("backend.sock");
     let handle = capture_backend(&sock);
     drive_and_capture(&sock, req, client_ip);

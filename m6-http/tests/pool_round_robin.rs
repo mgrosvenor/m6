@@ -179,7 +179,7 @@ struct Fixture {
 
 impl Fixture {
     fn start(members: &[&'static str]) -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
         let site = dir.path().to_path_buf();
         let ck = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),

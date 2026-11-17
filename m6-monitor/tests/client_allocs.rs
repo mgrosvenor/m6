@@ -41,7 +41,7 @@ level  = "debug"
 
 #[test]
 fn the_client_path_allocates_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = dir.path().join("monitor.conf");
     std::fs::write(&config, CONFIG).expect("write config");
     std::fs::write(dir.path().join("site.toml"), "").unwrap();
