@@ -132,7 +132,7 @@ fn start(with_policy: bool) -> Server {
         "m6-http-unmatched-host",
         Command::new(binary("m6-http")).arg(&site).arg(&config),
     );
-    proc.wait_for_tcp(port, Duration::from_secs(20));
+    proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
     Server {
         port,
         cert,
@@ -159,7 +159,7 @@ fn a_by_address_request_is_answered_before_routing() {
         head.contains("location: https://canonical.example/capabilities"),
         "the Location is the canonical name with the path kept:\n{head}"
     );
-    let status = srv.proc.terminate(Duration::from_secs(10));
+    let status = srv.proc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "clean stop, got {status}");
 }
 
@@ -188,7 +188,7 @@ fn a_served_name_reaches_routing_and_a_cached_answer_cannot_stand_in() {
         head.contains("location: https://canonical.example/no-such-page"),
         "head:\n{head}"
     );
-    let status = srv.proc.terminate(Duration::from_secs(10));
+    let status = srv.proc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "clean stop, got {status}");
 }
 
@@ -206,6 +206,6 @@ fn the_policy_is_off_without_a_target() {
         status, 404,
         "a node without the policy serves as before:\n{head}"
     );
-    let status = srv.proc.terminate(Duration::from_secs(10));
+    let status = srv.proc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "clean stop, got {status}");
 }

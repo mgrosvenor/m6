@@ -751,7 +751,7 @@ fn m6_http_runs_one_thread() {
     );
 
     let pid = fx.service.pid();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut threads = thread_count(pid);
     while threads != 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -792,7 +792,7 @@ fn held_backend_does_not_delay_a_cache_hit(tag: &str, get: GetFn) {
     let slow_handle = std::thread::spawn(move || get(slow_port, "/slow", Duration::from_secs(20)));
 
     // Wait until the backend reports it received /slow.
-    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + Duration::from_secs(5));
+    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + m6_core::testkit::STARTUP_BOUND);
     assert!(
         seen,
         "the backend never received /slow\n--- m6-http ---\n{}",
@@ -873,7 +873,7 @@ fn a_backend_past_its_timeout_answers_and_the_member_stays_in_turn() {
     // One member, so the next /fast miss takes the same member again and is
     // served. Poll with a deadline rather than sleep.
     let recovered = (|| {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         loop {
             match h1_get(fx.port(), "/fast", Duration::from_secs(2)) {
                 Ok((200, b)) if b == FAST_BODY => return true,
@@ -986,7 +986,7 @@ fn a_connection_event_never_accepts() {
         assert_eq!(body, FAST_BODY);
     }
     // Wait for the accounting tick that copies the loop trace into /perf.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut accept = None;
     let mut conn_events = None;
     while Instant::now() < deadline {
@@ -1034,7 +1034,7 @@ fn a_large_response_to_a_slow_reader_is_resumed_by_write_readiness() {
         .expect("write");
     stream.flush().expect("flush");
     // Wait until the backend has written the whole response, then drain it.
-    let seen = await_slow_seen(&fx.large_seens[0], Instant::now() + Duration::from_secs(5));
+    let seen = await_slow_seen(&fx.large_seens[0], Instant::now() + m6_core::testkit::STARTUP_BOUND);
     assert!(seen, "the backend never wrote /large");
     let mut body = Vec::new();
     let _ = stream.read_to_end(&mut body);
@@ -1167,7 +1167,7 @@ fn periodic_lines(fx: &Fixture) -> usize {
 
 /// Wait for the next accounting tick, observed as a new "periodic stats" line.
 fn wait_for_periodic(fx: &Fixture, after: usize) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     while Instant::now() < deadline {
         if periodic_lines(fx) > after {
             return;
@@ -1254,7 +1254,7 @@ fn a_closed_client_does_not_leak_its_upstream() {
         .write_all(b"GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .expect("write");
     stream.flush().expect("flush");
-    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + Duration::from_secs(5));
+    let seen = await_slow_seen(&fx.slow_seens[0], Instant::now() + m6_core::testkit::STARTUP_BOUND);
     assert!(
         seen,
         "member A never received /slow\n--- m6-http ---\n{}",
@@ -1411,7 +1411,7 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
     });
 
     // Wait until the backend reports the /errors fetch.
-    let seen = await_slow_seen(&error_seen_rx, Instant::now() + Duration::from_secs(5));
+    let seen = await_slow_seen(&error_seen_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
     assert!(
         seen,
         "the backend never received /errors\n--- m6-http ---\n{}",
@@ -1581,7 +1581,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         a.dispatch(&h2_req("/slow"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
             .expect("dispatch /slow");
         a.drive();
-        let seen = await_slow_seen(&slow_seen_rx, Instant::now() + Duration::from_secs(5));
+        let seen = await_slow_seen(&slow_seen_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
         assert!(
             seen,
             "the backend never received /slow\n--- m6-http ---\n{}",
@@ -1596,7 +1596,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     wait_for_log(
         &service,
         "h2 fill_recv",
-        Instant::now() + Duration::from_secs(5),
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
     );
 
     // Client B, on the reused token, dispatches /slow2 (also held).
@@ -1606,7 +1606,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
         .dispatch(&h2_req("/slow2"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
         .expect("dispatch /slow2");
     b.drive();
-    let seen = await_slow_seen(&slow2_seen_rx, Instant::now() + Duration::from_secs(5));
+    let seen = await_slow_seen(&slow2_seen_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
     assert!(
         seen,
         "the backend never received /slow2\n--- m6-http ---\n{}",
@@ -1640,7 +1640,7 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
 
     // Now release B's own /slow2 and collect its reply.
     release_slow2.store(true, Ordering::SeqCst);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         b.drive();
         if let Some(c) = b
@@ -1863,7 +1863,7 @@ fn an_idle_url_connection_the_backend_closes_is_dropped_before_reuse() {
     wait_for_log(
         &fx.service,
         "idle url connection dropped",
-        Instant::now() + Duration::from_secs(5),
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
     );
 
     let (second_status, second_body) = h1_get(fx.port(), "/conn/1", Duration::from_secs(5))
@@ -1972,7 +1972,7 @@ fn a_slow_https_upstream_does_not_stall_cache_hits() {
 
     let port = fx.port();
     let slow = std::thread::spawn(move || h1_get(port, "/slow", Duration::from_secs(20)));
-    let seen = await_slow_seen(&slow_rx, Instant::now() + Duration::from_secs(5));
+    let seen = await_slow_seen(&slow_rx, Instant::now() + m6_core::testkit::STARTUP_BOUND);
     assert!(
         seen,
         "the https backend never received /slow\n--- m6-http ---\n{}",
@@ -2095,7 +2095,7 @@ fn an_unreachable_h2c_upstream_does_not_stall_cache_hits() {
     wait_for_log(
         &fx.service,
         "url backend dispatch",
-        Instant::now() + Duration::from_secs(5),
+        Instant::now() + m6_core::testkit::STARTUP_BOUND,
     );
     let hit = h1_get(fx.port(), "/fast", Duration::from_secs(2));
     let (hit_status, hit_body) = match hit {

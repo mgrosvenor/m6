@@ -82,7 +82,7 @@ fn spawn(configs: &Configs) -> Service {
 }
 
 fn stop(mut svc: Service) -> std::process::ExitStatus {
-    svc.terminate(Duration::from_secs(10))
+    svc.terminate(m6_core::testkit::STARTUP_BOUND)
 }
 
 fn serve(server: &mut CheckServer, svc: &Service) {

@@ -253,7 +253,7 @@ fn deliver(
     let mut interest = smtp.interest();
     let mut drive = 0usize;
     let mut events = Events::with_capacity(16);
-    let deadline = m6_core::platform::now() + Duration::from_secs(30);
+    let deadline = m6_core::platform::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         poll.poll(&mut events, Some(Duration::from_millis(100)))
             .expect("poll");

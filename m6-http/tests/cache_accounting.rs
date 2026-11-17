@@ -294,7 +294,7 @@ impl Stack {
 
 /// Wait until the fake origin has answered `want` requests, never on a sleep.
 fn wait_for_origin(origin: &Origin, want: usize) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     while Instant::now() < deadline {
         if origin.requests() >= want {
             return true;

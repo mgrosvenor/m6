@@ -421,7 +421,7 @@ fn no_response(reason: impl std::fmt::Display) -> Resp {
 fn await_resp(
     mut poll: impl FnMut() -> Option<std::io::Result<m6_http_lib::forward::HttpResponse>>,
 ) -> Resp {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         match poll() {
             Some(Ok(r)) => {
@@ -520,7 +520,7 @@ fn spawn_holding_backend(path: &Path) -> HoldingBackend {
                     let _ = release_rx
                         .lock()
                         .unwrap()
-                        .recv_timeout(Duration::from_secs(20));
+                        .recv_timeout(m6_core::testkit::STARTUP_BOUND);
                 }
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nCache-Control: public\r\nConnection: close\r\n\r\nslow",
@@ -702,7 +702,7 @@ fn a_response_dispatched_before_the_advance_is_not_stored() {
         let slow = scope.spawn(|| fx.h1_request("GET", "/slow", None));
         backend
             .held
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(m6_core::testkit::STARTUP_BOUND)
             .expect("the slow request never reached the backend");
         let posted = fx.h1_request("POST", "/genid", Some(&fx.write_token()));
         assert_eq!(posted.status, 200);

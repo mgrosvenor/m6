@@ -61,7 +61,7 @@ fn a_thousand_plain_requests_allocate_nothing() -> usize {
     let path = dir.path().join("up.sock");
     let listener = UnixListener::bind(&path).expect("bind");
     let addr = Addr::Unix(path);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     let mut up = Upstream::new(64 * 1024, 16 * 1024);
     let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n".to_vec();
@@ -164,7 +164,7 @@ fn tls_requests_report_their_allocations() {
         config: Arc::new(client),
         name,
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut up = Upstream::new(64 * 1024, 16 * 1024);
     let mut poll = m6_core::platform::Poll::new().expect("poll");
     let mut events = m6_core::platform::Events::with_capacity(8);

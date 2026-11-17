@@ -525,7 +525,7 @@ backend = "example"
         };
         *backend_pid = backend.child.as_ref().map(|c| c.id());
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         loop {
             if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
                 break;

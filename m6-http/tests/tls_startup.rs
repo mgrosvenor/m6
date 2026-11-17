@@ -146,7 +146,7 @@ fn h3_leaf(port: u16) -> Result<Vec<u8>, String> {
 
     let mut buf = vec![0u8; 65536];
     let mut out = vec![0u8; 1350];
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     while !conn.is_established() {
         if Instant::now() > deadline {
@@ -304,7 +304,7 @@ fn every_protocol_serves_the_configured_certificate_at_start() {
         "HTTP/3 serves the configured certificate"
     );
 
-    let status = srv.proc.terminate(Duration::from_secs(10));
+    let status = srv.proc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "clean stop, got {status}");
 }
 

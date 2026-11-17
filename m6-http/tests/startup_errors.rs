@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use m6_core::testkit::{self, Service};
 
@@ -267,7 +267,7 @@ fn server_in_the_system_config_only_starts_because_validation_runs_after_the_mer
     let mut svc = Service::spawn("m6-http-server-in-system", &mut cmd);
     svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-http should exit 0 on SIGTERM, got {status}"
@@ -565,7 +565,7 @@ fn a_url_backend_that_skips_verification_starts_with_an_empty_system_store() {
         .env("SSL_CERT_DIR", &empty_dir);
     let mut svc = Service::spawn("m6-http-empty-roots-skip", &mut cmd);
     svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-http should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
@@ -675,7 +675,7 @@ fn a_present_analytics_log_directory_starts_and_writes_the_file() {
         svc.output()
     );
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-http should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",

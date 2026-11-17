@@ -17,7 +17,6 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use m6_core::testkit::{binary, read_response, wait, Service, RESPONSE_BOUND};
 
@@ -247,7 +246,7 @@ fn rotate_key(env: &TestEnv, mut guard: Service) -> Service {
     let (private_b, public_b) = generate_test_rsa_keys();
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
     std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
-    let status = guard.terminate(Duration::from_secs(5));
+    let status = guard.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-auth-server did not stop cleanly for a rotation, got {status}"

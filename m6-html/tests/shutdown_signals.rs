@@ -160,7 +160,7 @@ fn a_log_reopen_signal_is_not_a_shutdown() {
     let (mut server, socket_path) = spawn("usr1");
     server.svc.request(m6_core::platform::Signal::ReopenLogs);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         if server.svc.output().contains("log reopen requested") {
             break;
@@ -196,5 +196,5 @@ fn a_log_reopen_signal_is_not_a_shutdown() {
         "the service stopped serving after SIGUSR1: {response}\n--- output ---\n{}",
         server.svc.output()
     );
-    server.svc.terminate(Duration::from_secs(5));
+    server.svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }

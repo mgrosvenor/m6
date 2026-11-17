@@ -574,7 +574,7 @@ fn a_parked_backend_does_not_delay_the_check_deadline() {
     std::thread::scope(|scope| {
         let parked = scope.spawn(move || https_get_raw(port, "/slow", &[], tls));
         srv.slow_ready
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(m6_core::testkit::STARTUP_BOUND)
             .expect("the slow backend was never reached");
         let started = std::time::Instant::now();
         let response = srv.request(
@@ -788,7 +788,7 @@ fn a_checker_that_stops_answering_logs_one_warn_and_one_info() {
         assert_eq!(response.status, 503, "{}", response.headers);
     }
     assert!(
-        wait::until(Duration::from_secs(10), || {
+        wait::until(m6_core::testkit::STARTUP_BOUND, || {
             check_log_lines(&srv, "the check backend did not answer") >= 1
         }),
         "the outage was not logged\n--- output ---\n{}",
@@ -806,7 +806,7 @@ fn a_checker_that_stops_answering_logs_one_warn_and_one_info() {
         assert_eq!(response.status, 503, "{}", response.headers);
     }
     assert!(
-        wait::until(Duration::from_secs(10), || {
+        wait::until(m6_core::testkit::STARTUP_BOUND, || {
             check_log_lines(&srv, "the check backend answered again") >= 1
         }),
         "the recovery was not logged\n--- output ---\n{}",

@@ -349,7 +349,7 @@ fn a_check_only_process_needs_only_the_public_key() {
     );
     assert_eq!(json_body(&resp)["username"], "dave");
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "the check-only process should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",

@@ -274,7 +274,7 @@ fn a_quiet_service_flushes_within_a_tick() {
         "the request was not served: {response}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     while Instant::now() < deadline {
         if svc.output().contains("\"message\":\"request complete\"") {
             return;
@@ -320,7 +320,7 @@ fn l1_sigterm_exits_zero() {
     // what the process did, which passed whatever happened — including the
     // process being killed outright by the signal.
     let mut guard = guard;
-    let status = guard.svc.terminate(Duration::from_secs(5));
+    let status = guard.svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-html should exit 0 on SIGTERM, got {status}. A signal exit status means the \
@@ -377,7 +377,7 @@ fn a_request_is_served_on_the_accepting_thread() {
 
     // The wait is for the count to settle, never a fixed sleep: the assertion
     // below is the signal and the deadline is the bound.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut threads = thread_count(pid);
     while threads != 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));

@@ -186,7 +186,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     let mut svc = spawn(dir.path(), &path, &sock);
 
     accepted_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("the monitor did not start its /health request");
 
     // The poll is outstanding: the answer must come from the loop, not after
@@ -204,7 +204,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     );
 
     // The deadline passes, the poll finishes, and the node reads unreachable.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         let (status, body) = support::get(&sock, "/digest");
         if status == 200 && body.contains("\"unreachable\"") {
@@ -219,7 +219,7 @@ fn the_monitor_serves_while_a_node_hangs() {
     }
     drop(release_tx);
     held.join().expect("the hanging listener ends");
-    svc.terminate(Duration::from_secs(5));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }
 
 /// A slash a client adds changes nothing: `/digest/`, `//` and a relative
@@ -235,7 +235,7 @@ fn a_trailing_or_doubled_slash_still_answers() {
     let mut svc = spawn(dir.path(), &config, &sock);
 
     // A completed poll is a 200 from /digest.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     while support::get(&sock, "/digest").0 != 200 {
         assert!(
             Instant::now() < deadline,
@@ -265,7 +265,7 @@ fn a_trailing_or_doubled_slash_still_answers() {
     // The loop is still serving after all three.
     let (status, _) = support::get(&sock, "/digest");
     assert_eq!(status, 200, "the monitor stopped after a slashed path");
-    svc.terminate(Duration::from_secs(5));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }
 
 /// The monitor runs one loop thread. Three counts test that: one node, the

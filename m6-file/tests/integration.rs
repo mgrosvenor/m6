@@ -152,7 +152,7 @@ fn l1_sigterm_exits_zero() {
     // version signalled, slept, and dropped the guard without ever looking at
     // what the process did, which passed whatever happened.
     let mut guard = guard;
-    let status = guard.svc.terminate(Duration::from_secs(5));
+    let status = guard.svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-file should exit 0 on SIGTERM, got {status}. A signal exit status means the \

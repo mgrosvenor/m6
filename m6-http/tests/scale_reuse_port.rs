@@ -180,7 +180,7 @@ fn start_front_end_with(
         "m6-http",
         Command::new(binary("m6-http")).arg(site).arg(&system),
     );
-    let deadline = m6_core::platform::now() + Duration::from_secs(20);
+    let deadline = m6_core::platform::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         service.assert_alive(&format!("waiting for front end {node} to bind"));
         if service.output().contains("listeners bound") {
@@ -263,7 +263,7 @@ fn three_front_ends_share_one_port_with_reuse_port() {
     // request in flight at that instant is reset by the kernel rather than
     // answered. Every request before and after is 200, and the port is served
     // by the two that remain.
-    let status = front_ends[1].terminate(Duration::from_secs(10));
+    let status = front_ends[1].terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "front end two did not shut down cleanly");
     every_request_is_200(port, 12, "after one of three front ends stopped");
 
@@ -272,7 +272,7 @@ fn three_front_ends_share_one_port_with_reuse_port() {
         TcpStream::connect(("127.0.0.1", port)).is_ok(),
         "the shared port stopped accepting"
     );
-    let status = front_ends[0].terminate(Duration::from_secs(10));
+    let status = front_ends[0].terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "front end one did not shut down cleanly");
     every_request_is_200(port, 6, "one front end left on the shared port");
 }
@@ -292,7 +292,7 @@ fn two_front_ends_on_separate_ports_share_one_backend_set() {
     every_request_is_200(second.port(), 6, "the second front end alone");
 
     // Stop the first while the second keeps serving the same backend set.
-    let status = front_end.terminate(Duration::from_secs(10));
+    let status = front_end.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "the first front end did not shut down cleanly"
@@ -369,7 +369,7 @@ fn each_front_end_answers_health_on_its_own_status_port() {
         );
     }
 
-    let status = front_ends[1].terminate(Duration::from_secs(10));
+    let status = front_ends[1].terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(status.success(), "process 1 did not shut down cleanly");
     assert!(
         TcpStream::connect(("127.0.0.1", base + 1)).is_err(),

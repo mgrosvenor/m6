@@ -453,7 +453,7 @@ impl Backend {
         // Bind before announcing readiness (spec §8.1), so the socket appearing
         // is the signal. Waited for rather than slept on: a fixed sleep is
         // either flaky or slow, and under a loaded build host it is both.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         while Instant::now() < deadline {
             if sock.exists() && UnixStream::connect(&sock).is_ok() {
                 return Some(b);
@@ -840,7 +840,7 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
         m6_core::platform::send(b.child.id(), m6_core::platform::Signal::Shutdown)
             .expect("send the shutdown request");
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         let status = loop {
             if let Some(s) = b.child.try_wait().expect("try_wait") {
                 break s;

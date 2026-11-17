@@ -468,7 +468,7 @@ fn successful_stub() -> (
         sock.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
         accepted_tx.send(()).expect("accepted");
-        go.recv_timeout(Duration::from_secs(5)).expect("go");
+        go.recv_timeout(m6_core::testkit::STARTUP_BOUND).expect("go");
         sock.write_all(b"220 test\r\n").expect("greeting");
         let mut log = Vec::new();
         for (expect, reply) in [
@@ -534,7 +534,7 @@ fn the_service_answers_while_a_message_is_in_flight() -> Result<(), Failed> {
     let service = Service::start(dir.path(), relay);
     let mut sending = service.send("POST", "/send");
     accepted
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("the service must connect to the relay");
     // The relay holds its greeting. The service must still answer /now.
     let mut now = service.send("GET", "/now");
@@ -589,7 +589,7 @@ fn a_send_past_its_deadline_answers_504() -> Result<(), Failed> {
         "the 504 must come from the loop's deadline"
     );
     assert!(eof
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("the stub must see EOF"));
     peer.join().expect("stub");
     Ok(())
@@ -601,11 +601,11 @@ fn a_client_that_leaves_drops_the_delivery() -> Result<(), Failed> {
     let service = Service::start(dir.path(), relay);
     let sending = service.send("POST", "/send");
     accepted
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("the service must connect to the relay");
     drop(sending);
     assert!(
-        eof.recv_timeout(Duration::from_secs(2))
+        eof.recv_timeout(m6_core::testkit::STARTUP_BOUND)
             .expect("the relay must see EOF"),
         "close() must close the slot's socket"
     );
@@ -657,7 +657,7 @@ fn an_outgoing_event_after_the_client_left_is_ignored() -> Result<(), Failed> {
         "the request must start the delivery"
     );
     accepted
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("the service must connect to the relay");
 
     // The client leaves. Its event frees the slot and the delivery.

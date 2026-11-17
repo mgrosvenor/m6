@@ -732,7 +732,7 @@ fn a_restart_forgets_the_failure_counts() {
     );
 
     assert!(
-        svc.terminate(Duration::from_secs(10)).success(),
+        svc.terminate(m6_core::testkit::STARTUP_BOUND).success(),
         "the service did not exit cleanly on SIGTERM\n--- output ---\n{}",
         svc.output()
     );
@@ -1107,7 +1107,7 @@ fn a_rotated_signing_key_signs_after_a_restart() {
     std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
 
     // Restart on the same config: the new pair is read at start.
-    let status = guard.terminate(Duration::from_secs(5));
+    let status = guard.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-auth-server did not stop cleanly, got {status}"

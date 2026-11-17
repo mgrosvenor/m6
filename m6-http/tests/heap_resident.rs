@@ -150,7 +150,7 @@ fn a_warm_server_is_resident_within_its_reservation() {
 
     // A shutdown request must exit cleanly with the pin in force.
     assert!(
-        svc.terminate(Duration::from_secs(30)).success(),
+        svc.terminate(m6_core::testkit::STARTUP_BOUND).success(),
         "m6-http did not exit cleanly:\n{}",
         svc.output()
     );
@@ -296,7 +296,7 @@ impl Fixture {
     /// until the service is serving and not merely bound.
     fn h1_ready(&self) -> H1Conn {
         let config = tls_config(&self.cert_der);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         loop {
             let mut conn = H1Conn::connect(self.port(), Arc::clone(&config));
             match conn.get("/") {

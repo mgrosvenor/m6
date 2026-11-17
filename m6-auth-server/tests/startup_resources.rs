@@ -256,7 +256,7 @@ fn a_present_storage_directory_starts_and_accepts_a_connection() {
         svc.output()
     );
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-auth-server should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
@@ -402,7 +402,7 @@ fn check_only_starts_without_the_private_key() {
         check.display(),
         svc.output()
     );
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "the check-only process should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",

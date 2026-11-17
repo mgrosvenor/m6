@@ -281,7 +281,7 @@ fn h2_get(
     poll.registry()
         .register_fd(conn.raw_fd(), Token(0), conn.phase_interest())
         .map_err(|e| e.to_string())?;
-    let deadline = m6_core::platform::now() + Duration::from_secs(10);
+    let deadline = m6_core::platform::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         conn.drive();
         if let Some(done) = conn
@@ -385,7 +385,7 @@ fn h3_requests(port: u16, requests: &[H3Request<'_>]) -> Result<Vec<H3Reply>, St
     // in flight, so there is at most one.
     let mut current: Option<usize> = None;
     let mut sent = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     loop {
         if Instant::now() > deadline {
@@ -1024,7 +1024,7 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
     // Before the fix the socket just closed, which is exactly what this catches.
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut saw_headers = false;
 
     while Instant::now() < deadline && !saw_headers {

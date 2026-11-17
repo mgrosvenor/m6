@@ -136,7 +136,7 @@ fn range() -> String {
 
 /// Poll `/history` until it has a line, or fail with what it last said.
 fn history_with_rows(sock: &Path) -> Answer {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         let a = get(sock, &format!("/history?{}", range()));
         if a.status == 200 && !a.body.is_empty() {
@@ -260,7 +260,7 @@ fn an_unwritable_history_path_does_not_stop_monitoring() {
     assert_eq!(a.status, 503, "{}", a.body);
     assert!(a.body.contains("history is unavailable"), "{}", a.body);
     // Polling carries on, and the digest says why there is no history.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         let d = get(&s.sock, "/digest");
         if d.status == 200 {

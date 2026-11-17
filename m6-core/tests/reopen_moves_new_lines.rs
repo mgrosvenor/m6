@@ -10,7 +10,6 @@
 //! end against m6-html by `shutdown_signals.rs`.
 
 use std::path::Path;
-use std::time::Duration;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use m6_core::log::{self, Level, Line};
@@ -53,7 +52,7 @@ fn reopen_moves_new_lines_to_the_new_file() -> Result<(), Failed> {
 
     write_line(1);
     assert!(
-        until(Duration::from_secs(5), || lines(&live).len() == 1),
+        until(m6_core::testkit::STARTUP_BOUND, || lines(&live).len() == 1),
         "the first line never reached the file"
     );
 
@@ -61,13 +60,13 @@ fn reopen_moves_new_lines_to_the_new_file() -> Result<(), Failed> {
     std::fs::rename(&live, &rotated).unwrap();
     log::reopen().expect("reopen the analytics file");
     assert!(
-        until(Duration::from_secs(5), || live.exists()),
+        until(m6_core::testkit::STARTUP_BOUND, || live.exists()),
         "the live path never reappeared"
     );
 
     write_line(2);
     assert!(
-        until(Duration::from_secs(5), || lines(&live).len() == 1),
+        until(m6_core::testkit::STARTUP_BOUND, || lines(&live).len() == 1),
         "the second line never reached the new file"
     );
 

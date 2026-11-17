@@ -750,7 +750,7 @@ fn reopen_signals_never_count_toward_a_forced_shutdown() {
         assert!(reopened, "reopen {want} should have been handled");
     }
     srv.http.borrow_mut().assert_alive("after two SIGUSR1");
-    srv.http.borrow_mut().terminate(Duration::from_secs(10));
+    srv.http.borrow_mut().terminate(m6_core::testkit::STARTUP_BOUND);
     let out = srv.http.borrow().output();
     assert!(out.contains("shutdown complete"), "{out}");
     assert!(!out.contains("shutdown forced"), "{out}");

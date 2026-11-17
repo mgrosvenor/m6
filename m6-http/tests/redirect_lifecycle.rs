@@ -100,7 +100,7 @@ fn one(port: u16, host: &str, path: &str) -> String {
 fn sigterm_shuts_down_rather_than_being_ignored() {
     let (mut svc, _claim, _dir) = start();
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "redirect mode should exit 0 on SIGTERM, got {status}. A signal exit status \
@@ -143,7 +143,7 @@ fn it_answers_a_redirect_before_it_is_stopped() {
         "got: {resp}"
     );
 
-    svc.terminate(Duration::from_secs(5));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }
 
 /// The redirector makes the same unmatched-host decision as the serving
@@ -170,5 +170,5 @@ fn an_unserved_host_goes_to_the_canonical_name() {
             .contains("location: https://canonical.example/capabilities?a=1"),
         "the unmatched name goes to the canonical target, got: {other}"
     );
-    svc.terminate(Duration::from_secs(5));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }

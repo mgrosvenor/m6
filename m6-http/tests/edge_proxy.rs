@@ -452,7 +452,7 @@ impl EdgeStack {
         // actually answers rather than assuming a fixed delay is enough. This
         // is the difference between a suite that passes alone and one that
         // passes under load.
-        let ready_deadline = Instant::now() + Duration::from_secs(20);
+        let ready_deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         loop {
             let (status, _, _) = https_get(global_port, "/", &[], skip_verify_client_config());
             if status_code(&status) == 200 {

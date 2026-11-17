@@ -271,7 +271,7 @@ fn h1_get(port: u16, cert_der: &[u8], path: &str) -> (u16, Vec<u8>) {
 /// GET over h1 until the warm cache answers, then return that body. The first
 /// call fills the cache; the second is the hit every other protocol must match.
 fn warm_h1(fixture: &Fixture) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         match h1_get(fixture.port(), &fixture.cert_der, "/") {
             (200, body) if body.len() == BODY_LEN => return body,
@@ -432,7 +432,7 @@ fn h3_get(port: u16, path: &str, extra: &[(&str, &str)]) -> Result<(u16, Fields,
     let mut status: Option<u16> = None;
     let mut names: Vec<(String, String)> = Vec::new();
     let mut bytes: Vec<u8> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     loop {
         if Instant::now() > deadline {
@@ -1207,7 +1207,7 @@ fn fixture_serving(len: usize) -> (Fixture, Service) {
     let fixture = Fixture::new();
     fixture.start_backend_with(sized_backend_response(len));
     let svc = fixture.start();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         match h1_get(fixture.port(), &fixture.cert_der, "/") {
             (200, body) if body.len() == len => break,

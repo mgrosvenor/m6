@@ -176,7 +176,7 @@ level = "warn"
     );
 
     // The budget passes and the poll completes with the tunnel lost.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         let (status, body) = support::get(&sock, "/digest");
         if status == 200 && body.contains("no answer") {
@@ -189,5 +189,5 @@ level = "warn"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    svc.terminate(Duration::from_secs(5));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }

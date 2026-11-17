@@ -282,7 +282,7 @@ fn a_backbone_body_respects_the_peers_send_window() {
 
     // Drive the non-blocking client until the response lands. The whole point
     // is that this takes many iterations: credit arrives over time.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut response = None;
     while Instant::now() < deadline {
         conn.drive();
@@ -301,7 +301,7 @@ fn a_backbone_body_respects_the_peers_send_window() {
     }
 
     let observed = rx
-        .recv_timeout(Duration::from_secs(20))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("stub origin reported nothing");
     origin.join().expect("stub origin panicked");
 

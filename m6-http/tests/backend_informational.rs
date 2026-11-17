@@ -52,7 +52,7 @@ fn drive_upstream(
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
     forward::encode_request(up.request_buf(), req, client_ip, original_host)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
     up.start(
         &m6_core::client::Addr::Unix(sock.to_path_buf()),
         None,

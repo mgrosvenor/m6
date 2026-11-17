@@ -108,7 +108,7 @@ fn get() -> HttpRequest {
 fn await_response(
     mut poll: impl FnMut() -> Option<std::io::Result<HttpResponse>>,
 ) -> std::io::Result<HttpResponse> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     while Instant::now() < deadline {
         if let Some(r) = poll() {
             return r;

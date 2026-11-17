@@ -58,7 +58,7 @@ fn the_client_path_allocates_nothing() {
     // A completed poll is the signal its debug line gives. Waiting for it
     // keeps /digest out of the measured window: that route builds its body per
     // request, on purpose.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     while !svc.output().contains("fleet poll completed") {
         assert!(
             Instant::now() < deadline,
@@ -79,7 +79,7 @@ fn the_client_path_allocates_nothing() {
         );
     }
 
-    svc.terminate(Duration::from_secs(10));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
     let output = svc.output();
     let line = output
         .lines()

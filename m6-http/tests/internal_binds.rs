@@ -196,7 +196,7 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
         let stream_id = conn
             .dispatch(&req, "127.0.0.1", &client, "localhost")
             .expect("dispatch");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         let resp = loop {
             conn.drive();
             if let Some(c) = conn
@@ -215,7 +215,7 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
         statuses.push(resp.status);
     }
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     let output = svc.output();
     assert!(status.success(), "exit {status}\n{output}");
     statuses
@@ -311,7 +311,7 @@ fn an_unlisted_peer_is_refused_at_connect() {
             match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost") {
                 Err(e) => Err(format!("dispatch: {e}")),
                 Ok(stream_id) => {
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
                     loop {
                         conn.drive();
                         if let Some(c) = conn
@@ -340,7 +340,7 @@ fn an_unlisted_peer_is_refused_at_connect() {
         svc.output()
     );
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     let output = svc.output();
     assert!(
         status.success(),

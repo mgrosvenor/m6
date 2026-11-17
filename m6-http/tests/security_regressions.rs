@@ -89,7 +89,7 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
     forward::encode_request(up.request_buf(), req, client_ip, "example.com").expect("encode");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
     up.start(
         &m6_core::client::Addr::Unix(sock.to_path_buf()),
         None,

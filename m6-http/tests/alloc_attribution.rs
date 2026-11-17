@@ -275,7 +275,7 @@ fn measure(row: Row, requests: usize, out: &Path) -> (u64, u64) {
         }
     }
 
-    let status = svc.terminate(Duration::from_secs(60));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "{}: m6-http exited {status} on SIGTERM\n{}",
@@ -437,7 +437,7 @@ impl H1Conn {
 
 fn h1_ready(fixture: &Fixture, warm_path: &str) -> H1Conn {
     let config = tls_config(&fixture.cert_der, &[b"http/1.1"]);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         let mut conn = H1Conn::connect(fixture.port(), Arc::clone(&config));
         match conn.get(warm_path, fixture.port(), false) {
@@ -455,7 +455,7 @@ fn h1_ready(fixture: &Fixture, warm_path: &str) -> H1Conn {
 
 fn h2_ready(fixture: &Fixture) -> H2sTlsClientConn {
     let config = tls_config(&fixture.cert_der, &[b"h2"]);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         match H2sTlsClientConn::connect("localhost", fixture.port(), Arc::clone(&config)) {
             Ok(mut conn) => match h2_get(&mut conn, "/", fixture.port()) {
@@ -488,7 +488,7 @@ fn h2_get(conn: &mut H2sTlsClientConn, path: &str, port: u16) -> std::io::Result
         body: Vec::new(),
     };
     let stream_id = conn.dispatch(&request, "localhost", "127.0.0.1", "localhost")?;
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         conn.drive();
         if let Some(done) = conn

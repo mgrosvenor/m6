@@ -866,7 +866,7 @@ fn run_h3_client_once(server_addr: std::net::SocketAddr) -> Result<(u16, Vec<u8>
     let mut body: Vec<u8> = Vec::new();
     let mut done = false;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     loop {
         if std::time::Instant::now() > deadline {
