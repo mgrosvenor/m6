@@ -182,8 +182,6 @@ impl TestServer {
         let cert_der = cert.cert.der().to_vec();
         std::fs::write(site.join("cert.pem"), &cert_pem).unwrap();
         std::fs::write(site.join("key.pem"), &key_pem).unwrap();
-        let jwt_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        std::fs::write(site.join("auth-public.pem"), jwt_key.public_key_pem()).unwrap();
 
         std::fs::create_dir_all(site.join("private")).unwrap();
         std::fs::write(site.join("private/secret.txt"), b"TOP SECRET").unwrap();
@@ -285,11 +283,9 @@ name = "test-node"
 
 [auth]
 backend = "auth-check"
-public_key = "{pubkey}"
 "#,
                 cert = site.join("cert.pem").display(),
                 key = site.join("key.pem").display(),
-                pubkey = site.join("auth-public.pem").display(),
             ),
         )
         .unwrap();

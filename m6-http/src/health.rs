@@ -12,7 +12,6 @@
 
 use std::net::IpAddr;
 
-use crate::auth::{self, Decision, PublicKey};
 use crate::config::{GenidConfig, HealthConfig};
 use crate::stats::Iface;
 
@@ -626,20 +625,17 @@ pub enum Gate {
     /// Serve the report.
     Open,
     /// Answer with this exact status, headers and body and do nothing else:
-    /// the 404 a disabled endpoint gives, or the token check's refusal.
+    /// the 404 a disabled endpoint gives.
     Refused(u16, Vec<(String, String)>, Vec<u8>),
+    /// A credential check is required, with this `require` string. The caller
+    /// asks `POST /check` and resumes with the decision.
+    Check(String),
 }
 
 impl Gate {
     /// The 404 an endpoint answers when it is not configured.
     fn disabled() -> Self {
         let (code, headers, body) = PerfOutcome::Disabled.into_response();
-        Gate::Refused(code, headers, body)
-    }
-
-    /// The one token check's refusal, as the wire answer.
-    fn refusal(decision: Decision) -> Self {
-        let (code, headers, body) = decision.refusal().expect("a refusal, by construction");
         Gate::Refused(code, headers, body)
     }
 }
@@ -658,13 +654,7 @@ impl Gate {
 ///
 /// The address rule allocates nothing: one parse of the peer address and a
 /// scan of a short slice, and only on these two paths.
-pub fn metrics_gate(
-    h: &HealthConfig,
-    key: Option<&PublicKey>,
-    headers: &[(String, String)],
-    client_ip: &str,
-    from_internal: bool,
-) -> Gate {
+pub fn metrics_gate(h: &HealthConfig, client_ip: &str, from_internal: bool) -> Gate {
     if let Some(peers) = &h.metrics_peer_ips {
         let listed = !from_internal
             && client_ip
@@ -674,15 +664,9 @@ pub fn metrics_gate(
             return Gate::disabled();
         }
     }
-    let Some(require) = h.metrics_require.as_deref() else {
-        return Gate::disabled();
-    };
-    match auth::check(key, headers, require) {
-        Decision::Allow(_) => Gate::Open,
-        // Spelled out, not a catch-all. When this return type becomes the core
-        // four-variant `Decision`, `NoDecision` must be a compile error here,
-        // and its answer is a 503 rather than `Gate::refusal`'s panic.
-        refusal @ (Decision::NoCredential | Decision::Deny) => Gate::refusal(refusal),
+    match h.metrics_require.as_deref() {
+        Some(require) => Gate::Check(require.to_string()),
+        None => Gate::disabled(),
     }
 }
 
@@ -696,14 +680,7 @@ pub fn metrics_gate(
 /// 2. The one token check decides with `read_require` for a `GET` or
 ///    `write_require` for a `POST`. It is called once, here, and its refusal
 ///    is the answer unchanged. Unconfigured is the same 404.
-pub fn genid_gate(
-    g: &GenidConfig,
-    key: Option<&PublicKey>,
-    headers: &[(String, String)],
-    client_ip: &str,
-    from_internal: bool,
-    write: bool,
-) -> Gate {
+pub fn genid_gate(g: &GenidConfig, client_ip: &str, from_internal: bool, write: bool) -> Gate {
     if !genid_address_ok(client_ip, from_internal) {
         return Gate::disabled();
     }
@@ -712,14 +689,9 @@ pub fn genid_gate(
     } else {
         g.read_require.as_deref()
     };
-    let Some(require) = require else {
-        return Gate::disabled();
-    };
-    match auth::check(key, headers, require) {
-        Decision::Allow(_) => Gate::Open,
-        // Spelled out for the same reason as `metrics_gate`: a fourth variant
-        // must be a compile error here and must never reach the `expect`.
-        refusal @ (Decision::NoCredential | Decision::Deny) => Gate::refusal(refusal),
+    match require {
+        Some(require) => Gate::Check(require.to_string()),
+        None => Gate::disabled(),
     }
 }
 
@@ -834,15 +806,14 @@ fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::V
 mod traffic_endpoint_tests {
     use super::*;
 
-    /// No token configured means the endpoint does not exist: a 404, so it
-    /// does not advertise a door. A wrong credential is refused by the one
-    /// token check, which runs before `traffic_authorised` and so before the
-    /// report is built.
+    /// No credential configured means the endpoint does not exist: a 404, so
+    /// it does not advertise a door. A configured one asks for a check, and
+    /// the report is built only after that check allows.
     #[test]
     fn a_disabled_endpoint_refuses_before_the_report_is_built() {
         let none = HealthConfig::default();
-        let Gate::Refused(code, _, _) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
-            panic!("no token configured must refuse");
+        let Gate::Refused(code, _, _) = metrics_gate(&none, "127.0.0.1", false) else {
+            panic!("no claims configured must refuse");
         };
         assert_eq!(code, 404);
 
@@ -850,11 +821,10 @@ mod traffic_endpoint_tests {
             metrics_require: Some("role:monitor".to_string()),
             ..HealthConfig::default()
         };
-        let wrong = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        let Gate::Refused(code, _, _) = metrics_gate(&h, None, &wrong, "127.0.0.1", false) else {
-            panic!("no key loaded must fail closed");
+        let Gate::Check(require) = metrics_gate(&h, "127.0.0.1", false) else {
+            panic!("a configured endpoint must ask for a check");
         };
-        assert_eq!(code, 401);
+        assert_eq!(require, "role:monitor");
     }
 
     #[test]
@@ -1177,37 +1147,54 @@ mod traffic_endpoint_tests {
 mod genid_gate_tests {
     use super::*;
 
-    /// Address first, token never read: a public peer sees the 404 an unknown
-    /// path gives, whether or not it carries a valid token. `None` for the key
-    /// is the proof: a gate that looked at a token would have to answer 401.
-    #[test]
-    fn an_external_peer_is_refused_before_any_token() {
-        let g = GenidConfig {
+    fn config() -> GenidConfig {
+        GenidConfig {
             read_require: Some("role:reader".to_string()),
             write_require: Some("role:writer".to_string()),
             ..GenidConfig::default()
+        }
+    }
+
+    /// Address first, check never made: a public peer sees the 404 an unknown
+    /// path gives, whether or not it carries a credential.
+    #[test]
+    fn an_external_peer_is_refused_before_any_check() {
+        let g = config();
+        for write in [false, true] {
+            let Gate::Refused(code, _, _) = genid_gate(&g, "192.0.2.10", false, write) else {
+                panic!("a public peer must be refused");
+            };
+            assert_eq!(code, 404);
+            let Gate::Refused(code, _, _) = genid_gate(&g, "::ffff:192.0.2.10", false, write)
+            else {
+                panic!("a canonical public peer must be refused");
+            };
+            assert_eq!(code, 404);
+        }
+    }
+
+    #[test]
+    fn a_loopback_peer_asks_for_the_methods_claim() {
+        let g = config();
+        let Gate::Check(read) = genid_gate(&g, "127.0.0.1", false, false) else {
+            panic!("a loopback GET must ask for a check");
         };
-        let Gate::Refused(code, _, _) = genid_gate(&g, None, &[], "192.0.2.10", false, false)
-        else {
-            panic!("a public peer must be refused");
+        assert_eq!(read, "role:reader");
+        let Gate::Check(write) = genid_gate(&g, "127.0.0.1", false, true) else {
+            panic!("a loopback POST must ask for a check");
         };
-        assert_eq!(code, 404);
-        let Gate::Refused(code, _, _) = genid_gate(&g, None, &[], "::ffff:192.0.2.10", false, true)
-        else {
-            panic!("a canonical public peer must be refused");
-        };
-        assert_eq!(code, 404);
-        // The same gate opens the address check for a loopback caller, which
-        // then has no token, so it is refused as unauthorised rather than as
-        // the nonexistent endpoint.
-        let Gate::Refused(code, _, _) = genid_gate(&g, None, &[], "127.0.0.1", false, false) else {
-            panic!("no token must be refused");
-        };
-        assert_eq!(code, 401);
-        // Neither claim set is the endpoint not existing, to everyone.
+        assert_eq!(write, "role:writer");
+        // The internal listener is the other allowed path and asks the same.
+        assert!(matches!(
+            genid_gate(&g, "203.0.113.7", true, false),
+            Gate::Check(_)
+        ));
+    }
+
+    #[test]
+    fn no_claims_is_the_endpoint_not_existing() {
         let none = GenidConfig::default();
-        let Gate::Refused(code, _, _) = genid_gate(&none, None, &[], "127.0.0.1", false, false)
-        else {
+        let Gate::Refused(code, _, _) = genid_gate(&none, "127.0.0.1", false, false) else {
             panic!("no claims must be refused");
         };
         assert_eq!(code, 404);
@@ -1217,11 +1204,6 @@ mod genid_gate_tests {
 #[cfg(test)]
 mod metrics_gate_tests {
     use super::*;
-    use crate::auth::test_keys::{bearer, keypair, mint};
-
-    fn token(private_pem: &str, roles: &[&str]) -> Vec<(String, String)> {
-        bearer(&mint(private_pem, roles, 3600))
-    }
 
     fn health(peers: Option<&[&str]>, require: Option<&str>) -> HealthConfig {
         HealthConfig {
@@ -1235,100 +1217,58 @@ mod metrics_gate_tests {
         }
     }
 
-    fn code(g: &Gate) -> u16 {
-        match g {
-            Gate::Open => 200,
-            Gate::Refused(code, _, _) => *code,
-        }
-    }
-
     #[test]
-    fn an_unlisted_peer_is_404_before_any_token_check() {
-        let (_d, key, private) = keypair();
+    fn an_unlisted_peer_is_404_before_any_check() {
         let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        let good = token(&private, &["monitor"]);
         for ip in ["203.0.113.7", "2001:db8::1", "10.0.0.8"] {
-            let g = metrics_gate(&h, Some(&key), &good, ip, false);
-            assert_eq!(code(&g), 404, "{ip} must get 404 even with a valid token");
+            let Gate::Refused(code, _, _) = metrics_gate(&h, ip, false) else {
+                panic!("{ip} must get 404");
+            };
+            assert_eq!(code, 404);
         }
-        // No token and an unlisted peer is still 404, not 401: a stranger
-        // learns nothing about the credential.
-        assert_eq!(
-            code(&metrics_gate(&h, Some(&key), &[], "203.0.113.7", false)),
-            404
-        );
     }
 
     #[test]
-    fn a_listed_peer_passes_the_address_rule() {
-        let (_d, key, private) = keypair();
+    fn a_listed_peer_asks_for_a_check() {
         let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        let good = token(&private, &["monitor"]);
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &good, "10.0.0.9", false),
-            Gate::Open
-        ));
-        // An IPv4-mapped IPv6 peer is the same host, so the comparison is canonical.
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &good, "::ffff:10.0.0.9", false),
-            Gate::Open
-        ));
+        for ip in ["10.0.0.9", "::ffff:10.0.0.9"] {
+            let Gate::Check(require) = metrics_gate(&h, ip, false) else {
+                panic!("{ip} must ask for a check");
+            };
+            assert_eq!(require, "role:monitor");
+        }
     }
 
     #[test]
     fn an_unparseable_client_address_is_refused() {
-        let (_d, key, private) = keypair();
         let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        let good = token(&private, &["monitor"]);
         for ip in ["", "unknown", "10.0.0.9:443", "10.0.0.9, 1.2.3.4"] {
-            assert_eq!(
-                code(&metrics_gate(&h, Some(&key), &good, ip, false)),
-                404,
-                "{ip:?}"
-            );
+            let Gate::Refused(code, _, _) = metrics_gate(&h, ip, false) else {
+                panic!("{ip:?} must get 404");
+            };
+            assert_eq!(code, 404, "{ip:?}");
         }
     }
 
     #[test]
-    fn a_listed_peer_on_an_internal_listener_is_refused() {
-        let (_d, key, private) = keypair();
+    fn an_internal_request_from_a_listed_peer_is_refused() {
+        // In an internal h2c listener the peer address is a forwarded claim,
+        // so the allow-list cannot trust it.
         let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        let good = token(&private, &["monitor"]);
-        assert_eq!(
-            code(&metrics_gate(&h, Some(&key), &good, "10.0.0.9", true)),
-            404
-        );
-    }
-
-    #[test]
-    fn a_listed_peer_with_a_valid_token_but_wrong_role_is_403() {
-        let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"));
-        let reader = token(&private, &["reader"]);
-        let Gate::Refused(code, _, body) = metrics_gate(&h, Some(&key), &reader, "10.0.0.9", false)
-        else {
-            panic!("the wrong role must be refused");
-        };
-        assert_eq!(code, 403);
-        assert_eq!(body, br#"{"error":"forbidden"}"#);
-    }
-
-    #[test]
-    fn metrics_require_without_a_loaded_key_fails_closed() {
-        let h = health(None, Some("role:monitor"));
-        let Gate::Refused(code, _, _) = metrics_gate(&h, None, &[], "10.0.0.9", false) else {
-            panic!("a missing key must fail closed");
-        };
-        assert_eq!(code, 401);
+        assert!(matches!(
+            metrics_gate(&h, "10.0.0.9", true),
+            Gate::Refused(404, _, _)
+        ));
     }
 
     #[test]
     fn without_a_require_the_endpoint_is_disabled() {
         let h = health(None, None);
-        let ok = vec![("authorization".to_string(), "Bearer anything".to_string())];
-        // Any peer, internal or not: no require key means no endpoint.
         for (ip, internal) in [("203.0.113.7", false), ("10.0.0.9", true)] {
-            assert_eq!(code(&metrics_gate(&h, None, &ok, ip, internal)), 404);
+            assert!(matches!(
+                metrics_gate(&h, ip, internal),
+                Gate::Refused(404, _, _)
+            ));
         }
     }
 }

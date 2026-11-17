@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use m6_core::auth::Identity;
-use m6_core::testkit::{CheckServer, Reply};
+use m6_core::testkit::CheckServer;
+pub use m6_core::testkit::Reply;
 
 /// One fake authority, serving on its own thread until dropped.
 pub struct RunningCheck {

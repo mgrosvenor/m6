@@ -2136,7 +2136,6 @@ dependencies = [
  "httparse",
  "httpdate",
  "itoa",
- "jsonwebtoken",
  "libtest-mimic",
  "m6-core",
  "matchit",

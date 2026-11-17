@@ -25,6 +25,10 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, read_one, PortClaim, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
+use check_support::{identity, Reply, RunningCheck};
 use m6_http_lib::probe;
 
 /// The body every fake-origin answer carries, so a served copy is identifiable.
@@ -99,57 +103,18 @@ fn keypair() -> (String, String) {
     (ck.cert.pem(), ck.key_pair.serialize_pem())
 }
 
-// ── The token `/perf` needs ──────────────────────────────────────────────────
-
-/// The signing key and its public half, for the token `/perf` expects.
-///
-/// The legacy `[health] metrics_token_file` bearer string is removed at this
-/// tip: `/perf` is gated by `metrics_require` and a signed token, so the suite
-/// mints one with the claim the system config names.
-fn auth_keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-fn mint(private_pem: &str, roles: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: i64,
-        roles: Vec<String>,
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let claims = Claims {
-        sub: "cache-accounting-test".to_string(),
-        exp: now + 3600,
-        roles: roles.iter().map(|r| r.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
-fn system_toml(
-    port: u16,
-    cert: &std::path::Path,
-    key: &std::path::Path,
-    auth_public: &std::path::Path,
-) -> String {
+fn system_toml(port: u16, cert: &std::path::Path, key: &std::path::Path) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
-         [auth]\npublic_key = \"{}\"\n\n\
+         [auth]\nbackend = \"auth-check\"\n\n\
          [health]\nmetrics_require = \"role:monitor\"\n\n\
          [node]\nname = \"cache-accounting\"\n",
         cert.display(),
         key.display(),
-        auth_public.display(),
     )
 }
 
-fn site_toml(origin_port: u16) -> String {
+fn site_toml(origin_port: u16, check: &std::path::Path) -> String {
     format!(
         "[site]\nname = \"cache-accounting\"\ndomain = \"localhost\"\n\n\
          [server]\nbackend_timeout_secs = 5\n\n\
@@ -157,8 +122,10 @@ fn site_toml(origin_port: u16) -> String {
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
          [[backend]]\nname = \"origin\"\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
+         [[backend]]\nname = \"auth-check\"\nsockets = \"{}\"\n\n\
          [[route]]\npath = \"/fresh\"\nbackend = \"origin\"\n\n\
-         [[route]]\npath = \"/stale\"\nbackend = \"origin\"\n"
+         [[route]]\npath = \"/stale\"\nbackend = \"origin\"\n",
+        check.display()
     )
 }
 
@@ -168,6 +135,7 @@ struct Stack {
     port: u16,
     token: String,
     service: Service,
+    _check: RunningCheck,
 }
 
 impl Stack {
@@ -180,13 +148,23 @@ impl Stack {
         let key = dir.path().join("key.pem");
         std::fs::write(&cert, cert_pem).expect("cert");
         std::fs::write(&key, key_pem).expect("key");
-        let (auth_private, auth_public_pem) = auth_keypair();
-        let auth_public = dir.path().join("auth-public.pem");
-        std::fs::write(&auth_public, auth_public_pem).expect("auth public key");
-        let token = mint(&auth_private, &["monitor"]);
-        std::fs::write(dir.path().join("site.toml"), site_toml(origin_port)).expect("site.toml");
+        let check_path = dir.path().join("check.sock");
+        let check = RunningCheck::start(
+            &check_path,
+            vec![(
+                "monitor-token".to_string(),
+                Reply::Identity(identity(&[], &["monitor"])),
+            )],
+        )
+        .unwrap();
+        let token = "monitor-token".to_string();
+        std::fs::write(
+            dir.path().join("site.toml"),
+            site_toml(origin_port, &check_path),
+        )
+        .expect("site.toml");
         let system: PathBuf = dir.path().join("system.toml");
-        std::fs::write(&system, system_toml(port, &cert, &key, &auth_public)).expect("system.toml");
+        std::fs::write(&system, system_toml(port, &cert, &key)).expect("system.toml");
         let mut service = Service::spawn(
             "m6-http-cache-accounting",
             Command::new(binary("m6-http")).arg(dir.path()).arg(&system),
@@ -198,6 +176,7 @@ impl Stack {
             port,
             token,
             service,
+            _check: check,
         }
     }
 

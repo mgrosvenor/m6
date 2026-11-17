@@ -29,6 +29,10 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
+use check_support::{identity, Reply, RunningCheck};
 use m6_http_lib::cache::{Cache, CacheKey, CachedResponse, HeaderBlock};
 use m6_http_lib::disk_cache;
 
@@ -108,34 +112,6 @@ fn parse_h1(raw: &[u8]) -> Resp {
     }
 }
 
-// ── Crypto fixture ───────────────────────────────────────────────────────────
-
-fn keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-fn mint(private_pem: &str, roles: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: i64,
-        roles: Vec<String>,
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let claims = Claims {
-        sub: "disk-cache-test".to_string(),
-        exp: now + 3600,
-        roles: roles.iter().map(|r| r.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 // ── The stack under test ──────────────────────────────────────────────────────
 
 /// A source `m6-http`, a cache `m6-http` with `[cache] dir`, and the `m6-html`
@@ -153,7 +129,7 @@ struct Stack {
     state_dir: PathBuf,
     source_port: PortClaim,
     cache_port: PortClaim,
-    private_pem: String,
+    _check: RunningCheck,
 }
 
 impl Stack {
@@ -170,13 +146,26 @@ impl Stack {
         .expect("rcgen");
         std::fs::write(d.join("cert.pem"), ck.cert.pem()).unwrap();
         std::fs::write(d.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
-        let (private_pem, public_pem) = keypair();
-        std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
-        std::fs::write(
-            d.join("genid-token"),
-            format!("{}\n", mint(&private_pem, &["reader", "writer"])),
+        let check_path = d.join("check.sock");
+        let check = RunningCheck::start(
+            &check_path,
+            vec![
+                (
+                    "read-token".to_string(),
+                    Reply::Identity(identity(&[], &["reader"])),
+                ),
+                (
+                    "write-token".to_string(),
+                    Reply::Identity(identity(&[], &["writer"])),
+                ),
+                (
+                    "monitor-token".to_string(),
+                    Reply::Identity(identity(&[], &["monitor"])),
+                ),
+            ],
         )
         .unwrap();
+        std::fs::write(d.join("genid-token"), "read-token\n").unwrap();
 
         let source_port = claim_port();
         let cache_port = claim_port();
@@ -221,9 +210,11 @@ impl Stack {
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"m6-html\"\nsockets = \"{}/html-*.sock\"\n\n\
+                 [[backend]]\nname = \"auth-check\"\nsockets = \"{}/check.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"m6-html\"\n\n\
                  [[route]]\npath = \"/other\"\nbackend = \"m6-html\"\n\n\
                  [[route]]\npath = \"/load\"\nbackend = \"m6-html\"\n",
+                d.display(),
                 d.display()
             ),
         )
@@ -235,10 +226,9 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n\n\
                  [node]\nname = \"disk-source\"\n\n\
-                 [auth]\npublic_key = \"{}/auth-public.pem\"\n\n\
+                 [auth]\nbackend = \"auth-check\"\n\n\
                  [genid]\nread_require = \"role:reader\"\nwrite_require = \"role:writer\"\n",
                 source_port.addr(),
-                d.display(),
                 d.display(),
                 d.display()
             ),
@@ -263,9 +253,11 @@ impl Stack {
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"origin\"\nurl = \"https://{}\"\ntls_skip_verify = true\n\n\
+                 [[backend]]\nname = \"auth-check\"\nsockets = \"{}/check.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"origin\"\n\n\
                  [[route]]\npath = \"/{{*path}}\"\nbackend = \"origin\"\n",
-                source_port.addr()
+                source_port.addr(),
+                d.display()
             ),
         )
         .unwrap();
@@ -276,12 +268,11 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n\n\
                  [node]\nname = \"disk-cache\"\n\n\
-                 [auth]\npublic_key = \"{}/auth-public.pem\"\n\n\
+                 [auth]\nbackend = \"auth-check\"\n\n\
                  [health]\nmetrics_require = \"role:monitor\"\n\n\
                  [genid]\nupstream = \"origin\"\ntoken_file = \"{}/genid-token\"\nheartbeat_secs = 1\n\n\
                  [cache]\ndir = \"{}\"\n",
                 cache_port.addr(),
-                d.display(),
                 d.display(),
                 d.display(),
                 d.display(),
@@ -302,12 +293,12 @@ impl Stack {
             state_dir,
             source_port,
             cache_port,
-            private_pem,
+            _check: check,
         }
     }
 
     fn write_token(&self) -> String {
-        mint(&self.private_pem, &["writer"])
+        "write-token".to_string()
     }
 
     fn d(&self) -> &Path {
@@ -506,7 +497,7 @@ impl Stack {
     }
 
     fn perf(&self) -> Resp {
-        let auth = format!("Bearer {}", mint(&self.private_pem, &["monitor"]));
+        let auth = format!("Bearer {}", "monitor-token");
         self.get_cache("/perf", &[("Authorization", auth.as_str())])
     }
 

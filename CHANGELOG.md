@@ -40,7 +40,7 @@ The released versions, newest first:
 
 ## Unreleased
 
-**m6-http checks a token in one place, and every route that gates on one answers the same 401 or 403 from one definition.** Route `require`, `/perf`, `/traffic` and `/genid` each call `m6_http_lib::auth::check` exactly once per request; it decides `Allow(claims)`, `NoCredential` (401) or `Deny` (403), and `m6_core::http::token_refusal` is the only definition of the refusal's status, headers and body. The legacy `[health] metrics_token_file` bearer-string gate and its second checker, `m6_core::monitoring::metrics_authorised`, are removed: `/perf` and `/traffic` are gated by `metrics_require`, and without it they answer the 404 of an endpoint that does not exist. A missing `[auth] public_key` now fails closed on a `require` route instead of skipping the check.
+**m6-http checks a credential in one place, and every gate answers the same 401 or 403 from one definition.** Route `require`, `/perf`, `/traffic` and `/genid` each send one `POST /check` to `[auth] backend`; `m6_core::http::token_refusal` is the only definition of the refusal's status, headers and body. The legacy `[health] metrics_token_file` bearer-string gate and its second checker, `m6_core::monitoring::metrics_authorised`, are removed: `/perf` and `/traffic` are gated by `metrics_require`, and without it they answer the 404 of an endpoint that does not exist.
 
 ### Added
 
@@ -557,6 +557,14 @@ Comments only.
 
 ### Changed
 
+**Every credential gate in m6-http now asks m6-auth-server's `POST /check`, and `[auth] public_key` is removed.**
+`/perf`, `/traffic` and a source node's `GET` and `POST /genid` join route `require` on the one checker, under the same 50 ms deadline.
+A checker that does not answer is 503 with `Retry-After: 1`; a refusal is 401 or 403; `metrics_require`, `read_require` and `write_require` keep their names and meanings.
+`[auth]` now requires `backend`, and a config that still sets `public_key` fails at start with exit 2.
+**Migration:** add `[auth] backend = "<name>"` naming a `[[backend]]` with `sockets`, remove `[auth] public_key`, and run the check side of m6-auth-server on every node that gates a route, `/perf`, `/traffic` or `/genid`.
+No decision is cached, so a role change or a revocation counts from the next request.
+`cargo tree -p m6-http -e normal` lists no `jsonwebtoken`; the test `m6_http_does_not_link_jsonwebtoken` refuses it in the crate's manifest or source.
+
 **A `--check-only` `m6-auth-server` starts without the private signing key and cannot write the authority database.**
 The check unit answers `/check`, which decodes a token and reads users, so it now reads only `[keys] public_key` and opens the database through `m6_core::sqlite::open_read_only`.
 That opener creates no file, applies no schema and sets `PRAGMA query_only`, so a write through it fails with `SQLITE_READONLY`.
@@ -578,7 +586,7 @@ The credential is refused before the hand-built `POST /check` is written if it c
 A check that does not answer at all, through a transport failure or the 50 ms deadline, logs one warn naming the `auth-checker` dependency, and the next check that answers logs one info. A checker that answers 403, 500 or 503 is present and answering, so it logs neither.
 A config with a `require` route now needs `[auth] backend`, and the start fails without it.
 Public routes are unchanged and reach no authority.
-Three gates still decide locally until step 6: `/perf`, `/traffic` and a source node's `POST /genid` call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token the authority would refuse still opens them until it expires.
+The first cut of this entry left `/perf`, `/traffic` and `/genid` on the local verifier; the entry above moves them onto the same check.
 
 **`[auth] backend` now names the backend whose members answer `POST /check`, and every member is probed at start.**
 The key keeps its name and stays optional.

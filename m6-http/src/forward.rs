@@ -677,6 +677,18 @@ pub enum PendingKind {
     Auth,
 }
 
+/// Which gate a `PendingKind::Auth` request is waiting for.
+///
+/// The completion re-enters the request path with the decision, and this says
+/// where that decision is consumed: a route's `require`, `/perf` or
+/// `/traffic`, or `/genid`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthGate {
+    Route,
+    Metrics,
+    Genid,
+}
+
 /// Which upstream a pending request was dispatched to, so the loop can store
 /// who waits in that upstream's own slot and complete the waiter directly when
 /// the upstream finishes.
@@ -758,6 +770,9 @@ pub struct PendingUrlContext {
     /// on `PendingKind::Auth`, where the completion applies it to the identity
     /// the authority answered.
     pub auth_require: Option<String>,
+    /// Which gate `auth_require` belongs to. `Some` exactly when `kind` is
+    /// `Auth`.
+    pub auth_gate: Option<AuthGate>,
     /// The request arrived on the internal h2c listener. Carried so the check
     /// completion can re-enter `handle_request` with the same view the first
     /// pass had.
@@ -819,6 +834,7 @@ impl PendingUrlContext {
             kind: PendingKind::Socket,
             route_path: None,
             auth_require: None,
+            auth_gate: None,
             from_internal: false,
             route_cache: None,
             cacheable: false,
@@ -850,6 +866,7 @@ impl PendingUrlContext {
             kind: PendingKind::Url,
             route_path: None,
             auth_require: None,
+            auth_gate: None,
             from_internal: false,
             route_cache: None,
             cacheable: false,

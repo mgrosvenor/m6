@@ -195,7 +195,7 @@ The only process that listens on a public port.
 - One thread and one edge-triggered event loop over `m6_core::platform`
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, content-encoding)`, with each encoding variant cached independently
-- JWT verified locally with m6-auth's public key, so no request makes a network hop
+- Every credential check asks m6-auth-server's `POST /check` under a 50 ms deadline, so a role change or a revocation counts from the next request
 - Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
 - Backend sockets are found once at start from each pool's glob, and a change takes a restart
 - `site.toml` and the system config are read once at start.
@@ -540,7 +540,7 @@ tls_cert = "/etc/m6/cert.pem"
 tls_key  = "/etc/m6/key.pem"
 
 [auth]
-public_key = "/run/m6/auth.pub"
+backend = "auth-check"
 ```
 
 Every path in the system config is absolute, and a relative one is a startup error.

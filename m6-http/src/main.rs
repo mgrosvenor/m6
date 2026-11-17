@@ -146,7 +146,6 @@ use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::Signals;
 use m6_core::platform::{Events, Interest, Poll, Token};
-use m6_http_lib::auth::PublicKey;
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
@@ -318,7 +317,6 @@ struct ServerState {
     loaded_bad: usize,
     /// What the first heartbeat decided about the load, for `/perf`.
     disk_state: disk_cache::LoadState,
-    public_key: Option<PublicKey>,
     error_mode: ErrorMode,
     stats: Stats,
     /// One `mio` token per descriptor, the single allocator for every
@@ -1738,6 +1736,187 @@ fn complete_waiter(
     }
 }
 
+/// One gate's check request, with everything its pending context carries.
+struct CheckPlan<'a> {
+    req: &'a forward::HttpRequest,
+    client_ip: &'a str,
+    enc: &'a str,
+    auth_backend: String,
+    content_backend: String,
+    route_path: String,
+    route_cache: Option<String>,
+    cacheable: bool,
+    is_prefetch: bool,
+    from_internal: bool,
+    gate: forward::AuthGate,
+    require: String,
+}
+
+/// What resolving a gate's check produced.
+enum CheckResolution {
+    Decision(core_auth::Decision),
+    /// The request is parked on the authority; this is the answer to return.
+    Pending(RequestOutcome),
+}
+
+/// Resolve one gate's credential check.
+///
+/// A `pre_decided` answer for this gate is used as it is, which is the
+/// re-entry. Otherwise a request with no credential is refused here without a
+/// call, and a request with one parks on `POST /check`. Every launch failure is
+/// the authority being unreachable, so it answers 503 through
+/// `backend_unavailable`, never a 502 and never a 401.
+fn resolve_check(
+    plan: CheckPlan<'_>,
+    pre_decided: Option<PreDecided>,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+) -> CheckResolution {
+    if let Some(pre) = pre_decided {
+        return CheckResolution::Decision(if pre.gate == plan.gate {
+            pre.decision
+        } else {
+            core_auth::Decision::NoDecision
+        });
+    }
+    debug!("auth check");
+    let auth_header = m6_core::headers::get(&plan.req.headers[..], "authorization");
+    let cookie_header = auth::combined_cookie_header(&plan.req.headers);
+    let Some(credential) = auth::extract_token(auth_header, cookie_header.as_deref()) else {
+        return CheckResolution::Decision(core_auth::Decision::NoCredential);
+    };
+    let slot = match launch_socket_upstream(
+        state,
+        registry,
+        UpstreamSend::Check { credential },
+        plan.client_ip,
+        &plan.auth_backend,
+        auth::CHECK_DEADLINE,
+    ) {
+        Ok(slot) => slot,
+        Err(e) => {
+            note_check_reachability(state, false);
+            warn!(
+                backend = %plan.auth_backend,
+                route = %plan.route_path,
+                error = ?e,
+                "auth check dispatch failed"
+            );
+            return CheckResolution::Pending(backend_unavailable(
+                plan.req,
+                plan.client_ip,
+                state,
+                registry,
+                &plan.route_path,
+                &plan.auth_backend,
+                "auth check unavailable",
+            ));
+        }
+    };
+    let ctx = forward::PendingUrlContext {
+        req: plan.req.clone(),
+        client_ip: plan.client_ip.to_string(),
+        enc: plan.enc.to_string(),
+        backend_name: plan.content_backend,
+        kind: forward::PendingKind::Auth,
+        route_path: Some(plan.route_path),
+        auth_require: Some(plan.require),
+        auth_gate: Some(plan.gate),
+        from_internal: plan.from_internal,
+        route_cache: plan.route_cache,
+        cacheable: plan.cacheable,
+        is_prefetch: plan.is_prefetch,
+        start: m6_core::platform::now(),
+        error_status_override: None,
+        extra_headers: Vec::new(),
+        genid: state.genid.dispatched(),
+        genid_forward: false,
+    };
+    CheckResolution::Pending(RequestOutcome::Pending {
+        id: UpstreamId::Slot(slot),
+        ctx: Box::new(ctx),
+    })
+}
+
+/// Apply the `/perf` and `/traffic` gate, parking on the authority if needed.
+///
+/// `Err` is the answer to send. `Ok` means the endpoint may be served. The
+/// refusal is the authority's, unchanged: 401 or 403 from `token_refusal`, and
+/// 503 with `Retry-After: 1` for a checker that did not answer.
+fn metrics_gate_allows(
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    enc: &str,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    from_internal: bool,
+    pre_decided: &mut Option<PreDecided>,
+) -> Result<(), RequestOutcome> {
+    match health::metrics_gate(&state.config.health, client_ip, from_internal) {
+        health::Gate::Refused(code, headers, body) => Err(RequestOutcome::Ready(
+            code,
+            headers,
+            body,
+            health::PERF_BACKEND.to_string(),
+            None,
+        )),
+        health::Gate::Open => Ok(()),
+        health::Gate::Check(require) => {
+            let auth_backend = auth_backend_name(state);
+            let plan = CheckPlan {
+                req,
+                client_ip,
+                enc,
+                auth_backend: auth_backend.clone(),
+                content_backend: health::PERF_BACKEND.to_string(),
+                route_path: req.path.clone(),
+                route_cache: None,
+                cacheable: false,
+                is_prefetch: false,
+                from_internal,
+                gate: forward::AuthGate::Metrics,
+                require,
+            };
+            let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
+                CheckResolution::Decision(decision) => decision,
+                CheckResolution::Pending(outcome) => return Err(outcome),
+            };
+            match decision {
+                core_auth::Decision::Allow(_) => Ok(()),
+                core_auth::Decision::NoDecision => Err(backend_unavailable(
+                    req,
+                    client_ip,
+                    state,
+                    registry,
+                    &req.path,
+                    &auth_backend,
+                    "auth check unavailable",
+                )),
+                refusal => {
+                    let (code, headers, body) = refusal.refusal().expect("a refusal");
+                    Err(RequestOutcome::Ready(
+                        code,
+                        headers,
+                        body,
+                        "auth".to_string(),
+                        None,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// The configured authority's backend name, or `[auth]` for an error context.
+fn auth_backend_name(state: &ServerState) -> String {
+    state
+        .config
+        .auth
+        .as_ref()
+        .map(|auth| auth.backend.clone())
+        .unwrap_or_else(|| "[auth]".to_string())
+}
+
 /// Record whether the authority answered, with one log line per change.
 ///
 /// `answered` is false only when the check did not answer at all: a transport
@@ -1795,7 +1974,10 @@ fn complete_auth(
         ctx.is_prefetch,
         ctx.from_internal,
         cx.registry,
-        Some(decision),
+        Some(PreDecided {
+            gate: ctx.auth_gate.unwrap_or(forward::AuthGate::Route),
+            decision,
+        }),
     );
     let priority = if matches!(waiter, Waiter::H3 { .. }) {
         priority::from_headers(
@@ -4306,6 +4488,12 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
 /// inserts into the cache itself, so `should_cache` still inspects the exact
 /// `Vary` the backend sent, and a response varying on anything beyond encoding
 /// stays uncacheable.
+/// The authority's answer, carried back into the request path.
+struct PreDecided {
+    gate: forward::AuthGate,
+    decision: core_auth::Decision,
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the request path's fixed inputs, plus the decision a check re-entry carries"
@@ -4320,7 +4508,7 @@ fn handle_request(
     registry: &m6_core::platform::Registry,
     // A decision the auth check already produced, for the re-entry after
     // `POST /check`. `None` on every first pass.
-    pre_decided: Option<core_auth::Decision>,
+    pre_decided: Option<PreDecided>,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(
@@ -4824,8 +5012,9 @@ fn handle_request_inner(
     // client cannot claim it. The error-path guard and the metrics gate read it.
     from_internal: bool,
     registry: &m6_core::platform::Registry,
-    pre_decided: Option<core_auth::Decision>,
+    pre_decided: Option<PreDecided>,
 ) -> RequestOutcome {
+    let mut pre_decided = pre_decided;
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
     // them as analytics would mint a session/log a "MISS" line for a visit
@@ -4949,54 +5138,56 @@ fn handle_request_inner(
     // the split is what keeps the health answer cheap. `snapshot` is passed
     // as a closure and is not called until authorisation passes.
     if state.config.health.enabled && req.path == state.config.health.perf_path {
-        let (code, headers, body) = match health::metrics_gate(
-            &state.config.health,
-            state.public_key.as_ref(),
-            &req.headers,
+        if let Err(outcome) = metrics_gate_allows(
+            req,
             client_ip,
+            content_encoding,
+            state,
+            registry,
             from_internal,
+            &mut pre_decided,
         ) {
-            health::Gate::Refused(code, headers, body) => (code, headers, body),
-            health::Gate::Open => {
-                // Pool sizes are gathered here rather than on `/health`,
-                // which publishes neither, and only after the gate has passed.
-                // It costs a lock-free read of the pool manager, unlike the
-                // reservoir sort in `snapshot`.
-                let pools: Vec<health::PoolHealth> = state
-                    .pool_manager
-                    .pool_health()
-                    .into_iter()
-                    .map(|(name, total)| health::PoolHealth { name, total })
-                    .collect();
-                let outcome = health::PerfReport::build_authorised(
-                    health::PerfSubject {
-                        process_index: state.config.server.process_index,
-                        node: &state.config.node.name,
-                        uptime_s: state.started.elapsed().as_secs(),
-                        pools,
-                        url_backends: state.pool_manager.url_backend_names(),
-                        host_path: &state.config.site_dir,
-                    },
-                    || state.stats.snapshot(),
-                );
-                match outcome {
-                    health::PerfOutcome::Ok(report) => match state.config.genid.as_ref() {
-                        Some(genid_config) => health::genid_perf_response(
-                            *report,
-                            &state.genid,
-                            genid_config,
-                            state.disk.as_ref().map(|writer| health::DiskPerf {
-                                writer,
-                                queued: state.cache.queued(),
-                                loaded_entries: state.loaded_entries,
-                                loaded_bad: state.loaded_bad,
-                                state: state.disk_state,
-                            }),
-                        ),
-                        None => health::PerfOutcome::Ok(report).into_response(),
-                    },
-                    other => other.into_response(),
-                }
+            return outcome;
+        }
+        let (code, headers, body) = {
+            // Pool sizes are gathered here rather than on `/health`,
+            // which publishes neither, and only after the gate has passed.
+            // It costs a lock-free read of the pool manager, unlike the
+            // reservoir sort in `snapshot`.
+            let pools: Vec<health::PoolHealth> = state
+                .pool_manager
+                .pool_health()
+                .into_iter()
+                .map(|(name, total)| health::PoolHealth { name, total })
+                .collect();
+            let outcome = health::PerfReport::build_authorised(
+                health::PerfSubject {
+                    process_index: state.config.server.process_index,
+                    node: &state.config.node.name,
+                    uptime_s: state.started.elapsed().as_secs(),
+                    pools,
+                    url_backends: state.pool_manager.url_backend_names(),
+                    host_path: &state.config.site_dir,
+                },
+                || state.stats.snapshot(),
+            );
+            match outcome {
+                health::PerfOutcome::Ok(report) => match state.config.genid.as_ref() {
+                    Some(genid_config) => health::genid_perf_response(
+                        *report,
+                        &state.genid,
+                        genid_config,
+                        state.disk.as_ref().map(|writer| health::DiskPerf {
+                            writer,
+                            queued: state.cache.queued(),
+                            loaded_entries: state.loaded_entries,
+                            loaded_bad: state.loaded_bad,
+                            state: state.disk_state,
+                        }),
+                    ),
+                    None => health::PerfOutcome::Ok(report).into_response(),
+                },
+                other => other.into_response(),
             }
         };
         // Same treatment as /health above. A 401 here is worth seeing: it
@@ -5021,22 +5212,24 @@ fn handle_request_inner(
     // one. Cached, so a polling monitor cannot make the node rebuild it on
     // every scrape.
     if state.config.health.enabled && req.path == state.config.health.traffic_path {
-        let (code, headers, body) = match health::metrics_gate(
-            &state.config.health,
-            state.public_key.as_ref(),
-            &req.headers,
+        if let Err(outcome) = metrics_gate_allows(
+            req,
             client_ip,
+            content_encoding,
+            state,
+            registry,
             from_internal,
+            &mut pre_decided,
         ) {
-            health::Gate::Refused(code, headers, body) => (code, headers, body),
-            health::Gate::Open => health::traffic_authorised(
-                &state.config.node.name,
-                &state.traffic,
-                &mut state.traffic_report,
-                std::time::Duration::from_secs(state.config.health.traffic_cache_s),
-            )
-            .into_response(),
-        };
+            return outcome;
+        }
+        let (code, headers, body) = health::traffic_authorised(
+            &state.config.node.name,
+            &state.traffic,
+            &mut state.traffic_report,
+            std::time::Duration::from_secs(state.config.health.traffic_cache_s),
+        )
+        .into_response();
         analytics::log_monitor(
             state.config.analytics.enabled,
             &req.headers,
@@ -5116,6 +5309,7 @@ fn handle_request_inner(
                     kind: forward::PendingKind::Url,
                     route_path: None,
                     auth_require: None,
+                    auth_gate: None,
                     from_internal,
                     route_cache: None,
                     cacheable: false,
@@ -5169,15 +5363,7 @@ fn handle_request_inner(
             }
 
             let write = req.method == "POST";
-            let gate = health::genid_gate(
-                genid_config,
-                state.public_key.as_ref(),
-                &req.headers,
-                client_ip,
-                from_internal,
-                write,
-            );
-            match gate {
+            match health::genid_gate(genid_config, client_ip, from_internal, write) {
                 health::Gate::Refused(code, headers, body) => {
                     return RequestOutcome::Ready(
                         code,
@@ -5188,6 +5374,51 @@ fn handle_request_inner(
                     );
                 }
                 health::Gate::Open => {}
+                health::Gate::Check(require) => {
+                    let auth_backend = auth_backend_name(state);
+                    let plan = CheckPlan {
+                        req,
+                        client_ip,
+                        enc: content_encoding,
+                        auth_backend: auth_backend.clone(),
+                        content_backend: health::GENID_BACKEND.to_string(),
+                        route_path: req.path.clone(),
+                        route_cache: None,
+                        cacheable: false,
+                        is_prefetch: false,
+                        from_internal,
+                        gate: forward::AuthGate::Genid,
+                        require,
+                    };
+                    let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
+                        CheckResolution::Decision(decision) => decision,
+                        CheckResolution::Pending(outcome) => return outcome,
+                    };
+                    match decision {
+                        core_auth::Decision::Allow(_) => {}
+                        core_auth::Decision::NoDecision => {
+                            return backend_unavailable(
+                                req,
+                                client_ip,
+                                state,
+                                registry,
+                                &req.path,
+                                &auth_backend,
+                                "auth check unavailable",
+                            );
+                        }
+                        refusal => {
+                            let (code, headers, body) = refusal.refusal().expect("a refusal");
+                            return RequestOutcome::Ready(
+                                code,
+                                headers,
+                                body,
+                                "auth".to_string(),
+                                None,
+                            );
+                        }
+                    }
+                }
             }
             match req.method.as_str() {
                 "GET" | "HEAD" => {
@@ -5318,100 +5549,24 @@ fn handle_request_inner(
     // refresh path, when it still holds a refresh cookie), and a credential
     // lacking the role gets the site's own 403 page rather than JSON.
     if let Some(ref require) = route.require {
-        // The authority's backend, for the 503's error context and the warn
-        // line. A check failure is the authority's, and naming the route's
-        // content backend in the page told a reader the wrong service failed.
-        let auth_backend = state
-            .config
-            .auth
-            .as_ref()
-            .and_then(|auth| auth.backend.clone())
-            .unwrap_or_else(|| "[auth]".to_string());
-        let decision = match pre_decided {
-            Some(decision) => decision,
-            None => {
-                debug!("auth check");
-                let auth_header = m6_core::headers::get(&req.headers[..], "authorization");
-                let cookie_header = auth::combined_cookie_header(&req.headers);
-                match auth::extract_token(auth_header, cookie_header.as_deref()) {
-                    // No credential is answered here. An anonymous request
-                    // never reaches the authority, so an auth outage cannot
-                    // touch it.
-                    None => core_auth::Decision::NoCredential,
-                    Some(credential) => {
-                        let Some(backend) = state
-                            .config
-                            .auth
-                            .as_ref()
-                            .and_then(|auth| auth.backend.as_deref())
-                            .map(str::to_string)
-                        else {
-                            return backend_unavailable(
-                                req,
-                                client_ip,
-                                state,
-                                registry,
-                                &route.path,
-                                &auth_backend,
-                                "[auth] backend is not configured",
-                            );
-                        };
-                        let slot = match launch_socket_upstream(
-                            state,
-                            registry,
-                            UpstreamSend::Check { credential },
-                            client_ip,
-                            &backend,
-                            auth::CHECK_DEADLINE,
-                        ) {
-                            Ok(slot) => slot,
-                            // Every launch failure is the authority being
-                            // unreachable, so it answers the same 503 as an
-                            // unreachable backend. Never a 502, never a 401.
-                            Err(e) => {
-                                note_check_reachability(state, false);
-                                warn!(
-                                    backend = %auth_backend,
-                                    route = %route.path,
-                                    error = ?e,
-                                    "auth check dispatch failed"
-                                );
-                                return backend_unavailable(
-                                    req,
-                                    client_ip,
-                                    state,
-                                    registry,
-                                    &route.path,
-                                    &auth_backend,
-                                    "auth check unavailable",
-                                );
-                            }
-                        };
-                        let ctx = forward::PendingUrlContext {
-                            req: req.clone(),
-                            client_ip: client_ip.to_string(),
-                            enc: content_encoding.to_string(),
-                            backend_name: route.backend.clone(),
-                            kind: forward::PendingKind::Auth,
-                            route_path: Some(route.path.clone()),
-                            auth_require: Some(require.clone()),
-                            from_internal,
-                            route_cache: route.cache.clone(),
-                            cacheable: false,
-                            is_prefetch,
-                            start: m6_core::platform::now(),
-                            error_status_override: None,
-                            extra_headers: Vec::new(),
-                            genid: state.genid.dispatched(),
-                            genid_forward: false,
-                        };
-                        return RequestOutcome::Pending {
-                            id: UpstreamId::Slot(slot),
-                            ctx: Box::new(ctx),
-                        };
-                    }
-                }
-            }
+        let auth_backend = auth_backend_name(state);
+        let plan = CheckPlan {
+            req,
+            client_ip,
+            enc: content_encoding,
+            auth_backend: auth_backend.clone(),
+            content_backend: route.backend.clone(),
+            route_path: route.path.clone(),
+            route_cache: route.cache.clone(),
+            cacheable: false,
+            is_prefetch,
+            from_internal,
+            gate: forward::AuthGate::Route,
+            require: require.clone(),
+        };
+        let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
+            CheckResolution::Decision(decision) => decision,
+            CheckResolution::Pending(outcome) => return outcome,
         };
         match decision {
             core_auth::Decision::Allow(identity) => verified_identity = Some(identity),
@@ -5520,6 +5675,7 @@ fn handle_request_inner(
             kind: forward::PendingKind::Url,
             route_path: None,
             auth_require: None,
+            auth_gate: None,
             from_internal,
             route_cache: route.cache.clone(),
             cacheable,
@@ -5627,6 +5783,7 @@ fn handle_request_inner(
         kind: forward::PendingKind::Socket,
         route_path: Some(route.path.clone()),
         auth_require: None,
+        auth_gate: None,
         from_internal,
         route_cache: route.cache.clone(),
         cacheable,
@@ -5819,6 +5976,7 @@ fn dispatch_custom_error_async(
             kind: forward::PendingKind::Url,
             route_path: None,
             auth_require: None,
+            auth_gate: None,
             from_internal: false,
             route_cache: None,
             cacheable: false,
@@ -5856,6 +6014,7 @@ fn dispatch_custom_error_async(
         kind: forward::PendingKind::Socket,
         route_path: None,
         auth_require: None,
+        auth_gate: None,
         from_internal: false,
         route_cache: None,
         cacheable: false,
@@ -7179,20 +7338,6 @@ fn run(args: Vec<String>) -> i32 {
         return 0;
     }
 
-    // Load public key if auth declared
-    let public_key = if let Some(ref auth_cfg) = config.auth {
-        let key_path = PathBuf::from(&auth_cfg.public_key);
-        match PublicKey::from_pem_file(&key_path) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                eprintln!("auth key load error: {}", e);
-                return 2;
-            }
-        }
-    } else {
-        None
-    };
-
     // The generation state, after the `--dump-config` and redirect-mode
     // returns: a dump with `[genid]` and no StateDirectory prints and exits 0,
     // because it is not about to serve. A cache node holds no file. A source
@@ -7257,17 +7402,16 @@ fn run(args: Vec<String>) -> i32 {
     // start. A member that is down only warns, so a node can start while its
     // check process is being replaced.
     if let Some(ref auth_cfg) = config.auth {
-        if let Some(ref backend) = auth_cfg.backend {
-            let Some(pool) = pool_manager.get_pool(backend) else {
-                eprintln!(
-                    "m6-http: [auth] backend \"{backend}\" names no socket backend; [auth] backend must name a [[backend]] with `sockets`"
-                );
-                return 2;
-            };
-            if let Err(message) = probe_auth_backend(pool) {
-                eprintln!("{message}");
-                return 2;
-            }
+        let backend = &auth_cfg.backend;
+        let Some(pool) = pool_manager.get_pool(backend) else {
+            eprintln!(
+                "m6-http: [auth] backend \"{backend}\" names no socket backend; [auth] backend must name a [[backend]] with `sockets`"
+            );
+            return 2;
+        };
+        if let Err(message) = probe_auth_backend(pool) {
+            eprintln!("{message}");
+            return 2;
         }
     }
 
@@ -7552,7 +7696,6 @@ fn run(args: Vec<String>) -> i32 {
         loaded_entries,
         loaded_bad,
         disk_state,
-        public_key,
         error_mode,
         stats: initial_stats(),
         sources: Slots::new(initial_connections, ceiling, || Source::Vacant),

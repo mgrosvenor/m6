@@ -4,7 +4,7 @@
 //! Every test starts a real `m6-http` source in front of a real `m6-html`, and a
 //! second `m6-http` cache node whose `[genid] upstream` names the source and
 //! whose routes point at it. The tokens are ES256 JWTs minted here, verified by
-//! the source with the `[auth] public_key` the fixture writes. Nothing waits on
+//! the source with a credential a fake `/check` authority answers. Nothing waits on
 //! a fixed sleep for a result: every wait polls a condition with a deadline.
 //!
 //! Breaks are named on the tests that carry one.
@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
+use check_support::{identity, Reply, RunningCheck};
 
 // ── Responses ─────────────────────────────────────────────────────────────────
 
@@ -89,34 +93,6 @@ fn parse_h1(raw: &[u8]) -> Resp {
     }
 }
 
-// ── Crypto fixtures ───────────────────────────────────────────────────────────
-
-fn keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-fn mint(private_pem: &str, roles: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: i64,
-        roles: Vec<String>,
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let claims = Claims {
-        sub: "genid-cache-test".to_string(),
-        exp: now + 3600,
-        roles: roles.iter().map(|r| r.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 // ── The stack under test ──────────────────────────────────────────────────────
 
 /// A source `m6-http` and a cache `m6-http` in front of it, with the ports,
@@ -133,7 +109,7 @@ struct Stack {
     state_dir: PathBuf,
     source_port: PortClaim,
     cache_port: PortClaim,
-    private_pem: String,
+    _check: RunningCheck,
 }
 
 impl Stack {
@@ -152,13 +128,26 @@ impl Stack {
         .expect("rcgen");
         std::fs::write(d.join("cert.pem"), ck.cert.pem()).unwrap();
         std::fs::write(d.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
-        let (private_pem, public_pem) = keypair();
-        std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
-        std::fs::write(
-            d.join("genid-token"),
-            format!("{}\n", mint(&private_pem, &["reader"])),
+        let check_path = d.join("check.sock");
+        let check = RunningCheck::start(
+            &check_path,
+            vec![
+                (
+                    "read-token".to_string(),
+                    Reply::Identity(identity(&[], &["reader"])),
+                ),
+                (
+                    "write-token".to_string(),
+                    Reply::Identity(identity(&[], &["writer"])),
+                ),
+                (
+                    "monitor-token".to_string(),
+                    Reply::Identity(identity(&[], &["monitor"])),
+                ),
+            ],
         )
         .unwrap();
+        std::fs::write(d.join("genid-token"), "read-token\n").unwrap();
 
         let source_port = claim_port();
         let cache_port = claim_port();
@@ -199,8 +188,10 @@ impl Stack {
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"m6-html\"\nsockets = \"{}/html-*.sock\"\n\n\
+                 [[backend]]\nname = \"auth-check\"\nsockets = \"{}/check.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"m6-html\"\n\n\
                  [[route]]\npath = \"/other\"\nbackend = \"m6-html\"\n",
+                d.display(),
                 d.display()
             ),
         )
@@ -212,10 +203,9 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n\n\
                  [node]\nname = \"genid-source\"\n\n\
-                 [auth]\npublic_key = \"{}/auth-public.pem\"\n\n\
+                 [auth]\nbackend = \"auth-check\"\n\n\
                  [genid]\nread_require = \"role:reader\"\nwrite_require = \"role:writer\"\n",
                 source_port.addr(),
-                d.display(),
                 d.display(),
                 d.display()
             ),
@@ -238,9 +228,11 @@ impl Stack {
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [[backend]]\nname = \"origin\"\nurl = \"https://{}\"\ntls_skip_verify = true\n\n\
+                 [[backend]]\nname = \"auth-check\"\nsockets = \"{}/check.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"origin\"\n\n\
                  [[route]]\npath = \"/{{*path}}\"\nbackend = \"origin\"\n",
-                source_port.addr()
+                source_port.addr(),
+                d.display()
             ),
         )
         .unwrap();
@@ -251,11 +243,10 @@ impl Stack {
             format!(
                 "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\nwarm_on_start = {warm_on_start}\n\n\
                  [node]\nname = \"genid-cache\"\n\n\
-                 [auth]\npublic_key = \"{}/auth-public.pem\"\n\n\
+                 [auth]\nbackend = \"auth-check\"\n\n\
                  [health]\nmetrics_require = \"role:monitor\"\n\n\
                  [genid]\nupstream = \"origin\"\ntoken_file = \"{}/genid-token\"\nheartbeat_secs = {heartbeat_secs}\n",
                 cache_port.addr(),
-                d.display(),
                 d.display(),
                 d.display(),
                 d.display()
@@ -274,20 +265,16 @@ impl Stack {
             state_dir,
             source_port,
             cache_port,
-            private_pem,
+            _check: check,
         }
     }
 
-    fn token(&self, roles: &[&str]) -> String {
-        mint(&self.private_pem, roles)
-    }
-
     fn read_token(&self) -> String {
-        self.token(&["reader"])
+        "read-token".to_string()
     }
 
     fn write_token(&self) -> String {
-        self.token(&["writer"])
+        "write-token".to_string()
     }
 
     fn d(&self) -> &Path {
@@ -474,7 +461,7 @@ impl Stack {
     }
 
     fn perf(&self) -> Resp {
-        let auth = format!("Bearer {}", self.token(&["monitor"]));
+        let auth = format!("Bearer {}", "monitor-token");
         self.get_cache("/perf", &[("Authorization", auth.as_str())])
     }
 

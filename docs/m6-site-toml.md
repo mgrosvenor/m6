@@ -167,8 +167,7 @@ tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 
 [auth]
-backend    = "m6-auth-check"     # the backend declared above
-public_key = "/etc/m6/auth.pub"  # m6-auth's public key, used to verify tokens locally
+backend = "m6-auth-check"  # the backend whose members answer POST /check
 ```
 
 The example keeps the bind address, the certificate and key, and the `[auth]` section in the system config.
@@ -210,7 +209,7 @@ The merge rules, in order:
 
 1. Each key has one file, Table 1 in §3.3.
 2. A key in the other file, an unknown key or section in either file, or a system config with no `[node]` stops m6-http at start with exit 2, and the error names the key and the file it belongs in.
-3. `tls_cert`, `tls_key` and `[auth] public_key` are absolute paths, and a relative one is a startup error, exit 2.
+3. `tls_cert` and `tls_key` are absolute paths, and a relative one is a startup error, exit 2.
 4. An absolute path is used as given.
 5. Validation runs after both files are read.
 6. When both arguments name one file, every key is read from it, `[node]` included.
@@ -475,19 +474,18 @@ backend = "m6-html"
 
 ### 4.5. `[auth]`
 
-The `[auth]` table gives m6-http the key that verifies a *JWT* (JSON Web Token).
-Table 7 gives its two keys.
-Take from it that a site that only verifies tokens needs `public_key` alone.
+The `[auth]` table names the authority m6-http asks about a credential.
+Table 7 gives its one key.
+Take from it that every gated path needs a running checker: a route `require`, `metrics_require`, and a source node's `/genid`.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `backend` | string | no | The name of a declared `[[backend]]` with `sockets`. It is the backend whose members answer `POST /check`, and each member is probed once at start. A `url` backend is refused by name |
-| `public_key` | string | yes | Absolute path to m6-auth's public key for local JWT verification |
+| `backend` | string | yes | The name of a declared `[[backend]]` with `sockets`. It is the backend whose members answer `POST /check`, and each member is probed once at start. A `url` backend is refused by name |
 
-**Table 7: the `[auth]` keys.**
+**Table 7: the `[auth]` key.**
 The name in `backend` must be a socket backend, and its members are probed at start: 401 or 503 passes, 404 stops the start, and a refused connection warns.
-The key in `public_key` verifies every token.
-No request path calls `/check` yet.
+Every credential check sends one `POST /check`, so a node with any gated path needs a running checker.
+`[auth] public_key` is removed; the edge holds no key.
 
 `[auth]` sits in the system config only.
 
@@ -504,7 +502,7 @@ Take from it that the endpoint layout is site-wide and the two access keys belon
 | `perf_path` | string | `"/perf"` | Counters, latency percentiles and host facts |
 | `traffic_path` | string | `"/traffic"` | A summary of the last hour this process served, from memory. See [`m6-http.md`](m6-http.md) |
 | `traffic_cache_s` | integer | `60` | Seconds a `/traffic` summary is reused |
-| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. A token with this claim opens `/perf` and `/traffic`, and it comes from the Authorization header or the session cookie as a route `require` reads it. The one token check decides; without this key the endpoints answer 404 |
+| `metrics_require` | string | none | `"role:<name>"` or `"group:<name>"`. An identity with this claim opens `/perf` and `/traffic`, from the credential a route `require` reads. `POST /check` decides; without this key the endpoints answer 404 |
 | `metrics_peers` | list of strings | none | The IP addresses allowed to read `/perf` and `/traffic`. Anyone else gets 404 |
 
 **Table 8: the `[health]` keys.**
@@ -514,9 +512,10 @@ A request to `/perf` or `/traffic` is served only when both rules that are set p
 
 1. `metrics_peers`, when set: the request did not arrive on an internal h2c listener, and its peer address is one of the listed addresses.
    Otherwise the answer is 404 with the body of an endpoint that is not enabled, before any token is read.
-2. `metrics_require`, when set: the request carries a token, from the Authorization header or the session cookie as a route `require` reads it, that `[auth] public_key` verifies and that holds the claim.
-   No token or a bad token is 401 with `WWW-Authenticate: Bearer`.
-   A valid token without the claim is 403.
+2. `metrics_require`, when set: the request carries a credential, from the Authorization header or the session cookie as a route `require` reads it, and the authority answers an identity that holds the claim.
+   No credential, or one the authority refuses, is 401 with `WWW-Authenticate: Bearer`.
+   An identity without the claim is 403.
+   A checker that does not answer is 503 with `Retry-After: 1`.
    Without `metrics_require` the endpoints answer 404, so there is no second gate and no legacy bearer file.
 
 The peer address is the one a completed TCP or QUIC handshake proved, never a header.
@@ -535,7 +534,7 @@ The example below gates `/perf` and `/traffic` on a role and one peer address.
 
 ```toml
 [auth]
-public_key = "/etc/m6/api-auth.pub"
+backend = "auth-check"
 
 [health]
 metrics_require = "role:monitor"
@@ -652,11 +651,11 @@ Take from it that the two shapes do not mix and that the table belongs to the sy
 | `heartbeat_secs` | integer | 10 | Seconds between heartbeats. Cache node only |
 
 **Table 13: the `[genid]` keys.**
-A source sets both claims or neither, and needs `[auth] public_key` for either.
+A source sets both claims or neither, and needs `[auth] backend` for either.
 A cache node sets `upstream` and `token_file`, and needs `[auth]` for nothing, because the source authorises the caller.
 
 The start is refused with exit 2 for any of these.
-A table with only one claim, a claim that names no role or group, or a claim without `[auth] public_key`.
+A table with only one claim, a claim that names no role or group, or a claim without `[auth] backend`.
 `upstream` that names no `[[backend]]` with a `url`, or that is set without `token_file`.
 `token_file` that is relative, unreadable or empty.
 `heartbeat_secs = 0`.
@@ -670,7 +669,7 @@ A cache node holds no file and needs no `StateDirectory=`.
 
 ```toml
 [auth]
-public_key = "/etc/m6/api-auth.pub"
+backend = "auth-check"
 
 [genid]
 read_require  = "role:monitor"
@@ -831,10 +830,9 @@ Exit 2 on:
 - `cache` on a `[[route]]` or a `[[route_group]]` that is empty or holds a control character
 - A `methods` list naming a method other than `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or an empty list
 - `[errors] mode = "custom"` without `path`
-- `[auth]` declared but `public_key` file not found
-- `[auth]` declared with a `backend` that is not declared in `[[backend]]`, or that names a `url` backend
+- `[auth]` with no `backend`, or one that is not declared in `[[backend]]`, or that names a `url` backend
 - `require` on a route but no `[auth]` declared
-- `tls_cert`, `tls_key` or `[auth] public_key` given as a relative path
+- `tls_cert` or `tls_key` given as a relative path
 - `[health] metrics_peers` empty, or an entry that is not an IP address (names are never resolved, ranges and ports are refused)
 - `[health] metrics_peers` entry that is not in a local range
 - `[health] metrics_require` without `[auth]`, or not `role:<name>` or `group:<name>`

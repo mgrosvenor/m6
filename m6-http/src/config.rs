@@ -554,9 +554,10 @@ pub struct HealthConfig {
     #[serde(default = "default_traffic_cache_s")]
     pub traffic_cache_s: u64,
     /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
-    /// an API token that carries this claim, verified with `[auth] public_key`
-    /// exactly as a route `require` is: 401 for no or a bad token, 403 for the
-    /// wrong claim, both answered by the one token check.
+    /// a credential for an identity that carries this claim, checked by
+    /// `POST /check` exactly as a route `require` is: 401 for no or a refused
+    /// credential, 403 for the wrong claim, and 503 for a checker that did
+    /// not answer.
     #[serde(default)]
     pub metrics_require: Option<String>,
     /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
@@ -830,13 +831,9 @@ impl SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Optional. When given it must name a `[[backend]]` with `sockets`.
-    /// It is the backend the edge will send `POST /check` to, and its members
-    /// are probed once at start. It has no effect on request verification
-    /// until the check path lands.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    pub public_key: String,
+    /// The `[[backend]]` whose members answer `POST /check`, with `sockets`.
+    /// Its members are probed once at start.
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1531,33 +1528,27 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // Validate auth. The misplaced check above has already refused an [auth] in
     // site.toml in two-file mode, so `auth` is the one owner's value.
     if let Some(ref a) = auth {
-        let key_path = secret_path("[auth] public_key", &a.public_key)?;
-        if !key_path.exists() {
+        let Some(backend) = backends.iter().find(|backend| backend.name == a.backend) else {
             anyhow::bail!(
-                "config error: [auth].public_key file not found: {}",
-                key_path.display()
+                "config error: [auth].backend `{}` not in [[backend]]",
+                a.backend
             );
-        }
-        if let Some(ref b) = a.backend {
-            let Some(backend) = backends.iter().find(|backend| backend.name == *b) else {
-                anyhow::bail!("config error: [auth].backend `{}` not in [[backend]]", b);
-            };
-            // The check path is the socket-backend dispatch, so a URL backend
-            // cannot serve it: that would be a different transport and a
-            // different round trip. Refuse it by name at load, where
-            // --dump-config sees it too.
-            if backend.sockets.is_none() {
-                anyhow::bail!(
-                    "config error: [auth].backend `{}` is a URL backend: the check path is a Unix socket on this host, so [auth].backend must name a backend with `sockets`",
-                    b
-                );
-            }
+        };
+        // The check path is the socket-backend dispatch, so a URL backend
+        // cannot serve it: that would be a different transport and a
+        // different round trip. Refuse it by name at load, where
+        // --dump-config sees it too.
+        if backend.sockets.is_none() {
+            anyhow::bail!(
+                "config error: [auth].backend `{}` is a URL backend: the check path is a Unix socket on this host, so [auth].backend must name a backend with `sockets`",
+                a.backend
+            );
         }
     }
 
     // Validate require on routes needs [auth], and [auth] needs the check
     // backend that answers POST /check.
-    let auth_backend = auth.as_ref().and_then(|auth| auth.backend.as_deref());
+    let auth_backend = auth.as_ref().map(|auth| auth.backend.as_str());
     for route in &routes {
         if route.require.is_some() {
             if auth.is_none() {
@@ -1593,11 +1584,11 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
 
     if let Some(ref r) = health.metrics_require {
         if auth.is_none() {
-            anyhow::bail!("config error: [health].metrics_require needs [auth] with a public_key");
+            anyhow::bail!("config error: [health].metrics_require needs [auth] with a backend");
         }
         let named = matches!(
-            crate::auth::Require::parse(r),
-            Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
+            m6_core::auth::Require::parse(r),
+            Some(m6_core::auth::Require::Role(n) | m6_core::auth::Require::Group(n)) if !n.is_empty()
         );
         if !named {
             anyhow::bail!(
@@ -1708,12 +1699,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                 let Some(value) = value else { continue };
                 if auth.is_none() {
                     anyhow::bail!(
-                        "config error: [genid] read_require and write_require need [auth] with a public_key"
+                        "config error: [genid] read_require and write_require need [auth] with a backend"
                     );
                 }
                 let named = matches!(
-                    crate::auth::Require::parse(value),
-                    Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
+                    m6_core::auth::Require::parse(value),
+                    Some(m6_core::auth::Require::Role(n) | m6_core::auth::Require::Group(n)) if !n.is_empty()
                 );
                 if !named {
                     anyhow::bail!(
@@ -2870,7 +2861,6 @@ domain = "test.example.com"
     fn load_with(site_extra: &str, sys_extra: &str) -> (TempDir, anyhow::Result<Config>) {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        write_file(dir.path(), "auth.pem", "dummy");
         let mut site = minimal_site_toml();
         site.push_str(&site_extra.replace("{DIR}", &dir.path().display().to_string()));
         write_file(dir.path(), "site.toml", &site);
@@ -2882,58 +2872,39 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn auth_without_backend_loads() {
-        let (_d, cfg) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
-        let cfg = cfg.unwrap();
-        let auth = cfg.auth.expect("auth present");
-        assert_eq!(auth.backend, None);
-        assert!(auth.public_key.ends_with("/auth.pem"));
+    fn auth_needs_a_backend() {
+        let (_d, r) = load_with("", "\n[auth]\n");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("backend"), "{e}");
     }
 
     #[test]
     fn auth_backend_when_given_must_be_declared() {
-        let (_d, r) = load_with(
-            "",
-            "\n[auth]\nbackend = \"nope\"\npublic_key = \"{DIR}/auth.pem\"\n",
-        );
+        let (_d, r) = load_with("", "\n[auth]\nbackend = \"nope\"\n");
         assert!(r
             .unwrap_err()
             .to_string()
             .contains("[auth].backend `nope` not in [[backend]]"));
-        let (_d, ok) = load_with(
-            "",
-            "\n[auth]\nbackend = \"m6-html\"\npublic_key = \"{DIR}/auth.pem\"\n",
-        );
+        let (_d, ok) = load_with("", "\n[auth]\nbackend = \"m6-html\"\n");
         assert!(ok.is_ok());
     }
 
     #[test]
     fn auth_from_the_system_config_is_used() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
+        let (_d, r) = load_with("", "\n[auth]\nbackend = \"m6-html\"\n");
         let auth = r.unwrap().auth.expect("auth present");
-        assert!(auth.public_key.ends_with("/auth.pem"));
-        assert_eq!(auth.backend, None);
+        assert_eq!(auth.backend, "m6-html");
     }
 
     #[test]
     fn auth_in_both_files_is_refused() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n",
         );
         let e = r.unwrap_err().to_string();
         assert!(e.contains("site.toml sets [auth],"), "{e}");
         assert!(e.contains("belongs in the system config"), "{e}");
-    }
-
-    #[test]
-    fn a_missing_public_key_file_is_refused() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/missing.pem\"\n");
-        let e = r.unwrap_err().to_string();
-        assert!(
-            e.contains("[auth].public_key file not found") && e.ends_with("/missing.pem"),
-            "{e}"
-        );
     }
 
     #[test]
@@ -2963,13 +2934,6 @@ domain = "test.example.com"
                 .to_string();
             assert!(e.contains(expected), "{e}");
         }
-    }
-
-    #[test]
-    fn a_relative_public_key_is_refused_and_named() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
-        let e = r.unwrap_err().to_string();
-        assert!(e.contains("[auth] public_key"), "{e}");
     }
 
     #[test]
@@ -3039,7 +3003,7 @@ domain = "test.example.com"
         let (_d, r) = load_with("", "\n[health]\nmetrics_require = \"role:monitor\"\n");
         assert_eq!(
             r.unwrap_err().to_string(),
-            "config error: [health].metrics_require needs [auth] with a public_key"
+            "config error: [health].metrics_require needs [auth] with a backend"
         );
     }
 
@@ -3049,7 +3013,7 @@ domain = "test.example.com"
             let (_d, r) = load_with(
                 "",
                 &format!(
-                    "\n[auth]\npublic_key = \"{{DIR}}/auth.pem\"\n\n[health]\nmetrics_require = \"{bad}\"\n"
+                    "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"{bad}\"\n"
                 ),
             );
             let e = r.unwrap_err().to_string();
@@ -3060,14 +3024,14 @@ domain = "test.example.com"
         }
         let (_d, ok) = load_with(
             "",
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_require = \"group:ops\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"group:ops\"\n",
         );
         assert!(ok.is_ok());
     }
 
     #[test]
     fn genid_needs_both_requires_or_neither() {
-        let auth = "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n";
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
         for only in [
             "\n[genid]\nread_require = \"role:monitor\"\n",
             "\n[genid]\nwrite_require = \"role:editor\"\n",
@@ -3099,7 +3063,7 @@ domain = "test.example.com"
         );
         assert_eq!(
             r.unwrap_err().to_string(),
-            "config error: [genid] read_require and write_require need [auth] with a public_key"
+            "config error: [genid] read_require and write_require need [auth] with a backend"
         );
     }
 
@@ -3118,7 +3082,7 @@ domain = "test.example.com"
             };
             let (_d, r) = load_with(
                 "",
-                &format!("\n[auth]\npublic_key = \"{{DIR}}/auth.pem\"\n\n[genid]\n{body}"),
+                &format!("\n[auth]\nbackend = \"m6-html\"\n\n[genid]\n{body}"),
             );
             let e = r.unwrap_err().to_string();
             assert!(
@@ -3133,7 +3097,7 @@ domain = "test.example.com"
     fn genid_in_the_system_config_loads() {
         let (_d, r) = load_with(
             "",
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[genid]\nread_require = \"group:ops\"\nwrite_require = \"role:editor\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n\n[genid]\nread_require = \"group:ops\"\nwrite_require = \"role:editor\"\n",
         );
         let cfg = r.expect("a source loads");
         assert_eq!(
@@ -3168,7 +3132,7 @@ domain = "test.example.com"
     fn genid_in_site_toml_is_refused() {
         let (_d, r) = load_with(
             "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n",
         );
         let e = r.unwrap_err().to_string();
         assert!(e.contains("site.toml sets [genid]"), "{e}");
@@ -3184,7 +3148,6 @@ domain = "test.example.com"
     ) -> (tempfile::TempDir, anyhow::Result<Config>) {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        write_file(dir.path(), "auth.pem", "dummy");
         write_file(dir.path(), "genid-token", token);
         let mut site = minimal_site_toml();
         site.push_str("\n[[backend]]\nname = \"origin\"\nurl = \"https://127.0.0.1:9\"\n");
@@ -3273,7 +3236,7 @@ domain = "test.example.com"
 
     #[test]
     fn genid_cache_keys_need_an_upstream() {
-        let auth = "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n";
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
         for key in ["token_file = \"{DIR}/genid-token\"", "heartbeat_secs = 5"] {
             let (_d, r) = load_with("", &format!("{auth}\n[genid]\n{key}\n"));
             assert_eq!(
@@ -3288,7 +3251,7 @@ domain = "test.example.com"
 
     #[test]
     fn genid_source_claims_do_not_apply_to_a_cache_node() {
-        let auth = "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n";
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
         let (_d, r) = load_cache_with(
             &format!(
                 "{auth}\n[genid]\nupstream = \"origin\"\ntoken_file = \"{{DIR}}/genid-token\"\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
@@ -3344,7 +3307,7 @@ domain = "test.example.com"
     #[test]
     fn health_keys_in_site_toml_are_refused() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
             "\n[health]\nmetrics_require = \"role:system\"\nmetrics_peers = [\"10.0.0.2\"]\n",
         );
         let e = r.unwrap_err().to_string();
@@ -3356,7 +3319,7 @@ domain = "test.example.com"
     #[test]
     fn a_system_health_key_alone_keeps_the_other_from_the_site() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"role:site\"\n",
             "\n[health]\nmetrics_peers = [\"10.0.0.2\"]\n",
         );
         let e = r.unwrap_err().to_string();
@@ -3384,13 +3347,12 @@ domain = "test.example.com"
     fn one_file_given_as_both_is_read_once() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        write_file(dir.path(), "auth.pem", "dummy");
         let mut site = minimal_site_toml();
-        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"m6-html\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
         write_file(dir.path(), "site.toml", &site);
         let same = dir.path().join("site.toml");
         let cfg = load(dir.path(), &same).expect("one file for both loads");
-        assert!(cfg.auth.expect("auth").public_key.ends_with("/auth.pem"));
+        assert_eq!(cfg.auth.expect("auth").backend, "m6-html");
         assert_eq!(cfg.health.perf_path, "/p");
         assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
     }
@@ -3427,13 +3389,12 @@ domain = "test.example.com"
     #[test]
     fn misplaced_keys_names_a_bind_in_site_toml() {
         let m = misplaced(
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"{DIR}/k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
             "[server]\nbind = \"0.0.0.0:443\"\n",
         );
-        assert_eq!(m.len(), 3, "{m:?}");
+        assert_eq!(m.len(), 2, "{m:?}");
         assert!(m[0].starts_with("site.toml sets [server].bind, which is this node's own state"));
         assert!(m[0].contains("belongs in the system config "), "{}", m[0]);
-        assert!(m.iter().any(|x| x.contains("sets [auth],")));
         assert!(m.iter().any(|x| x.contains("sets [health].metrics_peers,")));
     }
 
@@ -3457,11 +3418,10 @@ domain = "test.example.com"
     fn one_file_mode_reads_node_keys_from_the_one_file() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\nallowed_methods = [\"GET\"]\n\n[node]\nname = \"test\"\n\n[auth]\npublic_key = \"{DIR}/k\"\n";
+        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\nallowed_methods = [\"GET\"]\n\n[node]\nname = \"test\"\n\n[[backend]]\nname = \"m6-html\"\nsockets = \"/run/m6/*.sock\"\n\n[auth]\nbackend = \"m6-html\"\n";
         write_file(dir.path(), "site.toml", one);
         std::fs::write(dir.path().join("cert.pem"), "").unwrap();
         std::fs::write(dir.path().join("key.pem"), "").unwrap();
-        std::fs::write(dir.path().join("k"), "").unwrap();
         let cfg = load(dir.path(), &dir.path().join("site.toml")).expect("one-file load");
         assert_eq!(cfg.node.name, "test");
         assert_eq!(cfg.server.bind, "127.0.0.1:8443");
@@ -3472,7 +3432,7 @@ domain = "test.example.com"
     fn misplaced_keys_is_silent_for_a_clean_pair() {
         let m = misplaced(
             "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_require = \"role:monitor\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\nbackend = \"m6-html\"\n\n[health]\nmetrics_require = \"role:monitor\"\n",
         );
         assert!(m.is_empty(), "{m:?}");
     }

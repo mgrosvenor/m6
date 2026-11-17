@@ -74,38 +74,10 @@ fn tls_config(cert_der: &[u8], alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     Arc::new(cfg)
 }
 
-/// ES256 keypair. Returns (private_pem, public_pem).
-fn keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-/// Mint an ES256 token carrying `roles`, expiring `exp_offset_s` from now.
-fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: i64,
-        roles: Vec<String>,
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let claims = Claims {
-        sub: "metrics-test".to_string(),
-        exp: now + exp_offset_s,
-        roles: roles.iter().map(|r| r.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 // ── The site under test ───────────────────────────────────────────────────────
 
 /// The `[auth]` block with the check backend the route gate asks.
-const AUTH: &str = "[auth]\nbackend = \"auth-check\"\npublic_key = \"{KEY}\"\n";
+const AUTH: &str = "[auth]\nbackend = \"auth-check\"\n";
 
 /// A route that needs a role, which belongs in site.toml.
 const PRIVATE_ROUTE: &str =
@@ -124,14 +96,10 @@ struct Fixture {
     /// A second claimed address, `{H2C}` in the configs.
     h2c: PortClaim,
     cert_der: Vec<u8>,
-    /// Signing key whose public half is `auth-public.pem`.
-    private_pem: String,
     /// The authority's answer for the two role sets the tests use.
     monitor_token: String,
     reader_token: String,
     _check: check_support::RunningCheck,
-    /// A signing key the site does not trust.
-    other_private_pem: String,
     /// The accounting tick this test needs, in seconds. Production is a fixed
     /// ten and has no key; the test-only variable is read by a debug build.
     stats_interval: Option<u64>,
@@ -142,8 +110,7 @@ struct Fixture {
 
 impl Fixture {
     /// `site` is appended to site.toml and `system` to system.toml (after
-    /// `[node]`). `server` adds lines to `[server]`. In all three `{KEY}` is
-    /// the verify key path and `{H2C}` a claimed
+    /// `[node]`). `server` adds lines to `[server]`. `{H2C}` is a claimed
     /// extra address.
     fn new(site: &str, server: &str, system: &str) -> Fixture {
         Self::build(site, server, system, false)
@@ -165,11 +132,8 @@ impl Fixture {
         let d = dir.path();
         std::fs::write(d.join("cert.pem"), ck.cert.pem()).unwrap();
         std::fs::write(d.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
-        let (private_pem, public_pem) = keypair();
-        let (other_private_pem, _) = keypair();
-        std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
-        let monitor_token = mint(&private_pem, &["monitor"], 3600);
-        let reader_token = mint(&private_pem, &["reader"], 3600);
+        let monitor_token = "monitor-token".to_string();
+        let reader_token = "reader-token".to_string();
         let check_path = d.join("check.sock");
         let check = check_support::RunningCheck::start(
             &check_path,
@@ -190,10 +154,7 @@ impl Fixture {
 
         let port = claim_port();
         let h2c = claim_port();
-        let sub = |s: &str| {
-            s.replace("{KEY}", &d.join("auth-public.pem").display().to_string())
-                .replace("{H2C}", &h2c.addr())
-        };
+        let sub = |s: &str| s.replace("{H2C}", &h2c.addr());
 
         let site_dir = d.join("site");
         std::fs::create_dir_all(&site_dir).unwrap();
@@ -243,8 +204,6 @@ impl Fixture {
             port,
             h2c,
             cert_der: ck.cert.der().to_vec(),
-            private_pem,
-            other_private_pem,
             monitor_token,
             reader_token,
             _check: check,
@@ -400,13 +359,8 @@ impl Running {
         match roles {
             ["monitor"] => self.fx.monitor_token.clone(),
             ["reader"] => self.fx.reader_token.clone(),
-            _ => mint(&self.fx.private_pem, roles, 3600),
+            other => panic!("no check answer for roles {other:?}"),
         }
-    }
-
-    /// A token for `roles` signed by a key the site does not trust.
-    fn foreign_token(&self, roles: &[&str]) -> String {
-        mint(&self.fx.other_private_pem, roles, 3600)
     }
 
     /// Number of `auth check` lines m6-http has logged so far. The one token
@@ -740,7 +694,7 @@ fn a_require_route_is_enforced_with_a_check_only_auth() {
 
 #[test]
 fn auth_in_site_toml_is_refused() {
-    let fx = Fixture::new("[auth]\npublic_key = \"{KEY}\"\n", "", "");
+    let fx = Fixture::new("[auth]\nbackend = \"auth-check\"\n", "", "");
     let (code, output) = fx.run_until_exit();
     assert_eq!(code, Some(2), "output:\n{output}");
     assert!(
@@ -874,18 +828,18 @@ fn perf_with_a_token_lacking_the_role_is_403() {
 }
 
 #[test]
-fn perf_with_another_keys_token_is_401() {
+fn perf_with_an_unknown_token_is_401() {
     let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
-    let auth = bearer(&run.foreign_token(&["monitor"]));
+    let auth = bearer("not-a-known-token");
     for (proto, r) in run.all("/perf", &[("Authorization", &auth)]) {
         assert_eq!(r.status, 401, "{proto}: {}", r.text());
     }
 }
 
 #[test]
-fn an_expired_token_is_401() {
+fn an_unknown_token_is_401() {
     let run = Fixture::new(PRIVATE_ROUTE, "", &gated()).start();
-    let auth = bearer(&mint(&run.fx.private_pem, &["monitor"], -3600));
+    let auth = bearer("expired-token");
     let r = run.h1("/perf", &[("Authorization", &auth)]);
     assert_eq!(r.status, 401, "{}", r.text());
 }
@@ -980,9 +934,10 @@ fn health_stays_open_to_an_unlisted_peer() {
 
 #[test]
 fn auth_and_health_keys_are_read_from_the_system_config() {
-    let system = "[auth]\npublic_key = \"{KEY}\"\n\n\
-        [health]\nmetrics_require = \"role:monitor\"\nmetrics_peers = [\"127.0.0.1\"]\n";
-    let run = Fixture::new("", "", system).start();
+    let system = format!(
+        "{AUTH}\n[health]\nmetrics_require = \"role:monitor\"\nmetrics_peers = [\"127.0.0.1\"]\n"
+    );
+    let run = Fixture::new("", "", &system).start();
     let auth = bearer(&run.token(&["monitor"]));
     assert_report("h1", &run.h1("/perf", &[("Authorization", &auth)]));
     assert_eq!(run.h1("/perf", &[]).status, 401);

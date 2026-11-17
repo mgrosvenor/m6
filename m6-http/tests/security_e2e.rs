@@ -50,45 +50,9 @@ fn generate_tls_cert() -> (String, String, Vec<u8>) {
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
 
-/// ES256 keypair for JWT signing. Returns (private_pem, public_pem).
-fn generate_jwt_keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-/// Mint an ES256 JWT carrying `groups`, valid for one hour.
-fn mint_jwt(private_pem: &str, sub: &str, groups: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        iss: String,
-        exp: u64,
-        groups: Vec<String>,
-        roles: Vec<String>,
-    }
-    let exp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600;
-    let claims = Claims {
-        sub: sub.to_string(),
-        iss: "m6-auth".to_string(),
-        exp,
-        groups: groups.iter().map(|s| s.to_string()).collect(),
-        roles: vec![],
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 // ── HTTP/1.1 client ───────────────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();
@@ -597,9 +561,7 @@ fn start_server(rate_limit_per_min: u32) -> Server {
     std::fs::write(site.join("cert.pem"), &cert_pem).unwrap();
     std::fs::write(site.join("key.pem"), &key_pem).unwrap();
 
-    let (jwt_priv, jwt_pub) = generate_jwt_keypair();
-    std::fs::write(site.join("auth-public.pem"), &jwt_pub).unwrap();
-    let admin_jwt = mint_jwt(&jwt_priv, "admin-user", &["admins"]);
+    let admin_jwt = "admin-token".to_string();
     let check_path = dir.path().join("check.sock");
     let check = check_support::RunningCheck::start(
         &check_path,
@@ -698,11 +660,9 @@ name = "test-node"
 
 [auth]
 backend    = "auth-check"
-public_key = "{pubkey}"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
-            pubkey = site.join("auth-public.pem").display(),
         ),
     )
     .unwrap();

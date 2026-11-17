@@ -3,9 +3,9 @@
 //!
 //! Each test starts a real `m6-http` on loopback in front of real backends:
 //! `m6-html` over a Unix socket for the content cases, and small in-file Unix
-//! backends where a test needs exact control of when a reply lands. The tokens
-//! are ES256 JWTs minted here, verified with the `[auth] public_key` the fixture
-//! writes. The unit's StateDirectory is a temp directory.
+//! backends where a test needs exact control of when a reply lands. The
+//! credentials are opaque strings answered by a fake `/check` authority in the
+//! fixture. The unit's StateDirectory is a temp directory.
 //!
 //! Breaks are named on the tests that carry one. Nothing here waits on a fixed
 //! sleep for a result: every wait polls a condition with a deadline.
@@ -27,6 +27,10 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
+use check_support::{identity, Reply, RunningCheck};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::h2c_client::H2cClientConn;
 use m6_http_lib::h2s_client::H2sTlsClientConn;
@@ -80,32 +84,6 @@ fn tls_config(cert_der: &[u8], alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     Arc::new(cfg)
 }
 
-fn keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-fn mint(private_pem: &str, roles: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: i64,
-        roles: Vec<String>,
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let claims = Claims {
-        sub: "genid-test".to_string(),
-        exp: now + 3600,
-        roles: roles.iter().map(|r| r.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 // ── The site under test ───────────────────────────────────────────────────────
 
 /// One fixture: a site directory, a system config and the claimed ports. The
@@ -118,8 +96,8 @@ struct Fixture {
     port: PortClaim,
     h2c: PortClaim,
     cert_der: Vec<u8>,
-    private_pem: String,
     state_dir: PathBuf,
+    _check: RunningCheck,
     html_sock: PathBuf,
 }
 
@@ -138,8 +116,21 @@ impl Fixture {
         .expect("rcgen");
         std::fs::write(d.join("cert.pem"), ck.cert.pem()).unwrap();
         std::fs::write(d.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
-        let (private_pem, public_pem) = keypair();
-        std::fs::write(d.join("auth-public.pem"), public_pem).unwrap();
+        let check_path = d.join("check.sock");
+        let check = RunningCheck::start(
+            &check_path,
+            vec![
+                (
+                    "read-token".to_string(),
+                    Reply::Identity(identity(&[], &["reader"])),
+                ),
+                (
+                    "write-token".to_string(),
+                    Reply::Identity(identity(&[], &["writer"])),
+                ),
+            ],
+        )
+        .unwrap();
 
         let port = claim_port();
         let h2c = claim_port();
@@ -171,6 +162,7 @@ impl Fixture {
                  [log]\nlevel = \"info\"\n\n\
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = {timeout_s}\n\n\
+                 [[backend]]\nname = \"auth-check\"\nsockets = \"{{DIR}}/check.sock\"\n\n\
                  {site_extra}"
             )),
         )
@@ -183,7 +175,7 @@ impl Fixture {
             sub(&format!(
                 "[server]\nbind = \"{{PORT}}\"\ntls_cert = \"{{DIR}}/cert.pem\"\ntls_key = \"{{DIR}}/key.pem\"\n{server_extra}\n\n\
                  [node]\nname = \"genid-source\"\n\n\
-                 [auth]\npublic_key = \"{{DIR}}/auth-public.pem\"\n\n\
+                 [auth]\nbackend = \"auth-check\"\n\n\
                  [genid]\nread_require = \"role:reader\"\nwrite_require = \"role:writer\"\n"
             )),
         )
@@ -195,23 +187,19 @@ impl Fixture {
             port,
             h2c,
             cert_der: ck.cert.der().to_vec(),
-            private_pem,
             state_dir,
+            _check: check,
             html_sock,
             dir,
         }
     }
 
-    fn token(&self, roles: &[&str]) -> String {
-        mint(&self.private_pem, roles)
-    }
-
     fn read_token(&self) -> String {
-        self.token(&["reader"])
+        "read-token".to_string()
     }
 
     fn write_token(&self) -> String {
-        self.token(&["writer"])
+        "write-token".to_string()
     }
 
     fn start_html(&self) -> Service {

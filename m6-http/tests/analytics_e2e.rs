@@ -32,6 +32,10 @@ use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
 
+#[path = "support/check.rs"]
+mod check_support;
+use check_support::{identity, Reply, RunningCheck};
+
 fn generate_tls_cert() -> (String, String, Vec<u8>) {
     let ck =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -386,35 +390,6 @@ fn read_analytics_lines(path: &Path) -> Vec<AnalyticsLine> {
 
 // ── Site fixture ──────────────────────────────────────────────────────────────
 
-/// ES256 keypair for the metrics gate's `[auth] public_key`.
-fn jwt_keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-/// A JWT carrying `roles`, valid for one hour.
-fn mint(private_pem: &str, roles: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: u64,
-        roles: Vec<String>,
-    }
-    let exp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600;
-    let claims = Claims {
-        sub: "t".to_string(),
-        exp,
-        roles: roles.iter().map(|s| s.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 struct Server {
     port: u16,
     cert_der: Vec<u8>,
@@ -422,6 +397,7 @@ struct Server {
     /// The `role:monitor` token, which `/perf` requires. The legacy bearer
     /// string is gone: `/perf` is behind the one token check now.
     token: String,
+    _check: RunningCheck,
     http: std::cell::RefCell<Service>,
     _file: Service,
     _dir: tempfile::TempDir,
@@ -548,9 +524,16 @@ fn start_server() -> Server {
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
     let analytics_log = dir.path().join("analytics.ndjson");
-    let (private_pem, public_pem) = jwt_keypair();
-    std::fs::write(site.join("auth-public.pem"), public_pem).unwrap();
-    let token = mint(&private_pem, &["monitor"]);
+    let check_path = dir.path().join("check.sock");
+    let check = RunningCheck::start(
+        &check_path,
+        vec![(
+            "monitor-token".to_string(),
+            Reply::Identity(identity(&[], &["monitor"])),
+        )],
+    )
+    .unwrap();
+    let token = "monitor-token".to_string();
 
     std::fs::write(
         site.join("site.toml"),
@@ -576,11 +559,16 @@ enabled = false
 name    = "m6-file"
 sockets = "{sock_glob}"
 
+[[backend]]
+name    = "auth-check"
+sockets = "{check_path}"
+
 [[route]]
 path    = "/public/{{relpath}}"
 backend = "m6-file"
 "#,
             sock_glob = sock_glob.display(),
+            check_path = check_path.display(),
             log_path = analytics_log.display(),
         ),
     )
@@ -612,14 +600,13 @@ tls_key  = "{key}"
 name = "test-node"
 
 [auth]
-public_key = "{auth_key}"
+backend = "auth-check"
 
 [health]
 metrics_require = "role:monitor"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
-            auth_key = site.join("auth-public.pem").display(),
         ),
     )
     .unwrap();
@@ -646,6 +633,7 @@ metrics_require = "role:monitor"
         cert_der,
         analytics_log,
         token,
+        _check: check,
         http: std::cell::RefCell::new(http_proc),
         _file: file_proc,
         _dir: dir,

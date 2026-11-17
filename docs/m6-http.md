@@ -66,7 +66,7 @@ m6-http starts in this order, before it serves a request.
    It carries `[node]`, the `[server]` node keys, `[auth]`, the `[health]` access keys, `[genid]` and `[cache]`, and nothing else.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
-4. If `[auth]` is declared, load the public key for local JWT verification.
+4. If `[auth]` is declared, note the check backend it names; the check side is probed at step 8.
    `backend` is optional and names the socket backend that answers `/check`.
 5. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
@@ -499,14 +499,15 @@ If a route declares `require`, m6-http asks the authority before forwarding:
 A request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
-Three gates still verify locally in this release: `/perf`, `/traffic` and a source node's `POST /genid` call `m6_http_lib::auth::check` with `[auth] public_key`.
-That verifier checks the signature and `exp`, does not compare `iss`, and reads roles and groups from the token.
-A token with a foreign `iss`, or a role removed in the database, still opens those three gates until the token expires.
-AUTH-1 step 6 converts them to `POST /check`.
+`/perf` and `/traffic`, and a source node's `GET` and `POST /genid`, take the same path.
+Their requirements keep their names and meanings: `[health] metrics_require`, and `[genid] read_require` and `write_require`.
+A refusal is the authority's 401 or 403; a checker that does not answer is 503 with `Retry-After: 1`.
+The index's `metrics_require` therefore sees a removed role or a deleted user on the next request, exactly as a route does.
 
 `m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
 `m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
-A missing `[auth] public_key` is still a start error. Config validation refuses `require` without `[auth]`, and without `[auth] backend`, so a running node cannot reach a protected route with no authority.
+`[auth]` now needs `backend`. Config validation refuses a `require` route, `metrics_require` or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
+`[auth] public_key` is removed: the edge holds no key and decodes no token.
 
 `[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
 Its `sockets` glob must match at least one socket, and a `url` backend is refused by name.
@@ -573,8 +574,8 @@ A response fetched from a backend moves `requests_total`, the response-code tabl
 
 | Key | Where | Meaning |
 |---|---|---|
-| `[auth] public_key` | `site.toml` or system config, not both | Key that verifies API tokens. An absolute path |
-| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. A token with the claim is required, from the Authorization header or the session cookie, as route `require` reads it |
+| `[auth] backend` | system config | The `[[backend]]` whose members answer `POST /check` |
+| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. An identity with the claim is required, from the credential a route `require` reads |
 | `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
 
 *Table 4: the keys that decide who reads `/perf` and `/traffic`. Take from it that with none of them set the endpoints do not exist, and that a config that still names the removed `metrics_token_file` stops the start with exit 2.*
@@ -586,7 +587,7 @@ The checks run in this order, as Table 5 shows.
 | Step | Check | Refusal |
 |---|---|---|
 | 1 | `metrics_peers` set: not on an internal h2c listener, and the peer address is listed | 404, the body of a disabled endpoint, before any token is read |
-| 2 | `metrics_require` set: the one token check verifies the token (Authorization header or session cookie) and holds the claim | 401 for no or a bad token, 403 for the wrong claim. Same status, headers and body as every other token-gated route |
+| 2 | `metrics_require` set: `POST /check` answers the credential (Authorization header or session cookie), and the identity holds the claim | 401 for no credential or a refusal, 403 for the wrong claim, 503 with `Retry-After: 1` for a checker that does not answer. Same status, headers and body as every other token-gated route |
 | 2 | `metrics_require` unset: the endpoint does not exist | 404, the body of a disabled endpoint, before any token is read |
 
 *Table 5: the metrics gate, in order. Take from it that a peer outside `metrics_peers` learns nothing, and that a token is read only when `metrics_require` names the claim it must hold.*

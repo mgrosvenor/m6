@@ -31,8 +31,8 @@ struct Configs {
 }
 
 /// Write a site and a system config. `check_glob` is the `[auth] backend`'s
-/// socket glob, or `None` for the config that carries only `public_key`.
-fn write_configs(dir: &Path, check_glob: Option<&str>) -> Configs {
+/// socket glob.
+fn write_configs(dir: &Path, check_glob: &str) -> Configs {
     let site = dir.join("site");
     std::fs::create_dir_all(&site).expect("site dir");
 
@@ -41,29 +41,19 @@ fn write_configs(dir: &Path, check_glob: Option<&str>) -> Configs {
             .expect("self-signed certificate");
     std::fs::write(site.join("cert.pem"), cert.cert.pem()).expect("cert.pem");
     std::fs::write(site.join("key.pem"), cert.key_pair.serialize_pem()).expect("key.pem");
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    std::fs::write(site.join("auth-public.pem"), key.public_key_pem()).expect("auth public key");
-
     let claim = claim_port();
-    let backend = match check_glob {
-        Some(glob) => format!("[[backend]]\nname = \"auth\"\nsockets = {glob:?}\n"),
-        None => String::new(),
-    };
-    let auth_backend = match check_glob {
-        Some(_) => "backend = \"auth\"\n",
-        None => "",
-    };
+    let backend = format!("[[backend]]\nname = \"auth\"\nsockets = {check_glob:?}\n");
+    let auth_backend = "backend = \"auth\"\n";
 
     let site_toml = format!(
         "[site]\nname = \"auth-startup\"\ndomain = \"example.com\"\n\n[log]\nlevel = \"info\"\n\n[analytics]\nenabled = false\n\n{backend}"
     );
     let system = dir.join("system.toml");
     let system_toml = format!(
-        "[node]\nname = \"test-node\"\n\n[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n\n[auth]\n{auth_backend}public_key = \"{pubkey}\"\n",
+        "[node]\nname = \"test-node\"\n\n[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{cert}\"\ntls_key = \"{key}\"\n\n[auth]\n{auth_backend}",
         port = claim.port(),
         cert = site.join("cert.pem").display(),
         key = site.join("key.pem").display(),
-        pubkey = site.join("auth-public.pem").display(),
     );
     std::fs::write(site.join("site.toml"), site_toml).expect("site.toml");
     std::fs::write(&system, system_toml).expect("system.toml");
@@ -104,7 +94,7 @@ fn a_401_from_the_check_backend_starts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     serve(&mut server, &svc);
@@ -120,7 +110,7 @@ fn a_503_from_the_check_backend_starts() {
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Unavailable);
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     serve(&mut server, &svc);
@@ -138,7 +128,7 @@ fn a_404_from_the_check_backend_exits_2_naming_the_setting() {
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Status(404));
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     serve(&mut server, &svc);
@@ -164,7 +154,7 @@ fn a_status_that_is_not_a_check_exits_2() {
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Status(200));
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     serve(&mut server, &svc);
@@ -189,7 +179,7 @@ fn a_connect_failure_warns_and_the_node_starts() {
     // Bind, then close: the socket file stays and nothing listens on it.
     let mut dead = CheckServer::bind(&path).expect("check server");
     dead.close();
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     svc.wait_for_started(STARTED);
@@ -218,7 +208,7 @@ fn one_member_down_still_starts() {
     dead.close();
 
     let glob = format!("{}", dir.path().join("check-*.sock").display());
-    let configs = write_configs(dir.path(), Some(glob.as_str()));
+    let configs = write_configs(dir.path(), glob.as_str());
     let mut svc = spawn(&configs);
     serve(&mut live_server, &svc);
     svc.wait_for_started(STARTED);
@@ -227,17 +217,6 @@ fn one_member_down_still_starts() {
         output.contains(&dead_path.display().to_string()),
         "the warning must name the dead socket, output:\n{output}"
     );
-    let status = stop(svc);
-    assert_eq!(status.code(), Some(0), "the node did not stop cleanly");
-}
-
-/// `[auth]` without `backend` carries only `public_key`, and no probe runs.
-#[test]
-fn no_backend_needs_no_probe() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let configs = write_configs(dir.path(), None);
-    let mut svc = spawn(&configs);
-    svc.wait_for_started(STARTED);
     let status = stop(svc);
     assert_eq!(status.code(), Some(0), "the node did not stop cleanly");
 }
@@ -254,7 +233,7 @@ fn a_403_from_the_check_backend_exits_2() {
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Forbidden);
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     serve(&mut server, &svc);
@@ -330,7 +309,7 @@ fn a_dribbling_peer_does_not_extend_the_probe_deadline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = check_socket(dir.path());
     let dribbler = dribbling_peer(&path);
-    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
 
     let mut svc = spawn(&configs);
     svc.wait_for_started(STARTED);

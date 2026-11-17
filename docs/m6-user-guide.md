@@ -641,15 +641,14 @@ public_key  = "/tmp/m6/dev/auth.pub"
 ### 5.3. New config
 
 Example 04 changes two config files.
-The system config gains the `[auth]` block that points `m6-http` at the auth service and its public key.
+The system config gains the `[auth]` block that points `m6-http` at the auth service's check backend.
 `site.toml` gains the `m6-auth` backend and the login, logout, refresh and members routes.
 
 The `[auth]` block lives in `configs/system-dev.toml`, the system config `m6-http` reads:
 
 ```toml
 [auth]
-backend    = "m6-auth-check"
-public_key = "/tmp/m6/dev/auth.pub"
+backend = "m6-auth-check"
 ```
 
 The backends and routes live in `site.toml`:
@@ -836,8 +835,7 @@ tls_cert = "/tmp/m6/dev/dev.pem"
 tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [auth]
-backend    = "m6-auth-check"
-public_key = "/tmp/m6/dev/auth.pub"
+backend = "m6-auth-check"
 
 [node]
 name = "dev"
@@ -1028,7 +1026,7 @@ Table 1 lists the settings, the file each sits in and the program that reads it.
 |---|---|---|
 | `secrets_file` | any renderer config | m6-core |
 | `[server] tls_cert`, `tls_key` | system config | m6-http |
-| `[auth] public_key` | system config | m6-http |
+| `[auth] backend` | system config | m6-http |
 | `[storage] path` | m6-auth config | m6-auth-server and m6-auth-cli |
 | `[keys] private_key` | m6-auth config | m6-auth-server with the login side, and m6-auth-cli |
 | `[keys] public_key` | m6-auth config | m6-auth-server on both sides, and m6-auth-cli |
@@ -1723,14 +1721,13 @@ tls_cert = "/tmp/m6/dev/dev.pem"
 tls_key  = "/tmp/m6/dev/dev-key.pem"
 
 [auth]
-backend    = "m6-auth-check"
-public_key = "/tmp/m6/dev/auth.pub"
+backend = "m6-auth-check"
 
 [node]
 name = "dev"
 ```
 
-The production system config `/etc/m6/my-blog.toml` holds the same three sections, with the node name `origin`, the public bind `0.0.0.0:443`, the two credential paths under `/run/credentials/m6-http.service/`, and the auth public key `/run/credentials/m6-http.service/auth.pub`.
+The production system config `/etc/m6/my-blog.toml` holds the same three sections, with the node name `origin`, the public bind `0.0.0.0:443`, the two credential paths under `/run/credentials/m6-http.service/`, and the check backend `m6-auth-check`.
 Section 8.3 writes it as a heredoc.
 
 The split is one rule: `site.toml` holds the state every node shares, and the system config holds the state of one node.
@@ -1786,8 +1783,7 @@ tls_cert = "/run/credentials/m6-http.service/tls-cert.pem"
 tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 
 [auth]
-backend    = "m6-auth-check"
-public_key = "/run/credentials/m6-http.service/auth.pub"
+backend = "m6-auth-check"
 
 [node]
 name = "origin"
@@ -1859,7 +1855,7 @@ Take from it that the two environments differ only in the system config and the 
 | m6-http invocation | `m6-http $SITE configs/system-dev.toml` | `m6-http /var/www/my-blog /etc/m6/my-blog.toml` |
 | `[server] bind` | `127.0.0.1:8443` | `0.0.0.0:443` |
 | `[server] tls_cert` | `/tmp/m6/dev/dev.pem` | `/run/credentials/m6-http.service/tls-cert.pem` |
-| `[auth] public_key` | `/tmp/m6/dev/auth.pub` | `/run/credentials/m6-http.service/auth.pub` |
+| `[auth] backend` | `m6-auth-check` | `m6-auth-check` |
 | System config | `configs/system-dev.toml`, in the repo | `/etc/m6/my-blog.toml`, on the server |
 | Process manager | `dev.sh` | systemd |
 | Logs | terminal stdout | journald |

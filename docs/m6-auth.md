@@ -342,8 +342,8 @@ The bearer path stops the next refresh by deleting the refresh rows, and the bro
 `GET /auth/public-key` returns the current public key as a PEM body with `Content-Type: application/x-pem-file`.
 The route is unauthenticated, and it serves the key that is loaded, so a rotation changes the body after the service restarts.
 
-m6-http reads the public key from the file named by `[auth] public_key`.
-It does not call this route, and the route exists for any other client that needs the key without filesystem access.
+m6-http holds no key and does not call this route.
+The route exists for any other client that needs the key without filesystem access.
 
 ### 5.5. Check
 
@@ -396,13 +396,12 @@ Section 7 gives the m6-http configuration, and section 8 gives the identity a ba
 
 ## 7. m6-http integration
 
-m6-http asks this service for the identity and enforces route `require` rules on the answer.
+m6-http asks this service for the identity and enforces `require`, `metrics_require` and the genid claims on the answer.
 This section gives the one configuration that points m6-http at this service, and where the rest is specified.
 
 ```toml
 [auth]
-backend    = "m6-auth-check"
-public_key = "/etc/m6/auth.pub" # the file m6-http reads at startup
+backend = "m6-auth-check"
 
 [[backend]]
 name = "m6-auth"
@@ -434,9 +433,7 @@ A route with `require` sends one `POST /check` per protected request, under a 50
 No credential is 401 with no call, a 401 from this service is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 Nothing caches the answer, so a role change or a revocation counts from the next request.
 
-Three gates in m6-http still decide locally in this release: `/perf`, `/traffic` and a source node's `POST /genid`.
-They call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token this service would refuse still opens them until it expires.
-AUTH-1 step 6 converts those three gates to `POST /check`.
+The same check covers `/perf`, `/traffic` and a source node's `/genid`, so their claims see a role change or a revocation from the next request too.
 The token sources, the `require` forms and the outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
 The header the edge sets carries the identity this service answered, and section 8 shows what a backend does with it.
 

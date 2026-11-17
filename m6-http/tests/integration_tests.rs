@@ -217,34 +217,10 @@ sockets = "/run/m6/*.sock"
     }
 
     #[test]
-    fn validation_auth_public_key_not_found_exits_2() {
-        let dir = tempfile::tempdir().unwrap();
-        write_file(dir.path(), "cert.pem", "dummy");
-        write_file(dir.path(), "key.pem", "dummy");
-        write_file(
-            dir.path(),
-            "site.toml",
-            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
-        );
-        write_file(
-            dir.path(),
-            "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"b\"\npublic_key = \"{DIR}/missing-key.pub\"\n",
-        );
-        let err = load(dir.path()).unwrap_err().to_string();
-        assert!(
-            err.contains("public_key"),
-            "error should mention 'public_key': {}",
-            err
-        );
-    }
-
-    #[test]
     fn validation_auth_backend_not_in_backends_exits_2() {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "auth.pub", "dummy-key");
         write_file(
             dir.path(),
             "site.toml",
@@ -253,7 +229,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"missing-auth-backend\"\npublic_key = \"{DIR}/auth.pub\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"missing-auth-backend\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -268,7 +244,6 @@ sockets = "/run/m6/*.sock"
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "auth.pub", "dummy-key");
         write_file(
             dir.path(),
             "site.toml",
@@ -277,7 +252,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"remote\"\npublic_key = \"{DIR}/auth.pub\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"remote\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -470,22 +445,7 @@ mod phase11 {
 // ── Phase 12: Auth ───────────────────────────────────────────────────────────
 
 mod phase12 {
-    use base64::Engine;
-    use m6_http_lib::auth::{
-        check_require, encode_claims_header, extract_refresh_cookie, extract_token,
-        is_browser_request, Claims,
-    };
-
-    fn make_claims(groups: Option<Vec<&str>>, roles: Option<Vec<&str>>) -> Claims {
-        Claims {
-            sub: Some("user1".to_string()),
-            iss: None,
-            exp: Some(9999999999),
-            groups: groups.map(|g| g.iter().map(|s| s.to_string()).collect()),
-            roles: roles.map(|r| r.iter().map(|s| s.to_string()).collect()),
-            extra: Default::default(),
-        }
-    }
+    use m6_http_lib::auth::{extract_refresh_cookie, extract_token, is_browser_request};
 
     #[test]
     fn extract_token_returns_none_without_an_auth_header_or_session_cookie() {
@@ -513,42 +473,6 @@ mod phase12 {
         assert!(is_browser_request(Some("text/html")));
         let refresh = extract_refresh_cookie(Some("refresh=my-refresh-token; session=old"));
         assert_eq!(refresh, Some("my-refresh-token"));
-    }
-
-    #[test]
-    fn valid_jwt_wrong_group_gets_403() {
-        let claims = make_claims(Some(vec!["users"]), None);
-        assert!(!check_require(&claims, "group:editors"));
-    }
-
-    #[test]
-    fn valid_jwt_correct_group_passes() {
-        let claims = make_claims(Some(vec!["editors", "users"]), None);
-        assert!(check_require(&claims, "group:editors"));
-    }
-
-    #[test]
-    fn valid_jwt_correct_role_passes() {
-        let claims = make_claims(None, Some(vec!["admin"]));
-        assert!(check_require(&claims, "role:admin"));
-    }
-
-    #[test]
-    fn valid_jwt_wrong_role_gets_403() {
-        let claims = make_claims(None, Some(vec!["user"]));
-        assert!(!check_require(&claims, "role:admin"));
-    }
-
-    #[test]
-    fn x_auth_claims_header_is_base64_json() {
-        let claims = make_claims(Some(vec!["editors"]), None);
-        let encoded = encode_claims_header(&claims);
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&encoded)
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(json["sub"], "user1");
-        assert_eq!(json["groups"][0], "editors");
     }
 }
 

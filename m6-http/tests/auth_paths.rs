@@ -57,14 +57,6 @@ fn generate_tls_cert() -> (String, String, Vec<u8>) {
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
 
-/// A public key PEM for `[auth] public_key`. Only the verify key is needed:
-/// no test here mints a token, because a public route ignores it and the
-/// redirects happen before a token is verified.
-fn generate_jwt_public_key() -> String {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    kp.public_key_pem()
-}
-
 // ── HTTP/1.1 over TLS client ──────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
@@ -238,9 +230,6 @@ fn start_server() -> Server {
     std::fs::write(site.join("cert.pem"), &cert_pem).unwrap();
     std::fs::write(site.join("key.pem"), &key_pem).unwrap();
 
-    let jwt_pub = generate_jwt_public_key();
-    std::fs::write(site.join("auth-public.pem"), &jwt_pub).unwrap();
-
     std::fs::create_dir_all(site.join("public")).unwrap();
     std::fs::create_dir_all(site.join("private")).unwrap();
     std::fs::create_dir_all(site.join("configs")).unwrap();
@@ -325,12 +314,10 @@ tls_key  = "{key}"
 name = "test-node"
 
 [auth]
-backend    = "auth-check"
-public_key = "{pubkey}"
+backend = "auth-check"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
-            pubkey = site.join("auth-public.pem").display(),
         ),
     )
     .unwrap();

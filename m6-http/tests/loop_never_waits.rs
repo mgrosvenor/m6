@@ -24,7 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use rustls::StreamOwned;
@@ -32,6 +32,10 @@ use rustls::StreamOwned;
 use quiche::h3::NameValue as _;
 
 use m6_core::testkit::{binary, claim_port, read_one, PortClaim, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
+use check_support::{identity, Reply, RunningCheck};
 use m6_http_lib::forward::HttpRequest;
 use m6_http_lib::h2s_client::H2sTlsClientConn;
 use m6_http_lib::probe;
@@ -600,7 +604,9 @@ fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> Str
          [log]\nlevel = \"{log_level}\"\n\n\
          [analytics]\nenabled = false\n\n\
          [rate_limit]\nenabled = false\n\n\
-         {backends}\n\n{routes}\n"
+         {backends}\n\n\
+         [[backend]]\nname = \"auth-check\"\nsockets = \"{check}\"\n\n{routes}\n",
+        check = check_socket().display(),
     )
 }
 
@@ -617,68 +623,39 @@ fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
     )
 }
 
-/// The one ES256 signing key the loop tests' `[auth]` uses.
-///
-/// Generated once per process so the `[auth] public_key` every fixture writes
-/// matches the token `/perf` sends. One checker means one credential fixture:
-/// the legacy bearer string is gone, so a token here is a real JWT and the
-/// public key beside it is what `auth::check` verifies.
-fn auth_keys() -> &'static (String, String) {
-    static KEYS: OnceLock<(String, String)> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-        (kp.serialize_pem(), kp.public_key_pem())
-    })
-}
-
-/// Write the fixture's `[auth]` public key into `dir` and name it.
-fn write_auth_key(dir: &std::path::Path) -> PathBuf {
-    let path = dir.join("auth-public.pem");
-    std::fs::write(&path, &auth_keys().1).expect("auth public key");
+/// The one fake authority every fixture points at, started on first use.
+fn check_socket() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static CHECK: OnceLock<(PathBuf, RunningCheck)> = OnceLock::new();
+    let (path, _) = CHECK.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("m6lnw-check-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let check = RunningCheck::start(
+            &path,
+            vec![(
+                "monitor-token".to_string(),
+                Reply::Identity(identity(&[], &["monitor"])),
+            )],
+        )
+        .expect("the fake checker");
+        (path, check)
+    });
     path
 }
 
-/// A `role:monitor` token signed by [`auth_keys`].
+/// A `role:monitor` token the authority above answers.
 fn monitor_token() -> String {
-    mint(&auth_keys().0, &["monitor"])
+    "monitor-token".to_string()
 }
 
-fn mint(private_pem: &str, roles: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        exp: u64,
-        roles: Vec<String>,
-    }
-    let exp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600;
-    let claims = Claims {
-        sub: "t".to_string(),
-        exp,
-        roles: roles.iter().map(|s| s.to_string()).collect(),
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
-fn system_toml(
-    port: u16,
-    cert: &std::path::Path,
-    key: &std::path::Path,
-    public_key: &std::path::Path,
-) -> String {
+fn system_toml(port: u16, cert: &std::path::Path, key: &std::path::Path) -> String {
     format!(
         "[server]\nbind = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\nmax_requests_per_connection = 10000\n\n\
-         [auth]\npublic_key = \"{}\"\n\n\
+         [auth]\nbackend = \"auth-check\"\n\n\
          [health]\nmetrics_require = \"role:monitor\"\n\n\
          [node]\nname = \"loop-never-waits\"\n",
         cert.display(),
         key.display(),
-        public_key.display(),
     )
 }
 
@@ -1129,14 +1106,9 @@ fn a_backend_that_resets_mid_response_answers_502_and_the_next_request_is_served
         Backend::start_with_release(healthy_path, slow_seen, large_seen, Arc::clone(&release));
 
     std::fs::write(site.join("site.toml"), site_toml(&glob, 30)).expect("site.toml");
-    let public_key = write_auth_key(&site);
     let claim = claim_port();
     let port = claim.port();
-    std::fs::write(
-        site.join("system.toml"),
-        system_toml(port, &cert, &key, &public_key),
-    )
-    .expect("system.toml");
+    std::fs::write(site.join("system.toml"), system_toml(port, &cert, &key)).expect("system.toml");
 
     let service = Service::spawn(
         "m6-http",
@@ -1387,20 +1359,17 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
              [rate_limit]\nenabled = false\n\n\
              [errors]\nmode = \"custom\"\npath = \"/errors\"\n\n\
              [[backend]]\nname = \"app\"\nsockets = \"{glob}\"\n\n\
+             [[backend]]\nname = \"auth-check\"\nsockets = \"{check}\"\n\n\
              [[route]]\npath = \"/fast\"\nbackend = \"app\"\n\n\
              [[route]]\npath = \"/missing\"\nbackend = \"app\"\n\n\
-             [[route]]\npath = \"/errors\"\nbackend = \"app\"\n"
+             [[route]]\npath = \"/errors\"\nbackend = \"app\"\n",
+            check = check_socket().display()
         ),
     )
     .expect("site.toml");
-    let public_key = write_auth_key(&site);
     let claim = claim_port();
     let port = claim.port();
-    std::fs::write(
-        site.join("system.toml"),
-        system_toml(port, &cert, &key, &public_key),
-    )
-    .expect("system.toml");
+    std::fs::write(site.join("system.toml"), system_toml(port, &cert, &key)).expect("system.toml");
 
     let mut service = Service::spawn(
         "m6-http",
@@ -1553,21 +1522,18 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
              [analytics]\nenabled = false\n\n\
              [rate_limit]\nenabled = false\n\n\
              [[backend]]\nname = \"app\"\nsockets = \"{}\"\n\n\
+             [[backend]]\nname = \"auth-check\"\nsockets = \"{}\"\n\n\
              [[route]]\npath = \"/slow\"\nbackend = \"app\"\n\n\
              [[route]]\npath = \"/slow2\"\nbackend = \"app\"\n",
-            sock.display()
+            sock.display(),
+            check_socket().display()
         ),
     )
     .expect("site.toml");
-    let public_key = write_auth_key(&site);
     let claim = claim_port();
     let port = claim.port();
     let _claim = claim;
-    std::fs::write(
-        site.join("system.toml"),
-        system_toml(port, &cert, &key, &public_key),
-    )
-    .expect("system.toml");
+    std::fs::write(site.join("system.toml"), system_toml(port, &cert, &key)).expect("system.toml");
 
     let mut service = Service::spawn(
         "m6-http",
@@ -1710,9 +1676,8 @@ fn write_site(dir: &std::path::Path, site_toml: &str, port: u16) -> PathBuf {
     std::fs::write(&cert, ck.cert.pem()).expect("cert");
     std::fs::write(&key, ck.key_pair.serialize_pem()).expect("key");
     std::fs::write(dir.join("site.toml"), site_toml).expect("site.toml");
-    let public_key = write_auth_key(dir);
     let system = dir.join("system.toml");
-    std::fs::write(&system, system_toml(port, &cert, &key, &public_key)).expect("system.toml");
+    std::fs::write(&system, system_toml(port, &cert, &key)).expect("system.toml");
     system
 }
 
