@@ -583,3 +583,49 @@ fn a_parked_backend_does_not_delay_the_check_deadline() {
         );
     });
 }
+
+/// A 500 from the authority is `NoDecision`, so the route answers 503 with
+/// `Retry-After: 1`, never 200 and never 502.
+#[test]
+fn a_check_that_is_500_is_503_not_200() {
+    let mut srv = TestServer::start();
+    srv.check.unknown_answer(Reply::Status(500));
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(
+        response.status, 503,
+        "a 500 from the authority was not the edge's 503\n{}",
+        response.headers
+    );
+    assert_eq!(
+        response.header_value("retry-after").as_deref(),
+        Some("1"),
+        "{}",
+        response.headers
+    );
+}
+
+/// An answer cut off mid-body is unparsable, so the route answers 503 with
+/// `Retry-After: 1` rather than serving what the head promised.
+#[test]
+fn a_check_cut_off_mid_answer_is_503_not_200() {
+    let mut srv = TestServer::start();
+    srv.check.unknown_answer(Reply::CloseMidAnswer);
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(
+        response.status, 503,
+        "a cut-off answer was not the edge's 503\n{}",
+        response.headers
+    );
+    assert_eq!(
+        response.header_value("retry-after").as_deref(),
+        Some("1"),
+        "{}",
+        response.headers
+    );
+}
