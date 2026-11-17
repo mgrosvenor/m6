@@ -439,6 +439,7 @@ m6-http reads its keys from the `[limits]` table of its system config, and every
 | `refresh_queue` | entries | 16 | 4096 | m6-http | stale cache entries waiting for a background fetch | the refresh is refused |
 | `rate_limit_addresses` | entries | 1024 | 50000 | m6-http | client addresses the request counter tracks | a new address is answered 429 |
 | `cache_bytes` | bytes | 128 MiB | 128 MiB | m6-http | the response cache, which evicts the least recently read entry | the cache evicts |
+| `heap_reserve` | bytes | 32 MiB (m6-http: `cache_bytes` max plus 64 MiB) | 4 GiB | services | the heap reserved from the OS at start, on huge pages where the kernel has them | the heap still grows from the OS, logged once, and is never a failure |
 
 **Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
 Take from it that every limit is one `start` and one `max`, and that a limit past its maximum refuses the work with an error naming the key, except the cache, which evicts by design.

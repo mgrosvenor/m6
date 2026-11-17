@@ -2,6 +2,7 @@
 # bench.sh — build, configure, and run the full m6 benchmark suite.
 #
 # Usage:
+#   BENCH_PROFILE=debug ./bench.sh ...   (only to check the script; numbers need release)
 #   ./bench.sh [--skip-verify] [--latency-n N] [--duration S] [--concurrency C]
 #              [--p99-limit-us F] [--rps-min F] [--addr HOST:PORT]
 #
@@ -74,20 +75,24 @@ while [[ $i -lt ${#args[@]} ]]; do
 done
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-echo "==> Building binaries..."
-cargo build --release \
-    -p m6-http --bin m6-http \
-    -p m6-http --bin m6-bench \
-    -p m6-http --bin bench-url-backend \
-    -p m6-html \
-    -p m6-file \
+# BENCH_PROFILE=debug runs the dev build, to check the script itself; a number
+# comes only from the default, release.
+PROFILE="${BENCH_PROFILE:-release}"
+PROFILE_FLAG=()
+[[ "$PROFILE" == release ]] && PROFILE_FLAG=(--release)
+echo "==> Building binaries ($PROFILE)..."
+cargo build ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
+    -p m6-http --bin m6-http --bin m6-bench --bin bench-url-backend \
+    2>&1 | grep -E "^(error|warning\[|Compiling|Finished)" || true
+# A separate call: `--bin` above would otherwise limit every package to those names.
+cargo build ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} -p m6-html -p m6-file \
     2>&1 | grep -E "^(error|warning\[|Compiling|Finished)" || true
 
-M6_HTTP="$REPO/target/release/m6-http"
-M6_BENCH="$REPO/target/release/m6-bench"
-URL_BACKEND="$REPO/target/release/bench-url-backend"
-M6_HTML="$REPO/target/release/m6-html"
-M6_FILE="$REPO/target/release/m6-file"
+M6_HTTP="$REPO/target/$PROFILE/m6-http"
+M6_BENCH="$REPO/target/$PROFILE/m6-bench"
+URL_BACKEND="$REPO/target/$PROFILE/bench-url-backend"
+M6_HTML="$REPO/target/$PROFILE/m6-html"
+M6_FILE="$REPO/target/$PROFILE/m6-file"
 
 for bin in "$M6_HTTP" "$M6_BENCH" "$URL_BACKEND" "$M6_HTML" "$M6_FILE"; do
     if [[ ! -x "$bin" ]]; then
@@ -106,9 +111,13 @@ mkdir -p \
     "$SITE_DIR/assets" \
     "$SITE_DIR/configs"
 
-# TLS certs — reuse the test-fixture self-signed certs.
-cp "$REPO/m6-http/tests/fixtures/site/cert.pem" "$SITE_DIR/cert.pem"
-cp "$REPO/m6-http/tests/fixtures/site/key.pem"  "$SITE_DIR/key.pem"
+# TLS certs — a throwaway self-signed certificate, made here. The old fixture
+# files no longer exist, and the tests make theirs the same way (rcgen, in the
+# test). RSA, because quiche's TLS library refuses LibreSSL's default EC output.
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+    -keyout "$SITE_DIR/key.pem" -out "$SITE_DIR/cert.pem" 2>/dev/null \
+    || { echo "ERROR: openssl could not make a certificate" >&2; exit 1; }
 
 # site.toml — four routes:
 #   /              → m6-html (cacheable, Cache-Control: public)
@@ -124,8 +133,14 @@ domain = "localhost"
 mode = "internal"
 
 [log]
-level  = "warn"
-format = "text"
+level = "warn"
+
+[analytics]
+log_path = "$BENCH_DIR/analytics.ndjson"
+
+# The per-address limit (300 a minute) would answer a benchmark client 429.
+[rate_limit]
+enabled = false
 
 [[backend]]
 name    = "m6-html"
@@ -223,13 +238,15 @@ EOF
 #   /tail/{relpath}   → tail=true;  Cache-Control: no-store  — never cached
 cat > "$SITE_DIR/configs/m6-file.conf" <<EOF
 [[route]]
-path = "/assets/{relpath}"
-root = "assets/"
+path    = "/assets/{relpath}"
+handler = "files"
+root    = "assets/"
 
 [[route]]
-path = "/tail/{relpath}"
-root = "assets/"
-tail = true
+path    = "/tail/{relpath}"
+handler = "files"
+root    = "assets/"
+tail    = true
 EOF
 
 # Template (minimal — no nav loop, renders fast).
@@ -382,6 +399,7 @@ run_suite() {
 # ── Nine suites: H1/H2/H3 × latency/path/throughput ──────────────────────────
 
 run_suite "HTTP/1.1 latency"    --http11-only --latency-only
+run_suite "HTTP/1.1 vs HTTP/2 hit latency (fails if h1 keep-alive p50 > 2x h2)" --h1-vs-h2 --latency-only
 run_suite "HTTP/2  latency"     --http2-only  --latency-only
 run_suite "HTTP/3  latency"     --http3-only  --latency-only
 run_suite "H2C     latency"     --h2c-only    --latency-only

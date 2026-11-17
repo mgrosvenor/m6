@@ -1,3 +1,4 @@
+pub mod alloc;
 pub mod client;
 pub mod compress;
 pub mod conditional;

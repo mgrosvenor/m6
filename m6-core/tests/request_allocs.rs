@@ -16,7 +16,7 @@ use m6_core::testkit::alloc_count;
 use m6_core::Response;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 /// The body both compression routes answer with.
 const BODY_LEN: usize = 64 * 1024;

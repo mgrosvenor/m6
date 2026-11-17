@@ -22,7 +22,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 #[global_allocator]
-static ALLOC: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);

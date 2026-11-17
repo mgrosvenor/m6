@@ -33,7 +33,7 @@ use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::{self, Event, Events, Interest, Poll, Signal, Signals, Token};
 
 #[global_allocator]
-static ALLOC: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);

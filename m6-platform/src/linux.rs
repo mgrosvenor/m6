@@ -200,6 +200,142 @@ pub(super) fn max_open_files() -> io::Result<Option<u64>> {
     Ok(None)
 }
 
+/// The error a refused pin returns: it names the limit and both ways to fix it.
+fn lock_memory_refused(reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{reason}. Pinning memory needs RLIMIT_MEMLOCK unlimited. \
+             Under systemd set LimitMEMLOCK=infinity in the unit, otherwise \
+             `ulimit -l unlimited` as root. Or set [server] lock_memory = false to run unpinned"
+        ),
+    )
+}
+
+/// Pin every page this process has faulted, and every page it faults later:
+/// `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`.
+///
+/// `MCL_ONFAULT` is the difference between pinning the pages a process holds and
+/// pinning every page it has a mapping for. Without it, `MCL_CURRENT` faults in
+/// every current VMA and `MCL_FUTURE` marks each mapping made later as one to be
+/// populated. mimalloc reserves 1 GiB of address space by default
+/// (`MI_DEFAULT_ARENA_RESERVE`, 1024*1024 KiB, in its `arena.c`), and a service's
+/// own `[limits.heap_reserve]` is another 192 MiB, so a process that had mapped
+/// 1.2 GiB and touched 96 MB of it became 1.2 GiB resident, on transparent huge
+/// pages, in one `mlockall` call: the pages were touched by the lock, not by the
+/// program. With `MCL_ONFAULT` a VMA is locked and not populated, and each page
+/// is pulled in and locked when the program first touches it, so memory that is
+/// reserved and never used is never resident, and after warm-up the hot path is
+/// resident and locked and takes no fault (the same zero it took before).
+///
+/// `MCL_ONFAULT` is Linux 4.4 (2016), and availability is checked by asking the
+/// kernel: a kernel that does not know the flag fails the call with `EINVAL`,
+/// which is answered here as an error naming the version and the fix, and never
+/// by falling back to pinning every mapping. The value is `libc`'s, and nix's
+/// `MlockAllFlags` has no constant for it, so the call is made through `libc`.
+///
+/// The limit must be unlimited, and that is the owner's rule for how a service
+/// starts. The kernel tests `RLIMIT_MEMLOCK` itself: `mlockall` compares
+/// `mm->total_vm` with the soft limit before it applies any flag, so a finite
+/// limit below this process's address space fails the call with `ENOMEM`
+/// whether or not `MCL_ONFAULT` is set (`mm/mlock.c`). Under `MCL_FUTURE` every
+/// later `mmap` and `brk` checks `mlock_future_ok`, which refuses a mapping
+/// that would take `mm->locked_vm` past the same soft limit (`mm/mmap.c`), so
+/// the kernel never creates a locked mapping unlocked. It cannot half-pin this
+/// process.
+///
+/// The limit is checked here anyway, so a finite one is one error at start with
+/// the same text for every limit and every process, including a privileged
+/// process the kernel would have allowed. That is the policy.
+/// `LimitMEMLOCK=infinity` is what the unit sets and what the error names.
+pub(super) fn lock_memory() -> io::Result<()> {
+    use nix::sys::resource::{getrlimit, Resource};
+    // The soft limit is the one the kernel enforces. `mlockall` compares
+    // `mm->total_vm` with `rlimit(RLIMIT_MEMLOCK)`, and every later `mmap` and
+    // `brk` compares `mm->locked_vm` with the same soft limit (`mlock_future_ok`
+    // in `mm/mmap.c`), so a hard limit of infinity with a finite soft limit
+    // would pass a hard-only check and be refused by the kernel.
+    let (soft, _hard) = getrlimit(Resource::RLIMIT_MEMLOCK)?;
+    if soft != nix::libc::RLIM_INFINITY {
+        return Err(lock_memory_refused(&format!(
+            "pinning pages as they are faulted needs an unlimited RLIMIT_MEMLOCK, and the soft \
+             limit is {soft} bytes"
+        )));
+    }
+    const FLAGS: nix::libc::c_int =
+        nix::libc::MCL_CURRENT | nix::libc::MCL_FUTURE | nix::libc::MCL_ONFAULT;
+    // SAFETY: `mlockall` takes no pointers, reads no memory of the caller's, and
+    // changes only how this process's own pages are backed. Every flag is a
+    // constant from the platform's headers.
+    let rc = unsafe { nix::libc::mlockall(FLAGS) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let errno = io::Error::last_os_error();
+    match errno.raw_os_error() {
+        Some(nix::libc::EINVAL) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mlockall with MCL_ONFAULT failed (EINVAL): locking pages as they are touched is \
+             Linux 4.4 or newer, and this kernel does not know the flag. Set [server] \
+             lock_memory = false to run unpinned on this kernel",
+        )),
+        Some(nix::libc::ENOMEM) | Some(nix::libc::EPERM) => {
+            Err(lock_memory_refused(&format!("mlockall failed ({errno})")))
+        }
+        _ => Err(errno),
+    }
+}
+
+/// `/proc/self/status`'s `field`, in bytes. `None` where the file or the line is
+/// missing, so a caller logs nothing rather than a wrong number.
+fn status_bytes(field: &str) -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix(field))?
+        .split_whitespace()
+        .next()?;
+    value.parse::<usize>().ok().map(|kib| kib * 1024)
+}
+
+/// The size of this process's address space, from `/proc/self/status` (`VmSize`).
+pub(super) fn virtual_bytes() -> Option<usize> {
+    status_bytes("VmSize:")
+}
+
+/// This process's resident set, from `/proc/self/status` (`VmRSS`).
+pub(super) fn resident_bytes() -> Option<usize> {
+    status_bytes("VmRSS:")
+}
+
+/// `madvise(MADV_HUGEPAGE)` on the range.
+#[allow(unsafe_code)] // the caller owns the range, and the advice changes no byte of it
+pub(super) fn advise_huge_pages(start: *mut u8, len: usize) -> io::Result<()> {
+    use nix::sys::mman::{madvise, MmapAdvise};
+    let Some(start) = std::ptr::NonNull::new(start.cast::<std::ffi::c_void>()) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "null range"));
+    };
+    // SAFETY: MADV_HUGEPAGE only changes how the kernel backs the range.
+    unsafe { madvise(start, len, MmapAdvise::MADV_HUGEPAGE) }.map_err(io::Error::from)
+}
+
+/// `AnonHugePages` (transparent) and `Hugetlb` (explicit) of this process, from
+/// `/proc/self/smaps_rollup`, in bytes.
+pub(super) fn huge_page_bytes() -> usize {
+    let Ok(text) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("AnonHugePages:")
+                .or_else(|| line.strip_prefix("Hugetlb:"))?;
+            rest.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()
+        })
+        .sum::<usize>()
+        * 1024
+}
+
 // ── Process facts ────────────────────────────────────────────────────────────
 
 pub(super) fn thread_count(pid: u32) -> io::Result<usize> {

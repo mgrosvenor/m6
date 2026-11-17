@@ -52,6 +52,20 @@ Take from it that only the last one runs everything.
 **Table 2: the five commands, and what each one runs.**
 `cargo test` is the loop while writing code, `check.sh` is the local gate, and `build-host-tests.sh` is what gates a merge, because it adds the performance check and real conformance.
 
+**On Linux, raise the memlock limit for your account before running them.**
+m6-http pins its memory at start (`[server] lock_memory`, on by default) and an ordinary account's `RLIMIT_MEMLOCK` is 8 MiB, so without the raise every test that starts m6-http stops at start with a `mlockall failed` error that names `RLIMIT_MEMLOCK`.
+Add two lines to a file under `/etc/security/limits.d/`, replacing `you` with the account, and log in again:
+
+```
+you  soft  memlock  unlimited
+you  hard  memlock  unlimited
+```
+
+CI does the same for the Linux jobs with `sudo prlimit --pid $$ --memlock=unlimited:unlimited` at the top of each step that starts m6-http: the limit is inherited by every process the step's shell starts, so the m6-http the tests spawn has it.
+macOS needs nothing, because it has nothing to pin.
+`lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix` in `m6-http/tests/startup_errors.rs` lowers the limit itself with `ulimit -l 0`, checks the shell it lowered it in reports 0, and passes under any account.
+`a_warm_server_is_resident_within_its_reservation` in `m6-http/tests/heap_resident.rs` measures a warmed m6-http's resident set against its own start-up size plus the reservation it configured, and its minor page faults over 1,000 cache hits, so a pin that makes reserved memory resident fails rather than passing unnoticed.
+
 Three rules apply to all of them:
 
 - **Tests share one machine, not one port.**

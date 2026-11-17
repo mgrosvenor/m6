@@ -15,7 +15,7 @@ use m6_core::platform::process::page_size;
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const KIB: usize = 1024;
 

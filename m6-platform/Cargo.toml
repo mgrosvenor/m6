@@ -20,7 +20,7 @@ name = "m6_platform"
 mio     = { version = "1", features = ["os-poll", "os-ext", "net"] }
 # Safe system calls: signal masks, signalfd and kqueue, poll, statvfs,
 # rlimits, if_nametoindex, waitpid, dup and fcntl.
-nix     = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net", "process", "user"] }
+nix     = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net", "process", "user", "mman"] }
 # Socket construction with the options every m6 socket needs. `all` for
 # `SO_NOSIGPIPE` on macOS.
 socket2 = { version = "0.6", features = ["all"] }

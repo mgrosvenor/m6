@@ -1,8 +1,9 @@
 //! Counts heap allocations, to prove a run loop makes none.
 //!
 //! `alloc` and `realloc` each bump the process-wide count; `dealloc` does not.
-//! Test instrumentation only: a test binary or example opts in by declaring its
-//! own global allocator, and the m6-core library never installs one. Planner B's
+//! Test instrumentation only: [`crate::alloc::M6Alloc`] calls these hooks when
+//! the `alloc-count` feature is on, and compiles them out when it is off. The
+//! m6-core library never installs a global allocator. Planner B's
 //! ALLOC-0 and LOG-1 use this same counter.
 //!
 //! # Two counters
@@ -22,12 +23,8 @@
 //! allocation during thread-local teardown has no counter left to bump and
 //! must not panic.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// The counting allocator, to install with `#[global_allocator]`.
-pub struct Counting;
 
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -54,29 +51,25 @@ fn record(bytes: usize) {
     });
 }
 
-#[allow(unsafe_code)] // replacing the allocator is unsafe by definition: test instrumentation only
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        COUNT.fetch_add(1, Ordering::Relaxed);
-        record_trace();
-        record(layout.size());
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // Not added to COUNT: `now` has always meant `alloc` and `realloc`,
-        // and changing it would change every earlier counting test's number.
-        record(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        COUNT.fetch_add(1, Ordering::Relaxed);
-        record_trace();
-        record(new_size);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
+/// Called by [`crate::alloc::M6Alloc`] on each `alloc`.
+pub(crate) fn on_alloc(bytes: usize) {
+    COUNT.fetch_add(1, Ordering::Relaxed);
+    record_trace();
+    record(bytes);
+}
+
+/// Called on each `alloc_zeroed`. Not added to COUNT: `now` has always meant
+/// `alloc` and `realloc`, and changing it would change every earlier counting
+/// test's number.
+pub(crate) fn on_alloc_zeroed(bytes: usize) {
+    record(bytes);
+}
+
+/// Called on each `realloc`, with the new size.
+pub(crate) fn on_realloc(new_size: usize) {
+    COUNT.fetch_add(1, Ordering::Relaxed);
+    record_trace();
+    record(new_size);
 }
 
 /// Heap allocations so far (`alloc` and `realloc`, not `dealloc`).
@@ -129,7 +122,7 @@ pub mod trace {
         sites
     }
 
-    /// Called from `Counting`'s `alloc` and `realloc`. Never called when the
+    /// Called from `M6Alloc`'s `alloc` and `realloc`. Never called when the
     /// feature is off, because `record_trace` is a no-op empty function then.
     pub(super) fn record() {
         if !RECORDING.load(Ordering::Relaxed) {

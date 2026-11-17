@@ -28,7 +28,7 @@ use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const LISTENER: Token = Token(2);
 const PEER: Token = Token(1);

@@ -66,9 +66,11 @@ use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::RouteMethod;
 use m6_core::{genid_failed, genid_ok};
 
-#[cfg(feature = "count-allocations")]
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
 #[global_allocator]
-static ALLOC: m6_core::testkit::alloc_count::Counting = m6_core::testkit::alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const LISTENER: Token = Token(usize::MAX);
 const SIGNALS: Token = Token(usize::MAX - 1);
@@ -114,6 +116,8 @@ const ROUTES: [CodeRoute; 5] = [
 const DEFAULT_POLL_SECS: u64 = 30;
 
 fn main() -> Result<()> {
+    // Never hand freed memory back to the OS: the heap grows and does not shrink.
+    m6_core::alloc::never_return();
     // `m6-monitor --check <config>` prints the hourly health check and exits.
     // Same poll code as the page, so the two cannot disagree.
     let args: Vec<String> = std::env::args().collect();
@@ -171,6 +175,7 @@ fn run_service() -> Result<()> {
 
     // ── start: blocking and allocation are fine ──────────────────────────
     let mut site = Site::load("m6-monitor", &ROUTES, &[], &NoTemplates);
+    m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
     let read_timeout = site.read_timeout();
     let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
         site.user_config().get(k).and_then(|v| v.as_u64())
@@ -468,6 +473,7 @@ fn run_service() -> Result<()> {
         last = end;
         if end - last_report >= TICK {
             m6_core::log::tick(m6_core::platform::wall());
+            m6_core::alloc::note_growth();
             let _ = trace.report();
             last_report = end;
         }

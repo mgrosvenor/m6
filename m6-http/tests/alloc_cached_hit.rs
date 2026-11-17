@@ -19,7 +19,7 @@ use m6_http_lib::http11::status_may_have_content_length;
 use m6_http_lib::http11::{write_cached_h1, HitHeaders};
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const BODY_LEN: usize = 20 * 1024;
 

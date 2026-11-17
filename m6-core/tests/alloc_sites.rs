@@ -17,7 +17,7 @@ use m6_core::site::{Handled, Site};
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const OK: &[u8] = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nCookie: _csrf=abc; a=b\r\n\
                     Accept-Encoding: identity\r\n\r\n";

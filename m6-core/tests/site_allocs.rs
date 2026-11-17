@@ -28,7 +28,7 @@ use m6_core::site::Site;
 use m6_core::testkit::alloc_count;
 
 #[global_allocator]
-static ALLOC: alloc_count::Counting = alloc_count::Counting;
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 const SERVER: Token = Token(0);
 const DEADLINE: Duration = Duration::from_secs(10);
