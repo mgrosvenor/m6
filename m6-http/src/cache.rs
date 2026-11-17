@@ -1863,8 +1863,38 @@ impl RequestDirectives {
     }
 }
 
+/// Whether a request carries a credential, which forbids a shared cache from
+/// storing its response (RFC 9111 3.5 and 5.2.2.5).
+///
+/// Any `Authorization` field counts, whatever its value. This deployment's
+/// browser credential is the `session` cookie, so a request carrying that
+/// cookie counts too, on any number of `Cookie` field lines. The design's
+/// Table 11 is the one permitted case, a protected response stored under the
+/// origin's requirement, and this tip has no such route, so every credentialed
+/// request is refused.
+fn request_carries_credential(req_headers: &[(String, String)]) -> bool {
+    req_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("authorization")
+            || (name.eq_ignore_ascii_case("cookie")
+                && value.split(';').any(|cookie| {
+                    cookie
+                        .trim()
+                        .strip_prefix("session=")
+                        .is_some_and(|token| !token.trim().is_empty())
+                }))
+    })
+}
+
+/// Whether the REQUEST permits this response to be stored in a shared cache.
+///
+/// RFC 9111 5.2.1.5: a request carrying `Cache-Control: no-store` must not
+/// have its response written to cache. RFC 9111 3.5 and 5.2.2.5: a response to
+/// a request that carried a credential must not be stored either, unless the
+/// response explicitly allows it. The one permitted case is the design's
+/// Table 11, which this tip does not have, so `Authorization` and the `session`
+/// cookie both refuse the store.
 pub fn request_permits_storage(req_headers: &[(String, String)]) -> bool {
-    !CacheControl::parse(req_headers).no_store
+    !CacheControl::parse(req_headers).no_store && !request_carries_credential(req_headers)
 }
 
 /// Headers safe to store in a shared cache entry, with `Set-Cookie` removed.
@@ -2850,6 +2880,48 @@ mod cache_control_tests {
             "Cache-Control",
             "No-Store"
         )])));
+    }
+
+    /// RFC 9111 3.5 and 5.2.2.5: a shared cache must not store a response to
+    /// a request that carried a credential. Any `Authorization` field counts,
+    /// and this deployment's browser credential is the `session` cookie. The
+    /// design's Table 11 is the one permitted case, and it is not in this tip.
+    ///
+    /// The same response is shown to be storable for an anonymous request
+    /// first, so this test fails because of the credential and not because
+    /// some other rule already refused the response.
+    #[test]
+    fn a_credential_in_the_request_forbids_storage() {
+        let response = h(&[("cache-control", "public, max-age=60")]);
+        assert!(
+            should_cache(200, &response),
+            "the response is otherwise storable, so the credential is the only refusal"
+        );
+
+        for request in [
+            h(&[("authorization", "Bearer a stolen token")]),
+            h(&[("Authorization", "Bearer a stolen token")]),
+            h(&[("cookie", "session=abc")]),
+            h(&[("cookie", "_m6sid=xyz; session=abc; refresh=def")]),
+            // HTTP/2 and HTTP/3 split cookies across field lines.
+            h(&[("cookie", "_m6sid=xyz"), ("cookie", "session=abc")]),
+        ] {
+            assert!(
+                !request_permits_storage(&request),
+                "a response to this request would be stored: {request:?}"
+            );
+        }
+
+        for request in [
+            h(&[("cookie", "theme=dark")]),
+            h(&[("cookie", "not_session=abc")]),
+            h(&[("x-forwarded-for", "203.0.113.9")]),
+        ] {
+            assert!(
+                request_permits_storage(&request),
+                "an uncredentialed request must still store: {request:?}"
+            );
+        }
     }
 
     /// Request `no-cache` means "revalidate before reuse", NOT "do not store".

@@ -84,6 +84,10 @@ fn serve(mut stream: TcpStream, seen: &AtomicUsize) {
     // connection keeps the fake honest without a keep-alive state machine.
     let cache_control = if path.starts_with("/stale") {
         "public, max-age=0, stale-while-revalidate=60"
+    } else if path.starts_with("/override-no-store") {
+        // The backend forbids storage and the route's `cache` tries to make it
+        // storable. The backend's veto must win.
+        "no-store"
     } else {
         "public, max-age=60"
     };
@@ -124,7 +128,9 @@ fn site_toml(origin_port: u16, check: &std::path::Path) -> String {
          [[backend]]\nname = \"origin\"\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
          [[backend]]\nname = \"auth-check\"\nsockets = \"{}\"\n\n\
          [[route]]\npath = \"/fresh\"\nbackend = \"origin\"\n\n\
-         [[route]]\npath = \"/stale\"\nbackend = \"origin\"\n",
+         [[route]]\npath = \"/stale\"\nbackend = \"origin\"\n\n\
+         [[route]]\npath = \"/override-no-store\"\nbackend = \"origin\"\ncache = \"public, max-age=60\"\n\n\
+         [[route]]\npath = \"/fresh-cookie\"\nbackend = \"origin\"\n",
         check.display()
     )
 }
@@ -447,5 +453,108 @@ fn each_cache_fact_moves_its_own_counter_once() {
             misses_total: 3,
         },
         "a local 404 is a miss answered locally, not a fetched one"
+    );
+}
+
+// ── A cache stores only what it is allowed to store ──────────────────────────
+
+/// The `Cache-Control` fields a response carries, comma joined so a split
+/// field and one field read the same.
+fn cache_control(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// RFC 9111 3.5: a cache must not store a response it is not allowed to
+/// store, and a route's `cache` override never removes the backend's
+/// `no-store`.
+///
+/// The route `/override-no-store` names `cache = "public, max-age=60"` while
+/// the origin answers `Cache-Control: no-store`. Before the fix the override
+/// replaced that field, so the response entered the cache and the second
+/// request never reached the origin.
+#[test]
+fn a_route_cache_override_cannot_make_a_no_store_response_storable() {
+    let origin = Origin::spawn();
+    let stack = Stack::start(origin.port);
+
+    let (status, headers, _) = stack.get_with_headers("/override-no-store", &[]);
+    assert_eq!(status, 200, "{}", stack.service.output());
+    let field = cache_control(&headers);
+    assert!(
+        field.to_ascii_lowercase().contains("no-store"),
+        "the route override removed the backend's no-store: Cache-Control: {field:?}\n{}",
+        stack.service.output()
+    );
+    assert!(
+        wait_for_origin(&origin, 1),
+        "the origin was never asked:\n{}",
+        stack.service.output()
+    );
+
+    let (status, _, _) = stack.get_with_headers("/override-no-store", &[]);
+    assert_eq!(status, 200, "{}", stack.service.output());
+    assert!(
+        wait_for_origin(&origin, 2),
+        "the route override stored a response the backend marked no-store, so the \
+         second request was served from cache instead of the origin:\n{}",
+        stack.service.output()
+    );
+}
+
+/// RFC 9111 5.2.2.5 and 3.5: a shared cache must not store a response to a
+/// request that carried `Authorization`, and the response here is otherwise
+/// storable (`public, max-age=60` from a route with no override).
+#[test]
+fn a_response_to_a_request_carrying_authorization_is_never_stored() {
+    let origin = Origin::spawn();
+    let stack = Stack::start(origin.port);
+
+    let (status, _, _) =
+        stack.get_with_headers("/fresh", &[("Authorization", "Bearer a-stolen-credential")]);
+    assert_eq!(status, 200, "{}", stack.service.output());
+    assert!(
+        wait_for_origin(&origin, 1),
+        "the origin was never asked:\n{}",
+        stack.service.output()
+    );
+
+    let (status, _, _) = stack.get_with_headers("/fresh", &[]);
+    assert_eq!(status, 200, "{}", stack.service.output());
+    assert!(
+        wait_for_origin(&origin, 2),
+        "the response to an Authorization request was stored and served to an \
+         anonymous request:\n{}",
+        stack.service.output()
+    );
+}
+
+/// RFC 9111 3.5: the `session` cookie is this deployment's browser
+/// credential, so a response to a request carrying it is not stored either.
+#[test]
+fn a_response_to_a_request_carrying_a_session_cookie_is_never_stored() {
+    let origin = Origin::spawn();
+    let stack = Stack::start(origin.port);
+
+    let (status, _, _) =
+        stack.get_with_headers("/fresh-cookie", &[("Cookie", "_m6sid=x; session=abc")]);
+    assert_eq!(status, 200, "{}", stack.service.output());
+    assert!(
+        wait_for_origin(&origin, 1),
+        "the origin was never asked:\n{}",
+        stack.service.output()
+    );
+
+    let (status, _, _) = stack.get_with_headers("/fresh-cookie", &[]);
+    assert_eq!(status, 200, "{}", stack.service.output());
+    assert!(
+        wait_for_origin(&origin, 2),
+        "the response to a session-cookie request was stored and served to an \
+         anonymous request:\n{}",
+        stack.service.output()
     );
 }

@@ -168,6 +168,7 @@ An unknown or empty `methods` list stops the start with exit 2.
 
 A `[[route]]` or `[[route_group]]` may name `cache`, a `Cache-Control` value that replaces the backend's own on every reply the route gets.
 It is applied before the reply is stored, so `no-store` keeps it out of the cache, and the stored copy and the client's reply carry the same one field (RFC 9111 5.2).
+The override never weakens a directive that forbids storage: a reply that already carries `no-store` or `private` keeps the field the backend sent, and the route value is not applied (RFC 9111 3.5).
 
 ---
 
@@ -213,6 +214,8 @@ m6-http caches a backend response when the response permits a shared cache to st
 `Cache-Control: public` is stored under the `(path, query, content-encoding)` key, while `no-store` and `private` are not stored.
 Each encoding variant is cached independently on demand, with no eager pre-fetching.
 A response whose `Vary` names any field other than `Accept-Encoding` is not stored, because the key cannot express it.
+A shared cache also refuses a response to a request that carried a credential: an `Authorization` field or a `session` cookie forbids the store (RFC 9111 3.5 and 5.2.2.5).
+That rule is the cache's own, so it holds whatever the backend's header says and whether or not the route names `cache`.
 
 ### 7.1 The browser-caching pattern
 

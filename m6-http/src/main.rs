@@ -24,7 +24,7 @@ use m6_http_lib::analytics::H3Headers;
 use m6_http_lib::auth;
 use m6_http_lib::cache::{
     evaluate_preconditions, make_lookup_key, not_modified_headers, request_permits_storage,
-    should_cache, strip_uncacheable, Cache, CacheKey, CachedResponse, Precondition,
+    should_cache, strip_uncacheable, Cache, CacheControl, CacheKey, CachedResponse, Precondition,
 };
 use m6_http_lib::config::{self, Config};
 use m6_http_lib::disk_cache::{self, DiskWriter};
@@ -6268,8 +6268,19 @@ fn invalidate_after_unsafe_method(
 /// and the reply to the client carry the same single field, and `no-store`
 /// stops the store. A miss pays one scan of the reply's headers; a hit never
 /// reaches here.
+///
+/// The override never weakens the backend's own refusal. RFC 9111 3.5 says a
+/// cache must not store a response it is not allowed to store, so a reply that
+/// carries `no-store` or `private` keeps that field untouched and the route
+/// value is not applied. `should_cache` reads every field line, so a reply that
+/// carried both would still be refused, but sending one field that names the
+/// backend's veto is clearer to every downstream cache than two that disagree.
 fn apply_route_cache(headers: &mut Vec<(String, String)>, route_cache: Option<&str>) {
     let Some(value) = route_cache else { return };
+    let backend = CacheControl::parse(&headers[..]);
+    if backend.no_store || backend.private {
+        return;
+    }
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
     headers.push(("Cache-Control".to_string(), value.to_string()));
 }

@@ -318,6 +318,18 @@ Verified on 2026-11-16 on a macOS sandbox: `tls_reload` and the new unit tests p
 
 ### Security
 
+**A cache no longer stores a response it is not allowed to store: a route's `cache` override cannot remove the backend's `no-store` or `private`, and a response to a request carrying `Authorization` or the `session` cookie is never stored.**
+`apply_route_cache` deleted every `Cache-Control` field and wrote the route's value, so a cache route configured `cache = "public, max-age=600"` turned an origin's `private` or `no-store` into `public` before `reply_rule` made the store decision.
+A protected page fetched through that cache was stored and replayed to an anonymous visitor with no check.
+RFC 9111 3.5 says a cache must not store a response it is not allowed to store.
+`request_permits_storage` read request `Cache-Control: no-store` alone.
+RFC 9111 5.2.2.5 forbids a shared cache from storing a response to a request that carried `Authorization`, and the `session` cookie is this deployment's browser credential, so both now refuse the store.
+The auth API design's Table 11 is the one permitted case, a protected response stored under the origin's requirement, and this tip has no such route, so every credentialed request is refused.
+Verified on 2026-11-17 on a macOS sandbox: `a_route_cache_override_cannot_make_a_no_store_response_storable` fails before the fix with `the route override removed the backend's no-store: Cache-Control: "public, max-age=60"` and passes after.
+`a_response_to_a_request_carrying_authorization_is_never_stored` and `a_response_to_a_request_carrying_a_session_cookie_is_never_stored` fail before the fix with the stored reply served to the anonymous second request, and pass after.
+`a_credential_in_the_request_forbids_storage` fails on the first `authorization` case before the fix and passes after.
+`docs/m6-http.md` section 4 and section 7 and `docs/m6-site-toml.md` Table 10 state both rules.
+
 **rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host; the update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
 
 **A login throttle blocks five wrong passwords even when the series takes longer than `window_secs`.**

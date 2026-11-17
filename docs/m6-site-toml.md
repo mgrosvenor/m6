@@ -581,12 +581,14 @@ Take from it that a route is a path and a backend, with an optional claim.
 | `backend` | string | yes | The name of a declared `[[backend]]` |
 | `require` | string | no | `"group:<name>"` or `"role:<name>"`. A token must satisfy it |
 | `methods` | array of strings | no | The methods the route answers, such as `["POST"]`. Absent adds no restriction |
-| `cache` | string | no | A `Cache-Control` value, such as `"no-store"`, that replaces the one the backend set on every reply this route gets. Absent leaves the backend's header alone |
+| `cache` | string | no | A `Cache-Control` value, such as `"no-store"`, that replaces the one the backend set on every reply this route gets. Absent leaves the backend's header alone. A reply that already carries `no-store` or `private` keeps that field |
 
 **Table 10: the `[[route]]` keys.**
 A `{param}` matches one segment, and a `{*rest}` in the last segment matches the rest of the path.
 A route that names `cache` has that value sent in place of the `Cache-Control` the backend set, so one path can be `no-store` whatever its handler decides.
 The edge applies it before it decides whether to store the reply, so `no-store` keeps the reply out of the cache, and a hit replays the stored value.
+The override never removes a `no-store` or `private` the backend sent: that reply keeps the backend's field and the route value is not applied.
+A response to a request that carried an `Authorization` field or a `session` cookie is never stored, whatever the route or the backend says.
 A route that lists `methods` answers exactly those: `GET` also answers `HEAD`, and a request with another method gets 405 with `Allow` before the cache or a backend is touched.
 The names m6 accepts are `GET`, `POST`, `PUT`, `PATCH` and `DELETE`.
 A name outside that set, or an empty list, stops the start with exit 2, and `--dump-config` fails the same way.
