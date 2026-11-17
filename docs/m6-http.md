@@ -2,7 +2,6 @@
 
 Reverse proxy, cache, and router.
 The only process in an m6 deployment that listens on a public port, unless `[server] reuse_port` asks several of them to share it.
-It does not manage other processes, which is systemd's job.
 
 The sections run from the process's surface to its protocols.
 §1 to §13 cover the CLI, startup, pools, routing, forwarding, limits, caching, the generation ID, errors, auth, monitoring, signals and exit codes.
@@ -39,7 +38,7 @@ The sections run from the process's surface to its protocols.
 m6-http <site-dir> <system-config>
 ```
 
-Both arguments are required.
+Both arguments are required to serve.
 Development uses a minimal local system config (e.g. `configs/system.toml`).
 Production uses `/etc/m6/my-blog.toml`.
 The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]`, `[genid]`, `[cache]` and `[limits]`.
@@ -51,6 +50,7 @@ Optional flags:
 ```
 --log-level debug    # override log level
 --dump-config        # print effective merged config to stdout, then exit 0
+--version, -V        # print the version and exit 0
 ```
 
 m6-http logs one structured JSON line per event to stdout, or journald's native socket under systemd.
@@ -66,7 +66,9 @@ m6-http starts in this order, before it serves a request.
    It carries `[node]`, the `[server]` node keys, `[auth]`, `[genid]`, `[cache]` and `[limits]`, and nothing else.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
-4. If `[auth]` is declared, note the check backend it names. The check side is probed at step 8, and `backend` names the socket backend that answers `/check`.
+4. If `[auth]` is declared, take the check backend it names.
+   `backend` is required and names the socket backend that answers `/check` (`m6-http/src/config.rs:807`).
+   The check side is probed at step 8 (`m6-http/src/main.rs:6971`).
 5. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
 6. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
@@ -76,8 +78,8 @@ m6-http starts in this order, before it serves a request.
    The probe sends one `POST /check` with no credential.
    A 401 or 503 passes, because a checker that refuses or is busy is there.
    A 404 is exit 2, naming the setting, the backend and the socket, because that address is not an auth server.
-   A connect failure or a timeout warns and the start continues, so a node can start while its checker is replaced.
-   When every member answered something other than 401, 503 or 404, the start is exit 2 and names the backend.
+   A connect failure or a timeout warns and skips that member, so a node can start while its checker is replaced.
+   If no member answers 401 or 503 and at least one answered another status, the start is exit 2 and names the backend.
 9. Bind the TLS and QUIC sockets on `[server].bind`.
    If `h2c_bind` is set, bind the H2C (plain-TCP HTTP/2) listener on that address.
    The listener is internal when `internal_binds` names it, and then accepts only the peers in `internal_peers`.
@@ -104,21 +106,13 @@ m6-http finds pool members once at start by expanding the socket glob.
 **Load balancing:** plain round robin.
 Each request takes the next member in turn, so `N * k` requests put exactly `k` on each of `N` members.
 
-**URL backends** (`http://`, `https://`) are not a member pool.
-Each request takes one HTTP/1.1 connection, kept open for later requests in a per-backend idle set of up to eight, driven by the event loop through a `client::Upstream` slot with no dedicated I/O thread.
+**URL backends** (`http://`, `https://`) take one HTTP/1.1 connection per request, kept open for later requests in a per-backend idle set of up to eight, through a `client::Upstream` slot in the event loop.
 The host name is resolved once at start, so an address change needs a restart.
 
-**H2C backends** use the `h2c://` scheme (e.g. `url = "h2c://origin.example.com:8080"`).
-The connection is maintained persistently by an event-loop-driven `H2cClientPool`, and no thread is spawned.
-It is intended for inter-node requests over a private backbone, where TLS at the application layer is redundant.
+**H2C backends** (`h2c://`, section 14) and **H2S backends** (`h2s://`, section 15) keep one persistent HTTP/2 connection each.
 
-**H2S backends** use the `h2s://` scheme (e.g. `url = "h2s://api.example.com:443"`).
-It is H2C over TLS, and ALPN negotiates `h2` during the handshake.
-The connection is maintained persistently by an event-loop-driven `H2sTlsClientPool`.
-It is intended for HTTP/2 forwarding to external TLS-terminating upstreams.
-
-A backend that answers before it has read the whole request and then refuses the write has that answer forwarded to the client, and its connection is never reused.
-A request that was written in full and answered early is a different case: the connection can still carry another request if the reply's framing says it can, so it rejoins the idle set like any other.
+A backend that answers before it has read the whole request and then refuses the write has that answer forwarded to the client, and its connection is not reused.
+A request written in full and answered early keeps its connection, which rejoins the idle set when the reply's framing allows another request.
 
 ---
 
@@ -129,13 +123,13 @@ m6-http decides a request's path through a fixed order, and each step can answer
 1. **Rate limit:** a request over the per-IP limit is answered 429 before the cache, the redirect, routing or any backend.
 2. **www redirect:** with `[site] redirect_www` set (the default), a `www.` host is answered 301 on the apex host.
 3. **Unmatched-host redirect:** with `[server] redirect_unmatched_to` set, a Host outside `[server] served_hosts`, including no Host at all, is answered 301 to `https://<redirect_unmatched_to><path>`. The internal h2c listener is excluded.
-4. **Method check:** a route that names `methods` answers only those, and another method is refused 405 with `Allow` before the cache is looked up or a backend is contacted.
+4. **Method check:** a route that names `methods` refuses another method with 405 and `Allow`, before the cache lookup.
 5. **Cache lookup:** a route with no `require` and a method that may read the cache is served from memory on a fresh hit, with no backend contact.
 6. **Route lookup:** a path that matches no route is answered 404 per `[errors] mode`.
 7. **Auth check:** when the route declares `require`, the credential is sent to `POST /check` on `[auth] backend` under a 50 ms deadline. An API request with no credential is 401 locally with no call, a browser is redirected as section 10 describes, a 401 from the authority is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 8. **Forward:** the request is forwarded to the backend pool.
 
-The two host redirects sit before the cache on purpose: the cache key is `(path, query, encoding)` with no host component, so a warm entry for a served name would otherwise answer a request for a name the node does not own.
+The two host redirects sit before the cache because the cache key is `(path, query, encoding)` with no host component, so a warm entry for a served name would otherwise answer a request for a name the node does not own.
 A redirector on `[server] redirect_bind` makes the same unmatched-host decision: a served name keeps its 301 to the HTTPS form of itself, and every other name goes to the canonical target.
 
 Route matching: a fixed route (every segment a literal) beats a pattern route (any `{param}` or `{*rest}`).
@@ -156,10 +150,8 @@ An operator who needs one number there sets `requests_per_min` to the node total
 A process that stops or starts moves some clients to another process until the group is whole again, and a client that moves starts a fresh count there.
 While the group is short of N, a client whose place has no socket is chosen by the kernel's own hash, so a stopped process drops no traffic.
 
-The steps after the limit decide which route and backend serve a request, and the next section states exactly what that backend receives.
-
 A `[[route]]` or `[[route_group]]` may name the methods it answers in `methods`.
-A request with another method is refused at the edge with 405 and `Allow` naming the ones the route does answer, before the body, the cache or a backend (RFC 9110 15.5.6 and 10.2.1).
+A request with another method is refused 405 with `Allow` naming the methods the route answers, before the body is read (RFC 9110 15.5.6 and 10.2.1).
 `GET` also answers `HEAD` (RFC 9110 9.3.2).
 `OPTIONS` is answered at the edge the same way and never forwarded (RFC 9110 9.3.7).
 An unknown or empty `methods` list stops the start with exit 2.
@@ -183,13 +175,12 @@ A URL backend receives its own host in `Host`, and a socket backend receives the
 **Response fields:** HTTP/2 and HTTP/3 write every response field name in lower case (RFC 9113 8.2.1, RFC 9114 4.2).
 Both drop the connection-specific set `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding` and `Upgrade`, and HTTP/2 writes its own `Content-Length`.
 HTTP/1.1 keeps the fields that describe its own connection, and it writes `Connection` itself.
-m6-html closes its connection after each page and sends `Connection: close`, and a client enforcing RFC 9114 4.2 reset an HTTP/3 stream that carried the field and read no body.
 
 ---
 
 ## 6. Request Header Limits
 
-A request head is bounded before routing, the cache lookup and every backend, so an over-limit request is answered by the edge and no backend sees it.
+A request head is bounded before routing, the cache lookup and every backend, so the edge answers an over-limit request.
 Two limits apply, and both follow the numbers the mainstream servers use: nginx's `large_client_header_buffers 4 8k`, Varnish's `http_req_hdr_len 8k` and `http_req_size 32k`, and Apache's `LimitRequestFieldSize 8190`.
 `MAX_HEADER_LINE` is 8 KiB for one field, counted as its name plus its value.
 `MAX_REQUEST_HEAD` is 32 KiB for the request line plus every field.
@@ -200,9 +191,9 @@ A request line over `MAX_HEADER_LINE` is answered 414 Request-URI Too Large, cou
 Both limits are defined once in m6-core as `m6_core::headers::MAX_HEADER_LINE` and `m6_core::headers::MAX_REQUEST_HEAD`, and the HTTP/1.1 parser, both backends and the edge read those definitions.
 
 HTTP/2 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_HEADER_LIST_SIZE` and enforces it while decoding.
-The 256 KiB bound on the compressed header block stays as the default of `[limits.h2_header_block] max`, because it is the defence against HPACK expansion.
+`[limits.h2_header_block] max` bounds the compressed header block, 256 KiB by default (section 16.4).
 HTTP/3 advertises `MAX_REQUEST_HEAD` in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the pinned quiche enforces it by closing the connection with H3_EXCESSIVE_LOAD.
-A single field over `MAX_HEADER_LINE` and a request line over it are answered on the HTTP/3 stream, as they are on the other two protocols.
+A field or request line over `MAX_HEADER_LINE` is answered on the HTTP/3 stream.
 The HTTP/1.1 head limit is separate from the cap on a whole request, which is `[limits.edge_request] max` and defaults to 32 MiB.
 
 ---
@@ -211,7 +202,7 @@ The HTTP/1.1 head limit is separate from the cap on a whole request, which is `[
 
 m6-http caches a backend response when the response permits a shared cache to store it and its status is one RFC 9111 3 makes storable.
 `Cache-Control: public` is stored under the `(path, query, content-encoding)` key, while `no-store` and `private` are not stored.
-Each encoding variant is cached independently on demand, with no eager pre-fetching.
+Each encoding variant is cached on demand.
 A response whose `Vary` names any field other than `Accept-Encoding` is not stored, because the key cannot express it.
 A shared cache also refuses a response to a request that carried a credential: an `Authorization` field or a `session` cookie forbids the store (RFC 9111 3.5 and 5.2.2.5).
 That rule is the cache's own, so it holds whatever the backend's header says and whether or not the route names `cache`.
@@ -219,9 +210,9 @@ That rule is the cache's own, so it holds whatever the backend's header says and
 ### 7.1 The browser-caching pattern
 
 A page and an unversioned file are read through two caches with different lifetimes, so one `Cache-Control` field names both.
-web.dev's HTTP caching guide and MDN's `Cache-Control` reference describe the same split: the browser revalidates, and the shared cache keeps its copy.
+The browser revalidates, and the shared cache keeps its copy.
 A versioned asset is one exact version, so it is pinned instead.
-These are the three headers m6 emits, and the directives that decide each behaviour.
+m6 emits three headers.
 
 - A page, from m6-core: `Cache-Control: public, max-age=0, must-revalidate, s-maxage=86400`, with an `ETag`.
 - An unversioned file, from m6-file: the same header, with an `ETag`.
@@ -232,9 +223,7 @@ The browser therefore sends `If-None-Match` on every use, and an unchanged respo
 `s-maxage=86400` is honoured by shared caches only and overrides `max-age` for them (RFC 9111 section 5.2.2.10), so m6-http keeps the response for a day and answers that conditional request itself (RFC 9111 section 4.3.2) without contacting the backend.
 `public` makes the response storable by a shared cache.
 
-`no-cache` is absent because it would also force the shared cache to revalidate, the round trip `s-maxage` removes (RFC 9111 section 5.2.2.4).
-m6 does not emit `stale-while-revalidate` in these headers, because it would let the browser serve a stale copy while it revalidates.
-An upstream that sends `stale-while-revalidate` is still honoured: the cache serves stale inside the window the directive names and refreshes behind the request (RFC 9111 section 4.2.4).
+An upstream that sends `stale-while-revalidate` is honoured: the cache serves stale inside the window the directive names and refreshes behind the request (RFC 9111 section 4.2.4).
 `immutable` appears only on the versioned asset, where changed bytes mean a different URL, and it stops the browser revalidating that URL on reload.
 
 ### 7.2 Invalidation
@@ -249,13 +238,11 @@ An entry leaves the cache in one of four ways.
 4. The process restarts, because the cache is in memory.
 
 A file change behind a page therefore does not reach the cache until one of those happens, and a publish through `/genid` makes it happen at once.
-m6-http keeps no map from data files to the URL paths that depend on them, and it reads no renderer config at startup.
 
 ### 7.3 Which statuses are stored
 
 Storability starts from the statuses RFC 9111 3 lists, and Table 1 gives the set this cache accepts.
 A status outside Table 1 is answered to the client and not stored, whatever its `Cache-Control` says.
-m6-http never stores a 206, because the key carries no `Range` component and a partial representation would be replayed as a whole one.
 
 | Status | Stored when public |
 |---|---|
@@ -263,7 +250,7 @@ m6-http never stores a 206, because the key carries no `Range` component and a p
 | `300`, `301`, `308` | Yes |
 | `404`, `405`, `410`, `414` | Yes |
 | `501` | Yes |
-| `206` | Never |
+| `206` | Never, because the key has no `Range` component and a partial representation would replay as a whole one |
 | Every other 4xx, and every 5xx | Never |
 
 *Table 1: the statuses the cache may store, from RFC 9111 3. Take from it that a public 404 is stored, a 206 is never stored, and no 5xx is stored whatever its headers say.*
@@ -276,7 +263,7 @@ Table 1 also decides what reaches the disk cache, because only a stored response
 
 A source node holds a site generation ID.
 The ID is a `u64` counter that names the content the backends are serving at one moment.
-m6-http owns it, backend services never see it, and only the source's `[genid]` table names it.
+m6-http owns it and backend services never see it.
 A node is a source because its system config carries a `[genid]` table.
 A node with no `[genid]` has no endpoint at `/genid` and answers that path as it answers any other unknown path.
 
@@ -315,8 +302,7 @@ A `POST /genid` runs four steps in the source's loop.
 4. Answer every covered POST with the new ID.
    A state write failure answers those POSTs 500 and is logged with the path.
 
-The order matters.
-The ID must not change before every backend has the new content, because a cache could otherwise refill from a backend still serving the old bytes under the new number.
+The ID changes only after every backend has the new content, because a cache could otherwise refill from a backend still serving the old bytes under the new number.
 A POST that arrives while a sequence runs is parked, and the sequence that answers it started after it arrived.
 
 The ID advances only in step 3 of a POST, never at start.
@@ -324,7 +310,7 @@ It lives in `$STATE_DIRECTORY/genid` as the decimal ID and a newline, written to
 A restart reads that file, so a generation survives a restart.
 A source with `[genid]` and no `STATE_DIRECTORY`, or an existing state file that cannot be read or does not hold a `u64`, stops the start with exit 2.
 A missing state file starts the ID at 0, so a first start needs no file.
-`--dump-config` prints and exits 0 without one, because a dump is not about to serve.
+`--dump-config` prints and exits 0 without one.
 
 A publisher that is itself a backend of the source drives this POST from its own event loop, never as a blocking call, so its loop stays free to answer the source's refresh.
 
@@ -352,11 +338,8 @@ It asks that upstream for the ID and follows it.
    The address is the one resolved at start, so an address change needs a restart.
 2. **A new ID is a full flush.**
    The node rebuilds the route table from the config loaded at start, swaps the cache and the held error pages for empty ones in one assignment each, and logs `genid changed` at info with `from` and `to`.
-   No entry survives into the new generation.
-   One assignment publishes each replacement, so a request sees the old generation or the new one and never a half-emptied cache, and a request already holding an entry finishes on the content it took.
-   The cache refills on demand.
+   No entry survives into the new generation, and the cache refills on demand.
    A first answer sets the ID with no flush, because the node held nothing the new ID makes old.
-   That is the whole invalidation, and it keeps the cache and the ID in step without a per-path map.
 3. **The store rule.**
    A response from any URL backend enters the cache only when its `M6-Genid` parses and equals the ID the node holds, and the entry carries that ID.
    A response with no header, no current ID, or another ID is sent to the client unchanged and not stored.
@@ -367,7 +350,6 @@ It asks that upstream for the ID and follows it.
    A forward that ends in 502, 503 or 504 answers with the held entry for its key when there is one, at any age.
    The operator sees one `genid: upstream down` line at warn on the transition, and the metrics line reports `upstream_down: true`.
    The first answer after an outage logs `genid: upstream up` at info and clears the flag.
-   Old pages keep working while the source is unreachable, and that is better than an error page.
 5. **Background fetches wait.**
    Prefetch, warm-on-start and stale-while-revalidate fetches are not drained while the node has no ID or the upstream is down.
    The queue holds up to `[limits.refresh_queue] max`, 4096 by default, and drains once the upstream answers. A refresh past the maximum is refused with an error that names the key.
@@ -403,7 +385,6 @@ A slice that runs out of budget with more to write leaves the remaining keys fla
 A single entry larger than 4 MiB is written on its own, because a file is never split.
 The writer reads each entry again at the slice, so an entry replaced since it was queued is written as it is now, and an entry evicted since is skipped.
 
-Only public cacheable responses enter the cache, so only public cacheable responses reach the disk.
 A file holds the generation ID, the key, the status and headers as JSON, the body, and a SHA-256 check value over every byte before it.
 The writer encodes into one buffer reserved at start, writes `<name>.tmp` with one write, and renames it into place.
 There is no `fsync`.
@@ -412,7 +393,6 @@ A crash can leave a short or torn file, and the check value catches it.
 The disk copy is bounded by the memory cache's size, `[limits.cache_bytes] max`, 128 MiB by default.
 A write that would pass the bound is skipped and logged once per generation at info.
 A write failure is logged once per episode with the path and the error, and the entry is dropped without a retry.
-A failed write never fails a request, because no request waits for one.
 
 On a generation change the queue and the size map are cleared, the new subdirectory is used from the next write, and every other subdirectory is queued for removal.
 Removal takes up to 512 files per slice, or fewer when the 1 ms time budget runs out first, then the empty directory.
@@ -433,7 +413,7 @@ The decoded entries are held aside until the first heartbeat answers.
 The ID decides, by the same equality the store rule uses.
 A matching ID installs the copy as the live cache, so the node starts warm.
 Another ID drops it, because the site changed while the node was down, and the old directory is removed over the slices that follow.
-When the upstream does not answer, the copy is installed marked unverified, because a site with pages from before the restart serves visitors better than a site with none.
+When the upstream does not answer, the copy is installed marked unverified, so the node serves the pages it held before the restart.
 The first later success clears the mark, keeps the copy when the ID is unchanged and runs the usual flush when it has moved.
 
 The start cost is one directory listing, one read and one SHA-256 per file, up to `max_bytes`.
@@ -476,11 +456,8 @@ Table 3 gives the three modes.
 
 `[errors] path` is required when `mode = "custom"`.
 Startup validation exits 2 if mode is `"custom"` and path is absent.
-The fallback in Table 3 keeps a failed custom fetch from answering with no body.
-
 Error responses are never cached.
 The error path is declared as a route in `site.toml` like any other.
-m6-http has no static fallback file.
 
 ---
 
@@ -489,14 +466,14 @@ m6-http has no static fallback file.
 If a route declares `require`, m6-http asks the authority before forwarding:
 
 1. Extract the credential from the `Authorization: Bearer <token>` header, or if absent from the `session` cookie.
-   The header takes precedence: API clients use it, and browsers use the cookie.
-2. Send one `POST /check` over the `[auth] backend` socket, carrying that credential, under a 50 ms deadline.
-   The token is opaque to the edge. It is not decoded and its signature is not checked here.
-3. A 200 answers `sub`, `username`, `roles` and `groups`. Check the route's `require` (`group:<n>` or `role:<n>`) against those lists.
+   The header takes precedence over the cookie.
+2. Send one `POST /check` over the `[auth] backend` socket, carrying that credential, under a 50 ms deadline (`m6-http/src/auth.rs:11`).
+   The edge forwards the token unchanged and decodes nothing.
+3. A 200 answers `sub`, `username`, `roles` and `groups`. Check the route's `require` (`group:<n>` or `role:<n>`) against those lists (`m6-core/src/auth.rs:81`).
 4. A 401 is the authority refusing the credential, and the client gets 401.
    A 200 whose identity lacks the requirement is 403.
-5. A timeout, a connect failure, a 500 or a body that does not parse is 503 with `Retry-After: 1`.
-   It is never a 401: the authority did not refuse the credential, so the client is not told to log in again.
+5. A timeout, a connect failure, or an answer that is neither a 200 identity nor a 401 is 503 with `Retry-After: 1` (`m6-core/src/auth.rs:100`, `m6-http/src/main.rs:5808`).
+   The 503 carries no login redirect.
 
 An API request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
@@ -513,7 +490,7 @@ No monitoring path asks for a credential: `/health` is public and the metrics an
 `[auth] public_key` is removed: the edge holds no key and decodes no token.
 
 `[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
-Its `sockets` glob must match at least one socket, and a `url` backend is refused by name.
+Its `sockets` glob must match at least one socket, and a `url` backend is refused by name (`m6-http/src/config.rs:1530`).
 The members are probed once at start (section 2 step 8).
 
 Valid requests are forwarded with the identity the authority answered, base64 JSON in `X-Auth-Claims`.
@@ -545,12 +522,11 @@ The degraded status is 503 so a reader that only looks at the code sees it, and 
 `/health` reads flags and never probes.
 The origin flag is the cache node's own follower state, set where a heartbeat or a forwarded client request already observes the origin failing and cleared by the next successful heartbeat.
 A successful client request clears nothing: the heartbeat observes the recovery, and it is due immediately after a failure, so a recovered origin is reported within one heartbeat interval.
-The answer reads a flag, a node name and the process index, so its cost is one JSON serialisation, and the origin is asked nothing.
+The answer costs one JSON serialisation.
 A cache whose last success is an hour old and whose origin has no observed failure still answers `ok`, and a node that has just started answers `ok` until the first failure.
 
-The degraded body names the node and, when the node sets one, the process index.
-It names no dependency and no reason: `/health` is public and unsecured, so that detail would tell a stranger which part of the node to wait out.
-The detail goes in the process log instead, one warn line when the origin goes bad and one info line when it is back, on the change only and never per request.
+The degraded body carries the node name and, when the node sets one, the process index.
+`/health` is public, so the dependency and the reason go in the process log: one warn line when the origin goes bad and one info line when it is back, on the change only and never per request.
 m6-monitor's degraded line says a dependency is not answering and points at that log for which one.
 The lines go through `m6-log`, carry a static reason and allocate nothing on the request path.
 
@@ -605,7 +581,6 @@ A path is stored up to 512 bytes and a user agent up to 256, and a value the cap
 The notable-client sample is then cut at 160 characters, marked the same way.
 In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
 Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
-The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
 The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
 `/perf` and `/traffic` are removed, and five `[health]` keys went with them: `metrics_require`, `metrics_peers`, `perf_path`, `traffic_path` and `traffic_cache_s`.
@@ -629,23 +604,25 @@ A second termination signal exits at once.
 
 ## 13. Exit Codes
 
-The process exits with one of three codes, as Table 7 gives.
+The process exits with one of three codes, and Table 7 gives each with the failures behind it.
 
 | Code | Meaning |
 |---|---|
 | `0` | Clean shutdown |
-| `1` | Runtime error |
-| `2` | Config or usage error, before binding |
+| `1` | Runtime error, including a failed TLS, status or H2C listener bind |
+| `2` | Config or usage error, or a failed QUIC or shared-port bind |
 
-*Table 7: the exit codes m6-http uses. Take from it that a config error ends the process before it binds, and a clean shutdown is 0.*
+*Table 7: the exit codes m6-http uses and the failures behind each. Take from it that a config error and a QUIC or shared-port bind failure both exit 2, while a TLS, status or H2C listener bind failure exits 1.*
 
-A non-zero code from Table 7 is what a unit's status reports, and code 2 is the one the startup sequence returns for a config it refuses.
+The bind arms in `m6-http/src/main.rs` carry the split: the UDP socket and `listen_shared` return 2, and the TLS, status and H2C listeners return 1.
+Config validation happens before any listener binds, and `[cache].dir` and `lock_memory` are checked after the listeners are open, so a config error also exits 2 from a node whose listeners are bound.
+`m6-site-toml.md` §8 states the same split from the config side.
 
 ---
 
 ## 14. H2C (HTTP/2 Cleartext)
 
-m6-http supports HTTP/2 without TLS on a separate port, intended for use over a private backbone where network-layer encryption makes application-layer TLS redundant.
+m6-http serves HTTP/2 without TLS on a separate port, for a private backbone where network-layer encryption makes application-layer TLS redundant.
 
 **Inbound H2C:** configure `h2c_bind` in `[server]`:
 
@@ -661,8 +638,7 @@ internal_peers = ["127.0.0.1"]   # the only peers it accepts
 
 The unit's `LoadCredential` lines deliver the two files, as `m6-user-guide.md` section 7.2 sets out.
 
-The H2C listener accepts plain TCP connections and speaks HTTP/2 framing directly (no TLS record layer).
-The request is then routed and handled identically to a TLS request.
+The H2C listener speaks HTTP/2 framing over plain TCP, and routes and handles each request as it does a TLS request.
 
 The listener is internal, and trusts the `X-Forwarded-For` a cache node sends, only when `[server] internal_binds` names it.
 m6-http refuses to start with `h2c_bind` set and `internal_binds` absent.
@@ -677,7 +653,7 @@ name = "global"
 url  = "h2c://origin.example.com:8080"
 ```
 
-Outbound H2C connections are maintained persistently by `H2cClientPool`, driven by the event loop, and no thread is spawned per request.
+`H2cClientPool` keeps one persistent connection per upstream in the event loop.
 Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
 
 ---
@@ -704,8 +680,7 @@ A host with none stops m6-http at start with exit 2, naming the backend.
 
 m6-http builds the TLS client with ALPN `h2` at start and connects on the first request.
 If the server does not accept `h2` in ALPN, the connection attempt fails and the client receives 502.
-The connection is maintained persistently by `H2sTlsClientPool`, event-loop driven, identical to `H2cClientPool` but with a TLS record layer.
-Multiple requests to the same upstream are multiplexed over the single persistent H2 connection.
+`H2sTlsClientPool` keeps one persistent connection per upstream, as `H2cClientPool` does, with a TLS record layer.
 
 ---
 
@@ -713,8 +688,7 @@ Multiple requests to the same upstream are multiplexed over the single persisten
 
 Three HTTP/2 behaviours in m6-http bound specific work: a per-connection cap on streams, send-side flow control on the backbone clients, and the stream state machine.
 The cap limits how many streams a peer may start, both clients spend only the flow-control credit the peer grants, and the state machine decides which frames a peer may send.
-The sections below state each behaviour, the code that enforces it, and the tests that pin it.
-Connection count and the rate of PING and SETTINGS frames are outside these three behaviours.
+Each section names the code that enforces the behaviour and the tests that pin it.
 
 ### 16.1 Rapid Reset and the concurrency cap
 
@@ -735,7 +709,6 @@ m6-http answers it with a cap on counted streams, a decay window that holds a ca
 The cap counts started streams, because `active_streams` adds the live `streams` map to the client-initiated ids in `recently_reset` that are younger than `RESET_DECAY`.
 `note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY` (twice `MAX_CONCURRENT`, so 200 at the cap of 100: derived from the cap so it stays above it whatever the cap is, and so it has no config key of its own).
 `active_streams` counts only the client-initiated odd ids in that record.
-The decay window in Table 8 is what makes the cap count cancelled streams, as `active_streams` does.
 `resetting_streams_does_not_free_concurrency_slots` opens `MAX_CONCURRENT` streams, cancels each one, and checks that the count stays at `MAX_CONCURRENT` and that stream `1 + MAX_CONCURRENT * 2` is refused.
 
 A refusal is recorded as a reset, because the peer's own RST_STREAM is already in flight.
@@ -774,13 +747,11 @@ The checks live in `pump_stream` in `m6-http/src/h2_client.rs`.
 A stream with no credit keeps its unsent bytes in `pending_body` and returns.
 A WINDOW_UPDATE on stream 0 adds to the connection window and calls `pump_all`.
 A WINDOW_UPDATE on a stream adds to that stream's window and calls `pump_stream` for it.
-The connection window in Table 9 starts at 65535 and moves only on a connection WINDOW_UPDATE.
 
 A strict peer answers FLOW_CONTROL_ERROR or closes the connection when a client overruns its credit, so both clients read the connection window before sending.
 
 END_STREAM rides on the frame that drains the body, so the bytes sent always match the advertised `content-length`.
 Skipping an uncredited write would send fewer bytes than promised, and blocking in the loop would stall every other connection the poller drives.
-The remainder is stream state that resumes when credit arrives.
 
 A WINDOW_UPDATE that would push the connection window above 2^31-1 is a flow-control error, so both clients use `checked_add` and mark the connection dead on overflow.
 A WINDOW_UPDATE that would push a stream window above 2^31-1 sends RST_STREAM(FLOW_CONTROL_ERROR) and removes that stream, and the connection stays up.
@@ -790,7 +761,6 @@ A zero increment on a stream is answered with RST_STREAM(PROTOCOL_ERROR), becaus
 `a_backbone_body_respects_the_peers_send_window` in `m6-http/tests/backbone_flow_control.rs` drives the H2C client against a stub origin that grants a 4 KiB window.
 The stub records an overrun for every DATA byte beyond the credit it granted, and the test checks that the body arrives whole and in order.
 The H2S transport shares that engine and has no separate integration test.
-h2spec tests m6-http as a server, so it exercises neither backbone client.
 
 ### 16.3 The stream state machine
 
@@ -820,38 +790,31 @@ The closed row in Table 10 is the one that needs `recently_reset`, because the e
 
 `recently_reset` holds the reset ids so `frame_verdict` can choose the error class Table 10 describes, and it is bounded at `RESET_MEMORY`.
 The state table runs before dispatch, so no handler sees a frame in a state that forbids it.
-Known gaps below lists the one tracked implementation gap.
 
 ### 16.4 The header list size limit
 
 The server advertises `SETTINGS_MAX_HEADER_LIST_SIZE` (0x6) as `MAX_REQUEST_HEAD`, 32 KiB, and enforces that same value while decoding (RFC 9113 6.5.2).
 The bound covers one request head: the request line plus every field, counted as name plus value plus 32 bytes per field.
 A single field over `MAX_HEADER_LINE` (8 KiB) is refused as well, so a head under the total can still fail on one long field.
-Both constants are defined once in `m6_core::headers` and shared with the HTTP/1.1 parser and both backends.
+Section 6 defines both constants.
 
-`MAX_HEADER_BLOCK` bounds only the compressed block, at 256 KiB.
-HPACK lets one byte refer to a dynamic table entry of up to 4096 bytes, so a block under that cap can decode to a header list hundreds of times larger.
-The decoded limit closes that expansion.
-It is one eighth of the compressed cap, and a browser request with its cookies is a few KiB, so a legitimate peer does not reach it.
+`[limits.h2_header_block] max` bounds the compressed block, at 256 KiB by default.
+HPACK lets one byte refer to a dynamic table entry of up to 4096 bytes, so a block under that cap can decode to a header list hundreds of times larger, and the decoded limit closes that expansion.
+The decoded limit is one eighth of the compressed cap, and a browser request with its cookies is a few KiB.
 
 `decode_hpack` counts each field as it decodes and keeps a field only while the list is within `MAX_REQUEST_HEAD`, and it still decodes the rest of an oversize block so the connection's HPACK table stays in step with the peer's.
 An over-limit head is then answered 400 with the error page, or 414 when the request line alone is over `MAX_HEADER_LINE`, followed by RST_STREAM with NO_ERROR (RFC 9113 4.3.1 and 8.1).
-It is a stream error, so the other streams on the connection continue.
-The fault is in one request, and a COMPRESSION_ERROR would end every other stream on the connection.
+It is a stream error, so the other streams on the connection continue, where a COMPRESSION_ERROR would end them.
 
 ### 16.5 Known gaps
 
-One HTTP/2 behaviour is absent from the server today, and Table 11 records it with the m6 issue that tracks it.
-The row states what the code does and leaves the fix to the issue.
+One HTTP/2 behaviour is absent from the server today, and Table 11 records it.
 
 | Gap | What the code does today | Issue |
 |---|---|---|
-| HTTP/2 error codes | The server sends NO_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, COMPRESSION_ERROR and ENHANCE_YOUR_CALM. It has no path that sends INTERNAL_ERROR, SETTINGS_TIMEOUT, CANCEL, CONNECT_ERROR, INADEQUATE_SECURITY or HTTP_1_1_REQUIRED. The two backbone clients do send CANCEL. | #163 |
+| HTTP/2 error codes | The server sends NO_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, COMPRESSION_ERROR and ENHANCE_YOUR_CALM. It has no path that sends INTERNAL_ERROR, SETTINGS_TIMEOUT, CANCEL, CONNECT_ERROR, INADEQUATE_SECURITY or HTTP_1_1_REQUIRED. The two backbone clients do send CANCEL. | none, recorded here |
 
-*Table 11: the one HTTP/2 behaviour m6-http does not implement, and the issue that tracks it. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the issue number is the record of the gap.*
-
-The issue in Table 11 is the record of the gap, and the fix is engineering work tracked there.
-Event Loop below describes the one loop that drives these connections, and `m6-architecture.md` §1.10 states the rules it follows.
+*Table 11: the one HTTP/2 behaviour m6-http does not implement, and its tracker entry. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the error-code gap has no issue tracking it.*
 
 ---
 
@@ -869,11 +832,11 @@ An HTTP/2 connection sends in the same way: `send_until_blocked` frames and writ
 The send queue holds one 16 KiB frame batch at a time, so a body of any size is sent in many passes, and a single pass would stop at 32 KiB because a socket that took every byte never reports a new edge.
 `rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` fetch each size with a client that announces a browser's windows.
 
-The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
+The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_STATUS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
 Every connection and every upstream gets its own `Token(k)` in the `Slots` table.
 A turn matches the token and runs one arm: accept on a listener until it would block, drain the UDP socket for QUIC, read the signal descriptor and hand it to `m6_core::signal::Lifecycle`, flush the log, or drive one connection or upstream.
 The wait is bounded by a 1 s accounting tick, every deadline table and quiche's own timeout, and is zero while the disk writer has work: each idle turn then runs one slice.
-That single loop is also where every log line is written, and the next section lists the events it writes.
+Every log line is written from this loop.
 
 ---
 
@@ -881,7 +844,7 @@ That single loop is also where every log line is written, and the next section l
 
 m6-http writes one structured JSON line per event to its one log stream: stdout, or journald's native socket under systemd (`m6-log/src/sink.rs`).
 
-Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token`, `auth: insufficient claims` and `auth: refused` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
+Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token`, `auth: insufficient claims`, `auth: refused` and `auth check returned no decision` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
 
 Periodic stats, twice: one operational line and one `type` `perf` line.
 The operational line carries `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`, `hit_samples`, `hit_p0_ns`, `hit_p50_ns`, `hit_p99_ns`, `hit_max_ns`, `miss_samples`, `miss_p0_ns`, `miss_p50_ns`, `miss_p99_ns`, `miss_max_ns`, `monitor_requests`, `monitor_p50_ns` and `monitor_p99_ns`.
