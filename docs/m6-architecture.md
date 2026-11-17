@@ -300,10 +300,10 @@ Table 7 names what that produces.
 
 | binary | one job | where it sits |
 |---|---|---|
-| `m6-http` | terminate TLS, rate limit, cache, route, enforce route authentication, proxy to backends | the public port. A second process of the same binary answers `:80` with a redirect to HTTPS |
+| `m6-http` | terminate TLS, rate limit, cache, route, ask the check service for identity and enforce route authentication, proxy to backends | the public port. A second process of the same binary answers `:80` with a redirect to HTTPS |
 | `m6-html` | render HTML from templates and JSON data | behind the edge |
 | `m6-file` | serve files from the filesystem | behind the edge |
-| `m6-auth-server` | verify credentials and sign *JWTs* (*JSON Web Tokens*) | behind the edge |
+| `m6-auth-server` | verify credentials, sign *JWTs* (*JSON Web Tokens*), and answer the identity check | behind the edge |
 | `m6-monitor` | poll each node's health and performance endpoints, and where configured its tunnel round trip and WireGuard handshake age, keep a size-capped history of every poll and of crawler sightings in one SQLite file, and serve one report and the history | behind the edge |
 
 **Table 7: the five serving binaries, the one job each has, and where each sits.**
@@ -437,21 +437,74 @@ A crashed backend restarts in seconds (§3.3), so the window in which no pool me
 Maintaining an HTML file, validating its presence at startup, holding it in memory and serving it correctly for every content type is work that solves a problem a supervised deployment barely has.
 What covers the window instead is a mode: a status code with an empty body, the same with minimal generated HTML, or the configured page, with the richest degrading to the simplest.
 
+### 4.6 Why invalidation is one generation ID
+
+**A publish must not let the cache serve old bytes under a new name, so the unit of invalidation is one number the source owns.**
+A generation is the content a set of backends is serving at one moment, and the source node holds the `u64` that names it (`m6-http/src/genid.rs`).
+The number is m6-http's, and a backend never sees it. A backend's only part in a publish is answering `POST /genid` with 204 after it has rebuilt its content.
+
+A `POST /genid` on the source runs one change sequence.
+It sends `POST /genid` with an empty body to every member of every socket pool, on that member's own socket, and waits for each answer.
+It then rebuilds the route table from the config loaded at start, flushes the cache and the held error pages in one assignment each, advances the ID, and writes it to `$STATE_DIRECTORY/genid`.
+A member that fails is logged with its socket path and counted, and the POST still answers 200, so the operator sees a non-uniform generation and the deploy still succeeds.
+The ID advances before any POST is answered, so a publisher that sees 200 knows the new generation survives a restart.
+
+**The store rule is what keeps a stale render out of the cache.**
+Every response a backend returns is stamped with the ID that was current when the request was dispatched.
+The source stores a response only while that ID is still current, so a response rendered before the publish cannot enter the cache after it.
+A cache node stores only a response whose stamp equals the ID it holds, so a node cannot fill from an upstream that is one generation behind.
+A local answer such as a health check carries no stamp and is never stored.
+
+**A cache node learns the ID from its upstream.**
+Its `[genid] upstream` names a `[[backend]]` with a `url`, and its `token_file` holds a read token.
+It sends `GET /genid` at start and once `heartbeat_secs` has passed since the last answer, and a new ID flushes its cache in one assignment.
+A node with no ID stores nothing, so a failed first heartbeat is due again after one second (`NO_ID_RETRY` in `m6-http/src/genid.rs:47`), which matters at `heartbeat_secs = 3600`.
+Once the node holds an ID, the configured interval is the right wait.
+That is the whole invalidation: one number, one flush, no per-path map.
+
+The disk cache follows the same rule.
+Its layout is `<dir>/<genid>/<key hash>`, and the other generation directories are removed over the slices that follow (`m6-http/src/disk_cache.rs`).
+A restart holds the disk copy aside until the first heartbeat names its ID: a match installs it, another ID discards it, and no answer installs it unverified so the node serves from disk while the source is down.
+The next answer settles the copy, so a source that was unreachable for a while still corrects the node on its first reply.
+
+### 4.7 Why `/health` answers three states and names no dependency
+
+**The endpoint a monitor hits most often must cost one JSON serialisation and must tell a stranger nothing.**
+`/health` is answered ahead of routing, the cache and every backend, and it reads flags the loop already keeps (`m6-http/src/main.rs`).
+It never probes, so its cost is one serialisation (`m6-http/src/health.rs:107`).
+
+`200` with `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
+`503` with `{"status":"degraded","node":"<name>"}` says the process is alive and a dependency is failing.
+A process that is gone, or whose listener refuses, gives no answer at all, and m6-monitor reads that as unreachable.
+The monitor maps the three to `ok`, `degraded` and `unreachable`, and a 200 with any other status is `unknown`.
+
+**The body names the node and no dependency, because `/health` is public and unsecured.**
+A dependency named there would tell a stranger which part of the node to wait out (`m6-http/src/health.rs:104`).
+The dependency appears in the warn line the process logs when it fails and the info line when it recovers, on the change only and never per request.
+On a cache node the dependency is its origin.
+The flag is the follower's own `down` bit, set where a heartbeat or a forwarded request already observes the failure and cleared by the next heartbeat answer.
+A successful client request clears nothing, because the heartbeat observes the recovery and is due immediately after a failure.
+
+`/ready` was removed in this release.
+It answered readiness from the age of the origin's last success, and nothing consumed it: m6-monitor polls `/health`, `/perf` and `/traffic`.
+The owner's decision is that a readiness endpoint is a complex answer to a simple problem and that a log line is the answer.
+The edge already logs the origin's loss and recovery on the change, and a cache node serves held content while the origin is down.
+
 ---
 
 ## 5. Why authentication sits where it does
 
-Authentication is enforced at the edge, which asks the auth service for the identity on each protected request, and costs a public route almost nothing.
+Authentication is enforced at the edge, which asks the auth service for the identity on each credential gate, and costs a public route almost nothing.
 Each of those was a decision and none is obvious.
 
 ### 5.1 Why a public route costs almost nothing
 
 **A static site is the base case, so authentication has to cost as near to nothing as possible on a route that has none.**
-Three things make it cheap, and only the first is genuine absence.
+Three things make it cheap, and the first is genuine absence.
 
-**A site with no protected route loads no key.**
-No `[auth]` section is needed, no public key is read from disk, and no auth process need run.
-The verification path is then unreachable, because there is no key to verify against, so authentication is an absent feature for that site and absence has no configuration to get wrong.
+**A site with no protected route configures no checker.**
+No `[auth]` section is needed, and no auth process need run.
+With no `[auth]`, no credential gate can be configured, so authentication is an absent feature for that site and absence has no configuration to get wrong.
 
 **The caching decision short-circuits on one flag.**
 Whether a response may enter the shared cache turns on whether its route requires authentication, and the route table carries a single boolean saying whether any route does.
@@ -459,30 +512,31 @@ A site with none answers that question without a route lookup at all, which matt
 
 **A protected route is then one check on the route already matched.**
 `require` is an optional field on the route entry, so the cost on a public route is a single branch.
-
-**Stated plainly, that last one is a conditional and not two distinct code paths.**
 A public route on a site that protects something elsewhere pays a branch that a purely static site does not.
 That is the price of one route table instead of two, and at one branch against a path measured in microseconds it is the right trade.
 
-A site with no route requiring authentication therefore needs no auth section in `site.toml`, no public key on disk, and no auth process running.
+A site with no route requiring authentication therefore needs no `[auth]` section, no check backend and no auth process running.
 Authentication is an absent feature for that site, and absence has no configuration to get wrong.
 
 ### 5.2 Why the check is one network call
 
-**One checker is the owner's rule: m6-http decodes no token and holds no key, and every credential check asks m6-auth-server.**
-A protected request makes one `POST /check` on a Unix socket under a 50 ms deadline, and the answer is used once.
+**One checker is the owner's rule: m6-http decodes no token and holds no key, and every credential gate asks m6-auth-server (`m6-http/src/auth.rs`).**
+A gate makes one `POST /check` on a Unix socket under a 50 ms deadline, and the answer is used once.
+The gates are a route `require`, `/perf`, `/traffic`, and a source node's `GET` and `POST /genid`.
+A node with `[auth] backend` therefore needs a running checker for those three endpoints as well as for a protected route.
 The measured parts of one check add to about 111 µs, far below the deadline, and a request with no credential makes no call at all.
 
-Nothing caches the answer, so a revocation or a role change counts from the next request.
+Nothing caches the answer, so a role change or a deleted user counts from the next request.
 Key rotation needs no coordination at the edge: the service is the only holder of the key, and the next check uses the key it has.
+The check socket is derived beside the primary socket, so a deployment can run the login side and the check side as two processes and keep a login's bcrypt off the check loop.
 
 ### 5.3 Why enforcement happens twice
 
 **Route-level enforcement at the edge is a boundary that does not depend on every backend implementing authentication correctly.**
-An unauthenticated request to a protected route never reaches a backend, and the requirement is declared once in `site.toml` rather than reimplemented per backend.
+An unauthenticated request to a protected route never reaches a backend, and the requirement is declared once in `site.toml`, so a backend does not reimplement it.
 
 **Resource-level checks stay in the backend because a route cannot express them.**
-Whether this user may read this document depends on the document, not on the path that addressed it.
+Whether this user may read this document depends on the document.
 The identity the check answered is forwarded so the backend can answer that without its own check, which is why that header is the one that matters most in §4.4.
 
 ---
@@ -577,6 +631,29 @@ quiche reads the peer's QPACK instruction streams and discards them, running a s
 Closing the gap would mean new validation on the connection path with per-stream buffering for instructions split across reads, which is where a careless implementation becomes unbounded memory on a stream a peer controls.
 That trade was declined for two tests about how politely a hostile peer is refused.
 
+### 6.5 Why the allocator is mimalloc and the heap is pinned as it is faulted
+
+**Latency is the metric, so the kernel calls a heap makes are the cost to remove, and mimalloc is the one allocator every service uses.**
+`m6_core::alloc::M6Alloc` wraps mimalloc, and every service binary installs it as its global allocator (`m6-core/src/alloc.rs`).
+The allocator sets its purge delay so it never returns freed memory to the OS, and `alloc::reserve` takes `[limits.heap_reserve]` from the OS once at start.
+m6-http makes the reservation `[limits.cache_bytes] max` plus 64 MiB, rounded up to 2 MiB, so the cache is carved from one region and a warm service makes no `brk`, `mmap`, `munmap` or `madvise` call on the request path (`m6-http/src/limits.rs:82`).
+
+**Pinning is a separate promise, and it is kept page by page.**
+`[server] lock_memory` defaults true and calls `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` after the reservation and before the first request (`m6-platform/src/linux.rs:251`).
+`MCL_ONFAULT` locks each page when the program first touches it.
+Without it, `MCL_CURRENT` faults in every current mapping and `MCL_FUTURE` marks every later one to be populated.
+A process that had mapped 1.2 GiB and touched 96 MB then became 1.2 GiB resident in one call, because the lock touched the pages and the program had not.
+With it, memory that is reserved and unused stays unresident, and a page a cache hit reads was faulted during warm-up and stays locked.
+
+**A finite limit is refused at start.**
+The kernel enforces the soft `RLIMIT_MEMLOCK`, so m6-http reads that limit first and refuses any value but infinity (`m6-platform/src/linux.rs:251`).
+The error names `LimitMEMLOCK=infinity` for a systemd unit and `ulimit -l unlimited` as root, and `[server] lock_memory = false` is the way to run unpinned.
+A kernel older than 4.4 fails the call with `EINVAL`, which is answered with an error naming the version and the same key.
+The process never carries on unpinned when pinning was asked for.
+
+The start logs the resident set and the address space on either side of the pin, and `m6_platform::process::huge_page_bytes` reports how much sits on huge pages.
+`docs/m6-platform.md` and `docs/PERFORMANCE.md` own the interface and the numbers.
+
 ---
 
 ## 7. Why every service has one shape
@@ -651,11 +728,11 @@ The split exists because an operator and a developer own different things.
 ### 8.1 Why the system configuration holds node state and wins
 
 **The bind address and the TLS certificate paths genuinely differ between environments**, so the system configuration holds them.
-It holds the rest of a node's own state too, which means `[node]`, `[auth]` and the `[health]` access keys.
-Each of those names the node or a credential path, and none of them is shared by every node of the site.
+It holds the rest of a node's own state too, which means `[node]`, `[auth]`, the `[health]` access keys, `[genid]` and `[cache]`.
+Each of those names the node, a credential path, or a claim that only this node's publisher holds, and none of them is shared by every node of the site.
 `site.toml` holds the state every node shares.
-m6-http warns at start when a key sits in the other file.
-It is a required argument rather than an optional one, because one code path is simpler to specify and test than a branch for whether it was supplied.
+m6-http refuses the start with exit 2 when a key sits in the other file (`m6-http/src/config.rs:1268`).
+It is a required argument, because one code path is simpler to specify and test than a branch for whether it was supplied.
 
 **It wins on conflict so that a deploy cannot change where a server listens or which certificate it presents.**
 An operator needs that to hold regardless of what is deployed over the top, and everything else comes from `site.toml` unchanged.
@@ -703,13 +780,15 @@ Table 11 gives them by area.
 | processes | two positional arguments, and one environment variable, `M6_SOCKET_OVERRIDE` | the two positional arguments carry the service's configuration, and the named exception relocates only the listening socket, is set by a template unit that runs several instances, and is absent otherwise (`m6-app-anatomy.md` §4.1). |
 | processes | a connection serves at most 100 requests before closing | persistent connections are the default, and an unbounded one lets one peer hold a slot indefinitely by pipelining |
 | processes | an accepted connection has a read deadline, 30 seconds by default | a peer that connects and says nothing otherwise holds its connection slot until it disconnects, and enough of those fill the table while the service looks healthy |
-| processes | exit 0 clean, 1 runtime error, 2 configuration or usage error before binding | a supervisor can tell a bad config from a crash, which is what lets a deploy validate a new binary and refuse to install |
+| processes | exit 0 clean, 1 runtime error including a configured TLS or h2c bind failure, 2 configuration or usage error including a QUIC or shared-port bind failure | a supervisor can tell a refused config from a runtime failure, which is what lets a deploy validate a new binary and refuse to install |
 | content | minification runs before compression, a `no-store` response is not minified, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, a response no cache keeps would pay the cost on every request for a few saved bytes, and a minifier that does not understand a file should pass it through rather than corrupt it |
 | content | inline script minification is off by default | the engine parses scripts as modules, which has different scoping, and it can silently rewrite a valid classic script into a broken one |
 | content | text types declare a charset and JSON does not | without it clients fall back to a legacy encoding and render UTF-8 as mojibake, and the parameter is undefined for JSON |
 | auth | access tokens are short-lived with a longer refresh on its own path | a stolen access token expires on its own, and the refresh path is the only thing that needs to be revocable |
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
 | auth | a requirement is spelled as a group or a role, and an unknown form denies | a typo in a requirement must fail closed |
+| auth | every credential gate asks the one check service, and the edge holds no key | a role change or a deleted user counts from the next request, and key rotation needs no coordination at the edge |
+| auth | the check service reads the identity from the database on every call | a role change applies to the next request |
 
 **Table 11: the remaining decisions by area, each with the reason behind it.**
 Take from it that most exist because the alternative had already produced a defect, and that the pattern across them is failing closed and failing loudly.
@@ -729,6 +808,7 @@ Table 12 lists what is absent and the reason, and the last row is the one to rea
 | horizontal scaling of the edge itself | it is one process per node by default (§1.8) and scales through caching and more nodes. `[server] reuse_port` lets several processes share the public port, which is a deliberate second way and not the model the design assumes |
 | HTTP/2 server push | the specification deprecated it, and receipt of a push promise is correctly an error |
 | a computed admission control bound | m6 sheds at queue-full, which is not admitting work against a bound. A latency bound comes from the second, and maximum handler time is unbounded today, so there is no epoch to rate-limit against. An event loop is the model in which admission control is expressible, because a loop can decline work while a full queue can only report that it is full |
+| a separate readiness endpoint | `/health` carries the state a monitor needs: 200 `ok`, 503 `degraded`, and no answer for a process that is gone. A readiness answer was tried and removed because nothing consumed it, and the edge logs the origin's loss and recovery on the change |
 | **RFC 9218 extensible priorities** | **no decision.** Not implemented and not mentioned anywhere in the tree. Every other gap here was weighed and declined, and this one was not |
 
 **Table 12: what m6 does not do, and why.**
@@ -744,19 +824,22 @@ HTTP has the same shape, a path is a symbol and a response is the trade, and mos
 
 What reality adds is TLS and three wire formats, and m6 is a userspace server on a general-purpose stack, so a microsecond was always an upper bound on ambition.
 The figure that governs is 5 ms request to response for a real user, because a host network stack is milliseconds and saved microseconds are invisible against it.
-Microsecond work earns its place by leaving that budget to the network, and a site runs its own edge to spend the budget on distance rather than on a second system that believes it knows what the site contains.
+Microsecond work earns its place by leaving that budget to the network, and a site runs its own edge to spend the budget on distance, with no second system that believes it knows what the site contains.
 
 **One measurement decides most of the architecture.**
 A process boundary costs about 13 µs against a 2.2 µs cache lookup, so a cache hit must not leave the process.
 That puts TLS termination and the cache in one process on the public port, which puts the protocol burden and the trust boundary there too, which is why one strip of client-supplied headers protects every backend behind it.
 Everything else sits behind a wire contract so it can be written in any language, and one shared configuration describes the set so the parts can know about each other well enough to answer a health check cheaply, measure the site without evicting it, and warm the cache from the route table the edge already holds.
 
-What that gives up is stated rather than hidden: one core per process, HTTP/1.1 throughput against a mature server, zero-copy file serving, and kernel TLS.
+What that gives up is stated plainly: one core per process, HTTP/1.1 throughput against a mature server, zero-copy file serving, and kernel TLS.
 A site dominated by HTTP/1.1 or by large files is better served elsewhere.
 
 The rest follows.
-Authentication costs a public route one branch, and nothing at all on a site that protects nothing, because no key is loaded and the verification path is unreachable.
+Authentication costs a public route one branch, and nothing at all on a site that protects nothing, because no `[auth]` is configured and no checker is asked.
+Every gate that does exist asks the one checker, so the edge holds no key.
+A publish is one `POST /genid`: the source reloads every backend on a Unix socket, flushes the cache and advances one number, and a cache node follows that number on its heartbeat.
 `m6-core` is wide on purpose and singular by rule, because the duplicates had diverged and four of them were answering incorrectly on the wire.
+The heap is mimalloc, reserved once at start and pinned as it is faulted, and a finite memlock limit stops the start.
 HTTP/2, HTTP/3 and the caching rules stay at the edge because they have one consumer permanently, and a library with one consumer is that consumer's code in another directory.
 
-Changing any of this means answering the reason rather than editing the rule.
+Changing any of this means answering the reason before editing the rule.
