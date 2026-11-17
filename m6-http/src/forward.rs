@@ -680,8 +680,7 @@ pub enum PendingKind {
 /// Which gate a `PendingKind::Auth` request is waiting for.
 ///
 /// The completion re-enters the request path with the decision, and this says
-/// where that decision is consumed: a route's `require`, `/perf` or
-/// `/traffic`, or `/genid`.
+/// where that decision is consumed: a route's `require` or `/genid`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthGate {
     Route,

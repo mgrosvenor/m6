@@ -165,7 +165,8 @@ pub struct ProcessGroup {
     pub up: usize,
     /// The names of the ones that did not, as `<node>/<index>`.
     pub down: Vec<String>,
-    /// How many of the processes returned a `/perf`, which the sums cover.
+    /// How many of the processes had a metrics document in the journal, which
+    /// the sums cover.
     pub reporting: usize,
     pub requests_total: u64,
     pub cache_hits_total: u64,
@@ -246,15 +247,15 @@ pub struct NodeDigest {
     /// relabelled.
     pub reported_node: Option<String>,
     pub rtt_ms: Option<f64>,
-    /// The m6 release the node is running, from `/perf`. `None` when the node
-    /// predates the field, which reads as "cannot say" and never as agreement:
-    /// a fleet where one node is silent about its version is exactly the case the
-    /// drift check must not call uniform.
+    /// The m6 release the node is running, from the metrics document. `None`
+    /// when the node predates the field, which reads as "cannot say" and never
+    /// as agreement: a fleet where one node is silent about its version is
+    /// exactly the case the drift check must not call uniform.
     pub version: Option<String>,
-    /// Which binary reported the version, from `/perf`. A node runs several and
-    /// "the node is on 1.10.0" has never been one fact.
+    /// Which binary reported the version, from the metrics document. A node
+    /// runs several and "the node is on 1.10.0" has never been one fact.
     pub binary: Option<String>,
-    /// The hash of the build actually running, from `/perf`.
+    /// The hash of the build actually running, from the metrics document.
     ///
     /// This is what the version cannot say. Rust is not byte-reproducible, so
     /// one tag built twice gives two binaries reporting one version: two
@@ -291,7 +292,7 @@ pub struct NodeDigest {
     pub disk_total_bytes: Option<u64>,
     pub thermal_max_c: Option<f32>,
     /// Seconds left on the soonest-expiring certificate the node is serving,
-    /// from `/perf`.
+    /// from the metrics document.
     ///
     /// The soonest rather than the leaf's, because a chain is only good until
     /// its first expiry and an operator wants one number per node. Negative on
@@ -311,7 +312,8 @@ pub struct NodeDigest {
     /// comparing it ACROSS nodes is exact, and that comparison is the only way
     /// to see a fleet whose nodes have stopped agreeing about what they serve.
     pub cert_not_after_unix: Option<i64>,
-    /// SHA-256 of the leaf certificate this node is serving, from `/perf`.
+    /// SHA-256 of the leaf certificate this node is serving, from the metrics
+    /// document.
     ///
     /// This is the identity the expiry cannot give. Two certificates can
     /// expire on the same day, and then `cert_not_after_unix` above cannot
@@ -327,12 +329,13 @@ pub struct NodeDigest {
     pub perf_error: Option<String>,
     /// The WireGuard tunnel from the monitor host to this node, if configured.
     pub tunnel: Option<TunnelDigest>,
-    /// This node's traffic and security summary, from `/traffic`.
+    /// This node's traffic and security summary, from the traffic document.
     ///
     /// The check prints these facts in sections D and E. The digest carried
     /// none of them until #220, so a consumer of `/digest` was told less about
-    /// a node's traffic than a reader of `/check`. `None` when the node did
-    /// not answer `/traffic`, which is why `traffic_error` sits beside it.
+    /// a node's traffic than a reader of `/check`. `None` when the journal held
+    /// no traffic line for the node, which is why `traffic_error` sits beside
+    /// it.
     pub traffic: Option<TrafficDigest>,
     /// Why `traffic` is absent, when it is. Two silences read differently: a
     /// node with no traffic summary and a node whose summary is empty must not
@@ -511,7 +514,7 @@ pub const FIREWALL_HITS_KEPT: usize = 5;
 pub const NOTABLE_PROBE_PATHS_KEPT: usize = 8;
 pub const NOTABLE_INJECTION_PATHS_KEPT: usize = 4;
 
-/// One node's traffic and security summary, from `/traffic`.
+/// One node's traffic and security summary, from the traffic document.
 ///
 /// This is the digest's copy of what the check prints in section D, "SECURITY
 /// AND TRAFFIC", and section E, "CRAWLERS". The field names are the wire's
@@ -746,8 +749,8 @@ fn traffic_digest(t: &m6_core::monitoring::TrafficReport) -> TrafficDigest {
     }
 }
 
-/// The fault text for a main log that has gone quiet, from `/traffic`, or
-/// `None` while it is emitting.
+/// The fault text for a main log that has gone quiet, from the traffic
+/// document, or `None` while it is emitting.
 ///
 /// Section A of the check prints this text and the verdict counts it as a
 /// finding, so both say the same thing.
@@ -1058,7 +1061,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 // difference between seeing silent mail loss and not.
                 //
                 // Falls back to the bare total against a node older than 1.3.0,
-                // whose /perf carries no attribution, rather than reporting nothing.
+                // whose metrics document carries no attribution, rather than
+                // reporting nothing.
                 let text = if p.metrics.backend_errors_by_name.is_empty() {
                     format!(
                         "{} backend errors since start (node too old to attribute them)",
@@ -1220,7 +1224,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 level: Level::Warn,
                 node: r.name.clone(),
                 text: format!(
-                    "no /perf: {}. Health is known, everything else is not.",
+                    "metrics unavailable: {}. Health is known, everything else is not.",
                     r.perf_error.as_deref().unwrap_or("")
                 ),
             });
@@ -1255,8 +1259,9 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     // agreeing while the third is silent is not a uniform fleet, it is an unknown
     // one, and reporting it as uniform is the failure mode this whole change
     // exists to remove.
-    // uptime_s is set exactly when /perf was read, so it is the marker for "this
-    // node answered" without needing a second flag that could disagree with it.
+    // uptime_s is set exactly when the metrics document was built, so it is
+    // the marker for "this node answered" without needing a second flag that
+    // could disagree with it.
     let reporting: Vec<&NodeDigest> = nodes.iter().filter(|n| n.uptime_s.is_some()).collect();
     if reporting.len() > 1 {
         let mut seen: Vec<&str> = reporting
@@ -1365,8 +1370,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // one schedule, differ in the DER and agree in the expiry, so the
         // expiry comparison called them one certificate while a client
         // validating against them receives two. The fingerprint separates
-        // them, and it is the same value `/perf` carries, so the fleet
-        // comparison reads one fact rather than deriving a second.
+        // them, and it is the same value the metrics document carries, so the
+        // fleet comparison reads one fact rather than deriving a second.
         struct Certified<'a> {
             name: &'a str,
             fingerprint: Fingerprint,
@@ -2113,15 +2118,16 @@ pub(crate) mod tests {
         assert_eq!(d.nodes[0].status, "unreachable");
     }
 
-    /// A node we can reach but cannot read /perf from is a warning, not a
-    /// silent blank: "no numbers" and "good numbers" must not look alike.
+    /// A node we can reach but cannot read a metrics document for is a
+    /// warning, not a silent blank: "no numbers" and "good numbers" must not
+    /// look alike.
     #[test]
-    fn a_node_without_perf_says_so() {
+    fn a_node_without_a_metrics_document_says_so() {
         let mut r = reading("edge-a", "ok", None);
-        r.perf_error = Some("401: token rejected by this node".into());
+        r.perf_error = Some("no metrics line in the journal for this node".into());
         let d = build(&[r], &Thresholds::default(), now());
         assert_eq!(d.level, Level::Warn);
-        assert!(d.findings[0].text.contains("401"));
+        assert!(d.findings[0].text.contains("no metrics line"));
         assert!(d.nodes[0].hit_rate.is_none());
     }
 
@@ -2985,7 +2991,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ── traffic and security, from /traffic ─────────────────────────────────
+    // ── traffic and security, from the traffic document ─────────────────────
 
     /// The fixture section D and E print, with one of everything they can show.
     fn traffic_fixture() -> m6_core::monitoring::TrafficReport {
@@ -3062,7 +3068,7 @@ pub(crate) mod tests {
     }
 
     /// The JSON carries every fact sections D and E print, under the same
-    /// names the node's `/traffic` uses.
+    /// names the node's traffic document uses.
     #[test]
     fn the_json_digest_carries_the_traffic_and_security_section() {
         let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
@@ -3116,19 +3122,19 @@ pub(crate) mod tests {
         assert_eq!(t["firewall"]["hit"][0]["bytes"], 72900);
     }
 
-    /// A node with no `/traffic` is a null section plus the reason, which is
+    /// A node with no traffic line is a null section plus the reason, which is
     /// what the check's "unknown <reason>" line prints. Absence must never
     /// read as an empty traffic report.
     #[test]
     fn a_missing_traffic_report_says_why_in_the_digest() {
         let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
-        r.traffic_error = Some("404: /traffic not available on this node".into());
+        r.traffic_error = Some("no traffic line in the journal for this node".into());
         let d = build(&[r], &Thresholds::default(), now());
         let v = serde_json::to_value(&d).unwrap();
         assert!(v["nodes"][0]["traffic"].is_null());
         assert_eq!(
             v["nodes"][0]["traffic_error"],
-            "404: /traffic not available on this node"
+            "no traffic line in the journal for this node"
         );
     }
 

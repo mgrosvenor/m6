@@ -173,7 +173,7 @@ pub struct ServerConfig {
     /// they are bound in one call and always share the public 443 port. No
     /// other socket is shared: the redirect listener on port 80, the internal
     /// h2c listener and every backend socket keep their own binding. The
-    /// health endpoints are served on that shared listener, so a probe reaches
+    /// health endpoint is served on that shared listener, so a probe reaches
     /// one process. Linux spreads a new connection across the sockets by a
     /// hash of its 4-tuple and macOS does not, so the split is not even and no
     /// process is guaranteed traffic. A QUIC client that changes address may
@@ -193,16 +193,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub reuse_port_processes: Option<std::num::NonZeroU32>,
     /// This process's number among the m6-http processes of one node, 0 to N-1
-    /// (N is `reuse_port_processes` when set). `/health` and `/perf` report it
-    /// as `process_index`, so a monitor can tell which process answered. With
-    /// `status_bind` it also picks this process's status port. Read at start,
-    /// and a change needs a restart.
+    /// (N is `reuse_port_processes` when set). `/health` reports it as
+    /// `process_index`, and the metrics document carries it too, so a monitor
+    /// can tell which process answered. With `status_bind` it also picks this
+    /// process's status port. Read at start, and a change needs a restart.
     #[serde(default)]
     pub process_index: Option<u32>,
-    /// `"<address>:<base port>"`: where this process answers `/health`,
-    /// `/perf` and `/traffic` for a monitor, as a TLS listener of its own on
-    /// the base port plus `process_index`. It answers those three paths and
-    /// 404s every other, under the same `[health]` gate as the shared port.
+    /// `"<address>:<base port>"`: where this process answers the health path
+    /// for a monitor, as a TLS listener of its own on the base port plus
+    /// `process_index`. It answers that one path and 404s every other.
     /// Needs `process_index`. It is not part of the `reuse_port` group, so
     /// nothing steers to it. Bind it to the node's tunnel address, never a
     /// public one. Unset means no status listener. Read at start, and a change
@@ -511,7 +510,7 @@ impl Default for AnalyticsConfig {
 
 /// The `[stats]` table: how often the periodic metrics line is written.
 ///
-/// One key, because the line carries the whole `/perf` document at one
+/// One key, because the line carries the whole metrics document at one
 /// interval. A node that logs it more often writes more bytes, and the line's
 /// size is bounded by `[limits.log_buffer]`, not by this.
 #[derive(Debug, Clone, Serialize, Deserialize)]

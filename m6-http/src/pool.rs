@@ -410,7 +410,7 @@ impl PoolManager {
         self.pools.iter().map(|(_, p)| p.total_count()).sum()
     }
 
-    /// Per-pool member counts for `/perf`.
+    /// Per-pool member counts for the metrics document.
     ///
     /// This is the count alone: the pool carries no per-member health state,
     /// so every member stays in rotation. A member whose backend is down is

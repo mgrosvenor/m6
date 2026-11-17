@@ -21,7 +21,7 @@ The sections run from the process's surface to its protocols.
 8. [Site generation ID](#8-site-generation-id)
 9. [Error Handling](#9-error-handling)
 10. [Auth Enforcement](#10-auth-enforcement)
-11. [Monitoring Endpoints](#11-monitoring-endpoints)
+11. [Monitoring](#11-monitoring)
 12. [Signal Handling](#12-signal-handling)
 13. [Exit Codes](#13-exit-codes)
 14. [H2C (HTTP/2 Cleartext)](#14-h2c-http2-cleartext)
@@ -522,7 +522,7 @@ Renderers may perform additional fine-grained checks using the auth claims avail
 
 ---
 
-## 11. Monitoring Endpoints
+## 11. Monitoring
 
 m6-http answers `/health` itself, ahead of routing, the cache and every backend.
 A refusal never reaches routing or the cache, so a catch-all route can never answer `/health` and a built-in path never enters the cache.

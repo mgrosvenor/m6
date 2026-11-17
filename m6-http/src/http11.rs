@@ -2664,12 +2664,12 @@ struct TlsMaterial {
 impl TlsMaterial {
     /// Record this chain's expiry as what the server is now serving.
     ///
-    /// Called once the configuration is installed, so `/perf` reports the
-    /// material in use. A certificate whose `notAfter` cannot be read is logged
-    /// and left out of the report, never a reason to refuse to serve: rustls
-    /// accepted it or there would be no server at all, so the honest outcome is
-    /// that the monitor says "cannot say" for that one rather than a number
-    /// nobody took.
+    /// Called once the configuration is installed, so the metrics document
+    /// reports the material in use. A certificate whose `notAfter` cannot be
+    /// read is logged and left out of the report, never a reason to refuse to
+    /// serve: rustls accepted it or there would be no server at all, so the
+    /// honest outcome is that the monitor says "cannot say" for that one rather
+    /// than a number nobody took.
     fn record(&self, cert_path: &str) {
         for (depth, e) in m6_core::tls::record_loaded(&self.chain) {
             warn!(
@@ -2708,11 +2708,12 @@ fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsMater
         .map_err(|e| anyhow::anyhow!("parse key {}: {}", key_path, e))?;
 
     // The chain is kept alongside the configuration so its expiry can be
-    // recorded once the configuration is installed, which is what `/perf` must
-    // report: reading the file again at report time would answer about the
-    // path, and a renewal that wrote a new certificate without a restart is
-    // exactly the case where the path and the running server disagree. Issue
-    // #176, and #210 for why the recording moved out of this function.
+    // recorded once the configuration is installed, which is what the metrics
+    // document must report: reading the file again at report time would answer
+    // about the path, and a renewal that wrote a new certificate without a
+    // restart is exactly the case where the path and the running server
+    // disagree. Issue #176, and #210 for why the recording moved out of this
+    // function.
     let chain = certs.clone();
 
     let mut config = rustls::ServerConfig::builder()

@@ -153,9 +153,9 @@ pub type TokenRefusal = (u16, Vec<(String, String)>, Vec<u8>);
 /// `forbidden` is `false` for no credential or a credential that does not
 /// verify (401), and `true` for a credential that verifies but does not carry
 /// the required role or group (403). A 401 carries `WWW-Authenticate` naming
-/// the scheme, which RFC 9110 11.6.1 requires. `m6-http`'s route check,
-/// `/perf`, `/traffic` and `/genid` all answer through here, so the status,
-/// headers and body a caller sees are the same whichever path it asked for.
+/// the scheme, which RFC 9110 11.6.1 requires. `m6-http`'s route check and
+/// `/genid` both answer through here, so the status, headers and body a caller
+/// sees are the same whichever path it asked for.
 pub fn token_refusal(forbidden: bool) -> TokenRefusal {
     let mut headers = vec![
         (

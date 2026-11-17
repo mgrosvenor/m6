@@ -10,7 +10,7 @@
 //!
 //! Two halves live here. [`not_after_unix`] reads `notAfter` out of a DER
 //! certificate, and [`record_loaded`] stores what the server loaded so the
-//! monitoring endpoints can report it without re-reading a file. The second
+//! metrics document can report it without re-reading a file. The second
 //! half matters as much as the first: a path on disk and the material a running
 //! process is serving are different facts, and reading the file would report
 //! the one nobody asked about. A certificate renewed on disk and never
@@ -96,10 +96,11 @@ impl Fingerprint {
         Self(Sha256::digest(der).into())
     }
 
-    /// Characters in the hex form, which is what `/perf` carries.
+    /// Characters in the hex form, which is what the metrics document carries.
     pub const HEX_LEN: usize = 64;
 
-    /// The digest as lower-case hex, the form `/perf` and `openssl` print.
+    /// The digest as lower-case hex, the form the metrics document and
+    /// `openssl` print.
     pub fn to_hex(self) -> String {
         String::from_utf8(self.hex().to_vec()).expect("hex digits are ASCII")
     }
@@ -484,9 +485,9 @@ mod tests {
         assert_eq!(Fingerprint::of(b"abc").short(), "ba7816bf8f01");
     }
 
-    /// The value makes the round trip that `/perf` and the monitor need: one
-    /// hex string on the wire, the same bytes on the other side, and a node
-    /// older than the field still parses.
+    /// The value makes the round trip that the metrics document and the
+    /// monitor need: one hex string on the wire, the same bytes on the other
+    /// side, and a node older than the field still parses.
     #[test]
     fn a_fingerprint_survives_the_wire_and_an_old_node_still_parses() {
         let fp = Fingerprint::of(b"a certificate");
@@ -703,9 +704,9 @@ mod tests {
             Some(leaf_fingerprint),
             "the leaf's identity is the SHA-256 of the DER that was loaded"
         );
-        // Read twice, as two /perf polls do: the value is a property of the
-        // loaded certificate, so nothing about the clock or the request can
-        // move it.
+        // Read twice, as two builds of the metrics document do: the value is a
+        // property of the loaded certificate, so nothing about the clock or
+        // the request can move it.
         assert_eq!(
             loaded_at(now + 3_600)[0].fingerprint,
             loaded[0].fingerprint,

@@ -38,7 +38,7 @@
 //!   figures;
 //! - `health_channel` rows (one per channel with traffic) and `health_net`
 //!   rows (one per network interface);
-//! - once per node per `/traffic` window, one `crawl_window` row with the
+//! - once per node per traffic window, one `crawl_window` row with the
 //!   window's total, its response status counts (`crawl_status`) and its
 //!   crawler sightings (`crawl_sighting`).
 //!
@@ -59,12 +59,12 @@
 //!
 //! ## Crawler cadence
 //!
-//! `/traffic` is a rolling summary over `window_minutes`, polled every
-//! `poll_interval_s`. Storing every poll would repeat each sighting about 120
-//! times. A node's window is stored when it has none yet, or when at least
-//! `window_minutes` have passed since its last stored one, so the stored
-//! windows tile time without overlap. A restart resumes the tiling from the
-//! file.
+//! The traffic document is a rolling summary over `window_minutes`, read from
+//! the journal at every `poll_interval_s`. Storing every poll would repeat each
+//! sighting about 120 times. A node's window is stored when it has none yet, or
+//! when at least `window_minutes` have passed since its last stored one, so the
+//! stored windows tile time without overlap. A restart resumes the tiling from
+//! the file.
 //!
 //! # The cap
 //!

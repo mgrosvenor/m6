@@ -24,8 +24,8 @@
 //! # What this does not cover
 //!
 //! Cache-to-origin links are not probed from here. A cache node that cannot
-//! reach its origin already shows it as backend errors on that node's `/perf`,
-//! and the existing backend-error finding reports them.
+//! reach its origin already shows it as backend errors in that node's metrics
+//! document, and the existing backend-error finding reports them.
 //!
 //! The probes run after the poll's requests, one node at a time, so the
 //! monitor's own TLS work is not in flight beside the connect it times.

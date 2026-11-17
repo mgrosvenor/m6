@@ -1041,7 +1041,8 @@ fn a_connection_event_never_accepts() {
         assert_eq!(status, 200, "GET /fast: {body}");
         assert_eq!(body, FAST_BODY);
     }
-    // Wait for the accounting tick that copies the loop trace into /perf.
+    // Wait for the accounting tick that copies the loop trace into the metrics
+    // document.
     let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut accept = None;
     let mut conn_events = None;
@@ -1234,7 +1235,7 @@ fn wait_for_periodic(fx: &Fixture, after: usize) {
     );
 }
 
-/// The count of one named event-loop trigger in a `/perf` snapshot.
+/// The count of one named event-loop trigger in a metrics-line snapshot.
 fn trigger_count(loops: &[(String, u64)], name: &str) -> u64 {
     loops
         .iter()
@@ -2236,8 +2237,8 @@ fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
 fn an_idle_m6_http_wakes_about_once_a_second() {
     let fx = Fixture::start(1, 30, "idle");
     let _conn = H1KeepAlive::connect(fx.port());
-    // Start at one accounting tick, and read `/perf` after the next: the report
-    // then covers one whole idle window.
+    // Start at one accounting tick, and read the metrics line after the next:
+    // the report then covers one whole idle window.
     let lines = periodic_lines(&fx);
     wait_for_periodic(&fx, lines);
     let lines = periodic_lines(&fx);

@@ -1,14 +1,14 @@
 //! Fetching one node's view of itself, as steps an event loop drives.
 //!
-//! Three requests per node: `/health` for the verdict, `/perf` for everything
-//! else and `/traffic` for the node's own view of its visitors. They are
-//! separate endpoints on purpose (see `m6_core::monitoring`), and an
-//! aggregator is exactly the caller that wants all three.
+//! `/health` and each declared `[[monitor.header_check]]` are the requests. A
+//! header check asks the node's public address, because it asserts what a
+//! visitor receives. `/health` asks the status port of a process entry and the
+//! public address otherwise.
 //!
-//! `/health` and the header checks always use the node's public URL.
-//! `/perf` and `/traffic` use it too, unless the node sets
-//! `metrics_over_tunnel`, which sends them to its tunnel address with the
-//! same token.
+//! The metrics and traffic documents are steps too, and they read mon's
+//! journal, where the line carries `perf` or `traffic` on `M6_TYPE` and names
+//! its node in the document's own `node` field. Nothing is asked of a node for
+//! them.
 //!
 //! # A poll is a table of steps, not a thread per node
 //!
@@ -58,11 +58,12 @@ pub struct NodeReading {
     /// HTTP status from `/health`. 503 is a degraded node answering honestly,
     /// which is different from no answer.
     pub health_status: Option<u16>,
-    /// `/perf`: absent when no token is configured, when the node refused the
-    /// one we have, or when it is switched off there.
+    /// The metrics document: absent while the journal holds no line for this
+    /// node, or when the newest line does not parse.
     pub perf: Option<PerfReport>,
-    /// Why `/perf` is absent, when it is. An aggregator that silently shows
-    /// nothing for a node is indistinguishable from a healthy quiet node.
+    /// Why the metrics document is absent, when it is. An aggregator that
+    /// silently shows nothing for a node is indistinguishable from a healthy
+    /// quiet node.
     pub perf_error: Option<String>,
     /// Round trip for `/health`, measured from here, **including connect and
     /// TLS**.
@@ -81,8 +82,9 @@ pub struct NodeReading {
     /// rendering as a pass: "nothing configured" and "everything correct" must
     /// not look the same.
     pub header_checks: Vec<HeaderCheckResult>,
-    /// `/traffic`: this node's summary of its own traffic and whether its
-    /// logging is alive. Absent for the same reasons `/perf` can be.
+    /// The traffic document: this node's summary of its own traffic and
+    /// whether its logging is alive. Absent for the same reasons the metrics
+    /// document can be.
     pub traffic: Option<TrafficReport>,
     pub traffic_error: Option<String>,
     /// Set when the node could not be reached at all.
@@ -157,7 +159,9 @@ pub enum Step {
     Health,
     /// One declared header check, by its index in the fleet config.
     Header(usize),
+    /// Read the metrics document from the journal. It starts no request.
     Perf,
+    /// Read the traffic document from the journal. It starts no request.
     Traffic,
     Done,
 }
@@ -735,7 +739,7 @@ impl Poller {
         }
     }
 
-    /// The address, request path, authority and token of one step.
+    /// The address, request path and authority of one step.
     fn step_target(&self, node: usize, step: Step) -> (Addr, String, String) {
         let n = &self.nodes[node];
         let path = match step {
@@ -1553,9 +1557,10 @@ mod tests {
         }
     }
 
-    /// A process entry asks its status port for `/health`, `/perf` and
-    /// `/traffic`, and nothing else: no header check, no public address. Break:
-    /// `/health` sent to the public address, which reads unreachable here.
+    /// A process entry asks its status port for `/health`, and nothing else:
+    /// no header check, no public address. The two documents come from the
+    /// journal and ask it nothing. Break: `/health` sent to the public address,
+    /// which reads unreachable here.
     #[test]
     fn a_process_entry_asks_its_status_port_for_health() {
         let (port, seen) = serve(1, |path| match path {
@@ -1853,10 +1858,11 @@ mod tests {
     const HEALTH: &str = r#"{"status":"ok","node":"origin"}"#;
     const TRAFFIC: &str = r#"{"node":"origin","window_minutes":1,"total_requests":10,"status":{},"notable":[],"heavy_hitters":[],"crawlers":[{"user_agent":"ExampleBot/1.0","requests":3,"client_ips":["192.0.2.7"],"paths":["/"]}],"forged_bot_requests":0,"forgers":[],"probe_noise":[],"logging":{"events_total":1,"seconds_since_last":1}}"#;
 
-    fn health_traffic(path: &str) -> (u16, &'static str) {
+    /// The reply for a poll step that is still a request. The two documents
+    /// come from the journal, so no test asks this server for them.
+    fn health_reply(path: &str) -> (u16, &'static str) {
         match path {
             "/health" => (200, HEALTH),
-            "/traffic" => (200, TRAFFIC),
             _ => (404, r#"{"error":"not found"}"#),
         }
     }
@@ -1920,7 +1926,7 @@ mod tests {
     /// is gone.
     #[test]
     fn the_dns_stage_drives_a_real_confirm() {
-        let (public, seen) = serve(1, health_traffic);
+        let (public, seen) = serve(1, health_reply);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
@@ -1953,7 +1959,7 @@ mod tests {
     /// a sound trigger for this path.
     #[test]
     fn a_later_step_that_cannot_connect_finishes_the_node_once() {
-        let (public, seen) = serve(1, health_traffic);
+        let (public, seen) = serve(1, health_reply);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
@@ -2019,7 +2025,7 @@ mod tests {
     /// decide, and this test is about the tally.
     #[test]
     fn a_tunnel_address_that_cannot_connect_is_reported_not_fatal() {
-        let (public, seen) = serve(1, health_traffic);
+        let (public, seen) = serve(1, health_reply);
         let n = Node {
             name: "origin".into(),
             url: format!("http://127.0.0.1:{public}"),
@@ -2060,7 +2066,7 @@ mod tests {
     /// with a round trip, which is the branch a dead-but-reachable peer takes.
     #[test]
     fn a_closed_tunnel_port_reads_as_refused() {
-        let (public, seen) = serve(1, health_traffic);
+        let (public, seen) = serve(1, health_reply);
         let closed = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap()

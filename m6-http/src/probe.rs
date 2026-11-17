@@ -2,12 +2,13 @@
 //!
 //! ## Why these exist
 //!
-//! m6-http publishes a per-channel handshake figure on `/perf`. A figure the
-//! server reports about itself has to be checkable against something, and on
-//! 2026-09-15 the only thing reaching for was `h3spec` -- a CONFORMANCE tester,
-//! which deliberately opens stalled and malformed connections. It reported an h3
-//! handshake p50 of 113ms on loopback for an engine that answers requests in
-//! microseconds, and that number was believed long enough to be written down.
+//! m6-http publishes a per-channel handshake figure in its metrics document. A
+//! figure the server reports about itself has to be checkable against something,
+//! and on 2026-09-15 the only thing reaching for was `h3spec`, a CONFORMANCE
+//! tester, which deliberately opens stalled and malformed connections. It
+//! reported an h3 handshake p50 of 113ms on loopback for an engine that answers
+//! requests in microseconds, and that number was believed long enough to be
+//! written down.
 //!
 //! We are writing a complete HTTP engine. The client halves of all three
 //! protocols are already in this crate. So the thing that checks the server's
@@ -24,8 +25,8 @@
 //!
 //! These probes are strictly sequential, one handshake per connection, nothing
 //! else on the wire. That is what makes them comparable to the server's own
-//! number: if the probe and `/perf` disagree, the difference is the server's
-//! queueing rather than a difference in what was being timed.
+//! number: if the probe and the metrics document disagree, the difference is the
+//! server's queueing rather than a difference in what was being timed.
 //!
 //! ## What is and is not in the number
 //!
@@ -111,9 +112,9 @@ pub fn tls_config(alpn: &[u8]) -> Arc<ClientConfig> {
 ///
 /// A struct rather than a tuple for the same reason [`ZeroRtt`] is one: the
 /// duration alone cannot tell a full handshake from a resumed one, and those are
-/// the two things being told apart. m6-http reports them as separate channels on
-/// `/perf` and never blends them, so a probe that returned one number could not
-/// be compared with it.
+/// the two things being told apart. m6-http reports them as separate channels in
+/// its metrics document and never blends them, so a probe that returned one
+/// number could not be compared with it.
 #[derive(Debug, Clone)]
 pub struct Handshake {
     /// After TCP connect, to handshake complete. Matches what the server's

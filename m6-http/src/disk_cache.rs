@@ -64,7 +64,7 @@ pub const REMOVE_BUDGET: usize = 512;
 const MAGIC: &[u8; 4] = b"M6DC";
 const VERSION: u8 = 1;
 
-/// What one tick of the writer did, for `/perf` and the tests.
+/// What one tick of the writer did, for the metrics document and the tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TickStats {
     /// Files written in this tick.
@@ -464,7 +464,8 @@ pub struct Loaded {
     pub files: Vec<([u8; 32], u64)>,
 }
 
-/// What happened to the disk copy a node read at start, for `/perf`.
+/// What happened to the disk copy a node read at start, for the metrics
+/// document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoadState {
     /// Nothing is installed: there was nothing to read, or the first heartbeat
@@ -481,7 +482,7 @@ pub enum LoadState {
 }
 
 impl LoadState {
-    /// The `/perf` spelling.
+    /// The spelling the metrics document uses.
     pub fn as_str(self) -> &'static str {
         match self {
             LoadState::None => "none",

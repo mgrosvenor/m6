@@ -1,6 +1,6 @@
 //! m6's own telemetry formats, and how to read them back.
 //!
-//! `/health`, `/perf`, the `periodic stats` log line and the analytics NDJSON
+//! `/health`, the `periodic stats` log line and the analytics NDJSON
 //! stream are all m6 features. Every deployment of m6 emits them and every
 //! deployment therefore has the same problem: turning them back into an answer
 //! about whether a fleet is healthy, fast, and being probed.
@@ -59,8 +59,8 @@ pub struct AnalyticsRecord {
 /// The event's fields, as emitted by `m6_http::analytics`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyticsFields {
-    /// `"request"` for site traffic, `"monitor"` for a `/health` or `/perf`
-    /// poll. Monitoring is deliberately a different message so that site
+    /// `"request"` for site traffic, `"monitor"` for a `/health` poll.
+    /// Monitoring is deliberately a different message so that site
     /// traffic stays honest while the monitoring itself stays visible; every
     /// consumer that wants traffic must filter on this.
     #[serde(default)]
@@ -102,10 +102,10 @@ impl AnalyticsRecord {
 
     /// The record the analytics line with these values parses to.
     ///
-    /// `/traffic` keeps a window of what this process logged, as the fields
-    /// the report reads, and builds its report from those. This turns them
-    /// back into a record, so a window produces the report the same lines
-    /// would have produced from the file.
+    /// The traffic window holds what this process logged, as the fields the
+    /// report reads, and builds its report from those. This turns them back
+    /// into a record, so a window produces the report the same lines would
+    /// have produced from the file.
     ///
     /// The one difference is a value the window cut: the record keeps the
     /// prefix the slot kept, and `truncated` says the rest is missing. The
@@ -1193,8 +1193,8 @@ mod tests {
         assert_eq!(parse_analytics(text, "").count(), 1);
     }
 
-    /// `from_parts` is the only way `/traffic` gets a record from its window,
-    /// so what it builds has to be the record the line with those values
+    /// `from_parts` is the only way the traffic window gets a record from its
+    /// slots, so what it builds has to be the record the line with those values
     /// parses to. One case for each kind of line m6-http logs: a request, a
     /// monitor poll, and a rate-limited request.
     ///
@@ -1972,9 +1972,9 @@ mod tests {
     }
 }
 
-// ── The /perf metrics payload ────────────────────────────────────────────────
+// ── The metrics document ────────────────────────────────────────────────────
 //
-// The wire format of m6's monitoring endpoints. Here rather than in the binary
+// The wire format of the metrics document. Here rather than in the binary
 // that produces it, because anything reading a fleet needs the same types the
 // nodes write, and a consumer holding its own copy of the shape is a consumer
 // that drifts from it. That is the mistake the analytics stream made: no type
@@ -1982,9 +1982,9 @@ mod tests {
 //
 // `version` and `iface` are `String` rather than `&'static str` for the same
 // reason. The producer knows them at compile time; a deserializing client
-// cannot. It costs two short allocations per channel on an endpoint that
-// already sorts a 4096 sample reservoir, and it is on no hot path.
-/// One channel's figures, as reported by `/perf`.
+// cannot. It costs two short allocations per channel when the document is
+// built, and it is on no hot path.
+/// One channel's figures, as carried in the metrics document.
 ///
 /// Cumulative counters, unlike the aggregate percentiles, which are windowed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2063,17 +2063,17 @@ pub struct HandshakeStats {
     pub max_ns: u64,
 }
 
-/// A read-only view of the counters, for the health endpoint.
+/// A read-only view of the counters, for the metrics document.
 ///
 /// Cumulative fields are monotonic for the life of the process, which is what
 /// makes "the request count stopped increasing" a usable liveness signal.
 ///
-/// The percentile fields are **not** cumulative. `maybe_emit` clears the
-/// latency reservoirs every 10 seconds, so these describe the current partial
-/// window only, which may hold very few samples or none. That is why
-/// `hit_samples`/`miss_samples` are reported alongside: a p99 drawn from three
-/// samples is noise, and a consumer that cannot see the sample count has no
-/// way to tell it apart from a real one.
+/// The percentile fields are **not** cumulative. They describe the most recent
+/// samples held in the ring, which on a quiet node can cover hours, and which
+/// may hold very few samples or none. That is why `hit_samples`/`miss_samples`
+/// are reported alongside: a p99 drawn from three samples is noise, and a
+/// consumer that cannot see the sample count has no way to tell it apart from
+/// a real one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatsSnapshot {
     pub requests_total: u64,
@@ -2107,23 +2107,23 @@ pub struct StatsSnapshot {
     /// only here.
     #[serde(default)]
     pub backend_errors_by_name: std::collections::BTreeMap<String, u64>,
-    /// Every request in the monitor population: `/health`, `/perf` and
-    /// `/traffic` polls, and any request on the TLS or QUIC listener from an
-    /// private network address. Cumulative, and deliberately excluded from
-    /// `requests_total` so a stalled site is still detectable while a monitor
-    /// keeps polling. Reported rather than discarded so the monitor itself is
-    /// observable: a check that stops, or one that floods, shows up here.
+    /// Every request in the monitor population: a `/health` poll, and any
+    /// request on the TLS or QUIC listener from a private network address.
+    /// Cumulative, and deliberately excluded from `requests_total` so a stalled
+    /// site is still detectable while a monitor keeps polling. Reported rather
+    /// than discarded so the monitor itself is observable: a check that stops,
+    /// or one that floods, shows up here.
     pub monitor_requests_total: u64,
     pub monitor_samples: usize,
     pub monitor_p50_ns: u64,
     pub monitor_p99_ns: u64,
     pub rps_peak: u64,
-    /// Samples backing the hit percentiles in the current window.
+    /// Samples backing the hit percentiles in the ring.
     pub hit_samples: usize,
     pub hit_p50_ns: u64,
     pub hit_p99_ns: u64,
     pub hit_max_ns: u64,
-    /// Samples backing the miss percentiles in the current window.
+    /// Samples backing the miss percentiles in the ring.
     pub miss_samples: usize,
     pub miss_p50_ns: u64,
     pub miss_p99_ns: u64,

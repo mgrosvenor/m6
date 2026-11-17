@@ -414,7 +414,7 @@ Section 7 gives the m6-http configuration, and section 8 gives the identity a ba
 
 ## 7. m6-http integration
 
-m6-http asks this service for the identity and enforces `require`, `metrics_require` and the genid claims on the answer.
+m6-http asks this service for the identity and enforces `require` and the genid claims on the answer.
 This section gives the one configuration that points m6-http at this service, and where the rest is specified.
 
 ```toml
