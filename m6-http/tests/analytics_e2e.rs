@@ -656,6 +656,26 @@ fn read_traffic_lines(output: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The document without its three pressure-stall blocks.
+///
+/// `Pressure` is `f32`. serde_json's default float parser is best effort and
+/// not round-trip exact, and a widened `f32` prints as a 15-to-17 digit
+/// decimal that the parser can land one f64 ulp away from. So a field for
+/// field comparison over these blocks compares the parser with itself instead
+/// of the line with the document. Both sides must still carry the blocks, and
+/// every other field is compared exactly.
+fn without_pressure_blocks(mut document: serde_json::Value) -> serde_json::Value {
+    if let Some(host) = document
+        .get_mut("host")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for key in ["cpu_pressure", "io_pressure", "memory_pressure"] {
+            host.remove(key);
+        }
+    }
+    document
+}
+
 fn wait_for_perf_lines(srv: &Server, want: usize) -> Vec<serde_json::Value> {
     let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         read_perf_lines(&srv.http.borrow().output()).len() >= want
@@ -722,9 +742,25 @@ fn the_stats_line_carries_the_perf_document() {
         serde_json::from_value(from_line.clone()).expect("the line parses as a PerfReport");
     assert_eq!(parsed.node, "test-node");
     assert!(!parsed.tls.is_empty(), "the served chain is on the line");
+    let from_report = serde_json::to_value(&parsed).expect("the report serialises");
+    // The pressure readings are f32 and do not survive serde_json's default
+    // parse back to the same f64. They are asserted present on both sides, and
+    // every other field is compared exactly.
+    for key in ["cpu_pressure", "io_pressure", "memory_pressure"] {
+        assert!(
+            from_line["host"].get(key).is_some(),
+            "the line carries host.{key}: {}",
+            from_line["host"]
+        );
+        assert!(
+            from_report["host"].get(key).is_some(),
+            "the document carries host.{key}: {}",
+            from_report["host"]
+        );
+    }
     assert_eq!(
-        serde_json::to_value(&parsed).expect("the report serialises"),
-        from_line,
+        without_pressure_blocks(from_report),
+        without_pressure_blocks(from_line),
         "the line is the document, field for field"
     );
 }

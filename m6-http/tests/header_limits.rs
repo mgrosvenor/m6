@@ -1131,7 +1131,23 @@ impl FileBackend {
                 .arg(site.join("configs/m6-file.conf"))
                 .env("M6_SOCKET_OVERRIDE", &socket),
         );
+        // Wait for the socket to accept, not for the path to exist.
+        // `listen_unix` creates the file at `bind`, one call before `listen`,
+        // so the path can be there while a connect is still refused. That
+        // refused connect is a ready check reporting the wrong fact: under
+        // load one test saw "connect to m6-file: Connection refused" at
+        // header_limits.rs:1143.
         file.wait_for_path(&socket, m6_core::testkit::STARTUP_BOUND);
+        let deadline = m6_core::platform::now() + m6_core::testkit::STARTUP_BOUND;
+        while UnixStream::connect(&socket).is_err() {
+            assert!(
+                m6_core::platform::now() < deadline,
+                "m6-file never accepted a connection on {} within the startup bound\n{}",
+                socket.display(),
+                file.output()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         FileBackend {
             socket,
             _file: file,
