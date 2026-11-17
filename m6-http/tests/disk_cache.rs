@@ -385,6 +385,20 @@ impl Stack {
         );
     }
 
+    /// The message for a first request that should have been served: the
+    /// status and body, then both services' logs.
+    ///
+    /// A 502 or a 504 at the first request says the node could not reach its
+    /// source, and which side answered is only in these two logs.
+    fn served_message(&self, r: &Resp) -> String {
+        format!(
+            "{}\n--- m6-http-cache ---\n{}\n--- m6-http-source ---\n{}",
+            r.text(),
+            self.cache_output(),
+            self.source_output()
+        )
+    }
+
     fn stop_cache(&mut self) {
         if let Some(mut svc) = self.cache.take() {
             svc.kill();
@@ -628,8 +642,37 @@ impl Stack {
         self.genid_block()["id"].as_str().map(str::to_string)
     }
 
-    fn wait_perf_id(&self, want: &str, timeout: Duration) -> bool {
-        wait_until(timeout, || self.perf_id().as_deref() == Some(want))
+    /// How many metrics lines the cache node has written.
+    fn perf_lines(&self) -> usize {
+        self.cache_output().matches("\"type\":\"perf\"").count()
+    }
+
+    /// Wait until a metrics line written after this call started says the node
+    /// holds the ID and its upstream is up.
+    ///
+    /// `/perf` was a live read: it answered with the node's state at the
+    /// moment it was asked. The metrics line is a summary written on the
+    /// accounting tick, so the newest line can be a second old, and a line
+    /// that merely says the ID is set says nothing about whether the node can
+    /// reach its source now. The old check asserted the state, so this waits
+    /// for a freshly written line whose genid block says the ID is held and
+    /// `upstream_down` is false, which is what the live read meant.
+    fn wait_perf_ready(&self, want: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut seen = self.perf_lines();
+        while Instant::now() < deadline {
+            let lines = self.perf_lines();
+            if lines > seen {
+                seen = lines;
+                if self.perf_id().as_deref() == Some(want)
+                    && self.genid_block()["upstream_down"].as_bool() == Some(false)
+                {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     /// Directory names under the cache root: one per generation.
@@ -741,13 +784,13 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
     let mut stack = Stack::new();
     stack.start();
     assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "the metrics line never showed the source's ID:\n{}",
+        stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND),
+        "the metrics line never reported the source's ID on a fresh line with its upstream up:\n{}",
         stack.cache_output()
     );
 
     let served = stack.get_cache("/", &[]);
-    assert_eq!(served.status, 200, "{}", served.text());
+    assert_eq!(served.status, 200, "{}", stack.served_message(&served));
     assert_eq!(served.text(), "first: one");
     let hit = stack.get_cache("/", &[]);
     assert!(
@@ -967,7 +1010,7 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
 fn a_restart_reads_the_file_the_node_wrote() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
     let served = stack.get_cache("/", &[]);
     assert_eq!(served.text(), "first: one");
     assert!(
@@ -995,7 +1038,7 @@ fn a_restart_reads_the_file_the_node_wrote() {
 fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
@@ -1017,7 +1060,7 @@ fn a_generation_change_moves_the_files_and_removes_the_old_directory() {
     assert_eq!(posted.genid(), "1");
 
     assert!(
-        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
+        stack.wait_perf_ready("1", m6_core::testkit::RESPONSE_BOUND),
         "the cache never followed the publish:\n{}",
         stack.cache_output()
     );
@@ -1059,8 +1102,8 @@ fn a_restart_with_the_same_id_starts_warm() {
     let mut stack = Stack::new();
     stack.start();
     assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "the metrics line never showed the source's ID:\n{}",
+        stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND),
+        "the metrics line never reported the source's ID on a fresh line with its upstream up:\n{}",
         stack.cache_output()
     );
     let served = stack.get_cache("/", &[]);
@@ -1129,7 +1172,7 @@ fn a_restart_with_the_same_id_starts_warm() {
 fn a_restart_after_a_publish_starts_cold() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
@@ -1207,7 +1250,7 @@ fn a_restart_after_a_publish_starts_cold() {
 fn a_restart_with_the_source_down_serves_the_disk_copy() {
     let mut stack = Stack::new();
     stack.start();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert!(
         wait_until(m6_core::testkit::STARTUP_BOUND, || !stack
@@ -1291,7 +1334,7 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
     assert_eq!(posted.status, 200, "{}", posted.text());
     assert_eq!(posted.genid(), "1");
     assert!(
-        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
+        stack.wait_perf_ready("1", m6_core::testkit::RESPONSE_BOUND),
         "the cache never followed the publish:\n{}",
         stack.cache_output()
     );

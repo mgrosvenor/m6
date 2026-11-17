@@ -354,6 +354,20 @@ impl Stack {
         );
     }
 
+    /// The message for a first request that should have been served: the
+    /// status and body, then both services' logs.
+    ///
+    /// A 502 or a 504 at the first request says the node could not reach its
+    /// source, and which side answered is only in these two logs.
+    fn served_message(&self, r: &Resp) -> String {
+        format!(
+            "{}\n--- m6-http-cache ---\n{}\n--- m6-http-source ---\n{}",
+            r.text(),
+            self.cache_output(),
+            self.source_output()
+        )
+    }
+
     fn source_output(&self) -> String {
         self.source
             .as_ref()
@@ -507,8 +521,37 @@ impl Stack {
         self.genid()?[key].as_bool()
     }
 
-    fn wait_perf_id(&self, want: &str, timeout: Duration) -> bool {
-        wait_until(timeout, || self.genid_id().as_deref() == Some(want))
+    /// How many metrics lines the cache node has written.
+    fn perf_lines(&self) -> usize {
+        self.cache_output().matches("\"type\":\"perf\"").count()
+    }
+
+    /// Wait until a metrics line written after this call started says the node
+    /// holds the ID and its upstream is up.
+    ///
+    /// `/perf` was a live read: it answered with the node's state at the
+    /// moment it was asked. The metrics line is a summary written on the
+    /// accounting tick, so the newest line can be a second old, and a line
+    /// that merely says the ID is set says nothing about whether the node can
+    /// reach its source now. The old check asserted the state, so this waits
+    /// for a freshly written line whose genid block says the ID is held and
+    /// `upstream_down` is false, which is what the live read meant.
+    fn wait_perf_ready(&self, want: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut seen = self.perf_lines();
+        while Instant::now() < deadline {
+            let lines = self.perf_lines();
+            if lines > seen {
+                seen = lines;
+                if self.genid_id().as_deref() == Some(want)
+                    && self.genid_bool("upstream_down") == Some(false)
+                {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     fn wait_upstream_down(&self, want: bool, timeout: Duration) -> bool {
@@ -585,8 +628,8 @@ fn the_cache_learns_the_id_at_start() {
     stack.start_cache();
 
     assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "the metrics line never showed the source's ID:\n{}",
+        stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND),
+        "the metrics line never reported the source's ID on a fresh line with its upstream up:\n{}",
         stack.cache_output()
     );
     assert_eq!(stack.genid_bool("upstream_down"), Some(false));
@@ -624,8 +667,9 @@ fn a_node_with_no_id_retries_a_failed_heartbeat() {
     );
     stack.start_source();
     assert!(
-        stack.wait_perf_id("0", m6_core::testkit::STARTUP_BOUND),
-        "the metrics line never showed the source's ID after one failed heartbeat:\n{}",
+        stack.wait_perf_ready("0", m6_core::testkit::STARTUP_BOUND),
+        "the metrics line never reported the source's ID after one failed heartbeat, on a fresh \
+         line with its upstream up:\n{}",
         stack.cache_output()
     );
 }
@@ -642,10 +686,10 @@ fn a_publish_through_the_cache_node_reaches_it() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
 
     let first = stack.get_cache("/", &[]);
-    assert_eq!(first.status, 200, "{}", first.text());
+    assert_eq!(first.status, 200, "{}", stack.served_message(&first));
     assert_eq!(first.text(), "first: one");
     let second = stack.get_cache("/", &[]);
     assert_eq!(second.text(), "first: one");
@@ -665,7 +709,7 @@ fn a_publish_through_the_cache_node_reaches_it() {
     assert_eq!(posted.genid(), "1", "the source's new ID comes back");
 
     assert!(
-        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
+        stack.wait_perf_ready("1", m6_core::testkit::RESPONSE_BOUND),
         "the cache never followed the publish:\n{}",
         stack.cache_output()
     );
@@ -687,11 +731,13 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
     stack.start_source();
     stack.start_cache();
     assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "the metrics line never showed the source's ID 0:\n{}",
+        stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND),
+        "the metrics line never reported the source's ID 0 on a fresh line with its upstream up:\n{}",
         stack.cache_output()
     );
-    assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
+    let first = stack.get_cache("/", &[]);
+    assert_eq!(first.status, 200, "{}", stack.served_message(&first));
+    assert_eq!(first.text(), "first: one");
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
 
     std::fs::write(
@@ -713,7 +759,7 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
         "the reply carries the source's new ID"
     );
     assert!(
-        stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND),
+        stack.wait_perf_ready("1", m6_core::testkit::RESPONSE_BOUND),
         "only behind() can make a 3600s heartbeat due this soon; elapsed {:?}:\n{}",
         started.elapsed(),
         stack.cache_output()
@@ -739,9 +785,9 @@ fn the_cache_serves_what_it_holds_while_the_source_is_down() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
     let held = stack.get_cache("/", &[]);
-    assert_eq!(held.status, 200, "{}", held.text());
+    assert_eq!(held.status, 200, "{}", stack.served_message(&held));
     assert_eq!(held.text(), "first: one");
 
     stack.stop_source();
@@ -813,7 +859,7 @@ fn the_cache_recovers_when_the_source_returns() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
 
     stack.stop_source();
     assert!(stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND));
@@ -854,7 +900,7 @@ fn the_cache_recovers_when_the_source_returns() {
     .unwrap();
     let token = stack.write_token();
     assert_eq!(stack.post_source("/genid", Some(&token)).status, 200);
-    assert!(stack.wait_perf_id("1", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("1", m6_core::testkit::RESPONSE_BOUND));
     let after = stack.get_cache("/", &[]);
     assert_eq!(after.status, 200);
     assert_eq!(after.text(), "first: two");
@@ -869,12 +915,14 @@ fn genid_through_the_cache_is_authorised_by_the_source() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
 
     let none = stack.get_cache("/genid", &[]);
     assert_eq!(
-        none.status, 401,
-        "the source refuses a caller with no token"
+        none.status,
+        401,
+        "the source refuses a caller with no token: {}",
+        stack.served_message(&none)
     );
     let token = stack.read_token();
     let read = stack.get_cache("/genid", &[("Authorization", &format!("Bearer {token}"))]);
@@ -897,7 +945,7 @@ fn background_fetches_wait_for_the_id() {
     stack.start_cache();
 
     stack.start_source();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
     // The queue holds one fetch per warmable route per encoding; `/` and the
     // three encodings are the three. Their only trace before a client arrives
     // is the dispatch, because a background fetch has no response to write.
@@ -966,16 +1014,27 @@ fn health_goes_ok_degraded_ok_and_logs_each_change_once() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND));
 
     // `ok` while the origin answers, across many requests.
     for _ in 0..20 {
         let r = stack.get_cache("/", &[]);
-        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.status, 200, "{}", stack.served_message(&r));
         assert_eq!(r.text(), "first: one");
     }
+    // Waiting on the state, not asserting that no heartbeat missed. At
+    // `heartbeat_s = 1` under load one can, the node sets its flag honestly,
+    // and the next answer clears it: that is the product being right about an
+    // event this test did not drive, and the doc above says so. What this
+    // asserts is that a node whose origin answers reports ok.
+    assert!(
+        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
+            stack.get_cache("/health", &[]).status == 200
+        }),
+        "/health never answered ok while the origin was up:\n{}",
+        stack.cache_output()
+    );
     let up = stack.get_cache("/health", &[]);
-    assert_eq!(up.status, 200, "{}", up.text());
     assert_eq!(up.text(), r#"{"status":"ok","node":"genid-cache"}"#);
 
     // The origin goes away. The edge learns it from the heartbeat it already
@@ -1075,7 +1134,14 @@ fn health_goes_ok_degraded_ok_and_logs_each_change_once() {
         "a warn appeared after the recovery:\n{}",
         stack.cache_output()
     );
+    // The same wait as the first `ok`, for the same reason.
+    assert!(
+        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
+            stack.get_cache("/health", &[]).status == 200
+        }),
+        "/health never reported ok again after the requests:\n{}",
+        stack.cache_output()
+    );
     let back = stack.get_cache("/health", &[]);
-    assert_eq!(back.status, 200, "{}", back.text());
     assert_eq!(back.text(), r#"{"status":"ok","node":"genid-cache"}"#);
 }
