@@ -49,7 +49,7 @@ fn a_never_blocking_destination_drops_and_reports() {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let (stdout, read) = Stdout::to_pipe();
-        m6_log::init(m6_log::Level::Info, None).expect("the logger");
+        m6_log::init(m6_log::Level::Info).expect("the logger");
 
         let started = Instant::now();
         for n in 0..LINES {

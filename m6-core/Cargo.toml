@@ -176,13 +176,6 @@ name    = "echo_tls"
 path    = "examples/echo_tls.rs"
 required-features = ["testkit"]
 
-# Its own `main`: the signal mask is inherited only by threads created after
-# `block()`, and the libtest harness has already started one by the time a test
-# function runs.
-[[test]]
-name    = "reopen_moves_new_lines"
-harness = false
-
 # The three allocation checks (`Timeouts`, `Slots`, `LoopTrace`), each on the
 # main thread so the count is the checks' own.
 [[test]]

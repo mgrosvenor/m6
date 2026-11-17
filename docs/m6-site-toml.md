@@ -794,7 +794,7 @@ Section 7 states how the process stops when a signal arrives.
 
 ## 7. Signal handling
 
-A process stops on `SIGTERM` or `SIGINT`, with a second signal forcing the exit, and reopens its log file on `SIGUSR1`.
+A process stops on `SIGTERM` or `SIGINT`, with a second signal forcing the exit.
 Both receipts exit 0, so a supervisor reads a stop as a clean stop.
 [`m6-http.md`](m6-http.md) owns the signal table and the shutdown sequence.
 Section 8 gives the codes a failure returns.

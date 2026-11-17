@@ -486,33 +486,25 @@ fn default_max_requests_per_connection() -> u32 {
 
 /// Per-request traffic logging (session cookie, referrer, UA, cache state,
 /// node identity, ...) — separate from operational `[log]` above. Written to
-/// its own file through `m6_core::log`, always JSON.
+/// the one stream, stdout, through `m6_core::log`, always JSON, with
+/// `type=access`.
 ///
-/// Rotate by renaming the file and sending SIGUSR1: the process reopens the path.
+/// There is no path to rotate. Under systemd the journal rotates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyticsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Resolved relative to the process's current working directory (not
-    /// `site_dir`, which lives under a generated/rendered tree that gets
-    /// wiped on redeploy) unless absolute.
-    #[serde(default = "default_analytics_log_path")]
-    pub log_path: String,
 }
 
 fn default_true() -> bool {
     true
-}
-fn default_analytics_log_path() -> String {
-    "logs/analytics.ndjson".to_string()
 }
 
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         AnalyticsConfig {
             enabled: default_true(),
-            log_path: default_analytics_log_path(),
         }
     }
 }

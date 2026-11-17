@@ -20,7 +20,7 @@ fn a_line_waits_for_the_tick_when_stdout_is_not_blocked() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("batched.jsonl");
     let stdout = Stdout::to_file(&path);
-    m6_log::init(Level::Info, None).expect("the logger");
+    m6_log::init(Level::Info).expect("the logger");
 
     m6_log::info!("first line");
     assert!(

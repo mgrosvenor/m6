@@ -218,25 +218,21 @@ pub fn wall() -> SystemTime {
 pub enum Signal {
     /// Stop: SIGTERM or SIGINT.
     Shutdown,
-    /// Reopen the log file: SIGUSR1, the convention a rotation tool uses.
-    /// Not SIGHUP, which by convention re-reads a configuration, which m6
-    /// never does, and which also arrives when a terminal closes.
-    ReopenLogs,
 }
 
-/// SIGTERM, SIGINT and SIGUSR1 as one readable descriptor, registered with
+/// SIGTERM and SIGINT as one readable descriptor, registered with
 /// [`Registry::register_fd`].
 ///
 /// [`Signals::new`] asserts [`block`] already ran, because a thread started
 /// before the mask is set takes the signal at its default disposition. The
-/// three signals stay blocked for the life of the process. A child inherits
+/// two signals stay blocked for the life of the process. A child inherits
 /// that mask across `exec`, so a service spawns children through
 /// [`process::spawn`], which clears it.
 ///
 /// On Linux the descriptor is a `signalfd`, whose read dequeues the signal. On
 /// macOS it is a kqueue registered for `EVFILT_SIGNAL`, which reports a posted
-/// signal and does not dequeue it, so the three are also set to `SIG_IGN`
-/// there and are discarded once reported.
+/// signal and does not dequeue it, so the two are also set to `SIG_IGN` there
+/// and are discarded once reported.
 pub struct Signals(os::Signals);
 
 impl Signals {
@@ -260,26 +256,21 @@ impl Signals {
 }
 
 /// Send `what` to the process `pid`, as a test or a supervisor does: SIGTERM
-/// for [`Signal::Shutdown`], SIGUSR1 for [`Signal::ReopenLogs`].
+/// for [`Signal::Shutdown`].
 pub fn send(pid: u32, what: Signal) -> io::Result<()> {
     let sig = match what {
         Signal::Shutdown => nix::sys::signal::Signal::SIGTERM,
-        Signal::ReopenLogs => REOPEN_SIGNAL,
     };
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig)?;
     Ok(())
 }
 
-/// The signal that reopens the log file.
-const REOPEN_SIGNAL: nix::sys::signal::Signal = nix::sys::signal::Signal::SIGUSR1;
-
-/// The three signals the layer owns, as a mask.
+/// The two signals the layer owns, as a mask.
 fn managed() -> nix::sys::signal::SigSet {
     use nix::sys::signal::Signal as Sig;
     let mut set = nix::sys::signal::SigSet::empty();
     set.add(Sig::SIGTERM);
     set.add(Sig::SIGINT);
-    set.add(REOPEN_SIGNAL);
     set
 }
 
@@ -288,12 +279,11 @@ fn signal_from_signo(signo: i32) -> Option<Signal> {
     use nix::sys::signal::Signal as Sig;
     match Sig::try_from(signo).ok()? {
         Sig::SIGTERM | Sig::SIGINT => Some(Signal::Shutdown),
-        Sig::SIGUSR1 => Some(Signal::ReopenLogs),
         _ => None,
     }
 }
 
-/// Block the three signals in the calling thread, and mark every descriptor
+/// Block the two signals in the calling thread, and mark every descriptor
 /// this process inherited close-on-exec. The first statement of every `main`,
 /// under the name `m6_core::signal::block`, which delegates here: both are
 /// facts about the process that are set once, while it is still one thread.
@@ -302,13 +292,13 @@ pub fn block() {
     let _ = process::close_inherited_on_exec();
 }
 
-/// Unblock the three signals in the calling thread, so a test can prove the
+/// Unblock the two signals in the calling thread, so a test can prove the
 /// refusal [`require_blocked`] gives. Never called by a service.
 pub fn unblock_for_test() {
     let _ = managed().thread_unblock();
 }
 
-/// Whether the calling thread blocks the three signals.
+/// Whether the calling thread blocks the two signals.
 fn blocked_here() -> bool {
     match nix::sys::signal::SigSet::thread_get_mask() {
         Ok(m) => managed().iter().all(|s| m.contains(s)),

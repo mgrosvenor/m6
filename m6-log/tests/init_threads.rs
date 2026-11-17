@@ -14,7 +14,7 @@ use common::Stdout;
 
 fn init_and_log(name: &'static str) {
     std::thread::spawn(move || {
-        m6_log::init(m6_log::Level::Info, None).expect("the logger");
+        m6_log::init(m6_log::Level::Info).expect("the logger");
         m6_log::info!(name = name, "from the thread that called init");
         m6_log::stop().expect("a clean stop");
     })

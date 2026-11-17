@@ -10,10 +10,10 @@
 //! `harness = false` means no libtest thread shares this binary, so the
 //! counting allocator reads only what `record` allocated. A custom harness must
 //! still speak libtest's protocol (`--list --format terse`, `--exact <name>`),
-//! which `libtest-mimic` does, with the check forced onto the main thread. The analytics Sink is
-//! opened before the count, as it is at start, because `record` builds its line
-//! into that Sink: with no Sink the line is dropped and a zero would prove
-//! nothing.
+//! which `libtest-mimic` does, with the check forced onto the main thread. The
+//! one Sink is opened before the count, as it is at start, with stdout pointed
+//! at a file so the lines can be counted: with no Sink the line is dropped and
+//! a zero would prove nothing.
 //!
 //! The first loop measures a request that already carries a session cookie, a
 //! referer and a user agent, which is the returning visitor's path. The second
@@ -49,7 +49,14 @@ fn main() {
 fn recording_a_request_allocates_nothing() -> Result<(), Failed> {
     let dir = tempfile::tempdir().expect("a temp directory");
     let path = dir.path().join("analytics.jsonl");
-    log::init(log::Level::Info, Some(path.as_path())).expect("the analytics sink");
+    let out = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("the stdout file");
+    let saved = m6_core::platform::fd::dup(&std::io::stdout()).expect("a copy of stdout");
+    m6_core::platform::fd::dup2_stdout(&out).expect("stdout is the file");
+    log::init(log::Level::Info).expect("the one sink");
 
     let with_cookie = vec![
         (
@@ -107,14 +114,15 @@ fn recording_a_request_allocates_nothing() -> Result<(), Failed> {
     }
     let new_session = alloc_count::now() - start;
 
-    log::stop().expect("the analytics sink closes");
+    log::stop().expect("the sink closes");
 
     // A line was built for every call, so a zero below is the line path's and
     // not an empty Sink's.
-    let written = std::fs::read_to_string(&path).expect("the analytics file");
+    let written = std::fs::read_to_string(&path).expect("the written lines");
     let lines = written.lines().count();
     let expected = 2 + 2 * REQUESTS;
     let bytes_each = written.len() / lines;
+    m6_core::platform::fd::dup2_stdout(&saved).expect("stdout is back");
     drop(dir);
 
     let allocations = returning + new_session;

@@ -7367,14 +7367,7 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let analytics_path = config
-        .analytics
-        .enabled
-        .then(|| PathBuf::from(&config.analytics.log_path));
-    let analytics = analytics_path
-        .as_deref()
-        .map(|path| ("[analytics] log_path", path));
-    if let Err(e) = m6_core::log::init_with_setting(level, analytics) {
+    if let Err(e) = m6_core::log::init(level) {
         eprintln!("m6-http: {e}");
         return 2;
     }

@@ -106,11 +106,11 @@ pub fn fd_limits() -> io::Result<(u64, u64)> {
 /// Spawn `cmd` as every m6 process must: with no signal blocked or ignored in
 /// the child, and no descriptor of this process above stderr.
 ///
-/// A service blocks SIGTERM, SIGINT and SIGUSR1 for its own loop
+/// A service blocks SIGTERM and SIGINT for its own loop
 /// ([`super::Signals`]), and on macOS ignores them as well. A child inherits
 /// both across `exec` on every supported target, so a child spawned with
 /// `Command::spawn` alone would ignore the SIGTERM that stops it. This clears
-/// the mask and restores the three default dispositions between fork and
+/// the mask and restores the two default dispositions between fork and
 /// exec, which is the one thing `pre_exec` is for here.
 ///
 /// A child also inherits every descriptor of this process that is not marked

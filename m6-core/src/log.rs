@@ -1,6 +1,6 @@
 //! Logging for every service, over the `m6-log` crate.
 //!
-//! `m6-log` owns the two Sinks, the JSON line format, the macros and the log
+//! `m6-log` owns the Sink, the JSON line format, the macros and the log
 //! heartbeat. This module re-exports them as `m6_core::log`, reads the `[log]`
 //! level from `site.toml` and the service config, and adds [`watch`], the one
 //! piece that needs the reactor.
@@ -9,20 +9,17 @@
 //! service config's `[log]`, then `--log-level`. The level is read once, at
 //! start, and a change takes a restart.
 //!
-//! **The analytics file can be reopened.**
-//! A rotation tool renames the file and sends SIGUSR1 (see `signal`), and the
-//! service's loop calls [`reopen`]. That call flushes the buffered lines, then
-//! opens the path again. From then on every line reaches the new file and none
-//! reaches the renamed one.
+//! **One stream.**
+//! Every line goes to stdout, which journals under systemd. There is no second
+//! file to rotate, because the journal rotates.
 
 use std::io;
 use std::path::Path;
-use std::time::{Instant, UNIX_EPOCH};
 
 pub use m6_log::pulse;
 pub use m6_log::{
-    debug, error, flush, info, init, init_with_setting, set_limits, stop, tick, trace, warn,
-    with_analytics, with_operational, Level, Line, LogLimits, LogPulse, Sink, Type,
+    debug, error, flush, info, init, set_limits, stop, tick, trace, warn, with_operational, Level,
+    Line, LogLimits, LogPulse, Sink, Type,
 };
 
 /// Watch stdout for writability under `token` while the operational Sink holds
@@ -61,133 +58,7 @@ thread_local! {
     static STDOUT_WATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-// ── Is logging alive ─────────────────────────────────────────────────────────
-
-/// When this process last reopened the analytics file, and when a reopen last
-/// failed.
-///
-/// Atomics only, like [`LogPulse`]. A count of zero means "never". The node
-/// answers the ages itself, so a reader's clock never matters.
-pub struct ReopenRecord {
-    ok: std::sync::atomic::AtomicU64,
-    failed: std::sync::atomic::AtomicU64,
-    /// Milliseconds since process start, at the last success.
-    last_ok_ms: std::sync::atomic::AtomicU64,
-    /// Unix seconds at the last success.
-    last_ok_unix: std::sync::atomic::AtomicU64,
-    /// Milliseconds since process start, at the last failure.
-    last_fail_ms: std::sync::atomic::AtomicU64,
-}
-
-impl ReopenRecord {
-    const fn new() -> Self {
-        Self {
-            ok: std::sync::atomic::AtomicU64::new(0),
-            failed: std::sync::atomic::AtomicU64::new(0),
-            last_ok_ms: std::sync::atomic::AtomicU64::new(0),
-            last_ok_unix: std::sync::atomic::AtomicU64::new(0),
-            last_fail_ms: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn record_success(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.last_ok_ms.store(elapsed_ms(), Relaxed);
-        self.last_ok_unix.store(unix_now(), Relaxed);
-        self.ok.fetch_add(1, Relaxed);
-    }
-
-    fn record_failure(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.last_fail_ms.store(elapsed_ms(), Relaxed);
-        self.failed.fetch_add(1, Relaxed);
-    }
-
-    /// Reopens that succeeded since start.
-    pub fn successes(&self) -> u64 {
-        self.ok.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Reopens that failed since start.
-    pub fn failures(&self) -> u64 {
-        self.failed.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Seconds since the last successful reopen, or `None` if there was none.
-    pub fn seconds_since_last_success(&self) -> Option<u64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.ok.load(Relaxed) == 0 {
-            return None;
-        }
-        Some(elapsed_ms().saturating_sub(self.last_ok_ms.load(Relaxed)) / 1000)
-    }
-
-    /// Unix time of the last successful reopen, or `None` if there was none.
-    pub fn last_success_unix(&self) -> Option<u64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.ok.load(Relaxed) == 0 {
-            return None;
-        }
-        Some(self.last_ok_unix.load(Relaxed)).filter(|&u| u != 0)
-    }
-
-    /// Seconds since the last failed reopen, or `None` if there was none.
-    pub fn seconds_since_last_failure(&self) -> Option<u64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.failed.load(Relaxed) == 0 {
-            return None;
-        }
-        Some(elapsed_ms().saturating_sub(self.last_fail_ms.load(Relaxed)) / 1000)
-    }
-}
-
-static REOPENS: ReopenRecord = ReopenRecord::new();
-
-fn process_start() -> Instant {
-    use std::sync::OnceLock;
-    static START: OnceLock<Instant> = OnceLock::new();
-    *START.get_or_init(crate::platform::now)
-}
-
-fn elapsed_ms() -> u64 {
-    process_start().elapsed().as_millis() as u64
-}
-
-fn unix_now() -> u64 {
-    crate::platform::wall()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// When this process last reopened its log file.
-pub fn reopens() -> &'static ReopenRecord {
-    &REOPENS
-}
-
-/// Whether this process writes a log file that can be reopened.
-pub fn writes_log_file() -> bool {
-    m6_log::with_analytics(|_| {})
-}
-
-/// Flush the analytics file and open its path afresh. Called on
-/// [`crate::platform::Signal::ReopenLogs`].
-///
-/// A process with no analytics file answers `Ok` and writes nothing. A failed
-/// open leaves the previous file open, so the lines keep reaching the file the
-/// process already had, and the failure is recorded for [`reopens`].
-pub fn reopen() -> io::Result<()> {
-    if !writes_log_file() {
-        return Ok(());
-    }
-    let result = m6_log::reopen();
-    match &result {
-        Ok(()) => REOPENS.record_success(),
-        Err(_) => REOPENS.record_failure(),
-    }
-    result
-}
-
-// ── Reopening the log file: the tail reader ──────────────────────────────────
+// ── Reading a log file's tail ───────────────────────────────────────────────
 
 /// Append the last `max_bytes` of a plain or gzip file to `out`.
 ///
@@ -366,34 +237,5 @@ mod tests {
         let bytes = std::fs::read(&gz).unwrap();
         std::fs::write(&gz, &bytes[..bytes.len() / 2]).unwrap();
         assert!(!read_tail(&gz, 1 << 20).unwrap().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod reopen_tests {
-    use super::*;
-
-    #[test]
-    fn the_record_says_never_until_a_reopen_succeeds() {
-        let rec = ReopenRecord::new();
-        assert_eq!(rec.seconds_since_last_success(), None);
-        assert_eq!(rec.last_success_unix(), None);
-        assert_eq!(rec.successes(), 0);
-        assert_eq!(rec.seconds_since_last_failure(), None);
-        rec.record_success();
-        assert_eq!(rec.seconds_since_last_success(), Some(0));
-        let now = unix_now();
-        assert!(now.abs_diff(rec.last_success_unix().unwrap()) <= 5);
-        rec.record_failure();
-        assert_eq!(rec.failures(), 1);
-        assert_eq!(rec.seconds_since_last_failure(), Some(0));
-    }
-
-    #[test]
-    fn a_reopen_with_no_log_file_is_ok_and_records_nothing() {
-        // No `init` on this thread, which is the one case `reopen` answers
-        // without touching the filesystem.
-        assert!(!writes_log_file());
-        assert!(reopen().is_ok());
     }
 }

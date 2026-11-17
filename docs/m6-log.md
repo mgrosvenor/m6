@@ -65,7 +65,7 @@ Table 2: when the buffer is written.
 | trigger | what happens |
 |---|---|
 | the next line would overflow it | the complete lines are written, then the line is appended |
-| the accounting tick, once a second | both Sinks are flushed |
+| the accounting tick, once a second | the Sink is flushed |
 | a warning or an error | the line is appended and the Sink is flushed at once |
 | stop | everything is written, then the dropped-count line |
 
@@ -80,7 +80,7 @@ That is what keeps a write from splitting a line.
 
 ## Levels
 
-`init(level, analytics)` sets the level once, at start.
+`init(level)` sets the level once, at start.
 The level is fixed for the life of the process, because configuration is read at start.
 `error!`, `warn!`, `info!`, `debug!` and `trace!` compare against it before they build anything, and a line below the level costs one load and one compare.
 
@@ -88,15 +88,15 @@ The macro syntax is the common part of tracing's: an optional `target: "..."`, t
 A value's Rust type decides its JSON type: a string is a JSON string, an integer is a JSON number, a boolean is a JSON boolean and `None` writes no field.
 A call site that needs more than that writes its fields with `Line` directly.
 
-The analytics line is written with `Line` field by field into the analytics Sink, which `with_analytics` reaches.
-That line has no target, and its `type` is `access`.
-The metrics line and the traffic line are written with `Line` into the operational Sink, which `m6_core::log::with_operational` reaches, with `type` `perf` and `traffic` and the targets `m6_http::stats` and `m6_http::traffic`.
+Every line goes to the one Sink, stdout, which `m6_core::log::with_operational` reaches.
+The access line is written with `Line` field by field, has no target, and its `type` is `access`.
+The metrics line and the traffic line are written the same way, with `type` `perf` and `traffic` and the targets `m6_http::stats` and `m6_http::traffic`.
 
-## Reopen
+## One destination
 
-SIGUSR1 reaches `reopen()`, which flushes the analytics Sink and opens its path again.
-The flush comes first, so every line before the signal is in the file the rotation tool renamed, and no line reaches the old file after the new one is open.
-A process with no analytics file does nothing on SIGUSR1 and answers `Ok`.
+m6-log writes to stdout, and nothing else.
+Under systemd, stdout is the journal, and the journal rotates, so there is no file to rename and no signal to send.
+A service that needs a file sets `StandardOutput=append:` in its unit and lets the journal own the rotation.
 
 ## Dropped-line counting
 
@@ -109,22 +109,21 @@ If that report line itself cannot be written, the count stays pending and the ne
 `Sink::dropped()` reports the total for the life of the Sink.
 
 A write error other than `EAGAIN` counts the complete lines it could not send as dropped.
-A regular file never returns `EAGAIN`, so the analytics Sink is never registered with a loop.
+A terminal and a regular file never return `EAGAIN`, so neither is ever registered with a loop.
 
 ## The loop's calls
 
-A service's loop makes six calls: three while it runs, one on a signal and two at its edges.
+A service's loop makes five calls: three while it runs and two at its edges.
 Table 3 lists them.
 
 Table 3: the calls a service makes.
 
 | call | where |
 |---|---|
-| `init(level, analytics)` | at start, before the loop |
+| `init(level)` | at start, before the loop |
 | `tick(now)` | on the one-second accounting tick, with the time the loop already read |
 | `watch(poll.registry(), LOG)`, its error logged | after one turn's events, in `m6_core::log` |
 | `flush()` | in the match on the token, for `LOG` |
-| `reopen()`, its error logged | when `Signal::ReopenLogs` arrives |
 | `stop()?` | after the loop, where blocking is allowed |
 
 `watch` lives in `m6-core`, over `Sink::fd` and `Sink::wants_write`.
@@ -145,9 +144,8 @@ Table 4: the behaviour m6-log copies from nginx and HAProxy.
 | JSON escaping of every string | nginx `log_format ... escape=json` | one escaper and no invalid line |
 | a cached date string, not formatted per line | nginx `ngx_time_update` | one civil conversion per second |
 | never wait on a full destination, keep and count what cannot be written | HAProxy's non-blocking log sinks | a log call cannot stall the loop |
-| reopen the file on SIGUSR1 | nginx `USR1` | rotation without a restart |
 
-m6-log leaves out gzip of log files, conditional logging, syslog, a log format language and more than two destinations per process, because m6 has no use for them.
+m6-log leaves out gzip of log files, conditional logging, syslog, a log format language and any destination other than stdout, because the journal is the destination.
 
 ## Where it fits
 

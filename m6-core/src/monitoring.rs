@@ -443,10 +443,9 @@ pub struct PerfReport {
     /// the leaf is unaccounted for.
     #[serde(default)]
     pub tls_unreadable: usize,
-    /// Whether the log is emitting and when the log file was last reopened.
+    /// Whether the log is emitting.
     ///
-    /// `None` means a node older than this field, which is not the same as a
-    /// node that writes no log file. That case is `Some` with no `reopen`.
+    /// `None` means a node older than this field.
     #[serde(default)]
     pub logging: Option<LoggingHealth>,
     pub metrics: StatsSnapshot,
@@ -776,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_carries_logging_with_reopen_state() {
+    fn perf_carries_logging_state() {
         let v = authorised_perf_json();
         let p: PerfReport = serde_json::from_value(v.clone()).unwrap();
         assert!(p.logging.is_some());
@@ -791,20 +790,7 @@ mod tests {
         assert!(p.logging.is_none());
         let l: LoggingHealth =
             serde_json::from_str(r#"{"events_total":3,"seconds_since_last":1}"#).unwrap();
-        assert!(l.reopen.is_none());
-    }
-
-    #[test]
-    fn log_reopen_health_says_never_rather_than_zero() {
-        let h = LogReopenHealth {
-            reopens_total: 0,
-            failures_total: 0,
-            seconds_since_last_reopen: None,
-            last_reopen_unix: None,
-            seconds_since_last_failure: None,
-        };
-        let json = serde_json::to_string(&h).unwrap();
-        assert!(json.contains(r#""seconds_since_last_reopen":null"#));
+        assert_eq!(l.events_total, 3);
     }
 
     #[test]
@@ -990,56 +976,18 @@ pub struct TrafficReport {
     pub firewall: Option<crate::firewall::FirewallState>,
 }
 
-/// Whether this process's main log layer is still emitting.
+/// Whether this process's log is still emitting.
 ///
 /// Replaces counting log targets out of `journalctl` over ssh. A log level set
-/// at start can silence every target except `analytics`, and when it does the
-/// process looks entirely healthy from outside. It does not look healthy from
-/// inside, which is where this is measured.
+/// at start can silence everything, and when it does the process looks
+/// entirely healthy from outside. It does not look healthy from inside, which
+/// is where this is measured.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingHealth {
     pub events_total: u64,
     /// `None` means nothing has ever been emitted, which is not the same as
     /// "emitted zero seconds ago" and must not be reported as healthy.
     pub seconds_since_last: Option<u64>,
-    /// The log file's reopen record. `None` means this process writes no log
-    /// file, or is a node older than the field.
-    #[serde(default)]
-    pub reopen: Option<LogReopenHealth>,
-}
-
-/// When a process last reopened its log file, so a reader can tell whether
-/// rotation is still running.
-///
-/// The node computes the ages itself, so clock skew between the node and its
-/// reader does not matter. `last_reopen_unix` is for a reader that stores
-/// history.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LogReopenHealth {
-    pub reopens_total: u64,
-    pub failures_total: u64,
-    /// `None` means never reopened since start, which is not the same as
-    /// "reopened zero seconds ago".
-    pub seconds_since_last_reopen: Option<u64>,
-    pub last_reopen_unix: Option<u64>,
-    pub seconds_since_last_failure: Option<u64>,
-}
-
-impl LogReopenHealth {
-    /// `None` when this process writes no log file.
-    pub fn read() -> Option<Self> {
-        if !crate::log::writes_log_file() {
-            return None;
-        }
-        let r = crate::log::reopens();
-        Some(Self {
-            reopens_total: r.successes(),
-            failures_total: r.failures(),
-            seconds_since_last_reopen: r.seconds_since_last_success(),
-            last_reopen_unix: r.last_success_unix(),
-            seconds_since_last_failure: r.seconds_since_last_failure(),
-        })
-    }
 }
 
 impl LoggingHealth {
@@ -1047,7 +995,6 @@ impl LoggingHealth {
         Self {
             events_total: crate::log::pulse().events(),
             seconds_since_last: crate::log::pulse().seconds_since_last(),
-            reopen: LogReopenHealth::read(),
         }
     }
 
@@ -1286,14 +1233,12 @@ mod traffic_tests {
         let never = LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
-            reopen: None,
         };
         assert!(never.is_blind());
 
         let alive = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(3),
-            reopen: None,
         };
         assert!(!alive.is_blind());
 
@@ -1301,7 +1246,6 @@ mod traffic_tests {
         let quiet = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
-            reopen: None,
         };
         assert!(
             quiet.is_blind(),
@@ -1490,7 +1434,6 @@ mod perf_line_size_tests {
             logging: Some(LoggingHealth {
                 events_total: u64::MAX,
                 seconds_since_last: Some(u64::MAX),
-                reopen: None,
             }),
             metrics,
             host: crate::platform::host::snapshot(std::path::Path::new("/")),

@@ -8,7 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::line::write_dropped_line;
 
@@ -148,8 +148,6 @@ pub struct Sink {
     fd: RawFd,
     /// The file behind `fd`, when this sink is a file.
     file: Option<File>,
-    /// The absolute path `file` was opened at, for [`Sink::reopen`].
-    path: Option<PathBuf>,
     /// The flags `fd` had before `Sink::stdout` changed them, restored by
     /// [`Sink::finish`].
     original_nonblocking: Option<bool>,
@@ -190,7 +188,6 @@ impl Sink {
             commit: 0,
             fd: 1,
             file: None,
-            path: None,
             original_nonblocking: original,
             blocked: false,
             dropped: 0,
@@ -211,16 +208,15 @@ impl Sink {
     /// registered with a loop.
     ///
     /// The error names the directory, the user who should own it and the
-    /// remedy. [`crate::init_with_setting`] names the setting as well.
+    /// remedy. [`crate::init`] writes nothing but stdout.
     pub fn file(path: &Path) -> io::Result<Sink> {
         Sink::file_setting(path, "the log file path")
     }
 
     /// A sink on a file whose path was named by `setting`.
     ///
-    /// `setting` is the configuration key a reader can edit, such as
-    /// `[analytics] log_path`, so a missing directory's error says what to fix
-    /// as well as what to create.
+    /// `setting` is the name a reader can act on, so a missing directory's
+    /// error says what to fix as well as what to create.
     pub(crate) fn file_setting(path: &Path, setting: &str) -> io::Result<Sink> {
         let path = std::path::absolute(path)?;
         if let Some(parent) = path.parent() {
@@ -245,7 +241,6 @@ impl Sink {
             commit: 0,
             fd,
             file: Some(file),
-            path: Some(path),
             original_nonblocking: None,
             blocked: false,
             dropped: 0,
@@ -286,22 +281,6 @@ impl Sink {
             self.report = self.commit;
             self.try_write();
         }
-    }
-
-    /// Flush, then open the file at its path afresh.
-    ///
-    /// The open happens on the analytics file at SIGUSR1, so a rotation tool's
-    /// rename takes effect for the next line. A standard-output sink has no
-    /// path and does nothing.
-    pub fn reopen(&mut self) -> io::Result<()> {
-        self.flush();
-        let Some(path) = self.path.clone() else {
-            return Ok(());
-        };
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        self.fd = file.as_raw_fd();
-        self.file = Some(file);
-        Ok(())
     }
 
     /// The last word, at stop: restore the flags `Sink::stdout` changed, write

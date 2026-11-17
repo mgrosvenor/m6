@@ -6,8 +6,8 @@
 //! at the default disposition, and the process dies instead of shutting down.
 //!
 //! [`Lifecycle`] is the per-service surface. A service's loop reads the
-//! platform's signal descriptor and asks it what each signal means. SIGUSR1
-//! reopens the log file and never counts toward shutdown.
+//! platform's signal descriptor and asks it what each signal means. A
+//! termination counts toward shutdown.
 //!
 //! **Log the shutdown line before the loop stops, not after.** `on_signal`
 //! logs it before it returns [`Action::Stop`], so the line is buffered ahead
@@ -17,9 +17,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::log::{error, info};
+use crate::log::info;
 
-/// Block SIGTERM, SIGINT and SIGUSR1 in the calling thread.
+/// Block SIGTERM and SIGINT in the calling thread.
 ///
 /// **This must be the first statement of `main`.** Not the first interesting
 /// statement: the first one, before logging, before any pool, before anything
@@ -78,26 +78,6 @@ pub struct Lifecycle {
     terminations: u32,
 }
 
-/// The lines a log reopen logs, with the service's name, so a loop that
-/// performs the reopen itself says what happened.
-fn log_reopen(name: &str, result: &std::io::Result<()>) {
-    if !crate::log::writes_log_file() {
-        info!("{name} log reopen requested; this process writes no log file");
-        crate::log::flush();
-        return;
-    }
-    match result {
-        Ok(()) => info!("{name} log file reopened"),
-        Err(e) => error!(
-            error = %e,
-            "{name} log reopen failed; still writing to the previous file"
-        ),
-    }
-    // The operator asked for this reopen, so its line is written now rather
-    // than on the loop's next tick.
-    crate::log::flush();
-}
-
 impl Lifecycle {
     pub fn new(name: impl Into<String>, socket: Option<PathBuf>) -> Lifecycle {
         Lifecycle {
@@ -112,19 +92,9 @@ impl Lifecycle {
         log_started_line(&self.name, self.socket.as_deref());
     }
 
-    /// The lines a log reopen logs, with the service's name, so a loop that
-    /// performs the reopen itself says what happened.
-    pub fn reopened(&self, result: &std::io::Result<()>) {
-        log_reopen(&self.name, result);
-    }
-
     /// What to do after one signal. [`Action::Stop`] means the loop breaks.
     pub fn on_signal(&mut self, s: crate::platform::Signal) -> Action {
         match s {
-            crate::platform::Signal::ReopenLogs => {
-                self.reopened(&crate::log::reopen());
-                Action::Continue
-            }
             crate::platform::Signal::Shutdown => {
                 self.terminations += 1;
                 handle_terminate(&self.name, self.socket.as_deref(), self.terminations)

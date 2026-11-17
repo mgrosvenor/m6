@@ -11,9 +11,9 @@ use m6_log::{Level, Line, Sink};
 const SESSION: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
 fn benches(c: &mut Criterion) {
-    m6_log::init(Level::Info, None).expect("the logger");
+    m6_log::init(Level::Info).expect("the logger");
 
-    let mut sink = Sink::file(Path::new("/dev/null")).expect("the analytics sink");
+    let mut sink = Sink::file(Path::new("/dev/null")).expect("the line sink");
     c.bench_function("analytics_line/m6-log", |b| {
         b.iter(|| {
             Line::begin(&mut sink, Level::Info, "request")

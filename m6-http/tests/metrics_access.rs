@@ -174,13 +174,12 @@ impl Fixture {
             format!(
                 "[site]\nname = \"metrics-access\"\ndomain = \"localhost\"\n\n\
                  [errors]\nmode = \"internal\"\n\n\
-                 [analytics]\nenabled = {}\nlog_path = \"{}\"\n\n\
+                 [analytics]\nenabled = {}\n\n\
                  [rate_limit]\nenabled = false\n\n\
                  [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
                  [[backend]]\nname = \"auth-check\"\nsockets = \"{}\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"b\"\n\n{}",
                 analytics,
-                d.join("analytics.ndjson").display(),
                 backend_glob.display(),
                 check_path.display(),
                 sub(site),

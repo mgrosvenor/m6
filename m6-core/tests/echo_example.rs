@@ -419,7 +419,7 @@ fn the_table_grows_two_four_eight_and_keeps_eight() {
     assert_zero_allocations(&tail);
 }
 
-// ── The cases the platform layer adds (E2 to E7, E9) ─────────────────────────
+// ── The cases the platform layer adds (E2 to E6, E9) ─────────────────────────
 
 /// E3. 200 connections open at once, one message each, all answered. The test
 /// raises its own descriptor limit through the layer, because a default soft
@@ -517,20 +517,6 @@ fn shutdown_drains_in_flight_replies_and_exits_zero() {
     assert!(tail.contains("stopping, 0 connection(s) open"), "{tail}");
     assert_zero_allocations(&tail);
     assert!(TcpStream::connect(addr).is_err(), "the port is released");
-}
-
-/// E7. A reload request is logged and serving continues.
-#[test]
-fn reload_is_received_and_serving_continues() {
-    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
-    platform::send(srv.child.id(), Signal::ReopenLogs).expect("send reload");
-    srv.wait_for("log reopen requested", m6_core::testkit::RESPONSE_BOUND);
-    let mut s = TcpStream::connect(srv.addr).expect("connect");
-    s.write_all(b"after\n").expect("send");
-    assert_eq!(recv_exact(&mut s, 6, Duration::from_secs(10)), b"after\n");
-    drop(s);
-    let tail = srv.tail();
-    assert_zero_allocations(&tail);
 }
 
 /// E9. The loop never waits: with one connection held on a reply its client

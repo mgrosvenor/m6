@@ -1,10 +1,15 @@
 //! A 16 KiB buffer writes when the next line would not fit, on the tick and
 //! at stop, and a line is never split.
+//!
+//! The process's one Sink writes to stdout, so the test points stdout at a
+//! file before `init` and reads what arrived.
 
 use std::fs;
 use std::time::SystemTime;
 
-use m6_log::{with_analytics, Level, Line, Sink, BUFFER_BYTES, BUFFER_MAX_BYTES, FIELD_MAX_BYTES};
+use m6_log::{
+    with_operational, Level, Line, Sink, BUFFER_BYTES, BUFFER_MAX_BYTES, FIELD_MAX_BYTES,
+};
 
 const LINES: u64 = 200;
 const TAIL: u64 = 10;
@@ -13,11 +18,17 @@ const TAIL: u64 = 10;
 fn flushes_when_full_on_tick_and_at_stop() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("points.jsonl");
-    m6_log::init(Level::Info, Some(&path)).expect("the logger");
+    let out = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("the stdout file");
+    m6_platform::fd::dup2_stdout(&out).expect("stdout is the file");
+    m6_log::init(Level::Info).expect("the logger");
 
     let value = "0123456789".repeat(12);
     for n in 0..LINES {
-        with_analytics(|sink| {
+        with_operational(|sink| {
             Line::begin(sink, Level::Info, "flush")
                 .u64("n", n)
                 .str("value", &value)
@@ -45,7 +56,7 @@ fn flushes_when_full_on_tick_and_at_stop() {
     );
 
     for n in LINES..LINES + TAIL {
-        with_analytics(|sink| {
+        with_operational(|sink| {
             Line::begin(sink, Level::Info, "flush")
                 .u64("n", n)
                 .str("value", &value)

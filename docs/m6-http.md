@@ -606,25 +606,18 @@ The cache-hit path is unchanged.
 ## 12. Signal Handling
 
 m6-http handles two signals, and Table 6 gives what each receipt does.
-A second termination signal exits at once, and a repeated `SIGUSR1` only reopens the file again.
+A second termination signal exits at once.
 
 | Signal | First receipt | Second receipt |
 |---|---|---|
 | `SIGTERM` or `SIGINT` | Stop accepting, remove the socket if there is one, exit 0, without waiting for requests in progress | Immediate exit |
-| `SIGUSR1` | Reopen the analytics log file | Same again, and never a step toward exit |
 
-*Table 6: the signals m6-http handles. Take from it that `SIGUSR1` never moves the process toward exit, and that a second termination signal exits at once.*
-
-Rotate the analytics file by renaming it and sending `SIGUSR1`.
-The `SIGUSR1` row of Table 6 exists for this rotation.
-The process creates the file at its path again, and the path reappearing means the renamed file is finished.
-If the reopen fails, the process keeps writing to the previous file and logs an error.
-`/perf` reports the last reopen under `logging.reopen`.
+*Table 6: the signals m6-http handles. Take from it that a second termination signal exits at once.*
 `/traffic` reports the last 60 minutes this process served, from a window it keeps in memory.
 The window holds at most 32,768 events and is allocated at start, so a scrape reads no log file.
 It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
 When the ring wraps inside the hour, `events_dropped` counts the events it overwrote while they were still inside the window.
-A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the analytics log keeps them whole.
+A path is stored up to 512 bytes and a user agent up to 256, and a value the cap cut ends in `...`, while the access line keeps them whole.
 The notable-client sample is then cut at 160 characters, marked the same way.
 In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
 Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
@@ -897,7 +890,7 @@ Each line reports the window since the last line, and each percentile carries it
 The `type` `perf` line carries the whole `/perf` document, nested under `fields.perf`, from the same builder the endpoint answers with.
 Its target is `m6_http::stats` and its message is `stats`.
 `[stats].interval_s` sets how often both lines are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides it in a debug build.
-The metrics line goes to stdout with the operational line, so it does not depend on the analytics file, which a deployment ships separately.
+The metrics line goes to stdout with every other line.
 
 A third periodic line is the traffic summary, `type` `traffic`, target `m6_http::traffic`, nested under `fields.traffic`.
 It carries the document `/traffic` answers, from the same builder, at `[stats].traffic_interval_s`, one minute by default.

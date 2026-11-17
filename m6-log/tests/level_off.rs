@@ -26,7 +26,7 @@ fn level_off_builds_nothing() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("operational.jsonl");
     let stdout = Stdout::to_file(&path);
-    m6_log::init(m6_log::Level::Warn, None).expect("the logger");
+    m6_log::init(m6_log::Level::Warn).expect("the logger");
 
     m6_log::info!(value = %Boom, "never built");
     m6_log::debug!(value = %Boom, "never built");

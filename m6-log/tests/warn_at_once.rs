@@ -12,7 +12,7 @@ fn warn_and_error_are_written_at_once() {
     let dir = tempfile::tempdir().expect("a directory");
     let path = dir.path().join("operational.jsonl");
     let stdout = Stdout::to_file(&path);
-    m6_log::init(m6_log::Level::Info, None).expect("the logger");
+    m6_log::init(m6_log::Level::Info).expect("the logger");
 
     m6_log::warn!(reason = "test", "written at once");
     let after_warn = read_lines(&path);

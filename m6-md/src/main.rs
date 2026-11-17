@@ -234,7 +234,7 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    if let Err(e) = m6_core::log::init(level, None) {
+    if let Err(e) = m6_core::log::init(level) {
         eprintln!("logging init error: {e}");
         return 1;
     }

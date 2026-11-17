@@ -135,9 +135,6 @@ mode = "internal"
 [log]
 level = "warn"
 
-[analytics]
-log_path = "$BENCH_DIR/analytics.ndjson"
-
 # The per-address limit (300 a minute) would answer a benchmark client 429.
 [rate_limit]
 enabled = false

@@ -22,7 +22,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -370,8 +369,7 @@ struct AnalyticsLine {
     status: u16,
 }
 
-fn read_analytics_lines(path: &Path) -> Vec<AnalyticsLine> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+fn read_analytics_lines(content: &str) -> Vec<AnalyticsLine> {
     content
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -398,7 +396,9 @@ fn read_analytics_lines(path: &Path) -> Vec<AnalyticsLine> {
 struct Server {
     port: u16,
     cert_der: Vec<u8>,
-    analytics_log: PathBuf,
+    /// Where the readiness probe's line ended in the process output, so a test
+    /// counts only the lines its own requests produced.
+    log_mark: std::cell::Cell<usize>,
     /// The `role:monitor` token, which `/perf` requires. The legacy bearer
     /// string is gone: `/perf` is behind the one token check now.
     token: String,
@@ -463,6 +463,13 @@ impl Server {
         }
     }
 
+    /// The process output after the readiness probe, which is where a test's
+    /// own lines begin.
+    fn analytics(&self) -> String {
+        let out = self.http.borrow().output();
+        out[self.log_mark.get().min(out.len())..].to_string()
+    }
+
     /// `/perf` as JSON. Needs the bearer token the fixture configures.
     fn traffic_json(&self) -> serde_json::Value {
         let auth = format!("Bearer {}", self.token);
@@ -495,10 +502,10 @@ impl Server {
     /// not ready.
     ///
     /// The probe requests are real, so they are logged. Every test in this file
-    /// counts analytics lines and assumes it starts from an empty log, so the
-    /// probe line is waited for and then the log is truncated. The line is
+    /// counts analytics lines and assumes it starts from nothing, so the probe
+    /// line is waited for and the output mark set after it. The line is
     /// already written when it is readable, so nothing is left to arrive after
-    /// the truncation.
+    /// the mark.
     fn wait_until_serving(&self) {
         let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             self.get("/public/probe.html", &[]).status == 200
@@ -508,8 +515,8 @@ impl Server {
             "m6-http never served a backend request\n--- output ---\n{}",
             self.http.borrow().output()
         );
-        wait_until_probe_logged(&self.analytics_log, "/public/probe.html");
-        std::fs::write(&self.analytics_log, b"").expect("truncate analytics log");
+        wait_until_probe_logged(&|| self.analytics(), "/public/probe.html");
+        self.log_mark.set(self.http.borrow().output().len());
     }
 }
 
@@ -554,7 +561,6 @@ fn start_server() -> Server {
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
-    let analytics_log = dir.path().join("analytics.ndjson");
     let check_path = dir.path().join("check.sock");
     let check = RunningCheck::start(
         &check_path,
@@ -580,9 +586,6 @@ level  = "info"
 [errors]
 mode = "internal"
 
-[analytics]
-log_path = "{log_path}"
-
 # One second, so the metrics line appears inside a test's own bound. The
 # default is ten, and the key is what this exercises.
 [stats]
@@ -606,7 +609,6 @@ backend = "m6-file"
 "#,
             sock_glob = sock_glob.display(),
             check_path = check_path.display(),
-            log_path = analytics_log.display(),
         ),
     )
     .unwrap();
@@ -668,7 +670,7 @@ metrics_require = "role:monitor"
     let srv = Server {
         port,
         cert_der,
-        analytics_log,
+        log_mark: std::cell::Cell::new(0),
         token,
         _check: check,
         http: std::cell::RefCell::new(http_proc),
@@ -865,104 +867,36 @@ fn the_stats_interval_is_honoured() {
 }
 
 fn wait_for_request_lines(srv: &Server, want: usize) {
-    wait_for_request_lines_at(&srv.analytics_log, want);
+    wait_for_request_lines_at(&|| srv.analytics(), want);
 }
 
-fn wait_for_request_lines_at(log: &Path, want: usize) {
+/// Wait until `text` yields `want` request lines.
+fn wait_for_request_lines_at(text: &dyn Fn() -> String, want: usize) {
     let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
-        read_analytics_lines(log).len() >= want
+        read_analytics_lines(&text()).len() >= want
     });
     assert!(
         ok,
         "expected {want} request lines, saw {}",
-        read_analytics_lines(log).len()
+        read_analytics_lines(&text()).len()
     );
 }
 
-/// Wait until the analytics writer has flushed the readiness probe's first
-/// successful (200) line for `path`. That line is the last one the readiness
-/// loop enqueues, so its presence means every earlier probe line is flushed
-/// too, and truncating the log after it is safe.
-fn wait_until_probe_logged(log: &Path, path: &str) {
+/// Wait until the writer has flushed the readiness probe's first successful
+/// (200) line for `path`. That line is the last one the readiness loop
+/// enqueues, so its presence means every earlier probe line is flushed too,
+/// and a mark taken after it is safe.
+fn wait_until_probe_logged(text: &dyn Fn() -> String, path: &str) {
     let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
-        read_analytics_lines(log)
+        read_analytics_lines(&text())
             .iter()
             .any(|l| l.path == path && l.status == 200)
     });
     assert!(
         ok,
         "the readiness probe {path} never logged a 200 line; {} lines so far",
-        read_analytics_lines(log).len()
+        read_analytics_lines(&text()).len()
     );
-}
-
-/// Rotation by rename and signal loses nothing: five requests land in the
-/// renamed file, five in the new one, the process keeps serving, and `/perf`
-/// reports the reopen.
-#[test]
-fn sigusr1_reopens_the_analytics_log_and_loses_no_line() {
-    let srv = start_server();
-
-    let before = srv.perf_json();
-    let reopen = &before["logging"]["reopen"];
-    assert_eq!(reopen["reopens_total"], 0, "{before}");
-    assert!(reopen["seconds_since_last_reopen"].is_null());
-
-    for _ in 0..5 {
-        assert_eq!(srv.get("/public/plain.html", &[]).status, 200);
-    }
-    wait_for_request_lines(&srv, 5);
-
-    let rotated = srv.analytics_log.with_extension("ndjson.1");
-    std::fs::rename(&srv.analytics_log, &rotated).unwrap();
-    srv.http
-        .borrow()
-        .request(m6_core::platform::Signal::ReopenLogs);
-    let back = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
-        srv.analytics_log.exists()
-    });
-    assert!(back, "the live path never reappeared");
-
-    for _ in 0..5 {
-        assert_eq!(srv.get("/public/plain.html", &[]).status, 200);
-    }
-    wait_for_request_lines(&srv, 5);
-    srv.http.borrow_mut().assert_alive("after SIGUSR1");
-
-    assert_eq!(read_analytics_lines(&rotated).len(), 5);
-    assert_eq!(read_analytics_lines(&srv.analytics_log).len(), 5);
-
-    let after = srv.perf_json();
-    let reopen = &after["logging"]["reopen"];
-    assert_eq!(reopen["reopens_total"], 1, "{after}");
-    assert!(reopen["seconds_since_last_reopen"].as_u64().unwrap() < 60);
-    assert!(reopen["last_reopen_unix"].as_u64().is_some());
-    assert!(srv.http.borrow().output().contains("log file reopened"));
-}
-
-/// SIGUSR1 used to kill the process, and as a handled signal it must not
-/// count as the first of the two signals that force an exit.
-#[test]
-fn reopen_signals_never_count_toward_a_forced_shutdown() {
-    let srv = start_server();
-    // One at a time: a standard signal sent while the same one is pending is
-    // merged into it, so two sent back to back may be one reopen.
-    for want in 1..=2u64 {
-        srv.http
-            .borrow()
-            .request(m6_core::platform::Signal::ReopenLogs);
-        let reopened = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
-            srv.perf_json()["logging"]["reopen"]["reopens_total"] == want
-        });
-        assert!(reopened, "reopen {want} should have been handled");
-    }
-    srv.http.borrow_mut().assert_alive("after two SIGUSR1");
-    srv.http
-        .borrow_mut()
-        .terminate(m6_core::testkit::STARTUP_BOUND);
-    let out = srv.http.borrow().output();
-    assert!(out.contains("shutdown complete"), "{out}");
-    assert!(!out.contains("shutdown forced"), "{out}");
 }
 
 /// The core regression test: a request with no session cookie gets exactly
@@ -997,7 +931,7 @@ fn session_cookie_minted_once_and_reused_h1() {
     );
 
     wait_for_request_lines(&srv, 2);
-    let lines = read_analytics_lines(&srv.analytics_log);
+    let lines = read_analytics_lines(&srv.analytics());
     assert_eq!(
         lines.len(),
         2,
@@ -1057,7 +991,7 @@ fn session_cookie_minted_once_and_reused_h3() {
     );
 
     wait_for_request_lines(&srv, 2);
-    let lines = read_analytics_lines(&srv.analytics_log);
+    let lines = read_analytics_lines(&srv.analytics());
     assert_eq!(
         lines.len(),
         2,
@@ -1108,7 +1042,7 @@ fn prefetched_assets_are_not_logged_to_analytics() {
     // polling loop above = 21. A prefetch — a synthetic, response-discarded
     // internal warm-up triggered by page.html's hints — logging itself as a
     // 22nd line would mean bug (a) has regressed.
-    let lines = read_analytics_lines(&srv.analytics_log);
+    let lines = read_analytics_lines(&srv.analytics());
     assert_eq!(
         lines.len(),
         21,
@@ -1144,7 +1078,7 @@ fn backend_4xx_is_logged_to_analytics() {
     assert_eq!(missing.status, 404, "headers:\n{}", missing.headers);
 
     wait_for_request_lines(&srv, 1);
-    let lines = read_analytics_lines(&srv.analytics_log);
+    let lines = read_analytics_lines(&srv.analytics());
     assert_eq!(
         lines.len(),
         1,
@@ -1202,7 +1136,6 @@ fn custom_error_page_fetch_is_logged_to_analytics() {
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
-    let analytics_log = dir.path().join("analytics.ndjson");
 
     std::fs::write(
         site.join("site.toml"),
@@ -1218,9 +1151,6 @@ level  = "warn"
 [errors]
 mode = "custom"
 path = "/_error_page"
-
-[analytics]
-log_path = "{log_path}"
 
 [rate_limit]
 enabled = false
@@ -1242,7 +1172,6 @@ path    = "/_error_page"
 backend = "error-backend"
 "#,
             sock_glob = sock_glob.display(),
-            log_path = analytics_log.display(),
         ),
     )
     .unwrap();
@@ -1308,8 +1237,8 @@ name = "test-node"
         "m6-http never served a backend request\n--- output ---\n{}",
         _http_proc.output()
     );
-    wait_until_probe_logged(&analytics_log, "/public/open.txt");
-    std::fs::write(&analytics_log, b"").expect("truncate analytics log");
+    wait_until_probe_logged(&|| _http_proc.output(), "/public/open.txt");
+    let mark = _http_proc.output().len();
 
     // A 404 on a route with no match — dispatches the custom error page
     // fetch via dispatch_custom_error_async, exercising the exact branch
@@ -1317,8 +1246,8 @@ name = "test-node"
     let missing = https_get(port, "/does-not-exist-anywhere", &[], tls);
     assert_eq!(missing.status, 404, "headers:\n{}", missing.headers);
 
-    wait_for_request_lines_at(&analytics_log, 1);
-    let lines = read_analytics_lines(&analytics_log);
+    wait_for_request_lines_at(&|| _http_proc.output()[mark..].to_string(), 1);
+    let lines = read_analytics_lines(&_http_proc.output()[mark..]);
     assert_eq!(
         lines.len(),
         1,
@@ -1348,7 +1277,6 @@ fn connection_failure_is_logged_to_analytics() {
     // will refuse connections deterministically.
     let dead_port_claim = claim_port();
     let dead_port = dead_port_claim.port();
-    let analytics_log = dir.path().join("analytics.ndjson");
 
     std::fs::write(
         site.join("site.toml"),
@@ -1364,9 +1292,6 @@ level  = "warn"
 [errors]
 mode = "internal"
 
-[analytics]
-log_path = "{log_path}"
-
 [rate_limit]
 enabled = false
 
@@ -1378,7 +1303,6 @@ url  = "http://127.0.0.1:{dead_port}"
 path    = "/proxy/{{relpath}}"
 backend = "unreachable-backend"
 "#,
-            log_path = analytics_log.display(),
         ),
     )
     .unwrap();
@@ -1424,6 +1348,7 @@ name = "test-node"
         _http_proc.output()
     );
 
+    let mark = _http_proc.output().len();
     let resp = https_get(port, "/proxy/anything", &[], tls);
     assert!(
         resp.status >= 500,
@@ -1432,8 +1357,8 @@ name = "test-node"
         resp.headers
     );
 
-    wait_for_request_lines_at(&analytics_log, 1);
-    let lines = read_analytics_lines(&analytics_log);
+    wait_for_request_lines_at(&|| _http_proc.output()[mark..].to_string(), 1);
+    let lines = read_analytics_lines(&_http_proc.output()[mark..]);
     assert_eq!(
         lines.len(),
         1,
@@ -1488,7 +1413,6 @@ fn edge_reuses_origin_session_instead_of_minting_a_second_one() {
 
     let origin_sock = origin_dir.path().join("m6-file-1.sock");
     let origin_sock_glob = origin_dir.path().join("m6-file-*.sock");
-    let origin_analytics_log = origin_dir.path().join("analytics.ndjson");
 
     std::fs::write(
         origin_site.join("site.toml"),
@@ -1504,9 +1428,6 @@ level  = "warn"
 [errors]
 mode = "internal"
 
-[analytics]
-log_path = "{log_path}"
-
 [rate_limit]
 enabled = false
 
@@ -1519,7 +1440,6 @@ path    = "/public/{{relpath}}"
 backend = "m6-file"
 "#,
             sock_glob = origin_sock_glob.display(),
-            log_path = origin_analytics_log.display(),
         ),
     )
     .unwrap();
@@ -1564,7 +1484,6 @@ backend = "m6-file"
     let (edge_cert_pem, edge_key_pem, edge_cert_der) = generate_tls_cert();
     std::fs::write(edge_site.join("cert.pem"), &edge_cert_pem).unwrap();
     std::fs::write(edge_site.join("key.pem"), &edge_key_pem).unwrap();
-    let edge_analytics_log = edge_dir.path().join("analytics.ndjson");
 
     std::fs::write(
         edge_site.join("site.toml"),
@@ -1580,9 +1499,6 @@ level  = "warn"
 [errors]
 mode = "internal"
 
-[analytics]
-log_path = "{log_path}"
-
 [rate_limit]
 enabled = false
 
@@ -1595,7 +1511,6 @@ tls_skip_verify = true
 path    = "/public/{{relpath}}"
 backend = "origin"
 "#,
-            log_path = edge_analytics_log.display(),
         ),
     )
     .unwrap();
@@ -1635,12 +1550,12 @@ backend = "origin"
         _origin_http_proc.output()
     );
     // The probes are logged like any other request, and this test counts lines.
-    // Wait for each node's own 200 probe line, then truncate: that line is the
+    // Wait for each node's own 200 probe line, then mark: that line is the
     // last the readiness loop wrote, so nothing is left to leak in after it.
-    wait_until_probe_logged(&origin_analytics_log, "/public/probe.html");
-    wait_until_probe_logged(&edge_analytics_log, "/public/probe.html");
-    std::fs::write(&origin_analytics_log, b"").expect("truncate origin log");
-    std::fs::write(&edge_analytics_log, b"").expect("truncate edge log");
+    wait_until_probe_logged(&|| _origin_http_proc.output(), "/public/probe.html");
+    wait_until_probe_logged(&|| _edge_http_proc.output(), "/public/probe.html");
+    let origin_mark = _origin_http_proc.output().len();
+    let edge_mark = _edge_http_proc.output().len();
 
     // ── The actual test: one request through the edge, no cookie yet ──────
     let edge_tls = tls_client_config(&edge_cert_der);
@@ -1667,14 +1582,14 @@ backend = "origin"
         .1
         .to_string();
 
-    wait_for_request_lines_at(&origin_analytics_log, 1);
-    wait_for_request_lines_at(&edge_analytics_log, 1);
+    wait_for_request_lines_at(&|| _origin_http_proc.output()[origin_mark..].to_string(), 1);
+    wait_for_request_lines_at(&|| _edge_http_proc.output()[edge_mark..].to_string(), 1);
 
     // Both nodes should have logged their own analytics line for this one
     // request (the whole point of per-node analytics — edge hit/latency
     // visibility isn't lost), and BOTH must agree on the same session id.
-    let origin_lines = read_analytics_lines(&origin_analytics_log);
-    let edge_lines = read_analytics_lines(&edge_analytics_log);
+    let origin_lines = read_analytics_lines(&_origin_http_proc.output()[origin_mark..]);
+    let edge_lines = read_analytics_lines(&_edge_http_proc.output()[edge_mark..]);
     assert_eq!(
         origin_lines.len(),
         1,

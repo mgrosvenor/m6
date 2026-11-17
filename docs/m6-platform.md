@@ -32,8 +32,8 @@ Table 1 lists them.
 |---|---|---|---|
 | `Poll` | an event for every new readiness edge on a registered interest, one event per token per wait, `reregister` always reaches the kernel so a ready source is reported again, a peer close is readable then EOF, edge-triggered so a turn reads and writes until `WouldBlock` | epoll, edge-triggered, through `mio` | kqueue with `EV_CLEAR`, through `mio` |
 | `now`, `wall` | thin wrappers over the monotonic and wall clocks, read once per loop wake and passed down the turn | `CLOCK_MONOTONIC`, `CLOCK_REALTIME` | `CLOCK_UPTIME_RAW`, `gettimeofday` |
-| `Signals` | SIGTERM and SIGINT are one `Shutdown` request, SIGUSR1 is `ReopenLogs`, each read once, a burst coalesces and none is lost, the signals stay blocked for the life of the process | `signalfd`, whose read dequeues the signal | kqueue `EVFILT_SIGNAL`, which reports and does not dequeue, so the three are also `SIG_IGN` and discarded once reported |
-| `process::spawn` | a child starts with no signal blocked or ignored and inherits no descriptor above stderr, and stays in the parent's process group so a terminal's interrupt reaches it | `pre_exec` clears the mask and restores the three dispositions, every descriptor above stderr is marked close-on-exec first | the same |
+| `Signals` | SIGTERM and SIGINT are one `Shutdown` request, read once, a burst coalesces and none is lost, the signals stay blocked for the life of the process | `signalfd`, whose read dequeues the signal | kqueue `EVFILT_SIGNAL`, which reports and does not dequeue, so the two are also `SIG_IGN` and discarded once reported |
+| `process::spawn` | a child starts with no signal blocked or ignored and inherits no descriptor above stderr, and stays in the parent's process group so a terminal's interrupt reaches it | `pre_exec` clears the mask and restores the two dispositions, every descriptor above stderr is marked close-on-exec first | the same |
 | `net::accept_error` | an accept loop drains to `Drained`, passes over `SkipOne` (a connection gone before it was accepted, an interrupted call) and on `Stop` (any other error) logs it once and stops accepting for the turn | `EAGAIN`, `ECONNABORTED` and `EINTR` | the same |
 | `ChildExit` | a readable descriptor when the child exits, at once when it already has, `reap` never blocks | `pidfd_open` | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
 | `net::connect_unix` | a refused connect is a listener that is gone, a missing file is `NotFound`, and a full queue never connects and never hangs, so the caller tries the next member and answers 503 only when every attempt was a full queue | `EAGAIN` for a full queue: busy, the next member for this request | `ECONNREFUSED` for a full queue too, so a full queue reads the same as a listener that is gone and the caller tries the next member |
@@ -75,11 +75,11 @@ Table 2 lists them.
 | need | systemd | launchd |
 |---|---|---|
 | start, stop, restart | `ExecStart`, `KillSignal=SIGTERM`, `Restart=` | `ProgramArguments`, `KeepAlive`, SIGTERM on unload |
-| shutdown and reload requests | `systemctl stop`, `kill -USR1` | `launchctl unload`, `kill -USR1` |
+| shutdown requests | `systemctl stop` | `launchctl unload` |
 | secrets by absolute path | a path in the config, mode 0600 | the same |
 | runtime and state directories | paths in the config, created by the unit or the operator | paths in the config, created by the plist or the operator |
 | several instances | `M6_SOCKET_OVERRIDE` per unit | `M6_SOCKET_OVERRIDE` per plist |
-| logs | stdout to the journal, or a file with `SIGUSR1` reopen | stdout to `StandardOutPath`, or a file with `SIGUSR1` reopen |
+| logs | stdout to the journal, which rotates | stdout to `StandardOutPath`, which `newsyslog` rotates |
 
 Table 2: what a service needs from its manager and how each one provides it.
 
@@ -94,7 +94,7 @@ What would map and what would not, in a few lines each:
 
 - **FreeBSD and OpenBSD.** The macOS file, nearly as it is: kqueue for `Poll`, `Signals` and `ChildExit`, `SO_NOSIGPIPE`, `sun_path` of 104. `sysinfo` supports FreeBSD and not OpenBSD, which would take a small `sysctl` reader for memory and load. `listens_on_tcp` needs `sysctl` in place of `lsof`.
 - **Linux on arm64 and macOS on x86_64.** Nothing changes: selection is by family and no file reads the CPU. CI builds and tests Linux arm64.
-- **Windows.** `mio`'s backend polls sockets only, and the layer would keep its own ready set to give edge semantics. `Signals` would be a console control handler written into a socket pair, with no `ReopenLogs`. `ChildExit` would be a process handle waited on by a helper and written into a socket pair. Unix socket paths, file modes, `raise_fd_limit` and the load average have no equivalent, and `host` would come from `sysinfo`, which supports Windows.
+- **Windows.** `mio`'s backend polls sockets only, and the layer would keep its own ready set to give edge semantics. `Signals` would be a console control handler written into a socket pair. `ChildExit` would be a process handle waited on by a helper and written into a socket pair. Unix socket paths, file modes, `raise_fd_limit` and the load average have no equivalent, and `host` would come from `sysinfo`, which supports Windows.
 
 ## 5. Adding a port
 

@@ -268,7 +268,7 @@ One thread per process means more cores are more instances: one `m6-http` per no
 HTTP says nothing about how a server runs, which is why `docs/m6-backend-protocol.md` lets a backend use threads, processes or an event loop.
 
 **Signals arrive as a descriptor, and `Lifecycle` says what each one means.**
-`m6_core::platform::Signals` is signalfd on Linux and a kqueue filter elsewhere, so a shutdown or a log reopen is readable in the same `match` as every socket.
+`m6_core::platform::Signals` is signalfd on Linux and a kqueue filter elsewhere, so a shutdown is readable in the same `match` as every socket.
 `m6_core::signal::Lifecycle` turns each one into the lifecycle line to log and the decision to stop, and `m6_core::signal::block()` is the first statement of `main`, before the logging writer starts.
 
 **Logging in the loop is `m6_core::log`.**
@@ -313,7 +313,7 @@ Two command line tools sit outside that set and serve nothing: `m6-md` converts 
 
 **A site is therefore data and configuration only**, which is the third constraint showing up in the filesystem: `site.toml`, one config file per backend process, templates, assets, and content as JSON.
 No binaries live in a site, because they are found through the system path.
-No process keeps a log directory except `m6-http`, whose analytics file is the one exception, because every other process logs to stdout for the supervisor to capture (§3.3).
+No process keeps a log directory, because every process logs to stdout for the supervisor to capture (§3.3).
 
 ---
 
@@ -348,9 +348,7 @@ Restart policy, resource limits, dependency ordering, log capture and service is
 So `m6-http` spawns nothing, monitors nothing and restarts nothing, and expects its backends to be running.
 
 Two consequences follow.
-Every process logs structured JSON to stdout and journald captures it.
-The one exception is the analytics file that `m6-http` writes.
-A site rotates that file by renaming it and sending `m6-http` SIGUSR1, and the process reopens the path.
+Every process logs structured JSON to stdout and journald captures it, and the journal rotates it.
 And a crashed backend restarts in seconds, which is what makes §4.5 affordable.
 
 ### 3.4 Why pool membership is discovered rather than declared

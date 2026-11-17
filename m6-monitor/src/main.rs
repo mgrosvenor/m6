@@ -129,7 +129,7 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("usage: m6-monitor --check <config-path>"))?;
         // A one-shot tool: no loop, so the log starts here and stops before
         // the process exits.
-        m6_core::log::init(m6_core::log::Level::Info, None)?;
+        m6_core::log::init(m6_core::log::Level::Info)?;
         let result = run_check(Path::new(config));
         m6_core::log::stop()?;
         return result;
@@ -213,7 +213,6 @@ fn run_service() -> Result<()> {
     .unwrap_or_else(|e| fail("opening the history file", format!("{e:#}")));
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
-        log_reopen_age_s: fleet.log_reopen_max_age_s,
         health_last_ok_age_s: fleet.health_last_ok_limit_s(),
         one_certificate: fleet.one_certificate,
         ..Default::default()
@@ -853,7 +852,6 @@ fn run_check(config_path: &Path) -> Result<()> {
     );
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
-        log_reopen_age_s: fleet.log_reopen_max_age_s,
         health_last_ok_age_s: fleet.health_last_ok_limit_s(),
         one_certificate: fleet.one_certificate,
         ..Default::default()

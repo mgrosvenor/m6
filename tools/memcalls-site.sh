@@ -75,9 +75,6 @@ enabled = false
 [log]
 level = "error"
 
-[analytics]
-log_path = "$WORK/analytics.ndjson"
-
 [[backend]]
 name    = "m6-html"
 sockets = "$HTML_SOCK"

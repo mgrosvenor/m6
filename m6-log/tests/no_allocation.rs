@@ -10,7 +10,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use m6_log::{with_analytics, Level, Line, Type};
+use m6_log::{with_operational, Level, Line, Type};
 
 struct Counting;
 
@@ -58,7 +58,7 @@ fn no_allocation_after_init() -> Result<(), Failed> {
         .open("/dev/null")
         .expect("/dev/null");
     m6_platform::fd::dup2_stdout(&devnull).expect("stdout is /dev/null");
-    m6_log::init(Level::Trace, Some(std::path::Path::new("/dev/null"))).expect("the logger");
+    m6_log::init(Level::Trace).expect("the logger");
 
     // Built before the measured window: the document allocates, the line that
     // carries it does not.
@@ -74,7 +74,7 @@ fn no_allocation_after_init() -> Result<(), Failed> {
         m6_log::info!(n = n, "line");
         m6_log::debug!(n = n, "line");
         m6_log::trace!(n = n, "line");
-        let accepted = with_analytics(|sink| {
+        let accepted = with_operational(|sink| {
             Line::begin(sink, Level::Info, "request")
                 .str("node", "dev")
                 .str("path", "/capabilities")
@@ -87,22 +87,19 @@ fn no_allocation_after_init() -> Result<(), Failed> {
                 .u64("latency_ns", 3360)
                 .end();
         });
-        assert!(accepted, "the analytics Sink was not open");
-        let accepted = with_analytics(|sink| {
+        assert!(accepted, "the operational Sink was not open");
+        let accepted = with_operational(|sink| {
             Line::begin(sink, Level::Info, "stats")
                 .kind(Type::Perf)
                 .json("perf", &document)
                 .end();
         });
-        assert!(accepted, "the analytics Sink was not open");
+        assert!(accepted, "the operational Sink was not open");
     }
     let allocated = COUNT.load(Ordering::Relaxed) - before;
     let operational_lines = m6_log::operational_lines();
     let operational_written = m6_log::operational_written();
     let operational_dropped = m6_log::operational_dropped();
-    let analytics_lines = m6_log::analytics_lines();
-    let analytics_dropped = m6_log::analytics_dropped();
-    let analytics_written = m6_log::analytics_written();
     m6_log::stop().expect("a clean stop");
     eprintln!(
         "no_allocation: {allocated} allocation(s) in {} lines",
@@ -110,21 +107,14 @@ fn no_allocation_after_init() -> Result<(), Failed> {
     );
     assert_eq!(
         operational_lines,
-        LINES * 5,
-        "the macro lines did not reach the operational Sink"
+        LINES * 7,
+        "every line did not reach the operational Sink"
     );
-    assert_eq!(
-        analytics_lines,
-        LINES * 2,
-        "the analytics lines were not all written"
-    );
-    assert_eq!(operational_dropped, 0, "operational lines were dropped");
-    assert_eq!(analytics_dropped, 0, "analytics lines were dropped");
+    assert_eq!(operational_dropped, 0, "lines were dropped");
     assert!(
         operational_written > 0,
         "the operational Sink wrote nothing"
     );
-    assert!(analytics_written > 0, "the analytics Sink wrote nothing");
     if allocated == 0 {
         Ok(())
     } else {

@@ -165,8 +165,6 @@ fn main() -> anyhow::Result<()> {
                 SIGNALS => {
                     let mut stop = false;
                     while let Some(signal) = signals.read() {
-                        // One arm answers a reopen: `Lifecycle` calls
-                        // `m6_core::log::reopen()` and logs the outcome.
                         if lifecycle.on_signal(signal) == Action::Stop {
                             stop = true;
                         }
@@ -269,10 +267,10 @@ fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
 
 The loop has one `match` on the event's token.
 `LISTENER` takes free slots and accepts until the kernel has no more.
-`SIGNALS` drains the signal descriptor through `Lifecycle`, and a reopen request flushes the analytics file and opens its path again.
+`SIGNALS` drains the signal descriptor through `Lifecycle`, which answers whether to stop.
 `LOG` writes what a full stdout held.
 Every other token is one connection, and `turn` reads, dispatches and writes until its socket would block.
-`watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes both buffers once a second.
+`watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes the buffer once a second.
 `deadlines.expired` closes a peer that sent nothing before its read deadline.
 
 Two details keep the shape correct.
@@ -620,7 +618,7 @@ A service that needs state to survive a restart must not depend on a shutdown ho
 A second signal exits at once.
 A socket left behind keeps a dead member in the edge's backend pool.
 
-`Lifecycle::on_signal` decides what a signal means: `Action::Stop` breaks the loop and `Action::Continue` carries on, with SIGUSR1 reopening the log file inside it.
+`Lifecycle::on_signal` decides what a signal means: `Action::Stop` breaks the loop and `Action::Continue` carries on.
 `Lifecycle::complete()` removes the socket and writes the completion line.
 
 ### 6.2 The three lines

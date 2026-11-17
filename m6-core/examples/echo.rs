@@ -172,7 +172,7 @@ fn main() -> io::Result<()> {
                     }
                 }
                 // A SHUTDOWN REQUEST stops accepting and drains what is open,
-                // for at most the drain time. A RELOAD REQUEST is logged.
+                // for at most the drain time.
                 SIGNALS => {
                     while let Some(request) = signals.read() {
                         match request {
@@ -184,9 +184,6 @@ fn main() -> io::Result<()> {
                                 drain_until = Some(now + drain);
                             }
                             Signal::Shutdown => {}
-                            Signal::ReopenLogs => {
-                                io::stderr().write_all(b"log reopen requested\n")?;
-                            }
                         }
                     }
                 }

@@ -117,7 +117,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | **Building a service** | `site` | `Site`, `CodeRoute`, `Handled` and `RouteMethod`, the route table, the request dictionary and the site-wide finish. |
 | | `config` | `RendererConfig` and the configuration file that produces it. |
 | | `server` | `socket_path_from_config` and the blocking request and response adapters the benchmarks use. |
-| | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown, and SIGUSR1 to reopen the log file. |
+| | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
 | | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `BoundedBuf`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
@@ -142,7 +142,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `minify` | The four minifiers: markup, JavaScript, stylesheets and JSON. Feature `minify`. |
 | | `util` | `slugify`, `now_iso8601`, `today_iso8601`, `iso8601_minutes_ago` and `html_escape`. |
 | | `random` | `random_hex_token::<N>()`. One CSPRNG token generator, so there is never a third. |
-| **Observability** | `log` | `init`, `tick`, `watch`, `flush`, `reopen`, `stop`, `Line`, the five macros and `LogPulse`. The buffered JSONL logger every service loop drives, re-exported from `m6-log`. |
+| **Observability** | `log` | `init`, `tick`, `watch`, `flush`, `stop`, `Line`, the five macros and `LogPulse`. The buffered JSONL logger every service loop drives, re-exported from `m6-log`. |
 | | `telemetry` | m6's own formats read back: `AnalyticsRecord`, `PeriodicStats`, `TrafficSummary`, and the probe and crawler heuristics. |
 | | `monitoring` | `/health` and `/perf`: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
@@ -251,12 +251,9 @@ A service that started that way could lose its shutdown line invisibly, because 
 `Signals::new()` asserts that the mask is set and refuses to start otherwise.
 `Lifecycle::on_signal` decides what each signal means and `complete()` ends the lifecycle.
 
-The reload signal is SIGUSR1 (`platform::Signal::ReopenLogs`).
-`block()` blocks it with SIGTERM and SIGINT, and a service's loop reads it from the same descriptor.
-The loop calls `log::reopen()` and logs what happened. The call flushes the buffered lines first, then opens the path again, so once the path exists every new line reaches the new file and none reaches the renamed one.
-If the open fails, the previous file stays in place, the process keeps writing to it and an error is logged.
-A reopen never counts toward a forced exit.
-SIGHUP is not handled.
+The only signal a service acts on is a termination: SIGTERM or SIGINT, and a second one before the loop has ended forces an exit.
+`block()` blocks both, and a service's loop reads them from one descriptor.
+Every log line goes to stdout, which the journal rotates, so no signal reopens a log file and SIGHUP is not handled.
 
 ### 4.5. `render` and `template`
 
@@ -775,16 +772,15 @@ must not be append-only.
 ### 8.1. `log`
 
 `m6_core::log` re-exports the `m6-log` crate and adds `watch`.
-`init(level, analytics)` sets the level and opens the two Sinks at start: the operational Sink on stdout and, when `analytics` is given, the analytics Sink on that path.
+`init(level)` sets the level and opens the Sink on stdout at start.
 It returns nothing to hold. The Sinks and the level are thread-local, and a process has one loop thread.
 `read_site_log_config(site_toml)` reads `[log] level` from `site.toml`, and `parse_level(s)` turns a level name into a `Level`.
 `Site` applies the precedence: the command line, then the service's `[log]`, then `site.toml`'s `[log]`.
 
 A service's loop calls the logger in plain sight.
-`tick(now)` flushes both Sinks on the one-second accounting tick.
+`tick(now)` flushes the Sink on the one-second accounting tick.
 `watch(registry, token)` registers stdout for writability while the operational Sink holds bytes a full destination would not take, and removes it when they drain.
 The `LOG` arm calls `flush()`.
-A `Signal::ReopenLogs` calls `reopen()`.
 `stop()` runs after the loop: it restores stdout's flags, writes everything buffered, then the dropped-count line.
 `Line` and the `error!`, `warn!`, `info!`, `debug!` and `trace!` macros build one line into a Sink without allocating.
 
@@ -792,9 +788,6 @@ A `Signal::ReopenLogs` calls `reopen()`.
 `seconds_since_last()` answers "has anything been logged recently", which is how
 a silent log becomes a fault rather than a zero.
 
-`reopen()` flushes the analytics file and opens its path afresh.
-`reopens() -> &'static ReopenRecord` answers how many reopens succeeded and failed, and how long ago the last of each was.
-`writes_log_file()` says whether this process has a file to reopen.
 `read_tail(path, max_bytes)` reads the end of one file.
 
 ### 8.2. `telemetry`
@@ -872,9 +865,7 @@ The fingerprint is what tells two certificates with one expiry apart, and
 `TlsCertificate.fingerprint` is `serde(default)` for the same reason.
 
 `PerfReport.logging` carries `LoggingHealth`, which is also on `/traffic`.
-Its `reopen` field is a `LogReopenHealth`: reopens and failures since start, the age of the last reopen, its unix time and the age of the last failure.
-`reopen` is `None` for a process that writes no log file, and `seconds_since_last_reopen` is `None` until the first reopen.
-Both are `serde(default)`, so a node older than the fields still parses.
+It is the line count the level let through and the age of the last line, and it is `serde(default)`, so a node older than the field still parses.
 
 `TrafficReport::from_records(node, records, window_minutes)` summarises records
 that are already parsed, which is how `m6-http` answers `/traffic` from its

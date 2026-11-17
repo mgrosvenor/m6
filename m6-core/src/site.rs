@@ -375,7 +375,7 @@ impl Site {
                 field_max: config.limits.get(&crate::limits::LOG_FIELD).max(),
                 file: config_path.display().to_string(),
             });
-            crate::log::init(level, None).map_err(|e| (format!("logging init error: {e}"), 1))?;
+            crate::log::init(level).map_err(|e| (format!("logging init error: {e}"), 1))?;
         }
 
         let socket_path = crate::socket_path_from_config(&config_path);

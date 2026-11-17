@@ -35,7 +35,7 @@
 //! - one `health` row per node: reachability, the node's own verdict level,
 //!   build, uptime, request, cache and backend error counters, hit and miss
 //!   percentiles with their sample counts, the host figures, the tunnel
-//!   figures and the log reopen state;
+//!   figures;
 //! - `health_channel` rows (one per channel with traffic) and `health_net`
 //!   rows (one per network interface);
 //! - once per node per `/traffic` window, one `crawl_window` row with the
@@ -135,7 +135,7 @@
 //! backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
 //! miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes,
 //! disk_used, disk_total_bytes, thermal_max_c, cert_not_after_unix,
-//! cert_expires_in_s, tunnel, log_reopen, net, channels, findings,
+//! cert_expires_in_s, tunnel, net, channels, findings,
 //! other_findings
 //! ```
 //!
@@ -222,9 +222,7 @@ CREATE TABLE health (
   load_one REAL, cpus INTEGER, memory_used REAL, memory_total_bytes INTEGER,
   disk_used REAL, disk_total_bytes INTEGER, thermal_max_c REAL, cert_not_after_unix INTEGER,
   tunnel_rtt_ms REAL, tunnel_rtt_n INTEGER, tunnel_probe TEXT, tunnel_probe_error TEXT,
-  tunnel_handshake TEXT, tunnel_handshake_age_s INTEGER, tunnel_handshake_detail TEXT,
-  reopen_state TEXT, reopen_age_s INTEGER, reopen_last_unix INTEGER, reopen_reopens INTEGER,
-  reopen_failures INTEGER, reopen_last_failure_age_s INTEGER, reopen_detail TEXT) STRICT;
+  tunnel_handshake TEXT, tunnel_handshake_age_s INTEGER, tunnel_handshake_detail TEXT) STRICT;
 CREATE INDEX health_poll ON health (poll_id);
 CREATE INDEX health_at ON health (at_ms);
 CREATE INDEX health_node_at ON health (node_id, at_ms);
@@ -372,17 +370,6 @@ pub struct TunnelRow {
     pub handshake_detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ReopenRow {
-    pub state: String,
-    pub age_s: Option<i64>,
-    pub last_unix: Option<i64>,
-    pub reopens: Option<i64>,
-    pub failures: Option<i64>,
-    pub last_failure_age_s: Option<i64>,
-    pub detail: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ChannelRow {
     pub channel: String,
@@ -452,7 +439,6 @@ pub struct Row {
     pub thermal_max_c: Option<f64>,
     pub cert_not_after_unix: Option<i64>,
     pub tunnel: Option<TunnelRow>,
-    pub reopen: ReopenRow,
     pub channels: Vec<ChannelRow>,
     pub net: Vec<NetRow>,
     pub crawl: Option<CrawlSnapshot>,
@@ -514,15 +500,6 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
             handshake_age_s: t.handshake_age_s.map(i),
             handshake_detail: t.handshake_detail.clone(),
         }),
-        reopen: ReopenRow {
-            state: n.log_reopen.state.to_string(),
-            age_s: n.log_reopen.age_s.map(i),
-            last_unix: n.log_reopen.last_unix.map(i),
-            reopens: n.log_reopen.reopens.map(i),
-            failures: n.log_reopen.failures.map(i),
-            last_failure_age_s: n.log_reopen.last_failure_age_s.map(i),
-            detail: n.log_reopen.detail.clone(),
-        },
         ..Row::default()
     };
     if let Some(p) = &r.perf {
@@ -835,11 +812,6 @@ impl Store {
                 ":tunnel_handshake": t.map(|t| t.handshake.as_str()),
                 ":tunnel_handshake_age_s": t.and_then(|t| t.handshake_age_s),
                 ":tunnel_handshake_detail": t.and_then(|t| t.handshake_detail.as_deref()),
-                ":reopen_state": r.reopen.state, ":reopen_age_s": r.reopen.age_s,
-                ":reopen_last_unix": r.reopen.last_unix, ":reopen_reopens": r.reopen.reopens,
-                ":reopen_failures": r.reopen.failures,
-                ":reopen_last_failure_age_s": r.reopen.last_failure_age_s,
-                ":reopen_detail": r.reopen.detail,
             })?;
             let health_id = tx.last_insert_rowid();
             for c in &r.channels {
@@ -1058,16 +1030,14 @@ detail, traffic_error, rtt_ms, build_id, uptime_s, host_uptime_s, requests_total
 cache_hits, cache_misses, backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples, \
 miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes, disk_used, \
 disk_total_bytes, thermal_max_c, cert_not_after_unix, tunnel_rtt_ms, tunnel_rtt_n, tunnel_probe, \
-tunnel_probe_error, tunnel_handshake, tunnel_handshake_age_s, tunnel_handshake_detail, \
-reopen_state, reopen_age_s, reopen_last_unix, reopen_reopens, reopen_failures, \
-reopen_last_failure_age_s, reopen_detail) VALUES (:poll_id, :at_ms, :node_id, :level, :reachable, \
+tunnel_probe_error, tunnel_handshake, tunnel_handshake_age_s, tunnel_handshake_detail) \
+VALUES (:poll_id, :at_ms, :node_id, :level, :reachable, \
 :status, :detail, :traffic_error, :rtt_ms, :build_id, :uptime_s, :host_uptime_s, :requests_total, \
 :monitor_requests, :cache_hits, :cache_misses, :backend_errors, :hit_samples, :hit_p50_ns, \
 :hit_p99_ns, :miss_samples, :miss_p50_ns, :miss_p99_ns, :load_one, :cpus, :memory_used, \
 :memory_total_bytes, :disk_used, :disk_total_bytes, :thermal_max_c, :cert_not_after_unix, \
 :tunnel_rtt_ms, :tunnel_rtt_n, :tunnel_probe, :tunnel_probe_error, :tunnel_handshake, \
-:tunnel_handshake_age_s, :tunnel_handshake_detail, :reopen_state, :reopen_age_s, :reopen_last_unix, \
-:reopen_reopens, :reopen_failures, :reopen_last_failure_age_s, :reopen_detail)";
+:tunnel_handshake_age_s, :tunnel_handshake_detail)";
 
 // ── status ───────────────────────────────────────────────────────────────────
 
@@ -1550,7 +1520,6 @@ pub struct PageRow {
     pub cert_not_after_unix: Option<i64>,
     pub cert_expires_in_s: Option<i64>,
     pub tunnel: Option<TunnelOut>,
-    pub log_reopen: Option<ReopenRow>,
     pub net: Vec<NetRow>,
     pub channels: Vec<ChannelOut>,
     pub findings: Vec<FindingOut>,
@@ -1567,8 +1536,7 @@ h.hit_samples, h.hit_p50_ns, h.hit_p99_ns, h.miss_samples, h.miss_p50_ns, h.miss
 h.load_one, h.cpus, h.memory_used, h.memory_total_bytes, h.disk_used, h.disk_total_bytes, \
 h.thermal_max_c, h.cert_not_after_unix, h.tunnel_rtt_ms, h.tunnel_rtt_n, h.tunnel_probe, \
 h.tunnel_probe_error, h.tunnel_handshake, h.tunnel_handshake_age_s, h.tunnel_handshake_detail, \
-h.reopen_state, h.reopen_age_s, h.reopen_last_unix, h.reopen_reopens, h.reopen_failures, \
-h.reopen_last_failure_age_s, h.reopen_detail, h.poll_id \
+h.poll_id \
 FROM health h JOIN node n ON n.id = h.node_id JOIN poll p ON p.id = h.poll_id \
 LEFT JOIN build b ON b.id = h.build_id \
 WHERE h.at_ms >= ?1 AND h.at_ms < ?2 AND (?3 IS NULL OR h.node_id = ?3) \
@@ -1671,19 +1639,6 @@ pub fn health_page(
                     handshake_detail: r.get(40)?,
                 }),
             };
-            let reopen_state: Option<String> = r.get(41)?;
-            let log_reopen = match reopen_state {
-                None => None,
-                Some(state) => Some(ReopenRow {
-                    state,
-                    age_s: r.get(42)?,
-                    last_unix: r.get(43)?,
-                    reopens: r.get(44)?,
-                    failures: r.get(45)?,
-                    last_failure_age_s: r.get(46)?,
-                    detail: r.get(47)?,
-                }),
-            };
             Ok(PageRow {
                 id: r.get(0)?,
                 at,
@@ -1723,12 +1678,11 @@ pub fn health_page(
                 cert_not_after_unix: cert,
                 cert_expires_in_s: cert.map(|c| c - at / 1000),
                 tunnel,
-                log_reopen,
                 net: Vec::new(),
                 channels: Vec::new(),
                 findings: Vec::new(),
                 other_findings: Vec::new(),
-                poll_id: r.get(48)?,
+                poll_id: r.get(41)?,
             })
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
@@ -2031,7 +1985,6 @@ mod tests {
             logging: LoggingHealth {
                 events_total: 5,
                 seconds_since_last: Some(1),
-                reopen: None,
             },
             firewall: None,
         }
@@ -2318,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_and_log_reopen_figures_are_stored() {
+    fn tunnel_figures_are_stored() {
         use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path());
@@ -2334,22 +2287,13 @@ mod tests {
             file_age_s: Some(1),
         });
         s.write(&make(T0, &[r])).unwrap();
-        let (rtt, n, probe, hs, age, state): (f64, i64, String, String, i64, String) = s
+        let (rtt, n, probe, hs, age): (f64, i64, String, String, i64) = s
             .conn
             .query_row(
                 "SELECT tunnel_rtt_ms, tunnel_rtt_n, tunnel_probe, tunnel_handshake, \
-                 tunnel_handshake_age_s, reopen_state FROM health",
+                 tunnel_handshake_age_s FROM health",
                 [],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(
@@ -2357,7 +2301,6 @@ mod tests {
             (3, "connected", "ok", 42)
         );
         assert!((rtt - 0.4).abs() < 1e-9);
-        assert_eq!(state, "unknown");
     }
 
     #[test]
@@ -2721,7 +2664,7 @@ mod tests {
                  cache_hits cache_misses hit_rate backend_errors hit_samples hit_p50_ns hit_p99_ns \
                  miss_samples miss_p50_ns miss_p99_ns load_one cpus memory_used memory_total_bytes \
                  disk_used disk_total_bytes thermal_max_c cert_not_after_unix cert_expires_in_s \
-                 tunnel log_reopen net channels findings other_findings"
+                 tunnel net channels findings other_findings"
             )
         );
         assert_eq!(v["at"], "2027-01-15T08:00:00.000Z");

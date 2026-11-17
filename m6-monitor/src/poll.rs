@@ -1429,7 +1429,6 @@ mod tests {
             header_check: Vec::new(),
             wg_handshakes_file: None,
             tunnel_handshake_max_age_s: 600,
-            log_reopen_max_age_s: None,
             health_last_ok_max_age_s: None,
         }
     }

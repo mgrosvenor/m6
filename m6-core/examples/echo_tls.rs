@@ -186,9 +186,6 @@ fn main() -> io::Result<()> {
                                 drain_until = Some(now + drain);
                             }
                             Signal::Shutdown => {}
-                            Signal::ReopenLogs => {
-                                io::stderr().write_all(b"log reopen requested\n")?;
-                            }
                         }
                     }
                 }

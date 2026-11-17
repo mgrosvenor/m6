@@ -1472,61 +1472,14 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 Every m6 log line is JSON, so `journalctl -u m6-http -o cat | jq .` parses every one.
 
-### 7.8. Rotating the analytics log
+### 7.8. Rotating the logs
 
-m6-http writes the analytics log to one file and reopens it when it receives SIGUSR1.
-Rotation renames the file and sends that signal, so no line is lost and `copytruncate` is not needed.
-This logrotate stanza rotates the file every hour and keeps the last 48 files, two days:
+There is nothing to rotate in m6.
+Every unit logs to stdout, journald holds it, and `systemd-journald` rotates its own files under `/var/log/journal` by size and age.
+The analytics lines are on the same stream, with `type` `access`, so they rotate with everything else and no signal is involved.
+Section 7.7 lists the reads.
 
-```
-/var/www/my-blog/logs/analytics.ndjson {
-    hourly
-    dateext
-    dateformat -%Y%m%d%H
-    rotate 48
-    compress
-    missingok
-    notifempty
-    postrotate
-        systemctl kill --kill-whom=main --signal=SIGUSR1 m6-http.service
-        timeout 10 sh -c 'until test -e "$1"; do sleep 0.1; done' sh "$1"
-    endscript
-}
-```
-
-`rotate` is a finite count because every kept file uses disk.
-`rotate -1` keeps files forever and is not suitable.
-Choose a count that fits the disk at your traffic.
-
-`hourly` takes effect only when logrotate itself runs every hour, and logrotate's default schedule is once a day.
-Run it hourly with a systemd timer override:
-
-```
-# systemctl edit logrotate.timer
-[Timer]
-OnCalendar=
-OnCalendar=hourly
-AccuracySec=1m
-```
-
-On a system that uses cron instead, add `/etc/cron.hourly/logrotate` containing `#!/bin/sh` and `exec /usr/sbin/logrotate /etc/logrotate.conf`, and make it executable.
-Keep the daily run too when other stanzas use `daily`.
-logrotate skips a file that is not due, so the double run is harmless.
-
-There is no `create` line, because m6-http creates the file itself.
-The wait in `postrotate` proves that reopen happened.
-The log writer cannot write to the renamed file once the new file exists, so the old file is finished before logrotate compresses it.
-When the reopen fails, the wait times out and `postrotate` fails.
-`--kill-whom=` needs systemd 252 or later, and older systemd spells it `--kill-who=`.
-
-`/perf` reports the last reopen as `logging.reopen`, with the seconds since the last reopen, how many reopens succeeded and failed, and the age of the last failure.
-`m6-monitor` shows it for each node in section A of `/check` and in `/digest`.
-Setting `[monitor] log_reopen_max_age_s` makes it a fault when a node's last reopen is older than that many seconds.
-A limit of twice the rotation interval suits an hourly rotation, so 7200 seconds with the schedule above.
-The limit is only as true as the schedule, so set it after logrotate runs hourly.
-`/traffic` answers from a window in memory and reads no log file, so rotation leaves its figures alone.
-The window covers the last 60 minutes this process served, starts empty after a restart, and `window_minutes` says how much of the hour it holds.
-The `/traffic` paragraph in [`m6-http.md`](m6-http.md) gives the field caps and the count of events a full window dropped.
+`/traffic` answers from a window in memory and reads no log file, so the journal's rotation leaves its figures alone.
 
 ### 7.9. Monitor history
 

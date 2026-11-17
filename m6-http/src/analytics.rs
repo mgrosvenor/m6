@@ -358,15 +358,15 @@ pub fn finish_proxied_response(
     finish_response(enabled, resp_headers, request_headers, ev, window);
 }
 
-/// Emit one structured analytics line into the analytics Sink, which its own
-/// file receives and the operational log never does. See `m6_core::log`.
+/// Emit one structured analytics line into the one Sink, stdout, which
+/// journals under systemd. See `m6_core::log`.
 fn log_request(
     ev: &Event<'_>,
     session_id: &str,
     session_new: bool,
     features: &RequestFeatures<'_>,
 ) {
-    m6_core::log::with_analytics(|sink| {
+    m6_core::log::with_operational(|sink| {
         write_request_line(sink, ev, session_id, session_new, features);
     });
 }
@@ -374,7 +374,7 @@ fn log_request(
 /// Build the `message = "request"` line into `sink`.
 ///
 /// Split out from [`log_request`] so the golden-meaning test can write the
-/// line into a file of its own without opening the process's analytics Sink.
+/// line into a file of its own without opening the process's Sink.
 fn write_request_line(
     sink: &mut Sink,
     ev: &Event<'_>,
@@ -432,7 +432,7 @@ pub fn log_monitor(
         return;
     }
     let features = extract_features(request_headers);
-    m6_core::log::with_analytics(|sink| {
+    m6_core::log::with_operational(|sink| {
         write_monitor_line(
             sink,
             node,
@@ -484,7 +484,7 @@ pub fn log_rate_limited(
     user_agent: Option<&str>,
     window: &mut TrafficWindow,
 ) {
-    m6_core::log::with_analytics(|sink| {
+    m6_core::log::with_operational(|sink| {
         write_rate_limited_line(sink, node, path, client_ip, user_agent);
     });
     window.push(

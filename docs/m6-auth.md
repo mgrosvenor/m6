@@ -529,13 +529,12 @@ This section gives the signals, the exit codes and the log lines, beginning with
 
 ### 11.1. Signals
 
-Table 8 gives the three signals.
+Table 8 gives the two signals.
 Take from it that both shutdown signals exit 0 and remove the sockets the process bound.
 
 | signal | first receipt | later receipt |
 |---|---|---|
 | `SIGTERM` or `SIGINT` | stop accepting, remove the sockets, exit 0 | the same, and the second signal ends the process at once if the first has not |
-| `SIGUSR1` | reopen the log file | reopen it again |
 
 **Table 8: the signals the service handles.**
 
