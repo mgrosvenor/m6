@@ -301,8 +301,8 @@ public_key = "{pubkey}"
                 .arg(site.join("m6-file.conf"))
                 .env("M6_SOCKET_OVERRIDE", &file_sock),
         );
-        file.wait_for_path(&file_sock, Duration::from_secs(10));
-        file.wait_for_started(Duration::from_secs(10));
+        file.wait_for_path(&file_sock, m6_core::testkit::STARTUP_BOUND);
+        file.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
         let mut http = Service::spawn(
             "m6-http",
@@ -311,7 +311,7 @@ public_key = "{pubkey}"
         // The start probe sends no credential, so the fake's default 401 is
         // its answer, and the node starts.
         check.serve_one().expect("serve the start probe");
-        http.wait_for_started(Duration::from_secs(20));
+        http.wait_for_started(m6_core::testkit::STARTUP_BOUND);
         let base_calls = check.calls();
 
         TestServer {

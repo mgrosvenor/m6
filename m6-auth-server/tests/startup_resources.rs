@@ -390,8 +390,8 @@ fn check_only_starts_without_the_private_key() {
     cmd.arg("--check-only")
         .env("M6_CHECK_SOCKET_OVERRIDE", &check);
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
-    svc.wait_for_path(&check, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&check, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
         !missing.exists(),
         "the test wrote the private key it says is missing"
@@ -430,7 +430,7 @@ fn check_only_does_not_create_the_database() {
         .env("M6_CHECK_SOCKET_OVERRIDE", &check);
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "the check-only process did not exit for a missing database\n--- output ---\n{}",
@@ -472,7 +472,7 @@ fn check_only_refuses_a_database_without_the_schema() {
         .env("M6_CHECK_SOCKET_OVERRIDE", &check);
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
     let status = svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(10))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "the check-only process did not exit for a database without a schema\n--- output ---\n{}",

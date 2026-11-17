@@ -120,7 +120,7 @@ fn exits_promptly_with_a_request_in_flight(id: &str) {
     server.svc.request(m6_core::platform::Signal::Shutdown);
     let status = server
         .svc
-        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
         .unwrap_or_else(|| {
             panic!(
                 "m6-html did not exit within 5s of {name} with a request in flight\n\

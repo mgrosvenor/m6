@@ -123,9 +123,9 @@ fn spawn_server(env: &TestEnv) -> Service {
             .env("M6_SOCKET_OVERRIDE", &env.socket_path)
             .env("M6_CHECK_SOCKET_OVERRIDE", &env.check_socket_path),
     );
-    svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
-    svc.wait_for_path(&env.check_socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&env.socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_path(&env.check_socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
         wait::for_unix(&env.socket_path, Duration::from_secs(10)),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
@@ -334,8 +334,8 @@ fn a_check_only_process_needs_only_the_public_key() {
         .env("M6_CHECK_SOCKET_OVERRIDE", &env.check_socket_path)
         .arg("--check-only");
     let mut svc = Service::spawn("m6-auth-server", &mut cmd);
-    svc.wait_for_path(&env.check_socket_path, Duration::from_secs(10));
-    svc.wait_for_started(Duration::from_secs(10));
+    svc.wait_for_path(&env.check_socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
         !env.private_key_path.exists(),
         "the test's private key is still there, so this proves nothing"

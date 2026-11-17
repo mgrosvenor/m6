@@ -524,7 +524,7 @@ fn shutdown_drains_in_flight_replies_and_exits_zero() {
 fn reload_is_received_and_serving_continues() {
     let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 10_000, 1024, None);
     platform::send(srv.child.id(), Signal::ReopenLogs).expect("send reload");
-    srv.wait_for("log reopen requested", Duration::from_secs(5));
+    srv.wait_for("log reopen requested", m6_core::testkit::RESPONSE_BOUND);
     let mut s = TcpStream::connect(srv.addr).expect("connect");
     s.write_all(b"after\n").expect("send");
     assert_eq!(recv_exact(&mut s, 6, Duration::from_secs(10)), b"after\n");
