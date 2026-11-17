@@ -42,10 +42,6 @@ The released versions, newest first:
 
 **m6-http checks a token in one place, and every route that gates on one answers the same 401 or 403 from one definition.** Route `require`, `/perf`, `/traffic` and `/genid` each call `m6_http_lib::auth::check` exactly once per request; it decides `Allow(claims)`, `NoCredential` (401) or `Deny` (403), and `m6_core::http::token_refusal` is the only definition of the refusal's status, headers and body. The legacy `[health] metrics_token_file` bearer-string gate and its second checker, `m6_core::monitoring::metrics_authorised`, are removed: `/perf` and `/traffic` are gated by `metrics_require`, and without it they answer the 404 of an endpoint that does not exist. A missing `[auth] public_key` now fails closed on a `require` route instead of skipping the check.
 
-### Added
-
-**A public `GET /ready` answers whether a node can serve a request that may need its origin (#175).** It answers 200 while a cache node's last successful origin answer is no more than two heartbeats old, and 503 past that with the follower's failure reason, for example `{"status":"not_ready","node":"edge-a","origin":"down","reason":"connect failed"}`. A source answers 200 `{"status":"ready","node":"origin","origin":"not_applicable"}`: `[genid] upstream` is what makes a node a cache, so the role comes from config rather than from a missing timestamp. A cache that has never had a successful answer is 503 because it holds no ID. The window is `2 * heartbeat_secs`, 20 s at the default 10 s, and there is no new config key. `/ready` is public and answered ahead of routing beside `/health`, and `/health` is unchanged: it still answers 200 `{"status":"ok","node":"<name>"}` for the process alone with no origin state, so a load balancer reads readiness from a status code without pulling a node whose process and warm cache still serve. No migration: the endpoint is new and no existing answer changes. Verified on 2026-11-16 on a macOS sandbox: an end-to-end test stops a real origin, waits until `last_ok_s` is past the window and reads 503 with `connect failed` from `/ready` while `/health` still answers 200, and three further tests cover a live origin, a source node and the unchanged `/health` body in all three states.
-
 ### Migration
 
 **`Response.headers` is `Vec<Header>`, a pair of `HeaderText`, where it was `Vec<(String, String)>`.**
@@ -707,6 +703,13 @@ The sync used to delete the file the build host wrote, so the history never ente
 **One platform layer.** m6 named the operating system, or an OS crate, in every service loop, three thread counters, a Linux-only test, the host readings and the bench tools. They now live in one crate, `m6-platform`, re-exported as `m6_core::platform` and selected by OS family: readiness over mio, the clock, a shutdown or reload request as a descriptor, a child's exit as a descriptor (pidfd on Linux, kqueue on macOS), sockets with the right options, the open-file and socket-path limits, host and process facts. A gate test refuses platform conditionals, OS crates, direct clock reads and service-manager variables anywhere else. One shared contract suite and the echo reference app run unchanged on macOS arm64, Linux x86_64 and Linux arm64, and CI builds and tests all three. A child a service spawned inherited its blocked signals (and on macOS the ignored disposition) and could not be stopped: fixed. The thread-based `ShutdownHandle` is removed. Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives.
 
 ### Removed
+
+**The public `GET /ready` endpoint is removed (#175).**
+It answered whether a cache node's last successful origin answer was recent enough to serve a request that may need the origin.
+Nothing consumed it: `m6-monitor` polls `/health`, `/perf` and `/traffic`, and no documented deployment routes on a readiness answer.
+The owner's decision is that a readiness endpoint is a complex answer to a simple problem, and that a log line is the answer.
+The edge already logs one warn line when it loses its origin and one info line when the origin is back, on the change only.
+Nothing migrates: no config key changes and no documented caller exists.
 
 **`ureq`, `native-tls`, `openssl` and their dependents left m6-core, and email is a client the service's own loop drives.** A form POST is `client::Endpoint` over the loop's `Upstream`, and an SMTP send is `email::Smtp` driven by the loop's step, with lettre supplying the message bytes, the envelope, the command sequence and the reply parse. The socket, the descriptor and the deadline are ours, as they are for every other client. A send that a backend refuses answers 500 naming the reply code, and one that never answers answers 504 on the loop's deadline rather than blocking it.
 
