@@ -536,7 +536,10 @@ impl Fixture {
     /// Start `n_backends` socket backends and one m6-http with a pool on their
     /// glob. `backend_timeout_secs` is m6-http's backend deadline.
     fn start(n_backends: usize, backend_timeout_secs: u64, tag: &str) -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(m6_core::testkit::socket_scratch_root())
+            .expect("tempdir");
         let site = dir.path().to_path_buf();
 
         let pid = std::process::id();
@@ -632,7 +635,8 @@ fn check_socket() -> &'static std::path::Path {
     use std::sync::OnceLock;
     static CHECK: OnceLock<(PathBuf, RunningCheck)> = OnceLock::new();
     let (path, _) = CHECK.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!("m6lnw-check-{}.sock", std::process::id()));
+        let path = m6_core::testkit::socket_scratch_root()
+            .join(format!("m6lnw-check-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let check = RunningCheck::start(
             &path,
@@ -1159,7 +1163,10 @@ fn a_request_body_larger_than_the_tls_plaintext_buffer_arrives_whole() {
 
 #[test]
 fn a_backend_that_resets_mid_response_answers_502_and_the_next_request_is_served() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let site = dir.path().to_path_buf();
     let ck =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -1346,7 +1353,10 @@ fn a_closed_client_does_not_leak_its_upstream() {
 #[test]
 fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch() {
     const ERROR_PAGE_BODY: &str = "SITE ERROR PAGE BODY";
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let site = dir.path().to_path_buf();
 
     let ck =
@@ -1514,7 +1524,10 @@ fn a_custom_error_page_from_a_socket_backend_is_served_without_a_blocking_fetch(
 #[test]
 fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     const SECOND_BODY: &str = "second";
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let site = dir.path().to_path_buf();
 
     let ck =
@@ -1772,7 +1785,10 @@ struct UrlFixture {
 
 impl UrlFixture {
     fn start(site_toml: &str, tag: &str) -> UrlFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(m6_core::testkit::socket_scratch_root())
+            .expect("tempdir");
         let claim = claim_port();
         let port = claim.port();
         let system = write_site(dir.path(), site_toml, port);
@@ -2185,7 +2201,10 @@ fn an_unreachable_h2c_upstream_does_not_stall_cache_hits() {
 /// `--dump-config` still validates the same config without a lookup.
 #[test]
 fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let site = dir.path().to_path_buf();
     let site_toml = url_site(
         "backend_timeout_secs = 30",

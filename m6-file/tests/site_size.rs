@@ -21,7 +21,10 @@ const ROUTE: &str = "[[route]]\npath = \"/{*relpath}\"\nhandler = \"files\"\nroo
 /// A site root with one served file and an empty `site.toml`, which every
 /// service needs to find.
 fn tree() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
     std::fs::write(dir.path().join("hello.txt"), b"hello").unwrap();
     std::fs::write(dir.path().join("site.toml"), "").unwrap();
     dir

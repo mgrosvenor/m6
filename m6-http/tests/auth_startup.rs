@@ -91,7 +91,10 @@ fn check_socket(dir: &Path) -> PathBuf {
 /// A 401 proves the socket is a checker, so the node starts.
 #[test]
 fn a_401_from_the_check_backend_starts() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
@@ -106,7 +109,10 @@ fn a_401_from_the_check_backend_starts() {
 /// A 503 is a checker that is there and busy, so the node starts.
 #[test]
 fn a_503_from_the_check_backend_starts() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Unavailable);
@@ -124,7 +130,10 @@ fn a_503_from_the_check_backend_starts() {
 /// setting, the backend and the socket.
 #[test]
 fn a_404_from_the_check_backend_exits_2_naming_the_setting() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Status(404));
@@ -150,7 +159,10 @@ fn a_404_from_the_check_backend_exits_2_naming_the_setting() {
 /// checker, and no member answering 401 or 503 stops the start.
 #[test]
 fn a_status_that_is_not_a_check_exits_2() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Status(200));
@@ -174,7 +186,10 @@ fn a_status_that_is_not_a_check_exits_2() {
 /// a restarted checker.
 #[test]
 fn a_connect_failure_warns_and_the_node_starts() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     // Bind, then close: the socket file stays and nothing listens on it.
     let mut dead = CheckServer::bind(&path).expect("check server");
@@ -200,7 +215,10 @@ fn a_connect_failure_warns_and_the_node_starts() {
 /// node starts.
 #[test]
 fn one_member_down_still_starts() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let live = dir.path().join("check-live.sock");
     let dead_path = dir.path().join("check-dead.sock");
     let mut live_server = CheckServer::bind(&live).expect("live check server");
@@ -229,7 +247,10 @@ fn one_member_down_still_starts() {
 /// call a service that refuses the probe a checker.
 #[test]
 fn a_403_from_the_check_backend_exits_2() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     let mut server = CheckServer::bind(&path).expect("check server");
     server.unknown_answer(Reply::Forbidden);
@@ -306,7 +327,10 @@ fn dribbling_peer(path: &Path) -> std::thread::JoinHandle<()> {
 /// serves public and cached traffic.
 #[test]
 fn a_dribbling_peer_does_not_extend_the_probe_deadline() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
     let path = check_socket(dir.path());
     let dribbler = dribbling_peer(&path);
     let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));

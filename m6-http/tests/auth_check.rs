@@ -169,7 +169,10 @@ impl TestServer {
     }
 
     fn start_with(verbose: bool) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(m6_core::testkit::socket_scratch_root())
+            .unwrap();
         let site = dir.path();
 
         let cert = rcgen::generate_simple_self_signed(vec![

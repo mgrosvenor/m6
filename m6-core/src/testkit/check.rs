@@ -520,7 +520,10 @@ mod tests {
 
     #[test]
     fn the_fake_answers_an_identity_and_counts_the_call() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.answer("token", Reply::Identity(identity()));
         let answer = ask(&mut server, &check_request("token"));
@@ -531,7 +534,10 @@ mod tests {
 
     #[test]
     fn the_fake_answers_401_403_and_503() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.answer("none", Reply::Unauthorised);
         server.answer("wrong", Reply::Forbidden);
@@ -543,7 +549,10 @@ mod tests {
 
     #[test]
     fn an_unknown_token_is_401_and_another_path_is_404() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         assert_eq!(status(&ask(&mut server, &check_request("absent"))), 401);
         let not_found = ask(
@@ -560,7 +569,10 @@ mod tests {
 
     #[test]
     fn a_slow_answer_is_served_after_its_delay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.answer(
             "token",
@@ -574,7 +586,10 @@ mod tests {
 
     #[test]
     fn a_close_mid_answer_ends_the_stream() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.answer("token", Reply::CloseMidAnswer);
         let answer = ask(&mut server, &check_request("token"));
@@ -587,7 +602,10 @@ mod tests {
 
     #[test]
     fn close_leaves_a_socket_that_refuses_the_connection() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.close();
         let refused = UnixStream::connect(server.path()).expect_err("connect must be refused");
@@ -600,7 +618,10 @@ mod tests {
 
     #[test]
     fn the_answer_can_change_between_requests() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.answer("token", Reply::Identity(identity()));
         assert_eq!(status(&ask(&mut server, &check_request("token"))), 200);
@@ -612,7 +633,10 @@ mod tests {
 
     #[test]
     fn the_unknown_answer_is_what_the_start_probe_sees() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6-")
+            .tempdir_in(crate::platform::socket_scratch_root())
+            .unwrap();
         let mut server = CheckServer::bind(dir.path().join("check.sock")).expect("bind");
         server.unknown_answer(Reply::Status(404));
         assert_eq!(

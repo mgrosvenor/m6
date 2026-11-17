@@ -161,7 +161,10 @@ fn text<'a>(fields: &'a [Field], name: &str) -> &'a str {
 }
 
 fn fields_and_one_datagram_per_line() {
-    let dir = tempfile::tempdir().expect("a directory");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_platform::socket_scratch_root())
+        .expect("a directory");
     let (socket, _path) = receiver(dir.path());
     m6_log::init(Level::Info).expect("the logger");
     assert!(m6_log::writes_journal(), "the test socket is the journal");
@@ -226,7 +229,10 @@ fn fields_and_one_datagram_per_line() {
 }
 
 fn an_oversized_datagram_is_refused_and_counted() {
-    let dir = tempfile::tempdir().expect("a directory");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_platform::socket_scratch_root())
+        .expect("a directory");
     let (socket, _path) = receiver(dir.path());
     // The field cap is raised so the line reaches the datagram limit rather
     // than being refused for its field, which is a different refusal.
@@ -274,7 +280,10 @@ fn an_oversized_datagram_is_refused_and_counted() {
 }
 
 fn a_failed_send_falls_back_to_stdout() {
-    let dir = tempfile::tempdir().expect("a directory");
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_platform::socket_scratch_root())
+        .expect("a directory");
     let (socket, path) = receiver(dir.path());
     let out_path = dir.path().join("stdout.log");
     let out = std::fs::File::options()
