@@ -27,18 +27,32 @@
 //!
 //! # What `/health` answers for
 //!
-//! `/health` answers for the m6-http process alone. Its socket pools keep no
-//! per-member health state, so a dead member cannot change the answer. A
-//! request that connects to a dead member takes the next member, and that is
-//! where the failure is found.
+//! `/health` answers for the m6-http process and for the dependencies whose
+//! failure the process already observes. It probes nothing: every answer is a
+//! flag read and a JSON serialisation.
 //!
-//! A URL backend is outside that answer too. Proving one reachable would put a
-//! network round trip inside the check, and a warm cache keeps serving while
-//! the origin is unreachable.
+//! A cache node's origin is one such dependency. Its flag is the follower's own
+//! down bit, set where a heartbeat or a forwarded client request already
+//! observes the origin failing and cleared by the next answer. While it is set
+//! `/health` answers 503 `{"status":"degraded","node":"<name>"}`. While it is
+//! clear `/health` answers 200 `{"status":"ok","node":"<name>"}`.
+//!
+//! Proving the origin reachable inside the check would put a network round trip
+//! on the most frequently hit path on the box, and a warm cache keeps serving
+//! while the origin is unreachable. The flag costs one branch.
+//!
+//! The degraded body names the node and never the dependency. `/health` is
+//! public and unsecured, so a dependency name tells a stranger which part of
+//! the node to wait out. The warn and info lines the process logs on the change
+//! carry that detail.
+//!
+//! A socket pool keeps no per-member health state, so a dead member cannot
+//! change the answer. A request that connects to a dead member takes the next
+//! member, and that is where the failure is found.
 //!
 //! # Two endpoints, because they have opposite requirements
 //!
-//! `/health` answers up or down. `/perf` answers counters and latency
+//! `/health` answers `ok` or `degraded`. `/perf` answers counters and latency
 //! percentiles. They are separate paths rather than one path with a richer
 //! response for authorised callers, and the reason is cost.
 //!

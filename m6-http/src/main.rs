@@ -4663,7 +4663,13 @@ fn handle_request_inner(
     // It sits *after* method validation so a health path still refuses PUT
     // and friends like every other path, rather than becoming a hole in it.
     if state.config.health.enabled && req.path == state.config.health.path {
-        let (code, mut report) = health::HealthReport::build(&state.config.node.name);
+        // The dependency flags this answer reads. A cache node's origin is the
+        // follower's own state, set where a heartbeat or a forwarded request
+        // already observes the failure and cleared by the next answer. No
+        // timer, no probe, no clock. A second dependency is one more term on
+        // this line: AUTH-1 step 5 ORs the checker's flag in beside it.
+        let degraded = health::origin_down(&state.genid);
+        let (code, mut report) = health::health_answer(degraded, &state.config.node.name);
         report.process_index = state.config.server.process_index;
         let (code, headers, body) = report.into_response(code);
         // Recorded, not discarded. `message = "monitor"` keeps it out of the

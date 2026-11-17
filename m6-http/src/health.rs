@@ -71,6 +71,119 @@ pub fn peer_iface(peer: IpAddr) -> Iface {
     }
 }
 
+// ── /health's dependency flags ───────────────────────────────────────────────
+//
+// `/health` answers for the process and for the dependencies whose failure the
+// loop already observes. It reads flags and never probes: each flag is set
+// where a real request's outcome is already known and cleared by the next
+// success. That is what keeps the answer a JSON serialisation on the most
+// frequently hit path on the box.
+
+/// Whether this node's origin is failing, which is what a cache node's
+/// `degraded` answer reports.
+///
+/// The flag is the follower's own `down` bit. `Follower::answered` sets it
+/// where a heartbeat's failure is already observed and clears it on the next
+/// answer, and `Follower::failed` sets it where a forwarded request's failure
+/// is already observed. `/health` reads it and does nothing else, so the cost
+/// is one branch, with no timer, no probe, no clock and no round trip.
+///
+/// A second dependency is one more term at the call site in `main.rs`: AUTH-1
+/// step 5 adds the checker's flag where its `/check` call fails, and ORs it
+/// into the same `degraded` bit.
+pub fn origin_down(role: &crate::genid::Role) -> bool {
+    role.cache().is_some_and(crate::genid::Follower::down)
+}
+
+/// The `/health` answer: `ok` while every dependency answers, `degraded` while
+/// one is failing.
+///
+/// The status carries the answer, 200 or 503. `m6-monitor` reads a non-200 as
+/// `degraded` without consulting the body, which is the mapping the two
+/// answers were built to fit. The body names the node and never the dependency:
+/// `/health` is public and unsecured, so the dependency is in the warn and info
+/// lines the process logs on the change instead.
+pub fn health_answer(degraded: bool, node: &str) -> (u16, HealthReport) {
+    if degraded {
+        HealthReport::degraded(node)
+    } else {
+        HealthReport::build(node)
+    }
+}
+
+#[cfg(test)]
+mod health_state_tests {
+    use super::*;
+    use crate::genid::{Follower, Genid, Role};
+    use std::time::{Duration, Instant};
+
+    /// A follower that has answered once, then met `result` on the next
+    /// heartbeat.
+    fn cache_after(result: Result<(u64, Duration), &'static str>, at: Instant) -> Role {
+        let mut f = Follower::new(Duration::from_secs(10), at);
+        f.answered(Ok((7, Duration::ZERO)), at);
+        f.answered(result, at);
+        Role::Cache(f)
+    }
+
+    /// A node with no origin is known to be one from config, so it has no
+    /// dependency to lose and answers `ok` while its process runs.
+    #[test]
+    fn a_source_has_no_origin_flag() {
+        let role = Role::Source(Genid::new(0, None));
+        assert!(!origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "origin");
+        assert_eq!(code, 200);
+        assert_eq!(report.status, "ok");
+    }
+
+    /// A cache whose origin has not failed answers `ok`.
+    #[test]
+    fn a_cache_whose_origin_answers_is_ok() {
+        let role = cache_after(Ok((7, Duration::ZERO)), m6_core::platform::now());
+        assert!(!origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "edge-a");
+        assert_eq!(code, 200);
+        assert_eq!(report.status, "ok");
+    }
+
+    /// A cache that has observed its origin fail answers 503 `degraded`, and
+    /// the public body names the node and nothing a stranger can aim at.
+    #[test]
+    fn a_cache_whose_origin_fails_is_degraded_and_names_nothing() {
+        let role = cache_after(Err("connect failed"), m6_core::platform::now());
+        assert!(origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "edge-a");
+        assert_eq!(code, 503);
+        assert_eq!(report.status, "degraded");
+        let (code, _, body) = report.into_response(code);
+        assert_eq!(code, 503);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"status":"degraded","node":"edge-a"}"#
+        );
+    }
+
+    /// The answer reads a flag and not a clock: a success an hour old with no
+    /// observed failure is still `ok`, so `/health` needs no staleness window
+    /// and no probe.
+    #[test]
+    fn an_old_answer_is_not_a_failure() {
+        let t0 = m6_core::platform::now();
+        let role = cache_after(Ok((7, Duration::ZERO)), t0);
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!(
+            role.cache().unwrap().last_ok_s(later),
+            Some(3600),
+            "the success is an hour old"
+        );
+        assert!(
+            !origin_down(&role),
+            "no failure was observed, so the flag is clear"
+        );
+    }
+}
+
 #[cfg(test)]
 mod monitoring_exclusion_tests {
     use super::*;
