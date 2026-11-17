@@ -613,6 +613,39 @@ fn the_cache_learns_the_id_at_start() {
     assert!(rest.starts_with(|c: char| c.is_ascii_digit()), "{block}");
 }
 
+/// A cache node that has no ID retries a failed first heartbeat on the next
+/// tick, not after the configured interval.
+///
+/// A node with no ID cannot serve. With `heartbeat_secs = 3600` one timeout
+/// while the source starts would otherwise leave it blind for an hour, and one
+/// timeout under load is enough to miss the first answer. The test holds the
+/// source down until the node has logged the first failure, then starts it, so
+/// the retry is what has to find it.
+///
+/// Break: schedule the retry a whole heartbeat away, and this waits out
+/// `STARTUP_BOUND` with an empty `/perf` genid block.
+#[test]
+fn a_node_with_no_id_retries_a_failed_heartbeat() {
+    let mut stack = Stack::new("public, max-age=60", 3600, false);
+    stack.start_html();
+    // Deliberately not started: the first heartbeat fails.
+    stack.start_cache();
+    assert!(
+        wait_until(m6_core::testkit::STARTUP_BOUND, || {
+            let out = stack.cache_output();
+            out.contains("genid: heartbeat failed to start") || out.contains("genid: upstream down")
+        }),
+        "the first heartbeat never failed:\n{}",
+        stack.cache_output()
+    );
+    stack.start_source();
+    assert!(
+        stack.wait_perf_id("0", m6_core::testkit::STARTUP_BOUND),
+        "/perf never showed the source's ID after one failed heartbeat:\n{}",
+        stack.cache_output()
+    );
+}
+
 /// A publish through the cache node reaches it: the POST is forwarded, the
 /// source advances, the heartbeat follows, and the node serves the new content
 /// under the new ID.
@@ -669,7 +702,11 @@ fn a_response_under_a_newer_id_wakes_the_heartbeat() {
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
+    assert!(
+        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
+        "/perf never showed the source's ID 0:\n{}",
+        stack.cache_output()
+    );
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
     assert_eq!(stack.get_cache("/", &[]).text(), "first: one");
 
@@ -808,12 +845,20 @@ fn the_cache_recovers_when_the_source_returns() {
         Some("0"),
         "a restart keeps the ID, so nothing is old"
     );
-    // `info` lines are buffered and flushed once a second, so this polls the
-    // absence for a bounded window rather than reading once.
+    // The recovery line is written on the turn the answer is applied, after
+    // the outcome branch that would log a change. The Sink writes complete
+    // lines in order, so once that line is on the wire every earlier line has
+    // been flushed before it. The order is the assertion, with no bounded
+    // absence window: waiting ten seconds here was a wall clock, not an event.
     assert!(
-        !wait_until(Duration::from_secs(10), || stack
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
             .cache_output()
-            .contains("genid changed")),
+            .contains("genid: upstream up")),
+        "the recovery is logged:\n{}",
+        stack.cache_output()
+    );
+    assert!(
+        !stack.cache_output().contains("genid changed"),
         "a success after down is not a change:\n{}",
         stack.cache_output()
     );
@@ -866,16 +911,6 @@ fn background_fetches_wait_for_the_id() {
     stack.start_html();
     // Deliberately not started yet.
     stack.start_cache();
-    // A bounded absence check: `debug` is buffered, so the dispatch line can
-    // surface a second after it happens.
-    assert!(
-        !wait_until(Duration::from_secs(10), || {
-            let out = stack.cache_output();
-            out.contains("url backend dispatch") || out.contains("url backend error")
-        }),
-        "a warm fetch ran with no ID to store it under:\n{}",
-        stack.cache_output()
-    );
 
     stack.start_source();
     assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
@@ -888,6 +923,23 @@ fn background_fetches_wait_for_the_id() {
         }),
         "the drain never ran once the ID was known:\n{}",
         stack.cache_output()
+    );
+    // The node logs the ID it learned before the drain that answer unblocks.
+    // A warm fetch that ran with no ID to store it under would have dispatched
+    // (or failed) before that line, so the order is the assertion. This
+    // replaces a ten second absence window with the event that ends the
+    // window.
+    let out = stack.cache_output();
+    let learned = out
+        .find("genid: upstream answered; following its ID")
+        .expect("the node logs the ID it learned");
+    let first_fetch = out
+        .find("url backend dispatch")
+        .or_else(|| out.find("url backend error"))
+        .expect("the drain dispatches the held fetches");
+    assert!(
+        first_fetch > learned,
+        "a warm fetch ran with no ID to store it under:\n{out}"
     );
 
     // A warmed route is a hit: its entry is fresh, so the answer carries Age

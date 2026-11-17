@@ -36,6 +36,16 @@ pub const GENID_HEADER_LOWER: &str = "m6-genid";
 /// How often a cache node asks its upstream for the ID, unless configured.
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 10;
 
+/// How soon a cache node with no ID retries a heartbeat that failed.
+///
+/// A node with no ID cannot serve a request: the store rule needs the ID a
+/// reply was dispatched under. One missed answer under load would otherwise
+/// keep it blind for a whole configured interval, which is an hour at
+/// `heartbeat_secs = 3600`. The loop's own accounting tick is the smallest
+/// unit it schedules, so this is one tick. Once the node holds an ID the
+/// interval is the right wait and this constant is not used.
+const NO_ID_RETRY: Duration = Duration::from_secs(1);
+
 /// What this node's generation state is: the source that owns the ID, or a
 /// cache node that follows another node's ID.
 ///
@@ -280,9 +290,9 @@ impl Follower {
         now: Instant,
     ) -> Outcome {
         self.in_flight = false;
-        self.due = now + self.heartbeat;
         match result {
             Ok((id, rtt)) => {
+                self.due = now + self.heartbeat;
                 self.rtt = Some(rtt);
                 self.last_ok = Some(now);
                 self.down = false;
@@ -303,6 +313,15 @@ impl Follower {
                 }
             }
             Err(reason) => {
+                // A node with no ID cannot serve, so it retries a failed
+                // heartbeat on the next tick rather than waiting out an
+                // interval that may be configured very long.
+                self.due = now
+                    + if self.current.is_none() {
+                        self.heartbeat.min(NO_ID_RETRY)
+                    } else {
+                        self.heartbeat
+                    };
                 let was_down = self.down;
                 self.down = true;
                 self.last_failure = Some(reason);
@@ -731,6 +750,45 @@ mod tests {
         let due = t0 + Duration::from_secs(10);
         assert!(!f.heartbeat_due(due - Duration::from_millis(1)));
         assert!(f.heartbeat_due(due));
+    }
+
+    /// A failed heartbeat with no ID is due again on the next tick, not after
+    /// the configured interval.
+    ///
+    /// Break: always schedule the retry a heartbeat away, and a node that
+    /// missed its first answer at `heartbeat_secs = 3600` cannot learn an ID
+    /// for an hour.
+    #[test]
+    fn a_failed_heartbeat_with_no_id_retries_on_the_next_tick() {
+        let t0 = m6_core::platform::now();
+        let mut f = Follower::new(Duration::from_secs(3600), t0);
+        assert!(f.heartbeat_due(t0));
+        f.sent();
+        assert_eq!(
+            f.answered(Err("timed out"), t0 + Duration::from_secs(5)),
+            Outcome::Down("timed out")
+        );
+        assert_eq!(f.current(), None);
+        assert!(
+            f.heartbeat_due(t0 + Duration::from_secs(6)),
+            "a node with no ID must retry on the next tick"
+        );
+    }
+
+    /// Once the node holds an ID, a failed heartbeat waits the interval: it can
+    /// still serve what it holds, and there is no reason to retry sooner.
+    #[test]
+    fn a_failed_heartbeat_with_an_id_waits_the_interval() {
+        let (mut f, t0) = follower();
+        f.answered(Ok((7, Duration::ZERO)), t0);
+        f.sent();
+        let failed_at = t0 + Duration::from_secs(1);
+        f.answered(Err("timed out"), failed_at);
+        assert!(
+            !f.heartbeat_due(failed_at + Duration::from_secs(9)),
+            "the configured interval starts at the failure"
+        );
+        assert!(f.heartbeat_due(failed_at + Duration::from_secs(10)));
     }
 
     /// A different ID is the change, and the ID is the one just heard.

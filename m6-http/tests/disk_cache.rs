@@ -1212,6 +1212,16 @@ fn a_restart_with_the_source_down_serves_the_disk_copy() {
         stack.disk_block(),
         stack.cache_output()
     );
+    // The confirmation is a state transition the operator can see: the log
+    // said "served unverified" when the first answer timed out, so it says
+    // "kept" when an answer confirms the copy.
+    assert!(
+        wait_until(m6_core::testkit::STARTUP_BOUND, || stack
+            .cache_output()
+            .contains("disk cache kept")),
+        "the confirmation is logged:\n{}",
+        stack.cache_output()
+    );
     assert_eq!(stack.perf_id().as_deref(), Some("0"));
     let hits = stack.perf_u64("cache_hits_total").expect("a hit counter");
     let unchanged = stack.get_cache("/", &[]);

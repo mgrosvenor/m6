@@ -2165,9 +2165,15 @@ fn follower_answered(
         genid::Outcome::Same => {
             state.cache.set_serve_held(false);
             // A success after an unverified install confirms the disk copy:
-            // the ID is unchanged, so nothing is flushed.
+            // the ID is unchanged, so nothing is flushed. The operator saw the
+            // "served unverified" warning when the first answer timed out, so
+            // this transition writes the same "kept" line the settle path
+            // writes. Without it `/perf` says kept and the log never does.
             if state.disk_state == disk_cache::LoadState::Unverified {
                 state.disk_state = disk_cache::LoadState::Kept;
+                if let Some(id) = state.genid.cache().and_then(|f| f.current()) {
+                    info!(genid = id, "disk cache kept");
+                }
             }
         }
         genid::Outcome::Changed { from, to } => {
