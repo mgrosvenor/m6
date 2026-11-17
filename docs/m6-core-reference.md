@@ -815,7 +815,7 @@ it is a fault.
 
 ### 8.3. `monitoring`
 
-`/health` answers up or down and is constant-cost by construction. `/perf`
+`/health` answers `ok` or `degraded` and is constant-cost by construction. `/perf`
 answers counters and percentiles and is token-gated, **and not out of modesty
 about traffic volume**: live latency and error counters tell an attacker
 which requests cost 2.8us and which cost 7.8ms, about 2800 to 1 on this
@@ -823,11 +823,14 @@ deployment, which turns a blind probe into a tuning loop. With no token
 configured `/perf` is a 404, not a 401, so forgetting to configure it fails
 closed and does not advertise a door.
 
-`HealthReport::build(node)` returns `(u16, HealthReport)` and
-`into_response(code)`, always 200 `ok`. The answer covers the m6-http process.
-Backend liveness is outside it: a socket pool keeps no per-member health state,
-so a dead member is found when a request connects to it and that request takes
-the next member.
+`HealthReport::build(node)` and `HealthReport::degraded(node)` return
+`(u16, HealthReport)` and `into_response(code)`. `build` is 200 `ok` and
+`degraded` is 503 with the status `degraded`, whose body names no dependency.
+The answer covers the m6-http process and the dependency flags the process
+already holds: an edge's origin is the follower's own `down` bit, so the answer
+reads a flag and makes no probe. A socket pool keeps no per-member health
+state, so a dead member is found when a request connects to it and that request
+takes the next member.
 
 `PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`, `PERF_BACKEND`.

@@ -518,6 +518,16 @@ Comments only.
 
 ### Changed
 
+**`/health` answers `ok` or `degraded`, and an edge's dependency failure is the 503 (#175).**
+`200` `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
+`503` `{"status":"degraded","node":"<name>"}` says the process is alive and serving its public and cached pages while a dependency is failing, which on an edge is its origin.
+A process that is gone or whose listener refuses gives no answer, which `m6-monitor` reads as `unreachable`.
+The degraded body names the node and, when the node sets one, the process index. It names no dependency and no reason, because `/health` is public and unsecured and that detail would tell a stranger which part of the node to wait out.
+The detail is in the process log instead: one warn line when the origin's flag goes bad and one info line when it recovers, on the change only, through `m6-log`, with a static reason and no allocation on the request path.
+The flag is the cache node's follower state, set where a heartbeat or a forwarded request already observes the failure and cleared by the next successful heartbeat, so `/health` reads flags, never probes, and costs one JSON serialisation.
+`m6-monitor` needed no change: it already reads a non-200 as `degraded`, and its four states and these two answers were designed to fit.
+Verified on 2026-11-17 on a macOS sandbox: a real cache node in front of a real source answers 200 `{"status":"ok","node":"genid-cache"}`, then 503 `{"status":"degraded","node":"genid-cache"}` while the source is stopped, then 200 again after it returns, while serving held content throughout. The cache's log holds exactly one `genid: upstream down` warn and exactly one `genid: upstream up` info across 61 requests, counted and asserted, and the degraded body is asserted byte for byte so it cannot start naming a dependency.
+
 **Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
 `m6_core::alloc::M6Alloc` wraps mimalloc and is the one allocator type: m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor declare it in `main.rs`, and every allocation-counting test and example declares the same type, so counts are taken against the allocator production runs. Under `alloc-count` (the `testkit` and `count-allocations` features) it counts exactly as `testkit::alloc_count::Counting` did, and without them the counting is not compiled. `Counting` is removed. A library crate declares no allocator. m6-auth-cli is a one-shot command and keeps the system allocator.
 Each service sets mimalloc's options in code at the top of `main`: freed memory is never returned to the OS (purge delay -1; the option's number is counted from the bundled `mimalloc.h` by `m6-core/build.rs`, because the binding does not export it), so the heap grows and does not shrink. It then reserves `[limits.heap_reserve]` bytes from the OS once, committed and on huge pages where the kernel offers them, and logs once when the heap later grows past it; growth is never a failure.
