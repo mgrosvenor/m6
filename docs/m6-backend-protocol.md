@@ -187,10 +187,10 @@ A read beyond that waits for bytes that will never arrive, until the proxy's tim
 ### 2.7. The check the proxy makes
 
 Every credential gate in the proxy asks the authority, and this subsection gives that exchange.
-The gates are a route's `require`, `/perf` and `/traffic` through `metrics_require`, and a source node's `GET` and `POST /genid` through `read_require` and `write_require` (`m6-http/src/health.rs:657`, `m6-http/src/health.rs:683`).
+The gates are a route's `require`, and a source node's `GET` and `POST /genid` through `read_require` and `write_require`.
 The authority decodes every credential.
 The authority is the backend named by `[auth] backend`, which must name a `[[backend]]` with `sockets` (`m6-http/src/config.rs:1543`).
-A gate configured with no `[auth]` stops the start with exit `2` (`m6-http/src/config.rs:1556`, `m6-http/src/config.rs:1587`, `m6-http/src/config.rs:1702`).
+A gate configured with no `[auth]` stops the start with exit `2` (`m6-http/src/config.rs:1502`, `m6-http/src/config.rs:1508`, `m6-http/src/config.rs:1633`).
 
 The proxy takes the credential from `Authorization: Bearer` or the `session` cookie (`m6-http/src/auth.rs:56`).
 A request that carries neither is refused by the proxy, so the authority never sees it (`m6-http/src/main.rs:1786`).
