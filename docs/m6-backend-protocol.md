@@ -3,8 +3,7 @@
 **The contract between `m6-http` and a backend.**
 It is language agnostic and normative: anything that satisfies it is a valid m6 backend, whatever it is written in.
 
-The contract is the primary interface of the platform, and `m6-core` is a convenience for writing Rust backends against it.
-It is not required, and it is not allowed to justify a change that would make a non-Rust backend harder to write.
+`m6-core` is an optional library for writing Rust backends against it, and no change to `m6-core` may make a non-Rust backend harder to write.
 
 **Conformance language.**
 MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used in the *RFC* (Request for Comments) 2119 sense.
@@ -29,7 +28,6 @@ Anything else is a new version number.
 ## 1. Transport
 
 A backend receives every request over one Unix domain socket, and this section fixes that socket: its path, the order in which it is bound, and how long a connection lives.
-The socket is the whole transport, because the proxy is the only process that connects to it.
 
 The backend MUST listen on a Unix domain socket of type `SOCK_STREAM`.
 A Unix socket is not reachable from the network, so a backend on this contract needs no *TLS* (Transport Layer Security) and no TCP listener.
@@ -49,6 +47,14 @@ The glob exists so a pool can have more than one member, with names such as `my-
 
 `m6-site-toml.md` owns the `sockets` key and the pool behaviour, including how a socket joins or leaves the pool.
 
+By default, an `m6-auth-server` listens on two sockets.
+The proxy treats one of them as the authority, so the split is part of this contract.
+The primary is the service's socket, `/run/m6/<config file stem>.sock` by default (`m6-core/src/server.rs:46`).
+The check socket sits beside it as `<parent>/check-<primary file name>` (`m6-auth-server/src/main.rs:174`), so `/run/m6/m6-auth.sock` pairs with `/run/m6/check-m6-auth.sock`.
+The four login routes answer on the primary socket and `POST /check` answers on the check socket.
+A route that belongs to the other socket answers the house `404` (`m6-auth-server/src/main.rs:768`), which is the same answer an unknown path gets.
+A `[auth] backend` whose glob matches the primary socket gets `404` from that member, and the start probe stops the proxy (§2.7).
+
 ### 1.2. Binding sequence
 
 The backend MUST take these steps in this order.
@@ -60,11 +66,8 @@ The backend MUST take these steps in this order.
   The proxy's user MUST be able to connect.
   A group used to admit the proxy MUST contain only users trusted as the proxy is trusted, because every user who can connect can send the proxy-owned fields in §2.5.
   With mode `0666` and a `0755` directory, any local user on the host can connect and bypass the proxy.
-  The socket is not reachable from the network.
   The m6 service default is `0660`, which lets the proxy connect when its user is in the socket's group.
   A backend that runs as its own user SHOULD set `0666` only when the parent directory limits traversal to the same trusted users.
-  A backend that any user outside that set can reach MUST NOT trust the fields in §2.2 and §2.3.
-  A socket the proxy cannot connect to serves no traffic at all.
 - **Listen with a backlog of at least 64.**
 
 The service manager can create the parent directory, for example systemd's `RuntimeDirectory=` with `RuntimeDirectoryMode=0750`.
@@ -81,8 +84,7 @@ The backend MUST close the connection after responding to a request that carries
 Pipelining does not occur and MUST NOT be relied on.
 A backend MAY handle connections concurrently, as §7 sets out.
 
-The socket, its mode and its one-request lifetime are the whole transport contract.
-Section 2 gives the request that travels inside it.
+Section 2 gives the request that travels over the socket.
 
 ## 2. The request
 
@@ -100,9 +102,6 @@ field-name ":" OWS field-value OWS CRLF
 CRLF
 [ message-body ]
 ```
-
-The version token is always `HTTP/1.1`, regardless of the version the client used.
-A request that arrived over HTTP/2 or HTTP/3 is translated, as §2.4 sets out.
 
 The request target is in origin-form: an absolute path, optionally followed by `?` and a query string.
 The proxy forwards the target in the encoded form the client sent, so the backend MUST decode it before use and MUST treat the decoded result as untrusted input (§6.2).
@@ -123,7 +122,6 @@ Take from it that `Host` is the client's value, forwarded unchanged when the cli
 | `Connection` | `close` |
 
 **Table 1: the fields every forwarded request carries.**
-Every row is present except `Content-Length`, which is present when the body is non-empty.
 `Host` is client-supplied and attacker-controlled (§2.5).
 
 ### 2.3. Headers the proxy can add
@@ -133,11 +131,12 @@ Take from it that a protected route is the only place the claims field appears.
 
 | Field | When | Meaning |
 |---|---|---|
-| `X-Auth-Claims` | The route declares `require` | The identity the auth server answered for this request: `sub`, `username`, `roles` and `groups`, base64-encoded JSON |
+| `X-Auth-Claims` | The route declares `require` | The identity the authority answered for this request: `sub`, `username`, `roles` and `groups`, base64-encoded JSON |
 
 **Table 2: the field the proxy adds after routing.**
-The value is encoded, so a backend decodes it before reading any claim.
-The four named fields are the whole value. The token's `exp`, `iss` and any extra claim do not survive, because the proxy forwards the identity the authority answered and not the token it received.
+The value holds the four named fields and nothing else: the proxy forwards the identity the authority answered, so the token's `exp`, `iss` and any extra claim do not appear.
+The encoder writes exactly those keys (`m6-core/src/auth.rs:147`), and the backend-side parser reads them into the `auth_*` request-dictionary keys (`m6-core/src/site.rs:2087`, `m6-core/src/request.rs:684`).
+Every `require` request that reaches a backend has passed the check, so it carries the field (§2.7).
 
 Every field not in Table 1 or Table 2 is forwarded from the client unchanged, in the order the client sent it, except the hop-by-hop and proxy-owned fields in §2.5.
 A field named by the client's `Connection` header is also dropped (RFC 9110 §7.6.1).
@@ -158,7 +157,7 @@ connection   upgrade   keep-alive   transfer-encoding
 te           trailer   proxy-authorization   proxy-connection
 ```
 
-Proxy-owned fields are stripped from client input before routing, on every protocol, and the proxy re-adds the ones it can vouch for:
+Proxy-owned fields are stripped from client input before routing, on every protocol:
 
 ```text
 content-length   x-auth-claims   x-forwarded-for   x-forwarded-proto   x-forwarded-host   x-real-ip
@@ -167,8 +166,7 @@ content-length   x-auth-claims   x-forwarded-for   x-forwarded-proto   x-forward
 The proxy re-emits `Content-Length` from the body it sends, `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` on every request, and `X-Auth-Claims` on a `require` route.
 It drops `X-Real-IP` and never re-adds it.
 
-`Host` is the exception.
-The proxy forwards the client's `Host` unchanged and writes one only when the client sent none (§2.2), so a backend MUST treat `Host` as attacker-controlled.
+The proxy forwards the client's `Host` unchanged (§2.2), so a backend MUST treat `Host` as attacker-controlled.
 
 The stripping is a security boundary.
 A backend that resolves a repeated field by first match would take a client's forged copy, because the proxy appends its own copy after the client's.
@@ -181,18 +179,65 @@ That trust holds only while the socket is reachable by the proxy alone (§6.1), 
 ### 2.6. Request body
 
 A body is present when `Content-Length` is present and non-zero.
-The proxy writes entire bodies and never chunked transfer coding, so `Transfer-Encoding` never appears on a forwarded request.
+The proxy writes the whole body under `Content-Length`, so `Transfer-Encoding` never appears on a forwarded request.
 
 The backend MUST read exactly `Content-Length` bytes.
 A read beyond that waits for bytes that will never arrive, until the proxy's timeout expires.
 
-Those are the fields a backend parses.
-It MAY trust the proxy-owned values in §2.2 and §2.3 only while §2.5 holds, with `Host` excepted.
+### 2.7. The check the proxy makes
+
+Every credential gate in the proxy asks the authority, and this subsection gives that exchange.
+The gates are a route's `require`, `/perf` and `/traffic` through `metrics_require`, and a source node's `GET` and `POST /genid` through `read_require` and `write_require` (`m6-http/src/health.rs:657`, `m6-http/src/health.rs:683`).
+The authority decodes every credential.
+The authority is the backend named by `[auth] backend`, which must name a `[[backend]]` with `sockets` (`m6-http/src/config.rs:1543`).
+A gate configured with no `[auth]` stops the start with exit `2` (`m6-http/src/config.rs:1556`, `m6-http/src/config.rs:1587`, `m6-http/src/config.rs:1702`).
+
+The proxy takes the credential from `Authorization: Bearer` or the `session` cookie (`m6-http/src/auth.rs:56`).
+A request that carries neither is refused by the proxy, so the authority never sees it (`m6-http/src/main.rs:1786`).
+A credential is written into one request with no body (`m6-http/src/auth.rs:87`):
+
+```text
+POST /check HTTP/1.1
+Host: localhost
+Authorization: Bearer <credential>
+Content-Length: 0
+Connection: close
+```
+
+A credential carrying CR, LF or NUL, or longer than one header line, is refused before this request is written (`m6-http/src/auth.rs:94`).
+The check has a 50 ms deadline in its own timeout table, so a slow authority delays a gated request by at most 50 ms (`m6-http/src/auth.rs:11`).
+
+The answer has three outcomes (`m6-core/src/auth.rs:100`):
+
+- A `200` whose JSON body carries all four identity fields is an identity (`m6-core/src/auth.rs:102`).
+- A `401` is the authority's refusal (`m6-core/src/auth.rs:105`).
+- Every other status, a `200` that does not parse, a timeout and a connect failure are no decision (`m6-core/src/auth.rs:106`).
+
+Each gate applies its own `require` string to the identity (`m6-core/src/auth.rs:81`).
+An identity without the named role or group is `403` (`m6-core/src/auth.rs:86`).
+A refusal is the `401` or `403` from the one definition (`m6-core/src/http.rs:159`).
+The `401` carries `WWW-Authenticate: Bearer`.
+On a route, an allowed request is forwarded with `X-Auth-Claims` set (§2.3).
+A browser with no credential, or one the authority refused, is redirected to `/login`, or to `/auth/refresh` when it still holds a refresh cookie (`m6-http/src/main.rs:5599`).
+The metrics and generation endpoints answer the refusal unchanged (`m6-http/src/main.rs:1896`, `m6-http/src/main.rs:5411`).
+No decision is `503` with `Retry-After: 1` at every gate, because a `401` would tell a user with a valid credential to log in again (`m6-http/src/main.rs:5808`).
+
+The `m6-auth-server` reads the identity from its database on every check, so a role change or a revocation counts from the next request (`m6-auth-server/src/handlers.rs:485`).
+Its `200` carries `Cache-Control: no-store` (`m6-auth-server/src/handlers.rs:513`).
+A missing, invalid or expired token is `401` `{"error":"unauthorised"}` (`m6-auth-server/src/handlers.rs:540`).
+A locked database is `503` `{"error":"unavailable"}` at once, because the proxy's 50 ms deadline would pass before the service's one-second deferral (`m6-auth-server/src/handlers.rs:532`).
+
+The proxy probes every `[auth] backend` member once at start with one credential-less `POST /check` under a 2 s deadline (`m6-http/src/main.rs:7028`).
+A member that answers `401` or `503` serves checks (`m6-http/src/main.rs:7046`).
+A `404` stops the start and names the socket (`m6-http/src/main.rs:7050`).
+An unreachable member warns and the node starts (`m6-http/src/main.rs:7065`).
+
+Those are the fields a backend parses and the check that runs before `X-Auth-Claims` appears.
+A backend MAY trust the proxy-owned values in §2.2 and §2.3 only while §2.5 holds, with `Host` excepted.
 Section 3 gives the response it writes.
 
 ## 3. The response
 
-The proxy validates every response before a client sees it, and framing is the part it validates hardest.
 This section gives the wire format, the three framing choices, the responses that carry no body, and the headers a backend sends.
 
 ### 3.1. Wire format
@@ -220,7 +265,7 @@ A backend MUST do exactly one of these:
 - send `Transfer-Encoding: chunked` and a correctly framed chunked body.
 - send neither and signal the end of the body by closing the connection.
 
-A backend SHOULD choose the first: it is the simplest to produce correctly, and the reference examples use it.
+A backend SHOULD send `Content-Length`.
 
 The proxy refuses a response that:
 
@@ -234,7 +279,6 @@ The proxy refuses a response that:
 A refused response reaches the client as a backend error (§5).
 
 `Transfer-Encoding` is parsed as a comma-separated list, so `gzip, chunked` is chunked.
-A backend MAY send it and SHOULD prefer `Content-Length`.
 A chunked body MUST terminate every chunk with CRLF and end with a terminated trailer section.
 
 ### 3.3. Responses that must not have a body
@@ -250,8 +294,7 @@ The proxy stops reading at the header section for these responses and closes the
 
 The backend SHOULD send `Content-Type` on every response with a body, and MUST include a `charset` parameter on textual types.
 
-The charset is part of the representation.
-A browser falls back to Latin-1 for a textual type without one, so correct UTF-8 bytes render as mojibake and the missing label is the only fault.
+A browser reads a textual type without a charset as Latin-1, so correct UTF-8 bytes render as mojibake.
 
 ### 3.5. Caching
 
@@ -268,7 +311,7 @@ The proxy is a cache: `m6-http` negotiates between and caches the representation
 A backend MAY compress.
 If it does, it MUST send an accurate `Content-Encoding` and MUST honour `Accept-Encoding`, including `q=0` meaning not acceptable.
 
-A backend that does not compress serves one representation, which is a legitimate choice for a service that would rather spend its cycles elsewhere.
+A backend that does not compress serves one representation.
 Either way it MUST declare which, in config, so the proxy and the backend agree.
 Section 3.6.1 gives the key.
 
@@ -284,7 +327,6 @@ compresses = false          # default: true
 ```
 
 The proxy uses `compresses` to decide whether to advertise an encoding dimension on a cache miss.
-A backend that does not compress has one representation, so `Vary: Accept-Encoding` would promise variants that can never exist, and every shared cache downstream would fragment its storage on a field that cannot change the body.
 When the backend sent no `Vary` and does not compress, a cache miss adds none.
 When the backend sent a `Vary`, a cache miss keeps its field names and adds `Accept-Encoding` to them, even when the backend does not compress.
 A cache hit, including a `304` revalidation, adds `Accept-Encoding` to the served `Vary` whatever `compresses` says, because the cache key carries the content coding.
@@ -305,7 +347,6 @@ Take from it that a false declaration is worse in one direction than the other.
 A `false` declaration is the dangerous one because the client that cannot read the body has no way to ask again.
 
 The default is `true`, because an `m6-core` backend compresses unless told not to.
-A `site.toml` written before the key existed keeps working and keeps agreeing.
 
 Those are the rules a response satisfies.
 Section 4 gives the status codes the proxy treats specially.
@@ -338,7 +379,7 @@ Section 5 gives the conditions under which no response arrives.
 ## 5. Failure handling
 
 The proxy turns every backend failure into a status the client can act on.
-This section gives the proxy's response to each failure, because a backend author needs to know which failures are survivable.
+This section gives the proxy's response to each failure.
 
 Table 5 gives the conditions.
 Take from it that a transport-level failure the proxy cannot route to another member reaches the client as a `502`, whatever its cause.
@@ -371,12 +412,12 @@ This section gives both boundaries and the header-injection rule that follows.
 ### 6.1. Trust boundary
 
 The backend socket MUST be reachable only by the proxy.
-The permissions on the socket's directory are the mechanism, and everything in §2.5 depends on them.
+The permissions on the socket's directory enforce this, and §2.5 depends on them.
 
 ### 6.2. Untrusted input
 
 Every field in a request is attacker-controlled except the proxy-owned fields in §2.2 and §2.3.
-`Host` is client-supplied, so it stays in the untrusted set.
+`Host` is client-supplied and untrusted.
 
 A backend MUST:
 
@@ -391,19 +432,18 @@ A CR or LF in a field value terminates the header section early and injects an a
 
 The proxy performs the equivalent check in the other direction and refuses a request whose fields would inject HTTP/1.1 framing.
 
-Those rules hold whatever language the backend is written in.
 Section 7 gives the concurrency the socket supports.
 
 ## 7. Concurrency
 
-A backend is required to accept work while it is busy.
 This section gives the concurrency model a member needs.
 
 A backend MUST be able to accept a new connection while it is handling another.
 It MAY use threads, processes or an event loop.
 
 The reference model, given in `m6-architecture.md` §7.1, is one process with one event loop, scaling by running more instances.
-A backend at its connection ceiling stops accepting, and clients wait in the kernel's listen backlog. The proxy's own deadline answers a request that waits there too long.
+A backend at its connection ceiling stops accepting, and clients wait in the kernel's listen backlog.
+The proxy's own deadline answers a request that waits there too long.
 
 That is the concurrency a member provides.
 Section 8 gives the lifecycle that puts a member in the pool and takes it out.
@@ -416,8 +456,7 @@ A load that succeeds answers `204` with `Cache-Control: no-store`.
 A load that fails assigns nothing, the old site keeps serving, and the answer is `500` with `Cache-Control: no-store` and a body naming the cause.
 
 A method other than POST on `/genid` is `405` with `Allow: POST`, and a route whose pattern is exactly `/genid` is refused at startup.
-The socket's directory permissions are the only authentication for this request (§6.1): there is no token and no mTLS.
-The caller compares its own generation identity, which this response does not carry.
+The socket's directory permissions are the only authentication for this request (§6.1).
 Section 8 gives the lifecycle.
 
 ## 8. Lifecycle
@@ -446,7 +485,7 @@ A backend that exits leaving the file behind leaves a member whose connect is re
 ### 8.3. Exit codes
 
 Table 6 gives the three codes.
-Take from it that a supervisor learns from the code whether the process ever bound.
+Take from it that code `2` tells a supervisor the process never bound.
 
 | Code | Meaning |
 |---|---|
@@ -455,7 +494,7 @@ Take from it that a supervisor learns from the code whether the process ever bou
 | `2` | Configuration or usage error, detected before binding |
 
 **Table 6: the three exit codes.**
-Code `2` means the process failed before binding, so a supervisor can tell a misconfiguration from a crash.
+A supervisor tells a misconfiguration from a crash by that code.
 
 Those are the three events in a member's lifecycle.
 Section 9 collects every MUST into one checklist.
@@ -483,6 +522,7 @@ Everything a backend MUST do:
 - [ ] Declare in `site.toml` whether the service compresses, and refuse to start with exit `2` when the declaration disagrees with what it does (§3.6.1).
 - [ ] If it compresses, send an accurate `Content-Encoding` and honour `Accept-Encoding` (§3.6).
 - [ ] Trust the proxy-owned fields in §2.2 and §2.3 only while the socket is reachable by the proxy alone (§2.5).
+- [ ] If `[auth] backend` names it, answer `POST /check` on the check socket with a `200` identity, a `401` refusal or a `503` when it cannot decide, and answer the house `404` for every other path (§2.7).
 - [ ] Treat `Host` as attacker-controlled (§2.5, §6.2).
 - [ ] Reject or sanitise path traversal before using a request-derived value in a filesystem path (§6.2).
 - [ ] Bound anything derived from the request that it allocates (§6.2).
@@ -490,12 +530,7 @@ Everything a backend MUST do:
 - [ ] On `SIGTERM` or `SIGINT`, stop accepting, drain, unlink the socket and exit `0` (§8.2).
 - [ ] Exit immediately on a second `SIGTERM` or `SIGINT` (§8.2).
 
-There is no requirement to implement TLS, HTTP/2, HTTP/3, chunked encoding, caching, authentication or connection reuse.
-The proxy terminates TLS and the newer protocols, caches responses and verifies tokens.
+The proxy terminates TLS, HTTP/2 and HTTP/3, caches responses, and asks the authority for every credential gate (§2.7), so a backend implements none of them.
 Compression is the exception: §3.6 makes it the backend's job, and `m6-http` has no compressor.
 
-The checklist is small enough to implement from scratch in any language.
 `m6-backend-examples.md` gives six reference implementations, all written against this document.
-
-A backend that meets these items serves the contract this version defines, whatever language it is written in.
-A later version adds to it without breaking what this version promises.
