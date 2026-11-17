@@ -2970,7 +2970,7 @@ fn event_loop(
     #[cfg(feature = "count-allocations")]
     m6_core::testkit::alloc_count::arm();
 
-    // ALLOC-0: the counted window can begin after a run's warm-up, so the
+    // The counted window can begin after a run's warm-up, so the
     // per-request figure is not polluted by the one TLS handshake every run
     // makes. A handshake's own allocation count moves with the read sizes the
     // peer's flight arrives in, and on the build host it moved by more than the
