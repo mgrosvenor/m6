@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use m6_core::limits::{BoundedBuf, Limit};
+use m6_core::limits::{Bounded, Limit};
 
 /// The longest the monitor waits before starting the reader again.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -127,7 +127,7 @@ pub struct Reader {
     child: Option<Child>,
     stdout: Option<ChildStdout>,
     /// The one line being assembled, bounded by a named limit.
-    line: BoundedBuf,
+    line: Bounded<u8>,
     /// A line past the limit is dropped, and its bytes are ignored until its
     /// newline arrives, so the next line starts clean.
     dropping: bool,
@@ -154,7 +154,7 @@ impl Reader {
             follow: true,
             child: None,
             stdout: None,
-            line: BoundedBuf::new(limit),
+            line: Bounded::<u8>::new(limit),
             dropping: false,
             restart_at: None,
             backoff: Duration::from_secs(1),
@@ -171,7 +171,7 @@ impl Reader {
             follow: true,
             child: None,
             stdout: None,
-            line: BoundedBuf::new(limit),
+            line: Bounded::<u8>::new(limit),
             dropping: false,
             restart_at: None,
             backoff: Duration::from_secs(1),
@@ -193,7 +193,7 @@ impl Reader {
             follow: false,
             child: None,
             stdout: None,
-            line: BoundedBuf::new(limit),
+            line: Bounded::<u8>::new(limit),
             dropping: false,
             restart_at: None,
             backoff: Duration::from_secs(1),

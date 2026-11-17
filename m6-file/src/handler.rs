@@ -464,8 +464,9 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
                         .saturating_add(1);
                     match limit.grown(lookback as usize, needed) {
                         Some(next) => {
+                            let from = lookback as usize;
                             lookback = (next as u64).min(file_size);
-                            limit.log_growth(next);
+                            limit.log_growth(from, next, "a tail read");
                         }
                         None => return Ok(tail_too_large(lookback + 1)),
                     }
@@ -493,8 +494,9 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
             let size = limit
                 .grown(body.capacity(), owed as usize)
                 .unwrap_or(owed as usize);
+            let from = body.capacity();
             body.reserve_exact(size);
-            limit.log_growth(size);
+            limit.log_growth(from, size, "a tail read");
         }
         Read::by_ref(&mut file)
             .take(owed)

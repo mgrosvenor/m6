@@ -1597,8 +1597,9 @@ impl ServerConn {
                     self.refuse_request(self.in_buf.len() + 1);
                     return Ok(Read::More);
                 };
+                let before = self.in_buf.len();
                 self.in_buf.resize(grown, 0);
-                self.read_limit.log_growth(grown);
+                self.read_limit.log_growth(before, grown, "a request body");
             }
 
             match self.fill()? {
@@ -2044,8 +2045,9 @@ impl std::io::Write for OutBuf<'_> {
             let Some(size) = self.limit.grown(self.buf.len(), end) else {
                 return Err(io::Error::other(self.limit.exceeded(end, "response")));
             };
+            let from = self.buf.len();
             self.buf.resize(size, 0);
-            self.limit.log_growth(size);
+            self.limit.log_growth(from, size, "a response");
         }
         self.buf[*self.len..end].copy_from_slice(bytes);
         *self.len = end;

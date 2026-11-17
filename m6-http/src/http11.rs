@@ -1605,7 +1605,7 @@ fn make_out_room(
         if let Some(size) = limit.grown(cap, body_len + 4096) {
             out_buf.clear();
             out_buf.reserve_exact(size);
-            limit.log_growth(out_buf.capacity());
+            limit.log_growth(cap, out_buf.capacity(), "a response");
         }
     }
     true
@@ -1695,7 +1695,12 @@ fn drive_h1<S, FH, FO, FR>(
                         }
                         let before = h1.read_buf.capacity();
                         h1.read_buf.extend_from_slice(&tmp[..n]);
-                        crate::limits::log_growth(limit, before, h1.read_buf.capacity());
+                        crate::limits::log_growth(
+                            limit,
+                            before,
+                            h1.read_buf.capacity(),
+                            "a request body",
+                        );
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         dry = true;

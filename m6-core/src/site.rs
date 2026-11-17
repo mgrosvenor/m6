@@ -728,6 +728,7 @@ impl Site {
                     &self.state.page_area,
                     &mut resp,
                     dict,
+                    raw.path(),
                 ) {
                     Ok(rendered) => in_area = rendered,
                     Err(RenderError::TooLarge(needed)) => {
@@ -1696,7 +1697,7 @@ pub(crate) struct FrameworkState {
     /// `render_page` limit's start, grown only past it, never shrunk and never
     /// freed per request. One request renders at a time on the service's one
     /// loop, so the borrow is never contended.
-    pub(crate) page_area: RefCell<crate::limits::BoundedBuf>,
+    pub(crate) page_area: RefCell<crate::limits::Bounded<u8>>,
 
     #[cfg(feature = "flash")]
     pub(crate) flash_secret: Vec<u8>,
@@ -1978,7 +1979,7 @@ impl FrameworkState {
             }
         };
 
-        let page_area = RefCell::new(crate::limits::BoundedBuf::new(
+        let page_area = RefCell::new(crate::limits::Bounded::new(
             config.limits.get(&crate::limits::RENDER_PAGE),
         ));
 
@@ -2249,9 +2250,10 @@ impl FrameworkState {
     /// released the read lock.
     pub(crate) fn render_response(
         renderer: &dyn Renderer,
-        page_area: &RefCell<crate::limits::BoundedBuf>,
+        page_area: &RefCell<crate::limits::Bounded<u8>>,
         resp: &mut Response,
         dict: &Dict,
+        path: &str,
     ) -> std::result::Result<bool, RenderError> {
         if let Some(template_name) = resp.template_name.take() {
             // No copy on the common path. A response that supplied its own
@@ -2269,6 +2271,7 @@ impl FrameworkState {
             // `true` for that.
             let mut area = page_area.borrow_mut();
             area.clear();
+            area.set_what_parts("page ", path);
             renderer.render(template_name.as_ref(), ctx, &mut area)?;
             resp.headers.push((
                 HeaderText::Static("Content-Type"),

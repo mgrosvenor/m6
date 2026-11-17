@@ -715,7 +715,9 @@ requests_per_min = 300
 ### 4.14. `[limits]`
 
 m6-http sizes its buffers and queues from named limits, each with a `start` and a `max`.
-The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer`, `log_field` and `heap_reserve`.
+The table lives in the system config, because memory is a property of the node.
+A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
+The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `h2_send`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer`, `log_field` and `heap_reserve`.
 `heap_reserve` is the heap m6-http reserves from the OS at start, on huge pages where the kernel has them: by default `cache_bytes` max plus 64 MiB, rounded to 2 MiB, so the cache is carved from it. A `start` below `cache_bytes` max is warned at start, naming both keys.
 [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
 

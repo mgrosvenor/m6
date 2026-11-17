@@ -34,7 +34,6 @@ use m6_http_lib::forward::{self, UpstreamId, Waiter};
 use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
-use m6_http_lib::http2::SEND_QUEUE_BYTES;
 use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
@@ -329,7 +328,7 @@ struct ServerState {
     generations: Vec<u64>,
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
-    prefetch_queue: m6_core::limits::BoundedQueue<Refresh>,
+    prefetch_queue: m6_core::limits::Bounded<Refresh>,
     /// Refreshes refused past the `refresh_queue` maximum, for the sampled
     /// error line.
     refresh_refused: u64,
@@ -1251,7 +1250,8 @@ fn take_token(state: &mut ServerState) -> Option<Token> {
 /// that will not set it still sends everything, in its own order, so the
 /// failure is a log line rather than a refused connection.
 fn limit_kernel_send_queue(fd: RawFd) {
-    if let Err(e) = m6_core::platform::net::limit_send_queue(fd, SEND_QUEUE_BYTES) {
+    let mark = m6_http_lib::limits::edge().h2_send.start();
+    if let Err(e) = m6_core::platform::net::limit_send_queue(fd, mark) {
         warn!(
             error = %e,
             "TCP_NOTSENT_LOWAT: the send queue is bounded, but this kernel will not wait for it"
@@ -7642,9 +7642,7 @@ fn run(args: Vec<String>) -> i32 {
         stats: initial_stats(stats_interval_s, traffic_interval_s),
         sources: Slots::new(initial_connections, ceiling, || Source::Vacant),
         generations: vec![0; initial_connections],
-        prefetch_queue: m6_core::limits::BoundedQueue::new(
-            &m6_http_lib::limits::edge().refresh_queue,
-        ),
+        prefetch_queue: m6_core::limits::Bounded::new(&m6_http_lib::limits::edge().refresh_queue),
         refresh_refused: 0,
         upstreams: Slots::new(initial_connections, ceiling, UpstreamEntry::empty),
         read_timeouts: Timeouts::new(

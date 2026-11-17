@@ -112,7 +112,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `alloc` | `M6Alloc`, the allocator every m6 binary installs, with `never_return`, `reserve` and `note_growth`. |
 | | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
-| | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `BoundedBuf`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
+| | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `Bounded<T>`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | | `client` | `Upstream`, `Addr`, `TlsClient`, `Reply` and `system_roots`: one outgoing HTTP request a loop drives. `Endpoint` is behind `http-client`. |
 | | `email` | `Relay`, `RelayConfig`, `Smtp` and `SmtpError`: an SMTP client a loop drives. Feature `email`. |
@@ -249,7 +249,7 @@ Every log line goes to stdout, which the journal rotates, so no signal reopens a
 
 `render` holds the interface between `Site` and a template engine.
 A route that names a template produces a `Response` carrying `template_name` and `template_dict`, a `Renderer` turns that into bytes, and a `RendererFactory` builds one at start.
-`Renderer::render` writes the page into a `BoundedBuf`, the one page area a service makes at the `render_page` limit's start and reuses for every page.
+`Renderer::render` writes the page into a `Bounded<u8>`, the one page area a service makes at the `render_page` limit's start and reuses for every page.
 A page past the limit's maximum is `RenderError::TooLarge`, and the client gets 500.
 `NoTemplates` implements both traits and errors if anything asks it to render.
 

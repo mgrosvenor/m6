@@ -1,6 +1,6 @@
 //! The rendered-page working area's allocation rules.
 //!
-//! One `BoundedBuf` is made at the `render_page` start when the service
+//! One `Bounded<u8>` is made at the `render_page` start when the service
 //! starts and reused for every page. A page under the start allocates nothing
 //! for it, a page over the start grows it once, and the pages after that, of
 //! any size up to the grown one, allocate nothing for it. Each check runs on
@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::Path;
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use m6_core::limits::{BoundedBuf, Limits, RENDER_PAGE};
+use m6_core::limits::{Bounded, Limits, RENDER_PAGE};
 use m6_core::platform::process::page_size;
 use m6_core::testkit::alloc_count;
 
@@ -41,13 +41,13 @@ fn check(run: impl FnOnce() -> Result<(), String>) -> Result<(), Failed> {
 }
 
 /// The default area: 512 KiB at start, 4 MiB at most.
-fn area() -> BoundedBuf {
+fn area() -> Bounded<u8> {
     let limits = Limits::from_toml(None, Path::new("site.toml"), page_size()).unwrap();
-    BoundedBuf::new(limits.get(&RENDER_PAGE))
+    Bounded::new(limits.get(&RENDER_PAGE))
 }
 
 /// A page written the way a renderer writes: many small pieces.
-fn write_page(area: &mut BoundedBuf, bytes: usize) {
+fn write_page(area: &mut Bounded<u8>, bytes: usize) {
     area.clear();
     let piece = [b'x'; 997];
     let mut left = bytes;
