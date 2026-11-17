@@ -968,7 +968,8 @@ chmod 600   /etc/m6/auth.pub
 systemd reads a credential as root, so both key files stay root's.
 
 Write `/etc/m6/m6-auth.conf` for the login unit and `/etc/m6/check/m6-auth.conf` for the check unit.
-Both are owned by root and readable by the m6 group, and they are identical except for the unit name in the two `[keys]` paths.
+Both are owned by root and readable by the m6 group.
+The check file is the login file without `private_key` and with the check unit name in the public key path.
 Both files have the stem `m6-auth`, so both derive `/run/m6/m6-auth.sock` as the primary path.
 
 ```bash
@@ -984,7 +985,7 @@ private_key = "/run/credentials/m6-auth-login.service/auth.pem"
 public_key  = "/run/credentials/m6-auth-login.service/auth.pub"
 CONF
 mkdir -p /etc/m6/check
-sed 's/m6-auth-login\.service/m6-auth-check.service/g' \
+sed -e '/^private_key/d' -e 's/m6-auth-login\.service/m6-auth-check.service/g' \
   /etc/m6/m6-auth.conf > /etc/m6/check/m6-auth.conf
 chown root:m6 /etc/m6/m6-auth.conf /etc/m6/check/m6-auth.conf
 chmod 640 /etc/m6/m6-auth.conf /etc/m6/check/m6-auth.conf
@@ -1029,7 +1030,8 @@ Table 1 lists the settings, the file each sits in and the program that reads it.
 | `[server] tls_cert`, `tls_key` | system config | m6-http |
 | `[auth] public_key` | system config | m6-http |
 | `[storage] path` | m6-auth config | m6-auth-server and m6-auth-cli |
-| `[keys] private_key`, `public_key` | m6-auth config | m6-auth-server and m6-auth-cli |
+| `[keys] private_key` | m6-auth config | m6-auth-server with the login side, and m6-auth-cli |
+| `[keys] public_key` | m6-auth config | m6-auth-server on both sides, and m6-auth-cli |
 | `perf_token_file` | `[monitor]` | m6-monitor |
 
 **Table 1: the settings that name a secret, key or certificate, the file each sits in and the program that reads it. Each takes an absolute path.**
@@ -1274,7 +1276,6 @@ ExecStart=/usr/local/bin/m6-auth-server \
     /etc/m6/check/m6-auth.conf \
     --check-only
 
-LoadCredential=auth.pem:/etc/m6/auth.pem
 LoadCredential=auth.pub:/etc/m6/auth.pub
 StateDirectory=m6-auth
 StateDirectoryMode=0700
@@ -1294,13 +1295,19 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-m6-auth's keys come from the two `LoadCredential` lines, and its database lives in `/var/lib/m6-auth`, which `StateDirectory=m6-auth` creates.
+m6-auth's keys come from the login unit's `LoadCredential` lines, and its database lives in `/var/lib/m6-auth`, which `StateDirectory=m6-auth` creates.
 Section 7.2 gives the layout.
 
-The two units run the same binary, the same database and the same keys.
+The two units run the same binary and the same database, and they hold different keys.
+The login unit signs tokens, so it gets both key files.
+The check unit decodes tokens and never signs one, so it gets only `auth.pub`.
 They take one config each because `LoadCredential` places a unit's keys under `/run/credentials/<unit>/`, and the `[keys]` paths in the config are absolute.
-`/etc/m6/m6-auth.conf` names `/run/credentials/m6-auth-login.service/auth.pem`, and `/etc/m6/check/m6-auth.conf` names `/run/credentials/m6-auth-check.service/auth.pem`.
-The two files are identical apart from those two paths, and both sit at a path with the stem `m6-auth` so the socket derivation agrees.
+`/etc/m6/m6-auth.conf` names `/run/credentials/m6-auth-login.service/auth.pem` and `/run/credentials/m6-auth-login.service/auth.pub`, and `/etc/m6/check/m6-auth.conf` names only `/run/credentials/m6-auth-check.service/auth.pub`.
+Both files sit at a path with the stem `m6-auth` so the socket derivation agrees.
+
+The check unit opens the database for reading and applies no schema, so it needs the file the login unit created.
+Start the login unit once before the check unit on a new deployment, or run `m6-auth-cli` to create the database.
+A check unit that starts on a missing file or a file with no schema stops with exit 2, naming the setting.
 
 The login unit binds `/run/m6/m6-auth.sock` and the four login routes.
 The check unit binds `/run/m6/check-m6-auth.sock` and `/check`.

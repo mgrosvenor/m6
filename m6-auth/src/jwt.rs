@@ -35,7 +35,9 @@ pub enum KeyAlgo {
 
 /// Holds encoding/decoding keys and the algorithm.
 pub struct JwtEngine {
-    encoding: EncodingKey,
+    /// `None` on a verify-only engine: the process holds the public key and
+    /// never signs.
+    encoding: Option<EncodingKey>,
     decoding: DecodingKey,
     algorithm: KeyAlgo,
     pub issuer: String,
@@ -64,7 +66,30 @@ impl JwtEngine {
         };
 
         Ok(JwtEngine {
-            encoding,
+            encoding: Some(encoding),
+            decoding,
+            algorithm,
+            issuer,
+        })
+    }
+
+    /// Create a verify-only engine from the public key, with no signing key.
+    ///
+    /// `/check` decodes a token and never signs one, so a process that serves
+    /// only that route needs the public key and not the private key. The
+    /// algorithm comes from the public key alone: EC is tried first, as the
+    /// signing constructor tries EC for the private key, so one key pair gives
+    /// one algorithm either way.
+    pub fn verify_only(public_pem: &str, issuer: String) -> Result<Self> {
+        let (decoding, algorithm) = if let Ok(k) = DecodingKey::from_ec_pem(public_pem.as_bytes()) {
+            (k, KeyAlgo::Es256)
+        } else {
+            let k = DecodingKey::from_rsa_pem(public_pem.as_bytes())
+                .map_err(|e| anyhow!("invalid public key (tried EC and RSA): {}", e))?;
+            (k, KeyAlgo::Rs256)
+        };
+        Ok(JwtEngine {
+            encoding: None,
             decoding,
             algorithm,
             issuer,
@@ -82,13 +107,19 @@ impl JwtEngine {
         Header::new(self.algo())
     }
 
+    fn encoding(&self) -> Result<&EncodingKey> {
+        self.encoding
+            .as_ref()
+            .ok_or_else(|| anyhow!("this process has no private signing key"))
+    }
+
     pub fn encode_access(&self, claims: &AccessClaims) -> Result<String> {
-        jsonwebtoken::encode(&self.header(), claims, &self.encoding)
+        jsonwebtoken::encode(&self.header(), claims, self.encoding()?)
             .map_err(|e| anyhow!("JWT encode error: {}", e))
     }
 
     pub fn encode_refresh(&self, claims: &RefreshClaims) -> Result<String> {
-        jsonwebtoken::encode(&self.header(), claims, &self.encoding)
+        jsonwebtoken::encode(&self.header(), claims, self.encoding()?)
             .map_err(|e| anyhow!("JWT encode error: {}", e))
     }
 

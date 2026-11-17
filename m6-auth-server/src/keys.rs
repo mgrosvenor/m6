@@ -45,6 +45,30 @@ impl KeyMaterial {
             public_key_pem: public_pem,
         })
     }
+
+    /// Load only the public key, for a process that answers `/check`.
+    ///
+    /// That route decodes a token and never signs one, so the check side does
+    /// not need the private key and must not read it: a bug in the process
+    /// that parses a client token on every protected request then cannot use
+    /// the signing key it never held.
+    pub fn load_verify_only(
+        public_key_path: &std::path::Path,
+        issuer: String,
+    ) -> anyhow::Result<Self> {
+        let public_pem = std::fs::read_to_string(public_key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read public key {}: {}",
+                public_key_path.display(),
+                e
+            )
+        })?;
+        let jwt = JwtEngine::verify_only(&public_pem, issuer)?;
+        Ok(KeyMaterial {
+            jwt,
+            public_key_pem: public_pem,
+        })
+    }
 }
 
 /// Sign a probe token with the private key and verify it with the public key.

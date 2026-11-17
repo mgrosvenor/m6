@@ -74,6 +74,13 @@ The two sockets feed one event loop and one connection table, so a `/check` that
 The second process is what removes that tail: with `/auth/login` absent from the check process's listener, the check loop runs no bcrypt, and a check process and a login process then have separate loops.
 `docs/m6-user-guide.md` section 7.4 gives the deployment that runs them as two units.
 
+The two processes do not load the same material.
+A process that binds the primary socket signs tokens and writes users, so it reads `[keys] private_key`, applies the auth schema and opens the database read-write.
+A process started with `--check-only` decodes a token and reads users, so it reads only `[keys] public_key`, applies no schema and opens the database through `m6_core::sqlite::open_read_only`, whose `PRAGMA query_only` refuses every write.
+The check side therefore needs a database that the login side created once, and a missing file or schema stops it at start with exit 2.
+It never creates the database.
+Deliver `auth.pub` to the check unit and both key files to the login unit.
+
 The service owns the signing keys, the token lifetimes, the rate limiter and one database connection, all built at start.
 It does not manage users or groups.
 `m6-auth-cli` (the *CLI*, command-line interface) writes those rows directly, and the service reads them at login and refresh.
@@ -130,7 +137,7 @@ Take from it that `[storage]` and `[keys]` are the required sections, and that t
 | `[tokens]` | `access_ttl` | integer | `900` | access token lifetime in seconds |
 | `[tokens]` | `refresh_ttl` | integer | `2592000` | refresh token lifetime in seconds |
 | `[tokens]` | `issuer` | string | `[site] domain`, then `localhost` | the `iss` claim |
-| `[keys]` | `private_key` | string | required | path to the PEM private key, absolute |
+| `[keys]` | `private_key` | string | required on the login side | path to the PEM private key, absolute. A `--check-only` process does not read it and may leave it out |
 | `[keys]` | `public_key` | string | required | path to the PEM public key, absolute |
 | `[rate_limit]` | `max_attempts` | integer | `5` | failed logins allowed per address per window |
 | `[rate_limit]` | `window_secs` | integer | `900` | length of the failure window in seconds |
@@ -174,7 +181,7 @@ window_secs  = 900                # 15 minutes
 ```
 
 The keys come from the unit's `LoadCredential` lines and the database from `StateDirectory=m6-auth`, as `m6-user-guide.md` section 7.2 sets out.
-The two-unit layout there gives the check unit its own config at `/etc/m6/check/m6-auth.conf`, identical apart from the unit name in the two `[keys]` paths.
+The two-unit layout there gives the check unit its own config at `/etc/m6/check/m6-auth.conf`, which is this file with `private_key` removed and the login unit name in `public_key` replaced by the check unit name.
 
 ### 4.1. Keys and paths
 

@@ -198,19 +198,31 @@ struct Retry {
 /// Build what the loop owns: the config, the keys, the rate limiter and the
 /// one database connection.
 ///
+/// The side decides how much is loaded. A process that serves the login routes
+/// signs tokens and writes users, so it loads the private key, opens the
+/// database read-write and applies the schema. A check-only process decodes
+/// tokens and reads users, so it loads only the public key, opens the database
+/// without the schema and cannot write it. The private key file is not read and
+/// may be absent.
+///
 /// Returns `Err` for `main` to print and exit 2. The database branches name the
 /// path they failed on: the directory that is missing, the database that
 /// cannot be opened and the connection that cannot stop waiting for a lock. The
 /// config and key branches name the setting or key that failed.
-fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
+fn build_state(site: &Site, bind: Bind) -> Result<(AppState, m6_auth::Db)> {
     let cfg =
         AuthConfig::load(site.config_path(), site.site_toml()).context("loading auth config")?;
 
-    let keys = KeyMaterial::load(
-        &cfg.private_key_path,
-        &cfg.public_key_path,
-        cfg.issuer.clone(),
-    )
+    let keys = if bind.login {
+        let private_key_path = cfg.private_key_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[keys] private_key is required because this process serves the login routes, which sign tokens: add it to the config, or run with --check-only"
+            )
+        })?;
+        KeyMaterial::load(private_key_path, &cfg.public_key_path, cfg.issuer.clone())
+    } else {
+        KeyMaterial::load_verify_only(&cfg.public_key_path, cfg.issuer.clone())
+    }
     .context("loading key material")?;
 
     if let Some(parent) = cfg.db_path.parent() {
@@ -222,8 +234,20 @@ fn build_state(site: &Site) -> Result<(AppState, m6_auth::Db)> {
             );
         }
     }
-    let db = m6_auth::Db::open(&cfg.db_path)
-        .map_err(|e| anyhow::anyhow!("opening the database {}: {e}", cfg.db_path.display()))?;
+    let db = if bind.login {
+        m6_auth::Db::open(&cfg.db_path)
+    } else {
+        m6_auth::Db::open_read_only(&cfg.db_path)
+    }
+    .map_err(|e| anyhow::anyhow!("[storage] path: {e}"))?;
+    if !bind.login {
+        db.schema_present().map_err(|e| {
+            anyhow::anyhow!(
+                "[storage] path: the database {} has no auth schema, and this process does not create it: start the login side once, or run m6-auth-cli, before --check-only: {e}",
+                cfg.db_path.display()
+            )
+        })?;
+    }
     // From here the loop owns the connection: a statement that meets another
     // process's lock must fail at once and be deferred, never wait in the loop.
     db.no_busy_wait().map_err(|e| {
@@ -274,10 +298,15 @@ fn main() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
+    // The flags are read before any state is built: `--check-only` selects the
+    // verify-only key load and the read-only database open, so a check-only
+    // process starts without the private key it never uses.
+    let bind = bind_from_args();
     let mut site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
     m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
     let read_timeout = site.read_timeout();
-    let (state, db) = build_state(&site).unwrap_or_else(|e| fail("building the auth state", e));
+    let (state, db) =
+        build_state(&site, bind).unwrap_or_else(|e| fail("building the auth state", e));
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");
@@ -290,7 +319,6 @@ fn main() -> Result<()> {
     let ceiling = ceiling.min(table.max());
     let initial = table.start().min(ceiling);
     let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
-    let bind = bind_from_args();
     let primary_socket = site.socket_path().to_path_buf();
     let check_socket = check_socket_path(&primary_socket);
     let mut login_listener = bind.login.then(|| {

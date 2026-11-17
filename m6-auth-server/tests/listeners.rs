@@ -70,6 +70,11 @@ fn setup(id: &str) -> TestEnv {
 
     let db_path = site_dir.join("data/auth.db");
     std::fs::create_dir_all(site_dir.join("data")).unwrap();
+    // The login side creates and owns the schema. A check-only process opens
+    // the file for reading without applying it, so the file and its schema
+    // exist before any process starts, as they do in a deployment where the
+    // login unit ran first.
+    drop(m6_auth::Db::open(&db_path).expect("create the auth database"));
     std::fs::write(site_dir.join("site.toml"), "").unwrap();
     let config = format!(
         r#"[storage]

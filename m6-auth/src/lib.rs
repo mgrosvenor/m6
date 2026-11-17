@@ -176,6 +176,37 @@ impl Db {
         Ok(Db(conn))
     }
 
+    /// Open an existing database for reading, without applying the schema.
+    ///
+    /// This is the check side's opener. It needs the users, groups and
+    /// memberships rows and never writes one, so the process that answers
+    /// `/check` cannot be the one that creates the schema or edits a role.
+    /// [`Db::open`] owns both, on the login side.
+    ///
+    /// The file is opened by [`m6_core::sqlite::open_read_only`], which cannot
+    /// create the file and refuses every write through the connection.
+    /// [`Db::schema_present`] is the start check that the login side has
+    /// already created the schema.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = m6_core::sqlite::open_read_only(path)?;
+        Ok(Db(conn))
+    }
+
+    /// Check that the file carries the auth schema, without writing it.
+    ///
+    /// A reader does not apply the schema, so a check process on a file the
+    /// login side has not initialized asks this before it binds. A missing
+    /// table is `Err`, as a corrupt database is.
+    pub fn schema_present(&self) -> Result<()> {
+        match self
+            .0
+            .query_row("SELECT 1 FROM users LIMIT 1", [], |_| Ok(()))
+        {
+            Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
+            Err(e) => Err(AuthError::Db(e)),
+        }
+    }
+
     /// Stop waiting for another connection's lock, so a statement that meets one
     /// fails with `SQLITE_BUSY` at once.
     ///
@@ -827,6 +858,68 @@ mod tests {
             db.0.query_row("PRAGMA journal_mode", [], |row| row.get(0))
                 .expect("pragma");
         assert_eq!(mode, "wal");
+    }
+
+    // ── Read-only open ───────────────────────────────────────────────────────
+
+    /// The reader beside a writer reads the rows the writer committed.
+    #[test]
+    fn an_open_for_reading_reads_the_writers_rows() {
+        let (writer, f) = tmp_db();
+        writer
+            .user_create_test("alice", "pass", &["admin"])
+            .expect("create");
+        let reader = Db::open_read_only(f.path()).expect("open for reading");
+        reader.schema_present().expect("the schema is present");
+        let got = reader
+            .user_get("alice")
+            .expect("get")
+            .expect("alice exists");
+        assert_eq!(got.roles, vec!["admin".to_string()]);
+    }
+
+    /// A write through the reader fails with `SQLITE_READONLY`. This is the
+    /// check side's guarantee: the process that parses a client token on every
+    /// protected request cannot edit a role.
+    #[test]
+    fn an_open_for_reading_refuses_a_write() {
+        let (writer, f) = tmp_db();
+        writer
+            .user_create_test("alice", "pass", &[])
+            .expect("create");
+        let reader = Db::open_read_only(f.path()).expect("open for reading");
+        let err = reader
+            .user_create_test("bob", "pass", &[])
+            .expect_err("a write through a reader must fail");
+        assert!(
+            matches!(
+                err,
+                AuthError::Db(rusqlite::Error::SqliteFailure(ref e, _))
+                    if e.code == rusqlite::ErrorCode::ReadOnly
+            ),
+            "expected SQLITE_READONLY, got {err}"
+        );
+    }
+
+    /// A reader never creates the file, so a check process on a missing
+    /// database stops at start and leaves no file behind.
+    #[test]
+    fn an_open_for_reading_does_not_create_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.db");
+        assert!(Db::open_read_only(&path).is_err());
+        assert!(!path.exists(), "the reader created {}", path.display());
+    }
+
+    /// A file with no auth schema is not present, and asking is not a write.
+    #[test]
+    fn schema_present_is_false_without_the_schema() {
+        let f = NamedTempFile::new().expect("tempfile");
+        let reader = Db::open_read_only(f.path()).expect("open for reading");
+        assert!(
+            reader.schema_present().is_err(),
+            "an empty file has no users table"
+        );
     }
 
     // ── User create / get ─────────────────────────────────────────────────────

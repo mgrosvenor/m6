@@ -548,6 +548,16 @@ Comments only.
 
 ### Changed
 
+**A `--check-only` `m6-auth-server` starts without the private signing key and cannot write the authority database.**
+The check unit answers `/check`, which decodes a token and reads users, so it now reads only `[keys] public_key` and opens the database through `m6_core::sqlite::open_read_only`.
+That opener creates no file, applies no schema and sets `PRAGMA query_only`, so a write through it fails with `SQLITE_READONLY`.
+It opens the file read-write without `SQLITE_OPEN_CREATE` and sets `PRAGMA query_only`, because a strict read-only connection cannot read a WAL database whose `-shm` file is absent, which is the state after the login side's clean shutdown.
+The login side still reads both keys, applies the schema and opens read-write.
+`[keys] private_key` is optional in the config and required only on the login side.
+A check process needs the database the login side created, and a missing file or schema stops it at start with exit 2.
+`docs/m6-auth.md` and `docs/m6-user-guide.md` give the check unit only `auth.pub` and say what each side loads.
+Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `--check-only` with the private key file removed exited 2 with "cannot read private key" and bound no socket, and `--check-only` on an empty data directory created `auth.db` with the five tables. After, the same missing key starts and answers 401 to `POST /check`, and the empty data directory exits 2 naming `[storage] path` and creates nothing. `check_only_starts_without_the_private_key`, `check_only_does_not_create_the_database`, `check_only_refuses_a_database_without_the_schema`, `a_check_only_process_needs_only_the_public_key` and four `m6-auth` unit tests pin it.
+
 **A route with `require` now asks m6-auth-server instead of verifying the token in m6-http.**
 Each protected request sends one `POST /check` with the caller's credential over the `[auth] backend` socket, under a 50 ms deadline, and applies the route's `require` to the identity in the answer.
 A request with no credential is answered 401 locally and makes no call.
