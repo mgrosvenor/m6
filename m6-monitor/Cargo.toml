@@ -10,7 +10,7 @@ repository.workspace   = true
 name = "m6-monitor"
 
 [features]
-# Builds the counting allocator in, as ALLOC-0 does for m6-http: the client
+# Builds the counting allocator in, as m6-http does for its allocation guard: the client
 # path's no-allocation proof needs a binary that counts. Off by default, so a
 # release build links no test harness.
 count-allocations = ["m6-core/testkit"]

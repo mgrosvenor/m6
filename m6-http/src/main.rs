@@ -46,8 +46,8 @@ use m6_http_lib::stats::Stats;
 #[global_allocator]
 static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
-/// ALLOC-ATTR: dhat replaces the counter only when attribution is asked for,
-/// because the two global allocators cannot coexist. Still behind
+/// Allocation attribution replaces the counter with dhat only when it is asked
+/// for, because the two global allocators cannot coexist. Still behind
 /// `count-allocations` (the feature implies it), still off in any released
 /// service, and it changes no request path.
 #[cfg(feature = "alloc-attribution")]
@@ -2964,7 +2964,7 @@ fn event_loop(
     // Set by a disk slice that found nothing it could do; see the slice below.
     let mut disk_slice_stalled = false;
 
-    // ALLOC-0: count this thread's allocations from the first iteration. The
+    // Count this thread's allocations from the first iteration. The
     // counter is read once at stop, after the loop, where ordinary logging may
     // allocate and is not part of the run.
     #[cfg(feature = "count-allocations")]
@@ -3351,7 +3351,7 @@ fn event_loop(
         trace.worked(first_index, last - now);
     }
 
-    // ALLOC-0: one operational line, which `tests/allocations.rs` reads from
+    // One operational line, which `tests/allocations.rs` reads from
     // the child's output. It is written after the count is taken, so logging
     // the number is not part of it.
     #[cfg(feature = "count-allocations")]
@@ -5104,7 +5104,7 @@ fn handle_request_inner(
         // follower's own state, set where a heartbeat or a forwarded request
         // already observes the failure and cleared by the next answer. No
         // timer, no probe, no clock. A second dependency is one more term on
-        // this line: AUTH-1 step 5 ORs the checker's flag in beside it.
+        // this line: the auth checker's flag is ORed in beside it.
         let degraded = health::origin_down(&state.genid);
         let (code, mut report) = health::health_answer(degraded, &state.config.node.name);
         report.process_index = state.config.server.process_index;
@@ -7200,7 +7200,7 @@ fn main() {
     // provider feature (aws-lc-rs), so the first config builder resolves and
     // installs it. Nothing in this process builds a config before that.
     //
-    // ALLOC-ATTR: the profiler is held for the whole process so every
+    // The profiler is held for the whole process so every
     // allocation is attributed. `run` returns before the explicit drop, because
     // `std::process::exit` does not run destructors and dhat writes its file on
     // drop. The path is set by the test; a plain run writes dhat-heap.json in

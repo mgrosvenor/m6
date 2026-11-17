@@ -1644,7 +1644,7 @@ impl Cache {
     /// refills on demand. This method is that whole rule. It builds the
     /// replacement beside the live cache and publishes it with
     /// `std::mem::replace`, which is read-copy-update's answer in one process
-    /// and the same publish rule G1a uses for the `Site`.
+    /// and the same publish rule a `Site` reload uses.
     ///
     /// Atomicity follows from ownership. `&mut self` means the loop cannot be
     /// reading the cache while the swap runs, and one assignment means it

@@ -4,7 +4,7 @@
 //! `harness = false` means no libtest thread runs here, so
 //! [`alloc_count::now`] reads only what these checks allocated. The plain
 //! request check is a guard: a thousand requests must allocate nothing. The TLS
-//! check is a recorded measurement for ALLOC-1 and runs only when the binary is
+//! check is a recorded TLS measurement and runs only when the binary is
 //! started with `--tls` (a rustls server thread allocates in the same process
 //! while it counts, so it asserts nothing). The test speaks libtest's protocol
 //! through `libtest-mimic`; the checks are forced onto one thread so the count
@@ -30,7 +30,7 @@ static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 fn main() {
-    // The ALLOC-1 measurement, not a test: started by hand, never listed.
+    // The TLS measurement, not a test: started by hand, never listed.
     if std::env::args().nth(1).as_deref() == Some("--tls") {
         tls_requests_report_their_allocations();
         return;

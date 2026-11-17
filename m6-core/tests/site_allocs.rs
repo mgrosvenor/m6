@@ -3,7 +3,7 @@
     reason = "test code: a blocking client with deadlines and a writer thread drive the slot from outside"
 )]
 
-//! The page path's allocation baseline, for ALLOC-3 to reduce.
+//! The page path's allocation baseline.
 //!
 //! A `Site` over a temp site with one template route and one params file is
 //! driven through a `ServerConn` for a hundred requests. Every request after
@@ -36,19 +36,20 @@ const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
 
 /// What one request on the page path may allocate.
 ///
-/// 71 when ALLOC-RENDER attributed it, on a tree that predates the four RS-2
-/// removals and does not carry CACHE-HDR's `ETag`; 67 on integration 6bb7a2f
-/// plus RS-2. The rendered-page job (I-177) removed the owned request, the
-/// compression candidate `Vec` and two of the `ETag`'s four, cached
-/// `Last-Modified`, made the dictionary's built-in keys borrow their
-/// `&'static str` and made the template name an `Arc<str>`: 50 here. The
-/// target is zero, and the remaining 13 were each attributed to a call site by
-/// a dhat profile of this test's page-path requests. A change that raises this
-/// is refused, and one that lowers it records the new number in that commit.
-/// The borrowed response head took nine of the 13 and the page copy one more:
-/// 41. The reusable page context took the last four: 36. A traced run shows all
-/// 36 are the libraries': minify-html's 21 and Tera's 15, and none is ours. A
-/// revert of the page context puts this back to 41, and of both changes to 50.
+/// 71 when the render attribution measured it, on a tree that predates the
+/// four earlier render-path removals and does not carry the cache-header
+/// `ETag`. It reads 67 on integration 6bb7a2f plus those removals. The
+/// rendered-page work removed the owned request, the compression candidate
+/// `Vec` and two of the `ETag`'s four, cached `Last-Modified`, made the
+/// dictionary's built-in keys borrow their `&'static str` and made the
+/// template name an `Arc<str>`: 50 here. The target is zero, and the remaining
+/// 13 were each attributed to a call site by a dhat profile of this test's
+/// page-path requests. A change that raises this is refused, and one that
+/// lowers it records the new number in that commit. The borrowed response head
+/// took nine of the 13 and the page copy one more: 41. The reusable page
+/// context took the last four: 36. A traced run shows all 36 are the
+/// libraries': minify-html's 21 and Tera's 15, and none is ours. A revert of
+/// the page context puts this back to 41, and of both changes to 50.
 const PAGE_BUDGET: usize = 36;
 
 fn main() {

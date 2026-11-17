@@ -1,7 +1,7 @@
 //! TLS material loaded at startup reaches every protocol, and a certificate or
 //! key that does not load is a startup error.
 //!
-//! Live reload is gone (R1a): a certificate and key are read once, when m6-http
+//! Live reload is gone: a certificate and key are read once, when m6-http
 //! starts, and a change takes a restart. These tests pin the two facts that
 //! follow. First, the one certificate written before start is the one every
 //! protocol serves. Second, a certificate file that is not PEM, or a key that

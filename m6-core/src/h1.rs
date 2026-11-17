@@ -1507,7 +1507,7 @@ impl ServerConn {
     /// The socket is read until it would block (edge-triggered) and the
     /// buffered bytes are framed. A whole request is then parsed once more to
     /// lend its head: the framing parse's head borrows a scratch array that
-    /// dies with it, and EL-3c's `RequestHead` needs the caller's slots to be
+    /// dies with it, and `RequestHead` needs the caller's slots to be
     /// the ones the parse filled, so the lending parse is the one that can
     /// return. A request already complete in the buffer is served on the same
     /// readiness event as the read that brought it.

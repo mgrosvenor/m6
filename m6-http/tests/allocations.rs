@@ -1,4 +1,4 @@
-//! ALLOC-0: heap allocations per cached request, measured by source category
+//! Heap allocations per cached request, measured by source category
 //! and held as a guard.
 //!
 //! Each row starts the `m6-http` binary cargo built for this test, which holds
@@ -10,7 +10,7 @@
 //! and the one backend-connecting first request in a run sit in both counts and
 //! cancel, so the difference is the N requests and nothing else.
 //!
-//! The rows are the four paths ALLOC-0 splits: a cache hit over HTTP/1.1 on one
+//! The rows are the four paths this test splits: a cache hit over HTTP/1.1 on one
 //! keep-alive connection, the same over HTTP/2, a cache miss that goes to the
 //! backend and is stored, and a cache hit on a new connection with a fresh TLS
 //! handshake. The last row sends one request per connection, so it is measured
@@ -21,8 +21,8 @@
 //! cargo test -p m6-http --test allocations --features count-allocations -- --test-threads=1 --nocapture
 //! ```
 //!
-//! The budgets are the top of the spread this job measured, with nothing added
-//! on top. They are ceilings: each ALLOC job lowers the row it attacks, and
+//! The budgets are the top of the spread the measurement took, with nothing
+//! added on top. They are ceilings: each change lowers the row it attacks, and
 //! none is ever raised. A budget that a run exceeds means a counted path
 //! started allocating more. The new-connection row is its own measure of what a
 //! connection costs and is reported rather than budgeted: one full handshake
@@ -115,17 +115,18 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // (`CommonState::take_received_plaintext`, which makes one such call per
 // received TLS record, and this row counts two of them per request) and one
 // `rustls::msgs::message::outbound::PrefixedPayload::with_capacity` per response
-// (`RecordLayer::encrypt_outgoing`). They are the accepted per-record buffers
-// (I-174); rustls's buffered API cannot be told to decrypt or encrypt in place.
+// (`RecordLayer::encrypt_outgoing`). They are the per-record buffers the
+// allocation budget accepts. rustls's buffered API cannot be told to decrypt
+// or encrypt in place.
 // Our request fields, cache key and header list are borrowed views of the
 // connection's read buffer, and the decoded field list is reused across
 // streams, so a cached hit allocates none of them.
 //
-// ALLOC-H1's second phase took h1_tls_miss_insert to 58,004 by removing the
-// per-header `format!` and the `String` per `Cache-Control` directive.
-// ALLOC-H1M took it to 47,004: a cache entry stores its header names and
-// values in one byte arena with `Range<u32>` pairs, so `strip_uncacheable`'s
-// twelve clones per insert became one arena build.
+// The second phase of the h1 work took h1_tls_miss_insert to 58,004 by removing
+// the per-header `format!` and the `String` per `Cache-Control` directive.
+// The header-arena change took it to 47,004: a cache entry stores its header
+// names and values in one byte arena with `Range<u32>` pairs, so
+// `strip_uncacheable`'s twelve clones per insert became one arena build.
 //
 // The new-connection row is a measure, not a budget: a full handshake per
 // connection read 122.859 to 123.849 per connection across the same runs, so a
@@ -371,7 +372,7 @@ fn check(row: Row) {
         assert!(
             calls <= budget,
             "{}: {}.{:03} calls per {} exceeds its budget of {}.{:03} calls per \
-             1,000 {}s. A counted path started allocating more. The plan is ALLOC-0.",
+             1,000 {}s. A counted path started allocating more. Fix the path rather than raising the budget.",
             row.name(),
             calls / REQUESTS as u64,
             calls % REQUESTS as u64 * 1_000 / REQUESTS as u64,
@@ -432,7 +433,7 @@ fn measure(row: Row, requests: usize) -> (u64, u64) {
     stop_counts(&svc.output(), row.name())
 }
 
-/// The `calls` and `bytes` fields of the stop line ALLOC-0 logs.
+/// The `calls` and `bytes` fields of the stop line the counting allocator logs.
 fn stop_counts(output: &str, row: &str) -> (u64, u64) {
     for line in output.lines().rev() {
         if !line.contains("allocations during the run") {

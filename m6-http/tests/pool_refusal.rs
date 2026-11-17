@@ -6,7 +6,7 @@
 //! writing when the peer goes. The pool keeps no per-member health state, so
 //! the next ordinary request is served by the same member.
 //!
-//! QUA-017's rule, that a refusal before the whole request was written is not a
+//! An earlier rule, that a refusal before the whole request was written is not a
 //! member failure, is obsolete: no request outcome changes a member's place in
 //! the rotation. This test keeps only the property that still applies, that the
 //! next request is served.

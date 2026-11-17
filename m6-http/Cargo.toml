@@ -58,7 +58,7 @@ path = "src/lib.rs"
 # counting file through `alloc-count`. `tests/allocations.rs` reads the stop
 # line of a binary built with this feature.
 count-allocations = ["m6-core/alloc-count"]
-# ALLOC-ATTR: dhat as the global allocator, so every allocation is attributed to
+# Allocation attribution: dhat as the global allocator, so every allocation is attributed to
 # a source line rather than just counted. It implies `count-allocations` so the
 # binary keeps the same arm and stop lines, and it is off by default. This is
 # measurement instrumentation only: no request path changes.
@@ -98,7 +98,7 @@ m6-core        = { path = "../m6-core", default-features = false }
 glob           = "0.3"
 bytes          = "1"
 base64         = "0.22"
-# ALLOC-ATTR only, behind `alloc-attribution`: the heap profiler that records a
+# Used only by `alloc-attribution`: the heap profiler that records a
 # backtrace for every allocation and writes dhat-heap.json at exit.
 dhat           = { version = "0.3", optional = true }
 sha2           = "0.10"
@@ -220,14 +220,14 @@ harness = false
 name = "analytics_allocs"
 harness = false
 
-# ALLOC-0: heap allocations per cached request, by row, read from the stop line
+# Heap allocations per cached request, by row, read from the stop line
 # of a binary built with the counting allocator. Needs the feature, so an
 # ordinary `cargo test --workspace` neither builds nor runs it.
 [[test]]
 name = "allocations"
 required-features = ["count-allocations"]
 
-# ALLOC-ATTR: the same four rows with dhat as the allocator, at two request
+# The same four rows with dhat as the allocator, at two request
 # counts, writing one dhat-heap.json per server run. It needs both features, so
 # an ordinary test run never builds it.
 [[test]]

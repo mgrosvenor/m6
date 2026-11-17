@@ -1841,7 +1841,7 @@ impl Http2Conn {
                     return Ok(());
                 }
             }
-            // P3 records the stream's priority from its request's HEADERS; the
+            // The stream's priority is read from its request's HEADERS. The
             // branch decodes those fields as ranges into the connection's
             // buffer, so the priority is read from the borrowed views and no
             // owned pair is built for it. Trailers carry no priority.

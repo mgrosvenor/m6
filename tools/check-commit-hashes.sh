@@ -10,7 +10,7 @@
 # repointed thirteen dead hashes in docs/PERFORMANCE.md and said so in its
 # message, and the rewrite after that one killed the replacements too. At
 # 024ec86 all 22 commit references in that document are dead again. The
-# repository had no docs check at all (ISS-128: no docs script in tools/, no
+# repository had no docs check at all (no docs script in tools/, no
 # xtask), so the next rewrite would be just as silent.
 #
 # What counts as a commit reference. Every lowercase hex token of 7 to 40

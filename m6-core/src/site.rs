@@ -2786,7 +2786,7 @@ mod tests {
     /// Step 11's read-back: a `_flash` cookie whose signature verifies reaches
     /// the template dictionary, and one that does not leaves nothing there.
     ///
-    /// These lived in `src/app.rs` after EL-6d moved `build_dict` here, and
+    /// These lived in `src/app.rs` after `build_dict` moved here, and
     /// `app.rs` has had no `mod` since, so they never compiled.
     #[cfg(feature = "flash")]
     fn flash_dict(cookie: &str, secret: &[u8]) -> Dict {

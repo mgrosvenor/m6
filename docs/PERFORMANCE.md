@@ -136,7 +136,7 @@ What changed:
 
 - `Response.headers` holds `HeaderText` pairs. A `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline, or owns a `String`, and it derefs to `str`.
 - A route's `Cache-Control`, `Last-Modified` and extra headers are made once, when the route loads, as `Arc<str>` texts that the route owns, and each response clones the `Arc`, which is a count and not an allocation. A reload that replaces the site frees the old texts once the responses still sending them are done, so nothing grows across reloads. The header names `Content-Type`, `Content-Encoding`, `ETag` and `Cache-Control` are literals.
-- The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes, so the page carries its validator to the caller and to the edge's cache, as CACHE-HDR's tests require, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it from `Response.headers`.
+- The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes, so the page carries its validator to the caller and to the edge's cache, as the cache-header tests require, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it from `Response.headers`.
 - A rendered page stays in the page area until the minifier has read it, so the copy out of the area is the minified body. A page that is not minified is copied once.
 
 A response is written from the page area only where a stage can read the area directly, which is the minifier, because `Response.body` is an owned `Vec<u8>` that the compression stage and the caller take.
@@ -247,7 +247,7 @@ Table 9 gives the four rows, measured on macOS on 2026-11-15.
 Take from it that our code allocates nothing on either hit path, and that a miss is a slow path whose budget is a ceiling.
 
 The budgets are the top of each row's observed spread with nothing added, and they only go down.
-Each ALLOC job lowers the row it attacks, the only calls allowed above a row's own count are the two named allowances below, and any other row above its budget fails the test.
+Each change lowers the row it attacks, the only calls allowed above a row's own count are the two named allowances below, and any other row above its budget fails the test.
 The miss row's one call above 47,000 is the single cache-table growth its 1,000 inserts trigger, and its observed spread across runs was 46.998 to 47.004.
 The new-connection row read 117.000 per connection, and a per-connection ceiling would fail on the run-to-run variation the handshake shows (122.859 to 123.849 before the close-path change).
 

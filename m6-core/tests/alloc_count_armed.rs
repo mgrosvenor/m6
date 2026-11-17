@@ -1,4 +1,4 @@
-//! ALLOC-0's guard on the counting allocator itself.
+//! The counting allocator's own guard.
 //!
 //! Four checks, all on the main thread so the per-thread count is this
 //! binary's own: an armed `Vec::with_capacity(10)` counts one call and ten

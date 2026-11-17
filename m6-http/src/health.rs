@@ -89,9 +89,9 @@ pub fn peer_iface(peer: IpAddr) -> Iface {
 /// `/health` reads the flag and does nothing else, so the cost is one branch,
 /// with no timer, no probe, no clock and no round trip.
 ///
-/// A second dependency is one more term at the call site in `main.rs`: AUTH-1
-/// step 5 adds the checker's flag where its `/check` call fails, and ORs it
-/// into the same `degraded` bit.
+/// A second dependency is one more term at the call site in `main.rs`: the auth
+/// checker's flag is added where its `/check` call fails and ORed into the
+/// same `degraded` bit.
 pub fn origin_down(role: &crate::genid::Role) -> bool {
     role.cache().is_some_and(crate::genid::Follower::down)
 }

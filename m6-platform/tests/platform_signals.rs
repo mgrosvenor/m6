@@ -7,8 +7,8 @@
 //! before any thread exists and the libtest harness starts one first. The
 //! harness speaks libtest's protocol through `libtest-mimic`, forced onto one
 //! thread so the checks run in `main`. The same checks run unchanged on every
-//! supported target. `OS-1-TESTS.md` section 2 names each case and the wrong
-//! implementation that must fail it.
+//! supported target. Each case names the wrong implementation that must fail
+//! it.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;

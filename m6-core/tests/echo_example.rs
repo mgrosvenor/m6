@@ -1,6 +1,6 @@
 //! The echo programs, the reference loop, proved over the wire: the nine
 //! checks of the echo prototype's `check.py` in Rust, the TLS round trips,
-//! and the cases `OS-1-TESTS.md` section 10 adds (many connections at once, a
+//! and the platform cases (many connections at once, a
 //! client that never reads, a close with a reply owed, a shutdown that drains,
 //! a reload, the loop never waiting). The same suite runs unchanged on every
 //! supported target.
@@ -419,7 +419,7 @@ fn the_table_grows_two_four_eight_and_keeps_eight() {
     assert_zero_allocations(&tail);
 }
 
-// ── The cases OS-1 adds (E2 to E7, E9) ───────────────────────────────────────
+// ── The cases the platform layer adds (E2 to E7, E9) ─────────────────────────
 
 /// E3. 200 connections open at once, one message each, all answered. The test
 /// raises its own descriptor limit through the layer, because a default soft
@@ -606,8 +606,8 @@ fn echo_tls_round_trips_and_stops() {
         assert_eq!(&back[..chunk.len()], chunk);
     }
     let tail = srv.tail();
-    // The TLS path may allocate per rustls record (ALLOC-1 takes it), so the
-    // number is reported, not asserted to be zero. The line is still required.
+    // The TLS path may allocate per rustls record, so the number is reported,
+    // not asserted to be zero. The line is still required.
     assert!(tail.contains("stopping,"), "{tail}");
     let n = tail
         .lines()

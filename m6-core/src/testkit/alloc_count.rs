@@ -3,8 +3,8 @@
 //! `alloc` and `realloc` each bump the process-wide count; `dealloc` does not.
 //! Test instrumentation only: [`crate::alloc::M6Alloc`] calls these hooks when
 //! the `alloc-count` feature is on, and compiles them out when it is off. The
-//! m6-core library never installs a global allocator. Planner B's
-//! ALLOC-0 and LOG-1 use this same counter.
+//! m6-core library never installs a global allocator. The allocation guard and
+//! the logging work use this same counter.
 //!
 //! # Two counters
 //!
@@ -14,9 +14,9 @@
 //!
 //! [`arm`], [`disarm`] and [`count`] are per thread. While a thread is armed,
 //! its own `alloc`, `alloc_zeroed` and `realloc` calls and bytes go into that
-//! thread's cells, and another thread's do not. That is what ALLOC-0 needs: a
-//! service's run loop arms once when it starts and reads its own count once at
-//! stop, so the number is the loop's, not the process's.
+//! thread's cells, and another thread's do not. That is what the allocation
+//! guard needs: a service's run loop arms once when it starts and reads its own
+//! count once at stop, so the number is the loop's, not the process's.
 //!
 //! The cells are `const`-initialised, so reading one never allocates and the
 //! allocator cannot recurse into itself. Every access is a `try_with`: an

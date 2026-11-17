@@ -27,7 +27,7 @@ const BODY_LEN: usize = 64 * 1024;
 /// `to_vec` of the whole body. With the copy gone the candidate list is all
 /// that is left, so the difference must drop by one.
 ///
-/// Measured on 2292e60 (the branch RS-1 left), before the copy was removed.
+/// Measured on 2292e60 (the branch the no-store change left), before the copy was removed.
 /// The copy and then the candidate `Vec` went; the block now allocates nothing
 /// for an `identity` request, so the difference is zero.
 const BASE_IDENTITY_DIFFERENCE: usize = 1;
@@ -52,10 +52,10 @@ const HANDLER_BUDGET: usize = 16;
 /// `Site::handle` renders a template route itself, through `render_response`,
 /// and finishes the page in the same call, so this is the render path's only
 /// count in the suite. The target is zero and this is today's count against
-/// it, so it may only ever be lowered, and ALLOC-3 carries the plan for the
-/// rest. Restoring the template-name `.clone()` costs one more.
+/// it, so it may only ever be lowered. Restoring the template-name `.clone()`
+/// costs one more.
 ///
-/// 51 on the branch; 55 on integration 6bb7a2f, where CACHE-HDR's
+/// 51 on the branch. It reads 55 on integration 6bb7a2f, where the cache-header change's
 /// `Site::finish` computes the page's `ETag` from its final bytes (four
 /// allocations). The page's own validator is the integration's behaviour, not
 /// an allocation coming back, so the budget took that integer. The

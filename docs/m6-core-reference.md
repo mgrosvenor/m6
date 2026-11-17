@@ -377,7 +377,7 @@ Error keys need no step, because they arrive as query parameters at the query st
 
 **Allocation.** `Site` allocates on the start and stop paths freely.
 The page path allocates on every request today: the owned `Request` and its dictionary, Tera and compression.
-EL-6a measures that count in `site_allocs` and ALLOC-3 reduces it.
+`site_allocs` measures that count and the page-path reduction lowers it.
 
 ### 4.7. `email` and `client::Endpoint`
 
