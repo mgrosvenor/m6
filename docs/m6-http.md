@@ -39,7 +39,7 @@ The sections run from the process's surface to its protocols.
 m6-http <site-dir> <system-config>
 ```
 
-Both arguments are required.
+Both arguments are required to serve.
 Development uses a minimal local system config (e.g. `configs/system.toml`).
 Production uses `/etc/m6/my-blog.toml`.
 The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]`, the `[health]` access keys, `[genid]` and `[cache]`.
@@ -51,6 +51,7 @@ Optional flags:
 ```
 --log-level debug    # override log level
 --dump-config        # print effective merged config to stdout, then exit 0
+--version, -V        # print the version and exit 0
 ```
 
 m6-http logs to stdout as structured JSON.
@@ -66,19 +67,20 @@ m6-http starts in this order, before it serves a request.
    It carries `[node]`, the `[server]` node keys, `[auth]`, the `[health]` access keys, `[genid]` and `[cache]`, and nothing else.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
-4. If `[auth]` is declared, note the check backend it names; the check side is probed at step 8.
-   `backend` is optional and names the socket backend that answers `/check`.
+4. If `[auth]` is declared, take the check backend it names.
+   `backend` is required and names the socket backend that answers `/check` (`m6-http/src/config.rs:833`).
+   The check side is probed at step 8 (`m6-http/src/main.rs:7400`).
 5. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
 6. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
 7. Resolve every URL backend host once.
    A name that does not resolve is exit 2.
-8. Probe every member of the `[auth] backend` pool, when that key is set.
+8. Probe every member of the `[auth] backend` pool.
    The probe sends one `POST /check` with no credential.
    A 401 or 503 passes, because a checker that refuses or is busy is there.
    A 404 is exit 2, naming the setting, the backend and the socket, because that address is not an auth server.
-   A connect failure or a timeout warns and the start continues, so a node can start while its checker is replaced.
-   When every member answered something other than 401, 503 or 404, the start is exit 2 and names the backend.
+   A connect failure or a timeout warns and skips that member, so a node can start while its checker is replaced.
+   If no member answers 401 or 503 and at least one answered another status, the start is exit 2 and names the backend.
 9. Bind the TLS and QUIC sockets on `[server].bind`.
    If `h2c_bind` is set, bind the H2C (plain-TCP HTTP/2) listener on that address.
    The listener is internal when `internal_binds` names it, and then accepts only the peers in `internal_peers`.
@@ -133,7 +135,7 @@ m6-http decides a request's path through a fixed order, and each step can answer
 4. **Method check:** a route that names `methods` answers only those, and another method is refused 405 with `Allow` before the cache is looked up or a backend is contacted.
 5. **Cache lookup:** a route with no `require` and a method that may read the cache is served from memory on a fresh hit, with no backend contact.
 6. **Route lookup:** a path that matches no route is answered 404 per `[errors] mode`.
-7. **Auth check:** when the route declares `require`, the credential is sent to `POST /check` on `[auth] backend` under a 50 ms deadline. No credential is 401 locally with no call, a 401 from the authority is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
+7. **Auth check:** when the route declares `require`, the credential is sent to `POST /check` on `[auth] backend` under a 50 ms deadline (`m6-http/src/auth.rs:11`). No credential is 401 locally with no call, a 401 from the authority is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 8. **Forward:** the request is forwarded to the backend pool.
 
 The two host redirects sit before the cache on purpose: the cache key is `(path, query, encoding)` with no host component, so a warm entry for a served name would otherwise answer a request for a name the node does not own.
@@ -487,30 +489,30 @@ m6-http has no static fallback file.
 If a route declares `require`, m6-http asks the authority before forwarding:
 
 1. Extract the credential from the `Authorization: Bearer <token>` header, or if absent from the `session` cookie.
-   The header takes precedence: API clients use it, and browsers use the cookie.
-2. Send one `POST /check` over the `[auth] backend` socket, carrying that credential, under a 50 ms deadline.
-   The token is opaque to the edge. It is not decoded and its signature is not checked here.
-3. A 200 answers `sub`, `username`, `roles` and `groups`. Check the route's `require` (`group:<n>` or `role:<n>`) against those lists.
+   The header takes precedence, because API clients use it and browsers use the cookie.
+2. Send one `POST /check` over the `[auth] backend` socket, carrying that credential, under a 50 ms deadline (`m6-http/src/auth.rs:11`).
+   The token is opaque to the edge, which forwards it unchanged and decodes nothing.
+3. A 200 answers `sub`, `username`, `roles` and `groups`. Check the route's `require` (`group:<n>` or `role:<n>`) against those lists (`m6-core/src/auth.rs:81`).
 4. A 401 is the authority refusing the credential, and the client gets 401.
    A 200 whose identity lacks the requirement is 403.
-5. A timeout, a connect failure, a 500 or a body that does not parse is 503 with `Retry-After: 1`.
-   It is never a 401: the authority did not refuse the credential, so the client is not told to log in again.
+5. A timeout, a connect failure, or an answer that is neither a 200 identity nor a 401 is 503 with `Retry-After: 1` (`m6-core/src/auth.rs:100`, `m6-http/src/main.rs:5808`).
+   The authority did not refuse the credential, so the client is not told to log in again, and the answer is never a 502.
 
 A request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
-`/perf` and `/traffic`, and a source node's `GET` and `POST /genid`, take the same path.
+`/perf` and `/traffic`, and every method a source node's `/genid` answers (`GET`, `HEAD` and `POST`), take the same path.
 Their requirements keep their names and meanings: `[health] metrics_require`, and `[genid] read_require` and `write_require`.
-A refusal is the authority's 401 or 403; a checker that does not answer is 503 with `Retry-After: 1`.
+A refusal is the authority's 401 or 403, and a checker that does not answer is 503 with `Retry-After: 1`.
 The index's `metrics_require` therefore sees a removed role or a deleted user on the next request, exactly as a route does.
 
 `m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
 `m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
-`[auth]` now needs `backend`. Config validation refuses a `require` route, `metrics_require` or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
-`[auth] public_key` is removed: the edge holds no key and decodes no token.
+`[auth]` needs `backend`. Config validation refuses a `require` route, `metrics_require` or a genid claim without `[auth]`, and `AuthConfig` requires `backend`, so a running node cannot reach a gated path with no authority (`m6-http/src/config.rs:833`, `:1550`).
+`[auth] public_key` is removed. The loader refuses a config that still sets it, because `AuthConfig` accepts only `backend` (`m6-http/src/config.rs:833`).
 
 `[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
-Its `sockets` glob must match at least one socket, and a `url` backend is refused by name.
+Its `sockets` glob must match at least one socket, and a `url` backend is refused by name (`m6-http/src/config.rs:1530`).
 The members are probed once at start (section 2 step 8).
 
 Valid requests are forwarded with the identity the authority answered, base64 JSON in `X-Auth-Claims`.
@@ -545,8 +547,8 @@ The detail goes in the process log instead, one warn line when the origin goes b
 m6-monitor's degraded line says a dependency is not answering and points at that log for which one.
 The lines go through `m6-log`, carry a static reason and allocate nothing on the request path.
 
-`/perf` and `/traffic` are gated by the `[health]` keys in Table 4.
-In two-file mode all four are node state and live in the system config.
+`/perf` and `/traffic` are gated by the keys in Table 4.
+In two-file mode all three are node state and live in the system config.
 In one-file mode they live in that one file.
 
 Each of the three endpoints reports the process that accepted the request.
@@ -575,10 +577,10 @@ A response fetched from a backend moves `requests_total`, the response-code tabl
 | Key | Where | Meaning |
 |---|---|---|
 | `[auth] backend` | system config | The `[[backend]]` whose members answer `POST /check` |
-| `[health] metrics_require` | either file, system config wins | `role:<name>` or `group:<name>`. An identity with the claim is required, from the credential a route `require` reads |
-| `[health] metrics_peers` | either file, system config wins | IP addresses in a local range. Any other peer gets 404 |
+| `[health] metrics_require` | system config | `role:<name>` or `group:<name>`. An identity with the claim is required, from the credential a route `require` reads |
+| `[health] metrics_peers` | system config | IP addresses in a local range. Any other peer gets 404 |
 
-*Table 4: the keys that decide who reads `/perf` and `/traffic`. Take from it that with none of them set the endpoints do not exist, and that a config that still names the removed `metrics_token_file` stops the start with exit 2.*
+*Table 4: the system-config keys that decide who reads `/perf` and `/traffic`. Take from it that with none of them set the endpoints do not exist, and that a config that still names the removed `metrics_token_file` stops the start with exit 2.*
 
 With none of the keys set, both endpoints answer the 404 an unconfigured path gives.
 A config that still names `[health] metrics_token_file` stops the start with exit 2, naming the key, because the legacy gate is removed.
@@ -590,7 +592,7 @@ The checks run in this order, as Table 5 shows.
 | 2 | `metrics_require` set: `POST /check` answers the credential (Authorization header or session cookie), and the identity holds the claim | 401 for no credential or a refusal, 403 for the wrong claim, 503 with `Retry-After: 1` for a checker that does not answer. Same status, headers and body as every other token-gated route |
 | 2 | `metrics_require` unset: the endpoint does not exist | 404, the body of a disabled endpoint, before any token is read |
 
-*Table 5: the metrics gate, in order. Take from it that a peer outside `metrics_peers` learns nothing, and that a token is read only when `metrics_require` names the claim it must hold.*
+*Table 5: the metrics gate, in order. Take from it that a peer outside `metrics_peers` learns nothing, and that a credential is read only when `metrics_require` names the claim it must hold.*
 
 Step 1 in Table 5 reads the peer address a completed TCP or QUIC handshake proved.
 It is never read from a header, so a forged `X-Forwarded-For` does not open the endpoints.
@@ -632,17 +634,21 @@ The 256-byte user-agent cap bounds the agent text the report shows and the text 
 
 ## 13. Exit Codes
 
-The process exits with one of three codes, as Table 7 gives.
+The process exits with one of three codes, and Table 7 gives each with the failures behind it.
 
 | Code | Meaning |
 |---|---|
 | `0` | Clean shutdown |
-| `1` | Runtime error |
-| `2` | Config or usage error, before binding |
+| `1` | Runtime error, including a failed TLS, status or H2C listener bind |
+| `2` | Config or usage error, or a failed QUIC or shared-port bind |
 
-*Table 7: the exit codes m6-http uses. Take from it that a config error ends the process before it binds, and a clean shutdown is 0.*
+*Table 7: the exit codes m6-http uses and the failures behind each. Take from it that a config error and a QUIC or shared-port bind failure both exit 2, while a TLS, status or H2C listener bind failure exits 1.*
 
-A non-zero code from Table 7 is what a unit's status reports, and code 2 is the one the startup sequence returns for a config it refuses.
+The bind arms in `m6-http/src/main.rs` carry the split: the UDP socket and `listen_shared` return 2, and the TLS, status and H2C listeners return 1.
+The code alone does not separate a config error from a QUIC or shared-port bind failure, or a TLS bind from a runtime error.
+Config validation happens before any listener binds, and `[cache].dir` and `lock_memory` are checked after the listeners are open, so a config error also exits 2 from a node whose listeners are bound.
+A non-zero code from Table 7 is what a unit's status reports.
+`m6-site-toml.md` §8 states the same split from the config side.
 
 ---
 
@@ -844,16 +850,16 @@ The fault is in one request, and a COMPRESSION_ERROR would end every other strea
 
 ### 16.5 Known gaps
 
-One HTTP/2 behaviour is absent from the server today, and Table 11 records it with the m6 issue that tracks it.
-The row states what the code does and leaves the fix to the issue.
+One HTTP/2 behaviour is absent from the server today, and Table 11 records it.
+The row states what the code does and leaves the fact here.
 
 | Gap | What the code does today | Issue |
 |---|---|---|
-| HTTP/2 error codes | The server sends NO_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, COMPRESSION_ERROR and ENHANCE_YOUR_CALM. It has no path that sends INTERNAL_ERROR, SETTINGS_TIMEOUT, CANCEL, CONNECT_ERROR, INADEQUATE_SECURITY or HTTP_1_1_REQUIRED. The two backbone clients do send CANCEL. | #163 |
+| HTTP/2 error codes | The server sends NO_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, COMPRESSION_ERROR and ENHANCE_YOUR_CALM. It has no path that sends INTERNAL_ERROR, SETTINGS_TIMEOUT, CANCEL, CONNECT_ERROR, INADEQUATE_SECURITY or HTTP_1_1_REQUIRED. The two backbone clients do send CANCEL. | none, recorded here |
 
-*Table 11: the one HTTP/2 behaviour m6-http does not implement, and the issue that tracks it. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the issue number is the record of the gap.*
+*Table 11: the one HTTP/2 behaviour m6-http does not implement, and its tracker entry. Take from it that the server sends no CANCEL or INTERNAL_ERROR, and that the error-code gap has no issue tracking it.*
 
-The issue in Table 11 is the record of the gap, and the fix is engineering work tracked there.
+`m6-http/src/http2.rs` defines the eight codes the server sends and no other.
 Event Loop below describes the one loop that drives these connections, and `m6-architecture.md` §1.10 states the rules it follows.
 
 ---
@@ -872,7 +878,7 @@ An HTTP/2 connection sends in the same way: `send_until_blocked` frames and writ
 The send queue holds one 16 KiB frame batch at a time, so a body of any size is sent in many passes, and a single pass would stop at 32 KiB because a socket that took every byte never reports a new edge.
 `rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` fetch each size with a client that announces a browser's windows.
 
-The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
+The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_STATUS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
 Every connection and every upstream gets its own `Token(k)` in the `Slots` table.
 A turn matches the token and runs one arm: accept on a listener until it would block, drain the UDP socket for QUIC, read the signal descriptor and hand it to `m6_core::signal::Lifecycle`, flush the log, or drive one connection or upstream.
 The wait is bounded by a 1 s accounting tick, every deadline table and quiche's own timeout, and is zero while the disk writer has work: each idle turn then runs one slice.
@@ -884,7 +890,7 @@ That single loop is also where every log line is written, and the next section l
 
 m6-http writes one structured JSON line per event to stdout, and journald captures it through systemd.
 
-Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token` and `auth: token verification failed` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
+Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token`, `auth: insufficient claims`, `auth: refused` and `auth check returned no decision` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
 
 Periodic stats: `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`, `hit_samples`, `hit_p0_ns`, `hit_p50_ns`, `hit_p99_ns`, `hit_max_ns`, `miss_samples`, `miss_p0_ns`, `miss_p50_ns`, `miss_p99_ns`, `miss_max_ns`, `monitor_requests`, `monitor_p50_ns` and `monitor_p99_ns`.
 `pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
@@ -894,7 +900,8 @@ Each line reports the window since the last line, and each percentile carries it
 
 ## 19. Dependencies
 
-m6-http links these crates directly: `quiche` (HTTP/3 and QUIC), `rustls` (TLS), `matchit` (routing), `bytes` (zero-copy buffers), `serde` and `toml` (config), and `jsonwebtoken` (JWT verification).
+m6-http links these crates directly: `quiche` (HTTP/3 and QUIC), `rustls` (TLS), `matchit` (routing), `bytes` (zero-copy buffers), and `serde` and `toml` (config).
+It decodes no token, so `m6-http/Cargo.toml` links no JWT library: every credential goes to `POST /check`.
 `quiche` is a fork pinned by revision, and `tools/conformance-scores.txt` records why.
 
 Where this document and the code disagree, the code is right and this document is a defect.
