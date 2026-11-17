@@ -179,6 +179,11 @@ pub struct Site {
     site_toml: PathBuf,
     socket_path: PathBuf,
     name: String,
+    /// Whether the command line asked this service to validate its own start
+    /// and dump the config. Only [`Site::load_deferring_dump`] sees it true,
+    /// because every other service has its dump answered before a `Site`
+    /// exists.
+    dump_config: bool,
     /// Index into `code` by `pattern:method`, the key the dispatch uses.
     code_index: HashMap<String, usize>,
     /// Index into the named handlers by name. `Handled::Named` is this index,
@@ -191,6 +196,9 @@ pub struct Site {
 enum StartMode {
     /// `Site::load`: logging starts and `flash_secret` is required.
     Service,
+    /// `Site::load_deferring_dump` with `--dump-config`: logging stays off
+    /// because a dump is not a serve, and nothing is bound.
+    Dump,
     /// `Site::reload`: no second `log::init` (it would replace the running
     /// sink and lose what it held), and the same `flash_secret` check.
     Reload,
@@ -217,8 +225,57 @@ impl Site {
             .map(|r| (r.pattern.to_string(), r.method.clone()))
             .collect();
         let names: Vec<String> = named.iter().map(|n| (*n).to_string()).collect();
-        let invocation = parse_invocation(&signatures, &names);
+        let invocation = parse_invocation(&signatures, &names, DumpHandling::Immediate);
         Site::start(name, invocation, None, &signatures, &names, renderer)
+    }
+
+    /// Start a service whose own start checks must run before `--dump-config`
+    /// answers.
+    ///
+    /// The service reads its config with the same statements the start uses,
+    /// then asks [`Site::dump_requested`] and calls [`Site::dump`] before it
+    /// resolves a name, opens a file or binds a socket. One sequence, so the
+    /// dump cannot accept a config the start refuses. A service that calls
+    /// this and never asks `dump_requested` would serve under `--dump-config`,
+    /// so the two calls belong together.
+    pub fn load_deferring_dump(
+        name: &str,
+        code: &[CodeRoute],
+        named: &[&str],
+        renderer: &dyn RendererFactory,
+    ) -> Site {
+        let signatures: Vec<(String, RouteMethod)> = code
+            .iter()
+            .map(|r| (r.pattern.to_string(), r.method.clone()))
+            .collect();
+        let names: Vec<String> = named.iter().map(|n| (*n).to_string()).collect();
+        let invocation = parse_invocation(&signatures, &names, DumpHandling::Deferred);
+        Site::start(name, invocation, None, &signatures, &names, renderer)
+    }
+
+    /// Whether `--dump-config` asked this service to validate its own start
+    /// and then print the config instead of serving.
+    pub fn dump_requested(&self) -> bool {
+        self.dump_config
+    }
+
+    /// Print what `--dump-config` prints, after this service has run the same
+    /// start checks. Returns the process exit code: 0 when this binary can
+    /// serve every route in the config, 2 otherwise.
+    pub fn dump(&self, code: &[CodeRoute], named: &[&str]) -> i32 {
+        let code_routes: Vec<(String, RouteMethod)> = code
+            .iter()
+            .map(|r| (r.pattern.to_string(), r.method.clone()))
+            .collect();
+        let names: Vec<String> = named.iter().map(|n| (*n).to_string()).collect();
+        print_dump(
+            &self.state.config,
+            &self.state.site_dir,
+            &self.config_path,
+            &self.site_toml,
+            &code_routes,
+            &names,
+        )
     }
 
     /// The start half with a config the caller already loaded, shared by
@@ -232,15 +289,12 @@ impl Site {
         named: &[String],
         renderer: &dyn RendererFactory,
     ) -> Site {
-        match Site::prepare(
-            name,
-            invocation,
-            config,
-            code,
-            named,
-            renderer,
-            StartMode::Service,
-        ) {
+        let mode = if invocation.dump_config {
+            StartMode::Dump
+        } else {
+            StartMode::Service
+        };
+        match Site::prepare(name, invocation, config, code, named, renderer, mode) {
             Ok(site) => site,
             Err((message, code)) => {
                 eprintln!("{message}");
@@ -272,6 +326,7 @@ impl Site {
                 site_dir,
                 config_path,
                 cli_log_level: None,
+                dump_config: false,
             },
             None,
             &signatures,
@@ -313,6 +368,7 @@ impl Site {
                 // No logging is initialised on a reload, so there is no level
                 // to resolve. The start already validated the command line.
                 cli_log_level: None,
+                dump_config: false,
             },
             None,
             &signatures,
@@ -339,6 +395,7 @@ impl Site {
             site_dir,
             config_path,
             cli_log_level,
+            dump_config,
         } = invocation;
         let cli_log_level = cli_log_level.as_deref();
 
@@ -395,9 +452,14 @@ impl Site {
         }
 
         // A service that enables flash without a key would sign every cookie
-        // with the empty key. Refuse at start rather than serve that.
+        // with the empty key. Refuse at start rather than serve that, and in a
+        // deferred dump for the same reason: a dump reports what the start says.
         #[cfg(feature = "flash")]
-        if matches!(mode, StartMode::Service | StartMode::Reload) && state.flash_secret.is_empty() {
+        if matches!(
+            mode,
+            StartMode::Service | StartMode::Dump | StartMode::Reload
+        ) && state.flash_secret.is_empty()
+        {
             return Err((
                 "Error: flash feature enabled but `flash_secret` is absent from config \
                  (generate: openssl rand -base64 32)"
@@ -423,6 +485,7 @@ impl Site {
             site_toml,
             socket_path,
             name: name.to_string(),
+            dump_config,
             code_index,
             named_index,
         })
@@ -959,6 +1022,7 @@ impl Site {
             site_toml: PathBuf::new(),
             socket_path: PathBuf::new(),
             name: "m6-test".to_string(),
+            dump_config: false,
             code_index,
             named_index,
         }
@@ -2432,6 +2496,26 @@ pub(crate) struct Invocation {
     pub(crate) site_dir: PathBuf,
     pub(crate) config_path: PathBuf,
     pub(crate) cli_log_level: Option<String>,
+    /// Whether `--dump-config` was asked for. It is only true when
+    /// [`Site::load_deferring_dump`] parsed the command line, because every
+    /// other service has its answer already and has exited.
+    pub(crate) dump_config: bool,
+}
+
+/// Who answers `--dump-config`.
+///
+/// A service with no start checks of its own leaves the answer to the shared
+/// parser, which is ahead of a `Site` and its logging. A service that parses a
+/// config the parser does not read takes the answer itself, after those reads,
+/// so the dump judges the same config the start would.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DumpHandling {
+    /// Answer in [`parse_invocation`], as every service without start checks
+    /// does.
+    Immediate,
+    /// Record the request on the [`Invocation`] and let the service answer it.
+    /// Only [`Site::load_deferring_dump`] uses this.
+    Deferred,
 }
 
 /// The binary's own name, from `argv[0]`, for `--version`.
@@ -2467,9 +2551,14 @@ pub(crate) fn program_name() -> String {
 /// against the old one both fail, in opposite directions and neither loudly.
 /// A validation step that runs before the install is what turns that from an
 /// outage into a refused deploy.
+///
+/// `dump` says who answers the flag. The shared parser answers it for a service
+/// with no start checks of its own, and records it for a service that parses a
+/// config of its own with [`Site::load_deferring_dump`].
 pub(crate) fn parse_invocation(
     routes: &[(String, RouteMethod)],
     handlers: &[String],
+    dump: DumpHandling,
 ) -> Invocation {
     let args: Vec<String> = std::env::args().collect();
 
@@ -2499,7 +2588,8 @@ pub(crate) fn parse_invocation(
         .find(|w| w[0] == "--log-level")
         .map(|w| w[1].clone());
 
-    if args.iter().any(|a| a == "--dump-config") {
+    let dump_requested = args.iter().any(|a| a == "--dump-config");
+    if dump_requested && dump == DumpHandling::Immediate {
         std::process::exit(dump_config(
             &site_dir,
             &config_path,
@@ -2513,6 +2603,7 @@ pub(crate) fn parse_invocation(
         site_dir,
         config_path,
         cli_log_level,
+        dump_config: dump_requested,
     }
 }
 
@@ -2573,6 +2664,29 @@ pub(crate) fn dump_config(
         return 2;
     }
 
+    print_dump(
+        &config,
+        site_dir,
+        config_path,
+        &site_toml,
+        code_routes,
+        handlers,
+    )
+}
+
+/// Print the resolved config and the route table, and answer 0 or 2.
+///
+/// The one printing path: the shared parser's dump and a service's
+/// [`Site::dump`] both end here, so the bytes an operator reads do not depend
+/// on which of the two answered.
+fn print_dump(
+    config: &crate::config::RendererConfig,
+    site_dir: &std::path::Path,
+    config_path: &std::path::Path,
+    site_toml: &std::path::Path,
+    code_routes: &[(String, RouteMethod)],
+    handlers: &[String],
+) -> i32 {
     println!("site_dir    {}", site_dir.display());
     println!("config      {}", config_path.display());
     println!("site.toml   {}", site_toml.display());

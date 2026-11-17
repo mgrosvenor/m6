@@ -167,6 +167,89 @@ fn a_removed_monitor_key_stops_the_start() {
     );
 }
 
+/// `--dump-config` runs the same fleet parse as the start, so a removed key in
+/// a node entry fails the dump with the start's exit code and message.
+///
+/// The dump used to go through m6-core's parser only, never built the `Fleet`,
+/// and exited 0 on exactly this config while the start exited 2. A coherence
+/// check that runs the dump therefore accepted the config the monitor would
+/// refuse.
+#[test]
+fn dump_config_refuses_a_removed_node_key() {
+    let config_text = CONFIG.replace(
+        "role = \"origin\"",
+        "role = \"origin\"\nperf_token_file = \"/etc/m6/perf-token\"",
+    );
+    let (dir, config, sock) = setup(&config_text);
+
+    let run = |dump: bool| {
+        let mut cmd = Command::new(binary("m6-monitor"));
+        cmd.arg(dir.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &sock);
+        if dump {
+            cmd.arg("--dump-config");
+        }
+        cmd.output().expect("run m6-monitor")
+    };
+
+    let dump = run(true);
+    let stderr = String::from_utf8_lossy(&dump.stderr);
+    assert_eq!(
+        dump.status.code(),
+        Some(2),
+        "--dump-config accepted a config the start refuses\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("perf_token_file"),
+        "the dump did not name the key it refused\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unknown field"),
+        "the dump did not give the unknown-key refusal\n--- stderr ---\n{stderr}"
+    );
+
+    // The start prints the same message, which is what one code path means.
+    let start = run(false);
+    assert_eq!(
+        start.status.code(),
+        Some(2),
+        "the start accepted the config\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&start.stderr),
+        stderr,
+        "the start and the dump gave different refusals for one config"
+    );
+}
+
+/// A valid config still dumps and prints the line a deploy's check reads.
+#[test]
+fn dump_config_accepts_a_valid_config() {
+    let (dir, config, sock) = setup(CONFIG);
+
+    let out = Command::new(binary("m6-monitor"))
+        .arg(dir.path())
+        .arg(&config)
+        .arg("--dump-config")
+        .env("M6_SOCKET_OVERRIDE", &sock)
+        .output()
+        .expect("run --dump-config");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a valid config must dump\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("ok: this binary can serve every route in this config"),
+        "the dump did not print the line check-configs reads\n--- stdout ---\n{stdout}"
+    );
+}
+
 /// The loop serves while a node's request hangs.
 ///
 /// The node's listener accepts the `/health` request and never answers. If the

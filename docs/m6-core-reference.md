@@ -291,9 +291,16 @@ It exits 2 on a configuration error and 1 when logging cannot start, and it refu
 `name` is the service's name for the lifecycle lines.
 `read_timeout`, `socket_mode` and `socket_path` are what the loop binds and applies, and `user_config`, `config`, `site_dir`, `config_path` and `site_toml` are the roots a service resolves its own files against. `config` is the whole parsed renderer config, for a start check a service runs itself.
 
+**A service's own config and `--dump-config`.** `Site::load` answers `--dump-config` before a `Site` exists, so that answer cannot see a table the service reads itself.
+A service with such a table calls `load_deferring_dump` instead, reads the table with the statements the start uses, and calls `dump_requested` and then `dump` before it resolves a name, opens a file or binds a socket.
+The dump then refuses what the start refuses, and it prints the same bytes the shared parser prints.
+
 ```rust
 pub const GENID_PATH: &str;
 pub fn load(name: &str, code: &[CodeRoute], named: &[&str], renderer: &dyn RendererFactory) -> Site;
+pub fn load_deferring_dump(name: &str, code: &[CodeRoute], named: &[&str], renderer: &dyn RendererFactory) -> Site;
+pub fn dump_requested(&self) -> bool;
+pub fn dump(&self, code: &[CodeRoute], named: &[&str]) -> i32;
 pub fn reload(&self, code: &[CodeRoute], named: &[&str], renderer: &dyn RendererFactory) -> Result<Site, String>;
 pub fn socket_path(&self) -> &Path;
 pub fn read_timeout(&self) -> Option<Duration>;

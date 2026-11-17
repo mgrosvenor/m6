@@ -195,21 +195,11 @@ struct Retry {
     verified: Option<m6_auth::User>,
 }
 
-/// Build what the loop owns: the config, the keys, the rate limiter and the
-/// one database connection.
+/// The config half of start: the auth table and the key material.
 ///
-/// The side decides how much is loaded. A process that serves the login routes
-/// signs tokens and writes users, so it loads the private key, opens the
-/// database read-write and applies the schema. A check-only process decodes
-/// tokens and reads users, so it loads only the public key, opens the database
-/// without the schema and cannot write it. The private key file is not read and
-/// may be absent.
-///
-/// Returns `Err` for `main` to print and exit 2. The database branches name the
-/// path they failed on: the directory that is missing, the database that
-/// cannot be opened and the connection that cannot stop waiting for a lock. The
-/// config and key branches name the setting or key that failed.
-fn build_state(site: &Site, bind: Bind) -> Result<(AppState, m6_auth::Db)> {
+/// `--dump-config` calls this and stops, so the dump judges the same config the
+/// start reads. It opens no database and reads nothing else at start.
+fn load_config(site: &Site, bind: Bind) -> Result<(AuthConfig, KeyMaterial)> {
     let cfg =
         AuthConfig::load(site.config_path(), site.site_toml()).context("loading auth config")?;
 
@@ -233,7 +223,20 @@ fn build_state(site: &Site, bind: Bind) -> Result<(AppState, m6_auth::Db)> {
         )
     }
     .context("loading key material")?;
+    Ok((cfg, keys))
+}
 
+/// Build what the loop owns from the config `load_config` already read.
+///
+/// The side decides how much is loaded. A process that serves the login routes
+/// signs tokens and writes users, so it opens the database read-write and
+/// applies the schema. A check-only process decodes tokens and reads users, so
+/// it opens the database without the schema and cannot write it.
+///
+/// Returns `Err` for `main` to print and exit 2. The database branches name the
+/// path they failed on: the directory that is missing, the database that
+/// cannot be opened and the connection that cannot stop waiting for a lock.
+fn build_state(bind: Bind, cfg: AuthConfig, keys: KeyMaterial) -> Result<(AppState, m6_auth::Db)> {
     if let Some(parent) = cfg.db_path.parent() {
         if !parent.is_dir() {
             anyhow::bail!(
@@ -312,11 +315,21 @@ fn main() -> Result<()> {
     // verify-only key load and the read-only database open, so a check-only
     // process starts without the private key it never uses.
     let bind = bind_from_args();
-    let mut site = Site::load("m6-auth-server", &ROUTES, &[], &NoTemplates);
+    let mut site = Site::load_deferring_dump("m6-auth-server", &ROUTES, &[], &NoTemplates);
+    let (cfg, keys) =
+        load_config(&site, bind).unwrap_or_else(|e| fail("building the auth state", e));
+
+    // `--dump-config` stops here, after the auth table and the key files the
+    // start reads and before the database is opened or either socket is
+    // bound. One config path, so the dump cannot accept what the start refuses.
+    if site.dump_requested() {
+        std::process::exit(site.dump(&ROUTES, &[]));
+    }
+
     m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
     let read_timeout = site.read_timeout();
     let (state, db) =
-        build_state(&site, bind).unwrap_or_else(|e| fail("building the auth state", e));
+        build_state(bind, cfg, keys).unwrap_or_else(|e| fail("building the auth state", e));
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
         fail("the open file limit", "leaves no connection table");

@@ -179,14 +179,25 @@ fn run_service() -> Result<()> {
     m6_core::signal::block();
 
     // ── start: blocking and allocation are fine ──────────────────────────
-    let mut site = Site::load("m6-monitor", &ROUTES, &[], &NoTemplates);
-    m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
+    let mut site = Site::load_deferring_dump("m6-monitor", &ROUTES, &[], &NoTemplates);
     let read_timeout = site.read_timeout();
     let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
         site.user_config().get(k).and_then(|v| v.as_u64())
     }));
     let fleet = fleet::Fleet::from_config(site.config_path())
         .unwrap_or_else(|e| fail("reading the fleet", format!("{e:#}")));
+    let history_config = history::config_from(site.user_config().get("monitor"), site.site_dir())
+        .unwrap_or_else(|e| fail("reading the history config", format!("{e:#}")));
+
+    // `--dump-config` stops here, after the same fleet and history parse the
+    // start runs and before anything resolves a name, opens a file or binds a
+    // socket. One sequence, so the dump cannot accept a config the start
+    // refuses.
+    if site.dump_requested() {
+        std::process::exit(site.dump(&ROUTES, &[]));
+    }
+
+    m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
     let tls = Arc::new(
         rustls::ClientConfig::builder()
             .with_root_certificates(
@@ -201,8 +212,6 @@ fn run_service() -> Result<()> {
     m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
     let nameserver = m6_core::dns::nameserver()
         .unwrap_or_else(|e| fail("reading the resolver configuration", e));
-    let history_config = history::config_from(site.user_config().get("monitor"), site.site_dir())
-        .unwrap_or_else(|e| fail("reading the history config", format!("{e:#}")));
     let mut history = history::start(
         history_config,
         site.limits().get(&m6_core::limits::HISTORY_QUEUE),
