@@ -1753,7 +1753,22 @@ fn complete_auth(
         priority::Priority::default()
     };
     match outcome {
-        RequestOutcome::Ready(status, headers, body, _backend, genid) => {
+        RequestOutcome::Ready(status, mut headers, body, backend, genid) => {
+            // The re-entry writes its answer here, not through `finish_miss`,
+            // so it runs the two steps that tail runs. Without them the
+            // authority's 401, the browser's 302, the 403 and the 503 are the
+            // only answers this release writes without `Alt-Svc`, and none of
+            // them is counted as answered locally.
+            set_alt_svc(&mut headers, cx.quic_port);
+            if let Some(chan) = waiter_channel(&waiter, cx.state) {
+                cx.state.stats.record(
+                    ctx.start.elapsed().as_nanos() as u64,
+                    CacheOutcome::AnsweredLocally,
+                    status,
+                    chan,
+                    &backend,
+                );
+            }
             write_waiter(
                 waiter,
                 status,

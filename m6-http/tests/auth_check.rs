@@ -629,3 +629,59 @@ fn a_check_cut_off_mid_answer_is_503_not_200() {
         response.headers
     );
 }
+
+/// The re-entry's answers advertise HTTP/3 like every other answer.
+///
+/// The wrong outcome this catches: `complete_auth` writing a `Ready` outcome
+/// straight through `write_waiter`, which skips `finish_miss` and its
+/// `Alt-Svc`. Before the fix the authority's 401, the 403 and the 503 were the
+/// only answers in the release without the header, so a client could tell that
+/// something other than the edge's own path had answered.
+#[test]
+fn the_authoritys_answers_advertise_http3_like_a_local_answer() {
+    let mut srv = TestServer::start();
+    let local = srv.request_without_check("/private/secret.txt", &[]);
+    assert_eq!(local.status, 401, "{}", local.headers);
+    let alt = local
+        .header_value("alt-svc")
+        .expect("the local 401 has no Alt-Svc");
+
+    srv.answer("refused-token", Reply::Unauthorised);
+    let refused = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer refused-token")],
+    );
+    assert_eq!(refused.status, 401, "{}", refused.headers);
+    assert_eq!(
+        refused.header_value("alt-svc").as_deref(),
+        Some(alt.as_str()),
+        "{}",
+        refused.headers
+    );
+
+    srv.answer("busy-token", Reply::Unavailable);
+    let busy = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer busy-token")],
+    );
+    assert_eq!(busy.status, 503, "{}", busy.headers);
+    assert_eq!(
+        busy.header_value("alt-svc").as_deref(),
+        Some(alt.as_str()),
+        "{}",
+        busy.headers
+    );
+
+    srv.answer("wrong-group", Reply::Identity(identity(&[])));
+    let denied = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer wrong-group")],
+    );
+    assert_eq!(denied.status, 403, "{}", denied.headers);
+    assert_eq!(
+        denied.header_value("alt-svc").as_deref(),
+        Some(alt.as_str()),
+        "{}",
+        denied.headers
+    );
+}
