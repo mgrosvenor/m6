@@ -3,15 +3,13 @@
 This document records what m6 costs, which change made it cost that, and the conditions each figure was taken under.
 It covers per-component costs inside the server.
 End-to-end figures live in [`BENCHMARKS.md`](BENCHMARKS.md), and the merge gate is `tools/perfcheck.sh`, an interleaved A/B whose run records live in `tools/perf-history.jsonl`.
-
-A figure without its conditions is unusable, so every number below carries the machine it came from and the method that produced it.
-Section 1 states the rules the rest of the document follows.
+Every number below carries the machine it came from and the method that produced it, and section 1 states the rules.
 
 ## Contents
 
 1. [What this document records](#1-what-this-document-records)
 2. [Per-request cost in m6-core](#2-per-request-cost-in-m6-core)
-3. [Allocation on the static file path](#3-allocation-on-the-static-file-path)
+3. [Allocation](#3-allocation)
 4. [Cache-hit latency, and why it is load dependent](#4-cache-hit-latency-and-why-it-is-load-dependent)
 5. [Connection setup, per channel](#5-connection-setup-per-channel)
 6. [Where a TLS handshake goes](#6-where-a-tls-handshake-goes)
@@ -24,7 +22,6 @@ Section 1 states the rules the rest of the document follows.
 ## 1. What this document records
 
 m6 keeps performance numbers in three places and each answers a different question.
-Sending a reader to the wrong one produces a figure that is accurate and irrelevant, so the split is stated first.
 
 | file | what it answers | authority |
 |---|---|---|
@@ -33,24 +30,19 @@ Sending a reader to the wrong one produces a figure that is accurate and irrelev
 | this document | what an individual component costs, and which change changed it | authoritative for per-component cost |
 
 **Table 1: where each kind of performance number lives.**
-Take from it that an end-to-end claim belongs in `BENCHMARKS.md` and a gate verdict in `tools/perfcheck.sh`, whose run records live in `tools/perf-history.jsonl`, so quoting this document for either is a mistake.
+Take from it that an end-to-end claim belongs in `BENCHMARKS.md` and a gate verdict in `tools/perfcheck.sh`, whose run records live in `tools/perf-history.jsonl`.
 
 Four rules govern every figure below.
-They exist because a performance document that breaks them misleads more effectively than no document at all.
 
 | rule | what it requires |
 |---|---|
-| conditions with every number | the machine and the method, always. CPU, core count, memory, load and the config that produced the figure all belong here. A laptop figure and a build-host figure never share a column |
+| conditions with every number | the machine and the method. CPU, core count, memory, load and the config that produced the figure all belong here. A laptop figure and a build-host figure never share a column |
 | an unmeasured change says so | "structural" means the reasoning is sound and nobody has put a number on it |
 | comparisons are paired and interleaved | run A, B, A, B against a fixed baseline, so drift hits both sides equally |
-| no figure identifies where it was taken | a number from a running instance appears as an anonymous example: its conditions in full, and no host, domain or node name. A number that has to be reproducible comes from a loopback instance, `m6-examples`, or the build host |
+| no figure identifies where it was taken | a number that has to be reproducible comes from a loopback instance, `m6-examples`, or the build host, described generically with no host, domain or node name |
 
 **Table 2: the four rules every number in this document follows.**
-Take from it that rules one and four pull in the same direction rather than against each other: hardware and config are the conditions a figure needs, and the identity of the box is not one of them.
-
-**Commit hashes recorded before 2026-09-26 do not resolve.**
-The history rewrite of that date changed every SHA in this repository, so hashes written into older records point at nothing.
-The hashes in this document were recovered by matching commit subjects and diffs, and Table 5 records the mapping.
+Take from it that hardware and config are the conditions a figure needs, and the identity of the box is not one of them.
 
 ---
 
@@ -58,7 +50,7 @@ The hashes in this document were recovered by matching commit subjects and diffs
 
 `App` built every request's dictionary by copying the whole of a service's static configuration into an empty map.
 Removing that copying took a rendered page from 2.79 ms to 1.64 ms and cut core's own copying by a factor of 280.
-This section gives the end figure, the per-copy audit behind it, the commits, and the one cost left in place.
+This section gives the end figure, the per-copy audit behind it, the changes, and the one cost left in place.
 
 ### 2.1. The rendered page
 
@@ -67,116 +59,107 @@ The figure is the median of each round's p50.
 
 | build | p50 per rendered page |
 |---|---:|
-| `4df91be`, the earlier build | 2.79 ms |
-| the branch tip, 2026-09-13 | 1.64 ms |
+| before the copy removal | 2.79 ms |
+| after it, the branch tip of 2026-09-13 | 1.64 ms |
 
 **Table 3: cost of one rendered page, before and after the copy removal, a 41% reduction.**
 Taken on a laptop, release build, with a fresh connection per request, whose cost is identical on both sides and cancels in the comparison.
 
-**The rendered bytes are identical.**
-Both builds answer `Content-Length: 16660` with ETag `"c97d83c5076770c"`, which is a content hash, so the pages match byte for byte.
-The only difference on the wire is that the newer build emits `Connection: close` when the client asked for it, which is 19 bytes and is the correct behaviour.
+Both builds answer `Content-Length: 16660` with ETag `"c97d83c5076770c"`, a content hash, so the pages match byte for byte.
+The newer build emits `Connection: close` when the client asked for it, which is 19 bytes.
 
 ### 2.2. Where the 1.15 ms went
 
-The dictionary was assembled from the config file's keys plus the site's content file.
-It was deep-copied six times per request, to produce something identical for every request.
+The dictionary was assembled from the config file's keys plus the site's content file, then deep-copied six times per request, to produce the same result for every request.
 `m6-core`'s `copy_audit` measures each copy separately, in release, against a real content file of 68 KB and 1,364 nodes.
 
 | copy | removed by | before | after |
 |---|---|---:|---:|
-| config and `site_dir` out of the read lock | `18d2efe` (J1) | 458 ns | 42 ns |
-| the matched route | `bf17313` (J6) | 167 ns | 42 ns |
-| `build_dict`, three copies inside | `18d2efe` (J2, J3, J4) | 222,708 ns | 1,125 ns |
-| `raw.clone()` into `Request` | `bf17313` (J6) | 458 ns | 0 |
-| `dict.clone()` into `Request` | `18d2efe` (J3) | 108,583 ns | 375 ns |
-| `dict.clone()` in `render_response` | `18d2efe` (J5) | 109,500 ns | 0 |
+| config and `site_dir` out of the read lock | `Arc<RendererConfig>` | 458 ns | 42 ns |
+| the matched route | routing returns a borrow | 167 ns | 42 ns |
+| `build_dict`, three copies inside | a per-route base dictionary built once per reload | 222,708 ns | 1,125 ns |
+| `raw.clone()` into `Request` | `serve_connection` hands the request to its handler | 458 ns | 0 |
+| `dict.clone()` into `Request` | the layered `Dict` | 108,583 ns | 375 ns |
+| `dict.clone()` in `render_response` | the layered `Dict` | 109,500 ns | 0 |
 | `tera::Context`, inside the engine | left in place, see 2.5 | 189,000 ns | 143,417 ns |
 | **total per request** | | **630,874 ns** | **145,001 ns** |
 
 **Table 4: the six per-request copies, each measured separately.**
-Take from it that core's own copying fell from about 442 µs to about 1.58 µs, a factor of 280, and that the remaining 143 µs is inside the template engine rather than in core.
+Take from it that core's own copying fell from about 442 µs to about 1.58 µs, a factor of 280, and that the remaining 143 µs is inside the template engine.
 
-### 2.3. The commits
+### 2.3. The change
 
-Five commits carried this work.
-Their hashes changed in the 2026-09-26 history rewrite, so both the current hash and the hash used in older records are given.
+An audit of the whole system found `m6-http` and `m6-file` already correct, with `Arc<Vec<_>>` headers and `bytes::Bytes` bodies at the edge, and `App` the only copier.
+A synthetic 20-key config had priced the copy at 3.08 µs, and against a real config it is seventy times larger, because the parser and the map cost 41 to 583 ns and the copy is the rest.
+The fix has three parts:
 
-| current | in older records | what it did |
-|---|---|---|
-| `fd77816` | `1b05a18` | Found it. The first figure was 3.08 µs from a synthetic 20-key config, which the owner judged too slow for building a small map. The parser and the map are 41 to 583 ns and the copy is the rest, seventy times larger against a real config |
-| `d7020aa` | `479f1df` | The audit across the whole system. `m6-http` and `m6-file` were already correct, using `Arc<Vec<_>>` headers and `bytes::Bytes` bodies at the edge. `App` was the only offender |
-| `18d2efe` | `13280a5` | J1 to J5. `Arc<RendererConfig>`, a per-route base dictionary built once per reload, and `m6-core/src/dict.rs`, a layered `Dict` of shared base plus per-request overlay |
-| `bf17313` | `5eb9af3` | J6. The last two copies were borrows written as copies. The route table is shared, so routing returns a borrow, and `serve_connection` hands the request to its handler |
-| `4df91be` | `22ee3a4` | The accounting change, and the earlier of the two builds in Table 3 |
+- `Arc<RendererConfig>` replaces the copy of the renderer config.
+- A per-route base dictionary is built once per reload.
+- `m6-core/src/dict.rs` holds a layered `Dict`, a shared base plus a per-request overlay.
 
-**Table 5: the copy-removal commits, with the hash each carried before the history rewrite.**
-Take from it that any hash in Table 4 or an older document resolves only through this mapping.
+The route table is shared, so routing returns a borrow, and `serve_connection` hands the request to its handler.
 
-### 2.4. The merge order the change had to preserve
+### 2.4. The merge order the change preserves
 
 The dictionary is assembled from a fixed order of sources, and the order decides which value wins.
-Built-in keys are merged after params files so that a params file cannot override `year`, `datetime` or `request_path`.
+Built-in keys are merged after params files, so a params file cannot override `year`, `datetime` or `request_path`.
 
-The layering preserves that order by construction, because built-ins live in the overlay and params files in the base.
-Steps 1 to 3 of the original order produced the same map for every request on a route, so they moved into `route.base_dict` and are shared behind an `Arc`.
-What `build_dict` still merges is what varies per request: per-request params files, path params, query params, form fields, cookies, built-ins and auth keys.
-The test was written before the change and is `dict::tests::a_base_entry_can_never_override_an_overlay_one`.
+The layering keeps that order because built-ins live in the overlay and params files in the base.
+The first three steps of the original order produced the same map for every request on a route, so they moved into `route.base_dict` behind an `Arc`.
+`build_dict` still merges what varies per request: per-request params files, path params, query params, form fields, cookies, built-ins and auth keys.
+The test `dict::tests::a_base_entry_can_never_override_an_overlay_one` was written before the change.
 
 ### 2.5. The template engine floor
 
 `tera::Context::insert` calls `to_value`, which deep-copies every entry into the engine's own `BTreeMap`, and that accounts for 143 µs of the remaining 145 µs.
-Measured against a minimal template, the case most favourable to the cost being small, building the context is 99.6% of the work, at 178,875 ns to build against 750 ns to render.
-The cost scales with the size of the context rather than with what the template reads, so a page touching three keys still pays to copy all 1,364 nodes.
+Against a minimal template, building the context is 99.6% of the work, at 178,875 ns to build against 750 ns to render.
+The cost scales with the size of the context, so a page touching three keys still pays to copy all 1,364 nodes.
 
-**Accepted on the owner's call, 2026-09-13.**
-It is recorded because the figure is larger than it looks.
-The cheaper lever sits on the site side: a content file named as both `global_params` and the route's `params` enters every page's context twice over.
-
-Removing core's copying left one measured cost inside the template engine and nothing measurable in core itself.
-The file path had a separate problem, which was allocation rather than latency.
+This cost was accepted on 2026-09-13.
+A cheaper lever sits on the site side: a content file named as both `global_params` and the route's `params` enters every page's context twice.
 
 ### 2.6. The borrowed response head
 
 A rendered page's header names and values are set up once and borrowed, and the page's own bytes are copied out of the page area once, as the minified body.
-The change took the page path from 50 allocations per request to 41 in `site_allocs`, and from 36 to 27 in `request_allocs`.
-Of the 27, 22 are the libraries': 11 in Tera's context and render, 2 in `render_to`, and 11 in minify-html.
-The other 5 are ours: the built-in `year` and `datetime` values (2), the dictionary overlay's first map node and its key insert (2), and the response's header vector (1).
+Table 5 lists the allocation counts, which `site_allocs` and `request_allocs` measure.
+
+| path | before | after the borrowed head | after the reusable context (2.7) |
+|---|---:|---:|---:|
+| `site_allocs`, page path | 50 | 41 | 36 |
+| `request_allocs`, template request | 36 | 27 | 22 |
+| `request_allocs`, handler request | 23 | 21 | 16 |
+
+**Table 5: allocations per request on the page and handler paths, after each of the two changes.**
+Take from it that the current budgets are 36, 22 and 16, and that 2.7 records what those allocations are.
 
 What changed:
 
 - `Response.headers` holds `HeaderText` pairs. A `HeaderText` borrows a `&'static str`, shares an `Arc<str>`, holds up to 23 bytes inline, or owns a `String`, and it derefs to `str`.
 - A route's `Cache-Control`, `Last-Modified` and extra headers are made once, when the route loads, as `Arc<str>` texts that the route owns, and each response clones the `Arc`, which is a count and not an allocation. A reload that replaces the site frees the old texts once the responses still sending them are done, so nothing grows across reloads. The header names `Content-Type`, `Content-Encoding`, `ETag` and `Cache-Control` are literals.
-- The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes where it was before, so the page carries its validator to the caller and to the edge's cache, as CACHE-HDR's tests require. Computing it at serialisation instead would move it out of `Response.headers`, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it there.
-- A rendered page stays in the page area until the minifier has read it, so the copy out of the area is the minified body. A page that is not minified is copied once, as before.
+- The `ETag` is 18 bytes, so it is held inline in the header. It is computed from the final bytes, so the page carries its validator to the caller and to the edge's cache, as CACHE-HDR's tests require, and `a_page_defaults_to_revalidation_and_carries_an_etag` reads it from `Response.headers`.
+- A rendered page stays in the page area until the minifier has read it, so the copy out of the area is the minified body. A page that is not minified is copied once.
 
-What stays, and why:
-
-- The response's header vector allocates once. Its removal needs a header buffer that the connection owns and reuses, which is the page-context redesign that also removes the four dictionary allocations.
-- A response is not written straight from the page area, because `Response.body` is an owned `Vec<u8>` that the compression stage and the caller take. The area is read directly where a stage can read it, which is the minifier.
+A response is written from the page area only where a stage can read the area directly, which is the minifier, because `Response.body` is an owned `Vec<u8>` that the compression stage and the caller take.
 
 **Rollback.**
 Revert the merge commit of `perf/borrowed-response-head`, found with `git log --first-parent --merges --grep borrowed-response-head`.
 Reverting returns `Response.headers` to `Vec<(String, String)>`, one `String` pair for each header a page sets, and the page copy out of the area.
 The budgets go back with it: `site_allocs` from 41 to 50, `request_allocs`'s template budget from 27 to 36 and its handler budget from 21 to 23.
-The revert changes no wire byte: a page carries the same headers in the same order before and after.
+The revert changes no wire byte.
 
 ### 2.7. The reusable page context
 
-A rendered page now makes no allocation of its own.
-In `request_allocs` a template request went from 27 allocations to 22, and every one of the 22 is Tera's or minify-html's.
-In `site_allocs`, which carries a params file and the connection's read and write, the page path went from 41 to 36, and a traced run shows all 36 are minify-html's 21 and Tera's 15.
-The handler request went from 21 to 16: the owned request (10), its cookies (5) and the route handle (1) are the ones left.
+A rendered page makes no allocation of its own.
+A traced `site_allocs` run shows all 36 page-path allocations are minify-html's 21 and Tera's 15.
+The 16 handler-request allocations are the owned request (10), its cookies (5) and the route handle (1), which stay because a handler is handed a `Request` that owns them.
 
 What changed:
 
-- The dictionary's per-request layer is a list, not a map, and it is taken from a spare one that the last request left on the thread. The service runs one loop on one thread, so the spare is the service's own reusable dictionary. It is cleared, not freed, and it never shrinks.
-- The three built-in values, `request_path`, `datetime` and `year`, are written into the `String` buffers the last request left for those keys. A spare overlay keeps only those three, each at most 8 KiB, so nothing else of the last request waits in it.
+- The dictionary's per-request layer is a list, taken from a spare one that the last request left on the thread. The service runs one loop on one thread, so the spare is the service's own reusable dictionary. It is cleared and never shrinks.
+- The three built-in values, `request_path`, `datetime` and `year`, are written into the `String` buffers the last request left for those keys. A spare overlay keeps only those three, each at most 8 KiB.
 - `datetime` and `year` are formatted into stack buffers, and no format string is parsed.
 - A response's header list goes back to a spare list on the thread when the response is dropped, with sixteen headers of room, and the next response takes it.
 - The overlay's size follows the `request_dict` limit, 32 entries at start and 4096 at most. A request with more fields is refused with a 400 that names the key.
-
-What stays: the handler path's owned request and its cookies, because a handler is handed a `Request` that owns them.
 
 **Rollback.**
 Revert the merge commit of `perf/reusable-page-context`, found with `git log --first-parent --merges --grep reusable-page-context`.
@@ -185,52 +168,60 @@ The budgets go back with it: `site_allocs` from 36 to 41, `request_allocs`'s tem
 The `request_dict` key is removed with it, and a config that sets it then stops the start with exit 2 as an unknown limit.
 The revert changes no wire byte and no template's context.
 
----
-
 ### 2.8. mimalloc as the global allocator, and whether it stays
 
 Every m6 binary installs `m6_core::alloc::M6Alloc`, which is mimalloc, and every allocation-counting test installs the same type, so the counts are taken against the allocator production runs.
-The change is on trial: **the A/B in section 7.2 decides whether it stays.**
-It stays only if cache-hit latency and render latency are no worse than the base build, and the memory-call and page-fault counts the owner asked for fall to zero or to a named handful.
-A result that is worse is a revert, not a tuning exercise.
+**The A/B in section 8.2 decides whether it stays.**
+It stays only if cache-hit latency and render latency are no worse than the base build, and the memory-call and page-fault counts fall to zero or to a named handful.
+A worse result reverts it.
 
-The claim is about the kernel, not the allocator's own time.
 A warm service should make no `brk`, `mmap`, `munmap`, `madvise`, `mremap` or `mprotect` call.
 That takes four settings, all made in code at start and none through an environment variable:
 
 | setting | what it does | where |
 |---|---|---|
 | purge delay -1 | mimalloc never hands freed memory back, so the heap grows and does not shrink | `m6_core::alloc::never_return`, first line of `main` |
-| `[limits.heap_reserve]` | one committed reservation taken from the OS at start, on explicit huge pages when mimalloc finds a pool and otherwise advised `MADV_HUGEPAGE` for transparent ones (the common `madvise` mode only backs an advised range); m6-http defaults it to `cache_bytes` plus 64 MiB so the cache lives in it | `m6_core::alloc::reserve` |
+| `[limits.heap_reserve]` | one committed reservation taken from the OS at start, on explicit huge pages when mimalloc finds a pool and otherwise advised `MADV_HUGEPAGE` for transparent ones (the common `madvise` mode only backs an advised range). m6-http defaults it to `cache_bytes` plus 64 MiB so the cache lives in it | `m6_core::alloc::reserve` |
 | `[server] lock_memory` | `mlockall(MCL_CURRENT \| MCL_FUTURE \| MCL_ONFAULT)`: a page is pinned as the load first touches it, so a hot page is never a page fault and memory that is reserved and unused is not resident | m6-http, after the reservation and before serving |
 | growth past the reservation | allowed, never a failure, logged once | `m6_core::alloc::note_growth`, on each service's one-second accounting tick |
 
-**Table: the settings that keep a warm service out of the kernel.**
+**Table 6: the settings that keep a warm service out of the kernel.**
 Take from it that the reservation is sized from the cache, so the hot data sits in one pinned region.
 
-## 3. Allocation on the static file path
+The measured window took zero memory calls and zero minor faults on both the base and the fixed build.
+Resident memory was measured on the build host, a Linux machine:
 
-Two changes stopped `m6-file` reading bytes it never sent.
-Neither carries a latency figure, and both are recorded as structural for that reason.
+| state | resident, pinned build (KiB) | resident, base build (KiB) | pinned build, on transparent huge pages (KiB) |
+|---|---:|---:|---:|
+| one cached page | 129,028 | 95,712 | 104,448 |
+| 128 MiB cache full | 277,632 | 228,788 | 235,520 |
 
-| commit | in older records | change | measurement |
-|---|---|---|---|
-| `e1ed6dd`, `1005519` | `a094851`, `7932e43` | A HEAD is answered from `metadata.len()` without opening the file, when the representation is the file. `1005519` is the directory case the first version got wrong | Structural. A HEAD on a large image previously paid a whole `fs::read`, then minification, then brotli at level 6, to produce bytes nobody receives |
-| `1d40724`, `dc9be74` | `8c79ee7`, `0759ad4` | Streaming response bodies. `Response.body` is a sum type of `Bytes` and `Stream { len, reader }`, so a file reaches the wire without being materialised | Structural. A 3.6 MB asset was read into a `Vec` on every cache miss to be copied straight out again |
+**Table 7: resident memory of m6-http with the on-fault pin, against the base build.**
+Take from it that the pin costs 33 to 49 MiB over the base, and that most of the pinned build's memory sits on transparent huge pages.
 
-**Table 6: the two allocation changes on the static file path.**
-Take from it that both are reasoned rather than measured, and that the second removed a 3.6 MB allocation per cache miss on the largest asset.
+`m6-http/tests/heap_resident.rs` returns before its assertions on macOS, so the Linux run behind these figures is the build host's, recorded in `work-queue/out/RSS-records/results3/` and `work-queue/out/RSS3-records/`, with the fix's proof in `work-queue/out/MIMALLOC-RSS.md`.
 
-`dc9be74` made the sum type deliberate.
-In `m6-core/src/response.rs`, `as_bytes()` returns `None` for a stream, so the minifier, the compressor and the default content-hash ETag structurally cannot run on a body core has not read.
+---
 
-Allocation on the file path is now bounded by what the response sends.
-The cache path raised a different question: whether its latency had regressed at all.
+## 3. Allocation
+
+Two changes stopped `m6-file` reading bytes it never sent, and `m6-http` counts every allocation per request against a budget.
+Neither file-path change carries a latency figure, so both are recorded as structural.
+
+| change | what it does | measurement |
+|---|---|---|
+| HEAD from metadata | A HEAD is answered from `metadata.len()` without opening the file, when the representation is the file, and a directory is handled the same way | Structural. A HEAD on a large image previously paid a whole `fs::read`, then minification, then brotli at level 6, to produce bytes nobody receives |
+| streaming response bodies | `Response.body` is a sum type of `Bytes` and `Stream { len, reader }`, so a file reaches the wire without being materialised | Structural. A 3.6 MB asset was read into a `Vec` on every cache miss to be copied straight out again |
+
+**Table 8: the two allocation changes on the static file path.**
+Take from it that both are reasoned and not measured, and that the second removed a 3.6 MB allocation per cache miss on the largest asset.
+
+In `m6-core/src/response.rs`, `as_bytes()` returns `None` for a stream, so the minifier, the compressor and the default content-hash ETag cannot run on a body core has not read.
 
 ### 3.1. Allocations per request
 
 `m6-http` counts its own heap allocations behind the `count-allocations` feature, which is off by default.
-A plain build compiles the counting and the arm and stop calls out, so its loop is unchanged: `m6_core::alloc::M6Alloc`, the allocator every binary and every counting test installs, is plain mimalloc without the feature and counts with it.
+A plain build compiles the counting and the arm and stop calls out, and `m6_core::alloc::M6Alloc`, the allocator every binary and every counting test installs, is plain mimalloc without the feature.
 With the feature on, the run loop arms `m6_core::testkit::alloc_count` when it starts and logs `calls` and `bytes` once at stop.
 The count covers every `alloc`, `alloc_zeroed` and `realloc` the loop thread made while serving, from m6-http, m6-core, rustls, quiche and every other Rust library in the process.
 
@@ -242,126 +233,99 @@ cargo test -p m6-http --test allocations --features count-allocations -- --test-
 
 `tests/allocations.rs` starts the binary cargo built with the feature, sends one warm-up request and then 1,000 requests on one connection and 2,000 requests on another, sends SIGTERM and reads each stop line.
 The per-request figure is `(2N count - N count) / N`, so the one handshake and the one backend-connecting first request in each run sit in both counts and cancel.
-The four rows measured on macOS on 2026-11-15:
+Table 9 gives the four rows, measured on macOS on 2026-11-15.
 
-- `h1_tls_hit`, a cached page on one keep-alive connection over TLS: 2.000 calls per request, both of them rustls's own record buffers. Our code allocates nothing on this path.
-- `h2_tls_hit`, the same over HTTP/2: 3.000 calls per request, all three of them rustls's own record buffers. Our code allocates nothing on this path either.
-- `h1_tls_miss_insert`, a new query string each time so each request reaches the backend and is stored: 47.001 calls per request. The cache entry keeps its header names and values in one byte arena and this branch stores them that way, so a miss builds the arena once instead of cloning twelve strings. A miss is a slow path, so its budget is a ceiling rather than a target.
-- `h1_tls_new_connection_per_connection`, a cached page with a full TLS handshake per request, measured per connection: 117.000 calls per connection.
+| row | what it runs | calls per 1,000 requests | budget | what the calls are |
+|---|---|---:|---:|---|
+| `h1_tls_hit` | a cached page on one keep-alive connection over TLS | 2,000 | 2,001 | two rustls record buffers per request |
+| `h2_tls_hit` | the same over HTTP/2 | 3,000 | 3,001 | three rustls record buffers per request |
+| `h1_tls_miss_insert` | a new query string each time, so each request reaches the backend and is stored | 47,001 | 47,004 | the cache entry keeps its header names and values in one byte arena, so a miss builds the arena once where it cloned twelve strings |
+| `h1_tls_new_connection_per_connection` | a cached page with a full TLS handshake per request | 117,000 per 1,000 connections | none | reported only |
 
-The difference did not repeat exactly under load: over the runs h1 read 1.997 to 2.003 before its close-path allocation was removed, 2.000 in fourteen runs after it, and 1.999 to 2.001 in twenty runs after aws-lc-rs became the one provider, the miss row 46.998 to 47.004, and h2 read 2.996 to 3.004 before its close-path allocation was removed and 2.999 to 3.001 in fourteen runs after it.
-The h2 budget is 3,001, one call above the 3,000 the path makes: the call it allows is one more TLS record received in a run, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue, and it is rustls's.
-The h2 row read as high as 3.002 on Linux because its TLS and plain close paths built `io::Error::new(UnexpectedEof, "closed")`, which boxes a message: a connection torn down inside the counted window cost 0 to 3 calls, so the figure moved with when the shutdown landed rather than with anything a request did. Both paths build the error from the kind now, so closing a connection allocates nothing of ours and 3,000 is the whole request path.
-The h1 budget is 2,001, one call above the 2,000 the path makes. The extra is in the TLS handshake at accept and it is aws-lc-rs's: `EVP_PKEY::sign` allocates the ECDSA signature buffer at the maximum DER length and shrinks it to the length the signature took, so a handshake whose signature is shorter than the 72-byte maximum makes one more call than one whose signature is exactly 72. dhat between a 2.001 run and a 2.000 run differs at that one stack and nowhere else (`ec::key_pair::EcdsaKeyPair::sign` through rustls's `emit_certificate_verify_tls13`), and between K = 1,000 and K = 2,000 it puts +1,000 on each of the two per-request rustls buffers and 0 on every other site, so the request path is exactly 2.000. The two per-request calls are rustls's record buffers, and the fixed part of each run fell by nine calls when the h1 close stopped allocating (N = 1,000 went 2,178 to 2,169, 2N = 2,000 went 4,178 to 4,169). Before the provider change the row did not need the allowance: ring's ECDSA signer made the one `Vec` at the signature's own length, so the DER length could not change the call count, and fourteen runs read 2.000. The row read as high as 2.003 before the close-path fix because `http11::advance_tls` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")` when a peer closed a TLS connection, and that constructor boxes its message, so a run that caught a different number of teardowns read a different figure.
-The miss row's budget is 47,004, the top of its observed spread with nothing added, in calls per 1,000 requests.
-The miss row's one call above 47,000 is the single cache-table growth that its 1,000 inserts trigger.
-The new-connection row is a measure, not a budget: a full handshake per connection read 122.859 to 123.849 per connection across the runs, so a per-connection ceiling would flake.
-The budgets only go down. Each ALLOC job lowers the row it attacks, the only calls allowed above a row's own count are the two named TLS-buffer allowances on the h1 and h2 hits, and any other row above its budget fails the test.
+**Table 9: the allocation rows of `m6-http/tests/allocations.rs`, in calls.**
+Take from it that our code allocates nothing on either hit path, and that a miss is a slow path whose budget is a ceiling.
+
+The budgets are the top of each row's observed spread with nothing added, and they only go down.
+Each ALLOC job lowers the row it attacks, the only calls allowed above a row's own count are the two named allowances below, and any other row above its budget fails the test.
+The miss row's one call above 47,000 is the single cache-table growth its 1,000 inserts trigger, and its observed spread across runs was 46.998 to 47.004.
+The new-connection row read 117.000 per connection, and a per-connection ceiling would fail on the run-to-run variation the handshake shows (122.859 to 123.849 before the close-path change).
+
+**The h1 allowance.**
+The extra call is in the TLS handshake at accept and it is aws-lc-rs's.
+`EVP_PKEY::sign` allocates the ECDSA signature buffer at the maximum DER length and shrinks it to the length the signature took, so a handshake whose signature is shorter than the 72-byte maximum makes one more call than one whose signature is exactly 72.
+There is one handshake in a run, so the N and 2N difference moves by one.
+A heap profile (dhat) of a 2.001 run and a 2.000 run differs at that one stack (`ec::key_pair::EcdsaKeyPair::sign` through rustls's `emit_certificate_verify_tls13`) and nowhere else.
+Between N = 1,000 and 2N = 2,000 it puts +1,000 on each of the two per-request rustls buffers and 0 on every other site, so the request path is exactly 2.000.
+Before aws-lc-rs became the one provider, ring's ECDSA signer made the one `Vec` at the signature's own length, and twenty runs read 1.999 to 2.001 after the change.
+
+**The h2 allowance.**
+The extra call is one more TLS record received in a run, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue, and it is rustls's.
+The allowance is one call per run, so it does not grow with the request count.
+The path reads 2.999 to 3.001 over fourteen runs.
+
+**The close path.**
+The h1 and h2 TLS and plain close paths built `io::Error::new(UnexpectedEof, "closed")`, which boxes a message, so a connection torn down inside the counted window cost 0 to 3 calls and the figure moved with when the shutdown landed.
+Both paths build the error from the kind now, so closing a connection allocates nothing of ours.
+The fixed part of each h1 run fell by nine calls (N = 1,000 went 2,178 to 2,169, 2N = 2,000 went 4,178 to 4,169).
 
 ---
 
 ## 4. Cache-hit latency, and why it is load dependent
 
 `hit_p50_ns` is a load-dependent measurement.
-On a near-idle single-core VM the cache-hit path goes cold between requests, so the number tracks request density rather than code.
-This section records the measurement that looked like a regression and was not, the defect that stopped the figure being published at all, and the rule for reading it.
+Read it with the hit count of the window it came from, because it tracks request density and the code is flat.
+This section records the cache lookup cost, the defect that stopped the figure being published at all, and the rule for reading it.
 
 **Three source comments cite this section by number**, in `m6-http/src/stats.rs` and `m6-monitor/src/digest.rs`.
 Renumbering it breaks them.
 
-### 4.1. The measurement that looked like a regression
+### 4.1. The cache lookup is flat
 
-The longest-running open performance item was resolved on 2026-09-13 in `72e155d`, and the answer is that there was never a code regression.
-One node, one binary, one counter, sampled minutes apart under different request densities:
-
-| window | cache hits in it | hit p50 | hit p99 |
-|---|---:|---:|---:|
-| routine traffic | 50-70 | 3,900-4,000 ns | 4,200-4,400 ns |
-| a tight burst | 1,200 | 1,064 ns | 3,782 ns |
-
-**Table 7: the same code reading four times faster under load, on a single-core VM with a `kvm-clock` clocksource.**
-Take from it that 1,064 ns sits below the 1.7-2.2 µs band recorded on 2026-09-06 and treated as the baseline afterwards, so the band described the traffic and not the code.
-These are example figures from one instance under real traffic, given with their conditions and without a host, per rule four of Table 2.
-They illustrate the effect rather than establishing a number for any particular deployment.
-
-A paired, interleaved A/B across five commits spanning 2026-09-09 to 2026-09-13 confirms it.
-Three of the five are recoverable after the history rewrite and two are not.
-
-| position | commit | cache lookup |
-|---|---|---:|
-| 1 | not recovered | 125 ns |
-| 2 | `3c3ea14`, 2026-09-09 | 125 ns |
-| 3 | not recovered | 125 ns |
-| 4 | `4df91be`, 2026-09-10 | 125 ns |
-| 5 | the branch tip, 2026-09-13 | 125 ns |
-
-**Table 8: cache-lookup cost at five points across the window in which the regression was suspected.**
-Take from it that the figure is flat across every commit, and that it stays between 125 ns and 166 ns from 1 cache entry to 20,000, which was the other candidate explanation.
-
-Each remaining candidate was measured rather than argued.
-The clocksource is `kvm-clock` at 20.9 ns per call, steal time read 0.02% at load 0.16, and neither the accounting change in `4df91be` nor cache growth moved the number.
-
-**Why nobody found it earlier.**
-`m6-http`'s bench stopped compiling at `3c3ea14`, when `stats.record` gained parameters and the bench was not updated, and it stayed broken until the clippy gate forced `--all-targets` on 2026-09-12.
-Benches are hidden from `cargo test` the same way the csrf tests were hidden behind a feature flag.
+A paired, interleaved A/B across five commits spanning 2026-09-09 to 2026-09-13 measured the cache lookup on a single-core VM with a `kvm-clock` clocksource.
 The A/B used a portable bench written against the API common to all five commits.
+
+| variable | cache lookup |
+|---|---:|
+| five commits, 2026-09-09 to 2026-09-13 | 125 ns each |
+| 1 cache entry to 20,000 | 125 ns to 166 ns |
+
+**Table 10: cache-lookup cost across five commits and across cache sizes.**
+Take from it that the lookup is flat across every commit and stays within 125 ns to 166 ns from 1 entry to 20,000, so neither code changes nor cache growth explain a rising `hit_p50_ns`.
+
+The clocksource costs 20.9 ns per call, steal time read 0.02% at load 0.16, and the accounting change did not move the number.
 
 ### 4.2. What the timer spans
 
 The timer starts immediately before the cache lookup and stops immediately after it, before the response is written.
-It therefore covers two in-memory operations, `make_lookup_key` and `Cache::lookup_with`.
+It covers two in-memory operations, `make_lookup_key` and `Cache::lookup_with`.
 The `ctx.start` timers elsewhere in `m6-http/src/main.rs` belong to the miss path and do not feed this number.
 
 ### 4.3. The aggregate that reported nothing
 
-Found and fixed on 2026-09-15 in `4acf0e0`.
-While checking nodes against the load-dependence finding, the endpoint that serves the figure turned out to report nothing at all:
-
-```json
-"cache_hits_total": 338,   "cache_misses_total": 1035,
-"hit_samples": 0, "hit_p50_ns": 0, "hit_p99_ns": 0,
-"miss_samples": 0, "monitor_samples": 0
-```
-
-338 hits counted and zero latency samples, after ten hours of uptime.
-`m6-monitor` correctly reads zero samples as "not measured" and publishes `null`, so the fleet digest carried no latency for any node and never had.
-The one number the monitor exists to trend was structurally absent, while the `periodic stats` line printed `hit_p50_ns=3878` for the same counter in the same minute.
+The endpoint that serves the figure reported `hit_samples: 0` with `hit_p50_ns: 0` after hundreds of cache hits.
+`m6-monitor` reads zero samples as "not measured" and publishes `null`, so the monitor digest carried no latency, while the `periodic stats` line printed a real `hit_p50_ns` for the same counter in the same minute.
 
 **Cause.**
 `maybe_emit` reset `hit_idx` and `hit_count` to zero every ten seconds, and `snapshot()`, which serves `/perf`, read those same fields.
-`/perf` therefore reported the percentiles of whatever fraction of a ten-second window happened to be open when it was scraped.
-A node taking two requests a minute averages one request per thirty-second window, so most ten-second windows contain no cache hit at all.
-The comment on `snapshot()` reasoned carefully about not resetting from the scrape path, so that a polling monitor could not gut the operational log.
-That reasoning was correct and incomplete: it read the window the emitter did reset.
-
-**Why it survived.**
-The per-channel reservoirs were never cleared, so they held real data throughout.
-
-| channel | requests | hit samples | hit p50 |
-|---|---:|---:|---:|
-| http/1.1/external | 839 | 35 | 3,191 ns |
-| http/2/external | 249 | 131 | 2,604 ns |
-| http/2/internal | 569 | 174 | 2,789 ns |
-
-**Table 9: the per-channel figures from the same scrape that reported a zeroed aggregate.**
-Take from it that only the aggregate was broken, and that it is the only figure `m6-monitor` reads, so anyone scrolling past it saw plausible numbers.
+`/perf` therefore reported the percentiles of whatever fraction of a ten-second window was open when it was scraped.
+A node taking two requests a minute sees most ten-second windows with no cache hit at all.
+The per-channel reservoirs were never cleared, so only the aggregate was zeroed, and it is the only figure `m6-monitor` reads.
 
 **Fix.**
 One reservoir, run as a ring and never cleared.
-`*_window_added` counters give the periodic log its own ten-second window, so operational logging is unchanged.
-`percentiles_ring` reads the newest *n* entries, which had been correct only because the index was reset every window and would have reported the oldest samples as current once the ring wrapped.
+`*_window_added` counters give the periodic log its own ten-second window.
+`percentiles_ring` reads the newest *n* entries, which had been correct only because the index was reset every window.
 The change costs no extra memory and no extra work per request.
 
-`snapshot()` now spans the most recent samples up to `RESERVOIR`, which is 4096 in `m6-http/src/stats.rs`, **and that is a count rather than a period of time**.
-On a quiet node it reaches back hours and blends idle and busy traffic.
-That is why `hit_samples` is reported beside it, in the periodic log, in the monitor digest and in `/perf`.
+`snapshot()` spans the most recent samples up to `RESERVOIR`, which is 4096 in `m6-http/src/stats.rs`, **a count of samples and not a period of time**.
+On a quiet node it reaches back hours and blends idle and busy traffic, which is why `hit_samples` is reported beside it, in the periodic log, in the monitor digest and in `/perf`.
 
 **Verified.**
 `stats::perf_reservoir_tests` holds six tests.
-Three fail against the old reset, including `an_emit_does_not_erase_what_perf_reports`, and the other three are properties that held either way.
-This was checked by reinstating the old reset and watching them fail, because a regression test that passes against the broken version is worth nothing.
+Three fail against the old reset, including `an_emit_does_not_erase_what_perf_reports`, and the other three hold either way.
+The check reinstated the old reset and watched them fail.
 
-End to end, the 05-cms example stack with a perf token, 40 requests, then scrapes across two emit boundaries with silence between them, which is the ordering that used to return zeros:
+End to end, the 05-cms example stack with a perf token took 40 requests, then three scrapes across two emit boundaries with silence between them, the ordering that used to return zeros:
 
 | scrape | hit_samples | hit_p50_ns | hit_p99_ns |
 |---|---:|---:|---:|
@@ -369,16 +333,14 @@ End to end, the 05-cms example stack with a perf token, 40 requests, then scrape
 | after 14 s of silence | 81 | 2,250 | 5,625 |
 | after 14 s more | 81 | 2,250 | 5,625 |
 
-**Table 10: `/perf` holding its samples across two emit boundaries.**
+**Table 11: `/perf` holding its samples across two emit boundaries.**
 Take from it that the reported figure no longer depends on when the scrape lands, and that the periodic log still means "this window", reading `cache_hits=39 hit_p50_ns=2208` in the busy window and zeros either side.
 
 ### 4.4. Reading the number correctly
 
-`hit_p50_ns` is comparable only between windows with similar hit counts.
-A baseline for it reads "1.7-2.2 µs at 40-70 hits per window, about 1.0 µs under sustained load", with the window's hit count reported beside the number.
-
-The cache path costs 125 ns and the figure that appeared to contradict that was measuring traffic density.
-Connection setup is the cost a client notices, and it is measured separately per protocol.
+`hit_p50_ns` is comparable only between windows with similar hit counts, so report the window's hit count beside the number.
+To measure it, warm one cacheable page, issue a few thousand rapid requests over loopback, and read the `periodic stats` line whose window contains them.
+The cache lookup costs 125 ns (Table 10), and connection setup is the cost a client notices.
 
 ---
 
@@ -386,7 +348,7 @@ Connection setup is the cost a client notices, and it is measured separately per
 
 Three single-purpose binaries measure connection setup from the client side: `m6-probe-h1`, `m6-probe-h2` and `m6-probe-h3`.
 Each performs one handshake per connection, strictly sequentially, with no requests.
-Their source is `m6-http/src/probe.rs`, and they exist so that the server's figure about itself can be checked against an independent measurement.
+Their source is `m6-http/src/probe.rs`, and they check the server's figure about itself against an independent measurement.
 
 *RTT* is round-trip time.
 *QUIC* is the transport underneath HTTP/3.
@@ -401,19 +363,18 @@ Taken on the build host's loopback, 200 sequential handshakes per channel, again
 | http/2 | 0.353 ms | 0.423 ms | 270 (200 probe plus 70 warmer) |
 | http/3 | 1.132 ms | 1.075 ms | 200 of 200 |
 
-**Table 11: client-measured against server-measured connection setup, loopback, 2026-09-15.**
+**Table 12: client-measured against server-measured connection setup, loopback, 2026-09-15.**
 Take from it that the two agree within 0.07 ms, and that the client figure sits above the server's for h1 and h3 because the client times from its own first send and the server from receiving that packet.
 
 **The h1 and h2 figures exclude the TCP round trip**, because rustls is handed the socket after the three-way handshake completes.
 **The h3 figure includes the equivalent**, because QUIC folds transport and crypto together and there is no earlier point to start from.
-The two spans differ and must never be averaged.
-A single handshake p50 across all three would track the protocol mix, which is the error section 4.3 fixed for the request-latency aggregate.
+The two spans differ, so a handshake p50 is reported per channel and never averaged across them.
 
 ### 5.2. Loopback prices only CPU
 
 On loopback h3 reads 1.1 ms against h2's 0.42 ms, because loopback has no round trip.
 Over a real path the ordering inverts.
-Measured from a client 5.1 ms away by ping:
+Table 13 was measured from a client 5.1 ms away by ping.
 
 | measurement | real path, 5.1 ms RTT |
 |---|---|
@@ -422,17 +383,14 @@ Measured from a client 5.1 ms away by ping:
 | h3 cold QUIC handshake | 12.2 ms |
 | h3 0-RTT, first packet to response headers | 6.0-6.7 ms |
 
-**Table 12: connection setup over a 5.1 ms path, where h3 wins.**
+**Table 13: connection setup over a 5.1 ms path, where h3 0-RTT wins.**
 Take from it that h1 and h2 need a TCP round trip before any of this, so a returning visitor over h2 pays TCP, then TLS, then a request round trip, reaching about 16 ms to a response where h3 with 0-RTT answers in 6.4 ms.
 
-**Never conclude anything about protocol choice from a loopback number.**
+Protocol choice needs a real-path number, so a loopback figure never decides it.
 
 ### 5.3. Resumption
 
-The probes gained the ability to offer a session ticket on 2026-09-19 in `378c535`.
-Before that they shared one `ClientConfig` across N connections, so they measured one full handshake and N-1 attempted resumptions under a single heading.
-Separating the two is what makes these figures comparable with `/perf`.
-
+The probes offer a session ticket since 2026-09-19, so a full handshake and a resumed one are measured separately and comparable with `/perf`.
 A resumed handshake saves the certificate and the signature.
 TLS 1.3 completes in one round trip either way, so the saving is crypto and it is sub-millisecond on a fast path.
 
@@ -441,68 +399,24 @@ TLS 1.3 completes in one round trip either way, so the saving is crypto and it i
 | h2 full | 7.153 ms | 1 |
 | h2 resumed | 6.634 ms | 7 |
 
-**Table 13: full against resumed handshake, measured by the probe from a distant client over a real path.**
+**Table 14: full against resumed handshake, measured by the probe from a distant client over a real path.**
 Take from it that the saving is 0.52 ms, which is the cost of the certificate and the signature.
 
-On the server's side of the same channel the gap is far larger, because its full figure includes slow and hostile clients that a probe is not.
-`/perf` read h1 full p50 at 161.65 ms against resumed at 0.76 ms, over 34 and 422 samples.
-Those are different client populations, which is why the two are never blended into one handshake p50.
+A browser opens one h2 connection per visit and multiplexes it, so h2 resumption needs a return visit inside the ticket's lifetime and a single-visit h2 channel reads 0%.
+`tools/conformance.sh resume` proves the capability on h1, h2 and h3 on every push.
 
-**What 1.9.0 delivered.**
-The server's own figure for `http/2/external`, across the change from 1.8.1 to 1.10.0:
-
-| figure | 1.8.1 | 1.10.0 |
-|---|---|---|
-| full p50 | 13.95 ms | 3.40 ms |
-| full p99 | 1339.00 ms | 34.04 ms |
-| full mean | 119.08 ms | 6.38 ms |
-
-**Table 14: full-handshake cost before and after 1.9.0, measured by the server.**
-Take from it that the p99 fell by a factor of 39, which is the figure that moved most.
-
-**Resumption reads 0% on `http/2/external` and that is correct.**
-A browser opens one h2 connection per visit and multiplexes it, so resumption needs a return visit inside the ticket's lifetime.
-An `http/1.1` channel reading 88-96% has a repeat client polling on a loop.
-`tools/conformance.sh resume` proves the capability on h1, h2 and h3 on every push, so the question cannot stay open again.
-
-### 5.4. Two measuring-tool defects, both of which produced numbers
-
-Both are recorded because the tool reported success and a plausible figure, which is worse than a tool that fails.
-
-1. **`m6-bench-detail` panicked before measuring anything.**
-   `m6-http` builds rustls with `default-features = false`, so no process-level CryptoProvider is installed automatically, and the first `ClientConfig::builder()` panicked.
-   Every other binary in the crate installs it and this one did not.
-   With the client broken, handshake timing was taken with `h3spec`, a conformance tester that deliberately opens stalled connections.
-   It reported an h3 handshake p50 of 113 ms on loopback, for an engine that answers requests in microseconds.
-   That figure was believed long enough to be written down.
-   The real figure is 1.1 ms.
-
-2. **The first version of `m6-probe-h1` and `m6-probe-h2` never completed a handshake.**
-   rustls reports `is_handshaking() == false` as soon as it has the traffic keys, one step before the client Finished is flushed.
-   The loop exited on that condition and dropped the socket, so the server never received Finished, sat handshaking until EOF, and recorded nothing.
-   The probe reported 200 successes at a plausible 0.34 ms while the server completed zero.
-   The 70 h2 samples the server did report were the cache warmer's curl connections at startup, which came close to being read as a server bug.
-
-A third defect sat in `m6-http` itself.
-The handshake was stamped about forty lines below the point where `advance_tls` returns an error, so a client that completed its handshake and closed immediately had the measurement discarded.
-h1 recorded 0 of 200 such handshakes, and h2 kept only the ones the server reached before the close, which are the slow ones, giving a p50 of 6.14 ms against a true 0.42 ms.
-A biased partial sample is worse than none, because 6.14 ms looked plausible.
-
-Connection setup is now measured from both ends and the two agree.
-One part of it, the size of the server's first flight, was large enough to cost a whole round trip and has its own section.
+Section 6 splits the handshake's cost, and section 7 covers the size of the server's first flight over QUIC.
 
 ---
 
 ## 6. Where a TLS handshake goes
 
-A TLS 1.3 handshake on a web front end is often read as one cost.
-This section splits it into crypto, kernel and m6's own code, prices the loopback method that produced the figure, compares the cipher suites and the two providers, follows the hit path under handshake load, and prices a system call.
-Every figure was taken on a 4-vCPU x86-64 cloud VM (Skylake) whose hypervisor hides ADX and SHA-NI, running Linux 7.0.0-43-generic at load 0.36 to 0.49, with an ECDSA P-256 certificate, TLS 1.3, a release build and the client on the same host.
+This section splits a TLS 1.3 handshake into crypto, kernel and m6's own code, prices the loopback method that produced the figure, compares the cipher suites and the two providers, follows the hit path under handshake load, and prices a system call.
+Every figure was taken on 2026-11-16 on a 4-vCPU x86-64 cloud VM (Skylake) whose hypervisor hides ADX and SHA-NI, running Linux 7.0.0-43-generic at load 0.36 to 0.49, with an ECDSA P-256 certificate, TLS 1.3, a release build and the client on the same host.
 The VM is a test guest.
 The finding is that m6's own code is 9 us of a 372 us handshake, and the rest needs a CPU exposing ADX and SHA-NI before it can fall much further.
 
 *ADX* is an x86 instruction set for integer arithmetic, and *SHA-NI* is the x86 extension that accelerates SHA-256 and SHA-1.
-A hypervisor can hide both from a guest, and this one does.
 The default provider is the crypto provider rustls installs when the application does not name one.
 The alternative is a second provider with a faster X25519 implementation on this hardware.
 The records are in the batch's `work-queue/out/` tree, outside this repository.
@@ -512,6 +426,7 @@ The records are in the batch's `work-queue/out/` tree, outside this repository.
 
 A full handshake with the default provider read 0.372 ms at p50 from the client over 3,000 connections, and the server's own CPU per handshake was 400.0 us.
 A profile of 1,000 of those handshakes attributes the server's CPU by leaf frame.
+The profiled run read 0.490 ms p50 and 580.0 us of server CPU per handshake (`PROFILE-records/ring-h1-full-perf.bench.log`), so the shares below are the profile's proportions applied to the 372 us.
 
 | share | us | of 372 us | what it is |
 |---|---:|---:|---|
@@ -534,8 +449,8 @@ The profile's SHA-512 compression frames are 7.58% of its self time, 28 us, and 
 
 The same handshake reads 0.372 ms in the first run and a 0.410 ms median in the repeat, 10% apart, on a host at load 0.36 to 0.49.
 Both ends share the four vCPUs on loopback, so each end's work sits inside the other's wall time.
-Read a loopback handshake as an upper bound on CPU cost.
-A real path moves the client's CPU to another machine and adds the round trips that Table 12 prices.
+A loopback handshake is an upper bound on CPU cost.
+A real path moves the client's CPU to another machine and adds the round trips that Table 13 prices.
 
 ### 6.3. The suites and the two providers
 
@@ -548,14 +463,11 @@ Seven rounds of each combination, 3,000 handshakes a round, compare the two ciph
 | AES-128-GCM | the default | 0.387 ms (0.360 to 0.419) | 0.345 ms |
 | AES-128-GCM | the alternative | 0.380 ms (0.360 to 0.441) | 0.337 ms |
 
-**Table 16: whole-handshake p50 by client suite and provider, seven rounds each, 3,000 handshakes a round (`TLS-records/job6/rep/local.txt`).**
+**Table 16: whole-handshake p50 by client suite and provider, seven rounds each, 3,000 handshakes a round on the VM (`TLS-records/job6/rep/local.txt`).**
 Take from it that the ranges overlap in every row and the ordering flips between the two suites, so the whole handshake does not measurably change.
 
-The primitive does change.
-The in-memory parts bench reads X25519 at 83.4 to 83.7 us with the default provider and 46.7 to 62.9 us with the alternative, and the P-256 signature at 29.4 to 32.3 us in both (`TLS-records/job6/res/parts-default.log` and `TLS-records/job6/res/parts-browser.log`).
-A saving of 20 to 36 us on the key exchange is 5% to 10% of the 372 us handshake, and the run-to-run spread in Table 16 is 10%.
-The primitive difference is real and the whole-handshake difference is below what this method resolves.
-The suite makes less difference than either, which is why the two suites' rows sit inside one another.
+The in-memory parts bench reads X25519 at 83.4 to 83.7 us with the default provider and 46.7 to 62.9 us with the alternative, and the P-256 signature at 26.0 to 33.6 us across both (`TLS-records/job6/res/parts-default.log` and `TLS-records/job6/res/parts-browser.log`).
+A saving of 20 to 36 us on the key exchange is 5% to 10% of the 372 us handshake, and the run-to-run spread in Table 16 is 10%, so the whole-handshake difference is below what this method resolves.
 
 ### 6.4. Hits under handshake load
 
@@ -570,44 +482,33 @@ One kept-alive connection served hits while a second generator opened new full h
 | 200 | 200.0 | 13,403.0 | 58.3 | 327.8 | 0.777 |
 | 500 | 500.0 | 13,658.8 | 58.2 | 300.6 | 0.645 |
 
-**Table 17: cache hits while new full handshakes arrive, one run per rate, 10 second windows (`MIXED-records/mixed.log`).**
+**Table 17: cache hits while new full handshakes arrive, one run per rate, 10 second windows on the VM (`MIXED-records/mixed.log`).**
 Take from it that the hit p50 stays flat at 57.4 to 60.5 us, the hit p99 rises to 327.8 us at 200 handshakes a second and holds at 300.6 us at 500, and hit throughput falls 15% from 15.7k to 13.4k a second.
 
-The p99 plateau is 300 us, which is 158 us of crypto plus 144 us of kernel from Table 15, 302 us.
-The hit tail is one handshake deep.
+The p99 plateau is 300 us, which matches the 158 us of crypto plus 144 us of kernel from Table 15, 302 us, so the hit tail is one handshake deep.
 The handshake p50 in this run is 0.65 to 0.87 ms, above the 0.372 ms of section 6.1, because the same four vCPUs now run the hit client, the handshake generator and the server together.
 
 ### 6.5. The system call
-
-A bare system call costs 1.20 us on this VM, measured with `getppid` over five million calls, and a write plus a read through a pipe costs 1.54 us per pair.
-The section uses 1.32 us, between the two readings.
 
 | operation | per call |
 |---|---:|
 | `getppid`, 5,000,000 calls | 1.20 us |
 | pipe write plus read, 2,000,000 pairs | 1.54 us |
-| figure used here | 1.32 us |
 
-**Table 18: bare system call cost on the VM (`PROFILE-records/getppid.txt`).**
-Take from it that a call costs about 1.3 us, and that most of the kernel share in Table 15 is the TCP work behind the calls, with 34 us of it the entry and exit.
+**Table 18: the two bare system call costs the record holds (`PROFILE-records/getppid.txt`).**
+Take from it that most of the kernel share in Table 15 is the TCP work behind the calls.
 
-A default-provider handshake makes about 26 system calls: `strace` counted 26,184 for 1,000 handshakes (the `strace` of the same run in `PROFILE-records/`).
-At 1.32 us that is 34 us of the kernel's 144 us, and the remaining 110 us is the TCP stack that the profile shows in `tcp_*` and `ip_*` frames.
-The default provider made nine `getrandom` calls per handshake in that record and the alternative made none, worth about 12 us of the 372.
-A syscall reduction can reach the 34 us of entry and exit at most, and that work is parked until after the release.
+A single per-call figure for the handshake's syscall mix is `NOT MEASURED`.
+The handshake makes 26,184 calls per 1,000 handshakes, of `writev`, `recvfrom`, `close`, `accept4`, `epoll_wait`, `epoll_ctl`, `setsockopt` and `ioctl` (`PROFILE-records/ring-h1-full-strace.strace`), and `strace`'s average per call carries its own overhead.
+Pricing it needs a bench on the same VM, with the profiler off, that times the mix the `strace` shows.
+The default provider made nine `getrandom` calls per handshake in that record and the alternative made two calls in 1,000 handshakes, and their cost is `NOT MEASURED` for the same reason.
+A syscall reduction is unpriced and parked until after the release.
 
-### 6.6. What was tried, and what it means
+### 6.6. Conclusion
 
-Four measurements were tried: the whole-handshake suite with both providers and both suites, the in-memory parts bench, the profile of the server, and the mixed hit and handshake load.
-The first found no whole-handshake difference, the second found the X25519 primitive 20 to 36 us faster with the alternative, the profile put m6's own share at 9 us, and the fourth put the hit tail at one handshake's CPU.
-A fifth idea, cutting the 26 system calls a handshake, was priced at 34 us and parked.
-
-The conclusion is that m6's own share is small.
 Of 372 us, 9 us is m6, 144 us is the kernel and 158 us is crypto, and the largest single item is the 83 us X25519 key exchange.
-The rest of the crypto needs a CPU that exposes ADX and SHA-NI, and those two instructions are what this hypervisor hides.
-A 100 us handshake is not reachable on this hardware, and it is not pursued further.
-The section stays so the next attempt starts from the split.
-Every figure here is the VM's.
+The rest of the crypto needs a CPU that exposes ADX and SHA-NI, which this hypervisor hides.
+A 100 us handshake is not reachable on this hardware.
 The development Mac did not reproduce the provider comparison, and its attempt is `NOT MEASURED` for that effect because the shared host's run-to-run spread was larger than the difference.
 
 ---
@@ -617,7 +518,7 @@ The development Mac did not reproduce the provider comparison, and its attempt i
 *QUIC* is the transport underneath HTTP/3.
 A QUIC server may send only `factor x bytes received` before it has validated the client's address, under RFC 9000 section 8.1, so that it cannot be used as a reflection amplifier.
 m6's uncompressed handshake flight exceeded that budget, stalled, and waited a full round trip.
-Certificate compression removed the excess and the server now runs at quiche's conforming default factor of 3.
+Certificate compression removed the excess and the server runs at quiche's conforming default factor of 3.
 
 ### 7.1. The stall
 
@@ -635,61 +536,44 @@ The uncompressed handshake flight was 4082 bytes, of which the certificate chain
 
 **Figure 1: the server exhausting its amplification budget mid-flight.**
 Take from it that the final datagram arrives one full round trip after the previous one, and that the ratio at the moment the server stopped was 3.00x.
+The ratio over the whole handshake reads 1.62x, because the client's ACKs have arrived by the end, so only the per-packet timeline shows the stall.
+Disabling pacing, which quiche enables by default, changed the stall not at all.
 
 ### 7.2. This is the ordinary case
 
-The first two explanations written for this assumed the opposite, so the general position is stated plainly.
-[Fastly's study](https://www.fastly.com/blog/quic-handshake-tls-compression-certificates-extension-study) measured 40-44% of uncompressed chains exceeding the budget, and certificate compression taking that to 1-9%.
+A published [study](https://www.fastly.com/blog/quic-handshake-tls-compression-certificates-extension-study) measured 40-44% of uncompressed chains exceeding the budget, and certificate compression taking that to 1-9%.
 [Other work](https://blog.apnic.net/2023/01/16/on-the-interplay-between-tls-certificates-and-quic-performance/) puts it at 61% for a Firefox-sized 1352-byte Initial.
 About half of the QUIC internet pays this round trip.
 
-| site | certs | chain bytes |
+| chain | certs | chain bytes |
 |---|---:|---:|
-| a 4-certificate Let's Encrypt ECDSA chain | 4 | 3429 |
-| news.ycombinator.com | 4 | 3393 |
-| letsencrypt.org | 4 | 3576 |
-| cloudflare.com | 3 | 2552 |
-| github.com | 3 | 2718 |
-| www.google.com | 3 | 3755 |
-| www.mozilla.org | 3 | 4051 |
+| m6's 4-certificate ECDSA chain from a public CA | 4 | 3429 |
+| public site A | 4 | 3393 |
+| public site B | 4 | 3576 |
+| public site C | 3 | 2552 |
+| public site D | 3 | 2718 |
+| public site E | 3 | 3755 |
+| public site F | 3 | 4051 |
 
 **Table 19: measured certificate chain sizes, for scale.**
-Take from it that a 3429-byte chain is unremarkable and that two of the seven are larger, so chain size alone does not explain which servers stall.
-
-**Two diagnoses were stated as fact and withdrawn.**
-
-1. "The chain is unusually long because it is on a new hierarchy."
-   The chain is a standard Let's Encrypt ECDSA chain, byte-identical on the intermediates to the one news.ycombinator.com and letsencrypt.org serve, and Google's and Mozilla's are larger.
-   Withdrawn after measuring seven sites instead of reasoning about one.
-
-2. "The amplification limit is not involved, the ratio is only 1.62x."
-   1.62x is the ratio at the end of the handshake, by which time the client has sent its ACKs.
-   The ratio at the instant the server stopped was 3.00x.
-   A totals-only view cannot see this, which is why the probe now prints the per-packet timeline in Figure 1.
-
-   The replacement for diagnosis 1, that other chains are smaller and therefore fit, failed its own arithmetic as well, since Cloudflare sends 4198 bytes and 4198 does not fit in 3600.
-   What differs between servers is the factor each one runs at.
-
-A third hypothesis, pacing, was tested and killed rather than argued.
-quiche enables pacing by default and `flush_conn` discards `send_info.at`, which made it a strong candidate.
-Disabling pacing changed the stall not at all.
+Take from it that a 3429-byte chain is typical and that two of the seven are larger, so chain size alone does not decide which servers stall.
+The factor each server runs at decides it:
 
 | edge | bytes sent before address validation | implied factor |
 |---|---:|---|
 | m6 at quiche's default | 3600 then stops | 3.00x |
-| Cloudflare | 4198 in one flight | 3.50x |
-| Fastly, serving www.mozilla.org | 5360 in one flight | 4.47x |
+| public edge A | 4198 in one flight | 3.50x |
+| public edge B, serving site F | 5360 in one flight | 4.47x |
 
 **Table 20: what other edges appear to run at, measured with `m6-probe-h3` on a 1200-byte client Initial.**
-Take this as our own measurement rather than established fact: the byte accounting counts QUIC payload, and no public source corroborates servers exceeding the limit.
+Take this as our own measurement: the byte accounting counts QUIC payload, and no public source corroborates servers exceeding the limit.
 
 ### 7.3. The fix that shipped
 
-Releases 1.2.0 and 1.3.0 carried `set_max_amplification_factor(4)`, which raised the budget to 4800 and let the whole flight go out at once.
-It was marked temporary from the day it shipped, because it deviates from RFC 9000 rather than satisfying it.
-**That override is deleted and the factor is back at the conforming 3.**
+Releases 1.2.0 and 1.3.0 carried `set_max_amplification_factor(4)`, which raised the budget to 4800 and let the whole flight go out at once, in deviation from RFC 9000.
+That override is deleted and the factor is the conforming 3.
 
-Certificate compression, RFC 8879, is what replaced it, and it closed issue #28 on 2026-09-17.
+Certificate compression, RFC 8879, replaced it.
 The compression runs in m6's own quiche fork, pinned by revision in `m6-http/Cargo.toml`, and is enabled by `cfg.enable_cert_compression()` in `m6-http/src/main.rs`.
 
 | algorithm | chain bytes | of uncompressed |
@@ -710,73 +594,57 @@ BoringSSL negotiates from the intersection with the client's `compress_certifica
 **Measured end to end.**
 The whole server flight went from 4081 bytes to 2859 with brotli, a saving of 1222 bytes, which leaves 741 bytes of headroom under the 3600 budget for a chain that grows.
 The handshake completes in one round trip: four datagrams with a 5.07 ms stall became three datagrams with none.
-Third parties verified that our client advertises compression instead of merely accepting it: Cloudflare's flight went from 4198 to 3388 bytes for the same probe, and a Fastly edge did not change at all.
+Public edge A's flight went from 4198 to 3388 bytes for the same probe, which shows our client advertises compression, and public edge B did not change.
 
 ### 7.4. 0-RTT
 
-0-RTT was held back on 2026-09-15 and **enabled on 2026-09-16**, once m6's quiche fork carried the three changes it needed.
-Enabling it costs no conformance: h3spec reads 47/49 with early data on, which is the recorded floor in `tools/conformance-scores.txt`.
-
-Accepting early data had cost one test, "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received", taking 47/49 to 46/49.
-Three attempts were needed and the first two were in the wrong place.
-A guard on the CRYPTO frame's contents cannot fire, because h3spec sends its 0-RTT packet during a fresh handshake with no resumption, so there is no 0-RTT read key and the packet is never parsed.
-Rejecting on packet type detected the violation and h3spec still failed, because quiche put the CONNECTION_CLOSE in a Handshake packet whose keys the client did not yet have.
-The close is now keyed on whether the server has ever sent a Handshake packet, which is the fact that determines whether the peer can read it.
+0-RTT is enabled since 2026-09-16, and h3spec reads 47/49 with early data on, which is the recorded floor in `tools/conformance-scores.txt`.
+The test "MUST send PROTOCOL_VIOLATION if CRYPTO in 0-RTT is received" passes because the close is keyed on whether the server has ever sent a Handshake packet, which is the fact that determines whether the peer can read it.
 
 **0-RTT data is replayable, so `handle_h3_request` is stricter than RFC 8470's advice on idempotent methods.**
 In early data it serves only a fresh cache hit and answers 425 Too Early to everything else.
 A replayed cache read re-sends bytes and does nothing more.
-"GET is safe" would not have been enough, because a site may serve a fire-and-forget GET beacon whose replay inflates a counter, and a stale hit would queue a background refresh, which is a write.
-Both gates were verified: a cached path answers 200 in early data and an uncached one answers 425.
+A site may serve a fire-and-forget GET beacon whose replay inflates a counter, and a stale hit queues a background refresh, which is a write.
+A cached path answers 200 in early data and an uncached one answers 425.
 
-The handshake now completes in one round trip and a returning visitor pays none.
-Every figure above can be re-taken, and the commands are next.
+With 0-RTT a returning visitor reaches response headers in 6.0 to 6.7 ms (Table 13).
+Section 8 gives the commands to re-take every figure above.
 
 ---
 
 ## 8. Reproducing these measurements
 
-Every measurement in this document can be re-run.
-The commands below are grouped by the section they support.
+The method behind every measurement in this document is below.
+A re-run measures the tree it runs on, so the figures here stay the record of the builds they name.
+The commands are grouped by the section they support.
 
-### 8.1. The render figures the earlier gate recorded
-
-The earlier gate recorded absolute render figures in a baseline file, which this change deletes.
-Table 22 keeps the two dated readings, both taken on the 4-core Linux build host, so they stay recoverable as history.
-
-| date | method | render:minimal median ns | render:blog-index median ns | conditions |
-|---|---:|---:|---:|---|
-| 2026-09-14 | three runs, medians of round minimums | 201827 | 1784823 | load 0.20 |
-| 2026-09-27 | three runs of five rounds, medians | 174101 | 1454253 | load 0.12, after the release profile |
-
-**Table 22: the render figures the earlier gate recorded.**
-Take from it that these were absolute numbers on content that has since changed, so they are history and no longer a gate.
+### 8.1. Sections 2 to 7
 
 **Per-request copy cost, sections 2.2 and 2.5:**
 
 ```sh
-cargo test --release -p m6-core copy_audit -- --ignored --nocapture
-cargo test --release -p m6-core dict_cost  -- --ignored --nocapture
+M6_REAL_CONTENT_JSON=/path/to/data/content.json \
+  cargo test --release -p m6-core copy_audit -- --ignored --nocapture
+M6_REAL_CONTENT_JSON=/path/to/data/content.json \
+  cargo test --release -p m6-core dict_cost  -- --ignored --nocapture
 ```
 
-Both are `#[ignore]`d deliberately.
-A timing assertion fires on a loaded build box against correct code, which is the trap `test_static_file_cache_hit` already fell into once.
-These are measurements and the gate for them is `tools/perfcheck.sh`, an interleaved A/B against the base build.
+Both are `#[ignore]`d and print `SKIP` and measure nothing when `M6_REAL_CONTENT_JSON` is unset, so the file is the measurement's input.
+The gate for these measurements is `tools/perfcheck.sh`, an interleaved A/B against the base build.
 
 **Page render A/B, section 2.1.**
 Build the renderer at the two commits into separate target directories, then alternate: start one on a unix socket against a real site directory and its renderer config, warm it, time 300 requests, kill it, repeat with the other, five rounds.
-Interleaving is the point, because running all of one and then all of the other measures the afternoon.
+Interleaving keeps the afternoon's drift on both sides.
 
-**Cache-hit A/B across commits, section 4.1.**
+**Cache-lookup A/B across commits, section 4.1.**
 Use `git worktree add --detach` per commit, and write a bench against the API common to all of them, which is `Cache::new`, `CacheKey::new`, `insert`, `get` and `make_lookup_key` in `m6-http/src/cache.rs`.
 Build each with its own `CARGO_TARGET_DIR`, then run interleaved rounds.
-The bench used in 2026-09-13 was written for that run and was not kept.
 
 **Cache-hit p50 under load, section 4.4.**
 Warm one cacheable page, issue a few thousand rapid requests over loopback, and read the `periodic stats` line whose window contains them.
 Report the hit count with the percentile.
 
-**Connection setup and 0-RTT, sections 5 and 6:**
+**Connection setup and 0-RTT, sections 5 and 7:**
 
 ```sh
 cargo build --release --bin m6-probe-h1 --bin m6-probe-h2 --bin m6-probe-h3
@@ -787,14 +655,12 @@ cargo build --release --bin m6-probe-h1 --bin m6-probe-h2 --bin m6-probe-h3
 ./target/release/m6-probe-h3 --addr HOST:443 --0rtt /some-path --method POST
 ```
 
-The probes take any host, which is how Tables 15 and 16 were measured against third-party edges.
-
----
+The probes take any host, which is how Tables 19 and 20 were measured against third-party edges.
 
 ### 8.2. The mimalloc A/B on the build host
 
 Run on the idle build host, holding the host lock, the base (`ce6c29c`) against the branch (`perf/mimalloc`).
-Build both with the release profile, which this is one of the two places for.
+Build both with the release profile.
 
 ```sh
 git worktree add ~/build/base ce6c29c
@@ -823,7 +689,8 @@ tools/hwcounters.sh base=$HOME/build/base/target/release cand=$HOME/build/cand/t
 ```
 
 The script says "hardware counters not available on this host" and reports the software events alone when the VM exposes no counters.
-`dTLB-load-misses` per request is the number huge pages should bring close to zero. The script also prints `AnonHugePages` and `Hugetlb` from `/proc/<pid>/smaps_rollup` for m6-http, so huge pages are measured and not only logged.
+`dTLB-load-misses` per request is the number huge pages should bring close to zero.
+The script also prints `AnonHugePages` and `Hugetlb` from `/proc/<pid>/smaps_rollup` for m6-http, so huge pages are measured.
 
 **Render latency**, interleaved and pinned, from the candidate checkout:
 
@@ -833,26 +700,29 @@ tools/perfcheck.sh --base-bin $HOME/build/base/target/release/m6-html \
 ```
 
 **Cache-hit latency end to end**: `./bench.sh --latency-n 20000` in each checkout (it makes its own certificate and builds the release binaries), alternating base and candidate for five rounds, and compare the HTTP/1.1 and HTTP/2 cache-hit rows.
-`tools/paired_bench.sh cache_hit` is not an allocator measurement: that bench runs in-process and installs no allocator of its own.
+`tools/paired_bench.sh cache_hit` runs in-process with no allocator of its own, so it cannot measure the allocator.
 
 **RSS after warm-up** is the `rss` row of both scripts above.
 Record the binary sizes (`ls -l target/release/m6-http`) and the release build time beside it.
 
+**The resident-set bound on Linux** is `cargo nextest run -p m6-http --test heap_resident`.
+The test returns on macOS before its assertions, so the build host is where it runs, and that is the run Table 7 comes from.
+
+---
+
 ## 9. What is not measured
 
-A performance document that implies more coverage than it has is how the next reader is misled, so the gaps are listed plainly.
+Four gaps remain.
 
 | gap | what is missing |
 |---|---|
-| throughput and concurrency | `m6-file` moved from an unbounded channel and a fixed worker set to `App`'s bounded pool with 503 backpressure, and `m6-auth-server` from a thread per connection to the same pool. Both are better shapes under overload and neither has a number |
-| conformance-side timing | h2spec and h3spec are correctness gates. h3spec must never be used as a load generator, because it deliberately opens stalled and malformed connections, which is what produced the 113 ms figure in section 5.4 |
-| the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%. Those absolute numbers are recorded as history in section 8.1, and the gate now compares the candidate against a base build |
-| magnitude on small hosts | Table 3 is a laptop figure. A single-core VM differs in magnitude, though the direction is a property of the code |
+| throughput and concurrency | `m6-file` moved from an unbounded channel and a fixed worker set to `App`'s bounded pool with 503 backpressure, and `m6-auth-server` from a thread per connection to the same pool. Neither has a number |
+| conformance-side timing | h2spec and h3spec are correctness gates. h3spec deliberately opens stalled and malformed connections, so it cannot generate load: it once reported an h3 handshake p50 of 113 ms on loopback, where the probe reads 1.1 ms (Table 12) |
+| the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%, and the gate now compares the candidate against a base build |
+| other machines | Table 3 is one laptop, and no other machine has a copy-removal figure |
 
-**Table 23: what this document does not cover.**
-Take from it that throughput has no number at all, and that Table 3 is superseded for any gating purpose by the A/B gate `tools/perfcheck.sh`.
+**Table 22: what this document does not cover.**
+Take from it that throughput has no number at all, and that `tools/perfcheck.sh` supersedes Table 3 for any gating purpose.
 
-The measured position is that core's per-request copying fell by a factor of 280 and the static file path no longer allocates what it does not send.
-The cache lookup costs 125 ns and is flat, and the QUIC handshake completes in one round trip at a conforming amplification factor.
-What remains is the template engine's 143 µs context build, which is measured and accepted, and throughput, which has never been measured at all.
-Both are recorded here so that the next measurement starts from what is known rather than from what is assumed.
+The measured position is that core's per-request copying fell by a factor of 280, the static file path no longer allocates what it does not send, the cache lookup costs 125 ns and is flat, and the QUIC handshake completes in one round trip at a conforming amplification factor.
+What remains is the template engine's 143 µs context build, which is measured and accepted, and throughput, which has no measurement.
