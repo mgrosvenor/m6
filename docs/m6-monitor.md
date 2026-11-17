@@ -1,0 +1,338 @@
+# m6-monitor: the fleet's figures from its journal
+
+m6-monitor reports how a fleet of m6 nodes is doing.
+It reads the monitor host's copy of every node's journal through one long-lived `journalctl --follow` child, and asks each node for `GET /health` on every poll.
+From those two inputs it builds one digest, serves it as a page, as *JSON* and as text, and records every poll in a history file when a config asks for one.
+All five routes answer on a unix socket, so the monitor has no listener of its own.
+
+Sections 1 to 3 describe the two inputs.
+Section 4 follows one poll from its first step to the snapshot.
+Sections 5 and 6 give the configuration and the keys that are gone.
+Sections 7 and 8 give the routes and every number the digest carries.
+Section 9 covers the history file, and section 10 says where the crate sits.
+
+## Contents
+
+1. [The two inputs](#1-the-two-inputs)
+2. [The journal reader](#2-the-journal-reader)
+3. [What the log cannot answer](#3-what-the-log-cannot-answer)
+4. [One poll](#4-one-poll)
+5. [Configuration](#5-configuration)
+6. [Removed keys and the refusal](#6-removed-keys-and-the-refusal)
+7. [The routes](#7-the-routes)
+8. [The digest and the check](#8-the-digest-and-the-check)
+9. [History](#9-history)
+10. [Where it fits](#10-where-it-fits)
+
+---
+
+## 1. The two inputs
+
+Every figure the monitor reports is one of two things: a document a node wrote as a log line, or a node's answer to `GET /health`.
+Table 1 gives both inputs, what each carries, and how current it is.
+
+Table 1: the two inputs and what each one carries.
+
+| input | read by | what it carries | how current |
+|---|---|---|---|
+| the journal | `journal::Reader` in `m6-monitor/src/journal.rs` | each node's metrics document and traffic document: host figures, requests, cache, *TLS* chains, crawlers, firewall state | the newest line the journal holds |
+| `GET /health` | `poll::Step::Health` in `m6-monitor/src/poll.rs` | liveness, the `ok` or `degraded` answer, the node's own name, its process index, and the round trip from this host | once per poll |
+
+Each node ships its journal to the monitor host with `systemd-journal-upload`, and `systemd-journal-remote` keeps every peer's journal in one directory, which `[monitor] journal_dir` names.
+The two documents arrive as log lines with `type` `perf` and `type` `traffic`.
+No m6-http answers `/perf` or `/traffic` any more.
+`docs/m6-log.md` gives the line and its keys, and `docs/m6-http.md` section 11 gives the two documents.
+
+`GET /health` is the request every node sees on every poll.
+A fleet can also declare header checks, and every configured tunnel is probed, so section 4 places both beside the two inputs.
+
+Section 2 follows the child that reads the journal, and section 3 the one input that is a request.
+
+## 2. The journal reader
+
+The journal is read by one child process for the life of the service, and its output is one more descriptor in the monitor's event loop.
+
+`journal::Reader::open` starts `journalctl` with `--follow`, `--lines=200`, `--output=json`, `--directory <journal_dir>`, and the two matches `M6_TYPE=perf` and `M6_TYPE=traffic`.
+`M6_TYPE` is the journal field `m6-log` writes for every line under systemd, set from the line's own `type` (`m6-log/src/journal.rs`), so the child selects the two document kinds before any JSON is parsed.
+`--lines=200` starts the follow with the last 200 matching lines, so a monitor that has just restarted reports figures before any node writes again.
+
+The pipe is made non-blocking and registered under the `JOURNAL` token in `m6-monitor/src/main.rs`.
+The loop reads whole lines from it and hands each to `Poller::ingest_journal`, so no poll runs `journalctl` and the loop never waits on the child.
+`journal::Latest` keeps the newest metrics document and the newest traffic document for each node name, and `Poller::record_journal` reads those two maps when a poll reaches its `Perf` and `Traffic` steps.
+
+A line is attributed by the `node` field of the document inside `MESSAGE`, which is the value the node's own config gives `[node] name`.
+`_HOSTNAME` is never read: a host that runs three nodes writes one `_HOSTNAME` for all three, and a key on it would report three nodes as one.
+A `perf` or `traffic` line whose document names no node is counted in `Latest::unattributed` and dropped.
+An entry that is not JSON, or one whose `MESSAGE` is missing or not JSON, is counted in `Latest::malformed`, and a line of another `type` is ignored.
+
+The fleet entry's `name` is the key the monitor looks a document up by, so it has to equal the node's `[node] name`.
+A fleet entry that names a node differently gets no figures for it, and the digest reports the absence as `no metrics line in the journal for this node` while `reported_node` shows the name the node calls itself.
+
+A line longer than `[limits] journal_line` is counted in `Reader::oversized` and dropped, and the reader discards bytes to the next newline so the following line starts clean.
+When the child exits, the loop deregisters the pipe and `Reader::retire` reaps the process.
+`Reader::restart_if_due` starts it again on a backoff that begins at one second and doubles to thirty (`Reader::stop` and `MAX_BACKOFF`).
+`Reader::stopped` keeps the reason, and `Poller::set_journal_state` hands it to the poller, which appends it to a node's missing-document error.
+At stop, `Reader`'s `Drop` kills and waits, so no `journalctl --follow` outlives the monitor.
+
+`record_journal` reports a node with no document: it sets `no metrics line in the journal for this node`, and `no traffic line in the journal for this node` for the traffic document.
+The digest turns the missing metrics document into a Warn finding, `no /perf: ... Health is known, everything else is not.`, which on its own leaves `/check` at exit 0 and the page at 200.
+A node that cannot be reached finishes its poll at the `Health` step, so it carries no document error and its `status` is `unreachable`.
+
+The same reader serves the one-shot check: `Reader::once` runs without `--follow`, `Reader::drain` reads the pipe to its end, and `m6-monitor --check` reads with the built-in `journal_line` limit.
+A relative `journal_dir` resolves against the config file's directory under `--check`, and against the site directory in the service.
+
+Section 3 turns to the one input that is a request.
+
+## 3. What the log cannot answer
+
+A document says nothing about whether the node is answering now, and some questions can be settled only by asking it.
+
+A node that is down, a node whose journal upload has stopped and an idle node all leave `Latest` unchanged, so the last document a node wrote stays in the digest at any age.
+`GET /health` is the per-poll fact, and `NodeReading::status` is the single rule that reads it: a 200 carries the body's `status`, any other code is `degraded`, a 200 with no parseable body is `unknown`, and a node that did not answer is `unreachable`.
+A 503 `degraded` says the process is alive and serving its public and cached pages while a dependency it reads is failing, which on a cache node is its origin (`m6-http/src/health.rs`).
+The node's log names the failing dependency, and `digest::DEGRADED_REASON` says so in the check's HEALTH line.
+
+The second question is where the node is.
+`NodeReading::rtt` is the round trip to `/health` measured from the monitor host, connect and TLS handshake included, so it measures the path from here to the node's public address.
+
+The third is which node answered.
+The body carries the node's own name and its process index, and `digest` reports the name as `reported_node` beside the fleet entry's `name`, so a fleet entry pointing at the wrong box is visible.
+The process index lets a poll tell the processes of a `processes` entry apart.
+
+The age of a node's last 200 comes from the history.
+The history answers it from the partial index `health_ok_node_at`, which holds only the rows that count as a 200, and `check::last_ok` reads that age.
+`[monitor] health_last_ok_max_age_s`, three poll intervals by default, is the age above which the HEALTH line reads `FAULT`.
+Without a history file the line reads `last 200 unknown (history off)`, and `--check` reads `last 200 unknown (--check keeps no history)`.
+
+A document carries no timestamp of its own, so the digest cannot say how old a node's figures are.
+A reading states its uptime and the seconds since its last log line, and the digest's `snapshot_age_s` is the age of the poll.
+
+Section 4 puts both inputs in the order one poll reaches them.
+
+## 4. One poll
+
+A poll is a table of steps the loop drives, one slot per node, with no thread and no blocking call.
+
+Table 2 lists the steps in the order a node reaches them.
+
+Table 2: the steps of one poll, in order.
+
+| step | what it does | where |
+|---|---|---|
+| `Health` | `GET {base_path}/health` on the node's public address, or on its status port for an entry expanded from `processes` | `Poller::begin_step` |
+| `Perf` | reads the newest metrics document for this node from `Latest` | `Poller::record_journal` |
+| `Traffic` | reads the newest traffic document for this node from `Latest` | `Poller::record_journal` |
+| `Header(i)` | one declared header check, a `GET` on the node's public address | `Poller::begin_step` |
+| the tunnel probe | three non-blocking connects to the node's `tunnel.address`, after the node's requests | `tunnel::PROBES_PER_POLL` |
+| the crawler lookups | reverse and forward *DNS* lookups for the addresses in a sighting | `check::VerdictCache` |
+
+Only `Health` and `Header` send a request, so a fleet with no header checks declared makes exactly one request per node per poll.
+A header check runs on a node whose `role` its entry lists, and on process 0 of a `processes` node, because the public face is one per node (`Poller::next_header`).
+A request is `GET <path> HTTP/1.1` with `Host` and `Connection: close`, and it carries no credential (`write_request`).
+Each node's steps advance as its own descriptors fire, so the nodes make progress at once, and a node that hangs holds its own slot until `timeout_ms` passes.
+`Poller::expire` records that timeout as the step's network error and moves the node on.
+
+A poll starts on the one-second tick, when `poll_interval_s` has passed since the last one started.
+A poll still running at its next due time is not restarted, and `main.rs` names that once in the debug log.
+
+`publish` builds the digest, records the history batch, renders the page once, and stores all of it as the snapshot.
+`/` serves those stored bytes, while `/digest` and `/check` build their bodies per request so their age fields are the age at the request.
+A poll that does not finish leaves the previous snapshot in place and its age keeps growing.
+At three poll intervals the reading is stale: `/digest` sets `stale` to true and `/check` prints a `STALE:` line first.
+
+Section 5 lists the keys that decide all of this.
+
+## 5. Configuration
+
+The monitor reads its own keys under `[monitor]`, its poll interval from the top level, and its buffers from `[limits]`.
+
+Table 3 lists the `[monitor]` keys, their defaults, and what each one decides.
+
+Table 3: the `[monitor]` keys.
+
+| key | default | what it decides |
+|---|---|---|
+| `nodes` | required, at least one | the fleet, as `[[monitor.nodes]]` entries |
+| `timeout_ms` | 5000 | the deadline for each step of a node's poll |
+| `journal_dir` | `/var/log/journal/remote` | the directory the reader follows, resolved against the site directory |
+| `history_file` | absent | the *SQLite* file that keeps the polls |
+| `history_max_mb` | 256, from 1 to 1048576 | the file's cap |
+| `one_certificate` | `false` | whether every node is expected to serve one certificate |
+| `header_check` | empty | the declared header assertions |
+| `wg_handshakes_file` | absent | the file a privileged timer writes from `wg show <interface> latest-handshakes` |
+| `tunnel_handshake_max_age_s` | 600 | the handshake age above which a tunnel is a fault |
+| `health_last_ok_max_age_s` | three poll intervals | the age above which a node's last 200 is flagged |
+
+A key under `[monitor]` outside Table 3 stops the start with exit 2, which is how the keys of section 6 are refused.
+
+Table 4 gives the keys of one fleet entry.
+
+Table 4: the keys of one `[[monitor.nodes]]` entry.
+
+| key | default | what it is |
+|---|---|---|
+| `name` | required | the node's name, which the journal is read by and the report shows |
+| `url` | required | the node's base URL, scheme and authority with an optional path prefix |
+| `role` | empty | a label for the report |
+| `tunnel.address` | absent | an IP address and port on the WireGuard tunnel |
+| `tunnel.public_key` | absent | the peer's public key, for the handshake check |
+| `processes` | absent | how many `[server] process_index` processes the node runs on its shared port |
+
+`processes` expands one entry into `<name>/<index>` entries, each polling `tunnel.address` with its port raised by the index, so it needs that address.
+A node without `processes`, or with `processes = 1`, is polled as one address.
+
+`poll_interval_s` is a top-level key with a default of 30 seconds, and `[monitor] poll_interval_s` is refused as an unknown key.
+`fleet::poll_interval_s` is the one function the poller and the handshake check both read it through.
+
+`[limits] journal_line` bounds one line the reader assembles, with `start` at 64 KiB and `max` at 4 MiB by default.
+A line past `max` is dropped and counted, and `docs/m6-app-anatomy.md` section 4.2 lists the limit with every other one.
+
+```toml
+poll_interval_s = 30
+
+[monitor]
+journal_dir = "/var/log/journal/remote"
+timeout_ms = 5000
+
+[[monitor.nodes]]
+name = "origin"
+url  = "https://www.example.com"
+role = "origin"
+
+[[monitor.nodes]]
+name = "edge-a"
+url  = "https://edge-a.example.com"
+role = "cache"
+```
+
+A `[[monitor.header_check]]` entry names a `path`, a `header`, the expected value in `expect`, an optional `roles` list, and `cache_bust`, which is on by default.
+
+Section 6 names the keys a config may not carry any more.
+
+## 6. Removed keys and the refusal
+
+The metrics tokens and the log reopen check are gone, and a config that still names one stops the start with exit 2.
+
+`Fleet` in `m6-monitor/src/fleet.rs` carries `deny_unknown_fields`, so a `[monitor]` key it does not declare is an unknown field at start.
+The message names the key and lists the ten that Table 3 gives.
+Table 5 lists what was removed and where it used to appear.
+
+Table 5: the keys and fields that are gone.
+
+| removed | where it used to appear | what a config or a reader gets now |
+|---|---|---|
+| `[monitor] log_reopen_max_age_s` | the monitor config | exit 2, `unknown field` naming the key |
+| `[monitor] perf_token_file` | the monitor config | exit 2, the same message |
+| `[[monitor.nodes]] perf_token_file` | a fleet entry | exit 2, `unknown field` naming the key |
+| `[[monitor.nodes]] metrics_over_tunnel` | a fleet entry | exit 2, the same message |
+| the log reopen section | `/check` | no section, and no `reopen` text in the report |
+| `LogReopenDigest` | `/digest` | no field, and no `log_reopen` key in the JSON |
+| the `reopen_*` columns | the history schema | new files have none, and old files keep them |
+
+There is no token anywhere in the monitor.
+`write_request` sends the method, the path, `Host` and `Connection: close`, and the crate holds no credential to send.
+The metrics documents need none, because they arrive in the journal with everything else.
+
+An old history file keeps its dead columns.
+`m6_core::sqlite::migrate` runs only the migrations above the file's `user_version`, so a `health` table made by a release that wrote the `reopen_*` columns is left as it is, and `INSERT_HEALTH` names the columns it writes.
+That is the expected state of a file that predates this release.
+
+Section 7 turns to what the service answers.
+
+## 7. The routes
+
+The monitor serves five routes on one unix socket and has no listener.
+
+Table 6 gives the routes and what each answers.
+
+Table 6: the five routes.
+
+| route | answer |
+|---|---|
+| `GET /` | the page, rendered once per poll, status 503 while the digest's level is `Fault` |
+| `GET /digest` | the digest as JSON, with `snapshot_age_s`, `snapshot_at`, `poll_interval_s` and `stale` added at the request |
+| `GET /check` | the report as text, with the age of the reading or a `STALE:` line first |
+| `GET /history` | the poll history as paged JSON Lines |
+| `GET /crawlers` | the crawler sightings as paged JSON Lines |
+
+The socket is `/run/m6/<config stem>.sock` (`socket_path_from_config` in `m6-core/src/server.rs`), so a config file named `m6-monitor.conf` gives `/run/m6/m6-monitor.sock`.
+`M6_SOCKET_OVERRIDE` replaces that path.
+
+The monitor has no access control of its own.
+An m6-http in front of the socket protects a route with its `require` rule, and `docs/m6-user-guide.md` section 7.10 gives the three tables that do it.
+
+`/history` and `/crawlers` answer 503 with `history is off: set [monitor] history_file to keep one` when no history file is configured.
+Both take `from` and `to` as RFC 3339 times, an optional `node`, and a range of at most 31 days.
+A page holds at most 4 MiB and 10,000 rows by default, and a `Link` header with `rel="next"` follows while rows remain.
+
+```bash
+curl --unix-socket /run/m6/m6-monitor.sock http://localhost/digest
+```
+
+A client needs the socket path, and `--unix-socket` points `curl` at it.
+
+Section 8 says what the digest and the check contain.
+
+## 8. The digest and the check
+
+One `digest::build` call turns a finished poll into the digest that every route serves.
+
+Table 7 gives each part of the digest and the input it came from.
+
+Table 7: where each part of the digest comes from.
+
+| digest field | source |
+|---|---|
+| `name`, `role`, `url` | the fleet config |
+| `status` | `/health`, through `NodeReading::status` |
+| `reported_node` | the `node` field of the `/health` body |
+| `rtt_ms` | the `/health` round trip, connect and TLS included |
+| `version`, `binary`, `hash` | the metrics document's `build` |
+| `uptime_s`, `host_uptime_s` | the metrics document |
+| `requests_total`, `hit_rate`, the hit and miss percentiles, `backend_errors`, `pools` | the metrics document's `metrics` and `pools` |
+| `load_one`, `cpus`, `memory_used`, `disk_used`, `thermal_max_c` | the metrics document's `host` |
+| `cert_not_after_unix`, `cert_fingerprint`, `cert_expires_in_seconds` | the metrics document's `tls` |
+| `traffic`, `traffic_error` | the traffic document |
+| `tunnel` | the TCP probe and the WireGuard handshake file |
+| `history` | the history file |
+| `perf_error` | the journal reader |
+
+`Thresholds` carries the limits the build judges against: load per CPU 2.0, memory 0.9, disk 0.8, thermal 80 C, certificate expiry 21 days, the tunnel handshake age, and the age of the last 200.
+
+`check::render` prints the same reading as text.
+HEALTH comes first, one line per node with this poll's `/health` answer and the age of its last 200 from the history, and a node past the age limit reads `FAULT` on its line and in the verdict.
+PROCESSES follows when the fleet declares `processes`.
+The rest is sections A to I: A LOGGING, B PERFORMANCE, C HOST, D SECURITY AND TRAFFIC, E CRAWLERS, F CACHE HEADERS, G CONNECTION SETUP, H TUNNELS, and I HISTORY.
+Section A judges the node's own log from the traffic document's `logging`, and `LoggingHealth::is_blind` faults a log silent for more than 40 seconds.
+
+`m6-monitor --check <config>` prints the same report and exits 1 on a fault and 0 otherwise.
+A config the fleet parser refuses exits 1 with the parser's message, and a service that cannot start exits 2 with `m6-monitor: <what>: <why>` on stderr.
+
+Section 9 turns to the file that keeps those readings.
+
+## 9. History
+
+With `[monitor] history_file` set, every finished poll is kept in one SQLite file, and that file is the record that outlives a node's journal.
+
+`history::start` opens the file, applies the migrations, and returns a `History` the loop owns.
+A batch is one poll: one row in `health` per node, with `health_channel` and `health_net` rows under it, the findings in `poll_finding`, and one `crawl_window` per node window with its sightings.
+
+When the file's used bytes pass `history_max_mb`, the oldest `poll` rows are deleted 256 at a time until the file is 5% under the cap.
+Nothing expires by age, and the file is never vacuumed.
+
+A write that meets a locked file leaves its batch for the next poll, so the loop never waits on the file.
+A write that fails for another reason is reported as `failing` in the digest's `history` object, and `behind`, `prune_failed` and `over_cap` are reported there too.
+
+Section 10 says where the crate sits.
+
+## 10. Where it fits
+
+m6-monitor links no m6 crate other than `m6-core` (`m6-monitor/Cargo.toml`), and runs as one process with one event loop.
+The journal child is the only process it starts, and it is killed at stop.
+
+The two documents it reads are m6-http's, defined in `m6_core::monitoring` and written by `m6-log`.
+[`docs/m6-http.md`](m6-http.md) section 11 gives the documents and `/health`.
+[`docs/m6-log.md`](m6-log.md) gives the line format and `M6_TYPE`.
+[`docs/m6-user-guide.md`](m6-user-guide.md) section 7.9 gives the deployment side: the journal upload, the directory, and the unit.
+
+Read this document as the crate's reference: sections 2 and 3 are the contract with the two inputs, section 5 is the whole configuration, and section 8 is every number the digest reports together with where it came from.
