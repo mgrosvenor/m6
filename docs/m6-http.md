@@ -42,8 +42,8 @@ m6-http <site-dir> <system-config>
 Both arguments are required.
 Development uses a minimal local system config (e.g. `configs/system.toml`).
 Production uses `/etc/m6/my-blog.toml`.
-The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]`, the `[health]` access keys, `[genid]` and `[cache]`.
-Everything else comes from `site.toml`.
+The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]`, `[genid]`, `[cache]` and `[limits]`.
+Everything else comes from `site.toml`, including `[health]` and `[stats]`, which describe the site every node serves.
 In one-file mode the same file serves as both, and every key is read from it.
 
 Optional flags:
@@ -53,7 +53,7 @@ Optional flags:
 --dump-config        # print effective merged config to stdout, then exit 0
 ```
 
-m6-http logs to stdout as structured JSON.
+m6-http logs one structured JSON line per event to stdout, or journald's native socket under systemd.
 
 ---
 
@@ -63,17 +63,16 @@ m6-http starts in this order, before it serves a request.
 
 1. Load `site.toml` from the site directory.
 2. Load `<system-config>`.
-   It carries `[node]`, the `[server]` node keys, `[auth]`, the `[health]` access keys, `[genid]` and `[cache]`, and nothing else.
+   It carries `[node]`, the `[server]` node keys, `[auth]`, `[genid]`, `[cache]` and `[limits]`, and nothing else.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
-4. If `[auth]` is declared, note the check backend it names; the check side is probed at step 8.
-   `backend` is optional and names the socket backend that answers `/check`.
+4. If `[auth]` is declared, note the check backend it names. The check side is probed at step 8, and `backend` names the socket backend that answers `/check`.
 5. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
 6. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
 7. Resolve every URL backend host once.
    A name that does not resolve is exit 2.
-8. Probe every member of the `[auth] backend` pool, when that key is set.
+8. Probe every member of the `[auth] backend` pool, when `[auth]` is declared.
    The probe sends one `POST /check` with no credential.
    A 401 or 503 passes, because a checker that refuses or is busy is there.
    A 404 is exit 2, naming the setting, the backend and the socket, because that address is not an auth server.
@@ -133,7 +132,7 @@ m6-http decides a request's path through a fixed order, and each step can answer
 4. **Method check:** a route that names `methods` answers only those, and another method is refused 405 with `Allow` before the cache is looked up or a backend is contacted.
 5. **Cache lookup:** a route with no `require` and a method that may read the cache is served from memory on a fresh hit, with no backend contact.
 6. **Route lookup:** a path that matches no route is answered 404 per `[errors] mode`.
-7. **Auth check:** when the route declares `require`, the credential is sent to `POST /check` on `[auth] backend` under a 50 ms deadline. No credential is 401 locally with no call, a 401 from the authority is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
+7. **Auth check:** when the route declares `require`, the credential is sent to `POST /check` on `[auth] backend` under a 50 ms deadline. An API request with no credential is 401 locally with no call, a browser is redirected as section 10 describes, a 401 from the authority is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
 8. **Forward:** the request is forwarded to the backend pool.
 
 The two host redirects sit before the cache on purpose: the cache key is `(path, query, encoding)` with no host component, so a warm entry for a served name would otherwise answer a request for a name the node does not own.
@@ -499,15 +498,18 @@ If a route declares `require`, m6-http asks the authority before forwarding:
 5. A timeout, a connect failure, a 500 or a body that does not parse is 503 with `Retry-After: 1`.
    It is never a 401: the authority did not refuse the credential, so the client is not told to log in again.
 
-A request with no credential is answered 401 locally, and no check is sent.
+An API request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
-A source node's `GET` and `POST /genid` take the same path, under `[genid] read_require` and `write_require`.
-A refusal is the authority's 401 or 403; a checker that does not answer is 503 with `Retry-After: 1`.
+A source node's `GET`, `HEAD` and `POST /genid` take the same path, under `[genid] read_require` and `write_require`.
+A refusal is the authority's 401 or 403, and a checker that does not answer is 503 with `Retry-After: 1`.
+
+A route's `require` and a source's `/genid` claims are the two credential consumers of `[auth] backend`.
+No monitoring path asks for a credential: `/health` is public and the metrics and traffic documents are log lines (section 11).
 
 `m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
 `m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
-`[auth]` now needs `backend`. Config validation refuses a `require` route or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
+`[auth]` needs `backend`. Config validation refuses a `require` route or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
 `[auth] public_key` is removed: the edge holds no key and decodes no token.
 
 `[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
@@ -524,15 +526,21 @@ Renderers may perform additional fine-grained checks using the auth claims avail
 
 ## 11. Monitoring Endpoints
 
-m6-http answers `/health` itself, ahead of routing, the cache and every backend.
-A refusal never reaches routing or the cache, so a catch-all route can never answer `/health` and a built-in path never enters the cache.
+m6-http reports monitoring through one public endpoint and two log lines.
+The endpoint is `[health].path`, and it answers liveness.
+The two lines carry the numbers an operator reads, and each comes from the process that wrote it.
+This section gives the endpoint's answers, the two lines and the traffic window behind the summary.
+
+When `[health].enabled` is true, m6-http answers `[health].path` ahead of routing, the cache and every backend, so a catch-all route cannot answer it and the path never enters the cache.
+`[health]` belongs in `site.toml` and has two keys, `enabled` (default true) and `path` (default `/health`), in `HealthConfig` in `m6-http/src/config.rs`.
 `/health` is public and has two answers, and the status code carries the answer.
-`200` with `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
+`200` with `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering, and the body gains `process_index` when the node sets one.
 `503` with `{"status":"degraded","node":"<name>"}` says the process is alive and serving its public and cached pages while a dependency is failing.
-On an edge the dependency is its origin, and a warm cache keeps serving while the origin is unreachable.
+On a cache node the dependency is its origin, and a warm cache keeps serving while the origin is unreachable.
+A source node reads no dependency here, so it answers `ok` while the process runs.
 So `/health` has two answers plus an absence: a process that is gone, or whose listener refuses, gives no answer at all, and m6-monitor reads that as `unreachable`.
 These two answers fit the monitor's four states: `ok`, `degraded`, `unknown` and `unreachable`.
-The degraded status is 503 so a reader that only looks at the code sees it, and m6-monitor already reads a non-200 as `degraded`.
+The degraded status is 503 so a reader that only looks at the code sees it, and m6-monitor reads a non-200 as `degraded`.
 
 `/health` reads flags and never probes.
 The origin flag is the cache node's own follower state, set where a heartbeat or a forwarded client request already observes the origin failing and cleared by the next successful heartbeat.
@@ -546,34 +554,48 @@ The detail goes in the process log instead, one warn line when the origin goes b
 m6-monitor's degraded line says a dependency is not answering and points at that log for which one.
 The lines go through `m6-log`, carry a static reason and allocate nothing on the request path.
 
-`/health` is the only built-in endpoint.
-The metrics document and the traffic document are log lines, as Table 4 gives, so a monitor reads them from the journal and no request opens them.
-The move is why nothing in m6-http needs a credential for monitoring any more: `[health] metrics_require` and `[health] metrics_peers` are gone, and a config that still names either stops the start with exit 2 as an unknown key.
-`[auth] backend` still names the backend that answers `POST /check` for a route's `require` and for `/genid`.
+With `[server] reuse_port`, `/health` is answered on the shared port, so the process the kernel picks answers it, and each process's metrics line is in the journal under the same node name.
+`[server] process_index` and `[server] status_bind` give every process a status listener of its own, at the `status_bind` port plus the index.
+That listener answers `[health].path` and nothing else, and every other path gets the 404 of a disabled endpoint (`is_status_path` and `status_refusal` in `m6-http/src/main.rs`).
 
-Table 4: the two monitoring lines.
+`/health` is the only built-in monitoring endpoint.
+`/genid` is the other path m6-http answers itself, on a node whose system config carries `[genid]` (section 8).
+The metrics document and the traffic summary are log lines, as Table 4 gives, so a monitor reads them from the journal.
+Table 4 also gives the interval key that writes each line.
 
-| line | `type` | target | message | interval key |
+| line | `type` | target | `fields.message` | interval key |
 |---|---|---|---|---|
 | the metrics document | `perf` | `m6_http::stats` | `stats` | `[stats].interval_s` |
 | the traffic summary | `traffic` | `m6_http::traffic` | `traffic` | `[stats].traffic_interval_s` |
 
-Both lines go to stdout, which journald carries, and under systemd each is also one datagram with `M6_TYPE` set to the same word, so a reader filters the journal on `M6_TYPE=perf` or `type=perf` without parsing the document.
-Both carry this process's share of the node, which is what a scrape of the shared port could only ever report while `[server] reuse_port` shares the port between processes.
-`/health` carries `process_index` when it is set, and a monitor reads the metrics line of each process out of the journal.
-`[server] process_index` and `status_bind` still give every process its own status listener, and that listener serves `/health` alone.
+*Table 4: the two monitoring lines. Take from it that the metrics document is the `type` `perf` line every `[stats].interval_s` seconds, and the traffic summary is the `type` `traffic` line every `[stats].traffic_interval_s` seconds.*
 
-Each of the three request counters' populations still reads as before, and the metrics line carries that table.
-Table 5 lists what a reader selects on.
+Both lines go to the process's one log stream: stdout outside systemd, and journald's native socket under systemd (`m6-log/src/sink.rs`).
+Under systemd each line is one datagram with `M6_TYPE` set to `perf` or `traffic`, so `journalctl M6_TYPE=perf` reads the metrics lines without parsing the document.
+The JSON line carries the same word in `type`.
+Each line is this process's share of the node.
+With `[server] reuse_port` the shared port answers from one process of N, so a monitor reads each process's metrics line from the journal and adds them.
+`/health` carries `process_index` when it is set.
 
-Table 5: what the monitoring reader selects on.
+Each line is one JSON object with `type`, `target` and `fields`.
+The metrics line's target is `m6_http::stats` and its `fields.message` is `stats`, and `fields.perf` holds the whole metrics document from `perf_document` in `m6-http/src/health.rs`.
+The traffic line's target is `m6_http::traffic` and its `fields.message` is `traffic`, and `fields.traffic` holds the traffic document from `build_report` in the same file.
+The metrics line is the largest line m6 writes: 26,143 bytes measured with every section at its maximum.
+`metrics.status_counts` is 8,501 bytes of that, `host` 3,572, `metrics.channels` 3,453 and `metrics.event_loop` 3,255.
+The `host` section varies by node, because it reports that machine's load, CPU count, memory, disks, interfaces and thermal zones, so a node with more of them writes a longer line.
+The log buffer's maximum is 1 MiB and its start is 16 KiB, so the first metrics line grows the sink to 32 KiB once and keeps it.
+
+The metrics line separates the three traffic populations on `metrics.channels`, each named `http/<version>/<iface>` (`Stats::record` in `m6-http/src/stats.rs`).
+Table 5 lists the key each monitoring reader selects on.
 
 | reader | selection |
 |---|---|
 | a metrics reader | `type` `perf` in the JSON line, or `M6_TYPE=perf` in the journal |
 | a traffic reader | `type` `traffic` in the JSON line, or `M6_TYPE=traffic` in the journal |
-| the access reader | `type` `access`, one line per request, the same row the analytics file used to carry |
+| the access reader | `type` `access`, one line per request or monitor poll |
 | a liveness reader | `GET /health`, the public endpoint |
+
+*Table 5: the key each monitoring reader selects on. Take from it that the two documents are found by `type` and the endpoint by its path.*
 
 The traffic line carries the last 60 minutes this process served, from a window it keeps in memory and reads no log file for.
 The window holds at most 32,768 events and is allocated at start.
@@ -585,6 +607,11 @@ In the traffic report, a request whose path or user agent was cut counts as prob
 Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
 The cut request is still probe-shaped under the rule above, and an injection marker past the cap is not reported.
 The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
+
+`/perf` and `/traffic` are removed, and five `[health]` keys went with them: `metrics_require`, `metrics_peers`, `perf_path`, `traffic_path` and `traffic_cache_s`.
+A config that still names one stops the start with exit 2 through the unknown-key check, which names the key (`HealthConfig` in `m6-http/src/config.rs`).
+`[auth] backend` has two credential consumers: a route's `require` and a source's `/genid` claims (section 10).
+Section 12 covers the two signals that stop the process.
 
 ---
 
@@ -852,34 +879,33 @@ That single loop is also where every log line is written, and the next section l
 
 ## 18. Logging
 
-m6-http writes one structured JSON line per event to stdout, and journald captures it through systemd.
+m6-http writes one structured JSON line per event to its one log stream: stdout, or journald's native socket under systemd (`m6-log/src/sink.rs`).
 
-Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token` and `auth: token verification failed` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
+Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token`, `auth: insufficient claims` and `auth: refused` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
 
-Periodic stats, twice: one operational line and one `type` `perf` line, both to stdout, which journald carries.
+Periodic stats, twice: one operational line and one `type` `perf` line.
 The operational line carries `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`, `hit_samples`, `hit_p0_ns`, `hit_p50_ns`, `hit_p99_ns`, `hit_max_ns`, `miss_samples`, `miss_p0_ns`, `miss_p50_ns`, `miss_p99_ns`, `miss_max_ns`, `monitor_requests`, `monitor_p50_ns` and `monitor_p99_ns`.
 `pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
 Each line reports the window since the last line, and each percentile carries its sample count beside it so a p50 over one sample cannot be read as a p50 over a thousand.
 
-The `type` `perf` line carries the whole metrics document, nested under `fields.perf`, from the one builder that produces it.
-Its target is `m6_http::stats` and its message is `stats`.
-`[stats].interval_s` sets how often both lines are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides it in a debug build.
-The metrics line goes to stdout with every other line.
+The `type` `perf` line carries the whole metrics document, nested under `fields.perf`, from `perf_document` in `m6-http/src/health.rs`.
+Its target is `m6_http::stats` and its `fields.message` is `stats`.
+`[stats].interval_s` sets how often the operational line and this one are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides both intervals in a debug build.
+The metrics line goes to the one log stream with every other line, and section 11 gives its 26,143-byte measured maximum and the `host` section that varies by node.
 
-A third periodic line is the traffic summary, `type` `traffic`, target `m6_http::traffic`, nested under `fields.traffic`.
-It carries the traffic document from the same one builder, at `[stats].traffic_interval_s`, one minute by default.
+A third periodic line is the traffic summary, `type` `traffic`, target `m6_http::traffic`, `fields.message` `traffic`, nested under `fields.traffic`.
+It carries the traffic document from `build_report` in `m6-http/src/health.rs`, at `[stats].traffic_interval_s`, one minute by default.
 Its own interval because the report summarises a sixty-minute window: a minute is the finest resolution at which a new line can say something the last one did not.
 
-The metrics document is the largest line m6 writes: 26,143 bytes measured with every section at its maximum.
-`metrics.status_counts` is 8,501 bytes of that, `host` 3,572, `metrics.channels` 3,453 and `metrics.event_loop` 3,255.
 The log buffer's maximum is 1 MiB and its start is 16 KiB, so the first metrics line grows the sink to 32 KiB once and keeps it.
-Size a log budget from these figures rather than from the section names.
+Size a log budget from the line's measured size.
 
 ---
 
 ## 19. Dependencies
 
-m6-http links these crates directly: `quiche` (HTTP/3 and QUIC), `rustls` (TLS), `matchit` (routing), `bytes` (zero-copy buffers), `serde` and `toml` (config), and `jsonwebtoken` (JWT verification).
+m6-http's direct dependencies include `quiche` (HTTP/3 and QUIC), `rustls` (TLS), `matchit` (routing), `hpack` (HTTP/2 header decoding), `httparse` (HTTP/1.1), `bytes` (buffers), `serde` and `toml` (config), and `sha2` (the disk cache's file names and check values).
+It links no JWT crate: the edge decodes no token, and `[auth] backend` answers `POST /check` (section 10).
 `quiche` is a fork pinned by revision, and `tools/conformance-scores.txt` records why.
 
 Where this document and the code disagree, the code is right and this document is a defect.
