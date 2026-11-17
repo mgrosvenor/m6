@@ -2057,8 +2057,7 @@ cd examples/11-admin-dashboard
 # open https://localhost:8444/
 ```
 
-Example 11 runs on Linux.
-On macOS, `render-admin` exits 2 at start because the shipped config sets `bench_bin` and the bench child is reaped from a pidfd, which only Linux provides.
+Example 11 runs on macOS and on Linux 5.3 or newer.
 
 The dashboard is served by m6-file at `https://localhost:8444/` and refreshes every 10 seconds.
 It has six tabs: Perf, System, Bench, Logs, Routes and Config.
