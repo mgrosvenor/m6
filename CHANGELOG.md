@@ -170,6 +170,14 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 ### Added
 
+**CI fails when a teardown selects its victim by name, port or command-line text.**
+`tools/check-kill-safety.sh` reads the tracked shell and workflow files and prints `file:line` for `pkill`, `killall`, `xargs kill`, `lsof -t` piped into a kill, and a `pgrep` whose result is killed.
+A comment that describes one of those shapes is skipped, and a `pgrep` that only compares or prints a result is not a kill.
+The examples and `m6-run-eg` record a pid and its start time in `examples/own.sh`, and this check enforces that shape on the rest of the tree.
+The m6-examples CI runs the same script from its m6 checkout with `--tree m6-examples`, so the two teardowns there are guarded without a copy.
+It needs no network and no build, and it runs in well under a second.
+Verified on 2026-11-16 on this Mac: it exits 1 naming `.github/workflows/ci.yml:705` and `tools/build-host-tests.sh:581` before the fix, exits 0 over 17 files in m6 and 30 in m6-examples after it, and exits 1 naming `examples/05-cms/dev.sh:151` when a `pkill -f m6-http` line is planted there and reverted.
+
 **m6-monitor reads each node's metrics and traffic documents from mon's journal.** One `journalctl --follow` child filters on `M6_TYPE=perf` and `M6_TYPE=traffic`, and its stdout is a descriptor in the monitor's existing event loop, so no `journalctl` runs per poll. Each line is attributed by the `node` field of the document in `MESSAGE`, and a line whose document names no node is counted and dropped. The child restarts on a backoff of up to thirty seconds and is killed at stop.
 
 **`[limits] journal_line` bounds one journal line.** It starts at 64 KiB, has a maximum of 4 MiB, and a line past the maximum is dropped and counted.
@@ -455,6 +463,12 @@ A directory symlink that stays inside the site still resolves inside and is serv
 Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
 
 ### Fixed
+
+**The examples job's teardown stops the `dev.sh` it started, by pid and start time, in place of `pgrep -f` on the directory.**
+The run step writes the pid and its `ps` start time to `.ci-dev.pid`, and the `Stop the stack` step compares the start time before signalling, so a pid that now belongs to another process is left alone.
+The build host's example 05 cleanup does the same: it stops the recorded `dev.sh`, reaps the service pids `dev.sh` wrote to `logs/.own-stack.pids` when `examples/own.sh` is present, and waits for the shell in place of killing everything whose command line mentions the directory.
+This removes the last `pgrep -f` teardown from m6's tree.
+Verified on 2026-11-16 on this Mac: `tools/check-kill-safety.sh` names both sites before the change and none after, `bash -n` parses the build-host script, and the workflow parses as YAML.
 
 **`m6-monitor --dump-config` now reads and validates its fleet, so a config that names a removed key in `[[monitor.nodes]]` fails the dump with the start's exit 2 and message.**
 The monitor answered `--dump-config` in m6-core's shared parser, which reads the framework table and the routes and never builds the `Fleet`.

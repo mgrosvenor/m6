@@ -538,6 +538,7 @@ fi
 # wedged lock would not be.
 M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 6<&- 7<&- 8<&- &
 DEV_PID=$!
+DEV_START=$(ps -o lstart= -p "$DEV_PID" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
 up=0
 # 180 seconds. Six services have to bind, and m6-md regenerates posts.json from
 # twelve markdown files first.
@@ -585,14 +586,34 @@ else
     fi
 fi
 kill $DEV_PID 2>/dev/null
-# The stack's own children: dev.sh's trap handles them, but it is not given long
-# here, so anything still holding the site directory is cleaned up by name of
-# path rather than by process name. Killing by name would reach other m6
-# instances on this box.
-for pid in $(pgrep -f "$(pwd)" 2>/dev/null || true); do
-    [ "$pid" = "$$" ] && continue
-    kill "$pid" 2>/dev/null || true
+# dev.sh stops the services it recorded when its EXIT trap runs. Reap those
+# recorded pids too, because a SIGKILL or a crash would leave the trap unrun.
+# This used to sweep `pgrep -f "$(pwd)"`, which matched anything whose command
+# line mentioned the directory, and that is another run's stack as easily as
+# this one.
+if [ -f ../own.sh ]; then
+    . ../own.sh
+    own_init "$(pwd)" stack
+    own_stop_records
+    own_forget
+fi
+i=0
+while [ "$i" -lt 50 ]; do
+    kill -0 "$DEV_PID" 2>/dev/null || break
+    # A child this shell has not reaped is a zombie: kill -0 still succeeds.
+    st=$(ps -o stat= -p "$DEV_PID" 2>/dev/null | tr -d ' ' || true)
+    case "$st" in Z*) break ;; esac
+    sleep 0.1
+    i=$((i + 1))
 done
+if kill -0 "$DEV_PID" 2>/dev/null; then
+    now=$(ps -o lstart= -p "$DEV_PID" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+    if [ "${DEV_START:--}" != "-" ] && [ -n "$now" ] && [ "$now" != "$DEV_START" ]; then
+        echo "dev.sh pid $DEV_PID is a different process now; leaving it alone"
+    else
+        kill -9 "$DEV_PID" 2>/dev/null || true
+    fi
+fi
 REMOTE_EG
 fi
 

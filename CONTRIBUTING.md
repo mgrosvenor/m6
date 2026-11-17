@@ -60,13 +60,14 @@ Table 2 lists the checks by the *CI* (continuous integration) job that runs each
 | h1, h2 and h3 conformance at or above the recorded floors (`tools/conformance.sh`) | h1, h2, h3 conformance |
 | dependencies (`cargo deny check`) | advisories, licences, duplicates |
 | shellcheck clean at warning level | shell scripts |
+| a teardown kills only a pid this run recorded (`tools/check-kill-safety.sh`) | shell scripts |
 | documents name live commits (`tools/check-commit-hashes.sh`) | documents name live commits |
 | the C client builds with no warnings | perf tools |
 | the examples build and work | the examples build and work |
 | the minimum supported Rust version in `Cargo.toml` | minimum supported Rust version |
 
 **Table 2: the checks a merge must pass, and the CI job that runs each one.**
-Take from it that five checks run in one CI job, and the other eight each have their own.
+Take from it that five checks run in one CI job, and the other nine run in eight more, with shellcheck and kill safety both in the shell job.
 
 The workspace test run does not compile m6-core's off-by-default features, so CI builds and tests m6-core with every feature on.
 The performance check runs on the build host, because it needs a quiet machine.
