@@ -176,9 +176,12 @@ fn redirect_head(
 }
 
 pub fn run(bind: &str, config: &config::Config) -> anyhow::Result<()> {
-    // `main` blocks the shutdown signals as its first statement, and `Signals`
-    // delivers them on a descriptor this loop reads, so SIGTERM is never
-    // blocked with nothing listening for it.
+    // `main` blocks the shutdown signals as its first statement. The descriptor
+    // opens before the socket exists, so a caller that waits for the port and
+    // then sends SIGTERM finds the handler armed. A stop that arrives while the
+    // mask is blocked and no descriptor is open is discarded on macOS, and the
+    // listener would then ignore the stop that followed its own bind.
+    let mut signals = Signals::new()?;
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
     lifecycle.started();
 
@@ -189,7 +192,6 @@ pub fn run(bind: &str, config: &config::Config) -> anyhow::Result<()> {
         crate::http11::INITIAL_CONNECTIONS,
         ceiling,
     )?;
-    let mut signals = Signals::new()?;
     let mut poll = Poll::new()?;
     poll.registry()
         .register_fd(listener.raw_fd(), TOKEN_LISTENER, Interest::READABLE)?;
