@@ -49,6 +49,11 @@ impl Resp {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
+    /// The `Retry-After` a 503 carries, for a retry that honours it.
+    fn retry_after(&self) -> Option<Duration> {
+        check_support::retry_after(self.header("retry-after"))
+    }
+
     /// The body's `genid`, from the tiny JSON the endpoint answers.
     fn genid(&self) -> String {
         let text = self.text();
@@ -364,6 +369,17 @@ impl Stack {
     // ── Clients ──────────────────────────────────────────────────────────────
 
     fn get(&self, port: u16, path: &str, headers: &[(&str, &str)]) -> Resp {
+        if check_support::check_gated(path) {
+            check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+                let r = self.exchange_get(port, path, headers);
+                (r.status, r.retry_after(), r)
+            })
+        } else {
+            self.exchange_get(port, path, headers)
+        }
+    }
+
+    fn exchange_get(&self, port: u16, path: &str, headers: &[(&str, &str)]) -> Resp {
         let tcp = match TcpStream::connect(("127.0.0.1", port)) {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),
@@ -404,6 +420,17 @@ impl Stack {
     }
 
     fn post(&self, port: u16, path: &str, token: Option<&str>) -> Resp {
+        if check_support::check_gated(path) {
+            check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+                let r = self.exchange_post(port, path, token);
+                (r.status, r.retry_after(), r)
+            })
+        } else {
+            self.exchange_post(port, path, token)
+        }
+    }
+
+    fn exchange_post(&self, port: u16, path: &str, token: Option<&str>) -> Resp {
         let tcp = match TcpStream::connect(("127.0.0.1", port)) {
             Ok(t) => t,
             Err(e) => return no_response(format!("connect: {e}")),

@@ -55,6 +55,11 @@ impl Resp {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
+    /// The `Retry-After` a 503 carries, for a retry that honours it.
+    fn retry_after(&self) -> Option<Duration> {
+        check_support::retry_after(self.header("retry-after"))
+    }
+
     /// The body's `genid`, from the tiny JSON the endpoint answers.
     fn genid(&self) -> String {
         let text = self.text();
@@ -306,6 +311,10 @@ impl Fixture {
     }
 
     fn h1_request(&self, method: &str, path: &str, token: Option<&str>) -> Resp {
+        self.retry_gated(path, || self.exchange_h1_request(method, path, token))
+    }
+
+    fn exchange_h1_request(&self, method: &str, path: &str, token: Option<&str>) -> Resp {
         let mut request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost:{}\r\nContent-Length: 0\r\nConnection: close\r\n",
             self.port.port()
@@ -317,7 +326,28 @@ impl Fixture {
         self.h1_wire(&request)
     }
 
+    /// Retry an answer from a check-gated endpoint while it is the design's
+    /// 503 for a check that missed its 50 ms deadline.
+    ///
+    /// A slow check is not a behaviour this suite tests, so the call is
+    /// repeated under the testkit bound and honours `Retry-After`. Any other
+    /// path, and any other status, is answered once.
+    fn retry_gated(&self, path: &str, mut attempt: impl FnMut() -> Resp) -> Resp {
+        if check_support::check_gated(path) {
+            check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+                let r = attempt();
+                (r.status, r.retry_after(), r)
+            })
+        } else {
+            attempt()
+        }
+    }
+
     fn h2(&self, method: &str, path: &str, token: Option<&str>, client_ip: &str) -> Resp {
+        self.retry_gated(path, || self.exchange_h2(method, path, token, client_ip))
+    }
+
+    fn exchange_h2(&self, method: &str, path: &str, token: Option<&str>, client_ip: &str) -> Resp {
         let cfg = tls_config(&self.cert_der, &[b"h2"]);
         let mut conn = match H2sTlsClientConn::connect("localhost", self.port.port(), cfg) {
             Ok(c) => c,
@@ -349,6 +379,10 @@ impl Fixture {
     }
 
     fn h2c(&self, path: &str, token: Option<&str>, client_ip: &str) -> Resp {
+        self.retry_gated(path, || self.exchange_h2c(path, token, client_ip))
+    }
+
+    fn exchange_h2c(&self, path: &str, token: Option<&str>, client_ip: &str) -> Resp {
         let mut conn = match H2cClientConn::connect("127.0.0.1", self.h2c.port()) {
             Ok(c) => c,
             Err(e) => return no_response(format!("h2c connect: {e}")),

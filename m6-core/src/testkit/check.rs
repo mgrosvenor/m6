@@ -6,10 +6,12 @@
 //! path without `m6-auth-server`, a database or a signing key, which is what
 //! lets `jsonwebtoken` leave `m6-http` and its tests.
 //!
-//! **No thread.** The test calls [`CheckServer::serve_one`] to accept and answer
-//! one connection, after it has sent the request that makes the edge dial this
-//! socket. The listener is bound and listening before [`CheckServer::bind`]
-//! returns, so the edge's connect is queued until that call.
+//! **Two ways to serve it.** [`CheckServer::serve_one`] accepts and answers one
+//! connection, for a test that is driving the order itself.
+//! [`ServingCheck`] binds one and answers every connection on a thread until it
+//! is dropped, for a fixture that needs the authority up while a service runs.
+//! Both bind and listen before they return, so the edge's connect is queued
+//! rather than raced.
 //!
 //! The fake can produce every answer a check test needs:
 //!
@@ -19,12 +21,20 @@
 //! - a refused connection, after [`CheckServer::close`] leaves the socket file
 //!   with no listener
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: the fake answers on its own thread and dials its own socket while a test drives the service from outside"
+)]
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// How long `serve_one` waits for the service's check connection.
@@ -110,6 +120,26 @@ impl CheckServer {
         self.calls
     }
 
+    /// Wait until the socket accepts a connection, under `timeout`.
+    ///
+    /// [`CheckServer::bind`] listens before it returns, so this succeeds at
+    /// once for a fresh server. It states the rule every fixture in the tree
+    /// follows: a dependency is up when its socket accepts, and the fixture
+    /// waits for that rather than racing the first request. The probe carries
+    /// no request, so it counts no check call.
+    pub fn wait_ready(&self, timeout: Duration) -> std::io::Result<()> {
+        if super::wait::for_unix(&self.path, timeout) {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "{} never accepted a connection within {timeout:?}",
+                self.path.display()
+            ),
+        ))
+    }
+
     /// Accept and answer one connection. Returns after the answer is written
     /// and the connection closed.
     ///
@@ -117,40 +147,43 @@ impl CheckServer {
     /// connection is already queued or about to arrive. The wait is bounded at
     /// ten seconds so a config error fails the test instead of hanging it.
     pub fn serve_one(&mut self) -> std::io::Result<()> {
-        let stream = {
-            let listener = self.listener.as_ref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "the check server is closed",
-                )
-            })?;
-            let mut poll = crate::platform::Poll::new()?;
-            poll.registry().register_fd(
-                listener.as_raw_fd(),
-                crate::platform::Token(0),
-                crate::platform::Interest::READABLE,
-            )?;
-            let deadline = crate::platform::now() + SERVE_BOUND;
-            let mut events = crate::platform::Events::with_capacity(1);
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        let now = crate::platform::now();
-                        if now >= deadline {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "no /check connection arrived within 10s",
-                            ));
-                        }
-                        poll.poll(&mut events, Some(deadline - now))?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-        };
+        let stream = self.accept_one()?;
         self.serve(stream)
+    }
+
+    /// Accept one connection, or time out after [`SERVE_BOUND`].
+    fn accept_one(&self) -> std::io::Result<UnixStream> {
+        let listener = self.listener.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the check server is closed",
+            )
+        })?;
+        let mut poll = crate::platform::Poll::new()?;
+        poll.registry().register_fd(
+            listener.as_raw_fd(),
+            crate::platform::Token(0),
+            crate::platform::Interest::READABLE,
+        )?;
+        let deadline = crate::platform::now() + SERVE_BOUND;
+        let mut events = crate::platform::Events::with_capacity(1);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return Ok(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let now = crate::platform::now();
+                    if now >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "no /check connection arrived within 10s",
+                        ));
+                    }
+                    poll.poll(&mut events, Some(deadline - now))?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Stop listening and leave the socket file with no listener, so the next
@@ -205,6 +238,79 @@ impl Drop for CheckServer {
     fn drop(&mut self) {
         self.close();
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A fake `/check` authority answering on its own thread until it is dropped.
+///
+/// A fixture that starts a service uses this instead of driving
+/// [`CheckServer::serve_one`] by hand. The worker must outlive every check the
+/// service sends, including one that arrives after a long idle period and one
+/// whose client has already gone away: a deadline the fake misses is the
+/// service's designed 503, so it is not a reason to stop answering, and
+/// stopping would delete the socket file and turn every later check into a
+/// connect failure.
+pub struct ServingCheck {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ServingCheck {
+    /// Bind `path`, wait for its socket to accept, then answer every connection
+    /// with the table until dropped.
+    ///
+    /// The listener exists and accepts before this returns, so a service
+    /// spawned next cannot see a missing socket.
+    pub fn start(path: impl Into<PathBuf>, answers: Vec<(String, Reply)>) -> std::io::Result<Self> {
+        let path = path.into();
+        let mut server = CheckServer::bind(&path)?;
+        for (token, reply) in answers {
+            server.answer(&token, reply);
+        }
+        // The rule every start in the tree follows. The probe carries no
+        // request, so the worker ignores it and `calls` stays at zero.
+        server.wait_ready(SERVE_BOUND)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("serving-check".to_string())
+            .spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    match server.accept_one() {
+                        Ok(stream) => {
+                            // A client that went away, because its check
+                            // timed out, is not a reason to stop serving.
+                            let _ = server.serve(stream);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        // The listener itself failed. Nothing can be served.
+                        Err(_) => break,
+                    }
+                }
+            })?;
+        Ok(Self {
+            path,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    /// The socket a service dials.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ServingCheck {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the accept behind `accept_one`; the loop sees the flag and ends.
+        let _ = UnixStream::connect(&self.path);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
