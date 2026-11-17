@@ -52,19 +52,24 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // ALLOC-0 with the difference of two runs: N = 1,000 and 2N = 2,000 on one warm
 // connection, per-request figure `(2N - N) / N`. The plan is
 // `work-queue/batch-9/ALLOC-0.md`. Each ALLOC job (ALLOC-1 rustls, ALLOC-2 the
-// cache, ALLOC-3 rendering) lowers the row it attacks. Never raise one: a count
-// above its budget is the defect the guard exists for.
+// cache, ALLOC-3 rendering) lowers the row it attacks. The only calls allowed
+// above a row's own per-request calls are the two named TLS-buffer allowances,
+// one on the h1 hit and one on the h2 hit. Any other count above its budget is
+// the defect the guard exists for.
 //
-// The integers the code makes are 2 for h1_tls_hit and 3 for h2_tls_hit (all
-// of them rustls; see below), and 47 for h1_tls_miss_insert. The h1 hit read
-// 2.000 in fourteen runs after its close-path allocation was removed, with
-// N = 1,000 counting 2,169 calls and 2N = 2,000 counting 4,169, so its budget
-// is 2,000, the whole request path with nothing added. The h2 hit is 3,000:
-// fourteen runs after its fix read 3,000 twelve times, 3,001 once and 2,999
-// once. Its budget is 3,001, and the one call above 3,000 is one more TLS
-// record received in a run than that run's baseline, which costs one
-// `Payload::into_vec` and can grow rustls's received-plaintext chunk queue.
-// Both are rustls's buffers.
+// The integers the code makes are 2 for h1_tls_hit and 3 for h2_tls_hit (the
+// per-request calls are all rustls's; see below), and 47 for
+// h1_tls_miss_insert. The h1 hit read 2.000 in fourteen runs after its
+// close-path allocation was removed, with N = 1,000 counting 2,169 calls and
+// 2N = 2,000 counting 4,169, and the path makes the same 2,000 calls per 1,000
+// requests now (the fixed part of a run moved with the provider change and
+// cancels in the difference). Its budget is 2,001: those 2,000 calls plus the
+// one handshake call explained below, which is aws-lc-rs's and is per run
+// rather than per request. The h2 hit is 3,000: fourteen runs after its fix
+// read 3,000 twelve times, 3,001 once and 2,999 once. Its budget is 3,001, and
+// the one call above 3,000 is one more TLS record received in a run than that
+// run's baseline, which costs one `Payload::into_vec` and can grow rustls's
+// received-plaintext chunk queue. Both are TLS buffers.
 //
 // The h2 row read 3.002 on Linux before that fix, and the extra was ours: the
 // HTTP/2 TLS and plain close paths built `io::Error::new(UnexpectedEof,
@@ -82,6 +87,27 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // fixed part of each run fell by nine calls (N = 1,000 went 2,178 -> 2,169,
 // 2N = 2,000 went 4,178 -> 4,169). The two calls per request are rustls's
 // record buffers.
+//
+// The one call the h1 budget allows is in the TLS handshake at accept, and it
+// is aws-lc-rs's. dhat over a 2.001 run and a 2.000 run differs at exactly one
+// stack: `EVP_PKEY::sign`'s `vec![0u8; sig_len]` in aws-lc-rs, through
+// `ptr::ManagedPointer::sign`, `ec::key_pair::EcdsaKeyPair::sign`, rustls's
+// `EcdsaSigner::sign`, `emit_certificate_verify_tls13` and
+// `process_new_packets`. Our frames are the callers only: `advance_tls` hands
+// the socket to rustls. `EVP_PKEY::sign` allocates the signature buffer at the
+// maximum DER length and then shrinks it to the length the signature took, so a
+// handshake whose DER signature is shorter than the 72-byte maximum makes one
+// more call than one whose signature is exactly 72. The row runs one handshake
+// per run, so the N/2N difference moves by one and reads 2.001 or 1.999.
+//
+// The provider change is why this row did not need the allowance before. ring's
+// ECDSA signer built the signature into a fixed-size value and rustls made the
+// one `Vec` at the signature's own length, so the DER length could not change
+// the call count. aws-lc-rs replaced ring in every crate at 7f96b2f, and its
+// `EVP_PKEY::sign` added the maximum-size buffer and its shrink. The
+// per-request calls are still exactly two, both rustls's record buffers: dhat
+// between K = 1,000 and K = 2,000 puts +1,000 on each of them and 0 on every
+// other site.
 //
 // The 3 left on h2's cached hit are rustls's, and nothing of ours:
 // two `rustls::msgs::base::Payload::into_vec` calls per request
@@ -106,7 +132,7 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 //
 // A path that allocates one more time per request adds 1,000 and fails every
 // budgeted row, which is the break.
-const H1_TLS_HIT_CALLS: u64 = 2_000;
+const H1_TLS_HIT_CALLS: u64 = 2_001;
 const H2_TLS_HIT_CALLS: u64 = 3_001;
 const H1_TLS_MISS_INSERT_CALLS: u64 = 47_004;
 
