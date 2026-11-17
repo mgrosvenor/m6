@@ -401,7 +401,7 @@ Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `POST
 
 **Every buffer and queue the audit found unbounded, shrinking, or silently dropping is on a named limit with a `start`, a `max` and one rule.**
 The rule is: allocate `start`, grow by doubling only when a write does not fit, clamp at `max`, keep the size, log one line on each growth, and refuse past `max` with an error that names the limit, the size needed, what was refused and the key and file to raise.
-Twenty-two limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from `[limits.<name>]` in a service's config and in m6-http's system config.
+Twenty-four limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from `[limits.<name>]` in a service's config and in m6-http's system config.
 - m6-core: the HTTP/1.1 slot's read buffer (`request_body`) and write buffer (`response_buffer`) no longer shrink after a large request, a request past the maximum is 413 and a response past it is 500.
   The upstream client's read buffer (`upstream_read`) and request buffer (`upstream_request`, which had no bound) refuse past their maximums.
   The compressor's and minifier's input (`compress_output`, `minify_output`) and the SMTP reply buffer (`smtp_reply`, a fixed buffer that failed when full) follow limits, and so do the connection table (`connections`) and the ndjson page (`ndjson_page`).

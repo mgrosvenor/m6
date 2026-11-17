@@ -227,7 +227,8 @@ harness = false
 name = "allocations"
 required-features = ["count-allocations"]
 
-# The same four rows with dhat as the allocator, at two request
+# The same four request-path rows with dhat as the allocator, plus the
+# handshake-only control, at two request
 # counts, writing one dhat-heap.json per server run. It needs both features, so
 # an ordinary test run never builds it.
 [[test]]
