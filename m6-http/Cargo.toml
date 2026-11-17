@@ -28,8 +28,8 @@ path = "src/bench_url_backend_main.rs"
 
 # Three single-purpose handshake probes. One protocol each, one handshake per
 # connection, strictly sequential, no requests and no charts -- the minimum that
-# can check m6-http's own per-channel handshake figure on /perf against an
-# independent measurement taken by our own client.
+# can check m6-http's own per-channel handshake figure on the `type=perf` line
+# against an independent measurement taken by our own client.
 #
 # Separate binaries rather than one with a --proto flag: each is a dozen lines
 # over src/probe.rs, and the h3 figure spans a DIFFERENT thing from the other two
@@ -207,8 +207,8 @@ harness = false
 [[test]]
 name = "disk_cache"
 
-# The /traffic window's per-event allocation check, on the main thread for the
-# same reason.
+# The `type=traffic` line's per-event allocation check, on the main thread for
+# the same reason.
 [[test]]
 name = "traffic_window_alloc"
 harness = false

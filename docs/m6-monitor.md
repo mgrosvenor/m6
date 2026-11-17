@@ -75,7 +75,7 @@ When the child exits, the loop deregisters the pipe and `Reader::retire` reaps t
 At stop, `Reader`'s `Drop` kills and waits, so no `journalctl --follow` outlives the monitor.
 
 `record_journal` reports a node with no document: it sets `no metrics line in the journal for this node`, and `no traffic line in the journal for this node` for the traffic document.
-The digest turns the missing metrics document into a Warn finding, `no /perf: ... Health is known, everything else is not.`, which on its own leaves `/check` at exit 0 and the page at 200.
+The digest turns the missing metrics document into a Warn finding, `metrics unavailable: ... Health is known, everything else is not.`, which on its own leaves `/check` at exit 0 and the page at 200.
 A node that cannot be reached finishes its poll at the `Health` step, so it carries no document error and its `status` is `unreachable`.
 
 The same reader serves the one-shot check: `Reader::once` runs without `--follow`, `Reader::drain` reads the pipe to its end, and `m6-monitor --check` reads with the built-in `journal_line` limit.

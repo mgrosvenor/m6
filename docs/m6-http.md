@@ -580,7 +580,7 @@ With `[server] reuse_port` the shared port answers from one process of N, so a m
 Each line is one JSON object with `type`, `target` and `fields`.
 The metrics line's target is `m6_http::stats` and its `fields.message` is `stats`, and `fields.perf` holds the whole metrics document from `perf_document` in `m6-http/src/health.rs`.
 The traffic line's target is `m6_http::traffic` and its `fields.message` is `traffic`, and `fields.traffic` holds the traffic document from `build_report` in the same file.
-The metrics line is the largest line m6 writes: 26,143 bytes measured with every section at its maximum.
+The metrics document is the largest document m6 writes: 26,143 bytes measured with every section at its maximum.
 `metrics.status_counts` is 8,501 bytes of that, `host` 3,572, `metrics.channels` 3,453 and `metrics.event_loop` 3,255.
 The `host` section varies by node, because it reports that machine's load, CPU count, memory, disks, interfaces and thermal zones, so a node with more of them writes a longer line.
 The log buffer's maximum is 1 MiB and its start is 16 KiB, so the first metrics line grows the sink to 32 KiB once and keeps it.
@@ -891,7 +891,7 @@ Each line reports the window since the last line, and each percentile carries it
 The `type` `perf` line carries the whole metrics document, nested under `fields.perf`, from `perf_document` in `m6-http/src/health.rs`.
 Its target is `m6_http::stats` and its `fields.message` is `stats`.
 `[stats].interval_s` sets how often the operational line and this one are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides both intervals in a debug build.
-The metrics line goes to the one log stream with every other line, and section 11 gives its 26,143-byte measured maximum and the `host` section that varies by node.
+The metrics line goes to the one log stream with every other line, and section 11 gives the document's 26,143-byte measured maximum and the `host` section that varies by node.
 
 A third periodic line is the traffic summary, `type` `traffic`, target `m6_http::traffic`, `fields.message` `traffic`, nested under `fields.traffic`.
 It carries the traffic document from `build_report` in `m6-http/src/health.rs`, at `[stats].traffic_interval_s`, one minute by default.
