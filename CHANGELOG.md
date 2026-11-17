@@ -567,6 +567,7 @@ A 401 from the authority is 401, an identity without the requirement is 403, and
 No decision is cached, so a role change or a revocation counts from the next request.
 The edge decodes no token and holds no key on a protected route, and `X-Auth-Claims` now carries `sub`, `username`, `roles` and `groups` and no token claim.
 The credential is refused before the hand-built `POST /check` is written if it carries CR, LF or NUL or is longer than one header line, so an HTTP/2 or HTTP/3 client cannot inject a field or a request line into that request.
+A check that does not answer at all, through a transport failure or the 50 ms deadline, logs one warn naming the `auth-checker` dependency, and the next check that answers logs one info. A checker that answers 403, 500 or 503 is present and answering, so it logs neither.
 A config with a `require` route now needs `[auth] backend`, and the start fails without it.
 Public routes are unchanged and reach no authority.
 Three gates still decide locally until step 6: `/perf`, `/traffic` and a source node's `POST /genid` call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token the authority would refuse still opens them until it expires.

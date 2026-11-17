@@ -20,7 +20,7 @@ use std::time::Duration;
 use rustls::StreamOwned;
 
 use m6_core::auth::Identity;
-use m6_core::testkit::{binary, claim_port, CheckServer, PortClaim, Reply, Service};
+use m6_core::testkit::{binary, claim_port, wait, CheckServer, PortClaim, Reply, Service};
 
 /// Build the one identity these tests answer, optionally with a group.
 fn identity(groups: &[&str]) -> Identity {
@@ -758,5 +758,71 @@ fn the_503_names_the_auth_backend_not_the_content_backend() {
         !timed.body.contains("Connect(") && !timed.body.contains("timed out"),
         "the timeout page named the transport failure\n{}",
         timed.body
+    );
+}
+
+/// The count of log lines carrying `needle`, read from the running service.
+fn check_log_lines(srv: &TestServer, needle: &str) -> usize {
+    srv.http.borrow().output().matches(needle).count()
+}
+
+/// One warn when the check backend stops answering, one info when it answers
+/// again, however many requests see each state.
+///
+/// The wrong outcome this catches: a line per failed request, which makes the
+/// outage unreadable in the log, or a line per answered request, which makes
+/// the recovery invisible by burying it. The state is one bool read where the
+/// outcome is already known, so `/health` can read the same flag later without
+/// a timer or a probe.
+#[test]
+fn a_checker_that_stops_answering_logs_one_warn_and_one_info() {
+    let mut srv = TestServer::start();
+
+    // The checker accepts and does not answer, so the 50 ms deadline fires.
+    srv.check.unknown_answer(Reply::Hold);
+    for _ in 0..3 {
+        let response = srv.request(
+            "/private/secret.txt",
+            &[("Authorization", "Bearer opaque-token")],
+        );
+        assert_eq!(response.status, 503, "{}", response.headers);
+    }
+    assert!(
+        wait::until(Duration::from_secs(10), || {
+            check_log_lines(&srv, "the check backend did not answer") >= 1
+        }),
+        "the outage was not logged\n--- output ---\n{}",
+        srv.http.borrow().output()
+    );
+
+    // A checker that answers 503 is present and answering, so it clears the
+    // flag: it is not the same fact as a checker that is not there.
+    srv.check.unknown_answer(Reply::Unavailable);
+    for _ in 0..3 {
+        let response = srv.request(
+            "/private/secret.txt",
+            &[("Authorization", "Bearer opaque-token")],
+        );
+        assert_eq!(response.status, 503, "{}", response.headers);
+    }
+    assert!(
+        wait::until(Duration::from_secs(10), || {
+            check_log_lines(&srv, "the check backend answered again") >= 1
+        }),
+        "the recovery was not logged\n--- output ---\n{}",
+        srv.http.borrow().output()
+    );
+
+    assert_eq!(
+        check_log_lines(&srv, "the check backend did not answer"),
+        1,
+        "the outage was logged more than once\n--- output ---\n{}",
+        srv.http.borrow().output()
+    );
+    assert_eq!(
+        check_log_lines(&srv, "the check backend answered again"),
+        1,
+        "the recovery was logged more than once\n--- output ---\n{}",
+        srv.http.borrow().output()
     );
 }

@@ -352,6 +352,15 @@ struct ServerState {
     /// behind a 30 s backend token and fire only when that token expired. The
     /// two bounds are different, so they are two tables.
     auth_timeouts: Timeouts,
+    /// Whether the last `POST /check` answered at all.
+    ///
+    /// The `auth-checker` dependency's state. It is set from the outcome the
+    /// request path already has: `false` when the check did not answer (a
+    /// transport failure, or the 50 ms deadline) and `true` on any answer,
+    /// including a 401, a 403 and a 500. A checker that answers is present,
+    /// and naming its internal answer in a public body would leak it. It is
+    /// one bool and one log line per change, with no timer and no probe.
+    auth_check_answered: bool,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -1709,6 +1718,31 @@ fn complete_waiter(
     }
 }
 
+/// Record whether the authority answered, with one log line per change.
+///
+/// `answered` is false only when the check did not answer at all: a transport
+/// failure or the 50 ms deadline. A checker that answers 401, 403, 500 or 503
+/// is present and answering, so those leave the flag set. The flag is the
+/// `auth-checker` dependency's state for `/health`, and it is read and written
+/// here only: one bool, no timer and no probe.
+fn note_check_reachability(state: &mut ServerState, answered: bool) {
+    if state.auth_check_answered == answered {
+        return;
+    }
+    state.auth_check_answered = answered;
+    if answered {
+        info!(
+            dependency = "auth-checker",
+            "the check backend answered again"
+        );
+    } else {
+        warn!(
+            dependency = "auth-checker",
+            "the check backend did not answer"
+        );
+    }
+}
+
 /// Finish a check: apply the route's `require` to the identity, then re-enter
 /// `handle_request` with the decision.
 ///
@@ -1723,6 +1757,7 @@ fn complete_auth(
     waiter: Waiter,
     cx: &mut CompletionCtx<'_>,
 ) {
+    note_check_reachability(cx.state, result.is_ok());
     let decision = match (ctx.auth_require.as_deref(), &result) {
         (Some(require), Ok(response)) => {
             core_auth::parse_check(response.status, &response.body).decide(require)
@@ -5316,6 +5351,7 @@ fn handle_request_inner(
                             // unreachable, so it answers the same 503 as an
                             // unreachable backend. Never a 502, never a 401.
                             Err(e) => {
+                                note_check_reachability(state, false);
                                 warn!(
                                     backend = %auth_backend,
                                     route = %route.path,
@@ -7522,6 +7558,7 @@ fn run(args: Vec<String>) -> i32 {
             std::time::Duration::from_secs(backend_timeout_secs),
         ),
         auth_timeouts: Timeouts::new(initial_connections, auth::CHECK_DEADLINE),
+        auth_check_answered: true,
         h2c_pool: H2cClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         h2s_pool: H2sTlsClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         tls_iface,
