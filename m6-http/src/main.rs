@@ -6997,11 +6997,10 @@ fn main() {
     // refuses to open without it. See m6_core::signal.
     m6_core::signal::block();
 
-    // rustls requires an explicit CryptoProvider when multiple are available
-    // (ring + aws-lc-rs both get pulled in transitively). Install ring first.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // rustls's provider is not installed here. Cargo.toml enables exactly one
+    // provider feature (aws-lc-rs), so the first config builder resolves and
+    // installs it. Nothing in this process builds a config before that.
+    //
     // ALLOC-ATTR: the profiler is held for the whole process so every
     // allocation is attributed. `run` returns before the explicit drop, because
     // `std::process::exit` does not run destructors and dhat writes its file on

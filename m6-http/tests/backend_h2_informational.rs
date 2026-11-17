@@ -142,7 +142,7 @@ fn fetch_h2c(informational: usize) -> std::io::Result<HttpResponse> {
 }
 
 fn fetch_h2s(informational: usize) -> std::io::Result<HttpResponse> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert = ck.cert.der().clone();
     let key = rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).unwrap();

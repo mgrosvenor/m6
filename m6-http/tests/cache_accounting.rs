@@ -206,7 +206,6 @@ impl Stack {
     }
 
     fn get_with(&self, path: &str, extra: &[(&str, &str)]) -> (u16, String) {
-        probe::install_crypto();
         let tcp = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
         // No socket read timeout: the read is waited for as an event under one
         // generous bound. A read timeout fires on a loaded host while the

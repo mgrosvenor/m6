@@ -48,7 +48,7 @@ fn gen_cert() -> Cert {
 
 /// A client that trusts the one certificate in the test.
 fn client_trusting(cert: &Cert, alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let mut store = rustls::RootCertStore::empty();

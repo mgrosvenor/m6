@@ -578,7 +578,7 @@ fn echo_tls_round_trips_and_stops() {
         None,
     );
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut root = rustls::RootCertStore::empty();
     root.add(ck.cert.der().clone()).expect("root");
     let cfg = rustls::ClientConfig::builder()

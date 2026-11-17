@@ -138,7 +138,9 @@ sha2          = "0.10"
 rusqlite      = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
 # `client::Upstream` and the TLS echo program use rustls with exactly the
 # features m6-http names, so the workspace builds one rustls, not two.
-rustls          = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# aws-lc-rs is rustls's default provider and the only one this tree names; see
+# m6-http/Cargo.toml for the Linux measurement behind the choice.
+rustls          = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", optional = true }
 # The host's own certificate store, for `client::system_roots`. The same
 # version m6-http uses, so the workspace links one of it and the lock gains no

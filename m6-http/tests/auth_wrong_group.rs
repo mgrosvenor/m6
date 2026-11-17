@@ -82,7 +82,7 @@ fn mint_jwt(private_pem: &str, groups: &[&str]) -> String {
 // ── HTTP/1.1 over TLS client ──────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());

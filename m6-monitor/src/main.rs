@@ -182,11 +182,8 @@ fn run_service() -> Result<()> {
     }));
     let fleet = fleet::Fleet::from_config(site.config_path())
         .unwrap_or_else(|e| fail("reading the fleet", format!("{e:#}")));
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls = Arc::new(
-        rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap_or_else(|e| fail("building the TLS client config", e))
+        rustls::ClientConfig::builder()
             .with_root_certificates(
                 m6_core::client::system_roots()
                     .unwrap_or_else(|e| fail("reading the host certificate store", e)),
@@ -843,10 +840,8 @@ fn nodes_in(out: &[poll::Out]) -> usize {
 /// cannot disagree.
 fn run_check(config_path: &Path) -> Result<()> {
     let fleet = fleet::Fleet::from_config(config_path)?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls = Arc::new(
-        rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
+        rustls::ClientConfig::builder()
             .with_root_certificates(m6_core::client::system_roots()?)
             .with_no_client_auth(),
     );
@@ -1134,41 +1129,36 @@ mod tests {
         assert!(html.contains("&lt;u&gt;ok&lt;/u&gt;"), "{html}");
     }
 
-    /// Every client config in this service names its provider.
+    /// The automatic client-config builder resolves the one provider.
     ///
-    /// The automatic client-config builder asks rustls for the process
-    /// default. In a workspace-wide test build rustls is compiled with both
-    /// providers, because m6-http's dev-dependency `tokio-rustls` pulls
-    /// `aws-lc-rs` in, so there is no default and the first call panics. A
-    /// per-crate build compiles only ring and hides it, which is how a
-    /// per-crate gate passed while the workspace build failed. Naming ring at
-    /// each call site keeps the monitor starting whatever else is in the
-    /// build. Nothing is installed process-wide: that is state a library
-    /// must not set.
+    /// This replaces the source scan that required every
+    /// `ClientConfig::builder()` call to name its provider. That rule existed
+    /// because a workspace-wide test build compiled rustls with both providers:
+    /// m6-http's dev-dependency `tokio-rustls` pulled `aws-lc-rs` in while the
+    /// direct dependency named ring, so the automatic builder had no default
+    /// and panicked. A per-crate build compiled only ring and hid it, which is
+    /// how a per-crate gate passed while the workspace build failed.
+    ///
+    /// m6-monitor, m6-core and m6-http now all name `aws_lc_rs` and none names
+    /// `ring`, so there is one provider in every build and the automatic
+    /// builder is unambiguous. This test holds that invariant by behaviour: a
+    /// second provider pulled into any workspace build panics the builder, and
+    /// a workspace that resolved a different single provider fails the
+    /// key-exchange check. X25519MLKEM768 is what tells aws-lc-rs's default
+    /// apart from ring's.
     #[test]
-    fn every_client_config_names_its_provider() {
-        let needle = ["ClientConfig::", "builder("].concat();
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = 0;
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("read m6-monitor/src") {
-            let path = entry.expect("directory entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read a source file");
-            files += 1;
-            for (line, body) in text.lines().enumerate() {
-                if body.contains(&needle) {
-                    found.push(format!("{}:{}: {}", path.display(), line + 1, body.trim()));
-                }
-            }
-        }
-        assert!(files > 0, "read no source files under {}", dir.display());
+    fn the_automatic_client_config_builder_resolves_the_one_provider() {
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("the automatic builder installs the provider from the crate features");
         assert!(
-            found.is_empty(),
-            "a client config without a named provider:\n{}",
-            found.join("\n")
+            provider
+                .kx_groups
+                .iter()
+                .any(|g| matches!(g.name(), rustls::NamedGroup::X25519MLKEM768)),
+            "the automatic builder resolved a provider other than aws-lc-rs"
         );
     }
 }

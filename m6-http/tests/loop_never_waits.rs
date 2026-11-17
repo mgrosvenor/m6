@@ -284,7 +284,6 @@ fn respond(stream: &mut UnixStream, status: u16, body: &str, cache: bool) {
 
 /// HTTP/1.1 over TLS, blocking, with a read timeout.
 fn h1_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), String> {
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
     tcp.set_read_timeout(Some(timeout))
         .map_err(|e| e.to_string())?;
@@ -317,7 +316,6 @@ fn parse_h1(raw: &[u8]) -> Result<(u16, String), String> {
 
 /// Whether an h1 response head advertises HTTP/3 via `alt-svc`.
 fn h1_has_alt_svc(port: u16, path: &str) -> Result<bool, String> {
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -340,7 +338,6 @@ fn h1_has_alt_svc(port: u16, path: &str) -> Result<bool, String> {
 /// HTTP/2 over TLS, driven in a loop until the reply arrives or the deadline
 /// passes.
 fn h2_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), String> {
-    probe::install_crypto();
     let cfg = probe::tls_config(b"h2");
     let mut conn = H2sTlsClientConn::connect("127.0.0.1", port, cfg).map_err(|e| e.to_string())?;
     let req = HttpRequest {
@@ -922,7 +919,6 @@ struct H1KeepAlive {
 
 impl H1KeepAlive {
     fn connect(port: u16) -> H1KeepAlive {
-        probe::install_crypto();
         let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         // No socket read timeout. Each response is waited for as an event under
         // one generous bound: a read timeout fires on a loaded host while the
@@ -1023,7 +1019,6 @@ fn a_connection_event_never_accepts() {
 #[test]
 fn a_large_response_to_a_slow_reader_is_resumed_by_write_readiness() {
     let fx = Fixture::start(1, 30, "large");
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", fx.port())).expect("connect");
     let sock = socket2::SockRef::from(&tcp);
     sock.set_recv_buffer_size(64 * 1024).expect("recv buffer");
@@ -1070,7 +1065,6 @@ fn a_large_response_to_a_slow_reader_is_resumed_by_write_readiness() {
 #[test]
 fn a_request_body_larger_than_the_tls_plaintext_buffer_arrives_whole() {
     let fx = Fixture::start(1, 30, "echo");
-    probe::install_crypto();
     let tcp = TcpStream::connect(("127.0.0.1", fx.port())).expect("connect");
     tcp.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("read timeout");
@@ -1246,7 +1240,6 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
 #[test]
 fn a_closed_client_does_not_leak_its_upstream() {
     let fx = Fixture::start(2, 30, "leak");
-    probe::install_crypto();
 
     // Open a connection, send /slow, and keep it open until member A reports
     // the request was dispatched, then close it while the backend still holds.
@@ -1582,7 +1575,6 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     };
 
     // Client A dispatches /slow, then closes while the backend holds it.
-    probe::install_crypto();
     {
         let cfg = probe::tls_config(b"h2");
         let mut a = H2sTlsClientConn::connect("127.0.0.1", port, cfg).expect("client A");
@@ -1893,7 +1885,7 @@ fn an_idle_url_connection_the_backend_closes_is_dropped_before_reuse() {
 /// A TLS test backend: `/fast` answers at once with a cacheable body, `/slow`
 /// reports it arrived and holds until `release`.
 fn spawn_tls_backend(slow_seen: mpsc::Sender<()>, release: Arc<AtomicBool>) -> u16 {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ck =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
             .expect("certificate");

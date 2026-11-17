@@ -158,7 +158,7 @@ struct Stack {
 
 impl Stack {
     fn new() -> Stack {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -661,7 +661,7 @@ fn no_verify_tls() -> Arc<rustls::ClientConfig> {
             Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }

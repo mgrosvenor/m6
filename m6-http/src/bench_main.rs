@@ -207,7 +207,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1802,9 +1802,9 @@ fn run_path_benchmarks(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // The crate enables exactly one rustls provider feature (aws-lc-rs), so the
+    // first config builder resolves and installs it. `supported_verify_schemes`
+    // reads the provider directly and does not need an installed default.
     let args = Args::parse();
     let mut all_pass = true;
 

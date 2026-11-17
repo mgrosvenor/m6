@@ -152,7 +152,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -1136,7 +1136,7 @@ fn main() {
     // Ensure ring is the active crypto provider.  tokio-rustls may pull in
     // aws-lc-rs as well, which causes rustls to refuse to auto-select; an
     // explicit install avoids the ambiguity.  .ok() makes it idempotent.
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
 

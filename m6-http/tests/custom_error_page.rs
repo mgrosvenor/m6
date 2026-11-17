@@ -286,7 +286,7 @@ struct Stack {
 
 impl Stack {
     fn start(tag: &str, fail_error_page: bool) -> Stack {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 

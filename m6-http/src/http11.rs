@@ -2760,9 +2760,12 @@ fn load_tls_material(cert_path: &str, key_path: &str) -> anyhow::Result<TlsMater
     // orders of magnitude of difference once a real network path is involved,
     // plus two extra round trips on every new browser connection.
     //
-    // `ring`, matching the provider this crate builds rustls with
-    // (m6-http/Cargo.toml: features = ["ring", "std"]).
-    config.ticketer = rustls::crypto::ring::Ticketer::new()
+    // The provider's ticketer, matching the one provider this crate builds
+    // rustls with (m6-http/Cargo.toml: features = ["aws_lc_rs", "std"]). Its
+    // design is the same: random keys on a 12 hour life. This is the provider
+    // substitution and nothing else: the ticketer is still installed, its
+    // lifetime is unchanged, and `session_storage` below is still the default.
+    config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
         .map_err(|e| anyhow::anyhow!("tls ticketer: {}", e))?;
 
     // `session_storage` is deliberately LEFT at the default 256.
