@@ -234,3 +234,31 @@ fn no_backend_needs_no_probe() {
     let status = stop(svc);
     assert_eq!(status.code(), Some(0), "the node did not stop cleanly");
 }
+
+/// A 403 to the no-credential probe is a service that is not a checker, so the
+/// start stops and names it.
+///
+/// The probe passes on 401 and 503 because both prove the `/check` route is
+/// there. A 403 is neither, and a catch-all that accepted any refusal would
+/// call a service that refuses the probe a checker.
+#[test]
+fn a_403_from_the_check_backend_exits_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = check_socket(dir.path());
+    let mut server = CheckServer::bind(&path).expect("check server");
+    server.unknown_answer(Reply::Forbidden);
+    let configs = write_configs(dir.path(), Some(path.to_str().expect("utf-8 socket path")));
+
+    let mut svc = spawn(&configs);
+    serve(&mut server, &svc);
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + STARTED)
+        .unwrap_or_else(|| panic!("m6-http did not exit\n--- output ---\n{}", svc.output()));
+    let output = svc.output();
+    assert_eq!(status.code(), Some(2), "output:\n{output}");
+    assert!(
+        output.contains("no member answered 401 or 503"),
+        "output:\n{output}"
+    );
+    assert!(output.contains("403"), "output:\n{output}");
+}

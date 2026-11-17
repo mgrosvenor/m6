@@ -434,3 +434,54 @@ fn a_browser_with_a_refresh_cookie_is_sent_to_refresh_when_the_check_refuses() {
         response.headers
     );
 }
+
+/// A 403 from the authority is `NoDecision`, so the route answers its 503 with
+/// `Retry-After: 1`.
+///
+/// The wrong decision this catches: a caller that treated a 403 as allowed
+/// would fetch `/private/secret.txt` and answer 200. The core unit test pins
+/// the mapping, and this drives the whole route path that acts on it.
+#[test]
+fn a_check_that_is_403_is_503_not_200() {
+    let mut srv = TestServer::start();
+    srv.check.unknown_answer(Reply::Forbidden);
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(
+        response.status, 503,
+        "a 403 from the authority was not the edge's 503\n{}",
+        response.headers
+    );
+    assert_eq!(
+        response.header_value("retry-after").as_deref(),
+        Some("1"),
+        "{}",
+        response.headers
+    );
+}
+
+/// A 503 from the authority is the route's 503 with `Retry-After: 1`, never
+/// 200. A caller that read an unavailable answer as allowed would serve the
+/// file.
+#[test]
+fn a_check_that_is_503_is_503_not_200() {
+    let mut srv = TestServer::start();
+    srv.check.unknown_answer(Reply::Unavailable);
+    let response = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer opaque-token")],
+    );
+    assert_eq!(
+        response.status, 503,
+        "a 503 from the authority was not the edge's 503\n{}",
+        response.headers
+    );
+    assert_eq!(
+        response.header_value("retry-after").as_deref(),
+        Some("1"),
+        "{}",
+        response.headers
+    );
+}
