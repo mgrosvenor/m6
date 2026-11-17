@@ -10,7 +10,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use m6_log::{with_analytics, Level, Line};
+use m6_log::{with_analytics, Level, Line, Type};
 
 struct Counting;
 
@@ -60,6 +60,13 @@ fn no_allocation_after_init() -> Result<(), Failed> {
     m6_platform::fd::dup2_stdout(&devnull).expect("stdout is /dev/null");
     m6_log::init(Level::Trace, Some(std::path::Path::new("/dev/null"))).expect("the logger");
 
+    // Built before the measured window: the document allocates, the line that
+    // carries it does not.
+    let document = serde_json::json!({
+        "node": "dev",
+        "metrics": {"requests_total": 7, "channels": [{"channel": "http/2/external"}]},
+        "status_counts": {"200": 7}
+    });
     let before = COUNT.load(Ordering::Relaxed);
     for n in 0..LINES {
         m6_log::error!(n = n, "line");
@@ -81,6 +88,13 @@ fn no_allocation_after_init() -> Result<(), Failed> {
                 .end();
         });
         assert!(accepted, "the analytics Sink was not open");
+        let accepted = with_analytics(|sink| {
+            Line::begin(sink, Level::Info, "stats")
+                .kind(Type::Perf)
+                .json("perf", &document)
+                .end();
+        });
+        assert!(accepted, "the analytics Sink was not open");
     }
     let allocated = COUNT.load(Ordering::Relaxed) - before;
     let operational_lines = m6_log::operational_lines();
@@ -92,7 +106,7 @@ fn no_allocation_after_init() -> Result<(), Failed> {
     m6_log::stop().expect("a clean stop");
     eprintln!(
         "no_allocation: {allocated} allocation(s) in {} lines",
-        LINES * 6
+        LINES * 7
     );
     assert_eq!(
         operational_lines,
@@ -100,7 +114,8 @@ fn no_allocation_after_init() -> Result<(), Failed> {
         "the macro lines did not reach the operational Sink"
     );
     assert_eq!(
-        analytics_lines, LINES,
+        analytics_lines,
+        LINES * 2,
         "the analytics lines were not all written"
     );
     assert_eq!(operational_dropped, 0, "operational lines were dropped");
@@ -113,6 +128,6 @@ fn no_allocation_after_init() -> Result<(), Failed> {
     if allocated == 0 {
         Ok(())
     } else {
-        Err(format!("{allocated} allocation(s) in {} lines", LINES * 6).into())
+        Err(format!("{allocated} allocation(s) in {} lines", LINES * 7).into())
     }
 }

@@ -44,6 +44,13 @@ The released versions, newest first:
 
 ### Added
 
+**The periodic stats line carries the whole `/perf` document, every log line names its `type`, and `[stats].interval_s` sets the line's interval.**
+`m6-log` writes a top-level `type` on every line, one of `event`, `perf` or `access`, so a reader filters on one key: a warning is `type` `event` with `level` `WARN`.
+`Line::json` writes a nested JSON value rather than escaping it into a string, so the document comes from the `Serialize` implementation the endpoint already used and there is no second copy of the field list.
+`m6-http` writes that document, the one `/perf` answers, into a `type` `perf` line at `[stats].interval_s`, ten seconds by default, to stdout where journald carries it.
+The document is 26,143 bytes with every section at its maximum, and `docs/m6-http.md` section 18 says which sections dominate it.
+Verified on 2026-11-17 on a macOS sandbox: one test compares the line with the endpoint's answer for the same node field by field and parses it as the type the monitor reads, a second shows that three lines at `interval_s = 1` are at least two intervals apart and arrive within six seconds, and `m6-log`'s no-allocation test carries a nested value through 700,000 lines with zero allocations.
+
 **`m6-auth-cli sessions revoke-all` deletes every refresh-token row in one transaction, for the key-rotation step.**
 It takes no argument and prints the number of rows it deleted.
 A login after the command creates a new row, which is unaffected.

@@ -11,6 +11,38 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sink::Sink;
 
+/// What kind of line this is, written to the top-level `type` key.
+///
+/// Three kinds, because a reader filters on one key rather than on a target
+/// and a message that a refactor can rename. `level` keeps the severity, so a
+/// reader asks for `type` `event` with `level` `WARN` rather than for a `warn`
+/// kind that would duplicate it.
+///
+/// A fourth kind arrives only with a line that is genuinely another kind. The
+/// traffic summary that replaces `/traffic` is one, and it comes with the code
+/// that writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Type {
+    /// An operational message, at any level.
+    Event,
+    /// The periodic metrics line, which carries the document the old `/perf`
+    /// endpoint answered.
+    Perf,
+    /// A per-request analytics line: the request row or the monitor row.
+    Access,
+}
+
+impl Type {
+    /// The word written to the line's `type` key.
+    pub fn text(self) -> &'static str {
+        match self {
+            Type::Event => "event",
+            Type::Perf => "perf",
+            Type::Access => "access",
+        }
+    }
+}
+
 /// The severity of a line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -149,6 +181,7 @@ pub struct Line<'a> {
     sink: &'a mut Sink,
     first: bool,
     target: Option<&'a str>,
+    kind: Type,
     failed: bool,
 }
 
@@ -171,6 +204,7 @@ impl<'a> Line<'a> {
             sink,
             first: true,
             target: None,
+            kind: Type::Event,
             failed: false,
         };
         line = line.raw(b"{\"timestamp\":\"");
@@ -186,6 +220,16 @@ impl<'a> Line<'a> {
     /// after the fields, which JSON readers cannot tell apart from before.
     pub fn target(mut self, target: &'a str) -> Self {
         self.target = Some(target);
+        self
+    }
+
+    /// Write the line's top-level `type`. [`Type::Event`] is the default, so
+    /// only a line that is a different kind calls this.
+    ///
+    /// The word is one of three static strings, written straight into the
+    /// buffer, so a line's type costs no allocation.
+    pub fn kind(mut self, kind: Type) -> Self {
+        self.kind = kind;
         self
     }
 
@@ -216,6 +260,40 @@ impl<'a> Line<'a> {
     pub fn bool(self, key: &str, value: bool) -> Self {
         let word = if value { &b"true"[..] } else { &b"false"[..] };
         self.field_head(key).raw(word)
+    }
+
+    /// Add a field whose value is one JSON value, written by `serde_json`.
+    ///
+    /// The value is written as JSON, not as a string: it is not escaped a
+    /// second time, and the `[limits.log_field]` cap does not apply to it. A
+    /// nested document is bounded by the line's own buffer,
+    /// `[limits.log_buffer] max`, because a nested value is not a string field
+    /// and must not be cut at 8 KiB: a document cut in half is not JSON.
+    ///
+    /// `serde_json` writes field by field into the Sink's buffer, so the value
+    /// costs no `String` and no intermediate document. It does allocate what
+    /// the value itself allocates before this call, which is the caller's to
+    /// hold and reuse.
+    ///
+    /// A value the buffer cannot hold refuses the whole line, exactly as a
+    /// string field past its cap does.
+    pub fn json<T: serde::Serialize + ?Sized>(self, key: &str, value: &T) -> Self {
+        let mut line = self.field_head(key);
+        if line.failed {
+            return line;
+        }
+        let failed = {
+            let mut adapter = JsonAdapter {
+                sink: line.sink,
+                failed: false,
+            };
+            let result = serde_json::to_writer(&mut adapter, value);
+            adapter.failed || result.is_err()
+        };
+        if failed {
+            line.failed = true;
+        }
+        line
     }
 
     /// Add a field through `Display`, formatted into the buffer with no
@@ -255,6 +333,10 @@ impl<'a> Line<'a> {
                 }
                 self = self.raw(b"\"");
             }
+            let kind = self.kind;
+            self = self.raw(b",\"type\":\"");
+            self = self.raw(kind.text().as_bytes());
+            self = self.raw(b"\"");
             self = self.raw(b"}\n");
         }
         if self.failed {
@@ -388,6 +470,32 @@ impl fmt::Write for EscapeAdapter<'_> {
                 Err(fmt::Error)
             }
         }
+    }
+}
+
+/// An `io::Write` over the line's buffer, for `serde_json` to write a nested
+/// value into.
+///
+/// No escaping: `serde_json` writes JSON, and escaping it again would turn the
+/// document into a string. A write the buffer will not take fails rather than
+/// waits, which marks the line refused and rolls it back whole.
+struct JsonAdapter<'a> {
+    sink: &'a mut Sink,
+    failed: bool,
+}
+
+impl std::io::Write for JsonAdapter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.sink.push(buf) {
+            Ok(buf.len())
+        } else {
+            self.failed = true;
+            Err(std::io::ErrorKind::WriteZero.into())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

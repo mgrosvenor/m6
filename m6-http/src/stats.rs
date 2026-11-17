@@ -1,6 +1,37 @@
 /// Performance statistics for the critical path.
 use std::time::Instant;
 
+/// The periodic metrics line's target and message, named once.
+///
+/// A reader selects on `type` `perf`, and these two stay stable beside it so
+/// that a refactor of either selector still finds the line.
+pub const PERF_LOG_TARGET: &str = "m6_http::stats";
+pub const PERF_LOG_MESSAGE: &str = "stats";
+
+/// Write the periodic metrics line: the whole document the `/perf` endpoint
+/// answers, nested under `fields.perf`, into the operational Sink.
+///
+/// stdout, and journald behind it, like every other operational line. The
+/// analytics file carries per-request rows and is shipped separately, so the
+/// metrics line does not depend on analytics being enabled.
+///
+/// The document comes from the same builder the endpoint uses, so a metric
+/// added to one is on the other. The nested value is written by `serde_json`
+/// through `Line::json`: bounded by the line's buffer, not by the string
+/// field cap.
+///
+/// Answers whether the Sink was open. It is open after start and before stop,
+/// so the caller ignores it.
+pub fn log_perf(document: &serde_json::Value) -> bool {
+    m6_core::log::with_operational(|sink| {
+        m6_core::log::Line::begin(sink, m6_core::log::Level::Info, PERF_LOG_MESSAGE)
+            .kind(m6_core::log::Type::Perf)
+            .json("perf", document)
+            .target(PERF_LOG_TARGET)
+            .end();
+    })
+}
+
 const EMIT_INTERVAL_SECS: u64 = 10;
 
 /// Number of latency samples kept per window per category (hit / miss).

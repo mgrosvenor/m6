@@ -7,7 +7,7 @@
 /// extraction, not a beacon. UA parsing and geo lookup are deliberately left
 /// to a downstream analytics ingester so the hot path here stays
 /// a handful of string operations, not a database/ruleset lookup.
-use m6_core::log::{Level, Line, Sink};
+use m6_core::log::{Level, Line, Sink, Type};
 use quiche::h3::NameValue as _;
 
 use crate::health::{unix_micros_now, Kind, TrafficWindow};
@@ -383,6 +383,7 @@ fn write_request_line(
     features: &RequestFeatures<'_>,
 ) {
     Line::begin(sink, Level::Info, "request")
+        .kind(Type::Access)
         .str("node", ev.node)
         .str("path", ev.path)
         .field("status", ev.status)
@@ -463,6 +464,7 @@ fn write_monitor_line(
     latency_ns: Option<u64>,
 ) {
     Line::begin(sink, Level::Info, "monitor")
+        .kind(Type::Access)
         .str("node", node)
         .str("path", path)
         .field("status", status)
@@ -508,6 +510,7 @@ fn write_rate_limited_line(
         .str("node", node)
         .str("path", path)
         .u64("status", 429)
+        .kind(Type::Access)
         .str("cache_state", "BYPASS")
         .str("client_ip", client_ip)
         .bool("bot_flag", true)

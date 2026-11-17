@@ -707,14 +707,7 @@ pub fn genid_address_ok(client_ip: &str, from_internal: bool) -> bool {
     from_internal || loopback
 }
 
-/// The authorised `/perf` answer with this node's generation block added.
-///
-/// The block is inserted into the report this node already built, so `m6-core`
-/// keeps no notion of a generation: it hands over the monitoring payload and
-/// m6-http adds the one field that is this binary's. A source reports the ID it
-/// owns and the peers that read it. A cache node reports the ID it follows,
-/// where it follows it from, and whether that upstream is answering.
-/// The disk-cache figures `/perf` adds, gathered so the response keeps one
+/// The disk-cache figures `/perf` adds, gathered so the document keeps one
 /// argument for them: the writer's counters, the load's counts, and the first
 /// heartbeat's decision.
 pub struct DiskPerf<'a> {
@@ -725,14 +718,31 @@ pub struct DiskPerf<'a> {
     pub state: crate::disk_cache::LoadState,
 }
 
-pub fn genid_perf_response(
-    report: PerfReport,
-    role: &crate::genid::Role,
-    config: &GenidConfig,
-    disk: Option<DiskPerf<'_>>,
-) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut value = serde_json::to_value(&report)
+/// The document `/perf` answers, with this node's generation and disk blocks
+/// added, as JSON.
+///
+/// One definition for the endpoint and for the periodic metrics line, which
+/// carries exactly this document in `fields.perf`. A field added here is on
+/// both, and neither can drift from the other because there is one builder.
+///
+/// The blocks are inserted into the report this node already built, so
+/// `m6-core` keeps no notion of a generation or a disk cache: it hands over the
+/// monitoring payload and m6-http adds the fields that are this binary's. A
+/// source reports the ID it owns and the peers that read it. A cache node
+/// reports the ID it follows, where it follows it from, and whether that
+/// upstream is answering.
+///
+/// `None` is a node with no `[genid]` table: the report alone, which is what
+/// such a node's `/perf` has always answered.
+pub fn perf_document(
+    report: &PerfReport,
+    genid: Option<(&crate::genid::Role, &GenidConfig, Option<DiskPerf<'_>>)>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(report)
         .unwrap_or_else(|_| serde_json::json!({"error": "serialisation failed"}));
+    let Some((role, config, disk)) = genid else {
+        return value;
+    };
     if let Some(object) = value.as_object_mut() {
         object.insert("genid".to_string(), genid_block(role, config));
         if let Some(disk) = disk {
@@ -754,20 +764,7 @@ pub fn genid_perf_response(
             );
         }
     }
-    let body = serde_json::to_vec(&value)
-        .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-    (
-        200,
-        vec![
-            (
-                "Content-Type".to_string(),
-                "application/json; charset=utf-8".to_string(),
-            ),
-            ("Cache-Control".to_string(), "no-store".to_string()),
-            ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
-        ],
-        body,
-    )
+    value
 }
 
 /// The `genid` object `/perf` adds, by role.

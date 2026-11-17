@@ -327,7 +327,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AnalyticsConfig, BackendConfig, Config, ErrorsConfig, LogConfig, NodeConfig,
-        RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig,
+        RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig, StatsConfig,
     };
     use std::path::PathBuf;
 
@@ -336,6 +336,7 @@ mod tests {
             genid: None,
             cache_dir: None,
             limits: Default::default(),
+            stats: StatsConfig::default(),
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: "test.example.com".to_string(),

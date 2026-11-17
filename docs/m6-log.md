@@ -20,7 +20,8 @@ Table 1: the keys of one line.
 | `timestamp` | UTC ISO 8601 with six fractional digits, for example `2026-11-13T16:55:49.489591Z` |
 | `level` | `ERROR`, `WARN`, `INFO`, `DEBUG` or `TRACE` |
 | `fields` | the event's message and its fields |
-| `target` | the operational line's module, absent from the analytics line |
+| `target` | the operational line's module, the metrics line's `m6_http::stats`, absent from the access line |
+| `type` | `event`, `perf` or `access` (see below) |
 
 The timestamp cache holds `YYYY-MM-DDTHH:MM:SS` for one second in a 20-byte array.
 Each line reads `SystemTime::now()` once and appends that second's cached text and its own six fractional digits, so the civil date is formatted once per second at most.
@@ -34,6 +35,21 @@ A value that needs more refuses its whole line: nothing is cut, the line counts 
 The Sink's buffer starts at `[limits.log_buffer] start`, 16 KiB by default, doubles when a line does not fit and the destination is blocked, and keeps its size.
 A line past `[limits.log_buffer] max`, 1 MiB by default, is refused the same way.
 A message, a `%display` field and a `?debug` field are formatted straight into the buffer through the escaping adapter, with no `String`.
+
+The `type` key names what kind of line it is, so a reader filters on one key rather than on a target and a message that a refactor can rename.
+Its three values are below.
+`level` keeps the severity: a warning is `type` `event` with `level` `WARN`.
+
+- `event`: an operational message, at any level.
+- `perf`: the periodic metrics line, which carries the document the old `/perf` endpoint answered.
+- `access`: a per-request analytics line, the request row or the monitor row.
+
+The type is a static word written into the buffer, so a line's type costs no allocation.
+
+`Line::json` writes one field as a JSON value rather than as a string: a nested object or array, written by the value's `Serialize` implementation through `serde_json` straight into the buffer.
+A nested value is bounded by the line's own buffer and not by the string field cap, because a document cut at 8 KiB is not JSON.
+The largest line m6 writes is the metrics document, measured at 26,143 bytes with every section at its maximum on 2026-11-17, against the 1 MiB buffer maximum.
+`docs/m6-http.md` says which sections dominate it.
 
 A field with no value is omitted, as tracing omitted it.
 Key order is free for a JSON reader.
@@ -72,7 +88,8 @@ A value's Rust type decides its JSON type: a string is a JSON string, an integer
 A call site that needs more than that writes its fields with `Line` directly.
 
 The analytics line is written with `Line` field by field into the analytics Sink, which `with_analytics` reaches.
-That line has no target.
+That line has no target, and its `type` is `access`.
+The metrics line is written with `Line` into the operational Sink, which `m6_core::log::with_operational` reaches, with `type` `perf` and the target `m6_http::stats`.
 
 ## Reopen
 

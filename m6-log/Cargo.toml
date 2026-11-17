@@ -11,6 +11,10 @@ name = "m6_log"
 
 [dependencies]
 itoa        = "1"
+# `Line::json` writes one nested value from a type's `Serialize` impl, so a
+# document's field list exists once rather than in a second copy here.
+serde       = "1"
+serde_json  = "1"
 # Raw descriptor writes and the non-blocking flag, from the platform layer.
 m6-platform = { path = "../m6-platform" }
 

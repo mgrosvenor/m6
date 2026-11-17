@@ -465,6 +465,64 @@ impl ServerState {
     }
 }
 
+impl ServerState {
+    /// The disk-cache block `/perf` reports, when this node has a directory.
+    fn disk_perf(&self) -> Option<health::DiskPerf<'_>> {
+        self.disk.as_ref().map(|writer| health::DiskPerf {
+            writer,
+            queued: self.cache.queued(),
+            loaded_entries: self.loaded_entries,
+            loaded_bad: self.loaded_bad,
+            state: self.disk_state,
+        })
+    }
+
+    /// The `/perf` document, exactly as the endpoint answers it.
+    ///
+    /// One builder for the endpoint and for the periodic metrics line, so a
+    /// metric added to either is on both. That is the reason the line carries
+    /// this document rather than a second list of fields: two copies of a
+    /// metric list is how a metric gets added to one and not the other.
+    ///
+    /// Allocation: the report build sorts the reservoirs, reads the host and
+    /// the TLS registry, and this path also builds one JSON value so the
+    /// generation and disk blocks can join the report's own object. It runs on
+    /// the accounting tick and on an authorised `/perf` request, and never on
+    /// an ordinary request.
+    fn perf_document(&self) -> serde_json::Value {
+        let pools: Vec<health::PoolHealth> = self
+            .pool_manager
+            .pool_health()
+            .into_iter()
+            .map(|(name, total)| health::PoolHealth { name, total })
+            .collect();
+        let outcome = health::PerfReport::build_authorised(
+            health::PerfSubject {
+                process_index: self.config.server.process_index,
+                node: &self.config.node.name,
+                uptime_s: self.started.elapsed().as_secs(),
+                pools,
+                url_backends: self.pool_manager.url_backend_names(),
+                host_path: &self.config.site_dir,
+            },
+            || self.stats.snapshot(),
+        );
+        match outcome {
+            health::PerfOutcome::Ok(report) => match self.config.genid.as_ref() {
+                Some(genid_config) => health::perf_document(
+                    &report,
+                    Some((&self.genid, genid_config, self.disk_perf())),
+                ),
+                None => health::perf_document(&report, None),
+            },
+            // `build_authorised` has one outcome: the report. The fallback is
+            // here so a future variant cannot silently produce a line that is
+            // not the document.
+            _ => serde_json::json!({"error": "report unavailable"}),
+        }
+    }
+}
+
 /// Whether a route is worth warming. Split out so it can be tested without a
 /// ServerState: the queueing needs one, the decision does not.
 fn is_warmable(path: &str, cache: Option<&str>, error_path: Option<&str>) -> bool {
@@ -3322,9 +3380,17 @@ fn event_loop(
         }
 
         // Emit periodic stats (cheap check every iteration: compares one Instant).
-        // On the emit, copy the loop trace into the snapshot so `/perf` serves it.
+        // On the emit, copy the loop trace into the snapshot, then write the
+        // metrics line: the whole document `/perf` answers, to stdout, which
+        // journald carries like every other operational line.
+        //
+        // Order matters once: the event-loop figures are copied into the
+        // snapshot first, so the line carries this tick's figures rather than
+        // the previous tick's.
         if state.stats.maybe_emit(state.pool_manager.total_members()) {
             state.stats.set_event_loop(trace.report());
+            let document = state.perf_document();
+            m6_http_lib::stats::log_perf(&document);
         }
 
         // Drain one background fetch per loop iteration, unless this node has
@@ -5175,45 +5241,13 @@ fn handle_request_inner(
             return outcome;
         }
         let (code, headers, body) = {
-            // Pool sizes are gathered here rather than on `/health`,
-            // which publishes neither, and only after the gate has passed.
-            // It costs a lock-free read of the pool manager, unlike the
-            // reservoir sort in `snapshot`.
-            let pools: Vec<health::PoolHealth> = state
-                .pool_manager
-                .pool_health()
-                .into_iter()
-                .map(|(name, total)| health::PoolHealth { name, total })
-                .collect();
-            let outcome = health::PerfReport::build_authorised(
-                health::PerfSubject {
-                    process_index: state.config.server.process_index,
-                    node: &state.config.node.name,
-                    uptime_s: state.started.elapsed().as_secs(),
-                    pools,
-                    url_backends: state.pool_manager.url_backend_names(),
-                    host_path: &state.config.site_dir,
-                },
-                || state.stats.snapshot(),
-            );
-            match outcome {
-                health::PerfOutcome::Ok(report) => match state.config.genid.as_ref() {
-                    Some(genid_config) => health::genid_perf_response(
-                        *report,
-                        &state.genid,
-                        genid_config,
-                        state.disk.as_ref().map(|writer| health::DiskPerf {
-                            writer,
-                            queued: state.cache.queued(),
-                            loaded_entries: state.loaded_entries,
-                            loaded_bad: state.loaded_bad,
-                            state: state.disk_state,
-                        }),
-                    ),
-                    None => health::PerfOutcome::Ok(report).into_response(),
-                },
-                other => other.into_response(),
-            }
+            // The endpoint answers the same document the periodic metrics line
+            // carries, built by the one function. The gate has passed, so this
+            // is the authorised path that pays the reservoir sort.
+            let document = state.perf_document();
+            let body = serde_json::to_vec(&document)
+                .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
+            (200, m6_core::monitoring::perf_headers(), body)
         };
         // Same treatment as /health above. A 401 here is worth seeing: it
         // means something is probing the metrics endpoint without the token.
@@ -7727,6 +7761,9 @@ fn run(args: Vec<String>) -> i32 {
             },
             _ => (None, 0, 0, disk_cache::LoadState::None),
         };
+    // Read before the config moves into the state, because the stats tick is
+    // built from it and the line is written for the life of the process.
+    let stats_interval_s = config.stats.interval_s;
     let mut state = ServerState {
         config,
         route_table,
@@ -7738,7 +7775,7 @@ fn run(args: Vec<String>) -> i32 {
         loaded_bad,
         disk_state,
         error_mode,
-        stats: initial_stats(),
+        stats: initial_stats(stats_interval_s),
         sources: Slots::new(initial_connections, ceiling, || Source::Vacant),
         generations: vec![0; initial_connections],
         prefetch_queue: m6_core::limits::BoundedQueue::new(
@@ -7841,12 +7878,13 @@ fn run(args: Vec<String>) -> i32 {
 
 /// The accounting tick for this process.
 ///
-/// `Stats::new()` is the production value: a fixed ten seconds, with no config
-/// key. Two integration suites assert on the tick and spawn this binary, so a
-/// `#[cfg(test)]` default cannot reach them. A debug build may shorten the tick
-/// through `M6_TEST_STATS_INTERVAL_SECS`, the only channel those tests have, and
-/// a release build does not read the variable at all.
-fn initial_stats() -> Stats {
+/// The interval is `[stats].interval_s`, ten seconds by default, and
+/// `Stats::with_interval` builds the tick from it. Two integration suites
+/// assert on the tick and spawn this binary, so a `#[cfg(test)]` default
+/// cannot reach them. A debug build may shorten the tick through
+/// `M6_TEST_STATS_INTERVAL_SECS`, which also overrides the config key for those
+/// suites, and a release build does not read the variable at all.
+fn initial_stats(interval_s: u64) -> Stats {
     #[cfg(debug_assertions)]
     if let Some(secs) = std::env::var("M6_TEST_STATS_INTERVAL_SECS")
         .ok()
@@ -7855,7 +7893,7 @@ fn initial_stats() -> Stats {
     {
         return Stats::with_interval(std::time::Duration::from_secs(secs));
     }
-    Stats::new()
+    Stats::with_interval(std::time::Duration::from_secs(interval_s))
 }
 
 #[cfg(test)]
@@ -7864,7 +7902,7 @@ mod www_redirect_tests {
 
     use m6_http_lib::config::{
         AnalyticsConfig, Config, ErrorsConfig, LogConfig, NodeConfig, RateLimitConfig,
-        SecurityConfig, ServerConfig, SiteConfig,
+        SecurityConfig, ServerConfig, SiteConfig, StatsConfig,
     };
     use std::path::PathBuf;
 
@@ -7873,6 +7911,7 @@ mod www_redirect_tests {
             genid: None,
             cache_dir: None,
             limits: Default::default(),
+            stats: StatsConfig::default(),
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: domain.to_string(),

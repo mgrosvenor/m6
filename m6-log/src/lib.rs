@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
-pub use line::{line_at, Field, Level, Line};
+pub use line::{line_at, Field, Level, Line, Type};
 pub use sink::{set_limits, LogLimits, Sink, BUFFER_BYTES, BUFFER_MAX_BYTES, FIELD_MAX_BYTES};
 
 thread_local! {
@@ -150,6 +150,15 @@ pub fn with_analytics(f: impl FnOnce(&mut Sink)) -> bool {
         }
         None => false,
     })
+}
+
+/// Build one line with [`Line`] into the operational Sink, which is stdout.
+///
+/// The macros take this path for every operational line. It is public for a
+/// caller that builds a line field by field because its field list is too
+/// large for a macro's, which is the metrics line and nothing else so far.
+pub fn with_operational(f: impl FnOnce(&mut Sink)) -> bool {
+    __with_operational(f)
 }
 
 /// The operational Sink's descriptor, for a loop that watches it for

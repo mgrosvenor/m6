@@ -570,6 +570,11 @@ mode = "internal"
 [analytics]
 log_path = "{log_path}"
 
+# One second, so the metrics line appears inside a test's own bound. The
+# default is ten, and the key is what this exercises.
+[stats]
+interval_s = 1
+
 [rate_limit]
 enabled = false
 
@@ -662,6 +667,140 @@ metrics_require = "role:monitor"
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
+
+/// The `type=perf` lines in the service's stdout, newest last.
+///
+/// The metrics line goes to stdout, which journald carries, rather than to
+/// the analytics file. A read can catch the writer mid-line, so a line that
+/// does not parse is skipped: it is complete on the next read.
+fn read_perf_lines(output: &str) -> Vec<serde_json::Value> {
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("type")?.as_str()? != "perf" {
+                return None;
+            }
+            Some(v["fields"]["perf"].clone())
+        })
+        .collect()
+}
+
+fn wait_for_perf_lines(srv: &Server, want: usize) -> Vec<serde_json::Value> {
+    let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        read_perf_lines(&srv.http.borrow().output()).len() >= want
+    });
+    assert!(
+        ok,
+        "expected {want} type=perf lines, saw {}",
+        read_perf_lines(&srv.http.borrow().output()).len()
+    );
+    read_perf_lines(&srv.http.borrow().output())
+}
+
+/// The line's document is the endpoint's document: same keys at every level,
+/// same node, same build, and it parses into the same type the monitor reads.
+#[test]
+fn the_stats_line_carries_the_perf_document() {
+    let srv = start_server();
+    assert_eq!(srv.get("/public/plain.html", &[]).status, 200);
+
+    // The first tick can land before the request does, so wait for a line
+    // that has seen it rather than for the first line.
+    let seen = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        read_perf_lines(&srv.http.borrow().output())
+            .last()
+            .is_some_and(|document| {
+                document["metrics"]["requests_total"]
+                    .as_u64()
+                    .is_some_and(|n| n >= 1)
+            })
+    });
+    assert!(seen, "no type=perf line reported the request");
+    let lines = read_perf_lines(&srv.http.borrow().output());
+    let from_line = lines.last().expect("a line");
+    let from_endpoint = srv.perf_json();
+
+    // It parses into the type the digest reads, which is the guarantee that
+    // matters to the monitor: a field missing here is a field the monitor
+    // would have had from the endpoint.
+    let parsed: m6_core::monitoring::PerfReport =
+        serde_json::from_value(from_line.clone()).expect("the line parses as a PerfReport");
+
+    assert_eq!(parsed.node, from_endpoint["node"]);
+    assert_eq!(from_line["build"], from_endpoint["build"]);
+    assert_eq!(from_line["pools"], from_endpoint["pools"]);
+    // `expires_in_seconds` is measured from the moment the document is built,
+    // so two builds one second apart differ by one there and nowhere else.
+    let certificates = |v: &serde_json::Value| -> Vec<(u64, String, i64)> {
+        v["tls"]
+            .as_array()
+            .map(|certs| {
+                certs
+                    .iter()
+                    .map(|c| {
+                        (
+                            c["depth"].as_u64().expect("depth"),
+                            c["fingerprint"].as_str().unwrap_or_default().to_string(),
+                            c["not_after_unix"].as_i64().expect("not_after_unix"),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(certificates(from_line), certificates(&from_endpoint));
+    assert_eq!(from_line["url_backends"], from_endpoint["url_backends"]);
+
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(keys(from_line), keys(&from_endpoint), "top-level fields");
+    assert_eq!(
+        keys(&from_line["metrics"]),
+        keys(&from_endpoint["metrics"]),
+        "metrics fields"
+    );
+    assert_eq!(
+        keys(&from_line["host"]),
+        keys(&from_endpoint["host"]),
+        "host fields"
+    );
+
+    // A count can only have grown between the line and the poll.
+    let line_requests = from_line["metrics"]["requests_total"]
+        .as_u64()
+        .expect("requests_total");
+    let endpoint_requests = from_endpoint["metrics"]["requests_total"]
+        .as_u64()
+        .expect("requests_total");
+    assert!(line_requests <= endpoint_requests);
+    assert!(line_requests >= 1, "the request did not reach the line");
+}
+
+/// The configured interval is honoured: two more lines are at least two
+/// intervals apart, and no slower than a generous bound.
+#[test]
+fn the_stats_interval_is_honoured() {
+    let srv = start_server();
+    // The first line proves the tick is running; the two after it are timed.
+    wait_for_perf_lines(&srv, 1);
+    let started = Instant::now();
+    let lines = wait_for_perf_lines(&srv, 3);
+    let elapsed = started.elapsed();
+    assert!(lines.len() >= 3);
+    assert!(
+        elapsed >= Duration::from_millis(1_800),
+        "three lines arrived in {elapsed:?} with a one-second interval: the          configured interval was not honoured"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "two intervals took {elapsed:?} with a one-second interval"
+    );
+}
 
 fn wait_for_request_lines(srv: &Server, want: usize) {
     wait_for_request_lines_at(&srv.analytics_log, want);

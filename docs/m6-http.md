@@ -889,9 +889,20 @@ m6-http writes one structured JSON line per event to stdout, and journald captur
 
 Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token` and `auth: token verification failed` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
 
-Periodic stats: `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`, `hit_samples`, `hit_p0_ns`, `hit_p50_ns`, `hit_p99_ns`, `hit_max_ns`, `miss_samples`, `miss_p0_ns`, `miss_p50_ns`, `miss_p99_ns`, `miss_max_ns`, `monitor_requests`, `monitor_p50_ns` and `monitor_p99_ns`.
+Periodic stats, twice: one operational line and one `type` `perf` line, both to stdout, which journald carries.
+The operational line carries `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`, `hit_samples`, `hit_p0_ns`, `hit_p50_ns`, `hit_p99_ns`, `hit_max_ns`, `miss_samples`, `miss_p0_ns`, `miss_p50_ns`, `miss_p99_ns`, `miss_max_ns`, `monitor_requests`, `monitor_p50_ns` and `monitor_p99_ns`.
 `pool_members` is the total member count read once at start, so it stays fixed for the life of the process.
 Each line reports the window since the last line, and each percentile carries its sample count beside it so a p50 over one sample cannot be read as a p50 over a thousand.
+
+The `type` `perf` line carries the whole `/perf` document, nested under `fields.perf`, from the same builder the endpoint answers with.
+Its target is `m6_http::stats` and its message is `stats`.
+`[stats].interval_s` sets how often both lines are written, ten seconds by default, and `M6_TEST_STATS_INTERVAL_SECS` overrides it in a debug build.
+The metrics line goes to stdout with the operational line, so it does not depend on the analytics file, which a deployment ships separately.
+
+The metrics document is the largest line m6 writes: 26,143 bytes measured with every section at its maximum.
+`metrics.status_counts` is 8,501 bytes of that, `host` 3,572, `metrics.channels` 3,453 and `metrics.event_loop` 3,255.
+The log buffer's maximum is 1 MiB and its start is 16 KiB, so the first metrics line grows the sink to 32 KiB once and keeps it.
+Size a log budget from these figures rather than from the section names.
 
 ---
 

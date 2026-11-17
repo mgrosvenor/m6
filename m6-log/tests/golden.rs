@@ -5,17 +5,22 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use m6_log::{line_at, Level, Sink};
+use m6_log::{line_at, Level, Sink, Type};
 use serde_json::Value;
 
 /// One file per captured line shape, in `tests/golden`.
-const GOLDEN: [&str; 6] = [
+///
+/// `perf` is the periodic metrics line: the whole document the old `/perf`
+/// endpoint answered, nested under `fields.perf`. Its nested object is what
+/// proves `Line::json` writes a value and not a string.
+const GOLDEN: [&str; 7] = [
     "request",
     "monitor",
     "rate_limited",
     "operational_info",
     "operational_warn",
     "operational_error",
+    "perf",
 ];
 
 #[test]
@@ -30,12 +35,13 @@ fn lines_mean_what_the_golden_lines_mean() {
         let now = timestamp_of(golden["timestamp"].as_str().expect("a timestamp"));
         let level = level_of(golden["level"].as_str().expect("a level"));
         let target = golden.get("target").and_then(Value::as_str);
+        let kind = type_of(golden["type"].as_str().expect("a type"));
         let fields = golden["fields"].as_object().expect("fields");
         let message = fields["message"].as_str().expect("a message");
 
         let path = dir.path().join(format!("{name}.jsonl"));
         let mut sink = Sink::file(&path).expect("the line file");
-        let mut line = line_at(now, &mut sink, level, message);
+        let mut line = line_at(now, &mut sink, level, message).kind(kind);
         if let Some(target) = target {
             line = line.target(target);
         }
@@ -50,7 +56,8 @@ fn lines_mean_what_the_golden_lines_mean() {
                     Some(value) => line.u64(key, value),
                     None => line.i64(key, value.as_i64().expect("a number")),
                 },
-                other => panic!("{name}: {key} is a {other}"),
+                Value::Object(_) | Value::Array(_) => line.json(key, value),
+                Value::Null => panic!("{name}: {key} is null, which m6-log never writes"),
             };
         }
         line.end();
@@ -62,6 +69,15 @@ fn lines_mean_what_the_golden_lines_mean() {
             ours, golden,
             "{name}: m6-log's line does not mean what the golden line means"
         );
+    }
+}
+
+fn type_of(text: &str) -> Type {
+    match text {
+        "event" => Type::Event,
+        "perf" => Type::Perf,
+        "access" => Type::Access,
+        other => panic!("unknown golden type {other}"),
     }
 }
 

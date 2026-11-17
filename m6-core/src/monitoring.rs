@@ -539,6 +539,22 @@ impl PerfReport {
     }
 }
 
+/// The headers a metrics answer carries.
+///
+/// One definition, because the endpoint and the periodic metrics line serve
+/// the same document, and a second copy of these three is a second thing to
+/// keep in step with it.
+pub fn perf_headers() -> Vec<(String, String)> {
+    vec![
+        (
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+        ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+    ]
+}
+
 impl PerfOutcome {
     pub fn into_response(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
         match self {
@@ -547,14 +563,7 @@ impl PerfOutcome {
             PerfOutcome::Unauthorised => crate::http::token_refusal(false),
             PerfOutcome::Forbidden => crate::http::token_refusal(true),
             other => {
-                let headers = vec![
-                    (
-                        "Content-Type".to_string(),
-                        "application/json; charset=utf-8".to_string(),
-                    ),
-                    ("Cache-Control".to_string(), "no-store".to_string()),
-                    ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
-                ];
+                let headers = perf_headers();
                 match other {
                     PerfOutcome::Disabled => (404, headers, br#"{"error":"not found"}"#.to_vec()),
                     PerfOutcome::Ok(report) => {
@@ -1346,5 +1355,186 @@ mod traffic_tests {
         with.process_index = Some(2);
         let body = String::from_utf8(with.into_response(200).2).unwrap();
         assert!(body.contains("\"process_index\":2"), "{body}");
+    }
+}
+
+/// The periodic metrics line carries the whole `/perf` document, so the
+/// document's size is a log-budget fact: a line past `[limits.log_buffer] max`
+/// is refused whole, and a refused metrics line is a node that stops reporting.
+///
+/// This builds the document with every section at its maximum cardinality and
+/// measures it. The number is recorded in `docs/m6-log.md` and
+/// `docs/m6-http.md`, so a reader who has to size a log budget does not have
+/// to derive it.
+#[cfg(test)]
+mod perf_line_size_tests {
+    use super::*;
+    use crate::telemetry::{ChannelSnapshot, HandshakeStats, LoopTriggerSnapshot, StatsSnapshot};
+    use crate::tls::{Fingerprint, TlsCertificate};
+
+    fn handshake() -> HandshakeStats {
+        HandshakeStats {
+            samples: 1024,
+            p50_ns: 1_234_567,
+            p99_ns: 9_876_543,
+            total: u64::MAX,
+            mean_ns: 1_345_678,
+            min_ns: 123_456,
+            max_ns: 12_345_678,
+        }
+    }
+
+    fn channel(version: &str, iface: &str) -> ChannelSnapshot {
+        ChannelSnapshot {
+            channel: format!("{version}/{iface}"),
+            version: version.to_string(),
+            iface: iface.to_string(),
+            requests: u64::MAX,
+            hits: u64::MAX,
+            misses: u64::MAX,
+            backend_errors: u64::MAX,
+            hit_samples: 4096,
+            hit_p50_ns: 1_234_567_890,
+            hit_p99_ns: 1_234_567_890,
+            miss_samples: 4096,
+            miss_p50_ns: 1_234_567_890,
+            miss_p99_ns: 1_234_567_890,
+            handshake_full: handshake(),
+            handshake_resumed: handshake(),
+        }
+    }
+
+    /// Every section at its maximum: 500 status codes, six channels, sixteen
+    /// event-loop triggers, three certificates, three pools, three URL
+    /// backends, three named backend errors, and the largest integer values.
+    fn maximal_report() -> PerfReport {
+        let mut metrics = StatsSnapshot {
+            requests_total: u64::MAX,
+            cache_hits_total: u64::MAX,
+            cache_misses_total: u64::MAX,
+            cache_hits_valid_total: u64::MAX,
+            cache_hits_invalid_total: u64::MAX,
+            cache_misses_fetched_total: u64::MAX,
+            cache_misses_answered_locally_total: u64::MAX,
+            backend_errors_total: u64::MAX,
+            monitor_requests_total: u64::MAX,
+            monitor_samples: 4096,
+            monitor_p50_ns: 1_234_567_890,
+            monitor_p99_ns: 1_234_567_890,
+            rps_peak: u64::MAX,
+            hit_samples: 4096,
+            hit_p50_ns: 1_234_567_890,
+            hit_p99_ns: 1_234_567_890,
+            hit_max_ns: 1_234_567_890,
+            miss_samples: 4096,
+            miss_p50_ns: 1_234_567_890,
+            miss_p99_ns: 1_234_567_890,
+            miss_max_ns: 1_234_567_890,
+            ..StatsSnapshot::default()
+        };
+        for code in 100..=599u16 {
+            metrics.status_counts.insert(code, u64::MAX);
+        }
+        for version in ["http/1.1", "http/2", "http/3"] {
+            for iface in ["external", "internal"] {
+                metrics.channels.push(channel(version, iface));
+            }
+        }
+        for n in 0..16 {
+            metrics.event_loop.push(LoopTriggerSnapshot {
+                name: format!("connection_{n}_maximum"),
+                count: u64::MAX,
+                wait_min_ns: 1_234_567_890,
+                wait_max_ns: 1_234_567_890,
+                wait_mean_ns: 1_234_567_890,
+                work_min_ns: 1_234_567_890,
+                work_max_ns: 1_234_567_890,
+                work_mean_ns: 1_234_567_890,
+            });
+        }
+        for name in ["render-contact", "render-analytics", "m6-html"] {
+            metrics
+                .backend_errors_by_name
+                .insert(name.to_string(), u64::MAX);
+        }
+
+        let certificate = TlsCertificate {
+            depth: 2,
+            not_after_unix: 1_800_000_000,
+            expires_in_seconds: 30_000_000,
+            fingerprint: Some(Fingerprint::of(b"a certificate's DER bytes")),
+        };
+
+        PerfReport {
+            process_index: Some(15),
+            node: "edge-b-with-a-long-name".to_string(),
+            build: BuildId {
+                name: "m6-http".to_string(),
+                version: "1.15.0".to_string(),
+                hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            },
+            uptime_s: u64::MAX,
+            pools: ["m6-html", "m6-file", "render-cms"]
+                .iter()
+                .map(|name| PoolHealth {
+                    name: name.to_string(),
+                    total: 4,
+                })
+                .collect(),
+            url_backends: ["origin-that-has-a-long-name", "second-url-backend", "third"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            tls: vec![certificate, certificate, certificate],
+            tls_unreadable: 0,
+            logging: Some(LoggingHealth {
+                events_total: u64::MAX,
+                seconds_since_last: Some(u64::MAX),
+                reopen: None,
+            }),
+            metrics,
+            host: crate::platform::host::snapshot(std::path::Path::new("/")),
+        }
+    }
+
+    #[test]
+    fn the_maximal_document_is_well_under_the_log_buffer_maximum() {
+        let document = super::tests_support::perf_document_of(&maximal_report());
+        let bytes = serde_json::to_vec(&document).expect("the document serialises");
+        // Measured at 20,477 bytes on 2026-11-17, with the sections above at
+        // their maximum. The buffer's maximum is 1 MiB, so the margin is about
+        // fifty times. A field that pushes this past a quarter of a megabyte
+        // is a field that should not be in a log line.
+        assert!(
+            bytes.len() < 256 * 1024,
+            "the maximal /perf document is {} bytes, past the quarter-megabyte \
+             budget this test keeps; the log buffer refuses a line past 1 MiB, \
+             and a refused metrics line is a node that stops reporting",
+            bytes.len()
+        );
+        let host = serde_json::to_vec(&document["host"])
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let metrics = serde_json::to_vec(&document["metrics"])
+            .map(|v| v.len())
+            .unwrap_or(0);
+        eprintln!(
+            "maximal /perf document: {} bytes (host {}, metrics {})",
+            bytes.len(),
+            host,
+            metrics
+        );
+    }
+}
+
+/// Helpers the size test shares with the document builders.
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+
+    /// The report as the endpoint serialises it, with no generation or disk
+    /// block: those are m6-http's own and are added to the value there.
+    pub fn perf_document_of(report: &PerfReport) -> serde_json::Value {
+        serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({"error": "x"}))
     }
 }

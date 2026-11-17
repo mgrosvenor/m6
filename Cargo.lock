@@ -2164,6 +2164,7 @@ dependencies = [
  "itoa",
  "libtest-mimic",
  "m6-platform",
+ "serde",
  "serde_json",
  "tempfile",
 ]

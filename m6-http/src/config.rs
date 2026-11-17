@@ -19,6 +19,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub log: LogConfig,
     pub analytics: AnalyticsConfig,
+    /// How often the periodic stats line is written. Site state: the line is
+    /// the site's record of what its node did.
+    pub stats: StatsConfig,
     pub health: HealthConfig,
     pub rate_limit: RateLimitConfig,
     pub errors: ErrorsConfig,
@@ -514,6 +517,36 @@ impl Default for AnalyticsConfig {
     }
 }
 
+/// The `[stats]` table: how often the periodic metrics line is written.
+///
+/// One key, because the line carries the whole `/perf` document at one
+/// interval. A node that logs it more often writes more bytes, and the line's
+/// size is bounded by `[limits.log_buffer]`, not by this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsConfig {
+    /// Seconds between two metrics lines. Ten matches the window the line's
+    /// own per-window figures describe, and the default it has always had.
+    #[serde(default = "default_stats_interval_s")]
+    pub interval_s: u64,
+}
+
+fn default_stats_interval_s() -> u64 {
+    DEFAULT_STATS_INTERVAL_S
+}
+
+/// Ten seconds: the interval m6-http emitted its stats line at before the key
+/// existed, and the window those per-window figures describe.
+pub const DEFAULT_STATS_INTERVAL_S: u64 = 10;
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        StatsConfig {
+            interval_s: default_stats_interval_s(),
+        }
+    }
+}
+
 /// The per-node health endpoint (see `crate::health`).
 ///
 /// Answered inside m6-http ahead of routing, the cache and every backend, so
@@ -985,6 +1018,7 @@ struct RawSiteToml {
     node: Option<NodeConfig>,
     log: Option<toml::Value>,
     analytics: Option<AnalyticsConfig>,
+    stats: Option<StatsConfig>,
     health: Option<HealthConfig>,
     rate_limit: Option<RateLimitConfig>,
     errors: Option<ErrorsConfig>,
@@ -1312,6 +1346,12 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         m6_core::platform::process::page_size(),
     )
     .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    let stats = site_parsed.stats.unwrap_or_default();
+    if stats.interval_s == 0 {
+        anyhow::bail!(
+            "config error: [stats].interval_s must be at least 1, because 0 would write the stats line on every pass of the event loop"
+        );
+    }
     let site_server = site_parsed.server.unwrap_or_default();
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
@@ -1764,6 +1804,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         server,
         log,
         analytics,
+        stats,
         health,
         rate_limit,
         errors,
@@ -1987,6 +2028,38 @@ tls_key  = "{DIR}/key.pem"
         assert_eq!(cfg.site.name, "Test");
         assert_eq!(cfg.server.bind, "127.0.0.1:8443");
         assert_eq!(cfg.routes.len(), 1);
+    }
+
+    /// The stats line's interval: ten seconds when no `[stats]` table is
+    /// present, and whatever `interval_s` names when one is.
+    #[test]
+    fn the_stats_interval_is_read_from_the_site_table() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.stats.interval_s, DEFAULT_STATS_INTERVAL_S);
+        assert_eq!(cfg.stats.interval_s, 10);
+
+        let with_stats = format!("{}\n[stats]\ninterval_s = 2\n", minimal_site_toml());
+        write_file(dir.path(), "site.toml", &with_stats);
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.stats.interval_s, 2);
+    }
+
+    /// Zero would write the line on every pass of the event loop: refused at
+    /// start, and the error names the key.
+    #[test]
+    fn a_zero_stats_interval_stops_the_start() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let with_stats = format!("{}\n[stats]\ninterval_s = 0\n", minimal_site_toml());
+        write_file(dir.path(), "site.toml", &with_stats);
+        let error = load(dir.path(), &dir.path().join("system.toml")).unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            text.contains("[stats].interval_s"),
+            "the error did not name the key: {text}"
+        );
     }
 
     #[test]

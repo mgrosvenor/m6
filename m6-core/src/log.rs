@@ -22,7 +22,7 @@ use std::time::{Instant, UNIX_EPOCH};
 pub use m6_log::pulse;
 pub use m6_log::{
     debug, error, flush, info, init, init_with_setting, set_limits, stop, tick, trace, warn,
-    with_analytics, Level, Line, LogLimits, LogPulse, Sink,
+    with_analytics, with_operational, Level, Line, LogLimits, LogPulse, Sink, Type,
 };
 
 /// Watch stdout for writability under `token` while the operational Sink holds
