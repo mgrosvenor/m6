@@ -337,7 +337,7 @@ fn the_monitor_runs_one_thread() {
 
 /// The loop, above the platform's own workers.
 fn assert_single_loop(what: &str, count: usize) {
-    // LOG-2 removed tracing-appender's writer, so the loop is the only thread
+    // The logging change removed tracing-appender's writer, so the loop is the only thread
     // m6 starts. The platform reports its certificate-store worker range, which
     // is why the bound is a range rather than a count measured in this process.
     let (workers_low, workers_high) = m6_core::platform::process::certificate_store_workers();

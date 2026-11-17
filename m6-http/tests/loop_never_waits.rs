@@ -877,7 +877,8 @@ fn a_backend_past_its_timeout_answers_and_the_member_stays_in_turn() {
 fn a_socket_backend_miss_advertises_alt_svc() {
     let fx = Fixture::start(1, 30, "altsvc");
     // The cache is empty, so this is a miss that runs through the socket
-    // upstream; the pre-EL-1 Ready caller advertised alt-svc, and the miss must
+    // upstream. The Ready caller advertised alt-svc before the event-loop
+    // refactor, and the miss must
     // keep doing so.
     let has = h1_has_alt_svc(fx.port(), "/fast").expect("GET /fast");
     assert!(

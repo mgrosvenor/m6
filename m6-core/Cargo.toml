@@ -24,8 +24,8 @@ default = ["templates", "minify"]
 # links it; enable it from a crate's [dev-dependencies] entry.
 testkit = ["alloc-count", "dep:rustls-pki-types"]
 # The counting allocator on its own, without the rest of the harness, so a
-# service binary can install it and count its own loop's allocations. ALLOC-0's
-# m6-http `count-allocations` feature turns this on. Off by default and never in
+# service binary can install it and count its own loop's allocations. m6-http's
+# `count-allocations` feature turns this on. Off by default and never in
 # a plain build of a service.
 alloc-count = []
 # Record a backtrace per allocation, so a test can say where one request's
@@ -190,7 +190,7 @@ name    = "event_allocs"
 harness = false
 required-features = ["testkit"]
 
-# The page area's allocation rules (I-217, I-223): a page under the start
+# The page area's allocation rules: a page under the start
 # allocates nothing for the area, an oversized one grows it once, and the next
 # pages of any size allocate nothing for it. Its own `main`, as `event_allocs`.
 [[test]]
@@ -215,7 +215,7 @@ name    = "server_conn"
 harness = false
 required-features = ["testkit"]
 
-# The page path's allocation baseline, for ALLOC-3: a hundred requests through
+# The page path's allocation baseline: a hundred requests through
 # a `Site` and a `ServerConn`, each after the first allocating the same number
 # of times. Its own `main`, as `server_conn`'s.
 [[test]]
@@ -261,7 +261,7 @@ required-features = ["email", "testkit"]
 name    = "critical_path"
 harness = false
 
-# ALLOC-0's guard on the counting allocator itself: armed, one
+# The counting allocator's own guard: armed, one
 # `Vec::with_capacity(10)` counts one call and ten bytes, a disarmed thread
 # counts nothing, another thread's allocation is not this thread's, and `now()`
 # still counts every thread's. Its own `main`, so the allocator is installed

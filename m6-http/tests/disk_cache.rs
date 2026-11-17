@@ -7,10 +7,11 @@
 //! removes the old one over the ticks that follow. Nothing waits on a fixed
 //! sleep for a result: every wait polls a condition with a deadline.
 //!
-//! The files are read back with `disk_cache::decode`, the function G2b's
+//! The files are read back with `disk_cache::decode`, the function the
 //! start-time load calls. That is the restart half this branch can prove: the
 //! bytes are on disk, complete without the writer, and decode to the response
-//! the node served. Inserting them into a fresh memory cache at start is G2b.
+//! the node served. Inserting them into a fresh memory cache at start is the
+//! other half.
 //!
 //! Breaks are named on the tests that carry one.
 
@@ -928,7 +929,7 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The node stops, and the file it left behind still decodes to the response it
-/// served. A restarted node's start-time load is G2b: these are the bytes it
+/// served. A restarted node's start-time load is the other half: these are the bytes it
 /// reads, complete without the writer and with their check value intact.
 ///
 /// Break: write the file only on the writer's drop, and the stopped node leaves

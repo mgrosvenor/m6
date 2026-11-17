@@ -600,7 +600,7 @@ jobs:
   # the ones written into the documents are no exception. The 2026-09-26
   # rewrite killed thirteen hashes in docs/PERFORMANCE.md, 83e4142 repointed
   # them, and the rewrite after that killed the replacements too. Nothing ran
-  # that noticed either time (ISS-128 found the repository had no docs check),
+  # that noticed either time (a sweep found the repository had no docs check),
   # so the next rewrite would be silent as well.
   #
   # FULL HISTORY, deliberately: `git cat-file` can only say a hash is dead if
@@ -717,7 +717,7 @@ jobs:
         run: |
           # Example 05's end-to-end test makes its own certificate, keys and
           # auth database in a temporary directory, so it runs here with the
-          # rest (it needed dev.sh's state until OS-1).
+          # rest (it needed dev.sh's state before the platform layer).
           status=0
           cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true

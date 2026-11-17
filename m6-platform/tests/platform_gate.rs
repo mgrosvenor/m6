@@ -5,7 +5,6 @@
 //! the four OS crates, read the clock directly in shipping code, or read a
 //! service manager's variable. The two OS files must
 //! define the same items, so a run on one OS sees an arm the other lacks.
-//! `OS-1-TESTS.md` section 9 names the four rules.
 
 use std::path::{Path, PathBuf};
 

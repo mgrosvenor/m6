@@ -112,7 +112,7 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
-# ALLOC-ATTR: attribution needs a source line for the library frames too, and
+# Allocation attribution needs a source line for the library frames too, and
 # the dev profile deliberately builds dependencies without debuginfo. This
 # profile is the dev profile plus line tables for every crate. It is only used
 # by `tests/alloc_attribution.rs`, through `cargo test --profile

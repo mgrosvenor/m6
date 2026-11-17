@@ -16,7 +16,7 @@
 //! # One process and one event loop
 //!
 //! The monitor's `main` is start, run and stop, the shape every service has
-//! since EL-6b: `m6_core::event` supplies the signals, the deadlines and the
+//! since the event-loop refactor: `m6_core::event` supplies the signals, the deadlines and the
 //! connection table, and `m6_core::platform` the reactor. The fleet poll is not a thread.
 //! It is a table of steps in this loop (`poll.rs`): each node's `/health`,
 //! `/perf` and `/traffic` requests, each tunnel connect and each crawler

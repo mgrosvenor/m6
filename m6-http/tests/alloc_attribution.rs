@@ -1,4 +1,4 @@
-//! ALLOC-ATTR: attribute every heap allocation on m6-http's request paths to
+//! Attribute every heap allocation on m6-http's request paths to
 //! the source line that made it.
 //!
 //! The binary this test starts is built with the `alloc-attribution` feature,
@@ -194,7 +194,10 @@ fn allocation_attribution() {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("m6-alloc-attribution"));
     std::fs::create_dir_all(&out).expect("create dhat output directory");
-    println!("ALLOC-ATTR: dhat files are in {}", out.display());
+    println!(
+        "allocation attribution: dhat files are in {}",
+        out.display()
+    );
 
     let rows = [
         Row::H1TlsHit,
@@ -216,7 +219,7 @@ fn allocation_attribution() {
         let calls = large_calls - small_calls;
         let bytes = large_bytes - small_bytes;
         println!(
-            "ALLOC-ATTR {}: {}.{:03} calls and {}.{:03} bytes per request \
+            "allocation attribution {}: {}.{:03} calls and {}.{:03} bytes per request \
              (K=100: {small_calls} calls, {small_bytes} bytes, \
              K=1,100: {large_calls} calls, {large_bytes} bytes)",
             row.name(),

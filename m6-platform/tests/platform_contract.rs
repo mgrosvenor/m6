@@ -3,11 +3,11 @@
 //! Every test here is written once against `m6_platform`'s public API
 //! and runs unchanged on macOS arm64, Linux x86_64 and Linux arm64. No `cfg`,
 //! no per-OS branch, no OS-specific helper. Each test's comment names the
-//! wrong implementation that must fail it, and `OS-1-TESTS.md` is the list.
+//! wrong implementation that must fail it, and this file is the list.
 //!
-//! Section 2 (signals) is `platform_signals.rs`, which needs its own `main`.
-//! Section 9 (the gate) is `platform_gate.rs`. Section 10 is the echo
-//! reference app's suite in `echo_example.rs`.
+//! The signal contract is `platform_signals.rs`, which needs its own `main`.
+//! The gate is `platform_gate.rs`. The echo reference app's suite is
+//! `echo_example.rs`.
 
 #![allow(
     clippy::disallowed_methods,
@@ -156,8 +156,8 @@ mod poll {
         let _peer = drained.join().expect("drain thread");
     }
 
-    /// P6. The EL-5b shape. Break: `reregister` short-circuited when the kernel
-    /// was already told, which is the bug kqueue hid on macOS.
+    /// P6. The reregistration shape. Break: `reregister` short-circuited when
+    /// the kernel was already told, which is the bug kqueue hid on macOS.
     #[test]
     fn interest_changed_after_the_handler_reports_waiting_data() {
         let (mut ours, mut peer) = pair();

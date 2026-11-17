@@ -10,7 +10,7 @@
 # repointed thirteen dead hashes in docs/PERFORMANCE.md and said so in its
 # message, and the rewrite after that one killed the replacements too. At
 # 024ec86 all 22 commit references in that document are dead again. The
-# repository had no docs check at all (ISS-128: no docs script in tools/, no
+# repository had no docs check at all (no docs script in tools/, no
 # xtask), so the next rewrite would be just as silent.
 #
 # What counts as a commit reference. Every lowercase hex token of 7 to 40
@@ -55,8 +55,11 @@ fi
 # historical record: the build a measurement was taken from, in a document that
 # dates the measurement.
 #
-# The pre-2026-09-26 hashes, kept in docs/PERFORMANCE.md Table 5 as "in older
-# records" precisely so the gap is visible:
+# The pre-2026-09-26 hashes. The copy-removal commit table in
+# docs/PERFORMANCE.md carried them under an "in older records" column, and the
+# #127 pass removed that table, so no document cites these five now. Table 5 of
+# that document is the allocation counts. They stay listed as history, each
+# allowed only in a document that already carries it:
 KNOWN_DEAD_PRE_REWRITE="1b05a18 479f1df 13280a5 5eb9af3 22ee3a4"
 # The post-2026-09-26 hashes 83e4142 repointed to, the rest of the same
 # measurement history, and the build README.md's throughput table was measured
