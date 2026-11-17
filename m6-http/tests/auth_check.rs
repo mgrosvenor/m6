@@ -35,7 +35,7 @@ fn identity(groups: &[&str]) -> Identity {
 // ── TLS client, copied from auth_paths ────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
