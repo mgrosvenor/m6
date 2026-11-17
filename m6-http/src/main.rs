@@ -2970,7 +2970,32 @@ fn event_loop(
     #[cfg(feature = "count-allocations")]
     m6_core::testkit::alloc_count::arm();
 
+    // ALLOC-0: the counted window can begin after a run's warm-up, so the
+    // per-request figure is not polluted by the one TLS handshake every run
+    // makes. A handshake's own allocation count moves with the read sizes the
+    // peer's flight arrives in, and on the build host it moved by more than the
+    // one call the h1 hit budget allows. The test sets `M6_ALLOC_MARK_AFTER` to
+    // the request number to read the counter at, and `tests/allocations.rs`
+    // takes that reading as the row's baseline. `requests_total` is bumped
+    // where a response is decided and the write follows in the same turn, so a
+    // reading at the top of the next turn is after that response is on the wire
+    // and its allocations are in the count. Off unless the feature and the
+    // variable are both present.
+    #[cfg(feature = "count-allocations")]
+    let mark_after: Option<u64> = std::env::var("M6_ALLOC_MARK_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|after| *after > 0);
+    #[cfg(feature = "count-allocations")]
+    let mut marked = mark_after.is_none();
+
     'run: loop {
+        #[cfg(feature = "count-allocations")]
+        if !marked && state.stats.requests_total >= mark_after.unwrap_or(u64::MAX) {
+            marked = true;
+            let (calls, bytes) = m6_core::testkit::alloc_count::count();
+            info!(calls, bytes, "allocations at mark");
+        }
         // The wait is the earliest of three bounds: the 1 s accounting tick,
         // every deadline table (connections, upstreams and h2 streams), and
         // quiche's own timeout over the QUIC connections. Nothing else needs a

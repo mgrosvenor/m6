@@ -32,8 +32,6 @@ use std::net::Shutdown;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -192,6 +190,29 @@ impl CheckServer {
         self.listener = None;
     }
 
+    /// One queued connection, or `None` when the queue is empty.
+    ///
+    /// [`ServingCheck`] does the waiting: it polls the listener and its stop
+    /// socket in one reactor, so the accept itself must not wait. The listener
+    /// is non-blocking, which is what makes this the drain step of an
+    /// edge-triggered event.
+    fn accept_ready(&mut self) -> std::io::Result<Option<UnixStream>> {
+        let listener = self.listener.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the check server is closed",
+            )
+        })?;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return Ok(Some(stream)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     fn serve(&mut self, mut stream: UnixStream) -> std::io::Result<()> {
         // An accepted stream can inherit the listener's non-blocking flag on
         // some hosts.
@@ -250,9 +271,18 @@ impl Drop for CheckServer {
 /// service's designed 503, so it is not a reason to stop answering, and
 /// stopping would delete the socket file and turn every later check into a
 /// connect failure.
+///
+/// [`Drop`] ends the worker on an event, not on the accept deadline. The worker
+/// waits on the listener and on one end of a socket pair, and [`Drop`] writes a
+/// byte to the other end. Waking it by connecting to `path` failed whenever a
+/// fixture dropped its temporary directory first and the socket file went with
+/// it, and then the worker sat out the rest of the accept deadline, ten
+/// seconds, in every test that fixture ran.
 pub struct ServingCheck {
     path: PathBuf,
-    stop: Arc<AtomicBool>,
+    /// One byte written here ends the worker's wait. Dropped after [`Drop`]
+    /// writes it.
+    stop: UnixStream,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -271,22 +301,74 @@ impl ServingCheck {
         // The rule every start in the tree follows. The probe carries no
         // request, so the worker ignores it and `calls` stays at zero.
         server.wait_ready(SERVE_BOUND)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
+        let listener = server.listener.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the check server is closed",
+            )
+        })?;
+        let listener_fd = listener.as_raw_fd();
+        let (stop_reader, stop) = UnixStream::pair()?;
         let worker = std::thread::Builder::new()
             .name("serving-check".to_string())
             .spawn(move || {
-                while !flag.load(Ordering::SeqCst) {
-                    match server.accept_one() {
-                        Ok(stream) => {
-                            // A client that went away, because its check
-                            // timed out, is not a reason to stop serving.
-                            let _ = server.serve(stream);
+                // Held for the worker's life, so the descriptor registered
+                // below stays open.
+                let stop_fd = stop_reader.as_raw_fd();
+                let mut poll = match crate::platform::Poll::new() {
+                    Ok(poll) => poll,
+                    Err(_) => return,
+                };
+                if poll
+                    .registry()
+                    .register_fd(
+                        listener_fd,
+                        crate::platform::Token(0),
+                        crate::platform::Interest::READABLE,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                if poll
+                    .registry()
+                    .register_fd(
+                        stop_fd,
+                        crate::platform::Token(1),
+                        crate::platform::Interest::READABLE,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                let mut events = crate::platform::Events::with_capacity(2);
+                loop {
+                    match poll.poll(&mut events, None) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        // The listener or the stop socket failed. Nothing can
+                        // be served.
+                        Err(_) => return,
+                    }
+                    if events
+                        .iter()
+                        .any(|event| event.token() == crate::platform::Token(1))
+                    {
+                        return;
+                    }
+                    // Edge-triggered: drain the queue the event reported, or a
+                    // connection left behind is not reported again.
+                    loop {
+                        match server.accept_ready() {
+                            Ok(Some(stream)) => {
+                                // A client that went away, because its check
+                                // timed out, is not a reason to stop serving.
+                                let _ = server.serve(stream);
+                            }
+                            Ok(None) => break,
+                            // The listener itself failed. Nothing can be served.
+                            Err(_) => return,
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        // The listener itself failed. Nothing can be served.
-                        Err(_) => break,
                     }
                 }
             })?;
@@ -305,9 +387,10 @@ impl ServingCheck {
 
 impl Drop for ServingCheck {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        // Wake the accept behind `accept_one`; the loop sees the flag and ends.
-        let _ = UnixStream::connect(&self.path);
+        // The event the worker waits on. The byte cannot block: the pair's
+        // buffer is empty and one byte fits. A failed write means the worker
+        // has already gone, which is the outcome this is asking for.
+        let _ = self.stop.write_all(&[0u8]);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

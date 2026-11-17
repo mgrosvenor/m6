@@ -3,12 +3,26 @@
 //!
 //! Each row starts the `m6-http` binary cargo built for this test, which holds
 //! the counting allocator behind its `count-allocations` feature. The server
-//! arms the counter when its run loop starts and logs the count at stop. A row
-//! runs the server twice, once for N = 1,000 requests and once for 2N = 2,000,
-//! each on one warm keep-alive connection after the same warm-up and start-up.
-//! The per-request figure is `(2N count - N count) / N`: the one TLS handshake
-//! and the one backend-connecting first request in a run sit in both counts and
-//! cancel, so the difference is the N requests and nothing else.
+//! arms the counter when its run loop starts, logs the count at a mark the test
+//! names, and logs it again at stop. A row runs the server twice, once for
+//! N = 1,000 requests and once for 2N = 2,000, each on one warm keep-alive
+//! connection. Both runs set `M6_ALLOC_MARK_AFTER=1`, so the mark is read at the
+//! first turn after the warm-up response is on the wire, and the row's window is
+//! the requests after it. The per-request figure is
+//! `((2N stop - 2N mark) - (N stop - N mark)) / N`, so the difference is the N
+//! requests and nothing else.
+//!
+//! The mark is what keeps one TLS handshake out of the difference. A handshake's
+//! own counted calls move with the number of reads its flight arrives in, and
+//! that number is the kernel's: one unsplit handshake cost 139 or 140 calls on
+//! this host, and 141 or 142 when the ClientHello arrived in two pieces, with
+//! the two extra calls in rustls's `DeframerVecBuffer::prepare_read` and the
+//! last one in aws-lc-rs's signature buffer. The h1 hit row read 2,003 on the
+//! build host against a budget of 2,001. Its N = 1,000 run counted 2,188, which
+//! is this host's own N figure, and its 2N = 2,000 run counted 4,191, three
+//! calls above this host's 4,188, so the three extra calls were in that run's
+//! fixed part and not in a request. Reading the counter after the warm-up keeps
+//! the fixed part out of the figure.
 //!
 //! The rows are the four paths this test splits: a cache hit over HTTP/1.1 on one
 //! keep-alive connection, the same over HTTP/2, a cache miss that goes to the
@@ -50,27 +64,28 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 
 // The budgets, in calls per 1,000 requests, measured on macOS on 2026-11-15
 // with the difference of two runs: N = 1,000 and 2N = 2,000 on one warm
-// connection, per-request figure `(2N - N) / N`. Each change that removes an
-// allocation lowers the row it attacks, in calls per 1,000 requests on the four
-// rows this test drives: rustls's buffers, the cache and the rendering path.
-// The only calls allowed
+// connection, per-request figure `(2N - N) / N`. Each run's mark is read after
+// its warm-up, so the run's one TLS handshake and its backend connection are in
+// neither reading. Each change that removes an allocation lowers the row it
+// attacks, in calls per 1,000 requests on the four rows this test drives:
+// rustls's buffers, the cache and the rendering path. The only calls allowed
 // above a row's own per-request calls are the two named TLS-buffer allowances,
 // one on the h1 hit and one on the h2 hit. Any other count above its budget is
 // the defect the guard exists for.
 //
 // The integers the code makes are 2 for h1_tls_hit and 3 for h2_tls_hit (the
-// per-request calls are all rustls's; see below), and 47 for
+// per-request calls are all rustls's, see below), and 47 for
 // h1_tls_miss_insert. The h1 hit read 2.000 in fourteen runs after its
 // close-path allocation was removed, with N = 1,000 counting 2,169 calls and
 // 2N = 2,000 counting 4,169, and the path makes the same 2,000 calls per 1,000
-// requests now (the fixed part of a run moved with the provider change and
-// cancels in the difference). Its budget is 2,001: those 2,000 calls plus the
-// one handshake call explained below, which is aws-lc-rs's and is per run
-// rather than per request. The h2 hit is 3,000: fourteen runs after its fix
-// read 3,000 twelve times, 3,001 once and 2,999 once. Its budget is 3,001, and
-// the one call above 3,000 is one more TLS record received in a run than that
-// run's baseline, which costs one `Payload::into_vec` and can grow rustls's
-// received-plaintext chunk queue. Both are TLS buffers.
+// requests now. Its budget is 2,001: those 2,000 calls plus one call of
+// headroom for a run whose received-record count is one higher than its
+// neighbour's, which the TLS record boundaries decide. The h2 hit is 3,000:
+// fourteen runs after its fix read 3,000 twelve times, 3,001 once and 2,999
+// once. Its budget is 3,001, and the one call above 3,000 is one more TLS record
+// received in a run than that run's baseline, which costs one
+// `Payload::into_vec` and can grow rustls's received-plaintext chunk queue. Both
+// are TLS buffers.
 //
 // The h2 row read 3.002 on Linux before that fix, and the extra was ours: the
 // HTTP/2 TLS and plain close paths built `io::Error::new(UnexpectedEof,
@@ -89,8 +104,21 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // 2N = 2,000 went 4,178 -> 4,169). The two calls per request are rustls's
 // record buffers.
 //
-// The one call the h1 budget allows is in the TLS handshake at accept, and it
-// is aws-lc-rs's. dhat over a 2.001 run and a 2.000 run differs at exactly one
+// The h1 row read 2.003 on the build host at cf0009a, a tree that touched
+// nothing on the hit path. dhat over K = 1,000 and K = 2,000 on this host put
+// exactly two sites above zero, both rustls's record buffers at +1,000 each,
+// and 0 on every other site, so no request allocated more than it did. The
+// three calls above 2,000 were in the fixed part of the 2N run: this host reads
+// N = 2,188 and 2N = 4,187 or 4,188, and the build host's 2N run read 4,191.
+// One handshake costs 139 or 140 counted calls here, and 141 or 142 when its
+// ClientHello arrives in two reads: dhat puts the two extra calls on rustls's
+// `DeframerVecBuffer::prepare_read`, which grows the deframer buffer for a
+// partial record, and the last one on aws-lc-rs's signature buffer. That is why
+// the row reads a mark after its warm-up now: the fixed part moves with the
+// kernel's read sizes, and it must not be part of a per-request figure.
+//
+// The allowance this row carried before the mark was one handshake call, and it
+// is aws-lc-rs's. dhat over a 2.001 run and a 2.000 run differed at exactly one
 // stack: `EVP_PKEY::sign`'s `vec![0u8; sig_len]` in aws-lc-rs, through
 // `ptr::ManagedPointer::sign`, `ec::key_pair::EcdsaKeyPair::sign`, rustls's
 // `EcdsaSigner::sign`, `emit_certificate_verify_tls13` and
@@ -98,8 +126,8 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // the socket to rustls. `EVP_PKEY::sign` allocates the signature buffer at the
 // maximum DER length and then shrinks it to the length the signature took, so a
 // handshake whose DER signature is shorter than the 72-byte maximum makes one
-// more call than one whose signature is exactly 72. The row runs one handshake
-// per run, so the N/2N difference moves by one and reads 2.001 or 1.999.
+// more call than one whose signature is exactly 72. The deframer buffer adds up
+// to two more, which is why one call of allowance was not enough.
 //
 // The provider change is why this row did not need the allowance before. ring's
 // ECDSA signer built the signature into a fixed-size value and rustls made the
@@ -246,6 +274,12 @@ impl Fixture {
         cmd.arg(&self.site)
             .arg(&self.system)
             .env("RUST_LOG", "info")
+            // Read the counter after the warm-up request, so the run's TLS
+            // handshake and its backend connection are outside the measured
+            // window. A handshake's allocation count varies with the read
+            // sizes the peer's flight arrives in, and that variance was what
+            // the h1 hit row counted above its two rustls calls.
+            .env("M6_ALLOC_MARK_AFTER", "1")
             // The periodic stats emit is not per request, and a slow run that
             // crossed the ten-second tick would add its allocations to one K
             // and not the other. The interval is the debug build's documented
@@ -338,9 +372,10 @@ fn h1_tls_new_connection_per_connection() {
 
 /// Measure a row over N = [`REQUESTS`] and over 2N, record the difference as
 /// calls and bytes per request (or per connection), and hold the request rows
-/// to their budgets. The two runs share the same start-up and warm-up, so the
-/// handshake and the first backend request sit in both counts and cancel.
-/// The new-connection row is printed and not asserted.
+/// to their budgets. Each run's own warm-up, handshake and backend connection
+/// sit before its mark and cancel inside that run, so the difference is the N
+/// requests and nothing else. The new-connection row is printed and not
+/// asserted.
 fn check(row: Row) {
     let (small_calls, small_bytes) = measure(row, REQUESTS);
     let (large_calls, large_bytes) = measure(row, 2 * REQUESTS);
@@ -384,8 +419,9 @@ fn check(row: Row) {
     }
 }
 
-/// One server run for `requests` requests, returning the calls and bytes its
-/// stop line reports.
+/// One server run for `requests` requests, returning the calls and bytes
+/// between the mark and stop. The mark is read after the run's warm-up, so the
+/// handshake and the first backend connection are in neither reading.
 fn measure(row: Row, requests: usize) -> (u64, u64) {
     let fixture = Fixture::new();
     fixture.start_backend();
@@ -430,22 +466,40 @@ fn measure(row: Row, requests: usize) -> (u64, u64) {
         row.name(),
         svc.output()
     );
-    stop_counts(&svc.output(), row.name())
+    let ((mark_calls, mark_bytes), (stop_calls, stop_bytes)) =
+        run_counts(&svc.output(), row.name());
+    assert!(
+        stop_calls >= mark_calls && stop_bytes >= mark_bytes,
+        "{}: the stop reading is smaller than the mark one ({stop_calls} calls, \
+         {stop_bytes} bytes against {mark_calls} calls, {mark_bytes} bytes). \
+         The count is not comparing the same run.",
+        row.name()
+    );
+    (stop_calls - mark_calls, stop_bytes - mark_bytes)
 }
 
-/// The `calls` and `bytes` fields of the stop line the counting allocator logs.
-fn stop_counts(output: &str, row: &str) -> (u64, u64) {
+/// The mark and stop readings the server logs, `(mark, stop)` as `(calls, bytes)`
+/// each.
+fn run_counts(output: &str, row: &str) -> ((u64, u64), (u64, u64)) {
+    (
+        line_counts(output, row, "allocations at mark"),
+        line_counts(output, row, "allocations during the run"),
+    )
+}
+
+/// The `calls` and `bytes` fields of one count line.
+fn line_counts(output: &str, row: &str, needle: &str) -> (u64, u64) {
     for line in output.lines().rev() {
-        if !line.contains("allocations during the run") {
+        if !line.contains(needle) {
             continue;
         }
         let calls = json_field(line, "calls")
-            .unwrap_or_else(|| panic!("{row}: stop line has no calls field: {line}"));
+            .unwrap_or_else(|| panic!("{row}: {needle} line has no calls field: {line}"));
         let bytes = json_field(line, "bytes")
-            .unwrap_or_else(|| panic!("{row}: stop line has no bytes field: {line}"));
+            .unwrap_or_else(|| panic!("{row}: {needle} line has no bytes field: {line}"));
         return (calls, bytes);
     }
-    panic!("{row}: no 'allocations during the run' line in m6-http's output\n{output}");
+    panic!("{row}: no '{needle}' line in m6-http's output\n{output}");
 }
 
 /// One integer field from a JSON line.

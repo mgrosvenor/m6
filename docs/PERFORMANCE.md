@@ -232,8 +232,9 @@ Run the test with the feature, serially:
 cargo test -p m6-http --test allocations --features count-allocations -- --test-threads=1 --nocapture
 ```
 
-`tests/allocations.rs` starts the binary cargo built with the feature, sends one warm-up request and then 1,000 requests on one connection and 2,000 requests on another, sends SIGTERM and reads each stop line.
-The per-request figure is `(2N count - N count) / N`, so the one handshake and the one backend-connecting first request in each run sit in both counts and cancel.
+`tests/allocations.rs` starts the binary cargo built with the feature, sends one warm-up request, then 1,000 requests on one connection and 2,000 on another, sends SIGTERM and reads each run's mark and stop lines.
+The server reads the counter at the first turn after the warm-up response is on the wire (`M6_ALLOC_MARK_AFTER=1`) and again at stop, and the per-request figure is `((2N stop - 2N mark) - (N stop - N mark)) / N`.
+The one TLS handshake and the one backend-connecting first request in a run sit before that run's mark, so they cancel inside the run.
 Table 9 gives the four rows, measured on macOS on 2026-11-15.
 
 | row | what it runs | calls per 1,000 requests | budget | what the calls are |
@@ -251,13 +252,15 @@ Each change lowers the row it attacks, the only calls allowed above a row's own 
 The miss row's one call above 47,000 is the single cache-table growth its 1,000 inserts trigger, and its observed spread across runs was 46.998 to 47.004.
 The new-connection row read 117.000 per connection, and a per-connection ceiling would fail on the run-to-run variation the handshake shows (122.859 to 123.849 before the close-path change).
 
-**The h1 allowance.**
-The extra call is in the TLS handshake at accept and it is aws-lc-rs's.
-`EVP_PKEY::sign` allocates the ECDSA signature buffer at the maximum DER length and shrinks it to the length the signature took, so a handshake whose signature is shorter than the 72-byte maximum makes one more call than one whose signature is exactly 72.
-There is one handshake in a run, so the N and 2N difference moves by one.
-A heap profile (dhat) of a 2.001 run and a 2.000 run differs at that one stack (`ec::key_pair::EcdsaKeyPair::sign` through rustls's `emit_certificate_verify_tls13`) and nowhere else.
+**The h1 fixed part.**
+The three calls above 2,000 are in the 2N run's one TLS handshake, not in a request.
+The build host's N = 1,000 run counted 2,188 calls, this host's own N figure, and its 2N = 2,000 run counted 4,191 against this host's 4,188.
+A handshake's counted calls move with the number of reads its flight arrives in.
+One unsplit handshake cost 139 or 140 calls here, and 141 or 142 when the ClientHello arrived in two reads.
+dhat puts the two extra calls on rustls's `DeframerVecBuffer::prepare_read`, which grows the deframer buffer for a partial record, and the last on aws-lc-rs's `EVP_PKEY::sign`, which allocates the ECDSA signature buffer at the maximum DER length and shrinks it.
+A heap profile (dhat) of a 2.001 run and a 2.000 run differs at that one signature stack (`ec::key_pair::EcdsaKeyPair::sign` through rustls's `emit_certificate_verify_tls13`) and nowhere else.
 Between N = 1,000 and 2N = 2,000 it puts +1,000 on each of the two per-request rustls buffers and 0 on every other site, so the request path is exactly 2.000.
-Before aws-lc-rs became the one provider, ring's ECDSA signer made the one `Vec` at the signature's own length, and twenty runs read 1.999 to 2.001 after the change.
+The row reads the counter at a mark after its warm-up now, so the fixed part is in neither reading.
 
 **The h2 allowance.**
 The extra call is one more TLS record received in a run, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue, and it is rustls's.
