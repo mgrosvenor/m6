@@ -30,8 +30,6 @@ my-site/
 │   ├── m6-html.conf
 │   ├── m6-file.conf
 │   └── <renderer>.conf
-├── logs/
-│   └── analytics.ndjson
 ├── templates/
 ├── assets/
 ├── content/
@@ -42,7 +40,7 @@ my-site/
 `site.toml` sits at the top, and `configs/` holds each renderer's own config.
 
 The directory holds data and config, and the binaries live outside it.
-Every process logs to stdout, and `[analytics]` writes `logs/analytics.ndjson` under the working directory by default.
+No `logs/` directory belongs here: every process logs to stdout, which the journal holds and rotates.
 
 ## 2. Complete annotated example
 
