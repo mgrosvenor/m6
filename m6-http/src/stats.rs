@@ -27,6 +27,10 @@ pub const DEFAULT_TRAFFIC_INTERVAL: std::time::Duration = std::time::Duration::f
 ///
 /// The monitor reads the line from mon's journal, where its `M6_TYPE` is
 /// `traffic`.
+///
+/// Flushed here, like a warn or an error line: the document describes the
+/// window that just closed, and leaving it in the buffer until the next tick's
+/// flush makes it a tick old before anything can read it.
 pub fn log_traffic(report: &impl serde::Serialize) -> bool {
     m6_core::log::with_operational(|sink| {
         m6_core::log::Line::begin(sink, m6_core::log::Level::Info, TRAFFIC_LOG_MESSAGE)
@@ -34,6 +38,7 @@ pub fn log_traffic(report: &impl serde::Serialize) -> bool {
             .json("traffic", report)
             .target(TRAFFIC_LOG_TARGET)
             .end();
+        sink.flush();
     })
 }
 
@@ -52,6 +57,10 @@ pub fn log_traffic(report: &impl serde::Serialize) -> bool {
 /// The monitor reads the line from mon's journal, where its `M6_TYPE` is
 /// `perf`.
 ///
+/// Flushed here, like a warn or an error line: the document is this tick's
+/// answer, and waiting for the next tick's flush delays it by one interval,
+/// which is a second at the interval the integration suites use.
+///
 /// Answers whether the Sink was open. It is open after start and before stop,
 /// so the caller ignores it.
 pub fn log_perf(document: &serde_json::Value) -> bool {
@@ -61,6 +70,7 @@ pub fn log_perf(document: &serde_json::Value) -> bool {
             .json("perf", document)
             .target(PERF_LOG_TARGET)
             .end();
+        sink.flush();
     })
 }
 

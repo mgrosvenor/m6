@@ -234,6 +234,12 @@ pub struct BuildId {
 /// service linking core from a git tag it is that tag, which is the more useful
 /// answer for a service whose own version says nothing about which m6 it is
 /// built against.
+///
+/// The serving binary calls this once with its other start-time constants,
+/// before any listener binds, so the periodic metrics document never pays for
+/// the read. A lazily cached constant costs whichever code path asks first, and
+/// after the metrics document moved onto the periodic line that path was the
+/// first accounting tick.
 pub fn build_id() -> &'static BuildId {
     static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| BuildId {
