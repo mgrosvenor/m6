@@ -49,6 +49,14 @@ The glob exists so a pool can have more than one member, with names such as `my-
 
 `m6-site-toml.md` owns the `sockets` key and the pool behaviour, including how a socket joins or leaves the pool.
 
+By default, an `m6-auth-server` listens on two sockets.
+The edge treats one of them as the authority, so the split is part of this contract.
+The primary is the service's socket, `/run/m6/<config file stem>.sock` by default (`m6-core/src/server.rs:46`).
+The check socket sits beside it as `<parent>/check-<primary file name>` (`m6-auth-server/src/main.rs:174`), so `/run/m6/m6-auth.sock` pairs with `/run/m6/check-m6-auth.sock`.
+The four login routes answer on the primary socket and `POST /check` answers on the check socket.
+A route that belongs to the other socket answers the house `404` (`m6-auth-server/src/main.rs:768`), which is the same answer an unknown path gets.
+A `[auth] backend` whose glob matches the primary socket gets `404` from that member, and the start probe stops the edge (§2.7).
+
 ### 1.2. Binding sequence
 
 The backend MUST take these steps in this order.
@@ -133,11 +141,14 @@ Take from it that a protected route is the only place the claims field appears.
 
 | Field | When | Meaning |
 |---|---|---|
-| `X-Auth-Claims` | The route declares `require` | The identity the auth server answered for this request: `sub`, `username`, `roles` and `groups`, base64-encoded JSON |
+| `X-Auth-Claims` | The route declares `require` | The identity the authority answered for this request: `sub`, `username`, `roles` and `groups`, base64-encoded JSON |
 
 **Table 2: the field the proxy adds after routing.**
 The value is encoded, so a backend decodes it before reading any claim.
-The four named fields are the whole value. The token's `exp`, `iss` and any extra claim do not survive, because the proxy forwards the identity the authority answered and not the token it received.
+The four named fields are the whole value.
+The token's `exp`, `iss` and any extra claim do not survive, because the proxy forwards the identity the authority answered and not the token it received.
+The encoder writes exactly those keys (`m6-core/src/auth.rs:147`), and the backend-side parser reads them into the `auth_*` request-dictionary keys (`m6-core/src/site.rs:2087`, `m6-core/src/request.rs:684`).
+Every `require` request that reaches a backend has passed the check, so it carries the field (§2.7).
 
 Every field not in Table 1 or Table 2 is forwarded from the client unchanged, in the order the client sent it, except the hop-by-hop and proxy-owned fields in §2.5.
 A field named by the client's `Connection` header is also dropped (RFC 9110 §7.6.1).
@@ -186,8 +197,53 @@ The proxy writes entire bodies and never chunked transfer coding, so `Transfer-E
 The backend MUST read exactly `Content-Length` bytes.
 A read beyond that waits for bytes that will never arrive, until the proxy's timeout expires.
 
-Those are the fields a backend parses.
-It MAY trust the proxy-owned values in §2.2 and §2.3 only while §2.5 holds, with `Host` excepted.
+### 2.7. The check behind `X-Auth-Claims`
+
+A route with `require` makes the edge ask the authority for the identity before it forwards anything.
+This subsection gives that exchange.
+The authority is the backend named by `[auth] backend`, which must name a `[[backend]]` with `sockets` (`m6-http/src/config.rs:1551`).
+A `require` route with no `[auth] backend` stops the start with exit `2` (`m6-http/src/config.rs:1571`).
+
+The edge takes the credential from `Authorization: Bearer` or the `session` cookie (`m6-http/src/auth.rs:154`).
+A request that carries neither is refused by the edge, so the authority never sees it (`m6-http/src/main.rs:5340`).
+A credential is written into one request with no body (`m6-http/src/auth.rs:245`):
+
+```text
+POST /check HTTP/1.1
+Host: localhost
+Authorization: Bearer <credential>
+Content-Length: 0
+Connection: close
+```
+
+A credential carrying CR, LF or NUL, or longer than one header line, is refused before this request is written (`m6-http/src/auth.rs:252`).
+The check has a 50 ms deadline in its own timeout table, so a slow authority delays a protected request by at most 50 ms (`m6-http/src/auth.rs:6`).
+
+The answer has three outcomes (`m6-core/src/auth.rs:100`):
+
+- A `200` whose JSON body carries all four identity fields is an identity (`m6-core/src/auth.rs:102`).
+- A `401` is the authority's refusal (`m6-core/src/auth.rs:105`).
+- Every other status, a `200` that does not parse, a timeout and a connect failure are no decision (`m6-core/src/auth.rs:106`).
+
+The edge applies the route's `require` to an identity (`m6-core/src/auth.rs:81`).
+An identity that carries the named role or group is forwarded to the route's backend with `X-Auth-Claims` set (§2.3).
+An identity without it is `403` (`m6-core/src/auth.rs:86`).
+The edge answers a `401` from the authority with `401` and `WWW-Authenticate: Bearer` for an API client (`m6-core/src/http.rs:159`).
+A browser that presents no credential, or one the authority refused, is redirected to `/login`, or to `/auth/refresh` when it still holds a refresh cookie (`m6-http/src/main.rs:5444`).
+No decision is `503` with `Retry-After: 1`, because a `401` would tell a user with a valid credential to log in again (`m6-http/src/main.rs:5420`, `m6-http/src/main.rs:5667`).
+
+The `m6-auth-server` reads the identity from its database on every check, so a role change or a revocation counts from the next request (`m6-auth-server/src/handlers.rs:485`).
+Its `200` carries `Cache-Control: no-store` (`m6-auth-server/src/handlers.rs:513`).
+A missing, invalid or expired token is `401` `{"error":"unauthorised"}` (`m6-auth-server/src/handlers.rs:540`).
+A locked database is `503` `{"error":"unavailable"}` at once, because the edge's 50 ms deadline would pass before the service's one-second deferral (`m6-auth-server/src/handlers.rs:532`).
+
+The edge probes every `[auth] backend` member once at start with one credential-less `POST /check` under a 2 s deadline (`m6-http/src/main.rs:6869`).
+A member that answers `401` or `503` serves checks (`m6-http/src/main.rs:6887`).
+A `404` stops the start and names the socket (`m6-http/src/main.rs:6891`).
+An unreachable member warns and the node starts (`m6-http/src/main.rs:6882`).
+
+Those are the fields a backend parses and the check that runs before `X-Auth-Claims` appears.
+A backend MAY trust the proxy-owned values in §2.2 and §2.3 only while §2.5 holds, with `Host` excepted.
 Section 3 gives the response it writes.
 
 ## 3. The response
@@ -403,7 +459,8 @@ A backend MUST be able to accept a new connection while it is handling another.
 It MAY use threads, processes or an event loop.
 
 The reference model, given in `m6-architecture.md` §7.1, is one process with one event loop, scaling by running more instances.
-A backend at its connection ceiling stops accepting, and clients wait in the kernel's listen backlog. The proxy's own deadline answers a request that waits there too long.
+A backend at its connection ceiling stops accepting, and clients wait in the kernel's listen backlog.
+The proxy's own deadline answers a request that waits there too long.
 
 That is the concurrency a member provides.
 Section 8 gives the lifecycle that puts a member in the pool and takes it out.
@@ -483,6 +540,7 @@ Everything a backend MUST do:
 - [ ] Declare in `site.toml` whether the service compresses, and refuse to start with exit `2` when the declaration disagrees with what it does (§3.6.1).
 - [ ] If it compresses, send an accurate `Content-Encoding` and honour `Accept-Encoding` (§3.6).
 - [ ] Trust the proxy-owned fields in §2.2 and §2.3 only while the socket is reachable by the proxy alone (§2.5).
+- [ ] If `[auth] backend` names it, answer `POST /check` on the check socket with a `200` identity, a `401` refusal or a `503` when it cannot decide, and answer the house `404` for every other path (§2.7).
 - [ ] Treat `Host` as attacker-controlled (§2.5, §6.2).
 - [ ] Reject or sanitise path traversal before using a request-derived value in a filesystem path (§6.2).
 - [ ] Bound anything derived from the request that it allocates (§6.2).
@@ -491,7 +549,7 @@ Everything a backend MUST do:
 - [ ] Exit immediately on a second `SIGTERM` or `SIGINT` (§8.2).
 
 There is no requirement to implement TLS, HTTP/2, HTTP/3, chunked encoding, caching, authentication or connection reuse.
-The proxy terminates TLS and the newer protocols, caches responses and verifies tokens.
+The proxy terminates TLS and the newer protocols, caches responses and asks the authority for the identity a `require` route needs (§2.7).
 Compression is the exception: §3.6 makes it the backend's job, and `m6-http` has no compressor.
 
 The checklist is small enough to implement from scratch in any language.
