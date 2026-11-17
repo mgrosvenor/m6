@@ -2,9 +2,10 @@
 
 m6-auth-cli is the administrative command for an m6-auth database.
 It creates, changes and deletes users, groups, roles and API (*Application Programming Interface*) tokens, and it can do so before m6-auth-server has started.
+It also runs the session step of a key rotation.
 
 This page is the reference for every command, flag, config key and exit code.
-Section 8 gives the order for a fresh install, and section 9 names the documents that own the material around the database.
+Section 9 gives the order for a fresh install, and section 10 names the documents that own the material around the database.
 
 **Contents**
 
@@ -14,9 +15,10 @@ Section 8 gives the order for a fresh install, and section 9 names the documents
 4. [Users](#4-users)
 5. [Groups](#5-groups)
 6. [API tokens](#6-api-tokens)
-7. [Exit codes](#7-exit-codes)
-8. [Bootstrap sequence](#8-bootstrap-sequence)
-9. [Where to read next](#9-where-to-read-next)
+7. [Sessions](#7-sessions)
+8. [Exit codes](#8-exit-codes)
+9. [Bootstrap sequence](#9-bootstrap-sequence)
+10. [Where to read next](#10-where-to-read-next)
 
 ## 1. What m6-auth-cli is for
 
@@ -48,7 +50,7 @@ Take from it that the entity selects which commands are available.
 | part | meaning |
 |---|---|
 | `<config>` | the path to the `m6-auth.conf` that names the database and the signing keys |
-| `<entity>` | `user`, `group` or `token` |
+| `<entity>` | `user`, `group`, `token` or `sessions` |
 | `<command>` | the operation on that entity, such as `ls` or `add` |
 | `[args] [flags]` | the command's arguments and flags, in that order |
 
@@ -194,9 +196,22 @@ An empty list prints the header and a note on stderr.
 `--ttl-days 1` limits that window to a day plus the leeway, and the row that `token ls` shows is the only record of the token afterwards.
 
 The sequence from minting a token to guarding a route with it is example 10 in [`m6-user-guide.md`](m6-user-guide.md).
-Section 7 gives the exit codes these commands return.
+Section 8 gives the exit codes these commands return.
 
-## 7. Exit codes
+## 7. Sessions
+
+`sessions revoke-all` deletes every refresh-token row in one transaction.
+It takes no argument and reports the number of rows it deleted.
+
+The command is the second step of a key rotation, after the new key files are written and before the server restarts.
+It ends every refresh token, so a stolen one cannot renew access.
+A login after the command creates a new row, which works at the restart.
+[`m6-auth.md` section 4.2](m6-auth.md#42-key-rotation) gives the three steps of the procedure.
+
+This is the interim form of the `sessions revoke-all` step in the auth API design.
+The auth generation, the new epoch and list key, and the cache acknowledgement arrive with the token-rules step, so this version reports the rows it deleted and waits for nothing.
+
+## 8. Exit codes
 
 Every run ends with 0, 1 or 2.
 Table 6 gives the three.
@@ -217,9 +232,9 @@ Code 2 covers a bad argument count and an unreadable config before the database 
 A matched command that is missing its argument exits 1, because the check runs inside the command.
 `user add` with no name is the example, and `group member` with no subcommand exits 2 because that check runs before a command is matched.
 
-Section 8 puts the commands in the order a first install needs them.
+Section 9 puts the commands in the order a first install needs them.
 
-## 8. Bootstrap sequence
+## 9. Bootstrap sequence
 
 A first install needs a signing key pair and one administrator user before m6-auth-server starts.
 Generate the key pair as [`m6-auth.md` section 4.3](m6-auth.md#43-key-generation) describes, which also covers the PKCS#8 conversion.
@@ -242,9 +257,9 @@ Start m6-auth-server after the database exists.
 
 Example 04 in [`m6-user-guide.md`](m6-user-guide.md) wraps the same steps in a setup script.
 Its key commands write the SEC1 form, so add the `openssl pkcs8` step from `m6-auth.md` section 4.3.
-Section 9 names the documents that own the rest.
+Section 10 names the documents that own the rest.
 
-## 9. Where to read next
+## 10. Where to read next
 
 This page covers the commands and stops at the edge of the database.
 Table 7 gives the documents that own the material around it.
@@ -258,5 +273,5 @@ Take from it that every fact left out here has a named owner.
 
 **Table 7: the documents that own what this page leaves out.** Start with the user guide for a working site, and use this page for the command in front of you.
 
-Each command reports its result on stdout or stderr, and section 7 tells a script which exit code to expect.
+Each command reports its result on stdout or stderr, and section 8 tells a script which exit code to expect.
 That is the whole interface: the config file, the commands, the flags and the three exit codes.

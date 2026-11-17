@@ -662,6 +662,19 @@ impl Db {
         Ok(())
     }
 
+    /// Delete every refresh-token row, for the key-rotation step.
+    ///
+    /// This is the interim form of the auth API design's `sessions revoke-all`.
+    /// The auth generation, the new epoch and list key, and the acknowledgement
+    /// from every cache arrive with the token-rules step. At this tip no node
+    /// holds a decision list, so this deletion is the whole effect of
+    /// `revoke-all` on refresh tokens. One DELETE is one transaction, and it
+    /// returns the number of rows it removed.
+    pub fn sessions_revoke_all(&self) -> Result<usize> {
+        let deleted = self.0.execute("DELETE FROM refresh_tokens", [])?;
+        Ok(deleted)
+    }
+
     // ── API token ops ────────────────────────────────────────────────────────
 
     pub fn api_token_create(
@@ -1270,6 +1283,24 @@ mod tests {
         db.refresh_tokens_revoke_all(&u.id).expect("revoke all");
         assert!(db.refresh_token_verify("tok1").expect("v1").is_none());
         assert!(db.refresh_token_verify("tok2").expect("v2").is_none());
+    }
+
+    /// The rotation step ends every user's refresh rows, not one user's.
+    #[test]
+    fn test_sessions_revoke_all_deletes_every_users_rows() {
+        let (db, _f) = tmp_db();
+        let alice = db.user_create_test("alice", "p", &[]).expect("alice");
+        let bob = db.user_create_test("bob", "p", &[]).expect("bob");
+        db.refresh_token_store(&alice.id, "a1", i64::MAX)
+            .expect("a1");
+        db.refresh_token_store(&alice.id, "a2", i64::MAX)
+            .expect("a2");
+        db.refresh_token_store(&bob.id, "b1", i64::MAX).expect("b1");
+        let deleted = db.sessions_revoke_all().expect("revoke all");
+        assert_eq!(deleted, 3, "every refresh row is deleted");
+        assert!(db.refresh_token_verify("a1").expect("a1").is_none());
+        assert!(db.refresh_token_verify("a2").expect("a2").is_none());
+        assert!(db.refresh_token_verify("b1").expect("b1").is_none());
     }
 
     // ── Concurrent open (WAL allows multiple readers + one writer) ───────────

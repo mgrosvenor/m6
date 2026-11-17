@@ -171,7 +171,7 @@ Section 5.1 gives refresh tokens, section 5.2 API tokens, and section 5.3 the en
 **A refresh token is a long-lived JWT whose row lets the server revoke it.**
 
 `m6-auth-server` stores the hash when a login succeeds, verifies it on refresh, and revokes it on logout.
-Table 5 gives the four operations.
+Table 5 gives the five operations.
 Take from it that verification answers with the user id, and an expired row answers `None`.
 
 | method | signature | what it does |
@@ -180,12 +180,14 @@ Take from it that verification answers with the user id, and an expired row answ
 | `refresh_token_verify` | `(&self, token_hash: &str) -> Result<Option<String>>` | returns the user id when the row exists and `expires_at` is in the future |
 | `refresh_token_revoke` | `(&self, token_hash: &str) -> Result<()>` | deletes the row, and an absent hash is not an error |
 | `refresh_tokens_revoke_all` | `(&self, user_id: &str) -> Result<()>` | deletes every refresh-token row for one user |
+| `sessions_revoke_all` | `(&self) -> Result<usize>` | deletes every refresh-token row, for the key-rotation step, and returns the count |
 
-**Table 5: the four refresh-token operations, their signatures and what each one does.**
+**Table 5: the five refresh-token operations, their signatures and what each one does.**
 The hash is the key, so the table never holds a usable token.
 
 `refresh_token_verify` compares `expires_at` with the current Unix time and leaves an expired row in place.
 `user_delete` reaches the same rows through the cascade in section 7.
+`sessions_revoke_all` is the interim rotation step: the auth generation, the new epoch and list key, and the cache acknowledgement arrive with the token-rules step.
 
 ### 5.2. API tokens
 

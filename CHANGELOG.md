@@ -44,6 +44,12 @@ The released versions, newest first:
 
 ### Added
 
+**`m6-auth-cli sessions revoke-all` deletes every refresh-token row in one transaction, for the key-rotation step.**
+It takes no argument and prints the number of rows it deleted.
+A login after the command creates a new row, which is unaffected.
+The command is the interim form of the auth API design's `sessions revoke-all`: the auth generation, the new epoch and list key, and the cache acknowledgement arrive with the token-rules step, and this version holds no decision list anywhere, so the command waits for nothing.
+No configuration key changes. The procedure that uses it is in `docs/m6-auth.md` section 4.2.
+
 **`[server] served_hosts` and `[server] redirect_unmatched_to` answer 301 to a site's canonical name for any Host the node does not serve.** A website might want unmatched hosts to redirect to its canonical domain. `served_hosts` lists the names this node serves, matched against `Host` or `:authority` with any port stripped and ASCII case ignored. `redirect_unmatched_to` names a bare host name, for example `example.com`, and turns the policy on. A request whose Host is outside the list, including one with no Host, is answered 301 to `https://<redirect_unmatched_to><path>` with the query kept, before the cache lookup and before routing, on HTTP/1.1, HTTP/2 and HTTP/3. A `:80` redirector applies the same decision: a served name keeps its usual 301 to the HTTPS form of itself, and an unmatched Host gets the canonical target. The internal h2c listener is excluded. Both keys default off, so a node that sets neither answers every Host as it did before. A target with an empty list is refused at load, because every request would redirect, including the node's own name, and the deploy's checks and the monitor could not reach it. A target that carries a scheme, port, path or wildcard, or that is an IP address, is refused at load. Verified by unit tests through the real loader and in redirect mode, plus a loopback TLS test: a by-address client gets the canonical 301, a served name still answers 200, and a target with an empty list exits 2 naming both keys.
 
 **A public `GET /ready` answers whether a node can serve a request that may need its origin (#175).** It answers 200 while a cache node's last successful origin answer is no more than two heartbeats old, and 503 past that with the follower's failure reason, for example `{"status":"not_ready","node":"edge-a","origin":"down","reason":"connect failed"}`. A source answers 200 `{"status":"ready","node":"origin","origin":"not_applicable"}`: `[genid] upstream` is what makes a node a cache, so the role comes from config rather than from a missing timestamp. A cache that has never had a successful answer is 503 because it holds no ID. The window is `2 * heartbeat_secs`, 20 s at the default 10 s, and there is no new config key. `/ready` is public and answered ahead of routing beside `/health`, and `/health` is unchanged: it still answers 200 `{"status":"ok","node":"<name>"}` for the process alone with no origin state, so a load balancer reads readiness from a status code without pulling a node whose process and warm cache still serve. No migration: the endpoint is new and no existing answer changes. Verified on 2026-11-16 on a macOS sandbox: an end-to-end test stops a real origin, waits until `last_ok_s` is past the window and reads 503 with `connect failed` from `/ready` while `/health` still answers 200, and three further tests cover a live origin, a source node and the unchanged `/health` body in all three states.
@@ -329,6 +335,19 @@ Verified on 2026-11-17 on a macOS sandbox: `a_route_cache_override_cannot_make_a
 `a_response_to_a_request_carrying_authorization_is_never_stored` and `a_response_to_a_request_carrying_a_session_cookie_is_never_stored` fail before the fix with the stored reply served to the anonymous second request, and pass after.
 `a_credential_in_the_request_forbids_storage` fails on the first `authorization` case before the fix and passes after.
 `docs/m6-http.md` section 4 and section 7 and `docs/m6-site-toml.md` Table 10 state both rules.
+
+**A key rotation now ends every outstanding refresh token: `m6-auth-cli sessions revoke-all` deletes every `refresh_tokens` row, and `docs/m6-auth.md` section 4.2 gives that command as a step of the rotation.**
+`/auth/refresh` identifies a refresh token by its stored SHA-256 hash and reads the row, and it never checks the token's signature.
+A key change alone therefore left every refresh token usable until its `exp`, so a stolen token renewed access after the operator rotated the key.
+The command deletes every row in one transaction, so the next refresh finds no row and answers 401.
+The documentation promised the opposite before this change: it said the service verified the refresh token's signature with the current key, which it does not.
+This is the interim form of the auth API design's `sessions revoke-all`.
+That design adds an auth generation, a new epoch and list key, and an acknowledgement from every cache, and those arrive with the token-rules step.
+This version holds no decision list on any node, so the deletion is the whole effect and the command waits for nothing.
+Verified on 2026-11-17 on a macOS sandbox: `sessions_revoke_all_ends_refresh_tokens_across_a_key_rotation` logs in, writes a new key pair, restarts the server, runs the command and gets 401 from the next refresh.
+With the CLI change removed the same test fails with exit 100 and `error: unknown entity: sessions`.
+`test_sessions_revoke_all_deletes_every_users_rows` deletes three rows across two users.
+The existing rotation tests still pass: a key change alone leaves a refresh token usable, and a token minted after it refreshes.
 
 **rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host; the update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
 

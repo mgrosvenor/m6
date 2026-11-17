@@ -159,6 +159,9 @@ fn print_usage() {
     eprintln!("  m6-auth-cli <config> token ls <username> [--json]");
     eprintln!("  m6-auth-cli <config> token revoke <token-id>");
     eprintln!();
+    eprintln!("Session commands:");
+    eprintln!("  m6-auth-cli <config> sessions revoke-all");
+    eprintln!();
     eprintln!("  Tokens require [keys] private_key and public_key in the config.");
     eprintln!("  Every path in the config is absolute.");
 }
@@ -551,6 +554,17 @@ fn cmd_token_revoke(db: &Db, args: &[String]) -> Result<()> {
     }
 }
 
+fn cmd_sessions_revoke_all(db: &Db) -> Result<()> {
+    let deleted = db.sessions_revoke_all()?;
+    eprintln!("all refresh tokens revoked: {deleted} row(s) deleted");
+    eprintln!(
+        "interim form: the auth generation, the new epoch and list key, and the cache \
+         acknowledgement arrive with the token-rules step, and this version holds no \
+         decision list on any node"
+    );
+    Ok(())
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn run() -> Result<()> {
@@ -636,6 +650,14 @@ fn run() -> Result<()> {
             "revoke" => cmd_token_revoke(&db, &rest)?,
             other => {
                 eprintln!("error: unknown token command: {}", other);
+                print_usage();
+                process::exit(2);
+            }
+        },
+        "sessions" => match command.as_str() {
+            "revoke-all" => cmd_sessions_revoke_all(&db)?,
+            other => {
+                eprintln!("error: unknown sessions command: {}", other);
                 print_usage();
                 process::exit(2);
             }

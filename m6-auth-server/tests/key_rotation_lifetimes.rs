@@ -3,10 +3,12 @@
 //! The rotation mechanics (a key is served only after a restart, a bad key is
 //! refused, a mismatched pair is refused) are covered in `integration.rs`.
 //! These tests cover what a rotation does to tokens already issued and to
-//! tokens issued afterwards, per `keys.rs`: a refresh token is verified against
-//! the database hash, not re-validated against the current signing key, so a
-//! token minted under the old key stays usable, a token minted under the new
-//! key works at once, and a token under a third key is rejected.
+//! tokens issued afterwards. A refresh token is verified against the database
+//! hash and never against the current signing key, so a key change alone leaves
+//! it usable. The rotation procedure also runs `m6-auth-cli sessions revoke-all`,
+//! which deletes every refresh row, and that is what ends the token. A token
+//! minted under the new key works at once, and a token under a third key is
+//! rejected because its hash was never stored.
 
 #![allow(
     clippy::disallowed_methods,
@@ -254,15 +256,27 @@ fn rotate_key(env: &TestEnv, mut guard: Service) -> Service {
     spawn_server(env)
 }
 
+/// Run the rotation step against this environment's config.
+fn sessions_revoke_all(env: &TestEnv) -> std::process::Output {
+    Command::new(binary("m6-auth-cli"))
+        .arg(&env.config_path)
+        .args(["sessions", "revoke-all"])
+        .output()
+        .expect("run m6-auth-cli sessions revoke-all")
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-/// A refresh token issued under the old key still refreshes after a rotation.
+/// A key change on its own leaves the refresh row in place, because refresh
+/// reads the hash and never checks a signature. The rotation procedure is the
+/// key change, `sessions revoke-all` and the restart, and the next test pins
+/// the whole of it.
 ///
 /// The wrong outcome it catches: refresh re-validates the JWT signature against
 /// the current key, so a token minted under the previous key is rejected even
 /// though its hash is still in the database.
 #[test]
-fn a_refresh_token_issued_before_rotation_still_refreshes_after_the_key_rotates() {
+fn a_refresh_token_issued_before_a_key_change_still_refreshes() {
     let env = setup_test_env("rotate-pre-token");
     seed_user(&env.site_dir, "ada", "ada-password");
     let mut guard = spawn_server(&env);
@@ -276,6 +290,41 @@ fn a_refresh_token_issued_before_rotation_still_refreshes_after_the_key_rotates(
         parse_status(&resp),
         200,
         "a pre-rotation refresh token was rejected after the rotation\n{resp}\n--- output ---\n{}",
+        guard.output()
+    );
+}
+
+/// The whole rotation procedure ends every refresh token: write both key
+/// files, restart on the new key, run `sessions revoke-all`, and the token
+/// minted before the rotation is refused at the next refresh.
+///
+/// The wrong outcome it catches: a rotation leaves the refresh rows in place,
+/// so a stolen refresh token still renews access after the operator rotated the
+/// key, which breaks the rule that a revocation counts from the next request.
+#[test]
+fn sessions_revoke_all_ends_refresh_tokens_across_a_key_rotation() {
+    let env = setup_test_env("rotate-revoke-all");
+    seed_user(&env.site_dir, "dee", "dee-password");
+    let mut guard = spawn_server(&env);
+
+    let (_, refresh_before) = login_json(&mut guard, &env.socket_path, "dee", "dee-password");
+
+    let mut guard = rotate_key(&env, guard);
+
+    let out = sessions_revoke_all(&env);
+    assert!(
+        out.status.success(),
+        "m6-auth-cli sessions revoke-all failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let resp = refresh_json(&mut guard, &env.socket_path, &refresh_before);
+    assert_eq!(
+        parse_status(&resp),
+        401,
+        "a refresh token minted before the rotation was still accepted after \
+         sessions revoke-all\n{resp}\n--- output ---\n{}",
         guard.output()
     );
 }

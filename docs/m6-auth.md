@@ -196,17 +196,23 @@ Section 4.2 covers what a rotation does to tokens already issued.
 
 ### 4.2. Key rotation
 
-A rotation writes the new key pair in /etc/m6.
-Restart m6-auth-server.
-Restart m6-http.
+A rotation has three steps: write the new key pair in `/etc/m6`, run `m6-auth-cli <config> sessions revoke-all`, and restart m6-auth-server and m6-http.
 systemd copies a credential when the unit starts, so each restart delivers the new files.
 
 A successful rotation changes the signing key immediately after the restart.
 From then on, m6-http refuses an access token signed with the old key at the next request with 401, and a browser sees the error response.
 
-A rotation also invalidates outstanding refresh tokens.
-The service verifies a refresh token's signature with the current key before it checks the SHA-256 hash in the database.
-A refresh token signed with the old key fails at the next refresh, so the session cannot be renewed.
+`sessions revoke-all` ends every refresh token.
+It deletes every `refresh_tokens` row in one transaction.
+The refresh route matches an opaque token by its stored SHA-256 hash and reads the row, so a deleted row refuses the next refresh even though the token itself is unchanged.
+A key change alone leaves a refresh token usable until its `exp`, so the command is the step that ends a stolen one.
+Run the command and the restart together with the key change, as one rotation.
+
+The command is the interim form of the `sessions revoke-all` step in the auth API design.
+That design adds an auth generation, a new epoch and list key, and an acknowledgement from every cache.
+This version holds no decision list on any node, so deleting the rows is the whole effect of the command and it waits for nothing.
+
+Section 4.3 gives the key formats and the commands that generate them.
 
 ### 4.3. Key generation
 
@@ -315,8 +321,9 @@ Take from it that a failed refresh is a 401 and a bad body is a 400, so a JSON c
 
 **Table 6: the three JSON refresh outcomes.**
 
-The service checks the token's signature, issuer and expiry.
-It then matches the SHA-256 hash to the `refresh_tokens` row and loads the user for current groups and roles.
+The service hashes the opaque token and matches the SHA-256 hash to the `refresh_tokens` row.
+It loads the user for current groups and roles.
+This path never verifies the token's signature, so a key change alone does not refuse a refresh token.
 
 A refresh token is a JWT with `type` set to `refresh`.
 The service does not rotate it on refresh, so the same refresh token works until it expires.
@@ -588,7 +595,7 @@ Take from it that every number and every contract has a file responsible for it.
 | document | covers |
 |---|---|
 | [`m6-auth-lib.md`](m6-auth-lib.md) | the `m6-auth` library: schema, password hashing, user and group operations |
-| [`m6-auth-cli.md`](m6-auth-cli.md) | the administrative CLI: users, groups and API tokens |
+| [`m6-auth-cli.md`](m6-auth-cli.md) | the administrative CLI: users, groups, API tokens and the session revoke-all step |
 | [`m6-site-toml.md`](m6-site-toml.md) | `[auth]`, `[[backend]]`, `[[route]]` and `require` |
 | [`m6-http.md`](m6-http.md) | m6-http internals, including the edge check and the cache |
 | [`m6-core-reference.md`](m6-core-reference.md) | the request dictionary and the renderer API |

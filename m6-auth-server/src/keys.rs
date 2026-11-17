@@ -1,13 +1,17 @@
 //! The signing key material.
 //!
-//! Rotation is: write the private key file and the public key file, then
-//! restart the service. The keys are read once at start, and a change takes a
-//! restart.
+//! Rotation is: write the private key file and the public key file, run
+//! `m6-auth-cli sessions revoke-all`, then restart the service. The keys are
+//! read once at start, and a change takes a restart.
 //!
-//! Rotation semantics (per spec): m6-auth begins signing with the new key
-//! immediately. Previously issued access tokens expire naturally. Refresh
-//! tokens are verified against the *database* (hash match), not re-validated by
-//! JWT signature, so old refresh tokens remain usable until they expire.
+//! Rotation semantics: m6-auth begins signing with the new key immediately
+//! after the restart, and a previously issued access token is refused by its
+//! signature. A refresh token is verified against the *database* (hash match),
+//! not re-validated by JWT signature, so the key change alone does not end it.
+//! `sessions revoke-all` deletes every refresh row, and that is the step that
+//! ends every session. The auth generation, the new epoch and list key, and the
+//! cache acknowledgement arrive with the token-rules step, when a cache can
+//! hold a decision list.
 
 use crate::jwt::JwtEngine;
 
