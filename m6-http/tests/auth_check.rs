@@ -51,6 +51,7 @@ fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
 struct HttpResponse {
     status: u16,
     headers: String,
+    body: String,
 }
 
 impl HttpResponse {
@@ -81,6 +82,7 @@ fn https_get(
             return HttpResponse {
                 status: 0,
                 headers: format!("<no connection: {e}>"),
+                body: String::new(),
             };
         }
     };
@@ -125,13 +127,18 @@ fn https_get_on(
     let text = String::from_utf8_lossy(&raw);
     let end = text.find("\r\n\r\n").unwrap_or(raw.len());
     let headers = text[..end].to_string();
+    let body = text.get(end + 4..).unwrap_or("").to_string();
     let status = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse().ok())
         .unwrap_or(0);
-    HttpResponse { status, headers }
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
@@ -152,6 +159,16 @@ struct TestServer {
 
 impl TestServer {
     fn start() -> Self {
+        Self::start_with(false)
+    }
+
+    /// The same fixture with `[errors] verbose_fallback`, so the 503 page
+    /// carries the backend name and the detail a client would see.
+    fn start_verbose() -> Self {
+        Self::start_with(true)
+    }
+
+    fn start_with(verbose: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let site = dir.path();
 
@@ -205,6 +222,7 @@ level = "debug"
 
 [errors]
 mode = "internal"
+verbose_fallback = {verbose}
 
 [analytics]
 enabled = false
@@ -683,5 +701,62 @@ fn the_authoritys_answers_advertise_http3_like_a_local_answer() {
         Some(alt.as_str()),
         "{}",
         denied.headers
+    );
+}
+
+/// The 503 names the authority's backend and gives one detail for every check
+/// failure.
+///
+/// The wrong outcome this catches: `backend_unavailable` passed the route's
+/// content backend and the real transport error, so a `verbose_fallback` page
+/// told the client that `m6-file` failed and whether the check timed out or
+/// refused the connection. The detail is now one fixed string, and a timeout
+/// renders the same body as a 503 the checker answered.
+#[test]
+fn the_503_names_the_auth_backend_not_the_content_backend() {
+    let mut srv = TestServer::start_verbose();
+    srv.answer("busy-token", Reply::Unavailable);
+    let busy = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer busy-token")],
+    );
+    assert_eq!(busy.status, 503, "{}", busy.headers);
+    assert!(
+        busy.body.contains("auth-check"),
+        "the page did not name the auth backend\n{}",
+        busy.body
+    );
+    assert!(
+        !busy.body.contains("m6-file"),
+        "the page named the content backend\n{}",
+        busy.body
+    );
+    assert!(
+        busy.body.contains("auth check unavailable"),
+        "the page did not carry the one check detail\n{}",
+        busy.body
+    );
+
+    srv.answer(
+        "slow-token",
+        Reply::Slow {
+            after: Duration::from_millis(200),
+            answer: Box::new(Reply::Identity(identity(&["admins"]))),
+        },
+    );
+    let timed = srv.request(
+        "/private/secret.txt",
+        &[("Authorization", "Bearer slow-token")],
+    );
+    assert_eq!(timed.status, 503, "{}", timed.headers);
+    assert!(
+        timed.body.contains("auth check unavailable"),
+        "{}",
+        timed.body
+    );
+    assert!(
+        !timed.body.contains("Connect(") && !timed.body.contains("timed out"),
+        "the timeout page named the transport failure\n{}",
+        timed.body
     );
 }

@@ -5265,6 +5265,15 @@ fn handle_request_inner(
     // refresh path, when it still holds a refresh cookie), and a credential
     // lacking the role gets the site's own 403 page rather than JSON.
     if let Some(ref require) = route.require {
+        // The authority's backend, for the 503's error context and the warn
+        // line. A check failure is the authority's, and naming the route's
+        // content backend in the page told a reader the wrong service failed.
+        let auth_backend = state
+            .config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.backend.clone())
+            .unwrap_or_else(|| "[auth]".to_string());
         let decision = match pre_decided {
             Some(decision) => decision,
             None => {
@@ -5290,7 +5299,7 @@ fn handle_request_inner(
                                 state,
                                 registry,
                                 &route.path,
-                                &route.backend,
+                                &auth_backend,
                                 "[auth] backend is not configured",
                             );
                         };
@@ -5307,15 +5316,20 @@ fn handle_request_inner(
                             // unreachable, so it answers the same 503 as an
                             // unreachable backend. Never a 502, never a 401.
                             Err(e) => {
-                                let detail = format!("auth check dispatch: {e:?}");
+                                warn!(
+                                    backend = %auth_backend,
+                                    route = %route.path,
+                                    error = ?e,
+                                    "auth check dispatch failed"
+                                );
                                 return backend_unavailable(
                                     req,
                                     client_ip,
                                     state,
                                     registry,
                                     &route.path,
-                                    &route.backend,
-                                    &detail,
+                                    &auth_backend,
+                                    "auth check unavailable",
                                 );
                             }
                         };
@@ -5350,14 +5364,19 @@ fn handle_request_inner(
             // The authority could not decide. That is a 503, never a 401: a
             // 401 would tell a user with a valid credential to log in again.
             core_auth::Decision::NoDecision => {
+                warn!(
+                    backend = %auth_backend,
+                    route = %route.path,
+                    "auth check returned no decision"
+                );
                 return backend_unavailable(
                     req,
                     client_ip,
                     state,
                     registry,
                     &route.path,
-                    &route.backend,
-                    "auth check returned no decision",
+                    &auth_backend,
+                    "auth check unavailable",
                 );
             }
             refusal @ (core_auth::Decision::NoCredential | core_auth::Decision::Deny) => {
