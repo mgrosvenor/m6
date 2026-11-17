@@ -974,6 +974,57 @@ fn perf_event_loop(fx: &Fixture) -> Vec<(String, u64)> {
     }
 }
 
+/// The `(name, count)` pairs of the event-loop figures, from the newest
+/// metrics line that has counted `requests_total` whole requests, and the node
+/// uptime that line reports.
+///
+/// A metrics line is a summary written on an accounting tick, not a live read.
+/// The removed `/perf` endpoint was read live, so the old check always saw the
+/// request it had just made. The line does not: one written before a caller's
+/// requests cannot answer for them, and it is the line that is merely present
+/// that gets read otherwise. `requests_total` is cumulative, so it is the
+/// freshness mark, and waiting for a line that has counted every request the
+/// caller made waits for a summary written after the last one.
+fn perf_event_loop_covering(fx: &Fixture, requests_total: u64) -> (Vec<(String, u64)>, u64) {
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
+    loop {
+        let output = fx.service.output();
+        let covering = output.lines().rev().find_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v["type"] != "perf" {
+                return None;
+            }
+            let perf = &v["fields"]["perf"];
+            let counted = perf["metrics"]["requests_total"].as_u64()?;
+            (counted >= requests_total).then(|| {
+                (
+                    perf["metrics"]["event_loop"].clone(),
+                    perf["uptime_s"].as_u64().unwrap_or(0),
+                )
+            })
+        });
+        if let Some((trigger, uptime_s)) = covering {
+            let triggers = trigger.as_array().expect("the event-loop figures");
+            let counts = triggers
+                .iter()
+                .map(|trigger| {
+                    (
+                        trigger["name"].as_str().unwrap_or_default().to_string(),
+                        trigger["count"].as_u64().unwrap_or(0),
+                    )
+                })
+                .collect();
+            return (counts, uptime_s);
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "no metrics line counted {requests_total} requests within the deadline\n--- m6-http ---\n{output}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// One keep-alive connection that sends 100 requests must fire the connection
 /// arm 100 times and the accept arm at most twice: every connection event used
 /// to fire the listener's arm, which then tried a failing accept.
@@ -1212,20 +1263,24 @@ fn a_socket_reply_is_written_in_the_turn_it_arrives() {
         assert_eq!(status, 200, "/miss/{i}: {body}");
         assert_eq!(body, FAST_BODY);
     }
-    // The next tick snapshots the window that held the 50 misses.
-    wait_for_periodic(&fx, periodic_lines(&fx));
+    // The line must be one written after the last miss, which is a line that
+    // has counted all 51 requests this test made: the warm one and the 50.
+    // Waiting for a tick, or reading the newest line, read a summary written
+    // before the misses.
+    let (loops, uptime_s) = perf_event_loop_covering(&fx, 51);
 
-    let loops = perf_event_loop(&fx);
     let upstream = trigger_count(&loops, "upstream");
     let conn_events = trigger_count(&loops, "conn");
     assert!(
         upstream >= 50,
-        "the upstream trigger rose {upstream}; expected at least 50\n--- m6-http ---\n{}",
+        "the upstream trigger rose {upstream}; expected at least 50, on the metrics line at node \
+         uptime {uptime_s}s\n--- m6-http ---\n{}",
         fx.service.output()
     );
     assert!(
         conn_events <= 60,
-        "the conn trigger rose {conn_events}; expected at most 60 (no writable wake)\n--- m6-http ---\n{}",
+        "the conn trigger rose {conn_events}; expected at most 60 (no writable wake), on the \
+         metrics line at node uptime {uptime_s}s\n--- m6-http ---\n{}",
         fx.service.output()
     );
 }
