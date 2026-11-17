@@ -566,6 +566,7 @@ A request with no credential is answered 401 locally and makes no call.
 A 401 from the authority is 401, an identity without the requirement is 403, and a timeout, a connect failure, a 500 or an unparsable answer is 503 with `Retry-After: 1`.
 No decision is cached, so a role change or a revocation counts from the next request.
 The edge decodes no token and holds no key on a protected route, and `X-Auth-Claims` now carries `sub`, `username`, `roles` and `groups` and no token claim.
+The credential is refused before the hand-built `POST /check` is written if it carries CR, LF or NUL or is longer than one header line, so an HTTP/2 or HTTP/3 client cannot inject a field or a request line into that request.
 A config with a `require` route now needs `[auth] backend`, and the start fails without it.
 Public routes are unchanged and reach no authority.
 Three gates still decide locally until step 6: `/perf`, `/traffic` and a source node's `POST /genid` call the local verifier with `[auth] public_key`, which does not compare `iss` and reads roles and groups from the token, so a token the authority would refuse still opens them until it expires.
