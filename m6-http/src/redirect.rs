@@ -31,6 +31,7 @@
 //!
 //! So this is now the same `Http11Listener` as `:443`, bound without TLS, and
 //! the redirect is what it should always have been: a response code.
+use crate::config;
 use crate::forward::HttpRequest;
 use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
 use crate::http2::RequestRef;
@@ -75,12 +76,13 @@ fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
 /// Two request targets are not resources and so have nothing to redirect to.
 /// Both used to be answered with 400, which says the request was malformed
 /// when it was not.
-fn redirect_for(req: &HttpRequest) -> RequestOutcome {
+fn redirect_for(req: &HttpRequest, config: &config::Config) -> RequestOutcome {
     redirect_head(
         &req.method,
         &req.path,
         req.query.as_deref(),
         &req.headers[..],
+        config,
     )
 }
 
@@ -89,6 +91,7 @@ fn redirect_head(
     path: &str,
     query: Option<&str>,
     headers: &(impl m6_core::http::HeaderSource + ?Sized),
+    config: &config::Config,
 ) -> RequestOutcome {
     // RFC 9110 9.3.6: CONNECT establishes a tunnel through a proxy. This is an
     // origin server and will not be one, so the method is refused -- 405, the
@@ -121,6 +124,30 @@ fn redirect_head(
         .map(str::trim)
         .unwrap_or("");
 
+    // An unsafe Host is a malformed request, and the canonical answer does not
+    // need the Host, so it is refused before the policy looks at it.
+    if !host.is_empty() && !host_is_safe(host) {
+        return ready(400, vec![("Content-Length".into(), "0".into())]);
+    }
+
+    // A Host this node does not serve, or no Host at all, goes to the site's
+    // canonical name. This is the same decision the serving listener makes, so
+    // a name that serves on 443 keeps its usual upgrade and every other name
+    // gets one canonical answer from either port.
+    if let Some(location) = config.server.unmatched_host_redirect(
+        if host.is_empty() { None } else { Some(host) },
+        path,
+        query,
+    ) {
+        return ready(
+            301,
+            vec![
+                ("Location".into(), location),
+                ("Content-Length".into(), "0".into()),
+            ],
+        );
+    }
+
     // The query is part of the target and must survive the hop. It did not:
     // `req.path` is the path alone, so `http://example.com/x?v=1` redirected to
     // `https://example.com/x` and every query parameter on an http:// link was
@@ -148,7 +175,7 @@ fn redirect_head(
     )
 }
 
-pub fn run(bind: &str) -> anyhow::Result<()> {
+pub fn run(bind: &str, config: &config::Config) -> anyhow::Result<()> {
     // `main` blocks the shutdown signals as its first statement, and `Signals`
     // delivers them on a descriptor this loop reads, so SIGTERM is never
     // blocked with nothing listening for it.
@@ -176,13 +203,13 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
         Duration::from_secs(crate::http11::READ_TIMEOUT_SECS),
     );
     let mut on_head = |_: &mut (), head: &RequestHead<'_>, _: &[u8], _: &str| {
-        redirect_head(head.method, head.path, head.query, head.headers)
+        redirect_head(head.method, head.path, head.query, head.headers, config)
     };
     let mut on_owned = |_: &mut (), req: RequestRef<'_>, _: &str| match req {
-        RequestRef::Owned(req) => redirect_for(req),
+        RequestRef::Owned(req) => redirect_for(req, config),
         RequestRef::H2(req) => {
             let owned = req.into_owned();
-            redirect_for(&owned)
+            redirect_for(&owned, config)
         }
     };
     // The redirect listener has no route table, so it decides nothing from a
@@ -313,12 +340,45 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn request(method: &str, target: &str) -> HttpRequest {
-        let raw = format!("{method} {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    /// A redirect-mode config, through the real loader. Redirect mode skips the
+    /// TLS files, so the temporary directory needs only the two TOML files.
+    fn cfg(served: &[&str], target: Option<&str>) -> config::Config {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("site.toml"),
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n",
+        )
+        .unwrap();
+        let hosts = served
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut system = format!(
+            "[node]\nname = \"test\"\n\n[server]\nredirect_bind = \"127.0.0.1:80\"\nserved_hosts = [{hosts}]\n"
+        );
+        if let Some(target) = target {
+            system.push_str(&format!("redirect_unmatched_to = \"{target}\"\n"));
+        }
+        std::fs::write(dir.path().join("system.toml"), system).unwrap();
+        config::load(dir.path(), &dir.path().join("system.toml")).unwrap()
+    }
+
+    fn request_host(method: &str, target: &str, host: &str) -> HttpRequest {
+        let (version, host_line) = if host.is_empty() {
+            ("HTTP/1.0", String::new())
+        } else {
+            ("HTTP/1.1", format!("Host: {host}\r\n"))
+        };
+        let raw = format!("{method} {target} {version}\r\n{host_line}\r\n");
         match m6_core::h1::parse_request(raw.as_bytes()) {
             m6_core::h1::ParseResult::Complete(r) => r,
             _ => panic!("fixture did not parse: {raw:?}"),
         }
+    }
+
+    fn request(method: &str, target: &str) -> HttpRequest {
+        request_host(method, target, "example.com")
     }
 
     fn status_of(outcome: &RequestOutcome) -> u16 {
@@ -345,7 +405,7 @@ mod tests {
     /// malformed" for a request that is not.
     #[test]
     fn options_asterisk_is_answered_for_the_server() {
-        let out = redirect_for(&request("OPTIONS", "*"));
+        let out = redirect_for(&request("OPTIONS", "*"), &cfg(&[], None));
         assert_eq!(status_of(&out), 200);
         assert_eq!(header_of(&out, "allow").as_deref(), Some(ALLOW));
     }
@@ -355,7 +415,7 @@ mod tests {
     /// called malformed.
     #[test]
     fn connect_is_refused_as_a_method_not_as_a_bad_request() {
-        let out = redirect_for(&request("CONNECT", "example.com:443"));
+        let out = redirect_for(&request("CONNECT", "example.com:443"), &cfg(&[], None));
         assert_eq!(status_of(&out), 405);
         assert_eq!(header_of(&out, "allow").as_deref(), Some(ALLOW));
     }
@@ -365,14 +425,17 @@ mod tests {
     /// not the one in the target.
     #[test]
     fn ordinary_targets_still_redirect() {
-        let out = redirect_for(&request("GET", "/capabilities?v=1"));
+        let out = redirect_for(&request("GET", "/capabilities?v=1"), &cfg(&[], None));
         assert_eq!(status_of(&out), 301);
         assert_eq!(
             header_of(&out, "location").as_deref(),
             Some("https://example.com/capabilities?v=1")
         );
 
-        let out = redirect_for(&request("GET", "http://elsewhere.example/x"));
+        let out = redirect_for(
+            &request("GET", "http://elsewhere.example/x"),
+            &cfg(&[], None),
+        );
         assert_eq!(
             header_of(&out, "location").as_deref(),
             Some("https://example.com/x"),
@@ -398,5 +461,62 @@ mod tests {
         assert!(!host_is_safe(""));
         assert!(host_is_safe("example.com"));
         assert!(host_is_safe("example.com:8443"));
+    }
+
+    /// A name the node serves keeps the plain-HTTP upgrade it has always had,
+    /// so the canonical policy does not take the node's own name off HTTPS.
+    #[test]
+    fn a_served_host_keeps_its_https_upgrade() {
+        let c = cfg(&["example.com"], Some("canonical.example"));
+        let out = redirect_for(&request("GET", "/capabilities?v=1"), &c);
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://example.com/capabilities?v=1")
+        );
+    }
+
+    /// A name the node does not serve goes to the site's canonical name, with
+    /// the path and query kept, and the Location never carries the request's
+    /// own Host.
+    #[test]
+    fn an_unserved_host_goes_to_the_canonical_name() {
+        let c = cfg(&["example.com"], Some("canonical.example"));
+        let out = redirect_for(
+            &request_host("GET", "/capabilities?a=1", "other.example"),
+            &c,
+        );
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://canonical.example/capabilities?a=1")
+        );
+    }
+
+    /// No Host at all is outside the list, so a redirector sends it to the
+    /// canonical name instead of the 400 it answers with the policy off.
+    #[test]
+    fn an_empty_host_goes_to_the_canonical_name() {
+        let c = cfg(&["example.com"], Some("canonical.example"));
+        let out = redirect_for(&request_host("GET", "/", ""), &c);
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://canonical.example/")
+        );
+        let out = redirect_for(&request_host("GET", "/", ""), &cfg(&[], None));
+        assert_eq!(status_of(&out), 400);
+    }
+
+    /// The policy is off with no target, so every request keeps the echo.
+    #[test]
+    fn the_policy_is_off_without_a_target() {
+        let c = cfg(&["example.com"], None);
+        let out = redirect_for(&request_host("GET", "/x", "other.example"), &c);
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://other.example/x")
+        );
     }
 }

@@ -268,7 +268,7 @@ Take from it that the service `[log]` is the one key with two homes, and every o
 |---|---|---|
 | `[site]` name, domain, redirect_www, describedby | `site.toml` | The identity every node shares |
 | `[node]` name | System config | Names this node |
-| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, lock_memory, max_requests_per_connection, reuse_port | System config | Differs per node |
+| `[server]` bind, tls_cert, tls_key, h2c_bind, internal_binds, internal_peers, redirect_bind, warm_on_start, lock_memory, max_requests_per_connection, reuse_port, served_hosts, redirect_unmatched_to | System config | Differs per node |
 | `[server]` backend_timeout_secs, allowed_methods | `site.toml` | How the site's routes are served, the same on every node |
 | `[auth]` | System config | A verify key path is a credential path |
 | `[limits.<name>]` | System config | The start and maximum of this node's buffers and queues, memory a node owns |
@@ -347,9 +347,19 @@ Take from it that the bind, the certificate and the key are required, and every 
 | `lock_memory` | boolean | no | Default `true`. Pins every page of the process in RAM at start, after the heap reservation and before the first request (`mlockall` on Linux, nothing on macOS), so a hot page is never a page fault and the cache is never swapped out. If the kernel refuses because `RLIMIT_MEMLOCK` is too low, m6-http stops at start with exit 2 and an error that names the limit; it never carries on unpinned when pinning was asked for. Under systemd set `LimitMEMLOCK=infinity` in the unit. Set `false` to run unpinned. System config only, read at start |
 | `process_index` | integer | no | Unset by default. This process's number among the m6-http processes of one node, 0 to N-1, below `reuse_port_processes` when that is set. `/health` and `/perf` report it as `process_index`, and with `status_bind` it picks this process's status port. System config only, read at start |
 | `status_bind` | string, `"<address>:<base port>"` | no | Unset by default. With `reuse_port`, each process also answers `/health`, `/perf` and `/traffic` on a TLS listener of its own at the base port plus its `process_index`, so a monitor reads every process and not whichever one the kernel picked on 443. Every other path on it is 404, and the `[health]` gate applies as on the shared port. Needs `process_index`; a port past 65535 is exit 2. It is not in the `reuse_port` group, so nothing steers to it. Bind it to the node's tunnel address, never a public one. System config only, read at start |
+| `redirect_bind` | string, `"address:port"` | no | Unset by default. Run this process as a plain-HTTP redirector on this address: every request is answered 301 to `https://<Host><path>`, or to `redirect_unmatched_to` when the Host is not in `served_hosts`. No TLS, no QUIC, no backends, no routes and no cache are built. System config only, read at start |
+| `served_hosts` | list of strings | no | `[]` by default. The host names this node serves, matched against `Host` or `:authority` with any port stripped and ASCII case ignored. The list alone changes nothing, because the policy is off until `redirect_unmatched_to` is set. System config only, read at start |
+| `redirect_unmatched_to` | string | no | Unset by default, which turns the policy off. A bare host name, for example `example.com`. A request outside `served_hosts`, including one with no Host, is answered 301 to `https://<redirect_unmatched_to><path>` with the query kept, before the cache and before routing. Refused when `served_hosts` is empty, when it carries a scheme, port, path or wildcard, and when it is an IP address. System config only, read at start |
 
 **Table 3: the `[server]` keys.**
 The bind addresses and the internal lists choose where the process listens and whom it trusts, and the certificate and key choose what it presents.
+
+The unmatched-host policy sends a request for a name this node does not serve to the site's canonical name.
+`served_hosts` names the served names, and `redirect_unmatched_to` names the destination.
+Both are off by default, so a node that sets neither answers every Host as it does today.
+A target with no served names is a config error, because every request would redirect, including the node's own name, and the deploy's checks and the monitor could not reach it.
+The policy runs in the same position as the `www.` redirect, before the cache lookup and before routing, so a warm entry for a served name cannot answer a request for a name the node does not own.
+The internal h2c listener is excluded, because its `:authority` is the backbone address, which no visitor sent.
 
 `reuse_port` is off by default, so an accidental second m6-http on a node's public port fails at bind and an existing config binds exactly as before.
 Set it to `true` on every process that should serve the public 443 port: only its TLS listener and its QUIC UDP socket on `bind` are bound in one call, so a request is answered by one of the processes.

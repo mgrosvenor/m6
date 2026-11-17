@@ -797,6 +797,26 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             "www-redirect".to_string(),
         );
     }
+    // A Host this node does not serve goes to the site's canonical name. This
+    // runs before the cache lookup for the same reason the www redirect does:
+    // the cache key has no host component, so a warm entry for a served name
+    // would answer a request for a name the node does not own. The internal
+    // h2c listener is excluded: its :authority is the backbone address, and
+    // the cache node behind it has already made this decision.
+    if !h2c {
+        if let Some(location) = state
+            .config
+            .server
+            .unmatched_host_redirect(host, path, query)
+        {
+            return Routed::Ready(
+                301,
+                www_redirect_headers(location),
+                Vec::new(),
+                "unmatched-host-redirect".to_string(),
+            );
+        }
+    }
     // A method the matched route does not answer is refused here, before the
     // cache lookup and any backend contact.
     if let Some(outcome) = route_method_refusal(state, path, method) {
@@ -3632,6 +3652,26 @@ fn handle_h3_request(
         });
         if let Some(location) =
             www_redirect_location(authority.as_deref(), path_str, query_str, &state.config)
+        {
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                301,
+                &www_redirect_headers(location),
+                Bytes::new(),
+                false,
+                None,
+            );
+            return;
+        }
+        // The same policy as the h1 and h2 paths, and the same position: before
+        // the cache fast path, which has no host component in its key.
+        if let Some(location) =
+            state
+                .config
+                .server
+                .unmatched_host_redirect(authority.as_deref(), path_str, query_str)
         {
             send_h3_response(
                 stream_id,
@@ -7132,7 +7172,7 @@ fn run(args: Vec<String>) -> i32 {
     // cannot stall TLS serving, because it is not sharing that event loop.
     if let Some(ref bind) = config.server.redirect_bind {
         info!(bind = %bind, node = %config.node.name, "starting in HTTP->HTTPS redirect mode");
-        if let Err(e) = m6_http_lib::redirect::run(bind) {
+        if let Err(e) = m6_http_lib::redirect::run(bind, &config) {
             error!(error = %e, "redirect listener failed");
             return 1;
         }
@@ -7669,6 +7709,8 @@ mod www_redirect_tests {
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
                 redirect_bind: None,
+                served_hosts: Vec::new(),
+                redirect_unmatched_to: None,
                 warm_on_start: false,
                 lock_memory: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
@@ -7813,6 +7855,87 @@ mod www_redirect_tests {
                 "host {host:?}"
             );
         }
+    }
+
+    fn host_policy(served: &[&str], target: Option<&str>) -> Config {
+        let mut c = cfg("example.com", true);
+        c.server.served_hosts = served.iter().map(|s| s.to_string()).collect();
+        c.server.redirect_unmatched_to = target.map(|s| s.to_string());
+        c
+    }
+
+    #[test]
+    fn a_host_outside_the_served_list_goes_to_the_canonical_name() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        assert_eq!(
+            c.server.unmatched_host_redirect(
+                Some("other.example"),
+                "/capabilities",
+                Some("a=1&b=2")
+            ),
+            Some("https://example.net/capabilities?a=1&b=2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_served_host_is_not_redirected() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        for host in [
+            "edge-a.example.com",
+            "EDGE-A.Example.COM",
+            "edge-a.example.com:8443",
+        ] {
+            assert_eq!(
+                c.server.unmatched_host_redirect(Some(host), "/", None),
+                None,
+                "host {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_host_is_outside_the_list() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        assert_eq!(
+            c.server.unmatched_host_redirect(None, "/", None),
+            Some("https://example.net/".to_string())
+        );
+    }
+
+    #[test]
+    fn the_target_is_built_from_config_never_from_the_host() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        let location = c
+            .server
+            .unmatched_host_redirect(Some("evil.example"), "/x", None)
+            .unwrap();
+        assert!(location.starts_with("https://example.net/"), "{location}");
+        assert!(!location.contains("evil.example"), "{location}");
+    }
+
+    #[test]
+    fn an_unsafe_path_or_query_is_served_instead_of_echoed() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        assert_eq!(
+            c.server
+                .unmatched_host_redirect(Some("other.example"), "/x\r\nX: 1", None),
+            None
+        );
+        assert_eq!(
+            c.server
+                .unmatched_host_redirect(Some("other.example"), "/x", Some("a=1\r\nX: 1")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_policy_is_off_without_a_target() {
+        let c = host_policy(&["edge-a.example.com"], None);
+        assert_eq!(
+            c.server
+                .unmatched_host_redirect(Some("other.example"), "/", None),
+            None
+        );
     }
 }
 

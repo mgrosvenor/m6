@@ -401,9 +401,11 @@ fn json_field(output: &str, key: &str) -> Option<u64> {
 // ── The client ───────────────────────────────────────────────────────────────
 
 fn tls_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .ok();
+    // No provider is named. The workspace enables one (aws-lc-rs), so the
+    // automatic builder installs it. This test arrived on the mimalloc branch,
+    // which was written against a workspace that still named ring in m6-http,
+    // so the merge with the one-provider change is where the old call failed to
+    // compile.
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).expect("trust the test certificate");
