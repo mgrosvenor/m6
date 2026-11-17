@@ -6,6 +6,15 @@ use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// A new identifier for a token's `jti`.
+///
+/// One place makes these, so an access token, an API token and a refresh token
+/// all name one mint the same way. At this tip nothing looks the value up: the
+/// row that can end a token is part of the shelved token-rules work.
+pub fn new_token_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -158,8 +158,13 @@ fn public_key(env: &TestEnv) -> String {
 
 /// A `JwtEngine` over the same key files the server loaded.
 fn engine(env: &TestEnv) -> JwtEngine {
-    JwtEngine::new(&private_key(env), &public_key(env), ISSUER.to_string())
-        .expect("build jwt engine")
+    JwtEngine::new(
+        &private_key(env),
+        &public_key(env),
+        ISSUER.to_string(),
+        ISSUER.to_string(),
+    )
+    .expect("build jwt engine")
 }
 
 /// A refresh token signed by the server's key whose `exp` is in the past.
@@ -167,11 +172,13 @@ fn expired_refresh_token(env: &TestEnv, user_id: &str, username: &str) -> String
     let now = now_secs();
     let claims = RefreshClaims {
         iss: ISSUER.to_string(),
+        aud: ISSUER.to_string(),
         sub: user_id.to_string(),
-        // One hour past expiry, well beyond jsonwebtoken's 60 second leeway,
-        // so the verdict cannot depend on which second the server checks in.
+        // One hour past expiry, well beyond the engine's zero leeway, so the
+        // verdict cannot depend on which second the server checks in.
         exp: now - 3600,
         iat: now - 7200,
+        jti: m6_auth::new_token_id(),
         username: username.to_string(),
         token_type: "refresh".to_string(),
     };
@@ -186,6 +193,7 @@ fn decode_access(env: &TestEnv, token: &str) -> AccessClaims {
         .expect("parse public key");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&[ISSUER]);
     jsonwebtoken::decode::<AccessClaims>(token, &decoding_key, &validation)
         .expect("a decodable access token")
         .claims

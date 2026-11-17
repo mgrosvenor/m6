@@ -18,10 +18,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use m6_auth::jwt::{now_secs, AccessClaims, JwtEngine};
+use m6_auth::jwt::{now_secs, AccessClaims, JwtEngine, TokenKind};
 use m6_core::testkit::{binary, wait, Service};
 
 const ISSUER: &str = "test.example.com";
+/// The audience the test config sets, deliberately a different name from the
+/// issuer, so a token that carried the issuer as its audience would fail.
+const AUDIENCE: &str = "audience.example.com";
 
 struct TestEnv {
     _temp: tempfile::TempDir,
@@ -83,6 +86,7 @@ path = "{}"
 access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "{}"
+audience    = "{}"
 
 [keys]
 private_key = "{}"
@@ -90,6 +94,7 @@ public_key  = "{}"
 "#,
         db_path.display(),
         ISSUER,
+        AUDIENCE,
         private_key_path.display(),
         public_key_path.display(),
     );
@@ -144,6 +149,11 @@ fn seed_user(env: &TestEnv, username: &str, password: &str) {
 
 /// The access token a real login issues.
 fn login(env: &TestEnv, username: &str, password: &str) -> String {
+    login_tokens(env, username, password).0
+}
+
+/// Both tokens a real login issues.
+fn login_tokens(env: &TestEnv, username: &str, password: &str) -> (String, String) {
     let body = format!(r#"{{"username":"{username}","password":"{password}"}}"#);
     let resp = http_request(
         &env.socket_path,
@@ -154,10 +164,43 @@ fn login(env: &TestEnv, username: &str, password: &str) -> String {
         ),
     );
     assert_eq!(parse_status(&resp), 200, "login failed\n{resp}");
-    json_body(&resp)["access_token"]
-        .as_str()
-        .expect("login returned no access token")
-        .to_string()
+    let body = json_body(&resp);
+    (
+        body["access_token"]
+            .as_str()
+            .expect("login returned no access token")
+            .to_string(),
+        body["refresh_token"]
+            .as_str()
+            .expect("login returned no refresh token")
+            .to_string(),
+    )
+}
+
+/// Claims for a token a test signs itself.
+fn claims(issuer: &str, audience: &str, sub: &str) -> AccessClaims {
+    let now = now_secs();
+    AccessClaims {
+        iss: issuer.to_string(),
+        aud: audience.to_string(),
+        sub: sub.to_string(),
+        exp: now + 900,
+        iat: now,
+        jti: m6_auth::new_token_id(),
+        username: "alice".to_string(),
+        groups: Vec::new(),
+        roles: vec!["user".to_string()],
+    }
+}
+
+/// A token signed by the service's key with the header `typ` the caller names,
+/// so a variant that must be refused is one call from the one that is accepted.
+fn signed_with_typ(env: &TestEnv, typ: Option<&str>, claims: &AccessClaims) -> String {
+    let private = std::fs::read_to_string(&env.private_key_path).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private.as_bytes()).expect("private key");
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.typ = typ.map(str::to_string);
+    jsonwebtoken::encode(&header, claims, &key).expect("encode")
 }
 
 /// A token for `sub`, signed with the service's key, so a test can choose the
@@ -165,18 +208,12 @@ fn login(env: &TestEnv, username: &str, password: &str) -> String {
 fn mint(env: &TestEnv, sub: &str, username: &str, exp: i64) -> String {
     let private = std::fs::read_to_string(&env.private_key_path).unwrap();
     let public = std::fs::read_to_string(&env.public_key_path).unwrap();
-    let engine = JwtEngine::new(&private, &public, ISSUER.to_string()).expect("key pair");
-    engine
-        .encode_access(&AccessClaims {
-            iss: ISSUER.to_string(),
-            sub: sub.to_string(),
-            exp,
-            iat: now_secs(),
-            username: username.to_string(),
-            groups: Vec::new(),
-            roles: vec!["user".to_string()],
-        })
-        .expect("encode token")
+    let engine = JwtEngine::new(&private, &public, ISSUER.to_string(), AUDIENCE.to_string())
+        .expect("key pair");
+    let mut claims = claims(ISSUER, AUDIENCE, sub);
+    claims.username = username.to_string();
+    claims.exp = exp;
+    engine.encode_access(&claims).expect("encode token")
 }
 
 fn check(env: &TestEnv, token: &str) -> String {
@@ -230,8 +267,9 @@ fn a_role_change_is_seen_without_a_new_token() {
     // Read the token through its own decoder: it still says `user`.
     let private = std::fs::read_to_string(&env.private_key_path).unwrap();
     let public = std::fs::read_to_string(&env.public_key_path).unwrap();
-    let engine = JwtEngine::new(&private, &public, ISSUER.to_string()).unwrap();
-    let claims = engine.decode_access(&token).unwrap().claims;
+    let engine =
+        JwtEngine::new(&private, &public, ISSUER.to_string(), AUDIENCE.to_string()).unwrap();
+    let claims = engine.decode_access(&token).unwrap().1.claims;
     assert_eq!(claims.roles, vec!["user".to_string()]);
 
     // The database moves to `admin`. No token is minted again.
@@ -258,7 +296,7 @@ fn a_role_change_is_seen_without_a_new_token() {
         "the answer must carry no cache hint, because nothing caches a decision: {body}"
     );
     assert_eq!(
-        engine.decode_access(&token).unwrap().claims.roles,
+        engine.decode_access(&token).unwrap().1.claims.roles,
         vec!["user".to_string()],
         "the token itself must be unchanged, or the test proves nothing"
     );
@@ -354,5 +392,174 @@ fn a_check_only_process_needs_only_the_public_key() {
         status.success(),
         "the check-only process should exit 0 on SIGTERM, got {status}\n--- output ---\n{}",
         svc.output()
+    );
+}
+
+// ─── The claim rules at the check route ──────────────────────────────────────
+//
+// Each refusal below sits beside a 200 positive control, because a route that
+// refused everything would pass a refusal-only test.
+
+/// The token a login mints carries the configured audience and the access
+/// token's `typ`, and its `jti` is not empty.
+#[test]
+fn the_access_token_carries_the_configured_audience_and_kind() {
+    let env = setup_test_env("check-audience");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    let token = login(&env, "alice", "correct_pass");
+    let public = std::fs::read_to_string(&env.public_key_path).unwrap();
+    let engine =
+        JwtEngine::verify_only(&public, ISSUER.to_string(), AUDIENCE.to_string()).expect("engine");
+    let (kind, data) = engine.decode_access(&token).expect("the token verifies");
+    assert_eq!(kind, TokenKind::Access);
+    assert_eq!(
+        data.header.typ.as_deref(),
+        Some("at+jwt"),
+        "the access token's typ is not at+jwt"
+    );
+    assert_eq!(
+        data.claims.aud, AUDIENCE,
+        "the token's aud is not the configured audience"
+    );
+    assert_ne!(data.claims.aud, ISSUER, "the token's aud is the issuer");
+    assert!(!data.claims.jti.is_empty(), "the token has no jti");
+}
+
+/// A token with no `typ` header is refused.
+#[test]
+fn a_token_without_typ_is_inactive() {
+    let env = setup_test_env("check-no-typ");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    assert_eq!(
+        parse_status(&check(&env, &login(&env, "alice", "correct_pass"))),
+        200,
+        "the positive control was refused"
+    );
+    let bad = signed_with_typ(&env, None, &claims(ISSUER, AUDIENCE, "alice"));
+    let resp = check(&env, &bad);
+    assert_eq!(
+        parse_status(&resp),
+        401,
+        "a token with no typ was accepted\n{resp}"
+    );
+}
+
+/// The library's default `typ: JWT` is refused.
+#[test]
+fn a_token_with_typ_jwt_is_inactive() {
+    let env = setup_test_env("check-typ-jwt");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    assert_eq!(
+        parse_status(&check(&env, &login(&env, "alice", "correct_pass"))),
+        200,
+        "the positive control was refused"
+    );
+    let bad = signed_with_typ(&env, Some("JWT"), &claims(ISSUER, AUDIENCE, "alice"));
+    let resp = check(&env, &bad);
+    assert_eq!(
+        parse_status(&resp),
+        401,
+        "a token with typ JWT was accepted\n{resp}"
+    );
+}
+
+/// A refresh token is refused at the check route, before its claims are read.
+#[test]
+fn a_refresh_token_is_inactive() {
+    let env = setup_test_env("check-refresh-token");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    let (access, refresh) = login_tokens(&env, "alice", "correct_pass");
+    assert_eq!(
+        parse_status(&check(&env, &access)),
+        200,
+        "the positive control was refused"
+    );
+    let resp = check(&env, &refresh);
+    assert_eq!(
+        parse_status(&resp),
+        401,
+        "a refresh token was accepted as an access token\n{resp}"
+    );
+}
+
+/// A token minted for another audience is refused even though the signing key
+/// verifies it.
+#[test]
+fn a_token_for_another_audience_is_inactive() {
+    let env = setup_test_env("check-other-audience");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    assert_eq!(
+        parse_status(&check(&env, &login(&env, "alice", "correct_pass"))),
+        200,
+        "the positive control was refused"
+    );
+    let bad = signed_with_typ(
+        &env,
+        Some("at+jwt"),
+        &claims(ISSUER, "other.example.com", "alice"),
+    );
+    let resp = check(&env, &bad);
+    assert_eq!(
+        parse_status(&resp),
+        401,
+        "a token for another audience was accepted\n{resp}"
+    );
+}
+
+/// Two logins of one user carry two ids, so a `jti` names one mint.
+#[test]
+fn two_mints_carry_different_jti() {
+    let env = setup_test_env("check-jti");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    let first = login(&env, "alice", "correct_pass");
+    let second = login(&env, "alice", "correct_pass");
+    let public = std::fs::read_to_string(&env.public_key_path).unwrap();
+    let engine =
+        JwtEngine::verify_only(&public, ISSUER.to_string(), AUDIENCE.to_string()).expect("engine");
+    let first = engine
+        .decode_access(&first)
+        .expect("first decodes")
+        .1
+        .claims;
+    let second = engine
+        .decode_access(&second)
+        .expect("second decodes")
+        .1
+        .claims;
+    assert!(!first.jti.is_empty(), "the first mint has no jti");
+    assert!(!second.jti.is_empty(), "the second mint has no jti");
+    assert_ne!(first.jti, second.jti, "two mints carried the same jti");
+}
+
+/// The answer keeps the v0 shape at this step: the four identity members and
+/// nothing else.
+#[test]
+fn the_check_answer_keeps_the_v0_shape() {
+    let env = setup_test_env("check-v0-shape");
+    seed_user(&env, "alice", "correct_pass");
+    let _guard = spawn_server(&env);
+
+    let resp = check(&env, &login(&env, "alice", "correct_pass"));
+    assert_eq!(parse_status(&resp), 200, "{resp}");
+    let body = json_body(&resp);
+    let object = body.as_object().expect("a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["groups", "roles", "sub", "username"],
+        "the check answer gained or lost a member: {body}"
     );
 }

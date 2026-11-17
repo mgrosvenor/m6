@@ -21,6 +21,7 @@ struct TokensConfig {
     access_ttl: Option<u64>,
     refresh_ttl: Option<u64>,
     issuer: Option<String>,
+    audience: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +54,9 @@ pub struct AuthConfig {
     pub access_ttl: u64,  // seconds
     pub refresh_ttl: u64, // seconds
     pub issuer: String,
+    /// The deployment the tokens are minted for, and the `aud` every token
+    /// carries. The issuer when the config names no audience.
+    pub audience: String,
     /// Absolute, as db_path is. `None` when the config names no private key,
     /// which only the check side may do.
     pub private_key_path: Option<PathBuf>,
@@ -84,16 +88,29 @@ impl AuthConfig {
             access_ttl: None,
             refresh_ttl: None,
             issuer: None,
+            audience: None,
         });
 
         let access_ttl = tokens.access_ttl.unwrap_or(900);
         let refresh_ttl = tokens.refresh_ttl.unwrap_or(2_592_000);
 
-        // Issuer: from config, or try to derive from site.toml
-        let issuer = tokens.issuer.unwrap_or_else(|| {
-            // Try reading the site's site.toml, wherever `site_toml` puts it.
-            try_issuer_from_site_toml(site_toml).unwrap_or_else(|| "localhost".to_string())
-        });
+        // The issuer is the deployment's name, taken from `[tokens] issuer`
+        // and then from `[site] domain` in the site's `site.toml`. A config
+        // that names neither stops the start: a token minted for one deployment
+        // must not verify at another, and a default would name every deployment
+        // the same thing.
+        let issuer = match tokens.issuer {
+            Some(issuer) => issuer,
+            None => try_issuer_from_site_toml(site_toml).ok_or_else(|| {
+                anyhow!(
+                    "[tokens] issuer: no issuer is set and {} has no [site] domain: set [tokens] issuer to the deployment's name, or set [site] domain in that file",
+                    site_toml.display()
+                )
+            })?,
+        };
+        // The audience is the deployment's own name, and the issuer is that name
+        // when the config names no separate one.
+        let audience = tokens.audience.unwrap_or_else(|| issuer.clone());
 
         let private_key_path = raw
             .keys
@@ -120,6 +137,7 @@ impl AuthConfig {
             access_ttl,
             refresh_ttl,
             issuer,
+            audience,
             private_key_path,
             public_key_path,
             rate_limit_max_attempts,
