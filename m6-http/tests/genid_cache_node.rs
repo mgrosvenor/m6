@@ -518,17 +518,6 @@ impl Stack {
     fn wait_upstream_down(&self, want: bool, timeout: Duration) -> bool {
         wait_until(timeout, || self.perf_bool("upstream_down") == Some(want))
     }
-
-    /// Seconds since the origin last answered, from the `/perf` genid block.
-    ///
-    /// The readiness tests wait on this rather than on a sleep: it is state
-    /// the node already keeps, so polling it asks the origin nothing.
-    fn last_ok_s(&self) -> Option<u64> {
-        let block = self.genid_block();
-        let rest = block.split("\"last_ok_s\":").nth(1)?;
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    }
 }
 
 fn no_verify_tls() -> Arc<rustls::ClientConfig> {
@@ -961,196 +950,125 @@ fn background_fetches_wait_for_the_id() {
     }
 }
 
-// ── Readiness: `/ready` beside an unchanged `/health` ────────────────────────
-//
-// Every test below asks both endpoints. The split is only proven when the same
-// state gives /ready one answer and /health another: a change that moved the
-// answer onto /health would fail the exact-body assertions here.
-
-/// A cache whose origin answered inside the window is ready, and `/health`
-/// still answers for the process alone.
+/// `/health` on an edge answers `ok`, then 503 `degraded` while the origin is
+/// down, then `ok` again when it returns. The degraded body names the node and
+/// nothing a stranger can aim at, and the cache's log holds exactly one warn on
+/// the loss and one info on the recovery across many requests.
 ///
-/// Break: answer 503 for every cache node, dropping the last-answer test, and
-/// a node whose origin answered a moment ago is pulled from rotation.
+/// Break: name the dependency in the public body, and the exact-body assertion
+/// fails. Break: log on each failed request, and the warn count exceeds one.
 #[test]
-fn a_cache_with_a_live_origin_is_ready() {
-    let mut stack = Stack::new("public, max-age=60", 10, false);
+fn health_goes_ok_degraded_ok_and_logs_each_change_once() {
+    let mut stack = Stack::new("public, max-age=60", 1, false);
     stack.start_html();
     stack.start_source();
     stack.start_cache();
-    assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID:\n{}",
-        stack.cache_output()
-    );
+    assert!(stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND));
 
-    let ready = stack.get_cache("/ready", &[]);
-    assert_eq!(ready.status, 200, "{}", ready.text());
-    assert!(
-        ready.text().contains("\"origin\":\"up\""),
-        "a live origin is not named up: {}",
-        ready.text()
+    // `ok` while the origin answers, across many requests.
+    for _ in 0..20 {
+        let r = stack.get_cache("/", &[]);
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.text(), "first: one");
+    }
+    let up = stack.get_cache("/health", &[]);
+    assert_eq!(up.status, 200, "{}", up.text());
+    assert_eq!(up.text(), r#"{"status":"ok","node":"genid-cache"}"#);
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream down").count(),
+        0,
+        "an origin that answered is not logged as lost"
     );
     assert_eq!(
-        stack.get_cache("/health", &[]).text(),
-        "{\"status\":\"ok\",\"node\":\"genid-cache\"}",
-        "/health must stay the process answer"
-    );
-}
-
-/// ISS-175: an edge cache reports `/health` ok while it cannot serve a request
-/// that depends on its origin.
-///
-/// Liveness asks whether the process works, readiness whether it can serve a
-/// request that needs the origin. `/health` answers the first and keeps
-/// answering 200 for the process alone. Readiness is the second answer, `GET
-/// /ready`, which answers 503 when the origin has been gone past two
-/// heartbeats and names the follower's last failure in the body.
-///
-/// Break: answer 200 by dropping the window test, the defect this replaces,
-/// and the dead origin is reported ready again.
-#[test]
-fn an_edge_with_a_dead_origin_past_the_window_reports_ready() {
-    let heartbeat_s = 1;
-    let mut stack = Stack::new("public, max-age=60", heartbeat_s, false);
-    stack.start_html();
-    stack.start_source();
-    stack.start_cache();
-    assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID:\n{}",
-        stack.cache_output()
+        stack.cache_output().matches("genid: upstream up").count(),
+        0
     );
 
+    // The origin goes away. The edge learns it from the heartbeat it already
+    // sends, and /health answers while the origin cannot be reached, because
+    // the answer is a flag read and never a probe.
     stack.stop_source();
     assert!(
-        stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the upstream down:\n{}",
-        stack.cache_output()
-    );
-    // Past the window: two heartbeats with no answer. `last_ok_s` is state the
-    // node already keeps, so this poll asks the origin nothing.
-    assert!(
         wait_until(m6_core::testkit::RESPONSE_BOUND, || {
-            stack.last_ok_s().is_some_and(|s| s > 2 * heartbeat_s)
+            stack.get_cache("/health", &[]).status == 503
         }),
-        "the origin state never left the window:\n{}",
-        stack.genid_block()
-    );
-
-    let ready = stack.get_cache("/ready", &[]);
-    assert_eq!(
-        ready.status,
-        503,
-        "an edge whose origin had been dead past the window reported ready: {} {} (last_ok_s {:?})",
-        ready.status,
-        ready.text(),
-        stack.last_ok_s()
-    );
-    assert!(
-        ready.text().contains("\"reason\":\"connect failed\""),
-        "the body does not name why the origin is gone: {}",
-        ready.text()
-    );
-    // The check that proves a split rather than a move.
-    let health = stack.get_cache("/health", &[]);
-    assert_eq!(health.status, 200, "{}", health.text());
-    assert_eq!(
-        health.text(),
-        "{\"status\":\"ok\",\"node\":\"genid-cache\"}",
-        "/health must keep answering for the process"
-    );
-}
-
-/// A node with no origin is known to be a source from config, so it is ready
-/// and names no origin rather than reporting a missing heartbeat.
-///
-/// Break: decide readiness from `last_ok` instead of the role, and a source
-/// that never heartbeats answers 503.
-#[test]
-fn a_source_node_is_ready_and_names_no_origin() {
-    let mut stack = Stack::new("public, max-age=60", 10, false);
-    stack.start_html();
-    stack.start_source();
-
-    let ready = stack.get_source("/ready", &[]);
-    assert_eq!(ready.status, 200, "{}", ready.text());
-    assert_eq!(
-        ready.text(),
-        "{\"status\":\"ready\",\"node\":\"genid-source\",\"origin\":\"not_applicable\"}"
-    );
-    assert_eq!(
-        stack.get_source("/health", &[]).text(),
-        "{\"status\":\"ok\",\"node\":\"genid-source\"}",
-        "/health must stay the process answer"
-    );
-}
-
-/// `/health` is unchanged in all three states: a source (no origin), a cache
-/// with a live origin, and a cache whose origin is past the window. Only
-/// `/ready` moves.
-///
-/// Break: make `/health` answer 503 when the origin is down, or add an origin
-/// field to it, and an exact body here fails. That is the move this endpoint
-/// exists to avoid.
-#[test]
-fn health_answers_process_only_in_all_three_states() {
-    let heartbeat_s = 1;
-    let mut stack = Stack::new("public, max-age=60", heartbeat_s, false);
-    stack.start_html();
-    stack.start_source();
-
-    // 1. A source: no origin to wait for.
-    assert_eq!(
-        stack.get_source("/health", &[]).text(),
-        "{\"status\":\"ok\",\"node\":\"genid-source\"}"
-    );
-
-    stack.start_cache();
-    assert!(
-        stack.wait_perf_id("0", m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the source's ID:\n{}",
+        "/health never answered degraded:\n{}",
         stack.cache_output()
-    );
-    // 2. A cache with a live origin.
-    let live = stack.get_cache("/health", &[]);
-    assert_eq!(live.status, 200, "{}", live.text());
-    assert_eq!(
-        live.text(),
-        "{\"status\":\"ok\",\"node\":\"genid-cache\"}",
-        "a live origin changed the process answer"
-    );
-
-    stack.stop_source();
-    assert!(
-        stack.wait_upstream_down(true, m6_core::testkit::RESPONSE_BOUND),
-        "/perf never showed the upstream down:\n{}",
-        stack.cache_output()
-    );
-    assert!(
-        wait_until(m6_core::testkit::RESPONSE_BOUND, || {
-            stack.last_ok_s().is_some_and(|s| s > 2 * heartbeat_s)
-        }),
-        "the origin state never left the window:\n{}",
-        stack.genid_block()
-    );
-    // 3. A cache whose origin is past the window. /ready moved, /health did
-    // not, and the body carries no origin state for a monitor to misread.
-    assert_eq!(
-        stack.get_cache("/ready", &[]).status,
-        503,
-        "the readiness answer did not move"
     );
     let down = stack.get_cache("/health", &[]);
-    assert_eq!(down.status, 200, "{}", down.text());
+    assert_eq!(down.status, 503, "{}", down.text());
     assert_eq!(
         down.text(),
-        "{\"status\":\"ok\",\"node\":\"genid-cache\"}",
-        "/health moved instead of /ready"
+        r#"{"status":"degraded","node":"genid-cache"}"#,
+        "the public body names no dependency and no reason"
+    );
+    for forbidden in ["origin", "auth", "reason", "dependency", "down"] {
+        assert!(
+            !down.text().contains(forbidden),
+            "the degraded body says {forbidden}: {}",
+            down.text()
+        );
+    }
+
+    // Many requests while the origin is down: held content is served, a miss
+    // fails, and neither adds a line.
+    for _ in 0..20 {
+        let r = stack.get_cache("/", &[]);
+        assert_eq!(r.status, 200, "held content must be served: {}", r.text());
+        assert_eq!(r.text(), "first: one", "the old body");
+    }
+    let never = stack.get_cache("/never", &[]);
+    assert!(
+        matches!(never.status, 502 | 504),
+        "a path the node never held is an error, got {}",
+        never.status
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream down").count(),
+        1,
+        "exactly one warn on the loss, never one per request:\n{}",
+        stack.cache_output()
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream up").count(),
+        0
+    );
+
+    // The origin returns on the same port and the next heartbeat clears the
+    // flag. `info` lines flush on the one-second log tick, so wait on the line
+    // rather than reading once.
+    stack.start_source();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            stack.get_cache("/health", &[]).status == 200
+        }),
+        "/health never recovered:\n{}",
+        stack.cache_output()
     );
     assert!(
-        !down.text().contains("origin") && !down.text().contains("ready"),
-        "the process answer gained origin state: {}",
-        down.text()
+        wait_until(Duration::from_secs(5), || {
+            stack.cache_output().matches("genid: upstream up").count() == 1
+        }),
+        "exactly one info on the recovery:\n{}",
+        stack.cache_output()
     );
+    for _ in 0..20 {
+        let r = stack.get_cache("/", &[]);
+        assert_eq!(r.status, 200, "{}", r.text());
+    }
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream down").count(),
+        1,
+        "no warn after the recovery:\n{}",
+        stack.cache_output()
+    );
+    assert_eq!(
+        stack.cache_output().matches("genid: upstream up").count(),
+        1,
+        "no second info on the requests that follow:\n{}",
+        stack.cache_output()
+    );
+    let back = stack.get_cache("/health", &[]);
+    assert_eq!(back.status, 200, "{}", back.text());
+    assert_eq!(back.text(), r#"{"status":"ok","node":"genid-cache"}"#);
 }

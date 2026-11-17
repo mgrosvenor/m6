@@ -20,8 +20,6 @@ pub use m6_core::monitoring::{HealthReport, PerfOutcome, PerfReport, PerfSubject
 
 /// Backend name tagged onto a `/health` response.
 pub const HEALTH_BACKEND: &str = "health";
-/// Backend name tagged onto a `/ready` response.
-pub const READY_BACKEND: &str = "ready";
 /// Backend name tagged onto a `/perf` response.
 pub const PERF_BACKEND: &str = "perf";
 /// Backend name tagged onto a `/genid` response, for stats and analytics.
@@ -41,7 +39,7 @@ pub const GENID_BACKEND: &str = "genid";
 /// stopped moving" can no longer detect a traffic stall, because the monitor
 /// keeps it moving on its own.
 pub fn is_monitoring_endpoint(backend: &str) -> bool {
-    backend == HEALTH_BACKEND || backend == READY_BACKEND || backend == PERF_BACKEND
+    backend == HEALTH_BACKEND || backend == PERF_BACKEND
 }
 
 /// Which population a request on a public listener belongs to, from the peer
@@ -73,6 +71,121 @@ pub fn peer_iface(peer: IpAddr) -> Iface {
     }
 }
 
+// ── /health's dependency flags ───────────────────────────────────────────────
+//
+// `/health` answers for the process and for the dependencies whose failure the
+// loop already observes. It reads flags and never probes: each flag is set
+// where a real request's outcome is already known and cleared by the next
+// heartbeat answer. That is what keeps the answer a JSON serialisation on the
+// most frequently hit path on the box.
+
+/// Whether this node's origin is failing, which is what a cache node's
+/// `degraded` answer reports.
+///
+/// The flag is the follower's own `down` bit. `Follower::answered` sets it
+/// where a heartbeat's failure is already observed and clears it on the next
+/// heartbeat answer, and `Follower::failed` sets it where a forwarded request's
+/// failure is already observed. A successful client request clears nothing: the
+/// heartbeat observes the recovery, and it is due immediately after a failure.
+/// `/health` reads the flag and does nothing else, so the cost is one branch,
+/// with no timer, no probe, no clock and no round trip.
+///
+/// A second dependency is one more term at the call site in `main.rs`: AUTH-1
+/// step 5 adds the checker's flag where its `/check` call fails, and ORs it
+/// into the same `degraded` bit.
+pub fn origin_down(role: &crate::genid::Role) -> bool {
+    role.cache().is_some_and(crate::genid::Follower::down)
+}
+
+/// The `/health` answer: `ok` while every dependency answers, `degraded` while
+/// one is failing.
+///
+/// The status carries the answer, 200 or 503. `m6-monitor` reads a non-200 as
+/// `degraded` without consulting the body, which is the mapping the two
+/// answers were built to fit. The body names the node and never the dependency:
+/// `/health` is public and unsecured, so the dependency is in the warn and info
+/// lines the process logs on the change instead.
+pub fn health_answer(degraded: bool, node: &str) -> (u16, HealthReport) {
+    if degraded {
+        HealthReport::degraded(node)
+    } else {
+        HealthReport::build(node)
+    }
+}
+
+#[cfg(test)]
+mod health_state_tests {
+    use super::*;
+    use crate::genid::{Follower, Genid, Role};
+    use std::time::{Duration, Instant};
+
+    /// A follower that has answered once, then met `result` on the next
+    /// heartbeat.
+    fn cache_after(result: Result<(u64, Duration), &'static str>, at: Instant) -> Role {
+        let mut f = Follower::new(Duration::from_secs(10), at);
+        f.answered(Ok((7, Duration::ZERO)), at);
+        f.answered(result, at);
+        Role::Cache(f)
+    }
+
+    /// A node with no origin is known to be one from config, so it has no
+    /// dependency to lose and answers `ok` while its process runs.
+    #[test]
+    fn a_source_has_no_origin_flag() {
+        let role = Role::Source(Genid::new(0, None));
+        assert!(!origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "origin");
+        assert_eq!(code, 200);
+        assert_eq!(report.status, "ok");
+    }
+
+    /// A cache whose origin has not failed answers `ok`.
+    #[test]
+    fn a_cache_whose_origin_answers_is_ok() {
+        let role = cache_after(Ok((7, Duration::ZERO)), m6_core::platform::now());
+        assert!(!origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "edge-a");
+        assert_eq!(code, 200);
+        assert_eq!(report.status, "ok");
+    }
+
+    /// A cache that has observed its origin fail answers 503 `degraded`, and
+    /// the public body names the node and nothing a stranger can aim at.
+    #[test]
+    fn a_cache_whose_origin_fails_is_degraded_and_names_nothing() {
+        let role = cache_after(Err("connect failed"), m6_core::platform::now());
+        assert!(origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "edge-a");
+        assert_eq!(code, 503);
+        assert_eq!(report.status, "degraded");
+        let (code, _, body) = report.into_response(code);
+        assert_eq!(code, 503);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"status":"degraded","node":"edge-a"}"#
+        );
+    }
+
+    /// The answer reads a flag and not a clock: a success an hour old with no
+    /// observed failure is still `ok`, so `/health` needs no staleness window
+    /// and no probe.
+    #[test]
+    fn an_old_answer_is_not_a_failure() {
+        let t0 = m6_core::platform::now();
+        let role = cache_after(Ok((7, Duration::ZERO)), t0);
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!(
+            role.cache().unwrap().last_ok_s(later),
+            Some(3600),
+            "the success is an hour old"
+        );
+        assert!(
+            !origin_down(&role),
+            "no failure was observed, so the flag is clear"
+        );
+    }
+}
+
 #[cfg(test)]
 mod monitoring_exclusion_tests {
     use super::*;
@@ -88,10 +201,8 @@ mod monitoring_exclusion_tests {
     #[test]
     fn monitoring_endpoints_are_excluded_from_traffic_stats() {
         assert!(is_monitoring_endpoint(HEALTH_BACKEND));
-        assert!(is_monitoring_endpoint(READY_BACKEND));
         assert!(is_monitoring_endpoint(PERF_BACKEND));
         assert!(is_monitoring_endpoint("health"));
-        assert!(is_monitoring_endpoint("ready"));
         assert!(is_monitoring_endpoint("perf"));
     }
 
@@ -716,372 +827,6 @@ fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::V
                 "last_ok_s": f.last_ok_s(now),
             })
         }
-    }
-}
-
-// ── /ready ───────────────────────────────────────────────────────────────────
-//
-// Readiness is a second answer, not a different first one. `/health` answers
-// for the m6-http process and keeps answering 200 while it runs. `/ready`
-// answers for a request that may need the origin, and a load balancer reads its
-// status code because that is what a health check consumes. The two answers
-// differ by construction rather than by a field: `/health` carries no origin
-// state at all.
-
-/// The path `/ready` answers on.
-///
-/// Fixed rather than a `[health]` key. `/health` has a path key because a site
-/// may want to serve its own page at that name. No site owns an answer about
-/// whether this node can reach its origin, so the decision gives the endpoint
-/// one public name and no config surface of its own.
-pub const READY_PATH: &str = "/ready";
-
-/// How many heartbeats without a successful answer leave a cache not ready.
-///
-/// The window and not the last failure decides the status, so a single failed
-/// heartbeat cannot pull a node whose cache still serves, and a heartbeat that
-/// never returns cannot leave the answer ready past the age. It derives from
-/// `[genid] heartbeat_secs`, so there is no second interval to configure.
-const READY_WINDOW_HEARTBEATS: u32 = 2;
-
-/// The most bytes of the node name the body keeps.
-///
-/// A node name is operator config and the answer is public. Cutting it keeps
-/// the body in one fixed buffer, and every name a deployment uses is far
-/// shorter than this.
-const READY_NODE_CAP: usize = 64;
-
-/// The body buffer, on the stack. The fixed text is under 100 bytes, the reason
-/// is a short static string and the name is capped at 64, so the worst case
-/// fits with room to spare.
-const READY_BODY_CAP: usize = 512;
-
-/// Where this node's readiness stands, as `GET /ready` publishes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ready {
-    /// 200 when a cache can still serve a request that may need the origin,
-    /// 503 when it cannot. A source is always 200.
-    pub code: u16,
-    /// `up`, `down`, `unknown` or `not_applicable`. The status is the answer.
-    /// This names the origin state the answer came from.
-    pub origin: &'static str,
-    /// The follower's last failure reason, when the answer is not ready.
-    ///
-    /// One `&'static str` already produced by `Follower::answered`, so
-    /// formatting the answer needs no second source of truth and no allocation
-    /// for a message.
-    pub reason: Option<&'static str>,
-}
-
-/// Decide `GET /ready` from state the loop already holds.
-///
-/// The role comes from config, decided once at start: `[genid] upstream` builds
-/// `Role::Cache` and no upstream builds `Role::Source`, so a node with no
-/// origin is known to be one rather than guessed from a missing timestamp. A
-/// source answers 200 `not_applicable`.
-///
-/// A cache is ready while its last successful answer is no older than
-/// `2 * heartbeat`. That reads `last_ok`, `down` and the last failure reason,
-/// and asks the origin nothing. A cache that has never had a successful answer
-/// is 503: it holds no ID, so it can serve neither a hit under one nor a miss.
-pub fn readiness(role: &crate::genid::Role, now: Instant) -> Ready {
-    let Some(follower) = role.cache() else {
-        return Ready {
-            code: 200,
-            origin: "not_applicable",
-            reason: None,
-        };
-    };
-    let Some(last_ok) = follower.last_ok() else {
-        return Ready {
-            code: 503,
-            origin: if follower.down() { "down" } else { "unknown" },
-            reason: follower.last_failure(),
-        };
-    };
-    let window = follower.heartbeat().saturating_mul(READY_WINDOW_HEARTBEATS);
-    if now.saturating_duration_since(last_ok) > window {
-        return Ready {
-            code: 503,
-            origin: "down",
-            reason: Some(
-                follower
-                    .last_failure()
-                    .unwrap_or("no answer within two heartbeats"),
-            ),
-        };
-    }
-    Ready {
-        code: 200,
-        origin: if follower.down() { "down" } else { "up" },
-        reason: None,
-    }
-}
-
-/// A fixed stack buffer the body is formatted into.
-///
-/// The readiness decision allocates nothing. The body is written here and
-/// copied once into the response's owned bytes, because `RequestOutcome::Ready`
-/// carries owned parts. That one copy is the same single body allocation
-/// `/health` makes, and it is the only one on this path.
-struct StackBuf<const N: usize> {
-    bytes: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> StackBuf<N> {
-    fn new() -> Self {
-        Self {
-            bytes: [0; N],
-            len: 0,
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl<const N: usize> std::fmt::Write for StackBuf<N> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let room = N - self.len;
-        if s.len() > room {
-            // The caller's budget makes this unreachable. Cut on a character
-            // boundary rather than split one, and stop the format rather than
-            // pad the tail with a plausible-looking body.
-            let mut end = room;
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            self.bytes[self.len..self.len + end].copy_from_slice(&s.as_bytes()[..end]);
-            self.len += end;
-            return Err(std::fmt::Error);
-        }
-        self.bytes[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
-        self.len += s.len();
-        Ok(())
-    }
-
-    fn write_char(&mut self, c: char) -> std::fmt::Result {
-        let mut buf = [0u8; 4];
-        self.write_str(c.encode_utf8(&mut buf))
-    }
-}
-
-/// Write `s` as a JSON string, escaping what JSON requires.
-fn write_json_string(w: &mut impl std::fmt::Write, s: &str) {
-    let _ = w.write_char('"');
-    for c in s.chars() {
-        match c {
-            '"' => {
-                let _ = w.write_str("\\\"");
-            }
-            '\\' => {
-                let _ = w.write_str("\\\\");
-            }
-            c if (c as u32) < 0x20 => {
-                let _ = write!(w, "\\u{:04x}", c as u32);
-            }
-            c => {
-                let _ = w.write_char(c);
-            }
-        }
-    }
-    let _ = w.write_char('"');
-}
-
-/// The node name the body carries, cut on a character boundary past the cap.
-fn capped_node(node: &str) -> &str {
-    if node.len() <= READY_NODE_CAP {
-        return node;
-    }
-    let mut end = READY_NODE_CAP;
-    while !node.is_char_boundary(end) {
-        end -= 1;
-    }
-    &node[..end]
-}
-
-/// The readiness answer: its status, headers and body.
-///
-/// `no-store` for the reason `/health` uses it: a stale readiness answer is
-/// worse than none. The body names the node and the origin state, and on a 503
-/// the follower's failure reason.
-pub fn ready_response(node: &str, ready: Ready) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    use std::fmt::Write as _;
-
-    let mut body = StackBuf::<READY_BODY_CAP>::new();
-    let status = if ready.code == 200 {
-        "ready"
-    } else {
-        "not_ready"
-    };
-    let _ = write!(body, "{{\"status\":\"{status}\",\"node\":");
-    write_json_string(&mut body, capped_node(node));
-    let _ = body.write_str(",\"origin\":");
-    write_json_string(&mut body, ready.origin);
-    if let Some(reason) = ready.reason {
-        let _ = body.write_str(",\"reason\":");
-        write_json_string(&mut body, reason);
-    }
-    let _ = body.write_str("}");
-    let body = body.as_bytes().to_vec();
-    let headers = vec![
-        (
-            "Content-Type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        ),
-        ("Cache-Control".to_string(), "no-store".to_string()),
-        ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
-    ];
-    (ready.code, headers, body)
-}
-
-#[cfg(test)]
-mod ready_tests {
-    use super::*;
-    use crate::genid::{Follower, Genid, Role};
-    use std::time::Duration;
-
-    fn cache(heartbeat: Duration) -> (Role, Instant) {
-        let t0 = m6_core::platform::now();
-        (Role::Cache(Follower::new(heartbeat, t0)), t0)
-    }
-
-    /// A node with no origin is known to be one from config, so it is ready
-    /// and says why the origin question does not apply. Reading a missing
-    /// `last_ok` as not ready instead would take every source out of rotation.
-    #[test]
-    fn a_source_is_ready_and_has_no_origin() {
-        let role = Role::Source(Genid::new(0, None));
-        let ready = readiness(&role, m6_core::platform::now());
-        assert_eq!(
-            ready,
-            Ready {
-                code: 200,
-                origin: "not_applicable",
-                reason: None,
-            }
-        );
-    }
-
-    /// A cache whose origin answered inside the window is ready.
-    #[test]
-    fn a_cache_with_a_live_origin_is_ready() {
-        let (mut role, t0) = cache(Duration::from_secs(10));
-        role.cache_mut()
-            .unwrap()
-            .answered(Ok((1, Duration::from_millis(2))), t0);
-        assert_eq!(
-            readiness(&role, t0 + Duration::from_secs(19)),
-            Ready {
-                code: 200,
-                origin: "up",
-                reason: None,
-            }
-        );
-    }
-
-    /// Past two heartbeats the node cannot serve a miss, and the body carries
-    /// the failure the follower already named.
-    #[test]
-    fn a_cache_past_the_window_is_not_ready_and_carries_the_reason() {
-        let (mut role, t0) = cache(Duration::from_secs(10));
-        let f = role.cache_mut().unwrap();
-        f.answered(Ok((1, Duration::from_millis(2))), t0);
-        f.sent();
-        f.answered(Err("connect failed"), t0 + Duration::from_secs(10));
-        assert_eq!(
-            readiness(&role, t0 + Duration::from_secs(21)),
-            Ready {
-                code: 503,
-                origin: "down",
-                reason: Some("connect failed"),
-            }
-        );
-    }
-
-    /// One failed heartbeat inside the window keeps a cache ready, and the
-    /// body still names the origin down: the window delays the status, it does
-    /// not hide the state. A single failure cannot pull a node whose cache is
-    /// one heartbeat old.
-    #[test]
-    fn a_failed_heartbeat_inside_the_window_stays_ready() {
-        let (mut role, t0) = cache(Duration::from_secs(10));
-        let f = role.cache_mut().unwrap();
-        f.answered(Ok((1, Duration::from_millis(2))), t0);
-        f.sent();
-        f.answered(Err("connect failed"), t0 + Duration::from_secs(10));
-        assert_eq!(
-            readiness(&role, t0 + Duration::from_secs(15)),
-            Ready {
-                code: 200,
-                origin: "down",
-                reason: None,
-            }
-        );
-    }
-
-    /// At the window the node is still ready: the boundary is two whole
-    /// heartbeats, not less.
-    #[test]
-    fn the_window_is_inclusive_and_a_heartbeat_late_is_not() {
-        let (mut role, t0) = cache(Duration::from_secs(10));
-        role.cache_mut()
-            .unwrap()
-            .answered(Ok((1, Duration::ZERO)), t0);
-        assert_eq!(readiness(&role, t0 + Duration::from_secs(20)).code, 200);
-        assert_eq!(readiness(&role, t0 + Duration::from_secs(21)).code, 503);
-    }
-
-    /// A cache with no successful answer holds no ID, so it is not ready even
-    /// before a heartbeat has failed.
-    #[test]
-    fn a_cache_that_never_answered_is_not_ready() {
-        let (role, _) = cache(Duration::from_secs(10));
-        let ready = readiness(&role, m6_core::platform::now());
-        assert_eq!(ready.code, 503);
-        assert_eq!(ready.origin, "unknown");
-    }
-
-    /// The body is JSON naming the node, the origin state and the reason,
-    /// formatted into the fixed buffer rather than through serde.
-    #[test]
-    fn the_body_names_the_node_and_the_origin() {
-        let (code, headers, body) = ready_response(
-            "edge-a",
-            Ready {
-                code: 503,
-                origin: "down",
-                reason: Some("connect failed"),
-            },
-        );
-        assert_eq!(code, 503);
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            r#"{"status":"not_ready","node":"edge-a","origin":"down","reason":"connect failed"}"#
-        );
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "Cache-Control" && v == "no-store"));
-    }
-
-    /// A ready source body is the same shape with no reason.
-    #[test]
-    fn a_ready_body_has_no_reason() {
-        let (code, _, body) = ready_response(
-            "origin",
-            Ready {
-                code: 200,
-                origin: "not_applicable",
-                reason: None,
-            },
-        );
-        assert_eq!(code, 200);
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            r#"{"status":"ready","node":"origin","origin":"not_applicable"}"#
-        );
     }
 }
 

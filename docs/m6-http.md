@@ -520,10 +520,25 @@ Renderers may perform additional fine-grained checks using the auth claims avail
 
 m6-http answers `/health`, `/perf` and `/traffic` itself, ahead of routing, the cache and every backend.
 A refusal never reaches routing or the cache, so a catch-all route can never answer `/perf` and a built-in path never enters the cache.
-`/health` is public and always answers 200 with `{"status":"ok","node":"<name>"}`.
-`/health` answers for the m6-http process alone: it reads no socket pool, makes no network round trip and says nothing about a URL backend.
-On an edge that means `ok` says the process is alive and answering, and says nothing about the origin.
-A warm cache keeps serving while the origin is unreachable.
+`/health` is public and has two answers, and the status code carries the answer.
+`200` with `{"status":"ok","node":"<name>"}` says the process is alive and every dependency it reads is answering.
+`503` with `{"status":"degraded","node":"<name>"}` says the process is alive and serving its public and cached pages while a dependency is failing.
+On an edge the dependency is its origin, and a warm cache keeps serving while the origin is unreachable.
+So `/health` has two answers plus an absence: a process that is gone, or whose listener refuses, gives no answer at all, and m6-monitor reads that as `unreachable`.
+These two answers fit the monitor's four states: `ok`, `degraded`, `unknown` and `unreachable`.
+The degraded status is 503 so a reader that only looks at the code sees it, and m6-monitor already reads a non-200 as `degraded`.
+
+`/health` reads flags and never probes.
+The origin flag is the cache node's own follower state, set where a heartbeat or a forwarded client request already observes the origin failing and cleared by the next successful heartbeat.
+A successful client request clears nothing: the heartbeat observes the recovery, and it is due immediately after a failure, so a recovered origin is reported within one heartbeat interval.
+The answer reads a flag, a node name and the process index, so its cost is one JSON serialisation, and the origin is asked nothing.
+A cache whose last success is an hour old and whose origin has no observed failure still answers `ok`, and a node that has just started answers `ok` until the first failure.
+
+The degraded body names the node and, when the node sets one, the process index.
+It names no dependency and no reason: `/health` is public and unsecured, so that detail would tell a stranger which part of the node to wait out.
+The detail goes in the process log instead, one warn line when the origin goes bad and one info line when it is back, on the change only and never per request.
+m6-monitor's degraded line says a dependency is not answering and points at that log for which one.
+The lines go through `m6-log`, carry a static reason and allocate nothing on the request path.
 
 `/perf` and `/traffic` are gated by the `[health]` keys in Table 4.
 In two-file mode all four are node state and live in the system config.

@@ -135,12 +135,6 @@ pub struct Follower {
     due: Instant,
     /// When the upstream last answered with an ID.
     last_ok: Option<Instant>,
-    /// Why the last heartbeat or forwarded request did not reach the upstream.
-    ///
-    /// One static string, cleared by the next answer, so the readiness answer
-    /// names a failure without formatting one and without asking the origin
-    /// again. `/ready` reads it, and nothing else does.
-    last_failure: Option<&'static str>,
     /// The last successful heartbeat's round trip.
     rtt: Option<Duration>,
     /// How long between heartbeats.
@@ -206,7 +200,6 @@ impl Follower {
             in_flight: false,
             due: now,
             last_ok: None,
-            last_failure: None,
             rtt: None,
             heartbeat,
             unverified: false,
@@ -248,27 +241,6 @@ impl Follower {
             .map(|at| now.saturating_duration_since(at).as_secs())
     }
 
-    /// When the upstream last answered, for `/ready`'s prompt staleness test.
-    ///
-    /// The whole `Instant` rather than the whole seconds `/perf` publishes:
-    /// truncating first would keep a node ready for up to a second past the
-    /// window.
-    pub fn last_ok(&self) -> Option<Instant> {
-        self.last_ok
-    }
-
-    /// The interval between heartbeats, so a reader can size the window from
-    /// the same value the loop uses rather than a second copy of it.
-    pub fn heartbeat(&self) -> Duration {
-        self.heartbeat
-    }
-
-    /// Why the last heartbeat or forwarded request failed, while it is still
-    /// the last thing the follower knows.
-    pub fn last_failure(&self) -> Option<&'static str> {
-        self.last_failure
-    }
-
     /// Whether a heartbeat may start now: at start, then once
     /// `heartbeat_secs` have passed since the last one finished. One at a time.
     pub fn heartbeat_due(&self, now: Instant) -> bool {
@@ -296,7 +268,6 @@ impl Follower {
                 self.rtt = Some(rtt);
                 self.last_ok = Some(now);
                 self.down = false;
-                self.last_failure = None;
                 // A success confirms whatever copy the node is serving,
                 // including one installed unverified at start.
                 self.unverified = false;
@@ -324,7 +295,6 @@ impl Follower {
                     };
                 let was_down = self.down;
                 self.down = true;
-                self.last_failure = Some(reason);
                 if was_down {
                     Outcome::StillDown
                 } else {
@@ -341,17 +311,16 @@ impl Follower {
         self.due = now;
     }
 
-    /// A forwarded client request could not reach the upstream. Mark it down,
-    /// remember why, and make the next heartbeat due now, which is the cheap
-    /// way to learn whether the whole upstream is gone.
+    /// A forwarded client request could not reach the upstream. Mark it down
+    /// and make the next heartbeat due now, which is the cheap way to learn
+    /// whether the whole upstream is gone.
     ///
     /// The heartbeat in flight is left alone: its own answer clears that flag,
     /// and clearing it here would let the next turn start a second one.
     /// Returns true on the transition, so the caller logs it once.
-    pub fn failed(&mut self, reason: &'static str, now: Instant) -> bool {
+    pub fn failed(&mut self, now: Instant) -> bool {
         let first = !self.down;
         self.down = true;
-        self.last_failure = Some(reason);
         self.due = now;
         first
     }
@@ -826,22 +795,11 @@ mod tests {
         // A forwarded request failing is the same fact from another source,
         // and it makes the next heartbeat due without touching the one in
         // flight.
-        assert!(
-            !f.failed("connect failed", t0),
-            "already down, so it is not a transition"
-        );
+        assert!(!f.failed(t0), "already down, so it is not a transition");
         let mut g = Follower::new(Duration::from_secs(10), t0);
         g.answered(Ok((7, Duration::ZERO)), t0);
         g.sent();
-        assert!(
-            g.failed("timed out", t0 + Duration::from_secs(1)),
-            "the first failure"
-        );
-        assert_eq!(
-            g.last_failure(),
-            Some("timed out"),
-            "the reason is kept for /ready"
-        );
+        assert!(g.failed(t0 + Duration::from_secs(1)), "the first failure");
         assert!(
             !g.heartbeat_due(t0 + Duration::from_secs(1)),
             "the heartbeat already in flight still owns the slot"
@@ -857,18 +815,12 @@ mod tests {
         f.answered(Ok((7, Duration::ZERO)), t0);
         f.answered(Err("status"), t0);
         assert!(f.down());
-        assert_eq!(f.last_failure(), Some("status"));
         assert_eq!(
             f.answered(Ok((7, Duration::ZERO)), t0),
             Outcome::Same,
             "a success after down is not a change when the ID is unchanged"
         );
         assert!(!f.down());
-        assert_eq!(
-            f.last_failure(),
-            None,
-            "a recovered follower has no failure to report"
-        );
     }
 
     /// The store rule: the current ID or nothing. No ID yet, no header, another
