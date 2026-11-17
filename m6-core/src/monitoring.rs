@@ -139,19 +139,22 @@ pub struct PoolHealth {
 
 /// The public payload. Field order here is the field order on the wire.
 ///
-/// Two fields, and that is the whole endpoint. It is an unauthenticated public
-/// URL, so everything on it is published to anyone who asks, and a monitor
-/// needs exactly two things from it: whether this node can serve, and which
-/// node answered.
+/// The status, the node and the process index when the node has one. It is an
+/// unauthenticated public URL, so everything on it is published to anyone who
+/// asks, and a monitor needs exactly those things from it: whether this node
+/// can serve, which node answered, and which of the node's processes did.
 ///
 /// It deliberately does not carry `uptime_s`, the name and occupancy of every
 /// socket pool, or the names of the URL backends. That would tell an anonymous
 /// caller the internal service topology (`m6-html`, `m6-file`, `render-contact`,
 /// `render-reports`), how many workers back each one, when the process last
 /// restarted, and, by polling, exactly when a deploy or a crash happened and
-/// whether a pool was losing members. None of that helps a monitor decide up
-/// or down, and all of it helps someone deciding what to aim at. It lives on
-/// `/perf` now, which is token-gated.
+/// whether a pool was losing members. None of that helps a monitor decide
+/// whether the node can serve, and all of it helps someone deciding what to
+/// aim at. It lives on `/perf` now, which is token-gated.
+///
+/// The degraded answer names no dependency for the same reason. The dependency
+/// is in the warn and info lines the process logs on the change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthReport {
     /// Which of a node's `reuse_port` processes answered, 0 to N-1. Absent
@@ -159,8 +162,9 @@ pub struct HealthReport {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_index: Option<u32>,
-    /// `"ok"`. A node running an older m6-http could still send `"degraded"`,
-    /// which the monitor reads as a fault.
+    /// `"ok"` with 200 while the process is alive and every dependency it
+    /// reads answers. `"degraded"` with 503 while the process is alive and
+    /// serving its public and cached pages with a dependency failing.
     ///
     /// `String` rather than `&'static str` because an aggregator reads this
     /// back off the wire and cannot produce a `'static` one.
@@ -274,13 +278,13 @@ fn executable_md5() -> String {
 }
 
 impl HealthReport {
-    /// Build a report and the HTTP status that should carry it.
+    /// The `ok` answer: 200, the process is alive and every dependency it
+    /// reads answers.
     ///
-    /// The answer is always 200 `ok`. A socket pool keeps no per-member
-    /// health state, so this process cannot judge one degraded, and `config`
-    /// refuses a pool with no members at start. Backend liveness is not part
-    /// of the answer: a dead member is found when a request connects to it,
-    /// and that request takes the next member.
+    /// A socket pool keeps no per-member health state, so this process cannot
+    /// judge one, and `config` refuses a pool with no members at start. A dead
+    /// member is found when a request connects to it, and that request takes
+    /// the next member.
     ///
     /// Deliberately never derived from performance. A latency spike is a
     /// signal for a human or a dashboard to act on, not grounds for a node
@@ -293,6 +297,28 @@ impl HealthReport {
             HealthReport {
                 process_index: None,
                 status: "ok".to_string(),
+                node: node.to_string(),
+            },
+        )
+    }
+
+    /// The `degraded` answer: 503, the process is alive and serving its public
+    /// and cached pages while a dependency it reads is failing.
+    ///
+    /// The status carries the answer so a reader that treats a non-200 as
+    /// degraded sees it without parsing the body, which is how `m6-monitor`
+    /// already reads a node.
+    ///
+    /// The body names the node and never the dependency or a reason. `/health`
+    /// is public and unsecured, so naming the failing dependency would tell a
+    /// stranger which part of the node to wait out or to aim at. That detail is
+    /// in the warn and info lines the process logs on the change.
+    pub fn degraded(node: &str) -> (u16, HealthReport) {
+        (
+            503,
+            HealthReport {
+                process_index: None,
+                status: "degraded".to_string(),
                 node: node.to_string(),
             },
         )
@@ -540,6 +566,23 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
         assert_eq!(report.node, "origin");
+    }
+
+    /// A degraded node answers 503 and the body carries the status and the
+    /// node. It names no dependency and no reason: `/health` is public and
+    /// unsecured, so that detail belongs in the process log.
+    #[test]
+    fn degraded_is_503_and_the_body_names_only_the_node() {
+        let (code, report) = HealthReport::degraded("edge-a");
+        assert_eq!(code, 503);
+        assert_eq!(report.status, "degraded");
+        assert_eq!(report.node, "edge-a");
+        let (code, _, body) = report.into_response(code);
+        assert_eq!(code, 503);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"status":"degraded","node":"edge-a"}"#
+        );
     }
 
     #[test]
@@ -827,25 +870,30 @@ mod tests {
     /// test whose name says why that is a decision and not a formality.
     #[test]
     fn public_payload_is_exactly_status_and_node() {
-        let (code, report) = HealthReport::build("origin");
-        let (_, _, body) = report.into_response(code);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let object = parsed.as_object().expect("object");
+        for (code, report) in [
+            HealthReport::build("origin"),
+            HealthReport::degraded("edge-a"),
+        ] {
+            let (_, _, body) = report.into_response(code);
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let object = parsed.as_object().expect("object");
 
-        let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
-        keys.sort_unstable();
-        assert!(
-            !object.contains_key("host"),
-            "/health must not publish load, memory or disk either: it is the \
-             same class of thing as the pool topology that was moved to /perf"
-        );
-        assert_eq!(
-            keys,
-            ["node", "status"],
-            "/health is unauthenticated and public: every field here is \
-             published to anyone who asks. Topology, worker counts and uptime \
-             belong on token-gated /perf."
-        );
+            let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            assert!(
+                !object.contains_key("host"),
+                "/health must not publish load, memory or disk either: it is the \
+                 same class of thing as the pool topology that was moved to /perf"
+            );
+            assert_eq!(
+                keys,
+                ["node", "status"],
+                "/health is unauthenticated and public: every field here is \
+                 published to anyone who asks. Topology, worker counts, uptime \
+                 and the failing dependency belong on token-gated /perf or in \
+                 the process log."
+            );
+        }
     }
 }
 
