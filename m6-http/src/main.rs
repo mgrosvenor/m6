@@ -7147,46 +7147,13 @@ const STARTUP_FLAGS: &[m6_core::startup::FlagDecl] = &[
 /// it might.
 fn startup_env() -> &'static [m6_core::startup::EnvDecl] {
     #[cfg(debug_assertions)]
-    const ALL: &[m6_core::startup::EnvDecl] = &[
-        m6_core::startup::EnvDecl {
-            name: "M6_TEST_STATS_INTERVAL_SECS",
-            why: "shortens the stats tick in a test build",
-            setting: Some("stats.interval_s"),
-        },
-        m6_core::startup::EnvDecl {
-            name: "XDG_RUNTIME_DIR",
-            why: "the journal socket's directory for a user service",
-            setting: None,
-        },
-        m6_core::startup::EnvDecl {
-            name: "JOURNAL_STREAM",
-            why: "whether stdout is systemd's journal",
-            setting: None,
-        },
-        m6_core::startup::EnvDecl {
-            name: "TMPDIR",
-            why: "the temporary directory for scratch paths",
-            setting: None,
-        },
-    ];
+    const ALL: &[m6_core::startup::EnvDecl] = &[m6_core::startup::EnvDecl {
+        name: "M6_TEST_STATS_INTERVAL_SECS",
+        why: "shortens the stats tick in a test build",
+        setting: Some("stats.interval_s"),
+    }];
     #[cfg(not(debug_assertions))]
-    const ALL: &[m6_core::startup::EnvDecl] = &[
-        m6_core::startup::EnvDecl {
-            name: "XDG_RUNTIME_DIR",
-            why: "the journal socket's directory for a user service",
-            setting: None,
-        },
-        m6_core::startup::EnvDecl {
-            name: "JOURNAL_STREAM",
-            why: "whether stdout is systemd's journal",
-            setting: None,
-        },
-        m6_core::startup::EnvDecl {
-            name: "TMPDIR",
-            why: "the temporary directory for scratch paths",
-            setting: None,
-        },
-    ];
+    const ALL: &[m6_core::startup::EnvDecl] = &[];
     ALL
 }
 

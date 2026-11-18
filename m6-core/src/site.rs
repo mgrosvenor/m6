@@ -2615,27 +2615,6 @@ pub(crate) enum DumpHandling {
     Deferred,
 }
 
-/// Parse the command line, and handle the flags that do not start a server.
-///
-/// `--dump-config` loads the configuration exactly as the service would, prints
-/// what it resolved to, and exits: **0 if this binary can serve this config, 2
-/// if it cannot.** That is the check a deploy runs against a new binary on each
-/// node before installing it, and it covers every service: they all load their
-/// config through this same function.
-///
-/// It is not a formality. A configuration format can change under a running
-/// deployment, and the old binary against the new config and the new binary
-/// against the old one both fail, in opposite directions and neither loudly.
-/// A validation step that runs before the install is what turns that from an
-/// outage into a refused deploy.
-///
-/// `--version` and `--version-full` are answered earlier, by
-/// `m6_core::version_flags!` at the top of the binary's `main`. They print
-/// constants fixed at build time and need no site directory and no config.
-///
-/// `dump` says who answers the flag. The shared parser answers it for a service
-/// with no start checks of its own, and records it for a service that parses a
-/// config of its own with [`Site::load_deferring_dump`].
 /// The flags every service parses, as the record declares them.
 ///
 /// A service adds none: the flags are core's, so a service that reads no flag
@@ -2682,28 +2661,29 @@ const SITE_ENV: &[EnvDecl] = &[
         why: "replaces the auth-check socket path",
         setting: Some("auth.check_socket_path"),
     },
-    EnvDecl {
-        name: "XDG_RUNTIME_DIR",
-        why: "the journal socket's directory for a user service",
-        setting: None,
-    },
-    EnvDecl {
-        name: "JOURNAL_STREAM",
-        why: "whether stdout is systemd's journal",
-        setting: None,
-    },
-    EnvDecl {
-        name: "STATE_DIRECTORY",
-        why: "the service manager's writable state directory",
-        setting: None,
-    },
-    EnvDecl {
-        name: "TMPDIR",
-        why: "the temporary directory for scratch paths",
-        setting: None,
-    },
 ];
 
+/// Parse the command line, and handle the flags that do not start a server.
+///
+/// `--dump-config` loads the configuration exactly as the service would, prints
+/// what it resolved to, and exits: **0 if this binary can serve this config, 2
+/// if it cannot.** That is the check a deploy runs against a new binary on each
+/// node before installing it, and it covers every service: they all load their
+/// config through this same function.
+///
+/// It is not a formality. A configuration format can change under a running
+/// deployment, and the old binary against the new config and the new binary
+/// against the old one both fail, in opposite directions and neither loudly.
+/// A validation step that runs before the install is what turns that from an
+/// outage into a refused deploy.
+///
+/// `--version` and `--version-full` are answered earlier, by
+/// `m6_core::version_flags!` at the top of the binary's `main`. They print
+/// constants fixed at build time and need no site directory and no config.
+///
+/// `dump` says who answers the flag. The shared parser answers it for a service
+/// with no start checks of its own, and records it for a service that parses a
+/// config of its own with [`Site::load_deferring_dump`].
 pub(crate) fn parse_invocation(
     routes: &[(String, RouteMethod)],
     handlers: &[String],

@@ -288,7 +288,7 @@ Table 7 gives the `part` value on each line.
 | `part` | lines | what the line carries |
 |---|---|---|
 | `identity` | one | `app`, `version` as the full SemVer string, `tag` as the tag form, and `crates`: one `"<crate> - <semver>"` string per m6 crate in the binary, the binary first |
-| `invocation` | one | `argv`, `flags` and `environment`; every declared flag and variable is listed, and an unset one has a null `value` |
+| `invocation` | one | `argv`, `flags` and `environment`. Every declared flag and variable is listed, and an unset one has a null `value` |
 | `config_file` | one per file | `role` (`config`, `secrets` or `site`), `path`, and `sha256` of the bytes as read |
 | `config_section` | one per table | `section`, the table's dotted path, `file` when the record knows it, and `settings`: every key with its `value` and `source` |
 | `platform` | one | `host`, the machine's facts from `m6_core::platform::host_facts()`, `limits`, every named limit's `start`, `max` and `source`, and `decided`, the facts the process chose such as the socket it bound |
