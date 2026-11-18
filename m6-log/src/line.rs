@@ -115,7 +115,7 @@ impl Clock {
         let second = since.as_secs();
         if second != self.second {
             self.second = second;
-            format_date(second, &mut self.text);
+            m6_platform::write_rfc3339_utc(second, &mut self.text);
         }
         since.subsec_micros()
     }
@@ -146,48 +146,6 @@ fn push_timestamp(sink: &mut Sink, now: SystemTime) -> bool {
         b'Z',
     ];
     sink.push(&fraction)
-}
-
-/// Fill `out` with `YYYY-MM-DDTHH:MM:SS` for a Unix second, UTC.
-fn format_date(secs: u64, out: &mut [u8; 20]) {
-    let days = (secs / 86_400) as i64;
-    let rest = (secs % 86_400) as u32;
-    let (year, month, day) = civil_from_days(days);
-    let year = year.clamp(0, 9999) as u32;
-    write2(out, 0, year / 100);
-    write2(out, 2, year % 100);
-    out[4] = b'-';
-    write2(out, 5, month);
-    out[7] = b'-';
-    write2(out, 8, day);
-    out[10] = b'T';
-    write2(out, 11, rest / 3_600);
-    out[13] = b':';
-    write2(out, 14, rest % 3_600 / 60);
-    out[16] = b':';
-    write2(out, 17, rest % 60);
-    out[19] = 0;
-}
-
-fn write2(out: &mut [u8; 20], at: usize, value: u32) {
-    out[at] = b'0' + (value / 10) as u8;
-    out[at + 1] = b'0' + (value % 10) as u8;
-}
-
-/// The day `z` days after 1970-01-01, as (year, month, day).
-///
-/// Howard Hinnant's `civil_from_days`.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 // ── The line ────────────────────────────────────────────────────────────────

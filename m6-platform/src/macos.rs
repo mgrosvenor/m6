@@ -11,9 +11,11 @@ use std::os::fd::{AsFd, AsRawFd, RawFd};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
+use super::facts::{self, ClockFacts, CpuFacts, Fact, Limits, MemoryFacts, OsFacts};
 use super::host::{
     DiskIo, LoadAverage, Memory, MemorySource, NetDevice, Pressure, TcpHealth, ThermalZone,
 };
+use super::process::ProcessMemory;
 use super::Signal;
 
 /// A zero timeout, for the drains below.
@@ -263,6 +265,24 @@ pub(super) fn listens_on_tcp(pid: u32) -> io::Result<bool> {
         .any(|l| l.contains("LISTEN")))
 }
 
+/// macOS reports its own process's memory through `task_info`, and keeps no
+/// report for another process. `Err` says so rather than reporting zeros.
+pub(super) fn memory_usage(pid: u32) -> io::Result<ProcessMemory> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("macOS keeps no memory report for pid {pid}"),
+    ))
+}
+
+/// The kernel's page fault counts are not exposed for another process on
+/// macOS. `Err` says so rather than reporting zero faults.
+pub(super) fn page_faults(pid: u32) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("macOS keeps no page fault count for pid {pid}"),
+    ))
+}
+
 // ── Host readings, through sysinfo ───────────────────────────────────────────
 //
 // `sysinfo` with `default-features = false` and the `system` and `network`
@@ -339,4 +359,205 @@ pub(super) fn thermal_zones() -> Vec<ThermalZone> {
 
 pub(super) fn uptime() -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(sysinfo::System::uptime()))
+}
+
+// ── Host facts ───────────────────────────────────────────────────────────────
+//
+// The start-up facts that differ from Linux. The reads that are the same on
+// both supported families, and every parser, are in `facts.rs`. A fact that
+// cannot be read is `Fact::Unknown` with a reason naming the `sysctl` or file
+// that did not answer.
+
+/// The OS product name and version, from Apple's `SystemVersion.plist`.
+pub(super) fn host_os_facts() -> Fact<OsFacts> {
+    const PLIST: &str = "/System/Library/CoreServices/SystemVersion.plist";
+    facts::parse(
+        facts::read_file(PLIST, "cannot read SystemVersion.plist"),
+        facts::parse_system_version,
+        "SystemVersion.plist has no ProductName",
+    )
+}
+
+/// The CPU model, from `machdep.cpu.brand_string`, and the number of CPUs this
+/// process may run on.
+pub(super) fn host_cpu() -> CpuFacts {
+    CpuFacts {
+        model: match sysctl_string("machdep.cpu.brand_string") {
+            Some(model) if !model.trim().is_empty() => Fact::Known(model.trim().to_string()),
+            Some(_) => Fact::Unknown("machdep.cpu.brand_string is empty"),
+            None => Fact::Unknown("cannot read machdep.cpu.brand_string"),
+        },
+        count: facts::cpu_count(),
+    }
+}
+
+/// Total memory, the page size and the huge-page setting.
+///
+/// macOS has no transparent huge pages, so that fact is unknown rather than
+/// zero, which would read as a host with none left.
+pub(super) fn host_memory() -> MemoryFacts {
+    MemoryFacts {
+        total_bytes: match sysctl_u64("hw.memsize") {
+            Some(bytes) if bytes > 0 => Fact::Known(bytes),
+            Some(_) => Fact::Unknown("hw.memsize is zero"),
+            None => Fact::Unknown("cannot read hw.memsize"),
+        },
+        page_size: facts::page_size(),
+        huge_pages: Fact::Unknown("macOS has no transparent huge pages"),
+    }
+}
+
+/// The open-file limit, `kern.ipc.somaxconn`, and the cgroup limits.
+///
+/// macOS has no `RLIMIT_MEMLOCK` and no cgroups, so those facts are unknown
+/// rather than zero or unlimited.
+pub(super) fn host_limits() -> Limits {
+    Limits {
+        memlock: Fact::Unknown("macOS has no RLIMIT_MEMLOCK"),
+        nofile: facts::nofile(),
+        somaxconn: match sysctl_i32("kern.ipc.somaxconn") {
+            Some(backlog) if backlog > 0 => Fact::Known(backlog as u32),
+            Some(_) => Fact::Unknown("kern.ipc.somaxconn is not positive"),
+            None => Fact::Unknown("cannot read kern.ipc.somaxconn"),
+        },
+        cgroup_memory: Fact::Unknown("macOS has no cgroups"),
+        cgroup_cpu: Fact::Unknown("macOS has no cgroups"),
+    }
+}
+
+/// The time zone, the clock source and the boot time.
+///
+/// macOS does not expose which hardware counter the kernel uses, so that one
+/// fact is unknown. The boot time is `kern.boottime`.
+pub(super) fn host_clock() -> ClockFacts {
+    ClockFacts {
+        timezone: facts::timezone(),
+        source: Fact::Unknown("macOS does not report its clock source"),
+        boot_time: match sysctl_timeval("kern.boottime") {
+            Some(seconds) => {
+                Fact::Known(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+            }
+            None => Fact::Unknown("cannot read kern.boottime"),
+        },
+    }
+}
+
+/// Whether a hypervisor is running this kernel, and, when the hardware model
+/// says so, which one.
+pub(super) fn host_virtualization() -> Fact<String> {
+    match sysctl_i32("kern.hv_vmm_present") {
+        Some(1) => {
+            let model = sysctl_string("hw.model").unwrap_or_default();
+            if model.starts_with("VirtualMac") || model.contains("Virtual") {
+                Fact::Known("virtualization.framework".to_string())
+            } else {
+                Fact::Known("hypervisor".to_string())
+            }
+        }
+        Some(_) => Fact::Known("none".to_string()),
+        None => Fact::Unknown("cannot read kern.hv_vmm_present"),
+    }
+}
+
+/// A `sysctl` string value at `name`.
+fn sysctl_string(name: &str) -> Option<String> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut size: nix::libc::size_t = 0;
+    // SAFETY: the name is a live C string. A null old value and zero old length
+    // ask only for the size, and the call writes nothing.
+    let rc = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut bytes = vec![0u8; size];
+    // SAFETY: `bytes` has exactly the size the call just asked for, and the
+    // call writes at most `size` bytes into it.
+    let rc = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    bytes.truncate(size);
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A `sysctl` `u64` value at `name`.
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: `value` is a live `u64` and `size` is its size in bytes. The
+    // kernel writes a value of the OID's own width, which for these names is
+    // 8 bytes.
+    let rc = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(value)
+}
+
+/// A `sysctl` `i32` value at `name`.
+fn sysctl_i32(name: &str) -> Option<i32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: i32 = 0;
+    let mut size = std::mem::size_of::<i32>();
+    // SAFETY: `value` is a live `i32` and `size` is its size in bytes.
+    let rc = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut i32).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(value)
+}
+
+/// The seconds since the epoch of a `struct timeval` sysctl, such as
+/// `kern.boottime`.
+fn sysctl_timeval(name: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: nix::libc::timeval = nix::libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<nix::libc::timeval>();
+    // SAFETY: `value` is a live `timeval` and `size` is its size in bytes.
+    let rc = unsafe {
+        nix::libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut nix::libc::timeval).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    u64::try_from(value.tv_sec).ok()
 }
