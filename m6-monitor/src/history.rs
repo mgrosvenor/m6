@@ -130,7 +130,7 @@
 //!
 //! ```text
 //! id, at, at_unix_ms, node, level, poll_level, reachable, status, detail,
-//! traffic_error, rtt_ms, binary, version, hash, uptime_s, host_uptime_s,
+//! traffic_error, rtt_ms, binary, version, uptime_s, host_uptime_s,
 //! requests_total, monitor_requests, cache_hits, cache_misses, hit_rate,
 //! backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
 //! miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes,
@@ -168,7 +168,7 @@
 //! when a node is down, which is when a history is wanted.
 //!
 //! To start fresh, stop the service, delete the file and start it again.
-//! Migrations 1 and 2 are permanent: a later release adds columns in migration 3.
+//! Migrations 1, 2 and 3 are permanent, and a later change adds migration 4.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -268,6 +268,28 @@ CREATE INDEX IF NOT EXISTS health_ok_node_at ON health (node_id, at_ms)
   WHERE reachable = 1 AND status = 'ok';
 ";
 
+/// The `build` table without `hash`.
+///
+/// `hash` held the md5 of the node's executable, and then the commit from the
+/// version's build metadata, which `version` already carries. A build is now
+/// `(binary, version)`. `ALTER TABLE build DROP COLUMN hash` is refused because
+/// the column is in the table's `UNIQUE` constraint, so the table is rebuilt the
+/// way SQLite documents for a change `ALTER TABLE` cannot make: a new table, the
+/// rows copied with their ids, the old one dropped and the new one renamed.
+/// Two old rows that differ only in `hash` become one, the first by id, and a
+/// `health` row that named the second names the first.
+const SCHEMA_V3: &str = "
+CREATE TABLE build_v3 (id INTEGER PRIMARY KEY, binary TEXT NOT NULL, version TEXT NOT NULL,
+                       UNIQUE (binary, version)) STRICT;
+INSERT OR IGNORE INTO build_v3 (id, binary, version) SELECT id, binary, version FROM build ORDER BY id;
+UPDATE health SET build_id = (
+    SELECT n.id FROM build o JOIN build_v3 n ON n.binary = o.binary AND n.version = o.version
+    WHERE o.id = health.build_id)
+  WHERE build_id IS NOT NULL AND build_id NOT IN (SELECT id FROM build_v3);
+DROP TABLE build;
+ALTER TABLE build_v3 RENAME TO build;
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -276,6 +298,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: SCHEMA_V2,
+    },
+    Migration {
+        version: 3,
+        sql: SCHEMA_V3,
     },
 ];
 
@@ -416,7 +442,9 @@ pub struct Row {
     pub detail: Option<String>,
     pub traffic_error: Option<String>,
     pub rtt_ms: Option<f64>,
-    pub build: Option<(String, String, String)>,
+    /// The binary and its full version. The version carries the commit as
+    /// its build metadata, so the pair names one build.
+    pub build: Option<(String, String)>,
     pub uptime_s: Option<i64>,
     pub host_uptime_s: Option<i64>,
     pub requests_total: Option<i64>,
@@ -465,8 +493,8 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
         .max()
         .unwrap_or(Level::Ok);
     let present = |s: &Option<String>| s.clone().unwrap_or_default();
-    let build = (n.binary.is_some() || n.version.is_some() || n.hash.is_some())
-        .then(|| (present(&n.binary), present(&n.version), present(&n.hash)));
+    let build = (n.binary.is_some() || n.version.is_some())
+        .then(|| (present(&n.binary), present(&n.version)));
     let mut out = Row {
         node: n.name.clone(),
         level: level_i(level),
@@ -714,8 +742,8 @@ impl Store {
                 "SELECT id FROM agent WHERE user_agent = ?1",
             ),
             builds: Interner::new(
-                "INSERT INTO build (binary, version, hash) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-                "SELECT id FROM build WHERE binary = ?1 AND version = ?2 AND hash = ?3",
+                "INSERT INTO build (binary, version) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                "SELECT id FROM build WHERE binary = ?1 AND version = ?2",
             ),
             last_crawl_at,
         })
@@ -788,7 +816,7 @@ impl Store {
         for r in &b.rows {
             let node_id = self.nodes.id(&tx, &[&r.node])?;
             let build_id = match &r.build {
-                Some((bin, ver, hash)) => Some(self.builds.id(&tx, &[bin, ver, hash])?),
+                Some((bin, ver)) => Some(self.builds.id(&tx, &[bin, ver])?),
                 None => None,
             };
             let t = r.tunnel.as_ref();
@@ -1495,7 +1523,6 @@ pub struct PageRow {
     pub rtt_ms: Option<f64>,
     pub binary: Option<String>,
     pub version: Option<String>,
-    pub hash: Option<String>,
     pub uptime_s: Option<i64>,
     pub host_uptime_s: Option<i64>,
     pub requests_total: Option<i64>,
@@ -1530,7 +1557,7 @@ pub struct PageRow {
 
 const HEALTH_SELECT: &str =
     "SELECT h.id, h.at_ms, n.name, h.level, p.level, h.reachable, h.status, \
-h.detail, h.traffic_error, h.rtt_ms, b.binary, b.version, b.hash, h.uptime_s, h.host_uptime_s, \
+h.detail, h.traffic_error, h.rtt_ms, b.binary, b.version, h.uptime_s, h.host_uptime_s, \
 h.requests_total, h.monitor_requests, h.cache_hits, h.cache_misses, h.backend_errors, \
 h.hit_samples, h.hit_p50_ns, h.hit_p99_ns, h.miss_samples, h.miss_p50_ns, h.miss_p99_ns, \
 h.load_one, h.cpus, h.memory_used, h.memory_total_bytes, h.disk_used, h.disk_total_bytes, \
@@ -1623,20 +1650,20 @@ pub fn health_page(
         let limit = iu(rows);
         let mapped = stmt.query_map(params![from_ms, to_ms, node, a_at, a_id, limit], |r| {
             let at: i64 = r.get(1)?;
-            let hits: Option<i64> = r.get(17)?;
-            let misses: Option<i64> = r.get(18)?;
-            let cert: Option<i64> = r.get(33)?;
-            let tunnel_probe: Option<String> = r.get(36)?;
+            let hits: Option<i64> = r.get(16)?;
+            let misses: Option<i64> = r.get(17)?;
+            let cert: Option<i64> = r.get(32)?;
+            let tunnel_probe: Option<String> = r.get(35)?;
             let tunnel = match tunnel_probe {
                 None => None,
                 Some(probe) => Some(TunnelOut {
-                    rtt_ms: r.get(34)?,
-                    rtt_n: r.get(35)?,
+                    rtt_ms: r.get(33)?,
+                    rtt_n: r.get(34)?,
                     probe,
-                    probe_error: r.get(37)?,
-                    handshake: r.get(38)?,
-                    handshake_age_s: r.get(39)?,
-                    handshake_detail: r.get(40)?,
+                    probe_error: r.get(36)?,
+                    handshake: r.get(37)?,
+                    handshake_age_s: r.get(38)?,
+                    handshake_detail: r.get(39)?,
                 }),
             };
             Ok(PageRow {
@@ -1653,28 +1680,27 @@ pub fn health_page(
                 rtt_ms: r.get(9)?,
                 binary: none_if_empty(r.get(10)?),
                 version: none_if_empty(r.get(11)?),
-                hash: none_if_empty(r.get(12)?),
-                uptime_s: r.get(13)?,
-                host_uptime_s: r.get(14)?,
-                requests_total: r.get(15)?,
-                monitor_requests: r.get(16)?,
+                uptime_s: r.get(12)?,
+                host_uptime_s: r.get(13)?,
+                requests_total: r.get(14)?,
+                monitor_requests: r.get(15)?,
                 cache_hits: hits,
                 cache_misses: misses,
                 hit_rate: rate(hits, misses),
-                backend_errors: r.get(19)?,
-                hit_samples: r.get(20)?,
-                hit_p50_ns: r.get(21)?,
-                hit_p99_ns: r.get(22)?,
-                miss_samples: r.get(23)?,
-                miss_p50_ns: r.get(24)?,
-                miss_p99_ns: r.get(25)?,
-                load_one: r.get(26)?,
-                cpus: r.get(27)?,
-                memory_used: r.get(28)?,
-                memory_total_bytes: r.get(29)?,
-                disk_used: r.get(30)?,
-                disk_total_bytes: r.get(31)?,
-                thermal_max_c: r.get(32)?,
+                backend_errors: r.get(18)?,
+                hit_samples: r.get(19)?,
+                hit_p50_ns: r.get(20)?,
+                hit_p99_ns: r.get(21)?,
+                miss_samples: r.get(22)?,
+                miss_p50_ns: r.get(23)?,
+                miss_p99_ns: r.get(24)?,
+                load_one: r.get(25)?,
+                cpus: r.get(26)?,
+                memory_used: r.get(27)?,
+                memory_total_bytes: r.get(28)?,
+                disk_used: r.get(29)?,
+                disk_total_bytes: r.get(30)?,
+                thermal_max_c: r.get(31)?,
                 cert_not_after_unix: cert,
                 cert_expires_in_s: cert.map(|c| c - at / 1000),
                 tunnel,
@@ -1682,7 +1708,7 @@ pub fn health_page(
                 channels: Vec::new(),
                 findings: Vec::new(),
                 other_findings: Vec::new(),
-                poll_id: r.get(41)?,
+                poll_id: r.get(40)?,
             })
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
@@ -2123,7 +2149,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open(dir.path());
         assert!(cfg(dir.path(), 1).file.exists());
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 2);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
         let mut stmt = s
             .conn
             .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%'")
@@ -2165,7 +2191,7 @@ mod tests {
         let s = open(dir.path());
         assert_eq!(count(&s, "poll"), 1);
         assert_eq!(count(&s, "health"), 1);
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 2);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
     }
 
     /// The last-200 read is answered from the partial index. The plan must name
@@ -2193,12 +2219,113 @@ mod tests {
         );
     }
 
+    /// A file written by migrations 1 and 2 opens, takes migration 3, and keeps
+    /// every row and every other column. Two builds that differed only in
+    /// `hash` become one, and the health row that named the second names the
+    /// first.
+    #[test]
+    fn a_file_from_schema_2_drops_the_build_hash_and_keeps_the_rest() {
+        type Rows = Vec<Vec<rusqlite::types::Value>>;
+        fn rows(c: &Connection, sql: &str) -> Rows {
+            let mut stmt = c.prepare(sql).unwrap();
+            let n = stmt.column_count();
+            stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+        fn columns(c: &Connection, table: &str) -> Vec<String> {
+            let mut stmt = c
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = cfg(dir.path(), 1).file;
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        {
+            let mut c = Connection::open(&file).unwrap();
+            sqlite::migrate(&mut c, &MIGRATIONS[..2]).unwrap();
+            c.execute_batch(
+                "INSERT INTO node (id, name) VALUES (1, 'origin');
+                 INSERT INTO build (id, binary, version, hash) VALUES
+                   (1, 'm6-http', '1.15.0', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+                   (2, 'm6-http', '1.15.0', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+                   (3, 'm6-http', '1.16.0-rc.1+abc123def456', 'abc123def456');
+                 INSERT INTO poll (id, at_ms, level, faults, warns) VALUES (1, 1000, 1, 0, 1);
+                 INSERT INTO poll_finding (id, poll_id, level, node, polled, text)
+                   VALUES (1, 1, 1, 'origin', 1, 'a finding');
+                 INSERT INTO health (id, poll_id, at_ms, node_id, level, reachable, status,
+                   detail, rtt_ms, build_id, uptime_s, requests_total, load_one, tunnel_probe)
+                 VALUES
+                   (1, 1, 1000, 1, 0, 1, 'ok', NULL, 1.5, 1, 10, 100, 0.25, 'ok'),
+                   (2, 1, 1001, 1, 1, 1, 'ok', 'slow', 2.5, 2, 11, 101, 0.5, NULL),
+                   (3, 1, 1002, 1, 2, 0, 'down', 'refused', NULL, 3, NULL, NULL, NULL, NULL),
+                   (4, 1, 1003, 1, 0, 0, 'down', NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+            )
+            .unwrap();
+        }
+        let before = {
+            let c = Connection::open(&file).unwrap();
+            assert_eq!(sqlite::schema_version(&c).unwrap(), 2);
+            (
+                rows(&c, "SELECT * FROM health ORDER BY id"),
+                rows(&c, "SELECT * FROM poll ORDER BY id"),
+                rows(&c, "SELECT * FROM poll_finding ORDER BY id"),
+                rows(&c, "SELECT * FROM node ORDER BY id"),
+            )
+        };
+
+        let s = open(dir.path());
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
+        assert_eq!(columns(&s.conn, "build"), ["id", "binary", "version"]);
+        assert_eq!(
+            rows(&s.conn, "SELECT id, binary, version FROM build ORDER BY id"),
+            rows(
+                &s.conn,
+                "SELECT 1, 'm6-http', '1.15.0' UNION ALL SELECT 3, 'm6-http', '1.16.0-rc.1+abc123def456'"
+            ),
+            "every build keeps its id, binary and version, and the two that differed only in hash are one"
+        );
+
+        let mut health = before.0.clone();
+        // Health row 2 named build 2, which is now build 1.
+        let build_id = columns(&s.conn, "health")
+            .iter()
+            .position(|c| c == "build_id")
+            .expect("health has build_id");
+        health[1][build_id] = rusqlite::types::Value::Integer(1);
+        assert_eq!(rows(&s.conn, "SELECT * FROM health ORDER BY id"), health);
+        assert_eq!(rows(&s.conn, "SELECT * FROM poll ORDER BY id"), before.1);
+        assert_eq!(
+            rows(&s.conn, "SELECT * FROM poll_finding ORDER BY id"),
+            before.2
+        );
+        assert_eq!(rows(&s.conn, "SELECT * FROM node ORDER BY id"), before.3);
+
+        assert!(
+            sqlite::is_append_only(&s.conn, "build").unwrap(),
+            "the rebuilt table keeps the lookup-table rule"
+        );
+        let broken: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken, 0, "every health row names a build that exists");
+    }
+
     #[test]
     fn a_file_newer_than_the_code_is_fatal() {
         let dir = tempfile::tempdir().unwrap();
         drop(open(dir.path()));
         let c = Connection::open(cfg(dir.path(), 1).file).unwrap();
-        c.pragma_update(None, "user_version", 3).unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
         drop(c);
         let err = Store::open(&cfg(dir.path(), 1)).err().expect("refused");
         assert!(is_fatal(&err), "{err:#}");
@@ -2663,7 +2790,7 @@ mod tests {
             keys(&v),
             words(
                 "id at at_unix_ms node level poll_level reachable status detail traffic_error \
-                 rtt_ms binary version hash uptime_s host_uptime_s requests_total monitor_requests \
+                 rtt_ms binary version uptime_s host_uptime_s requests_total monitor_requests \
                  cache_hits cache_misses hit_rate backend_errors hit_samples hit_p50_ns hit_p99_ns \
                  miss_samples miss_p50_ns miss_p99_ns load_one cpus memory_used memory_total_bytes \
                  disk_used disk_total_bytes thermal_max_c cert_not_after_unix cert_expires_in_s \

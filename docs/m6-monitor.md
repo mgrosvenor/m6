@@ -309,6 +309,11 @@ An old history file keeps its dead columns.
 `m6_core::sqlite::migrate` runs only the migrations above the file's `user_version`, so a `health` table made by a release that wrote the `reopen_*` columns is left as it is, and `INSERT_HEALTH` names the columns it writes.
 That is the expected state of a file that predates this release.
 
+Migration 3 drops `hash` from the `build` table, because `version` carries the same commit as its build metadata, and a build row is now `(binary, version)`.
+SQLite refuses `ALTER TABLE build DROP COLUMN hash` while the column is in the table's `UNIQUE` constraint, so the migration rebuilds the table: it copies every row with its id into a new table, drops the old one and renames the new one.
+Two old rows that differed only in `hash` become the first of them, and a `health` row that named the second names the first.
+Every other table and column is left as it was, and `/history` lines no longer carry `hash`.
+
 Section 7 turns to what the service answers.
 
 ## 7. The routes
@@ -359,7 +364,7 @@ Table 7: where each part of the digest comes from.
 | `status` | `/health`, through `NodeReading::status` |
 | `reported_node` | the `node` field of the `/health` body |
 | `rtt_ms` | the `/health` round trip, connect and TLS included |
-| `version`, `binary`, `hash` | the metrics document's `build` |
+| `version`, `binary` | the metrics document's `build`, the version with the commit as its build metadata |
 | `uptime_s`, `host_uptime_s` | the metrics document |
 | `requests_total`, `hit_rate`, the hit and miss percentiles, `backend_errors`, `pools` | the metrics document's `metrics` and `pools` |
 | `load_one`, `cpus`, `memory_used`, `disk_used`, `thermal_max_c` | the metrics document's `host` |

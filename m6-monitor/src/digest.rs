@@ -252,7 +252,11 @@ pub struct NodeDigest {
     pub reported_node: Option<String>,
     pub rtt_ms: Option<f64>,
     /// The m6 release the node is running, as the full SemVer string from the
-    /// metrics document, for example `1.16.0-rc.1+abc123def456`. `None` when
+    /// metrics document, for example `1.16.0-rc.1+abc123def456`. The build
+    /// metadata after the `+` is the commit, which is what the release tag
+    /// cannot say: Rust is not byte-reproducible, so one tag built twice gives
+    /// two binaries reporting one release, and the commit tells them apart.
+    /// [`commit`] reads it. `None` when
     /// the node predates the field, which reads as "cannot say" and never as
     /// agreement: a fleet where one node is silent about its version is
     /// exactly the case the drift check must not call uniform.
@@ -260,21 +264,6 @@ pub struct NodeDigest {
     /// Which binary reported the version, from the metrics document. A node
     /// runs several and "the node is on 1.10.0" has never been one fact.
     pub binary: Option<String>,
-    /// The commit the node's binary was built from, taken from the build
-    /// metadata of the version string.
-    ///
-    /// This is what the release tag cannot say. Rust is not byte-reproducible,
-    /// so one tag built twice gives two binaries reporting one version: two
-    /// hosts can run different builds of `v1.10.0` while every reading
-    /// available to an operator says the fleet agrees. `None` on a node whose
-    /// version carries no build metadata, which counts as drift rather than
-    /// agreement for the same reason the version does.
-    ///
-    /// The field keeps its name and its place in the digest and history schema,
-    /// where it is the value that tells two build rows for one binary and
-    /// version apart. What changed is where it comes from: the commit in the
-    /// version string, not a hash the node read from its own executable.
-    pub hash: Option<String>,
     pub uptime_s: Option<u64>,
     pub host_uptime_s: Option<u64>,
     pub requests_total: Option<u64>,
@@ -310,7 +299,7 @@ pub struct NodeDigest {
     /// a certificate that has already expired. `None` when the node reported no
     /// certificate at all, which reads as "cannot say" and never as "plenty of
     /// time": a node silent about its expiry is the exact case this check must
-    /// not call healthy, for the reason `version` and `hash` give above.
+    /// not call healthy, for the reason `version` gives above.
     pub cert_expires_in_seconds: Option<i64>,
     /// `notAfter` of the soonest-expiring certificate the node is serving, as
     /// an absolute time.
@@ -850,6 +839,13 @@ fn build_metadata(version: &str) -> Option<&str> {
     version.split_once('+').map(|(_, metadata)| metadata)
 }
 
+/// The commit a node's binary was built from: the build metadata of its
+/// version. `None` on a node whose version carries none, which counts as drift
+/// rather than agreement for the same reason a missing version does.
+pub fn commit(n: &NodeDigest) -> Option<&str> {
+    n.version.as_deref().and_then(build_metadata)
+}
+
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
@@ -867,7 +863,6 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             rtt_ms: r.rtt.map(|d| d.as_secs_f64() * 1000.0),
             version: None,
             binary: None,
-            hash: None,
             uptime_s: None,
             host_uptime_s: None,
             requests_total: None,
@@ -1015,7 +1010,6 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             };
             d.version = empty_to_none(&p.build.version);
             d.binary = empty_to_none(&p.build.name);
-            d.hash = build_metadata(&p.build.version).map(str::to_string);
             d.uptime_s = Some(p.uptime_s);
             // The soonest expiry in the chain. `min` over an empty list is
             // `None`, which is the answer for a node too old to report the
@@ -1338,7 +1332,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         let versions_agree = seen.len() == 1;
         let mut commits: Vec<&str> = reporting
             .iter()
-            .map(|n| n.hash.as_deref().unwrap_or("unknown"))
+            .map(|n| commit(n).unwrap_or("unknown"))
             .collect();
         commits.sort_unstable();
         commits.dedup();
@@ -1350,7 +1344,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                     // reading their own notes is looking at. The full build
                     // metadata is in the JSON digest for anything that wants to
                     // compare exactly.
-                    let c = n.hash.as_deref().unwrap_or("unknown");
+                    let c = commit(n).unwrap_or("unknown");
                     format!("{} {}", n.name, &c[..c.len().min(12)])
                 })
                 .collect::<Vec<_>>()

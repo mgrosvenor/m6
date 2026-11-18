@@ -594,8 +594,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             n.version
                 .as_deref()
                 .unwrap_or("unknown (node too old to report it)"),
-            n.hash
-                .as_deref()
+            crate::digest::commit(n)
                 .map(|h| &h[..h.len().min(12)])
                 .unwrap_or("unknown"),
             n.cert_expires_in_seconds
