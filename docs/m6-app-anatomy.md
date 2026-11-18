@@ -318,7 +318,7 @@ fn main() { m6_core::build_info::emit(); }
 m6_core::version_flags!(m6_core::build_info::linked());
 ```
 
-The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and whether `git status --porcelain` was non-empty.
+The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and whether `git status --porcelain --untracked-files=no` was non-empty: a modified or staged tracked file, not an untracked one such as the `.cargo-ok` cargo writes into a git-dependency checkout.
 A build with no git, which is a source tarball, reports `unknown` as the commit and still builds.
 
 **`--dump-config` exits 0 when this binary can serve this configuration and 2 when it cannot.**

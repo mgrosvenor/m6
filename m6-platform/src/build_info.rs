@@ -23,7 +23,8 @@ pub struct BuildIdentity {
     pub version: &'static str,
     /// The commit the crate was built from, twelve characters, or `unknown`.
     pub commit: &'static str,
-    /// Whether `git status --porcelain` was non-empty at build time.
+    /// Whether a tracked file was modified or a change staged at build time.
+    /// Untracked files do not count.
     pub dirty: bool,
 }
 
@@ -197,6 +198,58 @@ mod tests {
         let tarball = id("1.16.0-rc.1", "unknown", false);
         assert_eq!(tarball.full(), "1.16.0-rc.1+unknown");
         Version::parse(&tarball.full()).expect("unknown is a legal metadata identifier");
+    }
+
+    /// One git command in `dir`, with no user or global config to change it.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=m6", "-c", "user.email=m6@example.invalid"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A cargo git-dependency checkout holds an untracked `.cargo-ok`, so an
+    /// untracked file must not make a build dirty. A modified tracked file and
+    /// a staged new file must.
+    #[test]
+    fn dirty_means_a_tracked_change_not_an_untracked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        let at = path.to_str().expect("utf-8 path");
+        git_in(path, &["init", "-q"]);
+        std::fs::write(path.join("lib.rs"), "fn one() {}\n").expect("write");
+        git_in(path, &["add", "lib.rs"]);
+        git_in(path, &["commit", "-q", "-m", "one"]);
+
+        let (commit, dirty) = git_identity(at);
+        assert_eq!(commit.len(), 12, "a twelve-character hash: {commit}");
+        assert!(!dirty, "a clean checkout is clean");
+
+        std::fs::write(path.join(".cargo-ok"), "{\"v\":1}").expect("write");
+        assert!(!git_identity(at).1, "an untracked file is not dirty");
+
+        std::fs::write(path.join("lib.rs"), "fn two() {}\n").expect("write");
+        assert!(git_identity(at).1, "a modified tracked file is dirty");
+
+        git_in(path, &["checkout", "-q", "--", "lib.rs"]);
+        assert!(!git_identity(at).1, "restored, the tree is clean again");
+
+        git_in(path, &["add", ".cargo-ok"]);
+        assert!(git_identity(at).1, "a staged new file is dirty");
     }
 
     #[test]

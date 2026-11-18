@@ -63,7 +63,7 @@ An operator makes four changes.
 
 ### Added
 
-- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain`. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
+- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain --untracked-files=no`, so a cargo git-dependency checkout, which holds an untracked `.cargo-ok`, is not marked dirty. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
 - `--version-full`, one `<crate> - <full SemVer with build metadata>` line per m6 crate in the binary. Each line comes from that crate's own build-time constants, so a binary that links crates built from different commits shows both commits instead of reporting one for the whole binary.
 - A test that parses the full form with the `semver` crate, and a test that holds each binary's crate list against the workspace dependency graph from `cargo metadata`.
 - `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.

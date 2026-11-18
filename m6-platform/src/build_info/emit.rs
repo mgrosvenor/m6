@@ -51,12 +51,18 @@ pub fn emit() {
 /// The short hash is twelve characters, the length `git rev-parse
 /// --short=12` promises and long enough that two builds of this repository
 /// cannot collide by accident.
+///
+/// Dirty means a tracked file is modified or a change is staged. An untracked
+/// file does not count: cargo writes `.cargo-ok` into every git-dependency
+/// checkout, so counting untracked files marked every build of a pinned
+/// revision dirty.
 fn git_identity(dir: &str) -> (String, bool) {
     let Some(commit) = git(dir, &["rev-parse", "--short=12", "HEAD"]).filter(|s| !s.is_empty())
     else {
         return ("unknown".to_string(), false);
     };
-    let dirty = git(dir, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+    let dirty = git(dir, &["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|s| !s.is_empty());
     (commit, dirty)
 }
 

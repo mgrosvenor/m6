@@ -377,7 +377,7 @@ Each call opens one connection and sends `Connection: close`.
 
 `build_info` answers the two version flags from constants fixed at build time.
 `build_identity!()` builds a `BuildIdentity` from the `M6_BUILD_*` variables the service's own `build.rs` emitted, so each crate reports its own version, commit and dirty flag.
-`emit()` is the one line in that build script. It runs `git rev-parse --short=12 HEAD` and `git status --porcelain`, and writes `unknown` and a clean tree when git is absent.
+`emit()` is the one line in that build script. It runs `git rev-parse --short=12 HEAD` and `git status --porcelain --untracked-files=no`, so only a modified or staged tracked file marks the build dirty, and writes `unknown` and a clean tree when git is absent.
 `linked()` returns the calling crate's identity followed by its m6 dependencies' identities, depth first. Each of those crates emitted its own constants, so `--version-full` shows a mixed build.
 `handle_version_flags(own, linked)` prints the tag form for `--version` and the per-crate lines for `--version-full`, then exits. `m6_core::version_flags!` is the one-call form a service uses at the top of `main`, and it also registers the binary's identity for the start-up record. It names the first line for the binary with `CARGO_BIN_NAME` through `for_binary`, so the seven extra binaries of the m6-http package each name themselves and list `m6-http` second.
 `BuildIdentity`, `emit` and `full_lines` come from `m6-platform`, which sits below m6-core.
