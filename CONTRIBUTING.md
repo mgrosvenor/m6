@@ -106,6 +106,13 @@ Take from it that a release doing two things takes the larger move.
 A change to configuration or behaviour that needs a migration note is a Y change.
 It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of changes.
 
+**A release candidate carries the SemVer pre-release field.** On `develop` the workspace version is `X.Y.Z-rc.N`, and each candidate built from `develop` for staging is tagged `vX.Y.Z-rc.N`.
+The release commit sets `X.Y.Z` and is tagged `vX.Y.Z`.
+A binary reports the two forms. `--version` prints `vX.Y.Z-rc.N` or `vX.Y.Z`, which matches the tag and carries no build metadata.
+`--version-full` prints `X.Y.Z-rc.N+<commit>` per m6 crate, with `.dirty` appended on an uncommitted tree, so a build that mixes commits shows it.
+The commit and the dirty flag are build metadata, which SemVer allows and ignores when comparing precedence.
+A deploy refuses a `.dirty` build outside a development machine and refuses a pre-release on production.
+
 ### 4.2. A speed change
 
 A change is measured against its base by the A/B gate on the build host, which prints the paired difference and its 99% interval per target.

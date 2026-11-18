@@ -1964,6 +1964,10 @@ fn write_boxwhisker_svg(stats: &[BoxStats], title: &str, path: &str) -> std::io:
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Exactly one rustls provider feature is enabled (aws-lc-rs), so the first
     // `ClientConfig::builder()` below resolves and installs it.
     //

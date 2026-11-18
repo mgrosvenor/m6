@@ -39,6 +39,8 @@ mod line;
 mod macros;
 mod sink;
 
+pub mod build_info;
+
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::RawFd;

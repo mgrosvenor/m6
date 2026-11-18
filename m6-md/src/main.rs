@@ -159,11 +159,6 @@ fn parse_args(args: &[String]) -> Result<Cli> {
 
     while i < args.len() {
         match args[i].as_str() {
-            // Its own parser, so the flag is added here too.
-            "--version" | "-V" => {
-                println!("m6-md {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
             "--output" => {
                 i += 1;
                 if i >= args.len() {
@@ -212,6 +207,10 @@ fn parse_args(args: &[String]) -> Result<Cli> {
 static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 fn main() {
+    // `--version` and `--version-full` answer before the input directory is
+    // required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run(args));
 }

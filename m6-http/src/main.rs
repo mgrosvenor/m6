@@ -6907,12 +6907,6 @@ fn parse_args(args: &[String]) -> anyhow::Result<Cli> {
             "--dump-config" => {
                 dump_config = true;
             }
-            // Its own parser, so the flag is added here too. See m6-core's
-            // `parse_invocation`.
-            "--version" | "-V" => {
-                println!("m6-http {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
             arg if arg.starts_with("--") => {
                 anyhow::bail!("unknown flag: {}", arg);
             }
@@ -7119,6 +7113,10 @@ fn probe_deadline_error() -> std::io::Error {
 }
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before a config path is required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
     // Block SIGTERM and SIGINT before anything else. The mask is inherited
@@ -7161,7 +7159,7 @@ fn run(args: Vec<String>) -> i32 {
         Err(e) => {
             eprintln!("usage error: {}", e);
             eprintln!(
-                "Usage: m6-http <site-dir> <system-config> [--log-level <level>] [--dump-config]"
+                "Usage: m6-http <site-dir> <system-config> [--log-level <level>] [--dump-config] [--version] [--version-full]"
             );
             return 2;
         }

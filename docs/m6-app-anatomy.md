@@ -284,26 +284,40 @@ Everything from §3 on is what the resulting binary promises.
 ## 3. The command line
 
 **A service is configured by files and started with two paths.**
-This section gives both, the four flags core parses before it starts, and the exit code a supervisor reads.
+This section gives both, the flags a service answers before it starts, and the exit code a supervisor reads.
 
 ```
-my-service  <site_dir>  <config_path>  [--log-level LEVEL] [--dump-config] [--version]
+my-service  <site_dir>  <config_path>  [--log-level LEVEL] [--dump-config] [--version] [--version-full]
 ```
 
 `argv[1]` is the site directory, which is the root `Request::site_path` resolves against and the only tree the service reads.
 `argv[2]` is its TOML configuration.
 A call with fewer than two positional arguments prints the usage line and exits 2.
 
-Table 3 gives the flags, all of them handled in `parse_invocation` before any socket is bound.
+Table 3 gives the flags. `--version` and `--version-full` are answered at the top of `main`, before any configuration is read. The other two are handled in `parse_invocation` before any socket is bound.
 
 | flag | what it does |
 |---|---|
 | `--log-level LEVEL` | overrides both configuration sources for the level. §4 gives the precedence |
 | `--dump-config` | loads the configuration exactly as the service would, prints what it resolved to with every route and what would answer it, and exits |
-| `--version`, `-V` | prints the program's own name from `argv[0]` and the version, and exits 0. Takes no site directory and no configuration, so a freshly installed binary can be asked what it is before any configuration is in place |
+| `--version`, `-V` | prints the tag form of the build's version, `v1.16.0-rc.1`, and exits 0. It carries no crate name and no build metadata, so it matches the git tag even on a dirty tree |
+| `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary first, each from that crate's own build-time constants. A mixed build shows two commits |
 
-**Table 3: the flags core parses, and what each one is for.**
-Take from it that `--dump-config` is the only one that reads the configuration, and that `--version` is the only one that runs without it.
+**Table 3: the flags a service answers, and what each one is for.**
+Take from it that `--dump-config` is the only one that reads the configuration, and that the two version flags are the only ones that run without it.
+
+**The version flags come from two lines in the service.** The service's `build.rs` calls the one build helper, and its `main` calls the one function that answers both flags before it parses anything else:
+
+```rust
+// build.rs
+fn main() { m6_core::build_info::emit(); }
+
+// main
+m6_core::version_flags!(m6_core::build_info::linked());
+```
+
+The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and whether `git status --porcelain` was non-empty. A build with no git, which is a source tarball, says `unknown` and still builds. The call prints the tag form for `--version` and the per-crate list for `--version-full`, so a service formats no version string of its own.
+
 
 **`--dump-config` exits 0 when this binary can serve this configuration and 2 when it cannot**, which makes it a validation step a deploy can run against a new binary before installing it.
 It names every route that nothing can serve, and a route that nothing can serve is invisible at runtime because it answers 404 like any other unmatched path.

@@ -47,6 +47,10 @@ sysctl  = "0.6"
 [dev-dependencies]
 serde_json = "1"
 tempfile   = "3"
+# `BuildIdentity`'s formats are held by a test that parses them with the semver
+# crate, not by a hand-rolled pattern. Already in the lockfile through the
+# workspace's build tooling, so the build gains no package.
+semver     = "1"
 # The custom-harness tests speak libtest's protocol (`--list --format terse`,
 # `--exact <name>`), which is what `nextest` lists and runs.
 libtest-mimic = "0.8"

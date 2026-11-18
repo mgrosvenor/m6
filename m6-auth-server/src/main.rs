@@ -150,9 +150,7 @@ fn bind_from_args() -> Bind {
     let args: Vec<String> = std::env::args().collect();
     let check_only = args.iter().any(|arg| arg == "--check-only");
     let login_only = args.iter().any(|arg| arg == "--login-only");
-    // `--version` answers without a config, as it does in the shared parser.
-    let version = args.iter().any(|arg| arg == "--version" || arg == "-V");
-    if check_only && login_only && !version {
+    if check_only && login_only {
         eprintln!(
             "m6-auth-server: --check-only and --login-only are mutually exclusive: pass one or neither"
         );
@@ -304,6 +302,10 @@ fn peer_ip(req: &Request) -> String {
 static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 fn main() -> Result<()> {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before a config path is required. The auth list includes m6-auth.
+    m6_core::version_flags!(m6_auth::build_info::linked());
+
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
     // Block the signals before anything else: the mask is inherited only by

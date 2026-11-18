@@ -121,6 +121,10 @@ const ROUTES: [CodeRoute; 5] = [
 const DEFAULT_POLL_SECS: u64 = 30;
 
 fn main() -> Result<()> {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before a config path is required. `--check` is read below.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
     // `m6-monitor --check <config>` prints the hourly health check and exits.

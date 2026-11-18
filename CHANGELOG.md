@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.16.0-rc.1, 2026-11-18](#1160-rc1-2026-11-18)
 - [1.16.0, 2026-11-18](#1160-2026-11-18)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
@@ -36,6 +37,33 @@ The released versions, newest first:
 - [1.1.0, 2026-09-15](#110-2026-09-15)
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
+
+---
+
+## 1.16.0-rc.1, 2026-11-18
+
+**Every m6 binary reports the build it is running, from constants fixed at compile time.**
+`--version` prints the tag form, `v1.16.0-rc.1`, and nothing else.
+`--version-full` prints one line per m6 crate in the binary, the binary first, each as `<crate> - <full SemVer>` with that crate's own commit and dirty flag.
+The workspace version moves to `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
+The startup record, the monitor's use of these fields, and the hash deletions are later changes in the same workstream.
+
+### Added
+
+- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The build helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain`. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
+- `--version-full`, one `<crate> - <full SemVer with build metadata>` line per m6 crate in the binary. Each line comes from that crate's own build-time constants, so a binary that links crates built from different commits shows the difference instead of hiding it.
+- A test that parses the full form with the `semver` crate, and a test that holds each binary's crate list against the workspace dependency graph from `cargo metadata`.
+
+### Changed
+
+- `--version` no longer prints the crate name and the bare version. It prints `v1.16.0-rc.1` or `v1.16.0`, which matches the git tag and carries no build metadata, even on a dirty tree. A script that parsed the old `m6-http 1.16.0` line must read the new tag form.
+- The workspace version is `1.16.0-rc.1`. `Cargo.lock` carries the same version for every member, and `cargo metadata --locked` agrees with it.
+- Every m6 binary takes both flags: `m6-http`, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`, `m6-file`, `m6-html`, `m6-md`, `m6-monitor`, `m6-auth-server` and `m6-auth-cli`. The examples and the site applications adopt the same two lines in a later change.
+
+### Verified
+
+- `cargo test --workspace --no-fail-fast` passes. The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
+- `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
 
 ---
 

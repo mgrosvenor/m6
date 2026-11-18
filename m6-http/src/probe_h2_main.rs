@@ -39,6 +39,10 @@
 use m6_http_lib::probe;
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     let (addr, n) = probe::args("127.0.0.1:443", 100);
     // A flag rather than a second binary: the two runs differ by one line and
     // both belong to the same measurement.

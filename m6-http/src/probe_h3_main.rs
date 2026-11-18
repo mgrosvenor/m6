@@ -18,6 +18,10 @@
 use m6_http_lib::probe;
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // `--0rtt PATH` switches to the resumption measurement, because 0-RTT is a
     // different question from handshake cost: it asks how long until a RESPONSE,
     // having already held a ticket, and the answer should be shorter than any

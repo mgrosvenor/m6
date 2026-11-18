@@ -35,9 +35,10 @@ m6-md <input-dir> --output <file> [--log-level <level>]
 | `<input-dir>` | yes | Directory of `*.md` files. m6-md reads one level. |
 | `--output <file>` | yes | Path of the JSON file to write. |
 | `--log-level <level>` | no | One level name (`trace`, `debug`, `info`, `warn` or `error`), default `info`. Any other value is a usage error, exit 2. |
-| `--version`, `-V` | no | Print the m6-md version and exit 0. |
+| `--version`, `-V` | no | Print the tag form, `v1.16.0-rc.1`, and exit 0. |
+| `--version-full` | no | Print one `<crate> - <full SemVer>` line per m6 crate in the binary, then exit 0. |
 
-**Table 1: every command-line argument and flag, whether it is required, and what it does.** The version flag writes no file.
+**Table 1: every command-line argument and flag, whether it is required, and what it does.** The two version flags write no file.
 
 The input directory is positional and the output path is required, so a run that names both completes one pass.
 A successful run logs to stdout as one JSON object per line, and usage and runtime errors go to stderr as plain text, so a caller can read the output file and ignore the log.

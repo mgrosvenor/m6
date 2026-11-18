@@ -20,6 +20,10 @@
 use m6_http_lib::probe;
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     let (addr, n) = probe::args("127.0.0.1:443", 100);
     let no_resume = std::env::args().any(|a| a == "--no-resume");
     // ONE config, shared, so the session store persists between connections.

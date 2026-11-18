@@ -2004,13 +2004,14 @@ dependencies = [
 
 [[package]]
 name = "m6-auth"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "bcrypt",
  "hex",
  "jsonwebtoken",
  "m6-core",
+ "m6-platform",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2022,11 +2023,12 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-cli"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "m6-auth",
  "m6-core",
+ "m6-platform",
  "rpassword",
  "serde",
  "serde_json",
@@ -2036,13 +2038,14 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-server"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "hex",
  "jsonwebtoken",
  "m6-auth",
  "m6-core",
+ "m6-platform",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2053,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "m6-core"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2088,6 +2091,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -2103,23 +2107,24 @@ dependencies = [
 
 [[package]]
 name = "m6-example-rust-m6core"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "m6-core",
 ]
 
 [[package]]
 name = "m6-example-rust-plain"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 
 [[package]]
 name = "m6-file"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "criterion",
  "httpdate",
  "m6-core",
+ "m6-platform",
  "mime_guess",
  "serde",
  "serde_json",
@@ -2130,18 +2135,19 @@ dependencies = [
 
 [[package]]
 name = "m6-html"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
  "flate2",
  "m6-core",
+ "m6-platform",
  "tempfile",
 ]
 
 [[package]]
 name = "m6-http"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -2159,6 +2165,7 @@ dependencies = [
  "itoa",
  "libtest-mimic",
  "m6-core",
+ "m6-platform",
  "matchit",
  "quiche",
  "rand 0.8.8",
@@ -2179,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "m6-log"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "criterion",
  "itoa",
@@ -2192,11 +2199,12 @@ dependencies = [
 
 [[package]]
 name = "m6-md"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "comrak",
  "m6-core",
+ "m6-platform",
  "serde",
  "serde_json",
  "tempfile",
@@ -2205,10 +2213,11 @@ dependencies = [
 
 [[package]]
 name = "m6-monitor"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "anyhow",
  "m6-core",
+ "m6-platform",
  "rustls",
  "serde",
  "serde_json",
@@ -2218,13 +2227,14 @@ dependencies = [
 
 [[package]]
 name = "m6-platform"
-version = "1.16.0"
+version = "1.16.0-rc.1"
 dependencies = [
  "libproc",
  "libtest-mimic",
  "mio",
  "nix",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "socket2",

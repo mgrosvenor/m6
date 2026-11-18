@@ -1847,6 +1847,10 @@ fn run_path_benchmarks(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // The crate enables exactly one rustls provider feature (aws-lc-rs), so the
     // first config builder resolves and installs it. `supported_verify_schemes`
     // reads the provider directly and does not need an installed default.

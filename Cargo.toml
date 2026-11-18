@@ -51,7 +51,12 @@ resolver = "2"
 # release, because it needs a tag to pin to. See CHANGELOG.md's 1.0.0 entry for
 # what is knowingly not fixed.
 [workspace.package]
-version      = "1.16.0"
+# A release candidate carries the SemVer pre-release field, so the version
+# alone says what the build is: `-rc.N` is a develop build on staging, and a
+# plain version is a release. The build identity adds the commit and dirty flag
+# as SemVer build metadata at compile time, which is why this line stays a plain
+# Cargo version with no `+`.
+version      = "1.16.0-rc.1"
 edition      = "2021"
 # The oldest toolchain we test. Declared because declaring one and not testing
 # it is a claim rather than a fact: CI builds the whole workspace with exactly

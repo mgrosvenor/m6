@@ -147,10 +147,18 @@ rustls-pki-types = { version = "1", optional = true }
 # package.
 rustls-native-certs = "0.8"
 
+[build-dependencies]
+# The one build helper, from the crate below m6-core. m6-core links m6-log and
+# m6-platform, so it cannot be its own build dependency.
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 tempfile  = "3"
 filetime  = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
+# The version-flag test parses the full string with the semver crate rather than
+# a hand-rolled pattern. Already in the lockfile, so the build gains no package.
+semver    = "1"
 # The custom-harness tests speak libtest's protocol (`--list --format terse`,
 # `--exact <name>`), which is what `nextest` lists and runs.
 libtest-mimic = "0.8"

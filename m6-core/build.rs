@@ -6,10 +6,19 @@
 //! the source would mean something else after an upgrade without a word, so the
 //! number is counted from the header the linked library was built from: the
 //! position of `mi_option_purge_delay` in `enum mi_option_e`.
+//!
+//! It also emits m6-core's build identity, the constants `m6_core::build_info`
+//! reads. m6-core cannot name itself as a build dependency, so the helper comes
+//! from m6-platform, the crate below it.
 
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    emit_mimalloc_purge_delay();
+    m6_platform::build_info::emit();
+}
+
+fn emit_mimalloc_purge_delay() {
     let include = env::var("DEP_MIMALLOC_INCLUDE_DIR")
         .expect("libmimalloc-sys reports where its mimalloc.h is");
     let header = PathBuf::from(include).join("mimalloc.h");

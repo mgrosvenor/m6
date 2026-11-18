@@ -50,8 +50,11 @@ Optional flags:
 ```
 --log-level debug    # override log level
 --dump-config        # print effective merged config to stdout, then exit 0
---version, -V        # print the version and exit 0
+--version, -V        # print the tag form, v1.16.0-rc.1, and exit 0
+--version-full       # print one line per m6 crate in the binary, then exit 0
 ```
+
+`--version` carries the tag and nothing else, so a deploy can compare it with the tag it installed. `--version-full` gives each crate's full SemVer string with its own commit and dirty flag, which is what shows a mixed build.
 
 m6-http logs one structured JSON line per event to stdout, or journald's native socket under systemd.
 

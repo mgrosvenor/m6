@@ -33,6 +33,9 @@ toml       = "0.8"
 # only one this tree names; see m6-http/Cargo.toml for the measurement.
 rustls     = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 m6-core  = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile = "3"

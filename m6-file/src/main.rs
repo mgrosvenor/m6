@@ -55,6 +55,10 @@ const HANDLER: &str = "files";
 static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
 fn main() -> Result<()> {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before a config path is required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
     // Block the signals before anything else: the mask is inherited only by

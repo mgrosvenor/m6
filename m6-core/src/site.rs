@@ -2521,26 +2521,6 @@ pub(crate) enum DumpHandling {
     Deferred,
 }
 
-/// The binary's own name, from `argv[0]`, for `--version`.
-///
-/// The lifecycle lines take `Site::name`, the literal the service passes to
-/// `Site::load`.
-///
-/// Not `CARGO_PKG_NAME`: that macro expands where it is written, which is
-/// m6-core, so every service would announce itself as "m6-core" and a deploy
-/// log would not say which binary it had just checked.
-pub(crate) fn program_name() -> String {
-    std::env::args()
-        .next()
-        .and_then(|arg| {
-            std::path::Path::new(&arg)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "m6".to_string())
-}
-
 /// Parse the command line, and handle the flags that do not start a server.
 ///
 /// `--dump-config` loads the configuration exactly as the service would, prints
@@ -2555,6 +2535,10 @@ pub(crate) fn program_name() -> String {
 /// A validation step that runs before the install is what turns that from an
 /// outage into a refused deploy.
 ///
+/// `--version` and `--version-full` are answered earlier, by
+/// `m6_core::version_flags!` at the top of the binary's `main`. They print
+/// constants fixed at build time and need no site directory and no config.
+///
 /// `dump` says who answers the flag. The shared parser answers it for a service
 /// with no start checks of its own, and records it for a service that parses a
 /// config of its own with [`Site::load_deferring_dump`].
@@ -2565,21 +2549,9 @@ pub(crate) fn parse_invocation(
 ) -> Invocation {
     let args: Vec<String> = std::env::args().collect();
 
-    // Before the argument-count check, because `--version` takes no site directory
-    // and no config: a deploy asks a freshly installed binary what it is before
-    // any config is in place.
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        // The program's own name, from argv[0], not `CARGO_PKG_NAME`. That macro
-        // expands where it is written, which is m6-core, so every service would
-        // announce itself as "m6-core" and a deploy log would not say which binary
-        // it had just checked.
-        println!("{} {}", program_name(), env!("CARGO_PKG_VERSION"));
-        std::process::exit(0);
-    }
-
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config] [--version]",
+            "Usage: {} <site-dir> <config-path> [--log-level LEVEL] [--dump-config] [--version] [--version-full]",
             args[0]
         );
         std::process::exit(2);

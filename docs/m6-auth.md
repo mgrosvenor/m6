@@ -101,11 +101,12 @@ Take from it that every flag is optional and the two positional arguments are re
 | `<config-path>` | the service config, normally `configs/m6-auth.conf` |
 | `--log-level <level>` | overrides the configured log level for this run |
 | `--dump-config` | prints the core configuration and any routes declared in the config, validates the auth table and the key files, then exits |
-| `--version` or `-V` | prints the binary name and version, then exits |
+| `--version` or `-V` | prints the tag form, `v1.16.0-rc.1`, then exits |
+| `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, starting with `m6-auth-server`, then exits |
 | `--login-only` | binds the primary socket and serves the four login routes |
 | `--check-only` | binds the check socket and serves `/check` |
 
-**Table 2: the two positional arguments and the five flags.**
+**Table 2: the two positional arguments and the six flags.**
 
 For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
 The output does not list the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the five routes the service registers.
@@ -545,7 +546,7 @@ Take from it that a configuration fault fails the start, and a request fault bec
 
 | code | meaning |
 |---|---|
-| `0` | clean shutdown, `--version`, or a successful `--dump-config` |
+| `0` | clean shutdown, `--version`, `--version-full`, or a successful `--dump-config` |
 | `1` | runtime error, including a failure to start logging |
 | `2` | configuration or invocation error: a missing argument, a config that does not parse, a relative path, a key that does not load, a key pair that does not match, a database that cannot be opened, or a socket that cannot be bound |
 

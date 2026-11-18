@@ -307,6 +307,7 @@ Section A judges the node's own log from the traffic document's `logging`, and `
 
 `m6-monitor --check <config>` prints the same report and exits 1 on a fault and 0 otherwise.
 A config the fleet parser refuses exits 1 with the parser's message, and a service that cannot start exits 2 with `m6-monitor: <what>: <why>` on stderr.
+`m6-monitor --version` prints the tag form, `v1.16.0-rc.1`, and `m6-monitor --version-full` prints one line per m6 crate in the binary, starting with `m6-monitor`. Both answer before a config path is required.
 
 Section 9 turns to the file that keeps those readings.
 

@@ -1,3 +1,4 @@
+pub mod build_info;
 pub mod jwt;
 
 use rusqlite::{params, Connection};

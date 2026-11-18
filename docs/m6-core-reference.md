@@ -113,6 +113,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
 | | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `Bounded<T>`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
+| | `build_info` | `BuildIdentity`, the `build_identity!` macro, `emit` for a service's `build.rs`, `linked` and `handle_version_flags` for `--version` and `--version-full`. The constants are fixed at build time and the type comes from `m6-platform`. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | | `client` | `Upstream`, `Addr`, `TlsClient`, `Reply` and `system_roots`: one outgoing HTTP request a loop drives. `Endpoint` is behind `http-client`. |
 | | `email` | `Relay`, `RelayConfig`, `Smtp` and `SmtpError`: an SMTP client a loop drives. Feature `email`. |
@@ -276,7 +277,7 @@ Take from it that `asset` and `img_dims` are computed from tables built at start
 A service's loop calls `Site::load` once at start, then per request `handle`, its own handler for the index, and `finish`.
 `Site` never calls back into the service: a route the service answers itself comes back as `Handled::Code` or `Handled::Named` with the index of its route.
 
-**Start.** `Site::load` reads the command line (`--version`, `--dump-config`), the config, `site.toml`, the logging settings, the route table, templates and params.
+**Start.** `Site::load` reads the command line (`--dump-config`, `--log-level`), the config, `site.toml`, the logging settings, the route table, templates and params.
 It exits 2 on a configuration error and 1 when logging cannot start, and it refuses a route that names a handler nothing provides.
 `name` is the service's name for the lifecycle lines.
 `read_timeout`, `socket_mode` and `socket_path` are what the loop binds and applies, and `user_config`, `config`, `site_dir`, `config_path` and `site_toml` are the roots a service resolves its own files against. `config` is the whole parsed renderer config, for a start check a service runs itself.
@@ -368,6 +369,15 @@ The connection's state is one `enum` of steps inside the slot, so the service's 
 `post_form(&mut up, fields, deadline)` encodes `application/x-www-form-urlencoded` straight into the `Upstream`'s request buffer and starts it, and the service drives the `Upstream` as it drives an `Smtp`.
 One connection per call, with `Connection: close`, so there is no idle list.
 `m6_core::rustls` re-exports the TLS library, so a service names `m6_core::rustls::ClientConfig` and takes no `rustls` dependency of its own.
+
+### 4.8. `build_info`
+
+`build_info` answers the two version flags from constants fixed at build time.
+`build_identity!()` builds a `BuildIdentity` from the `M6_BUILD_*` variables the service's own `build.rs` emitted, so each crate reports its own version, commit and dirty flag.
+`emit()` is the one line in that build script. It runs `git rev-parse --short=12 HEAD` and `git status --porcelain`, and writes `unknown` and a clean tree when git is absent.
+`linked()` returns the calling crate's identity followed by its m6 dependencies' identities, depth first. Each of those crates emitted its own constants, so `--version-full` shows a mixed build.
+`handle_version_flags(own, linked)` prints the tag form for `--version` and the per-crate lines for `--version-full`, then exits. `m6_core::version_flags!` is the one-call form a service uses at the top of `main`.
+`BuildIdentity`, `emit` and `full_lines` come from `m6-platform`, which sits below m6-core.
 
 Section 5 turns to the objects a handler receives and returns.
 

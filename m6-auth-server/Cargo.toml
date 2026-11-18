@@ -20,6 +20,9 @@ anyhow       = "1"
 sha2         = { version = "0.10", features = [] }
 hex          = "0.4"
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 m6-core         = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile        = "3"

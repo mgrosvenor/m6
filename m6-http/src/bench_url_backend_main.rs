@@ -311,6 +311,10 @@ fn send_response(send_buf: &mut Vec<u8>, enc: &mut hpack::Encoder, sid: u32) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Exactly one rustls provider feature is enabled (aws-lc-rs), so the first
     // config builder resolves and installs it.
     let args = parse_args();

@@ -13,6 +13,9 @@ name = "m6-html"
 m6-core   = { path = "../m6-core" }
 anyhow    = "1"
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 m6-core       = { path = "../m6-core", features = ["testkit"] }
 tempfile      = "3"

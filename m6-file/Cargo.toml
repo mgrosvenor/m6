@@ -22,6 +22,9 @@ anyhow      = "1"
 mime_guess  = "2"
 httpdate    = "1"
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 m6-core       = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile  = "3"

@@ -59,7 +59,8 @@ Take from it that the entity selects which commands are available.
 Arguments are positional and are read from the left, so the name comes before the flags.
 A flag written before the name is read as the name, and `user add --role admin` creates a user called `--role`.
 
-`--version` or `-V` anywhere in the arguments prints `m6-auth-cli <version>` and exits 0, before the config file is read.
+`--version` or `-V` anywhere in the arguments prints the tag form, `v1.16.0-rc.1`, and exits 0, before the config file is read.
+`--version-full` prints one `<crate> - <full SemVer>` line per m6 crate in the binary, starting with `m6-auth-cli`, and exits 0 at the same point.
 The argument count is checked next: a call with fewer than three arguments prints the usage block to stderr and exits 2.
 An unknown entity or command also exits 2, after the config file is read and the database is opened.
 
@@ -221,13 +222,13 @@ Take from it that code 2 is the only code that guarantees no command ran.
 
 | code | meaning | examples |
 |---|---|---|
-| `0` | the call succeeded | a command finished, or `--version` printed the version before dispatch |
+| `0` | the call succeeded | a command finished, or `--version` or `--version-full` printed before dispatch |
 | `1` | the call failed after the config file was read | user not found, duplicate name, password mismatch, database locked, key pair unreadable, database that cannot be created or opened |
 | `2` | no command ran | fewer than three arguments, unknown entity or command, config file missing or unparsable |
 
 **Table 6: the three exit codes, their meanings and examples.**
 
-`--version` or `-V` anywhere in the arguments returns 0 before the config file or the database is read, so code 0 does not prove that a command ran.
+`--version` or `-V` anywhere in the arguments returns 0 before the config file or the database is read, so code 0 does not prove that a command ran. `--version-full` returns 0 at the same point for the same reason.
 A database that cannot be created or opened fails with code 1 before an entity or command is matched, so code 1 does not prove that a command ran either.
 Code 2 covers a bad argument count and an unreadable config before the database is opened, and an unknown entity or command after it, so a mistyped command can still create the database file and its directory.
 

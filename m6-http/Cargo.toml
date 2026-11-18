@@ -153,6 +153,9 @@ itoa           = "1"
 # version m6-core already uses, so Cargo.lock gains no new crate.
 socket2        = "0.6"
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 m6-core       = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile      = "3"

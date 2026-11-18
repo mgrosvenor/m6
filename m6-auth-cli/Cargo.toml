@@ -18,6 +18,9 @@ rpassword   = "7"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 tempfile = "3"
 m6-core  = { path = "../m6-core", default-features = false, features = ["testkit"] }

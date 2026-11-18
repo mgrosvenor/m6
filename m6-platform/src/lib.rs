@@ -45,6 +45,7 @@ compile_error!(
      m6-platform/src/lib.rs."
 );
 
+pub mod build_info;
 pub mod fd;
 pub mod host;
 pub mod net;

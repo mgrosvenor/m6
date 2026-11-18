@@ -1,5 +1,6 @@
 pub mod alloc;
 pub mod auth;
+pub mod build_info;
 pub mod client;
 pub mod compress;
 pub mod conditional;
