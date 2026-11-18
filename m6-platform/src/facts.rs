@@ -317,10 +317,13 @@ impl Serialize for BootTime<'_> {
 /// down: it is not on a request path and it must not become one.
 ///
 /// The cost is a fixed set of small reads: about a dozen files and four system
-/// calls on Linux, and ten `sysctl` calls on macOS, plus one resolver lookup
-/// when the host name has no domain part. It takes tens of microseconds on an
-/// idle host. The one read that can block is that resolver lookup, and it is
-/// skipped whenever the host name already contains a dot.
+/// calls on Linux, and six `sysctl` calls plus three system calls on macOS,
+/// plus one resolver lookup when the host name has no domain part. Measured on
+/// an idle macOS arm64 host it is 150 to 200 microseconds once warm and 300 to
+/// 700 microseconds on the first call, and the interface table is the largest
+/// single read at 55 to 85 microseconds. The one read that can block is that
+/// resolver lookup, and it is skipped whenever the host name already contains
+/// a dot.
 pub fn host_facts() -> HostFacts {
     let hostname = hostname();
     HostFacts {
