@@ -231,7 +231,7 @@ mod monitoring_exclusion_tests {
 use std::time::Instant;
 
 use m6_core::monitoring::TrafficReport;
-use m6_core::telemetry::AnalyticsRecord;
+use m6_core::telemetry::{RequestView, Stamp};
 // The one marker for a value a cap cut short. The slot and the report use the
 // same value, so the two cuts cannot drift apart.
 use m6_core::telemetry::USER_AGENT_TRUNCATED as TRUNCATED;
@@ -559,32 +559,29 @@ pub(crate) fn unix_micros_now() -> u64 {
 
 /// Build the traffic summary from the window, for the `type=traffic` line.
 ///
-/// The records of the last hour are turned back into the records the log
-/// lines would have parsed to, and `TrafficReport::from_records` builds the
-/// report body, so the figures match the ones a log read produces. A value the
-/// slot cut is the one difference, and `truncated` tells the record, because a
-/// cut field can hide a probe marker. The report also states how long a window
-/// it actually covers and how many events the ring overwrote inside that
-/// window.
+/// The slots of the last hour are read in place as borrowed views, and
+/// `TrafficReport::from_views` builds the report body with the rules a log
+/// read uses, so the figures match the ones the same lines would produce. A
+/// value the slot cut is the one difference, and `truncated` tells the
+/// summary, because a cut field can hide a probe marker. The report also
+/// states how long a window it actually covers and how many events the ring
+/// overwrote inside that window.
 pub fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
     let now_us = unix_micros_now();
     let cutoff = now_us.saturating_sub(WINDOW_US);
-    let mut records: Vec<AnalyticsRecord> = Vec::with_capacity(window.filled);
-    for slot in window.oldest_first() {
-        if slot.at_us < cutoff {
-            continue;
-        }
-        records.push(AnalyticsRecord::from_parts(
-            slot.at_us,
-            slot.kind.message(),
-            slot.status,
-            slot.path.as_str(),
-            slot.client_ip.as_str(),
-            slot.user_agent.as_opt(),
-            slot.truncated,
-        ));
-    }
-    let mut report = TrafficReport::from_records(node, &records, window.covered_minutes(now_us));
+    let views = window
+        .oldest_first()
+        .filter(|slot| slot.at_us >= cutoff)
+        .map(|slot| RequestView {
+            at: Stamp::Micros(slot.at_us),
+            message: slot.kind.message(),
+            status: slot.status,
+            path: slot.path.as_str(),
+            client_ip: slot.client_ip.as_str(),
+            user_agent: slot.user_agent.as_opt().unwrap_or(""),
+            truncated: slot.truncated,
+        });
+    let mut report = TrafficReport::from_views(node, views, window.covered_minutes(now_us));
     report.events_dropped = window.dropped_in_window(now_us);
     // Written by the m6-firewall-stats timer. A node without the timer
     // reports no firewall state rather than an empty one.

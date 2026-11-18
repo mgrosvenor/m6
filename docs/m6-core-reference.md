@@ -780,15 +780,15 @@ The `LOG` arm calls `flush()`.
 
 `m6-http` emits analytics through `m6_core::log`'s `Line`, and the line has the keys `timestamp` and `fields.user_agent` (`m6-core/src/telemetry.rs:12`).
 `AnalyticsRecord` and `AnalyticsFields` define that line, `Serialize` as well as `Deserialize` so the write side can adopt them.
-`AnalyticsRecord::from_parts(at_us, message, status, path, client_ip, user_agent, truncated)` builds the record the analytics line with those values parses to, which is how the traffic document turns the in-memory window back into records (`m6-core/src/telemetry.rs:118`).
-`truncated` is the window's own fact that a cap cut the path or user agent, and `serde` skips it.
+`RequestView` is one request as the traffic summary reads it, borrowed from a parsed record (`AnalyticsRecord::view`) or from the traffic window's slot, with its time as a `Stamp`, the envelope's text or Unix microseconds.
+`RequestView.truncated` is the window's own fact that a cap cut the path or user agent, and a parsed record never sets it.
 `parse_analytics(...)` reads a stream.
 `PeriodicStats::parse(line)` reads the `periodic stats` log line, `strip_ansi` first because the journal carries colour.
 `aggregate_windows(...) -> StatsAggregate` sums them.
 
 The heuristics and thresholds are named constants: `claims_to_be_bot`, `looks_like_probe`, `looks_like_injection`, `BOT_MARKERS`, `PROBE_MARKERS`, `INJECTION_MARKERS`, `PROBE_PATHS_FOR_CONCERN` (3), `REFUSED_REQUESTS_FOR_CONCERN` (10), `UA_ROTATION_THRESHOLD` (10) and `UA_ROTATION_MIN_REQUESTS` (20) (`m6-core/src/telemetry.rs:783`).
 
-`ClientSummary::is_notable()` and `error_ratio()`, `CrawlerSighting`, and `TrafficSummary::from_records(...)` assemble the picture.
+`ClientSummary::is_notable()` and `error_ratio()`, `CrawlerSighting`, and `TrafficSummary::from_records(...)` or `from_views(...)` assemble the picture.
 Volume alone earns no fault, and a single 404 to `/.git/config` is background noise (`m6-core/src/telemetry.rs:718`).
 
 ### 8.3. `monitoring`
@@ -819,8 +819,9 @@ It is `serde(default)`, so an aggregator can parse a payload from an older node,
 It is the line count the level let through and the age of the last line, and it is `serde(default)`, so a node older than the field still parses.
 
 `TrafficReport::from_records(node, records, window_minutes)` summarises records
-that are already parsed, which is how `m6-http` builds its traffic document from
-the in-memory window. `events_dropped` says how many events that window overwrote
+that are already parsed, and `TrafficReport::from_views(node, views, window_minutes)`
+summarises borrowed views, which is how `m6-http` builds its traffic document from
+the in-memory window without a record per request. `events_dropped` says how many events that window overwrote
 before they left it, so a short window is not read as a quiet hour. `LoggingHealth::read()`
 with `QUIET_SECONDS` (40) and `is_blind()` is the silent-log fault.
 `NotableClient`, `HeavyHitter`, `CrawlerReport` are its parts.

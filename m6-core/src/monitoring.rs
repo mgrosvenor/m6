@@ -969,8 +969,32 @@ impl TrafficReport {
         records: &[crate::telemetry::AnalyticsRecord],
         window_minutes: u64,
     ) -> Self {
-        let summary = crate::telemetry::TrafficSummary::from_records(records);
+        Self::from_summary(
+            node,
+            crate::telemetry::TrafficSummary::from_records(records),
+            window_minutes,
+        )
+    }
 
+    /// Summarise requests read as borrowed views, as the traffic window
+    /// holds them, with no record built per request.
+    pub fn from_views<'a>(
+        node: &str,
+        records: impl IntoIterator<Item = crate::telemetry::RequestView<'a>>,
+        window_minutes: u64,
+    ) -> Self {
+        Self::from_summary(
+            node,
+            crate::telemetry::TrafficSummary::from_views(records),
+            window_minutes,
+        )
+    }
+
+    fn from_summary(
+        node: &str,
+        summary: crate::telemetry::TrafficSummary,
+        window_minutes: u64,
+    ) -> Self {
         let notable: Vec<NotableClient> = summary
             .clients
             .iter()
