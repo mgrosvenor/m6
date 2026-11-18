@@ -161,10 +161,6 @@ pub enum Step {
     Health,
     /// One declared header check, by its index in the fleet config.
     Header(usize),
-    /// Read the metrics document from the journal. It starts no request.
-    Perf,
-    /// Read the traffic document from the journal. It starts no request.
-    Traffic,
     Done,
 }
 
@@ -292,6 +288,10 @@ pub struct Poller {
     header_checks: Vec<HeaderCheck>,
     /// The newest metrics and traffic document the journal carried, by node.
     latest: crate::journal::Latest,
+    /// The one journal reader: the service's `--follow` child, or a check's
+    /// one-shot read. Its `stopped` is the one record of why it is not
+    /// running.
+    pub journal: crate::journal::Reader,
     cache: VerdictCache,
     nameserver: SocketAddr,
     wg_file: Option<String>,
@@ -319,15 +319,30 @@ pub struct Poller {
     step_start_failure: std::cell::Cell<Option<(usize, io::ErrorKind)>>,
 }
 
-impl Poller {
-    /// Keep one line the journal carried.
-    pub fn ingest_journal(&mut self, entry: &[u8]) {
-        self.latest.ingest(entry);
+/// One document from the journal for one node, or why there is none.
+fn journal_document<T: serde::de::DeserializeOwned>(
+    document: Option<&serde_json::Value>,
+    stopped: Option<&str>,
+    what: &str,
+) -> Result<T, String> {
+    match (document, stopped) {
+        (Some(document), _) => {
+            T::deserialize(document).map_err(|e| format!("unreadable {what} line: {e}"))
+        }
+        (None, Some(reason)) => Err(format!(
+            "no {what} line: the journal reader is not running: {reason}"
+        )),
+        (None, None) => Err(format!("no {what} line in the journal for this node")),
     }
+}
 
-    /// Why the journal reader is not running, or `None` while it is.
-    pub fn set_journal_state(&mut self, unavailable: Option<String>) {
-        self.latest.unavailable = unavailable;
+impl Poller {
+    /// Read what the journal pipe holds and keep every line it carried.
+    pub fn read_journal(&mut self, now: Instant) -> crate::journal::Event {
+        let Poller {
+            journal, latest, ..
+        } = self;
+        journal.read(now, |line| latest.ingest(line))
     }
 
     /// Point the poller at the deploy's expectation file.
@@ -345,14 +360,14 @@ impl Poller {
         dir: Result<std::path::PathBuf, String>,
         limit: &m6_core::limits::Limit,
     ) {
-        match dir {
-            Ok(dir) => {
-                let mut reader = crate::journal::Reader::once(&dir, limit);
-                reader.drain(|line| self.latest.ingest(line));
-                self.latest.unavailable = reader.stopped.clone();
-            }
-            Err(reason) => self.latest.unavailable = Some(reason),
-        }
+        self.journal = match dir {
+            Ok(dir) => crate::journal::Reader::once(&dir, limit),
+            Err(reason) => crate::journal::Reader::unavailable(reason, limit),
+        };
+        let Poller {
+            journal, latest, ..
+        } = self;
+        journal.drain(|line| latest.ingest(line));
     }
 
     /// At start: the reading table, the lookup cache and every deadline, all
@@ -415,6 +430,9 @@ impl Poller {
             timeout,
             header_checks,
             latest: crate::journal::Latest::new(),
+            journal: crate::journal::Reader::idle(&m6_core::limits::Limit::builtin(
+                &m6_core::limits::JOURNAL_LINE,
+            )),
             cache: VerdictCache::with_cap(lookup_cap),
             nameserver,
             wg_file,
@@ -651,15 +669,6 @@ impl Poller {
     ) -> io::Result<Progress> {
         let mut step = step;
         loop {
-            // The two documents come from the journal, not from a request.
-            if matches!(step, Step::Perf | Step::Traffic) {
-                let next = self.record_journal(node, step);
-                if next == Step::Done {
-                    return self.after(node, next, poll, out, now);
-                }
-                step = next;
-                continue;
-            }
             match self.begin_step(poll, out, node, step, now) {
                 Ok(()) => return Ok(Progress::Working),
                 Err(e) => {
@@ -677,49 +686,23 @@ impl Poller {
         }
     }
 
-    /// Record one document from the journal, and answer what follows it.
+    /// Fill both journal documents for one node, once its health answered.
     ///
     /// A node with no line says so instead of showing nothing: a monitor that
     /// quietly reports a healthy quiet node when the journal is empty is the
     /// failure this exists to avoid.
-    fn record_journal(&mut self, node: usize, step: Step) -> Step {
-        let name = self.nodes[node].name.clone();
-        let perf = self.latest.perf(&name).cloned();
-        let traffic = self.latest.traffic(&name).cloned();
-        let unavailable = self.latest.unavailable.clone();
+    fn record_journal(&mut self, node: usize) {
+        let name = &self.nodes[node].name;
+        let stopped = self.journal.stopped.as_deref();
         let r = &mut self.readings[node];
-        match step {
-            Step::Perf => match perf {
-                Some(document) => match serde_json::from_value::<PerfReport>(document) {
-                    Ok(report) => r.perf = Some(report),
-                    Err(e) => r.perf_error = Some(format!("unreadable metrics line: {e}")),
-                },
-                None => {
-                    r.perf_error = Some(match &unavailable {
-                        Some(reason) => {
-                            format!("no metrics line: the journal reader is not running: {reason}")
-                        }
-                        None => "no metrics line in the journal for this node".to_string(),
-                    })
-                }
-            },
-            Step::Traffic => match traffic {
-                Some(document) => match serde_json::from_value::<TrafficReport>(document) {
-                    Ok(report) => r.traffic = Some(report),
-                    Err(e) => r.traffic_error = Some(format!("unreadable traffic line: {e}")),
-                },
-                None => {
-                    r.traffic_error = Some(match &unavailable {
-                        Some(reason) => {
-                            format!("no traffic line: the journal reader is not running: {reason}")
-                        }
-                        None => "no traffic line in the journal for this node".to_string(),
-                    })
-                }
-            },
-            _ => {}
+        match journal_document(self.latest.perf(name), stopped, "metrics") {
+            Ok(report) => r.perf = Some(report),
+            Err(e) => r.perf_error = Some(e),
         }
-        self.next_step(node, step)
+        match journal_document(self.latest.traffic(name), stopped, "traffic") {
+            Ok(report) => r.traffic = Some(report),
+            Err(e) => r.traffic_error = Some(e),
+        }
     }
 
     /// What follows `step` for this node, recorded or not.
@@ -729,11 +712,12 @@ impl Poller {
                 if self.readings[node].unreachable.is_some() {
                     Step::Done
                 } else {
-                    Step::Perf
+                    // The two documents come from the journal, not from a
+                    // request.
+                    self.record_journal(node);
+                    self.next_header(node, 0)
                 }
             }
-            Step::Perf => Step::Traffic,
-            Step::Traffic => self.next_header(node, 0),
             Step::Header(i) => self.next_header(node, i + 1),
             Step::Done => Step::Done,
         }
@@ -786,10 +770,6 @@ impl Poller {
         let n = &self.nodes[node];
         let path = match step {
             Step::Health => format!("{}/health", n.base_path),
-            // The two documents come from the journal, so neither is a request.
-            Step::Perf | Step::Traffic => {
-                unreachable!("a journal step starts no request")
-            }
             Step::Header(i) => {
                 let hc = &self.header_checks[i];
                 let sep = if hc.path.contains('?') { '&' } else { '?' };
@@ -826,7 +806,6 @@ impl Poller {
         let n = &self.nodes[node];
         let path = match step {
             Step::Health => "/health".to_string(),
-            Step::Perf | Step::Traffic => unreachable!("a journal step asks for no URL"),
             Step::Header(i) => self.header_checks[i].path.clone(),
             Step::Done => String::new(),
         };
@@ -922,7 +901,6 @@ impl Poller {
                     }
                 }
             }
-            Step::Perf | Step::Traffic => unreachable!("a journal step has no reply"),
             Step::Header(i) => {
                 let hc = &self.header_checks[i];
                 let actual = reply
@@ -949,7 +927,6 @@ impl Poller {
         let r = &mut self.readings[node];
         match step {
             Step::Health => r.unreachable = Some(text),
-            Step::Perf | Step::Traffic => unreachable!("a journal step starts no request"),
             Step::Header(i) => {
                 let hc = &self.header_checks[i];
                 r.header_checks.push(HeaderCheckResult {
@@ -1316,7 +1293,7 @@ impl Poller {
             environment: self.environment.clone(),
             cut: self.latest.startup.cut,
             orphan_shutdowns: self.latest.startup.orphan_shutdowns,
-            journal_unavailable: self.latest.unavailable.clone(),
+            journal_unavailable: self.journal.stopped.clone(),
         };
         self.running.active = false;
         Ok(Progress::Done(Polled {
@@ -1545,7 +1522,7 @@ mod tests {
         let mut poller =
             one_shot_poller(&fleet, &tls, nameserver, crate::check::MAX_LOOKUPS_PER_POLL).unwrap();
         for line in lines {
-            poller.ingest_journal(&journal_line(line.clone()));
+            poller.latest.ingest(&journal_line(line.clone()));
         }
         let mut out = poller.out();
         let polled = drive_to_end(
@@ -1732,8 +1709,12 @@ mod tests {
             crate::check::MAX_LOOKUPS_PER_POLL,
         )
         .unwrap();
-        poller.ingest_journal(&journal_line(perf_document("origin", 5)));
-        poller.ingest_journal(&journal_line(traffic_document("origin")));
+        poller
+            .latest
+            .ingest(&journal_line(perf_document("origin", 5)));
+        poller
+            .latest
+            .ingest(&journal_line(traffic_document("origin")));
         let mut out = poller.out();
         let polled = drive_to_end(
             &mut poller,
@@ -1800,7 +1781,7 @@ mod tests {
             crate::check::MAX_LOOKUPS_PER_POLL,
         )
         .unwrap();
-        poller.set_journal_state(Some("journalctl could not start".to_string()));
+        poller.journal.stopped = Some("journalctl could not start".to_string());
         let mut out = poller.out();
         let polled = drive_to_end(
             &mut poller,

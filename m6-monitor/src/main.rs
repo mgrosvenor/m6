@@ -252,14 +252,13 @@ fn run_service() -> Result<()> {
     // A directory that is not there is said once and reported as a fault,
     // never a refusal to start: the monitor's own page and check still run.
     let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
-    let mut journal = match fleet.journal_path(site.site_dir()) {
+    poller.journal = match fleet.journal_path(site.site_dir()) {
         Ok(dir) => journal::Reader::open(&dir, &journal_limit, m6_core::platform::now()),
         Err(e) => {
             m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
             journal::Reader::unavailable(format!("{e:#}"), &journal_limit)
         }
     };
-    poller.set_journal_state(journal.stopped.clone());
 
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
@@ -316,7 +315,7 @@ fn run_service() -> Result<()> {
     // one. It leaves again when the child stops, after the reactor has let the
     // descriptor go.
     let mut journal_fd = None;
-    if let Some(fd) = journal.fd() {
+    if let Some(fd) = poller.journal.fd() {
         poll.registry()
             .register_fd(fd, JOURNAL, Interest::READABLE)
             .unwrap_or_else(|e| fail("registering the journal", e));
@@ -429,15 +428,12 @@ fn run_service() -> Result<()> {
                 LOG => m6_core::log::flush(),
                 JOURNAL => {
                     let now = m6_core::platform::now();
-                    if journal.read(now, |line| poller.ingest_journal(line))
-                        == journal::Event::Exited
-                    {
+                    if poller.read_journal(now) == journal::Event::Exited {
                         if let Some(fd) = journal_fd.take() {
                             let _ = poll.registry().deregister_fd(fd);
                         }
-                        journal.retire();
+                        poller.journal.retire();
                     }
-                    poller.set_journal_state(journal.stopped.clone());
                 }
                 // One connection's turn: answer from the snapshot, or from
                 // the history for the two paged routes.
@@ -481,15 +477,14 @@ fn run_service() -> Result<()> {
 
         // The journal's child is started again on its backoff, and its pipe
         // joins the loop again when it does.
-        journal.restart_if_due(m6_core::platform::now());
+        poller.journal.restart_if_due(m6_core::platform::now());
         if journal_fd.is_none() {
-            if let Some(fd) = journal.fd() {
+            if let Some(fd) = poller.journal.fd() {
                 poll.registry()
                     .register_fd(fd, JOURNAL, Interest::READABLE)?;
                 journal_fd = Some(fd);
             }
         }
-        poller.set_journal_state(journal.stopped.clone());
 
         // A full stdout holds its bytes in the Sink. Watch it for writability
         // only while it does, so the loop never waits on the log.
@@ -551,9 +546,9 @@ fn run_service() -> Result<()> {
     history.flush();
     #[cfg(feature = "count-allocations")]
     eprintln!("{client_allocs} allocation(s) in the client arm outside table growth");
-    // The journal's child is killed by its own Drop, so no `journalctl
-    // --follow` outlives the monitor.
-    drop(journal);
+    // The journal's child is killed here, so no `journalctl --follow`
+    // outlives the monitor.
+    poller.journal.retire();
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.
     lifecycle.complete();

@@ -545,8 +545,6 @@ pub struct Latest {
     /// documents. Counted rather than guessed at.
     pub unattributed: u64,
     pub malformed: u64,
-    /// Why the reader is not running, when it is not.
-    pub unavailable: Option<String>,
 }
 
 impl Latest {
@@ -655,14 +653,11 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Start reading `dir`. A child that cannot start is not fatal: the
-    /// reason is kept, `unavailable` says it, and a backoff tries again.
-    /// A reader for a journal directory that could not be opened: it starts
-    /// nothing, and `stopped` says why.
-    pub fn unavailable(reason: String, limit: &Limit) -> Reader {
+    /// A reader with nothing started, the one place its fields are set.
+    fn new(dir: PathBuf, follow: bool, limit: &Limit, stopped: Option<String>) -> Reader {
         Reader {
-            dir: PathBuf::new(),
-            follow: true,
+            dir,
+            follow,
             child: None,
             stdout: None,
             line: Bounded::<u8>::new(limit),
@@ -672,25 +667,26 @@ impl Reader {
             lines: 0,
             oversized: 0,
             restarts: 0,
-            stopped: Some(reason),
+            stopped,
         }
     }
 
+    /// A reader with no child and no fault, before the service or the check
+    /// opens the journal.
+    pub fn idle(limit: &Limit) -> Reader {
+        Reader::new(PathBuf::new(), false, limit, None)
+    }
+
+    /// A reader for a journal directory that could not be opened: it starts
+    /// nothing, and `stopped` says why.
+    pub fn unavailable(reason: String, limit: &Limit) -> Reader {
+        Reader::new(PathBuf::new(), true, limit, Some(reason))
+    }
+
+    /// Start following `dir`. A child that cannot start is not fatal: the
+    /// reason is kept in `stopped`, and a backoff tries again.
     pub fn open(dir: &Path, limit: &Limit, now: Instant) -> Reader {
-        let mut reader = Reader {
-            dir: dir.to_path_buf(),
-            follow: true,
-            child: None,
-            stdout: None,
-            line: Bounded::<u8>::new(limit),
-            dropping: false,
-            restart_at: None,
-            backoff: Duration::from_secs(1),
-            lines: 0,
-            oversized: 0,
-            restarts: 0,
-            stopped: None,
-        };
+        let mut reader = Reader::new(dir.to_path_buf(), true, limit, None);
         reader.start(now);
         reader
     }
@@ -699,20 +695,7 @@ impl Reader {
     /// tail and exits, and the pipe is read to its end, so a one-shot tool does
     /// not wait on a timer.
     pub fn once(dir: &Path, limit: &Limit) -> Reader {
-        let mut reader = Reader {
-            dir: dir.to_path_buf(),
-            follow: false,
-            child: None,
-            stdout: None,
-            line: Bounded::<u8>::new(limit),
-            dropping: false,
-            restart_at: None,
-            backoff: Duration::from_secs(1),
-            lines: 0,
-            oversized: 0,
-            restarts: 0,
-            stopped: None,
-        };
+        let mut reader = Reader::new(dir.to_path_buf(), false, limit, None);
         reader.start(m6_core::platform::now());
         reader
     }
