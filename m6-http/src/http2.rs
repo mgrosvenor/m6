@@ -2832,20 +2832,24 @@ impl Http2Conn {
         scratch: &[u8],
     ) {
         let start = self.send_buf.len();
-        self.send_buf.extend_from_slice(&[0u8; FRAME_HDR]);
+        // HEADERS are not paced, so the area can be full. A refusal is
+        // recorded in `send_buf` and closes the connection at its next flush
+        // (`flush_io`), so the frame is left unfinished here.
+        if !self.send_buf.extend_from_slice(&[0u8; FRAME_HDR]) {
+            return;
+        }
         {
             let Http2Conn {
                 hpack_enc,
                 send_buf,
                 ..
             } = self;
-            hpack_enc
-                .encode_into(
-                    plan.iter()
-                        .map(|(name, value)| (name.resolve(scratch), value.resolve(scratch))),
-                    send_buf,
-                )
-                .expect("an HTTP/2 header block fits under the h2_send maximum");
+            let block = plan
+                .iter()
+                .map(|(name, value)| (name.resolve(scratch), value.resolve(scratch)));
+            if hpack_enc.encode_into(block, send_buf).is_err() {
+                return;
+            }
         }
         let payload_len = self.send_buf.len() - start - FRAME_HDR;
         self.send_buf[start] = (payload_len >> 16) as u8;
@@ -5672,6 +5676,36 @@ mod tests {
         assert_eq!(u24_be(&buf[0..3]), 8);
         assert_eq!(buf[3], TYPE_PING);
         assert_eq!(&buf[FRAME_HDR..], &[7; 8]);
+    }
+
+    /// HEADERS and control frames are not paced, so a peer that opens streams
+    /// and never reads can fill `h2_send` to its maximum. That closes the one
+    /// connection with an error naming the key. It used to panic on the HPACK
+    /// encode, which aborts the whole process.
+    #[test]
+    fn a_full_send_area_closes_the_connection_without_a_panic() {
+        use m6_core::limits::{Bounded, Limit, H2_SEND};
+
+        let mut c = Http2Conn::new();
+        c.send_buf = Bounded::new(&Limit::custom(&H2_SEND, 64, 128));
+        let value = vec![b'x'; 512];
+        let plan = [(FieldPart::Bytes(b"x-big"), FieldPart::Bytes(&value))];
+        c.write_headers_frame(1, &plan, &[]);
+        assert!(c.send_buf.overflow().is_some(), "the refusal is recorded");
+        // A control frame after the refusal is refused too: the area stays
+        // under its maximum.
+        c.push_frame(TYPE_PING, 0, 0, &[0; 200]);
+        assert!(c.send_buf.len() <= 128, "{} bytes queued", c.send_buf.len());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (_peer, _) = m6_core::platform::net::connect_tcp(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server.set_nonblocking(true).expect("nonblocking");
+        let err = c
+            .send_until_blocked(&mut H2Io::Plain { stream: &server })
+            .expect_err("a full send area closes the connection");
+        assert!(err.to_string().contains("[limits.h2_send]"), "{err}");
     }
 
     /// The bound frames one queue per pass, so a connection whose socket takes
