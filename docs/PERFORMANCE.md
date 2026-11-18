@@ -21,6 +21,7 @@ Section 1 gives the rules every figure follows, sections 2 to 7 give the figures
 ## 1. What this document records
 
 m6 keeps performance numbers in three places and each answers a different question.
+Table 1 names the three places and what each one answers.
 
 | file | what it answers | authority |
 |---|---|---|
@@ -31,7 +32,7 @@ m6 keeps performance numbers in three places and each answers a different questi
 **Table 1: where each kind of performance number lives.**
 Take from it that an end-to-end claim belongs in `BENCHMARKS.md` and a gate verdict in `tools/perfcheck.sh`, an interleaved A/B whose run records are in `tools/perf-history.jsonl`.
 
-Four rules govern every figure below.
+Four rules govern every figure below, and Table 2 states them.
 
 | rule | what it requires |
 |---|---|
@@ -54,7 +55,7 @@ This section gives the end figure, the per-copy audit behind it, the changes, an
 ### 2.1. The rendered page
 
 Two builds were run against the same site directory, the same renderer config and the same content file, over a unix socket, five interleaved rounds of 300 requests each.
-The figure is the median of each round's p50.
+The figure is the median of each round's p50, and Table 3 gives the two medians.
 
 | build | p50 per rendered page |
 |---|---:|
@@ -71,6 +72,7 @@ The newer build emits `Connection: close` when the client asked for it, which is
 
 Each request assembled its dictionary from the config file's keys plus the site's content file and deep-copied it six times, producing the same result for every request.
 `m6-core`'s `copy_audit` measures each copy separately, in release, against a real content file of 68 KB and 1,364 nodes.
+Table 4 lists the six copies with the change that removed each and its cost before and after.
 
 | copy | removed by | before | after |
 |---|---|---:|---:|
@@ -158,7 +160,7 @@ Every m6 service (m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monito
 The A/B in section 8.2 tests it against the base build: cache-hit and render latency no worse, and the memory-call and page-fault counts at zero or a named handful.
 
 A warm service should make no `brk`, `mmap`, `munmap`, `madvise`, `mremap` or `mprotect` call.
-That takes four settings, made at start:
+That takes four settings, made at start and listed in Table 6:
 
 | setting | what it does | where |
 |---|---|---|
@@ -171,7 +173,7 @@ That takes four settings, made at start:
 Take from it that the reservation is sized from the cache, so the hot data sits in one pinned region.
 
 The measured window took zero memory calls and zero minor faults on both the base and the candidate build.
-Resident memory was measured on the build host, a Linux machine:
+Table 7 gives the resident memory measured on the build host, a Linux machine:
 
 | state | resident, pinned build (KiB) | resident, base build (KiB) | pinned build, on transparent huge pages (KiB) |
 |---|---:|---:|---:|
@@ -190,6 +192,7 @@ Take from it that the pin costs 33 to 49 MiB over the base, and that most of the
 
 Two changes stopped `m6-file` reading bytes it never sent, and `m6-http` counts every allocation per request against a budget.
 Neither file-path change carries a latency figure, so both are recorded as structural.
+Table 8 describes each change and its measurement.
 
 | change | what it does | measurement |
 |---|---|---|
@@ -264,6 +267,7 @@ Renumbering it breaks them.
 
 A paired, interleaved A/B across five commits spanning 2026-09-09 to 2026-09-13 measured the cache lookup on a single-core VM with a `kvm-clock` clocksource.
 The A/B used a portable bench written against the API common to all five commits.
+Table 10 gives the lookup cost across the five commits and across cache sizes.
 
 | variable | cache lookup |
 |---|---:|
@@ -291,7 +295,7 @@ The reservoir is a ring that is never cleared, and `percentiles_ring` reads its 
 The `*_window_added` counters give the periodic log its own ten-second window.
 `stats::perf_reservoir_tests` holds six tests, including `an_emit_does_not_erase_what_the_document_reports`, which fails if an emit clears the ring.
 
-End to end, the 05-cms example stack took 40 requests, then read the metrics line three times across two emit boundaries with silence between them:
+End to end, the 05-cms example stack took 40 requests, then read the metrics line three times across two emit boundaries with silence between them, and Table 11 gives each scrape:
 
 | scrape | hit_samples | hit_p50_ns | hit_p99_ns |
 |---|---:|---:|---:|
@@ -322,6 +326,7 @@ Their shared source is `m6-http/src/probe.rs`, and they check the server's own f
 ### 5.1. The figures
 
 Taken on the build host's loopback, 200 sequential handshakes per channel, against the server's own report of the same connections.
+Table 12 compares the two figures per channel.
 
 | channel | probe p50 | metrics p50 | metrics samples |
 |---|---|---|---|
@@ -359,6 +364,7 @@ A real-path number decides protocol choice.
 The probes offer a session ticket from their second handshake on, so a full handshake and a resumed one are measured separately and are comparable on the metrics line.
 A resumed handshake saves the certificate and the signature.
 TLS 1.3 completes in one round trip either way, so the saving is crypto and it is sub-millisecond on a fast path.
+Table 14 gives the full and the resumed p50 from a distant client.
 
 | handshake | p50 | n |
 |---|---|---|
@@ -438,6 +444,7 @@ A saving of 20 to 36 us on the key exchange is 5% to 10% of the 372 us handshake
 
 A cache hit does not pay the handshake, and it can wait behind one.
 One kept-alive connection served hits while a second generator opened new full handshakes at 0, 50, 100, 200 and 500 a second, in 10 second windows.
+Table 17 gives the hit and handshake latency at each rate.
 
 | new handshakes/s | achieved/s | hits/s | hit p50 us | hit p99 us | handshake p50 ms |
 |---:|---:|---:|---:|---:|---:|
@@ -454,6 +461,8 @@ The p99 plateau is 300 us, which matches the 158 us of crypto plus 144 us of ker
 The handshake p50 in this run is 0.65 to 0.87 ms, above the 0.372 ms of section 6.1, because the same four vCPUs now run the hit client, the handshake generator and the server together.
 
 ### 6.5. The system call
+
+Table 18 gives the cost of two bare system calls on the VM, the unit in which the kernel share of Table 15 is spent.
 
 | operation | per call |
 |---|---:|
@@ -488,7 +497,8 @@ Certificate compression removed the excess and the server runs at quiche's confo
 
 A client's opening Initial is padded to 1200 bytes, so at a factor of 3 the budget is 3600 bytes.
 The uncompressed handshake flight was 4082 bytes, of which the certificate chain is 3429.
-`m6-probe-h3` prints a per-packet timeline with the live ratio, against a 4.85 ms RTT:
+`m6-probe-h3` prints a per-packet timeline with the live ratio, against a 4.85 ms RTT.
+Figure 1 shows that timeline for one uncompressed handshake:
 
 ```
 +0.741ms  client 1200B
@@ -507,6 +517,7 @@ Disabling pacing, which quiche enables by default, left the stall unchanged.
 
 A published [study](https://www.fastly.com/blog/quic-handshake-tls-compression-certificates-extension-study) measured 40-44% of uncompressed chains exceeding the budget, and certificate compression taking that to 1-9%.
 [Other work](https://blog.apnic.net/2023/01/16/on-the-interplay-between-tls-certificates-and-quic-performance/) puts it at 61% for a Firefox-sized 1352-byte Initial.
+Table 19 gives the chain sizes measured for m6 and six public sites, for scale.
 
 | chain | certs | chain bytes |
 |---|---:|---:|
@@ -520,7 +531,7 @@ A published [study](https://www.fastly.com/blog/quic-handshake-tls-compression-c
 
 **Table 19: measured certificate chain sizes, for scale.**
 Take from it that a 3429-byte chain is typical and that two of the seven are larger, so chain size alone does not decide which servers stall.
-The factor each server runs at decides it:
+The factor each server runs at decides it, and Table 20 gives the factor three servers run at:
 
 | edge | bytes sent before address validation | implied factor |
 |---|---:|---|
@@ -536,6 +547,7 @@ Take this as our own measurement: the byte accounting counts QUIC payload, and n
 m6-http sets no amplification factor override, so quiche's conforming default of 3 applies.
 Certificate compression, RFC 8879, keeps the flight under that budget.
 The compression runs in m6's own quiche fork, pinned by revision in `m6-http/Cargo.toml`, and is enabled by `cfg.enable_cert_compression()` in `m6-http/src/main.rs`.
+Table 21 gives the chain size under each compression algorithm.
 
 | algorithm | chain bytes | of uncompressed |
 |---|---:|---:|
@@ -688,6 +700,7 @@ The test returns on macOS before its assertions, so the build host is where it r
 
 Three costs inside the process, none of them a page cost, are recorded here and in `CHANGELOG.md`.
 Each was measured on a release build on an Apple M4.
+Table 22 gives each cost before and after the change.
 
 | what | before | after | what changed |
 |---|---|---|---|

@@ -39,7 +39,7 @@ my-site/
 **Figure 1: the site directory.**
 `site.toml` sits at the top, and `configs/` holds each renderer's own config.
 
-No `logs/` directory belongs here: every process logs to stdout, and the journal holds and rotates the lines.
+No `logs/` directory belongs here: every process logs to stdout or to journald's native socket, and the journal holds and rotates the lines.
 
 ## 2. Complete annotated example
 
@@ -407,7 +407,7 @@ An absent section leaves the process at `info`.
 
 **Table 4: the `[log]` key.**
 
-All processes log to stdout as JSON lines.
+All processes write JSON lines to stdout, or to journald's native socket under systemd, and [`m6-log.md`](m6-log.md) gives the line.
 Any `[log]` key other than `level` stops the start with exit 2 and the message names it (`LogConfig::from_toml` in `m6-core/src/config.rs`).
 
 ### 4.4. `[errors]`
@@ -726,9 +726,7 @@ Both intervals are whole seconds.
 **Table 16: the `[stats]` keys.**
 The `type` `perf` line and the `type` `traffic` line go to stdout, or to journald's native socket under systemd, where `M6_TYPE=perf` and `M6_TYPE=traffic` select them.
 
-The `type` `perf` line carries the whole metrics document under `fields.perf`, from `perf_document` in `m6-http/src/health.rs`.
-The document holds the request, cache and latency figures, the pool and TLS state, the build identity and the host facts.
-The `type` `traffic` line carries the traffic summary under `fields.traffic`, from `build_report` in the same file, over a window of up to the last 60 minutes.
+[`m6-http.md`](m6-http.md) §11 gives what each document holds.
 
 A zero for either key would write the line on every pass of the event loop, so it stops the start with exit 2.
 
@@ -862,7 +860,7 @@ Exit 2 on, in both `--dump-config` and a real start:
 - `internal_peers` set with no internal listener
 - `internal_peers` with no address of the internal bind's IP family (an IPv4-mapped bind is IPv4)
 
-Exit 2 at a real start only:
+Exit 2 at a real start only, after the start-up record is written, so the record shows the settings that were refused ([`m6-http.md`](m6-http.md) §2):
 
 - A `[[backend]]` `sockets` glob that matches no socket
 - A `[[backend]]` `url` host that does not resolve

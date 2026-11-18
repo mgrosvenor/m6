@@ -49,7 +49,8 @@ Take from it that the entity selects which commands are available.
 | `<command>` | the operation on that entity, such as `ls` or `add` |
 | `[args] [flags]` | the command's arguments and flags, in that order |
 
-**Table 1: the four parts of an m6-auth-cli command line.** The first three are required, and `[args] [flags]` belongs to the command.
+**Table 1: the four parts of an m6-auth-cli command line.**
+The first three are required, and `[args] [flags]` belongs to the command.
 
 Arguments are positional and are read from the left, so the name comes before the flags.
 `user add --role admin` creates a user called `--role`.
@@ -75,7 +76,8 @@ Take from it that the user and group commands need `[storage]` and `[tokens] iss
 | `[keys] private_key` | `token create` only | none | signing the token |
 | `[keys] public_key` | `token create` only | none | loading the key pair |
 
-**Table 2: the config keys m6-auth-cli reads.** Without `[keys]`, `token create` exits 1 with `config missing [keys] section`.
+**Table 2: the config keys m6-auth-cli reads.**
+Without `[keys]`, `token create` exits 1 with `config missing [keys] section`.
 
 Every path in the file is absolute, and a relative one exits 2 naming the setting.
 m6-auth-cli creates the directory that holds the database when it is missing.
@@ -135,7 +137,8 @@ Take from it that `group ls` counts the members, and only `group member add` and
 | `group member add <group> <username>` | adds a user to a group |
 | `group member del <group> <username>` | removes a user from a group |
 
-**Table 4: the six group commands.** `member` is a subcommand of `group`, so it follows the entity and precedes its own command.
+**Table 4: the six group commands.**
+`member` is a subcommand of `group`, so it follows the entity and precedes its own command.
 
 Group names are unique, and adding a name that exists fails with exit 1.
 A membership row holds the user and the group, so the ROLES column in `group member ls` is each user's global role list.
@@ -161,7 +164,8 @@ Take from it that `token create` is the only command that prints a token.
 | `token ls <username> [--json]` | lists every token record for the user |
 | `token revoke <token-id>` | deletes one token record |
 
-**Table 5: the three API token commands.** Only `create` needs the `[keys]` entries in the config.
+**Table 5: the three API token commands.**
+Only `create` needs the `[keys]` entries in the config.
 
 `token create` signs a token with the key pair from the config and prints the JWT to stdout.
 Its messages go to stderr, so `TOKEN=$(m6-auth-cli ... token create ...)` captures the token alone.

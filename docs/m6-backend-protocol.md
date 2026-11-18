@@ -534,3 +534,11 @@ The proxy terminates TLS, HTTP/2 and HTTP/3, caches responses and asks the autho
 Compression is the backend's job (§3.6).
 
 `m6-backend-examples.md` gives six reference implementations, all written against this document.
+
+---
+
+## Summary
+
+A backend is a process that binds a Unix socket the proxy can reach, parses an HTTP/1.1 request and answers with a framed HTTP/1.1 response.
+The proxy owns TLS, HTTP/2, HTTP/3, caching and every credential gate, so a backend trusts the proxy-owned request fields only while the socket is reachable by the proxy alone and treats everything else in a request as attacker-controlled.
+A backend that meets the checklist in section 9 satisfies every MUST in this version of the contract.

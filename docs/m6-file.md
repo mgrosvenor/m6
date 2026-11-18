@@ -50,7 +50,8 @@ Table 1 names the two configs and what each decides. Take from it that omitting 
 | `site.toml` | m6-http | which backend receives the request |
 | `m6-file.conf` | m6-file | which file is returned |
 
-**Table 1: the two route tables serving one static file request.** Each config answers a different question, and neither process reads the other's table.
+**Table 1: the two route tables serving one static file request.**
+Each config answers a different question, and neither process reads the other's table.
 
 A minimal pair looks like this.
 
@@ -83,7 +84,8 @@ Table 2 lists the three parts of a resolved path and where each comes from. Take
 | the route's `root` | `m6-file.conf` |
 | `relpath` or `filename` | the matched route parameter |
 
-**Table 2: the three inputs to a resolved filesystem path.** None of the three is the request URL.
+**Table 2: the three inputs to a resolved filesystem path.**
+None of the three is the request URL.
 
 The three are joined in that order.
 
@@ -138,7 +140,9 @@ Table 3 gives the header for each case. Take from it that a versioned request is
 | `?v=<hash>` present | `public, max-age=31536000, immutable` |
 | anything else | `public, max-age=0, must-revalidate, s-maxage=86400` |
 
-**Table 3: `Cache-Control` by request, decided from the query string alone.** A versioned request is pinned for a year. Everything else is stale in the browser at once and held for 86400 seconds by shared caches.
+**Table 3: `Cache-Control` by request, decided from the query string alone.**
+A versioned request is pinned for a year.
+Everything else is stale in the browser at once and held for 86400 seconds by shared caches.
 
 A `?v=` URL addresses one exact version, because changed bytes mean a changed hash and so a different URL.
 That is what makes a year and `immutable` safe, and it also stops a browser revalidating on reload.
@@ -163,7 +167,8 @@ Take from it that `cache` is the one input, and that `headers` does not replace.
 | `cache` on a `[[route]]` or `[[route_group]]` in `site.toml` | replaces it on the edge, before the edge stores the reply |
 | `headers` on the route | appended, so two `Cache-Control` headers. Use `cache` |
 
-**Table 4: where a route sets `Cache-Control`.** Without `cache` the handler's value stands.
+**Table 4: where a route sets `Cache-Control`.**
+Without `cache` the handler's value stands.
 
 An ACME challenge path, a one-time download or a health file takes `cache = "no-store"` on its route.
 Set it in both configs when the file is served through the edge: the edge stops storing the reply, and m6-file stops advertising a day to anything else in front of it.
@@ -209,7 +214,8 @@ Table 5 gives the names and the answer.
 | `logs/` | warning, then serve | A log viewer roots a route there on purpose, and a wildcard route over a wider root would publish it by accident |
 | `*~`, `*.swp`, `*.swo`, `*.rs.bk`, `.#*`, `.DS_Store` | warning, then serve | An editor backup or OS metadata leaks source and is never a served asset |
 
-**Table 5: what a served root may carry.** A version-control directory and a build tree stop the start, while a log directory and an editor backup are named and served.
+**Table 5: what a served root may carry.**
+A version-control directory and a build tree stop the start, while a log directory and an editor backup are named and served.
 
 A root that names one file, such as `root = "static/robots.txt"`, makes that file served on purpose, so its name is never a finding.
 A root holding a `{param}` is cut at the first placeholder, because the tree up to that point is the most the route can reach without a request.
@@ -271,10 +277,10 @@ The summary below collects what they imply.
 m6-file is a small service with one handler and its own route table.
 The table is the part to remember, because a static file needs a route in `site.toml` to reach m6-file and a route in `m6-file.conf` to reach the disk.
 Its handler owns the whole response, including the ETag and `Cache-Control`, and a route's `cache` replaces that `Cache-Control`.
-Its root bounds what it can serve, which is why the layout document treats that root as a security boundary rather than a convenience.
+Its root bounds what it can serve, which is why the layout document treats that root as a security boundary.
 Every route's root is walked once at start, and section 6 gives the entries that stop the start and the size budget that warns about a tree grown too large.
 
-Related reading:
+Table 6 gives the related reading.
 
 | document | covers |
 |---|---|
@@ -282,4 +288,4 @@ Related reading:
 | [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table, including `[[route_group]]` |
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing a service of your own |
 
-**Table 5: further reading, and what each document covers.**
+**Table 6: further reading, and what each document covers.**

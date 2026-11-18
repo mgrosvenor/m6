@@ -120,7 +120,7 @@ No measurement against a commercial network has been made.
 A commercial content delivery network is a second system with its own view of the site, and that view can diverge from the origin's.
 This half is structural and needs no measurement.
 
-An edge node is `m6-http` with no content behind it, so §4 has one edge to reason about.
+A cache node is `m6-http` with no content behind it, so §4 has one edge to reason about.
 
 ### 1.6 The second question: what does an integrated stack look like?
 
@@ -227,7 +227,7 @@ At that ceiling the loop stops accepting.
 
 **Signals arrive as a descriptor, and `Lifecycle` says what each one means.**
 `m6_core::platform::Signals` is signalfd on Linux and a kqueue filter elsewhere, so a shutdown is readable in the same `match` as every socket.
-`m6_core::signal::Lifecycle` turns each signal into the lifecycle line to log and the decision to stop, and `m6_core::signal::block()` is the first statement of `main`, before the logging writer starts.
+`m6_core::signal::Lifecycle` turns each signal into the lifecycle line to log and the decision to stop, and `m6_core::signal::block()` is the first statement of `main`, before anything that could start a thread.
 
 **Logging in the loop is `m6_core::log`.**
 A line is buffered and written on the accounting tick, and a full stdout is watched for writability under its own token, so the loop never waits on the log.
@@ -271,7 +271,7 @@ Two command line tools serve nothing: `m6-md` converts a directory of Markdown i
 
 **A site is data and configuration only**: `site.toml`, one config file per backend process, templates, assets, and content as JSON.
 The m6 binaries are found through the system path, so a site holds none of them.
-Every process logs to stdout for the supervisor to capture (§3.3), so no process keeps a log directory.
+Every process writes its log to journald's native socket under systemd and to stdout elsewhere (§3.3), so no process keeps a log directory.
 
 ---
 
@@ -305,7 +305,7 @@ Restart policy, resource limits, dependency ordering, log capture and service is
 So `m6-http` spawns nothing, monitors nothing and restarts nothing, and expects its backends to be running.
 
 Two consequences follow.
-Every process logs structured JSON to stdout, journald captures it, and the journal rotates it.
+Every process writes structured JSON lines to journald, one datagram per line, and the journal rotates them (`docs/m6-log.md` §5).
 A crashed backend restarts in seconds, which makes §4.5 affordable.
 
 ### 3.4 Why pool membership is discovered
@@ -623,8 +623,8 @@ A service supplies two pieces of data: the name in its lifecycle lines and the s
 Core owning the lifecycle lines means a journal search for a shutdown means the same thing for every unit.
 
 **Blocking signals is the first statement of `main`, the one ordering rule in m6 that cannot be relaxed.**
-A thread inherits the signal mask as it stands when the thread is created, and a service's logging writer is a thread.
-A writer started before the mask is set has SIGTERM unblocked, the kernel delivers a process-directed signal there, and the default disposition kills the process.
+A thread inherits the signal mask as it stands when the thread is created, and a library a service links can start one.
+A thread started before the mask is set has SIGTERM unblocked, the kernel delivers a process-directed signal there, and the default disposition kills the process.
 A supervisor counts death by the signal it sent as a clean stop, so the only symptoms are a missing log line, a wrong exit status, and a socket file left behind for the edge to keep in a pool.
 The install asserts the mask is already set and refuses to start otherwise, because nothing else about that failure is visible.
 

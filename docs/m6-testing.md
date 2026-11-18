@@ -187,6 +187,23 @@ Two of them need more than a row:
 - **Trap 5 risks more than the reading.**
   h2spec deliberately sends malformed frames, and a result measured against a private live site cannot be reproduced by anyone else.
 
+### 4.3. Without debug assertions
+
+Every check above builds the dev profile, where a `debug_assert!` argument runs, and a release build compiles that argument out.
+A write inside a `debug_assert!` therefore passes every test and vanishes from the shipped binary: HTTP/2's frame writer did that, and the release build of m6-http sent no HTTP/2 frame.
+Two checks close that gap.
+
+- **`m6-core/tests/debug_assert_purity.rs`** scans every Rust source in the workspace and fails when a `debug_assert!`, `debug_assert_eq!` or `debug_assert_ne!` argument calls a mutating method such as `put`, `push`, `write` or `send`.
+- **The `release-asserts` profile** in the workspace `Cargo.toml` is the dev profile with `debug-assertions = false`. CI's conformance job builds it and runs the HTTP/2 unit tests and h2spec against it, at dev-profile build speed:
+
+```sh
+cargo build --workspace --bins --profile release-asserts
+cargo test -p m6-http --lib --profile release-asserts http2
+M6_BIN_DIR="$PWD/target/release-asserts" ./tools/conformance.sh h2
+```
+
+The scan catches a known mutating call, and the profile run catches whatever the scan's list misses.
+
 ## 5. Where the tests are
 
 Table 6 gives a selection of the integration suites, by crate.
@@ -194,8 +211,8 @@ A behaviour in the table traces to the file that checks it, and each `tests/` di
 
 | crate | integration suites |
 |---|---|
-| m6-core | `pre_push_hook.rs`, `version_flag.rs` |
-| m6-http | `integration.rs`, `integration_tests.rs`, `security_e2e.rs`, `security_regressions.rs`, `robustness.rs`, `edge_proxy.rs`, `analytics_e2e.rs`, `backbone_flow_control.rs`, `cache_accounting.rs`, `scale_reuse_port.rs`, `backends_contract.rs`, `backends_through_proxy.rs`, `redirect_lifecycle.rs`, `tls_resumption.rs` |
+| m6-core | `pre_push_hook.rs`, `version_flag.rs`, `startup_record.rs`, `startup_secrets.rs`, `secret_fields.rs`, `debug_assert_purity.rs` |
+| m6-http | `integration.rs`, `integration_tests.rs`, `security_e2e.rs`, `security_regressions.rs`, `robustness.rs`, `edge_proxy.rs`, `analytics_e2e.rs`, `backbone_flow_control.rs`, `cache_accounting.rs`, `scale_reuse_port.rs`, `backends_contract.rs`, `backends_through_proxy.rs`, `redirect_lifecycle.rs`, `tls_resumption.rs`, `startup_errors.rs`, `startup_node.rs` |
 | m6-html | `integration.rs`, `read_timeout.rs`, `socket_mode.rs` |
 | m6-file | `integration.rs`, `two_files.rs`, `woff2.rs`, `security_regressions.rs`, `site_size.rs` |
 | m6-auth-server | `integration.rs`, `security_regressions.rs` |
