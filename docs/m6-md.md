@@ -1,14 +1,12 @@
 # m6-md
 
 m6-md converts a directory of Markdown files into one *JSON* (JavaScript Object Notation) document that an m6 route serves as params.
-It is a member of the m6 workspace at `m6-md/`, built by `cargo build --workspace`, and it runs as a command-line tool that writes one file and exits.
-Where this page and the code disagree, the code is right and this page is a defect.
+It is a member of the m6 workspace at `m6-md/`, and it runs as a command-line tool that writes one file and exits.
+Sections 2 to 5 describe the command, its input and its output, section 6 shows how a site serves the output, and sections 7 to 9 give the errors, the limits and the sources.
 
-## 1. How to read this page
+## 1. Contents
 
-The page is one binary's reference, and the list below links every section.
-The eight sections after this one are:
-
+1. [Contents](#1-contents)
 2. [The command line](#2-the-command-line)
 3. [Input files](#3-input-files)
 4. [Frontmatter](#4-frontmatter)
@@ -19,12 +17,11 @@ The eight sections after this one are:
 9. [Summary](#9-summary)
 
 The command line, the input and the output are in `m6-md/src/main.rs`.
-Table 5 names the sources for the workspace membership and the renderer's params.
 
 ## 2. The command line
 
 m6-md takes one input directory and one output path, and Table 1 gives every argument and flag it accepts.
-Take from it that an ordinary run needs those two arguments and nothing else.
+An ordinary run needs those two arguments.
 
 ```sh
 m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-full]
@@ -34,35 +31,33 @@ m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-f
 |---|---|---|
 | `<input-dir>` | yes | Directory of `*.md` files. m6-md reads one level. |
 | `--output <file>` | yes | Path of the JSON file to write. |
-| `--log-level <level>` | no | One level name (`trace`, `debug`, `info`, `warn` or `error`), default `info`. Any other value is a usage error, exit 2. |
+| `--log-level <level>` | no | `trace`, `debug`, `info`, `warn` (or `warning`) or `error`, in any letter case. Default `info`. Any other value is a usage error, exit 2. |
 | `--version`, `-V` | no | Print the tag form, `v1.16.0-rc.1`, and exit 0. |
 | `--version-full` | no | Print one `<crate> - <full SemVer>` line per m6 crate in the binary, then exit 0. |
 
 **Table 1: every command-line argument and flag, whether it is required, and what it does.** The two version flags write no file.
 
-The input directory is positional and the output path is required, so a run that names both completes one pass.
-A successful run logs to stdout as one JSON object per line, and usage and runtime errors go to stderr as plain text, so a caller can read the output file and ignore the log.
-Section 3 starts with the input directory that feeds that file.
+A successful run logs to stdout as one JSON object per line, and usage and runtime errors go to stderr as plain text.
+Section 3 describes the input directory.
 
 ## 3. Input files
 
 A run reads one directory level of `*.md` files, and each file becomes one document in the output.
-Three rules decide which files it reads: the extension must be exactly `md`, a name beginning with `_` is skipped, and a subdirectory is ignored.
-
-A file may begin with a *TOML* (Tom's Obvious Minimal Language) frontmatter block at its first character.
-A leading byte order mark is stripped before that check, so an editor that writes one does not hide the block.
-The block opens with `+++` as the first three characters of the file and closes with the next line that begins with `+++`, and the Markdown after the closing line becomes the body.
-A file with no closing `+++` is read whole as body, so a forgotten delimiter costs the frontmatter and not the run.
-Frontmatter is optional, and a file with no block is body only.
-
+Three rules decide which files it reads: the extension is exactly `md`, a name beginning with `_` is skipped, and a subdirectory is ignored.
 The input directory must exist and be a directory, and a run that names a file or a missing directory stops with exit 1.
+
+A file may begin with a *TOML* (Tom's Obvious Minimal Language) frontmatter block.
+The block opens with `+++` as the first three characters of the file, after a leading byte order mark is stripped.
+It closes at the next line that begins with `+++`, and the Markdown after the closing line becomes the body.
+A file with no closing `+++` is read whole as body.
+A file with no block is body only.
+
 Section 4 gives the keys the block may hold, and section 5 gives what the body becomes.
 
 ## 4. Frontmatter
 
-Frontmatter is a *TOML* (Tom's Obvious Minimal Language) block, and m6-md reads two keys from it.
-Table 2 gives them.
-Take from it that both keys are optional and each has a default taken from the file.
+Frontmatter is a *TOML* block, and m6-md reads two keys from it.
+Table 2 gives them, and both are optional.
 
 | key | type | default | what m6-md does with it |
 |---|---|---|---|
@@ -75,15 +70,14 @@ A value of the wrong type falls back to the default, and the run continues.
 Every other key is converted to a JSON value and copied into the output document: a string stays a string, an array stays an array, a table becomes an object, and a TOML datetime becomes a string.
 The names `stem`, `path` and `body` belong to m6-md, and a frontmatter block that sets one of them is ignored for that key with a warning in the log.
 
-A key such as `summary` or `tags` is site data, and it appears in the output beside the five fields section 5 describes.
-`title` and `date` are the only keys that change the output's shape, and the rest of the document is the site's to define.
-Section 5 gives the output document that carries them.
+A key such as `summary` or `tags` appears in the output beside the five fields in Table 3.
+Section 5 gives the output document.
 
 ## 5. The output file
 
-One run writes one pretty-printed *JSON* (JavaScript Object Notation) object with a single `documents` array, and each element is one input file.
+One run writes one pretty-printed *JSON* object with a single `documents` array, and each element is one input file.
 Table 3 gives the five fields m6-md always writes.
-Take from it that `path` is the stem with a leading slash, and a site that serves a blog under `/blog` builds its links from the stem.
+A site that serves a blog under `/blog` builds its links from `stem`, because `path` is the stem with a leading slash.
 
 | field | value |
 |---|---|
@@ -97,7 +91,7 @@ Take from it that `path` is the stem with a leading slash, and a site that serve
 
 The array is sorted by `date` descending, compared as text, and two documents with the same date are sorted by `stem` ascending.
 `body` is rendered by comrak with tables, strikethrough, autolinks, task lists, footnotes and emoji shortcodes enabled, and raw HTML in the source passes through.
-The file is written whole: m6-md writes a sibling temp file and renames it over the output, so a reader sees the old document array or the new one.
+m6-md writes a sibling temp file and renames it over the output, so a reader sees the old document array or the new one.
 The temp path is the output path with its extension replaced by `json.tmp`, which makes `data/posts.json` write through `data/posts.json.tmp`.
 
 A source file with a frontmatter block produces one element of that array:
@@ -127,12 +121,12 @@ The four frontmatter keys and the body become this element:
 }
 ```
 
-The order of the array is the order a site lists its posts in, and section 6 shows how a site serves the file.
+Section 6 shows how a site serves the file.
 
 ## 6. Serving the output
 
 A site serves the output through an m6-html route that lists the file in its `params` array, and the route pattern supplies the value the template looks up.
-The contract is one key from the file and one variable from the path, and this section shows both.
+This section shows both.
 
 A renderer route names a template and the params file that feeds it:
 
@@ -145,7 +139,7 @@ params   = ["data/posts.json"]
 
 The object's keys become template variables, so `documents` is the array of posts, and the `{stem}` segment of the matched path becomes the `stem` variable.
 The route that serves the index reads the same file, so one regenerated document feeds both pages.
-In `site.toml`, two `[[route]]` entries send `/blog` and `/blog/{stem}` to the m6-html backend, and the blog needs no `[[route_group]]` because both paths are fixed patterns.
+In `site.toml`, two `[[route]]` entries send `/blog` and `/blog/{stem}` to the m6-html backend.
 
 A template finds its post in the array and answers 404 when the lookup returns nothing:
 
@@ -158,29 +152,24 @@ A template finds its post in the array and answers 404 when the lookup returns n
 `not_found()` makes the render return the not-found result that m6-html turns into a 404.
 The index links each post with `/blog/{{ doc.stem }}`, because `path` carries no `/blog` prefix.
 
-A static params file is read once at start when m6-html builds its routes, so a running renderer keeps serving the old document array until a restart.
-Run m6-md again after a post changes.
-[`m6-http.md`](m6-http.md) owns the cache and its clearing rules, and Example 02 in [`m6-user-guide.md`](m6-user-guide.md) is the full site with both templates.
-Section 7 gives the exit codes a run can return.
+m6-html reads a static params file when it builds its routes, at start and again on each `POST /genid` reload.
+A running renderer keeps serving the old document array until one of those happens, so run m6-md again after a post changes and then restart the renderer or reload it.
+[`m6-http.md`](m6-http.md) owns `/genid` and the cache, and Example 02 in [`m6-user-guide.md`](m6-user-guide.md) is the full site with both templates.
 
 ## 7. Errors and exit codes
 
 m6-md exits with one of three codes, and Table 4 gives the condition behind each.
-Take from it that a usage mistake exits 2 and every failure during a run exits 1.
 
 | code | when |
 |---|---|
-| 0 | The run wrote the output, or `--version` printed the version |
+| 0 | The run wrote the output, or a version flag printed its answer |
 | 1 | A runtime failure: the input directory is missing or is a file, the output path's parent directory is missing, a source file cannot be read, a frontmatter block is malformed, or the output cannot be written |
-| 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, a second positional argument is given, or `--log-level` is not one level name |
+| 2 | A usage error: `<input-dir>` or `--output` is missing, a flag has no value, a flag is unknown, a second positional argument is given, or `--log-level` is not a level name |
 
 **Table 4: the three exit codes and the conditions behind each.**
 
 A malformed frontmatter block stops the run with the file named in the message, and the frontmatter parser adds the position of the error.
 A source file that cannot be read stops the run at that file, and the run writes no output file.
-
-The codes separate a wrong invocation from a failed run, and the message names the file that failed.
-Section 8 lists what m6-md leaves out.
 
 ## 8. Limits
 
@@ -190,32 +179,24 @@ Four limits follow from reading one directory and writing one file.
   A nested collection needs one m6-md run per directory and one output file per run.
 - **The collection is held in memory.**
   Every document is built in memory and serialised to one string, so memory grows with the total size of the source files.
-- **No syntax highlighting.**
+- **Plain code blocks.**
   `body` carries plain `<code>` blocks, and highlighting belongs to the template or the stylesheet.
-- **No link rewriting.**
-  A Markdown link such as `[other post](other-post.md)` stays as written, so a site writes the served route path in its source.
-
-The run has no option for any of them, and section 9 says where the surrounding subjects are written down.
+- **Links stay as written.**
+  A Markdown link such as `[other post](other-post.md)` appears in `body` unchanged, so a site writes the served route path in its source.
 
 ## 9. Summary
 
 m6-md is one command, one directory of Markdown and one JSON file, and a site serves that file through a route.
-The command line has two required arguments and two optional flags, the frontmatter has two keys, and the output has five fixed fields.
-A running site reads the output once at start.
-
-Table 5 gives the sources for what this page leaves out.
-Take from it that every subject here has one owner.
+The command line has two required arguments and three optional flags, the frontmatter has two keys, and the output has five fixed fields.
+Table 5 gives the sources for the subjects around it.
 
 | source | what it owns |
 |---|---|
 | `m6-md/src/main.rs` | m6-md's command line, input and output |
 | `Cargo.toml`, `m6-md/Cargo.toml` | the workspace members list, and the crate's dependencies |
-| `m6-core/src/site.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.6 | the renderer's static params, read at start |
+| `m6-core/src/site.rs`, [`m6-core-reference.md`](m6-core-reference.md) §4.6 | the renderer's static params, read at start and on reload |
 | [`m6-user-guide.md`](m6-user-guide.md) | Example 02, the blog that serves this output, with both templates |
-| [`m6-site-toml.md`](m6-site-toml.md) | `[[route]]`, `[[route_group]]` and the renderer `params` key |
-| [`m6-http.md`](m6-http.md) | the cache, and when a change clears it |
-| [`m6-testing.md`](m6-testing.md) | how the workspace's tests run |
+| [`m6-site-toml.md`](m6-site-toml.md) | `[[route]]` and the renderer `params` key |
+| [`m6-http.md`](m6-http.md) | `/genid`, the cache, and when a change clears it |
 
 **Table 5: where the code and the surrounding subjects are written down.**
-
-The tool, its output and the route that serves it are the whole subject, and Table 5 is where the next question goes.

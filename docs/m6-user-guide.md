@@ -23,35 +23,20 @@ Sections 2 to 12 walk Examples 01 to 11 in order.
 
 ## 1. Before you start
 
-The examples need two checkouts, one certificate tool and a release build of m6.
-This section installs them and points at the full-stack check.
-The `PATH` export below makes every m6 binary available, including `m6-md`, which Example 02 uses.
-
+The examples need a release build of m6, a certificate tool and the `m6-examples` checkout.
+[`README.md`](../README.md) section 1, steps 1 to 3, gives the commands.
+Step 1 puts `target/release` on `PATH`, which makes every m6 binary available, including `m6-md`, which Example 02 uses.
 Rust 1.89 or newer provides the compiler and Cargo.
-`mkcert` issues a development certificate that a browser trusts.
 The two checkouts must sit side by side, because the renderer crates reach m6 through the relative path `../../../../m6/m6-core`.
 
-Build m6 and the examples with these commands:
-
-```sh
-git clone https://github.com/mgrosvenor/m6
-cd m6
-cargo build --release --workspace
-export PATH="$PWD/target/release:$PATH"
-
-cd ..
-git clone https://github.com/mgrosvenor/m6-examples
-cd m6-examples
-cargo build --release
-```
-
 m6-http serves the public site over *TLS* (Transport Layer Security), so every site needs a certificate.
-Install `mkcert` once, and the local `dev.sh` scripts run `examples/dev-keys.sh`, which writes the development certificate to `/tmp/m6/dev` on first run.
+`mkcert` issues a development certificate that a browser trusts.
+With it installed, the local `dev.sh` scripts run `examples/dev-keys.sh`, which writes the development certificate to `/tmp/m6/dev` on first run.
 When `mkcert` is absent, `dev.sh` uses `openssl` and the browser warns about the self-signed certificate.
 
 Check the install with Example 05, which runs the whole stack.
-[`README.md`](../README.md) step 4 gives the commands and explains what the check covers.
-A green run there means every binary and every example dependency works.
+[`README.md`](../README.md) step 4 gives the commands.
+A green run exercises m6-http, m6-html, m6-file, m6-md, m6-auth-server and a custom renderer together.
 
 The next section starts from the smallest site: three processes, four config files, templates and data.
 
@@ -126,9 +111,10 @@ path    = "/assets/{relpath}"
 backend = "m6-file"
 ```
 
-The `[errors]` block sets `mode = "internal"`, so m6-http generates a small error page itself, and `custom` mode uses the `/_errors` route.
-The released example sets `verbose_fallback = true` for development, which adds the request path, the matched route, the backend name and the error detail to that page.
-Set `verbose_fallback = false` in a production `site.toml`, because every internal error page would carry those details to any client.
+The `[errors]` block sets `mode = "internal"`, so m6-http generates a small error page itself.
+`mode = "custom"` with `path = "/_errors"` renders that route instead.
+`verbose_fallback = true` adds the request path, the matched route, the backend name and the error detail to the internal page, for development.
+Leave it at its default, `false`, in production, because every internal error page would carry those details to any client.
 
 A `[[route]]` matches one path pattern, exact or with `{param}` captures.
 A `[[route_group]]` expands `assets/**/*` into one route per asset.
@@ -237,10 +223,8 @@ It adds a source directory, a generated data file, two routes and two templates.
 
 The blog keeps its posts in Markdown with *TOML* (Tom's Obvious, Minimal Language) frontmatter under `content/posts/`.
 `m6-md` reads that directory and writes `data/posts.json`, a single JSON object with a `documents` array.
-The Markdown conversion happens before the server starts.
-
-A new or changed post needs a rebuild and a cache invalidation.
-`dev.sh` builds the m6 binaries and runs m6-md once to write `data/posts.json`.
+`dev.sh` builds the m6 binaries and runs `m6-md` once to write `data/posts.json` before the server starts.
+`make` in `examples/02-blog` rebuilds that file when a post changes.
 
 ### 3.2. Source file format
 
@@ -257,12 +241,8 @@ tags    = ["rust", "web"]
 Post body in **Markdown**. Tables, footnotes, and strikethrough supported.
 ```
 
-`title` and `date` are the two keys that m6-md reads for itself.
-Other keys, such as `summary` and `tags`, pass through to the JSON unchanged.
-A key named `stem`, `path` or `body` is ignored with a warning, because m6-md sets those three fields.
-When `title` is absent, m6-md uses the file stem with hyphens replaced by spaces.
-When `date` is absent, m6-md uses the file's modification time as a `YYYY-MM-DD` date.
-Files whose names start with `_` are skipped, and the directory is read one level deep.
+`m6-md` reads `title` and `date` itself and copies every other key, such as `summary` and `tags`, into the JSON unchanged.
+[`m6-md.md`](m6-md.md) section 4 gives the defaults for a missing `title` or `date` and the three names m6-md reserves, and section 3 gives the files it skips.
 
 ### 3.3. `data/posts.json`
 
@@ -396,6 +376,7 @@ serde_json = "1"
 use std::sync::Arc;
 use std::time::Duration;
 
+use m6_core::client;
 use m6_core::email::{lettre, Relay, RelayConfig, Smtp};
 use m6_core::Secret;
 use m6_core::prelude::*;
@@ -461,19 +442,25 @@ fn message(global: &Global, name: &str, email: &str, text: &str) -> Result<Messa
 }
 ```
 
-`load_state` runs once at startup, and the loop passes its value to each request arm.
-The POST arm builds one message and calls `smtp.start(&state.relay, &msg)` on its connection's slot.
-The connection's state becomes `Sending`, and the loop registers `smtp.fd()` with `smtp.interest()` under the outgoing token and puts `smtp.deadline()` in the outgoing `Timeouts`.
-The client's own token stays `READABLE` while it waits.
-An outgoing event for a slot whose state is no longer `Sending` is ignored, because the client can leave in the same poll batch.
-When the outgoing token fires, `smtp.drive()` returns `Ok(None)` and the loop reregisters, or `Ok(Some(()))` and the handler renders `templates/contact.html` with `sent: true`, or `Err` and the handler answers with the cause.
+`load_state` runs once at startup, and the loop passes its value to the POST arm.
+The arm builds one message and calls `smtp.start(&global.relay, &msg)` on its connection's slot.
+When `start` fails, the arm answers 500 with the cause.
+When it succeeds, the arm renders `templates/contact.html` with `sent: true`, holds the page and sets the connection's state to `Sending`.
+The loop then registers `smtp.fd()` with `smtp.interest()` under the slot's outgoing token and puts `smtp.deadline()` in the outgoing `Timeouts`.
+When the outgoing token fires, `smtp.drive()` returns one of three results:
+- `Ok(None)`: the delivery continues, and the loop reregisters when the interest changed.
+- `Ok(Some(()))`: the relay accepted the message, and the loop sends the held page.
+- `Err`: the loop answers 500 with the cause.
+
 The outgoing deadline passing first answers 504.
+An outgoing event for a slot whose state is no longer `Sending` is ignored, because the client can leave in the same poll batch.
 A client that closes while `Sending` frees its slot, which closes the relay connection.
 
 ### 4.3. `configs/render-contact.conf`
 
 `render-contact.conf` loads `data/site.json` into every template, names the secrets file and declares the one route.
 The route renders `templates/contact.html` with `cache = "no-store"`, so m6-http never caches the form or its response.
+`methods = ["GET"]` limits the template route to GET, because the POST is the code route in `main.rs`.
 
 ```toml
 global_params = ["data/site.json"]
@@ -481,13 +468,14 @@ secrets_file  = "/etc/m6/render-contact.toml"
 
 [[route]]
 path     = "/contact"
+methods  = ["GET"]
 template = "templates/contact.html"
 params   = []
 cache    = "no-store"
 
 [smtp]
 host     = "localhost"
-port     = 1025
+port     = 2525
 # The local development relay on localhost speaks plain SMTP. Production relays take STARTTLS on port 587: delete this line.
 starttls = false
 username = ""
@@ -579,7 +567,8 @@ Example 04 adds authentication to the contact-form site.
 The `m6-auth` service verifies logins and issues *JWT* (JSON Web Token) tokens. `m6-http` enforces a protected route by asking that service for the identity on every request.
 
 Run the example from `examples/04-auth`.
-`setup.sh` generates the signing keys and creates the admin user, then `dev.sh` starts the stack.
+`setup.sh` generates the signing keys and creates the admin user.
+`dev.sh` starts the stack and, on first run, creates the `members` group with `admin` in it, because `/members` requires `group:members`.
 
 ```sh
 cd examples/04-auth
@@ -839,12 +828,12 @@ name = "dev"
 ```
 
 The `[genid]` table makes this node the source of a generation ID, and `dev.sh` gives m6-http the `STATE_DIRECTORY` it writes the ID into.
-The publisher and reader tokens come from `setup.sh`, and section 7.13 gives the commands that mint them.
+The publisher and reader tokens come from `setup.sh`, and section 7.14 gives the commands that mint them.
 
 ### 6.3. `render-cms/Cargo.toml`
 
 `render-cms` is a Rust crate in the m6-examples workspace.
-Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), and on `base64` for the editor transport.
+Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), on `base64` for the editor transport, and on `rustls` and `rustls-pemfile` for the TLS connection that carries `POST /genid`.
 
 ```toml
 [package]
@@ -857,6 +846,8 @@ m6-core    = { path = "../../../../m6/m6-core" }
 serde_json = "1"
 comrak     = { version = "0.21", default-features = false }
 base64     = "0.22"
+rustls     = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-pemfile = "2"
 ```
 
 ### 6.4. `render-cms/src/main.rs`
@@ -900,7 +891,7 @@ A publish moves a draft to the public blog in five steps.
    The next request for `/blog/{stem}` is a cache miss, m6-html renders the post from the updated index, and m6-http caches it.
 
 The renderer's `[genid]` block in `configs/render-cms.conf` names the publish URL and the token file, and the source's `[genid]` block in the system config names the read and write claims.
-Section 7.13 gives both blocks.
+Section 7.14 gives both blocks.
 A publish adds no restart, because m6-http and every backend read their content again as part of the change sequence.
 
 Unpublishing reverses the flow.
@@ -934,7 +925,7 @@ Example 06 runs the same site under systemd for production.
 ## 7. Example 06, production with systemd
 
 Example 06 runs the Example 05 CMS blog under systemd.
-The example holds only the unit files in `examples/06-systemd/systemd/`.
+The example holds the unit files in `examples/06-systemd/systemd/`.
 It reuses the Example 05 site directory, with a production `site.toml` and a production system config written on the server.
 This section prepares the server, deploys the site directory and writes the units.
 Sections 7.5 to 7.14 install them, verify the stack, and cover logs, journal rotation, what the monitor reads, monitor history, updates, scaling, recovery and publishing.
@@ -1009,13 +1000,9 @@ systemctl restart m6-http
 
 systemd copies the certificate and key into m6-http's credential directory when the unit starts, so the hook restarts m6-http after each renewal, and until then m6-http serves the previous certificate.
 
-The metrics line reports each loaded certificate with its expiry and its SHA-256 fingerprint, and the fingerprint is the identity two certificates with one expiry do not share.
-It is the same value `openssl x509 -noout -fingerprint -sha256 -in fullchain.pem` prints, in lower-case hex with no colons, taken over the certificate's DER.
-Every client already receives those bytes in the handshake, so the value discloses nothing a visitor does not have.
-
+The metrics line reports each loaded certificate with its expiry and its SHA-256 fingerprint (`Fingerprint` in [`m6-core-reference.md`](m6-core-reference.md)).
 A fleet whose nodes share one certificate sets `[monitor] one_certificate = true`, and then a node whose leaf fingerprint differs is a fault in `/check` and in `/digest`.
-Without the key the monitor warns only when some nodes agree and one does not, so it stays silent for a two-node fleet even when the two nodes differ.
-Leave the key unset when each node renews its own certificate.
+Leave the key unset when each node renews its own certificate, and the monitor warns only when some nodes agree and one does not.
 
 ### 7.2. Secrets and state
 
@@ -1026,6 +1013,7 @@ Table 1 lists the settings, the file each sits in and the program that reads it.
 |---|---|---|
 | `secrets_file` | any renderer config | m6-core |
 | `[server] tls_cert`, `tls_key` | system config | m6-http |
+| `[genid] token_file` | system config of a cache node | m6-http |
 | `[storage] path` | m6-auth config | m6-auth-server and m6-auth-cli |
 | `[keys] private_key` | m6-auth config | m6-auth-server with the login side, and m6-auth-cli |
 | `[keys] public_key` | m6-auth config | m6-auth-server on both sides, and m6-auth-cli |
@@ -1483,71 +1471,34 @@ journalctl -u m6-http -o json M6_TYPE=perf | jq -r .MESSAGE | jq .
 
 ### 7.8. Rotating the logs
 
-There is nothing to rotate in m6.
+Nothing in m6 rotates logs.
 Every unit logs to stdout, journald holds it, and `systemd-journald` rotates its own files under `/var/log/journal` by size and age.
-The analytics lines are on the same stream, with `type` `access`, so they rotate with everything else and no signal is involved.
+The analytics lines are on the same stream, with `type` `access`, so they rotate with everything else.
 Section 7.7 lists the reads.
-
-The traffic line answers from a window in memory and reads no log file, so the journal's rotation leaves its figures alone.
 
 ### 7.9. What the monitor reads
 
-m6-monitor polls each node's public `/health` for liveness, and reads every node's metrics and traffic documents from mon's own journal.
-Each node streams its journal to mon with `systemd-journal-upload`, and `systemd-journal-remote` keeps it under `/var/log/journal/remote`, one file per peer address.
+m6-monitor polls each node's public `/health` for liveness and reads every node's metrics and traffic documents from the monitor host's journal.
+Each node streams its journal to the monitor host with `systemd-journal-upload`, and `systemd-journal-remote` keeps it under `/var/log/journal/remote`, one file per peer address.
 `[monitor] journal_dir` names that directory and defaults to `/var/log/journal/remote`.
-
-The monitor starts one `journalctl --follow` child at start and reads its output as one more descriptor in its event loop, so it never runs `journalctl` per poll and never waits on the child.
-Each line is attributed by the `node` field inside the JSON it carries, which is the name the node's own config gives it, and never by `_HOSTNAME`: a host that runs three nodes writes one `_HOSTNAME` for all three, and the three must stay three.
-A line whose document names no node is counted and dropped rather than guessed at.
-If the child stops, the monitor reports the reason against every node and starts it again on a growing backoff, up to thirty seconds.
-
-No credentials are involved: nothing in m6-http answers metrics or traffic over HTTP any more, so the monitor needs no token and there is no `perf_token_file`.
+[`m6-monitor.md`](m6-monitor.md) sections 2 and 3 give how the reader follows the journal, attributes each line to a node and restarts after a failure.
+The monitor needs no token.
 
 ### 7.10. Monitor history
 
-m6-monitor keeps a history of every poll when `[monitor] history_file` is set, and serves it as *JSON Lines* (one JSON object per line).
-Table 2 gives the two keys.
-
-| key (`[monitor]`) | default | rule |
-|---|---|---|
-| `history_file` | absent, so no history | a non-empty path, relative to the site directory |
-| `history_max_mb` | 256 | 1 to 1048576, one MB is 2^20 bytes |
-
-**Table 2: the two `[monitor]` keys that switch the history on and cap it, with their defaults and rules.**
-A change to either needs a restart.
+m6-monitor keeps a history of every poll when `[monitor] history_file` is set, and `[monitor] history_max_mb` caps it (default 256, from 1 to 1048576).
 Put `history_file` in `/var/lib/m6-monitor/` and give the unit `StateDirectory=m6-monitor`.
-
-The file holds one row per node per poll, one row per channel and interface, the text of every finding, and once per traffic window the response status counts and crawler sightings of each node.
-When the file passes `history_max_mb`, the oldest polls are deleted, 256 at a time, until it is 5% under the cap.
-Nothing expires by age.
-One window of one node stores at most 100 crawler sightings, the ones with the most requests, and cuts each user agent to 256 bytes.
-The `/crawlers` key `sightings_dropped` says how many were left out.
-On Unix the monitor creates the directory with mode 0700 and the file with mode 0600, because the file holds client addresses.
-A write that fails is a warning on node `monitor` and never stops polling.
-While the history file is locked the monitor holds the polls in memory, up to `[limits.history_queue] max` (1024 polls, `m6-app-anatomy.md` §4.2), and a poll past that is refused and counted.
-A prune that fails, or a cap that deleting every earlier poll cannot meet, is its own warning, and the poll is still stored.
-To start fresh, stop the service, delete the file and start it again.
-
-The `/check` report starts with a HEALTH section, one line per node.
-The line shows this poll's `/health` answer and the age of the node's last 200 from the history.
-`[monitor] health_last_ok_max_age_s` sets the age above which the line is flagged, and it defaults to three `poll_interval_s` values.
-
-A node is ok only on a 200 (section 7.6 gives the three `/health` answers).
-A 503 means the node is alive and serving its public and cached pages while a dependency is failing, which on an edge is its origin, and the line stays a fault.
-The node's own log names the dependency in the warn line it wrote when the dependency failed and the info line it wrote when it recovered.
-The last 200 is read from an index that holds only the 200 rows, so reading it does not slow as the history grows.
+[`m6-monitor.md`](m6-monitor.md) section 8 gives what the file holds and how it is pruned.
 
 `GET /history` and `GET /crawlers` answer on the service's Unix socket and nowhere else.
-Both take `from` and `to` as *RFC 3339* UTC times, the range `[from, to)` is at most 31 days, and `node` limits the answer to one node.
-A page holds at most 4 MiB and 10,000 rows.
-When more rows match, the response carries a `Link` header with `rel="next"`, and the client follows it until a page has none.
+Both take `from` and `to` as *RFC 3339* UTC times and a `node`, and `m6-monitor.md` section 6 gives the paging.
 
 ```
 curl --unix-socket /run/m6/m6-monitor.sock \
   'http://localhost/history?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z&node=edge-a'
 ```
 
-The monitor has no listener and no token code.
+The monitor has no access control of its own.
 Put an m6-http in front of the socket and protect the routes with `require`, the way Example 11 protects its API:
 
 ```toml
@@ -1567,11 +1518,6 @@ require = "role:admin"
 ```
 
 The monitor sends `Cache-Control: no-store` on every page itself, so the routes need no `cache` key.
-
-The node's own `periodic stats` log is a 10 second series in the node's journal, which is capped.
-It disappears while a node is down.
-Only the history keeps channels, reachability, host figures and the tunnel, and it keeps them through an outage.
-Channel counters separate the monitor's own polls and header checks into `http/<version>/monitor`, and `monitor_requests` on each node row says how many.
 
 ### 7.11. Deploy updates
 
@@ -1617,9 +1563,7 @@ During the brief restart window, a request that lands on the missing socket trie
 ```bash
 systemctl kill -s KILL m6-html
 journalctl -u m6-html -f
-# ... process exited with status 9 (SIGKILL)
-# ... Starting m6-html renderer...
-# ... m6-html started, listening on /run/m6/m6-html.sock
+# systemd logs the exit with status 9 (SIGKILL), waits RestartSec=2 and starts the unit again
 ```
 
 
@@ -1730,8 +1674,7 @@ name = "dev"
 The production system config `/etc/m6/my-blog.toml` holds the same sections, with the node name `origin`, the public bind `0.0.0.0:443`, the two credential paths under `/run/credentials/m6-http.service/`, and the check backend `m6-auth-check`.
 Section 8.3 writes it as a heredoc.
 
-On a conflict, the system config's `[server]` keys win.
-Declaring `[auth]` in both files is a startup error, exit 2.
+A key in the file that does not own it stops m6-http at start with exit 2, and the error names the key and the file it belongs in.
 [`m6-site-toml.md`](m6-site-toml.md) section 3 owns the full split and its merge rules.
 
 ### 8.2. Dev script
@@ -1801,7 +1744,7 @@ cp examples/07-dev-to-production/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 ```
 
-Mint the publisher and reader tokens as section 7.13 shows, and deliver each token file with the unit's `LoadCredential`.
+Mint the publisher and reader tokens as section 7.14 shows, and deliver each token file with the unit's `LoadCredential`.
 
 Deploy the site with `deploy.sh`, then enable and start the units:
 
@@ -1853,7 +1796,7 @@ echo "Deployed."
 
 ### 8.6. Dev vs production at a glance
 
-Table 3 maps each setting to its two values.
+Table 2 maps each setting to its two values.
 Take from it that the two environments differ only in the system config and the process manager.
 
 | Setting | Development | Production |
@@ -1865,7 +1808,7 @@ Take from it that the two environments differ only in the system config and the 
 | Process manager | `dev.sh` | systemd |
 | Logs | terminal stdout | journald |
 
-**Table 3: development and production, key by key.**
+**Table 2: development and production, key by key.**
 The site directory, the routes and the backends are identical in both environments.
 
 ### 8.7. Checking what is in effect
@@ -1876,8 +1819,8 @@ The site directory, the routes and the backends are identical in both environmen
 m6-http /var/www/my-blog /etc/m6/my-blog.toml --dump-config
 ```
 
-The output shows the `[server]` values from the system config and everything else from `site.toml`.
-The merge rule is the one in section 8.1.
+The output shows the `[server]`, `[auth]`, `[genid]` and `[node]` values from the system config and everything else from `site.toml`.
+Section 8.1 gives the rule.
 
 ### 8.8. Common mistakes
 
@@ -1886,7 +1829,7 @@ Four mistakes come up, each with its fix:
 - **Forgetting the system config argument.**
   `m6-http /var/www/my-blog` exits 2, because the second argument is required.
 - **Putting node values in `site.toml`.**
-  `bind`, the certificate paths and `[auth]` belong in the system config.
+  `bind`, the certificate paths and `[auth]` belong in the system config, and m6-http exits 2 when `site.toml` carries them.
 - **Deploying over server-managed state.**
   Sync with the exclusions from section 8.5, so `--delete` does not remove `data/posts.json`, `content/posts/` or the auth database.
 - **Editing `site.toml` on the server.**
@@ -1945,9 +1888,10 @@ cd examples/09-global-deployment
 
 The origin serves the Example 07 site and answers the public domain.
 Each cache node runs only m6-http, pointing at the origin over the mesh, and caches responses independently.
-`setup-origin.sh` provisions the origin and `setup-cache-node.sh` provisions a cache node, both writing a system config, the WireGuard interface and the systemd unit.
+`setup-origin.sh <domain> <admin-email>` provisions the origin and `setup-cache-node.sh <node> <domain> <wg-config>` provisions a cache node.
+Each installs a system config from `configs/`, the WireGuard interface from `wireguard/` and the systemd unit from `systemd/`.
 
-A cache node's system config carries the `[genid]` table:
+A cache node follows the origin when its system config carries a `[genid]` table:
 
 ```toml
 [genid]
@@ -1958,14 +1902,14 @@ heartbeat_secs = 10
 
 `upstream` names the `[[backend]]` with a `url`, and `heartbeat_secs` defaults to 10.
 A cache node without a `[genid]` table does not follow the origin, so a publish does not flush it.
-[`m6-architecture.md`](m6-architecture.md) §4.6 gives the heartbeat and the flush.
+[`m6-http.md`](m6-http.md) section 8.3 gives the heartbeat and the flush.
 
 A publish is one `POST /genid` on the origin with a token carrying the write claim, and each cache node learns the new ID from its next heartbeat.
 The deploy tells the origin and no cache node.
-Section 7.13 gives the source's `[genid]` block and the publisher and reader tokens.
+Section 7.14 gives the source's `[genid]` block and the publisher and reader tokens.
 
-The example uses its own node names and addresses, held in `deploy.toml`, which is a local file never committed.
-The configs under `configs/` and the `wireguard/` files are the node-specific settings.
+`deploy.sh` reads the node addresses from `deploy.toml`.
+Copy `deploy.toml.example` to `deploy.toml` and fill in your SSH targets, and `site-gitignore` keeps `deploy.toml` out of version control.
 
 ## 11. Example 10, API tokens
 
@@ -1982,7 +1926,7 @@ cd examples/10-api-tokens
 
 ### 11.1. When to use API tokens
 
-Table 4 compares a session cookie with an API token.
+Table 3 compares a session cookie with an API token.
 Take from it that the token is the machine-friendly form of the same credential.
 
 | | Session cookie | API token |
@@ -1991,9 +1935,9 @@ Take from it that the token is the machine-friendly form of the same credential.
 | Lifetime | 15 minutes, refreshes to 30 days | Configurable, default 365 days |
 | Transport | `Cookie: session=...` | `Authorization: Bearer ...` |
 | Issuance | `POST /auth/login` | `m6-auth-cli token create` |
-| Revocation | `POST /auth/logout` | `m6-auth-cli token revoke` |
+| Ending it | `POST /auth/logout` clears the cookies | `m6-auth-cli token revoke` deletes the record |
 
-**Table 4: session cookie versus API token.**
+**Table 3: session cookie versus API token.**
 Both are signed with the same *EC* (Elliptic Curve) key, and `require` accepts either.
 
 ### 11.2. Setup
@@ -2041,8 +1985,8 @@ m6-auth-cli configs/m6-auth.conf token revoke 550e8400-e29b-41d4-a716-4466554400
 ```
 
 `token revoke` removes the token from the database and the listing.
-The *JWT* stays valid until its `exp` claim, because `POST /check` verifies only the token's signature, issuer and expiry and reads the user.
-For immediate revocation, use a short `--ttl-days`.
+The *JWT* stays valid until its `exp` claim, because `POST /check` verifies the token's signature, kind, issuer, audience and expiry and never reads the token record.
+`--ttl-days 1` limits that window to a day.
 
 ### 11.5. Template variables in protected routes
 
@@ -2062,7 +2006,7 @@ A request with a valid Bearer token gives m6-html templates the same `auth_usern
 ./test.sh   # another
 ```
 
-The checks cover public access, a 401 without a token, token create, list and revoke, role enforcement and the error page.
+The checks cover public access, a 401 without a token, a Bearer token on `/api/data` and `/dashboard`, token revocation and the 404 page.
 
 ## 12. Example 11, admin dashboard API
 
@@ -2080,12 +2024,13 @@ cd examples/11-admin-dashboard
 Example 11 runs on Linux 5.3 or newer and on macOS.
 The bench child's exit is a pidfd on Linux and a kqueue filter on macOS, so `render-admin` starts on both.
 
-The dashboard is served by m6-file at `https://localhost:8444/` and refreshes every 10 seconds.
+`setup.sh` creates the admin user and the publisher and reader tokens.
+The dashboard is served by m6-file at `https://localhost:8444/` and refreshes every 10 seconds by default.
 It has six tabs: Perf, System, Bench, Logs, Routes and Config.
 
 ### 12.1. API endpoints
 
-Table 5 lists the endpoints the renderer registers.
+Table 4 lists the endpoints the renderer registers.
 Take from it that the first twelve manage the dashboard tabs, and the last five report backend and m6-http statistics.
 
 | Method | Path | Returns |
@@ -2099,8 +2044,8 @@ Take from it that the first twelve manage the dashboard tabs, and the last five 
 | `GET` | `/api/admin/logs` | Last N log lines |
 | `GET` | `/api/admin/config` | site.toml as a JSON object |
 | `PUT` | `/api/admin/config` | Write site.toml from a JSON object |
-| `POST` | `/api/admin/config/touch` | Touch site.toml (a restart of m6-http applies the change) |
-| `POST` | `/api/admin/cache/flush` | Alias for config touch (a restart of m6-http applies the change) |
+| `POST` | `/api/admin/publish` | `POST /genid` on m6-http: advances the site generation and refreshes every backend |
+| `POST` | `/api/admin/cache/flush` | A second name for publish |
 | `POST` | `/api/admin/services/{name}/restart` | Send SIGTERM to a service via its PID file |
 | `GET` | `/api/admin/backends` | Backend topology and the system config bind |
 | `GET` | `/api/admin/backends/{name}/sample` | One backend's stats over the sample window |
@@ -2108,16 +2053,17 @@ Take from it that the first twelve manage the dashboard tabs, and the last five 
 | `GET` | `/api/admin/m6http/sample` | m6-http's own stats over the sample window |
 | `GET` | `/api/admin/m6http/alltime` | m6-http's own stats over all time |
 
-**Table 5: the seventeen `/api/admin` endpoints.**
+**Table 4: the seventeen `/api/admin` endpoints.**
 `site.toml` must declare `allowed_methods` with `PUT`, or the edge answers `PUT /api/admin/config` with a 405.
 
 ### 12.2. JSON blob shapes
 
 Each endpoint returns a single JSON blob.
 `n` sets how many entries come back: `GET /api/admin/perf?n=60` returns 60 periodic stats entries and `GET /api/admin/logs?n=100` returns 100 log lines.
-`GET /api/admin/routes?n=10000` samples that many request-complete log lines and sorts the per-route counts and hit rates by request count.
+`GET /api/admin/routes?n=10000` samples that many `access` log lines and sorts the per-route counts and hit rates by request count.
 `GET /api/admin/bench` lists one target per protocol from the `[server] bind` in the system config.
 `GET /api/admin/config` returns site.toml parsed as JSON, and `PUT` writes it back after validation, atomically.
+The `PUT` changes the file only: m6-http reads `site.toml` at start, so a restart applies it.
 
 ### 12.3. Config: `render-admin.conf`
 
@@ -2142,15 +2088,22 @@ pid_file = "/tmp/m6/m6-http-admin.pid"
 [[services]]
 name     = "render-admin"
 pid_file = "/tmp/m6/render-admin.pid"
+
+[genid]
+url        = "https://localhost:8444/genid"
+connect    = "127.0.0.1:8444"
+token_file = "/tmp/m6/11-admin-dashboard/genid-write.token"
+timeout_ms = 10000
 ```
 
 `system_toml` names the system config whose `[server] bind` supplies the bench targets.
 The `[[services]]` list names the processes the restart endpoint can signal.
+The `[genid]` table names the publish URL, the address to connect to and the write token file that `setup.sh` writes, and a missing or empty token file stops render-admin at start.
 
 ### 12.4. Tests
 
-`cargo test -p render-admin` runs the unit and integration suites for the five modules, `bench`, `logs`, `ops`, `perf` and `system`.
-They cover perf log parsing, per-route aggregation, system metrics shape, bench target discovery, the job lifecycle, log tail content, config read and write round-trips, and service restart.
+`cargo test -p render-admin` runs the unit and integration suites for the six modules, `bench`, `logs`, `ops`, `perf`, `publish` and `system`.
+They cover perf log parsing, per-route aggregation, system metrics shape, bench target discovery, the job lifecycle, log tail content, config read and write round-trips, service restart and the publish exchange.
 
 ### 12.5. Functional tests
 
@@ -2161,7 +2114,7 @@ They cover perf log parsing, per-route aggregation, system metrics shape, bench 
 ./test.sh   # another
 ```
 
-The checks cover a 401 without a token, the JSON keys of each endpoint, a config restart and a cache flush, and an unknown service returning 404.
+The checks cover a 401 without a token, the JSON keys of each endpoint, a publish, a cache flush and a 404 for an unknown service.
 
 ## 13. Summary
 

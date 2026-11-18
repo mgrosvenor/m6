@@ -2,14 +2,13 @@
 
 m6-monitor reports how a fleet of m6 nodes is doing.
 It reads the monitor host's copy of every node's journal through one long-lived `journalctl --follow` child, and asks each node for `GET /health` on every poll.
-From those two inputs it builds one digest, serves it as a page, as *JSON* and as text, and records every poll in a history file when a config asks for one.
-All five routes answer on a unix socket, so the monitor has no listener of its own.
+From those two inputs it builds one digest, serves it as a page, as *JSON* and as text, and records every poll in a history file when the config names one.
+All five routes answer on a unix socket, and the monitor has no listener of its own.
 
 Sections 1 to 3 describe the two inputs.
 Section 4 follows one poll from its first step to the snapshot.
-Sections 5 and 6 give the configuration and the keys that are gone.
-Sections 7 and 8 give the routes and every number the digest carries.
-Section 9 covers the history file, and section 10 says where the crate sits.
+Section 5 gives the configuration, section 6 the routes and section 7 every number the digest carries.
+Section 8 covers the history file, and section 9 says where the crate sits.
 
 ## Contents
 
@@ -18,11 +17,10 @@ Section 9 covers the history file, and section 10 says where the crate sits.
 3. [What the log cannot answer](#3-what-the-log-cannot-answer)
 4. [One poll](#4-one-poll)
 5. [Configuration](#5-configuration)
-6. [Removed keys and the refusal](#6-removed-keys-and-the-refusal)
-7. [The routes](#7-the-routes)
-8. [The digest and the check](#8-the-digest-and-the-check)
-9. [History](#9-history)
-10. [Where it fits](#10-where-it-fits)
+6. [The routes](#6-the-routes)
+7. [The digest and the check](#7-the-digest-and-the-check)
+8. [History](#8-history)
+9. [Where it fits](#9-where-it-fits)
 
 ---
 
@@ -42,7 +40,6 @@ Table 1: the two inputs and what each one carries.
 Each node ships its journal to the monitor host with `systemd-journal-upload`, and `systemd-journal-remote` keeps every peer's journal in one directory, which `[monitor] journal_dir` names.
 The two documents arrive as log lines with `type` `perf` and `type` `traffic`.
 The record arrives as several lines with `type` `startup` and one with `type` `shutdown`.
-No m6-http answers `/perf` or `/traffic` any more.
 `docs/m6-log.md` section 9 gives the record's parts and keys, and `docs/m6-http.md` section 11 gives the two documents.
 
 `GET /health` is the request every node sees on every poll.
@@ -55,7 +52,7 @@ Section 2 follows the child that reads the journal, and section 3 the one input 
 The journal is read by one child process for the life of the service, and its output is one more descriptor in the monitor's event loop.
 
 `journal::Reader::open` starts `journalctl` with `--follow`, `--lines=200`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
-One child therefore carries all four types, and no second follower exists.
+One child carries all four types.
 `M6_TYPE` is the journal field `m6-log` writes for every line under systemd, set from the line's own `type` (`m6-log/src/journal.rs`), so the child selects the types before any JSON is parsed.
 `--lines=200` starts the follow with the last 200 matching lines, so a monitor that has just restarted reports figures before any node writes again.
 
@@ -64,28 +61,26 @@ The loop reads whole lines from it and hands each to `Poller::ingest_journal`, s
 `journal::Latest` keeps the newest metrics document and the newest traffic document for each node name, and `Poller::record_journal` reads those two maps when a poll reaches its `Perf` and `Traffic` steps.
 The same `ingest` call hands a `startup` or `shutdown` line to `journal::Startup`, which groups the several lines of one record by their shared `run_id`.
 
-A start-up record's node is read from the record, never from `_HOSTNAME`.
-The record's own `node` field is used when a line carries one.
-Every line a record written by this release emits carries it, so the platform-line fallback is for records already in the journal.
-Otherwise the node is the hostname on the record's own platform line, which is the machine it runs on.
-That field is the app's configured node name when its config has one, and the platform facts' hostname otherwise, and the record's `node_source` says which.
-Two instances on one host that name themselves differently are therefore two nodes here, which is the case the hostname alone would merge.
+A start-up record's node is the record's own `node` field.
+A record already in the journal without that field takes the hostname on its own platform line, which is the machine it runs on.
+The field holds the app's configured node name when its config has one and the platform facts' hostname otherwise, and the record's `node_source` says which.
+Two instances on one host that name themselves differently are two nodes here.
 The app is the record's own `app` field.
 The key the report shows is the node and the app, and the deploy's expectation file uses the same key (section 5.1).
-A record that reports no hostname is attributed to its app alone, and the check warns that a second host running the same app would then be merged with it.
+A record that reports no hostname is attributed to its app alone, and the check warns that a second host running the same app would be merged with it.
 
 A record is judged only when the monitor saw it from its first line.
-The `--lines=200` tail can start in the middle of a record, so a record whose first line seen is not `seq` 1 is counted in `Startup::cut` and not shown or judged.
+The `--lines=200` tail can start in the middle of a record, so a record whose first line seen is not `seq` 1 is counted in `Startup::cut` and neither shown nor judged.
 A record that started before the monitor did is shown as the current run and is not judged for its completeness or its restarts, because the tail can cut its last lines as easily as its first.
 A record still arriving after `journal::INCOMPLETE_AFTER`, 120 seconds, is moved to the report's unfinished list, which is how a start that never finishes becomes a finding.
 
 A `perf` or `traffic` line is attributed by the `node` field of the document inside `MESSAGE`, which is the value the node's own config gives `[node] name`.
-`_HOSTNAME` is never read: a host that runs three nodes writes one `_HOSTNAME` for all three, and a key on it would report three nodes as one.
+A host that runs three nodes writes one `_HOSTNAME` for all three, so the monitor never reads it.
 A `perf` or `traffic` line whose document names no node is counted in `Latest::unattributed` and dropped.
 An entry that is not JSON, or one whose `MESSAGE` is missing or not JSON, is counted in `Latest::malformed`, and a line of another `type` is ignored.
 
 The fleet entry's `name` is the key the monitor looks a document up by, so it has to equal the node's `[node] name`.
-A fleet entry that names a node differently gets no figures for it, and the digest reports the absence as `no metrics line in the journal for this node` while `reported_node` shows the name the node calls itself.
+A fleet entry that names a node differently gets no figures for it, and the digest reports `no metrics line in the journal for this node` while `reported_node` shows the name the node calls itself.
 
 A line longer than `[limits] journal_line` is counted in `Reader::oversized` and dropped, and the reader discards bytes to the next newline so the following line starts clean.
 When the child exits, the loop deregisters the pipe and `Reader::retire` reaps the process.
@@ -108,7 +103,7 @@ A document says nothing about whether the node is answering now, and some questi
 
 A node that is down, a node whose journal upload has stopped and an idle node all leave `Latest` unchanged, so the last document a node wrote stays in the digest at any age.
 `GET /health` is the per-poll fact, and `NodeReading::status` is the single rule that reads it: a 200 carries the body's `status`, any other code is `degraded`, a 200 with no parseable body is `unknown`, and a node that did not answer is `unreachable`.
-A 503 `degraded` says the process is alive and serving its public and cached pages while a dependency it reads is failing, which on a cache node is its origin (`m6-http/src/health.rs`).
+A 503 `degraded` says the process is alive and serving its public and cached pages while a dependency it reads is failing, which on a cache node is its origin (`origin_down` in `m6-http/src/health.rs`).
 The node's log names the failing dependency, and `digest::DEGRADED_REASON` says so in the check's HEALTH line.
 
 The second question is where the node is.
@@ -131,7 +126,6 @@ Section 4 puts both inputs in the order one poll reaches them.
 ## 4. One poll
 
 A poll is a table of steps the loop drives, one slot per node, with no thread and no blocking call.
-
 Table 2 lists the steps in the order a node reaches them.
 
 Table 2: the steps of one poll, in order.
@@ -142,7 +136,7 @@ Table 2: the steps of one poll, in order.
 | `Perf` | reads the newest metrics document for this node from `Latest` | `Poller::record_journal` |
 | `Traffic` | reads the newest traffic document for this node from `Latest` | `Poller::record_journal` |
 | `Header(i)` | one declared header check, a `GET` on the node's public address | `Poller::begin_step` |
-| the tunnel probe | three non-blocking connects to the node's `tunnel.address`, after the node's requests | `tunnel::PROBES_PER_POLL` |
+| the tunnel probe | up to three non-blocking connects to the node's `tunnel.address`, after the node's requests | `tunnel::PROBES_PER_POLL` |
 | the crawler lookups | reverse and forward *DNS* lookups for the addresses in a sighting | `check::VerdictCache` |
 
 Only `Health` and `Header` send a request, so a fleet with no header checks declared makes exactly one request per node per poll.
@@ -164,7 +158,6 @@ Section 5 lists the keys that decide all of this.
 ## 5. Configuration
 
 The monitor reads its own keys under `[monitor]`, its poll interval from the top level, and its buffers from `[limits]`.
-
 Table 3 lists the `[monitor]` keys, their defaults, and what each one decides.
 
 Table 3: the `[monitor]` keys.
@@ -179,35 +172,35 @@ Table 3: the `[monitor]` keys.
 | `one_certificate` | `false` | whether every node is expected to serve one certificate |
 | `header_check` | empty | the declared header assertions |
 | `wg_handshakes_file` | absent | the file a privileged timer writes from `wg show <interface> latest-handshakes` |
-| `tunnel_handshake_max_age_s` | 600 | the handshake age above which a tunnel is a fault |
+| `tunnel_handshake_max_age_s` | 600 | the handshake age above which a tunnel is a fault. With a tunnel configured, the start is refused below `poll_interval_s` + `timeout_ms` rounded up to whole seconds + 180 |
 | `health_last_ok_max_age_s` | three poll intervals | the age above which a node's last 200 is flagged |
 | `environment` | absent | `dev`, `staging` or `prod`. A dirty build is refused anywhere but `dev`, and a pre-release is refused on `prod` |
 | `expected_deploy_file` | absent | the deploy's record of what it expects on each node, resolved against the site directory |
 
-A key under `[monitor]` outside Table 3 stops the start with exit 2, which is how the keys of section 6 are refused.
+A key under `[monitor]` outside Table 3 stops the start with exit 2, because `Fleet` in `m6-monitor/src/fleet.rs` carries `deny_unknown_fields`.
+`poll_interval_s` is a top-level key with a default of 30 seconds, and `[monitor] poll_interval_s` is refused the same way.
+`fleet::poll_interval_s` is the one function the poller and the handshake check both read it through.
 
 `[monitor] environment` is the deployment's own declaration, like `journal_dir`.
 Absent, the monitor reads the `environment` field of the deploy's record.
-With neither, the two version rules cannot be judged and the check says so once rather than guessing.
+With neither, the two version rules cannot be judged and the check says so once.
 
 ### 5.1 The deploy's record
 
 The monitor checks each run against what the deploy meant to ship: the release version and the sha256 of every rendered config file.
-The deploy writes that record and the monitor only reads it, so the expected values are the deployment's and no path or value is compiled into this crate.
+The deploy writes that record and the monitor only reads it, so no path or value is compiled into this crate.
+No writer of this file exists in this repository, so until a deployment supplies one the monitor prints `waiting for the deploy side` and every comparison against the record waits with it.
 
 `[monitor] expected_deploy_file` names the file.
 A relative path resolves against the monitor's site directory, and `--check` resolves it against the config file's directory, the same rule `journal_dir` follows.
-A file that does not exist is a state, not a refusal to start.
+A file that does not exist is a state and the monitor starts.
 The check prints `waiting for the deploy side` and adds one warning that says so, and it adds no per-run finding for the values it could not compare.
-A file that exists and cannot be read is a Fault, because the deploy wrote something and the monitor could not use it.
-A monitor with no `expected_deploy_file` key is a warning too, and it says that no run's version, config sha256 or decided facts are checked.
+A file that exists and cannot be read is a Fault.
+A monitor with no `expected_deploy_file` key gets a warning too, saying that no run's version, config sha256 or decided facts are checked.
 
-**The deploy-side writer of this file is not implemented.** It is not in this repository, and the deploy repository had no writer at this release.
-Until one exists, the file is absent in practice, the monitor prints `waiting for the deploy side`, and every comparison against the deploy's record waits with it.
+Table 4 gives the shape, which is JSON.
 
-Table 3.1 gives the shape, which is *JSON*.
-
-Table 3.1: the deploy's expectation file.
+Table 4: the deploy's expectation file.
 
 | field | type | what it says |
 |---|---|---|
@@ -221,7 +214,7 @@ Table 3.1: the deploy's expectation file.
 
 The keys of `nodes` and `apps` are the ones the record itself carries: the node is the record's `node` field, or the hostname on its platform line, and the app is the record's `app` field.
 A node polled as several processes may key an app as `<app>/<index>`, and that entry wins over the plain `<app>`.
-Unknown fields are refused, so a deploy-side typo fails the read instead of being ignored.
+Unknown fields are refused, so a deploy-side typo fails the read.
 
 ```json
 {
@@ -241,12 +234,11 @@ Unknown fields are refused, so a deploy-side typo fails the read instead of bein
 }
 ```
 
-The deploy side that writes this file is not part of this repository.
-Until that side writes it, the monitor reports the file as waiting, and no version or config sha256 is compared.
+### 5.2 The fleet entries
 
-Table 4 gives the keys of one fleet entry.
+Table 5 gives the keys of one fleet entry.
 
-Table 4: the keys of one `[[monitor.nodes]]` entry.
+Table 5: the keys of one `[[monitor.nodes]]` entry.
 
 | key | default | what it is |
 |---|---|---|
@@ -254,17 +246,16 @@ Table 4: the keys of one `[[monitor.nodes]]` entry.
 | `url` | required | the node's base URL, scheme and authority with an optional path prefix |
 | `role` | empty | a label for the report |
 | `tunnel.address` | absent | an IP address and port on the WireGuard tunnel |
-| `tunnel.public_key` | absent | the peer's public key, for the handshake check |
+| `tunnel.public_key` | absent | the peer's public key, for the handshake check. Without it the round trip is measured and the node reports a fault, because its handshake cannot be checked |
 | `processes` | absent | how many `[server] process_index` processes the node runs on its shared port |
 
 `processes` expands one entry into `<name>/<index>` entries, each polling `tunnel.address` with its port raised by the index, so it needs that address.
 A node without `processes`, or with `processes = 1`, is polled as one address.
 
-`poll_interval_s` is a top-level key with a default of 30 seconds, and `[monitor] poll_interval_s` is refused as an unknown key.
-`fleet::poll_interval_s` is the one function the poller and the handshake check both read it through.
+A `[[monitor.header_check]]` entry names a `path`, a `header`, the expected value in `expect`, an optional `roles` list, and `cache_bust`, which is on by default.
 
 `[limits] journal_line` bounds one line the reader assembles, with `start` at 64 KiB and `max` at 4 MiB by default.
-A line past `max` is dropped and counted, and `docs/m6-app-anatomy.md` section 4.2 lists the limit with every other one.
+`docs/m6-app-anatomy.md` section 4.2 lists the limit with every other one.
 
 ```toml
 poll_interval_s = 30
@@ -284,51 +275,11 @@ url  = "https://edge-a.example.com"
 role = "cache"
 ```
 
-A `[[monitor.header_check]]` entry names a `path`, a `header`, the expected value in `expect`, an optional `roles` list, and `cache_bust`, which is on by default.
+Section 6 turns to what the service answers.
 
-Section 6 names the keys a config may not carry any more.
-
-## 6. Removed keys and the refusal
-
-The metrics tokens and the log reopen check are gone, and a config that still names one stops the start with exit 2.
-
-`Fleet` in `m6-monitor/src/fleet.rs` carries `deny_unknown_fields`, so a `[monitor]` key it does not declare is an unknown field at start.
-The message names the key and lists the ten that Table 3 gives.
-Table 5 lists what was removed and where it used to appear.
-
-Table 5: the keys and fields that are gone.
-
-| removed | where it used to appear | what a config or a reader gets now |
-|---|---|---|
-| `[monitor] log_reopen_max_age_s` | the monitor config | exit 2, `unknown field` naming the key |
-| `[monitor] perf_token_file` | the monitor config | exit 2, the same message |
-| `[[monitor.nodes]] perf_token_file` | a fleet entry | exit 2, `unknown field` naming the key |
-| `[[monitor.nodes]] metrics_over_tunnel` | a fleet entry | exit 2, the same message |
-| the log reopen section | `/check` | no section, and no `reopen` text in the report |
-| `LogReopenDigest` | `/digest` | no field, and no `log_reopen` key in the JSON |
-| the `reopen_*` columns | the history schema | new files have none, and old files keep them |
-
-There is no token anywhere in the monitor.
-`write_request` sends the method, the path, `Host` and `Connection: close`, and the crate holds no credential to send.
-The metrics documents need none, because they arrive in the journal with everything else.
-
-An old history file keeps its dead columns.
-`m6_core::sqlite::migrate` runs only the migrations above the file's `user_version`, so a `health` table made by a release that wrote the `reopen_*` columns is left as it is, and `INSERT_HEALTH` names the columns it writes.
-That is the expected state of a file that predates this release.
-
-Migration 3 rebuilds the history's `build` table with the four columns that name a build, `binary`, `release`, `commit` and `dirty`, and a `UNIQUE` constraint over all four.
-The old rows are not carried across.
-Their `hash` was the md5 of an executable the release no longer reads, and their `version` was a bare release with no build metadata, so an old row and a new row would share no comparable fact while looking alike.
-The table is recreated empty, a `health` row that named a discarded build has `build_id` set to `NULL` and keeps every other figure, and the open writes one `type=event` line that says the table was rebuilt and why.
-A file that predates the migration therefore keeps its polls, its findings, its channels and its hosts, and its build column goes blank from the moment of the upgrade.
-The version stays at 3 because `1.16.0-rc.1` has not shipped, so this migration replaces one that no released file can be at.
-
-Section 7 turns to what the service answers.
-
-## 7. The routes
+## 6. The routes
 
 The monitor serves five routes on one unix socket and has no listener.
-
 Table 6 gives the routes and what each answers.
 
 Table 6: the five routes.
@@ -345,7 +296,7 @@ The socket is `/run/m6/<config stem>.sock` (`socket_path_from_config` in `m6-cor
 `M6_SOCKET_OVERRIDE` replaces that path.
 
 The monitor has no access control of its own.
-An m6-http in front of the socket protects a route with its `require` rule, and `docs/m6-user-guide.md` section 7.10 gives the three tables that do it.
+An m6-http in front of the socket protects a route with its `require` rule, and `docs/m6-user-guide.md` section 7.10 gives the backend and the two routes that do it.
 
 `/history` and `/crawlers` answer 503 with `history is off: set [monitor] history_file to keep one` when no history file is configured.
 Both take `from` and `to` as RFC 3339 times, an optional `node`, and a range of at most 31 days.
@@ -355,14 +306,11 @@ A page holds at most 4 MiB and 10,000 rows by default, and a `Link` header with 
 curl --unix-socket /run/m6/m6-monitor.sock http://localhost/digest
 ```
 
-A client needs the socket path, and `--unix-socket` points `curl` at it.
+Section 7 says what the digest and the check contain.
 
-Section 8 says what the digest and the check contain.
-
-## 8. The digest and the check
+## 7. The digest and the check
 
 One `digest::build` call turns a finished poll into the digest that every route serves.
-
 Table 7 gives each part of the digest and the input it came from.
 
 Table 7: where each part of the digest comes from.
@@ -383,11 +331,11 @@ Table 7: where each part of the digest comes from.
 | `tunnel` | the TCP probe and the WireGuard handshake file |
 | `history` | the history file |
 | `perf_error` | the journal reader |
-| `startup` | the start-up records and the deploy's expectation file (section 8.1) |
+| `startup` | the start-up records and the deploy's expectation file (section 7.1) |
 
 Version drift compares the release part of `version`, before the `+`, because SemVer 2.0.0 gives build metadata no precedence.
 Build drift compares the metadata, which is the commit the node's binary was built from.
-Two nodes on one release built from different commits are build drift and no version drift, and a node whose version carries no metadata counts as build drift rather than agreement.
+Two nodes on one release built from different commits show build drift and no version drift, and a node whose version carries no metadata counts as build drift.
 
 `Thresholds` carries the limits the build judges against: load per CPU 2.0, memory 0.9, disk 0.8, thermal 80 C, certificate expiry 21 days, the tunnel handshake age, and the age of the last 200.
 
@@ -396,7 +344,7 @@ HEALTH comes first, one line per node with this poll's `/health` answer and the 
 PROCESSES follows when the fleet declares `processes`, and STARTUP follows that.
 STARTUP gives each node's and app's current run: the version, the run id, the start time the record states, the sha256 of every config file it read, and the number of journal lines the monitor ingested for the run, with the shutdown line when there is one.
 A run that replaced an earlier one also prints `previous: <run id>, shut down <reason> at <time>`, or `previous: <run id>, no shutdown recorded`, marked `[info]` for an expected restart and `[WARN: unexpected restart]` for the rest.
-One run with two config files, a clean shutdown and an expected restart before it prints this, with the sha256 values abbreviated to `<sha256>` and every other character what the section writes:
+One run with two config files, a clean shutdown and an expected restart before it prints this, with the sha256 values abbreviated to `<sha256>`:
 
 ```text
   origin   m6-http      ok     1.16.0-rc.1+3a639b7e5f55   started 2026-11-18T02:16:20.858965Z
@@ -406,7 +354,6 @@ One run with two config files, a clean shutdown and an expected restart before i
            previous: 1794968120857-37600, shut down signal at 2026-11-18T02:16:19.000000Z  [info]
 ```
 
-A run that replaced an earlier one without a shutdown line reads `previous: <run id>, no shutdown recorded  [WARN: unexpected restart]`.
 A record that never closed reads `FAULT` on its line with the number of lines it received.
 The section also says when the journal tail cut records and when shutdown lines named no run.
 The rest is sections A to I: A LOGGING, B PERFORMANCE, C HOST, D SECURITY AND TRAFFIC, E CRAWLERS, F CACHE HEADERS, G CONNECTION SETUP, H TUNNELS, and I HISTORY.
@@ -414,16 +361,18 @@ Section A judges the node's own log from the traffic document's `logging`, and `
 
 `m6-monitor --check <config>` prints the same report and exits 1 on a fault and 0 otherwise.
 A config the fleet parser refuses exits 1 with the parser's message, and a service that cannot start exits 2 with `m6-monitor: <what>: <why>` on stderr.
-`m6-monitor --version` prints the tag form, `v1.16.0-rc.1`, and `m6-monitor --version-full` prints one line per m6 crate in the binary, starting with `m6-monitor`. Both answer before a config path is required.
+`m6-monitor --version` prints the tag form, `v1.16.0-rc.1`, and `m6-monitor --version-full` prints one line per m6 crate in the binary, starting with `m6-monitor`.
+Both answer before a config path is required.
 
-### 8.1 The start-up checks
+### 7.1 The start-up checks
 
 The `startup` object carries each run the journal holds and the state of the deploy's record.
 It carries `environment`, `expected_file`, `expected_state`, `expected_error`, `deploy_in_progress`, `cut_records`, `orphan_shutdowns`, `journal_unavailable` and `runs`.
-Each run carries `node`, `app`, `process_index`, `run_id`, `version`, `tag`, `started_at`, `config`, `config_paths`, `lines`, `complete_lines`, `state`, `shutdown` and `previous_run_id`.
-Table 7.1 gives every check, the reference it is judged against, and its severity.
+`expected_state` is `loaded`, `missing`, `not_configured` or `unreadable`.
+Each run carries `node`, `app`, `process_index`, `run_id`, `version`, `tag`, `started_at`, `config`, `config_paths`, `lines`, `ingested_lines`, `complete_lines`, `state`, `shutdown`, `previous_run_id`, `previous_shutdown` and `restart`.
+Table 8 gives every check, the reference it is judged against, and its severity.
 
-Table 7.1: the checks on the start-up record.
+Table 8: the checks on the start-up record.
 
 | check | reference | severity |
 |---|---|---|
@@ -449,23 +398,21 @@ Table 7.1: the checks on the start-up record.
 | the monitor's environment differs from the deploy's record | the two declarations | Warn |
 | the record names no node and its platform line reports no hostname | the record itself | Warn |
 
-A finding about the deploy's record or the environment rather than one run names node `monitor`.
+A finding about the deploy's record or the environment names node `monitor`.
 The other findings name the record's node, its run id and the fact, so a reader can act on one without opening the node.
-A missing expectation file is a warning and no refusal to start.
-An unreadable one is a fault, because the deploy wrote something the monitor could not use.
 
 A restart is expected only when the deploy's record says a deploy is in progress and the previous run wrote a shutdown line.
 An unexpected restart quotes the previous run's id and, when it wrote one, the shutdown reason, its time and the uptime.
-Every restart, expected or not, carries `previous_shutdown` in the run's `/digest` entry: `{reason, at, uptime_ms}` from the previous run's shutdown line, or `null` when it wrote none.
+Every restart carries `previous_shutdown` in the run's `/digest` entry: `{reason, at, uptime_ms}` from the previous run's shutdown line, or `null` when it wrote none.
 The entry's `restart` is `info` for an expected restart and `warn` for an unexpected one, and only the second is a finding.
 `ingested_lines` is the raw count of journal lines the monitor read for the run's id: the start-up lines, any replay of them from the journal tail, and the shutdown line. `lines` counts the start-up lines alone.
-Without the deploy's record the monitor cannot claim or deny a deploy, so it treats a restart with a shutdown line as expected and the missing record has its own warning.
+Without the deploy's record the monitor cannot claim or deny a deploy, so it treats a restart with a shutdown line as expected.
 
 A record that never closed is reported under the run it was, with the number of lines it received, and it stays in the report while it is one of the 32 most recent unfinished records.
 
-Section 9 turns to the file that keeps those readings.
+Section 8 turns to the file that keeps those readings.
 
-## 9. History
+## 8. History
 
 With `[monitor] history_file` set, every finished poll is kept in one SQLite file, and that file is the record that outlives a node's journal.
 
@@ -478,16 +425,16 @@ Nothing expires by age, and the file is never vacuumed.
 A write that meets a locked file leaves its batch for the next poll, so the loop never waits on the file.
 A write that fails for another reason is reported as `failing` in the digest's `history` object, and `behind`, `prune_failed` and `over_cap` are reported there too.
 
-Section 10 says where the crate sits.
+Section 9 says where the crate sits.
 
-## 10. Where it fits
+## 9. Where it fits
 
 m6-monitor links no m6 crate other than `m6-core` (`m6-monitor/Cargo.toml`), and runs as one process with one event loop.
 The journal child is the only process it starts, and it is killed at stop.
 
-The two documents it reads are m6-http's, defined in `m6_core::monitoring` and written by `m6-log`, and the start-up record is `m6_core::startup`'s, written by the same log.
+The two documents it reads are defined in `m6_core::monitoring` and written by `m6-log`, and the start-up record is `m6_core::startup`'s, written by the same log.
 [`docs/m6-http.md`](m6-http.md) section 11 gives the documents and `/health`.
 [`docs/m6-log.md`](m6-log.md) gives the line format and `M6_TYPE`.
 [`docs/m6-user-guide.md`](m6-user-guide.md) section 7.9 gives the deployment side: the journal upload, the directory, and the unit.
 
-Read this document as the crate's reference: sections 2 and 3 are the contract with the two inputs, section 5 is the whole configuration, and section 8 is every number the digest reports together with where it came from.
+This document is the crate's reference: sections 2 and 3 are the contract with the two inputs, section 5 is the whole configuration, and section 7 is every number the digest reports together with where it came from.

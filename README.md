@@ -6,8 +6,7 @@ Start with a single `site.toml` and get *TLS* (Transport Layer Security), routin
 Add Tera templates, static files, or custom renderers in any language as your site grows.
 Publish a change with one `POST /genid`, and read `/health` from a monitor.
 Deploy to a single machine, scale to multiple processes, or fan out to a global edge fleet.
-A cache hit costs about 2.2 µs inside m6 (section 3.1).
-The install comes first, then the architecture and components, and the document closes with the reference map.
+A cache hit costs about 2.2 µs inside m6 ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §6).
 
 ## Contents
 
@@ -67,16 +66,12 @@ cargo build --release      # the custom renderers
 
 ```sh
 cd examples/05-cms
-./dev.sh                   # in one terminal: six services come up
+./dev.sh                   # in one terminal: the stack comes up
 ./test.sh                  # in another
 ```
 
-Example 05 is the one that exercises everything at once: m6-http at the edge, m6-html for templates, m6-file for assets, m6-md for markdown, m6-auth-server for logins, and a custom Rust renderer for the CMS.
-`test.sh` makes 98 checks against it: both wire protocols, assets including nested paths, compression, the cache, the security headers, every request method, the full draft to publish to unpublish cycle checked against what a visitor actually sees, login, logout, and the login throttle including its recovery.
-
-```
-  98 passed  0 failed  (98 checks)
-```
+Example 05 exercises everything at once: m6-http at the edge, m6-html for templates, m6-file for assets, m6-md for markdown, m6-auth-server for logins, and a custom Rust renderer for the CMS.
+`test.sh` checks it end to end: both wire protocols, assets, compression, the cache, the security headers, the draft to publish to unpublish cycle, login, logout and the login throttle.
 
 Then read [`docs/m6-user-guide.md`](docs/m6-user-guide.md), which walks the eleven examples from a static site up to a global fleet.
 
@@ -174,9 +169,9 @@ Tier 4 repeats tier 3 across N nodes, and each edge node reaches the origin thro
 
 ## 3. Components
 
-m6 ships seven binaries and four libraries.
-Sections 3.1 to 3.7 take the components a request meets: the edge, the HTML and file backends, the auth service, two of the libraries, and the command that manages the auth database.
-The other binaries are `m6-monitor` and `m6-md`, and the other libraries are `m6-log` and `m6-platform`.
+m6 ships seven binaries (`m6-http`, `m6-html`, `m6-file`, `m6-auth-server`, `m6-auth-cli`, `m6-monitor`, `m6-md`) and four libraries (`m6-core`, `m6-auth`, `m6-log`, `m6-platform`).
+Sections 3.1 to 3.7 cover the components a request meets.
+[`docs/m6-monitor.md`](docs/m6-monitor.md), [`docs/m6-md.md`](docs/m6-md.md), [`docs/m6-log.md`](docs/m6-log.md) and [`docs/m6-platform.md`](docs/m6-platform.md) cover the other four.
 
 ### 3.1 m6-http
 
@@ -186,21 +181,20 @@ Reverse proxy, cache, and router.
 - One thread and one edge-triggered event loop over `m6_core::platform`
 - HTTP/3 over QUIC (`quiche`) and HTTP/2 + HTTP/1.1 on the same port
 - Response cache keyed by `(path, query, content-encoding)`, with each encoding variant cached independently
-- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline: a route `require` and a source node's `/genid`.
-  m6-http decodes no token and holds no key
+- Every credential gate forwards the credential to m6-auth-server's `POST /check` (section 7)
 - Backend pools: Unix socket globs (local) or URL backends (`http://`, `https://`, `h2c://`, `h2s://`)
 - Backend sockets are found once at start from each pool's glob, and a change takes a restart
 - `site.toml` and the system config are read once at start.
   Restart m6-http after renewing a certificate
 - `Cache-Control: public` responses are cached, and `no-store` and `private` responses are skipped
-- Error pages fetched from configured `[errors] path` backend on 4xx/5xx
-- `/health` and `/genid` answered ahead of routing, the cache and every backend
+- Error pages fetched from the `[errors] path` route on a backend 4xx or 5xx
+- `[health] path` (default `/health`) and `/genid` answered ahead of routing, the cache and every backend
 
 **Performance design:**
 - No heap allocation on the hot path (cached responses)
 - Every buffer and queue starts small, grows by doubling and never shrinks, and a request past its `[limits]` maximum is refused with an error that names the key (`docs/m6-site-toml.md` §4.14)
 - A request head is limited to 8 KiB per field and 32 KiB in all, answered 400 past either, or 414 for a request line over 8 KiB
-- - The response cache is an `AHashMap` behind `Arc<RwLock<..>>`, and a generation change replaces the whole map in one assignment
+- The response cache is an `AHashMap` behind `Arc<RwLock<..>>`, and a generation change replaces the whole map in one assignment
 - The service installs `m6_core::alloc::M6Alloc`, which is mimalloc, and takes its `[limits.heap_reserve]` from the OS once at start (section 6.3)
 
 **Benchmark results:**
@@ -285,7 +279,6 @@ Static file server for assets, downloads, and any file in the site directory.
 - Symlink guard: every request path goes through `m6_core::path::resolve_within`, which canonicalises the root and the deepest existing prefix.
   A symlink escaping `site_dir` is answered 404
 - Brotli and gzip compression applied per request, and m6-http caches the compressed response
-- m6-http does all the caching
 - `Cache-Control` from the query string alone: `public, max-age=0, must-revalidate, s-maxage=86400` unversioned, and `public, max-age=31536000, immutable` for `?v=<hash>`
 
 ---
@@ -300,12 +293,12 @@ Auth service that issues tokens, answers the identity check, and manages session
   `POST /check` answers on the check socket, derived beside it as `<parent>/check-<file name>`, so `/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`
 - `POST /check` verifies the access token's signature, issuer and expiry, then reads `sub`, `username`, `roles` and `groups` from the database for that request.
   A role change or a deleted user counts from the next request
-- RS256 or ES256 JWT signing (EC recommended).
-  Access token TTL 15 min, refresh token TTL 30 days
+- RS256 or ES256 JWT signing (ES256 recommended).
+  Access token TTL 15 min and refresh token TTL 30 days by default, set in `[tokens]`
 - Key pair read at start, so a key rotation is a restart.
   A key that fails to load, or a private key that is not the pair of the public key, exits 2
 - Rate limiting: 5 failed logins per 15 minutes per client address by default, set in `[rate_limit]`
-- Credential and ACL storage in the m6-auth library
+- Credentials and access lists live in the m6-auth library
 
 ---
 
@@ -354,6 +347,7 @@ m6-auth-cli <config> group member del <group> <username>
 m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>]
 m6-auth-cli <config> token ls <username> [--json]
 m6-auth-cli <config> token revoke <token-id>
+m6-auth-cli <config> sessions revoke-all
 ```
 
 ---
@@ -452,8 +446,7 @@ backend = "m6-auth-check"
 
 `[auth] backend` names a `[[backend]]` with `sockets`, and `[auth]` does not load without that key.
 `[auth]` is also needed by a route with `require` and by either `[genid]` claim, because both of those gates ask `POST /check`.
-A `[auth] public_key` key from an earlier release is refused at load.
-The login routes keep their own backend: `/auth/login`, `/auth/logout` and `/auth/refresh` reach the login socket, and `[auth] backend` names the check socket.
+`/auth/login`, `/auth/logout` and `/auth/refresh` reach the login socket, and `[auth] backend` names the check socket.
 
 Every path in the system config is absolute.
 [`docs/m6-site-toml.md`](docs/m6-site-toml.md) gives every key and names the one file that owns it.
@@ -484,12 +477,12 @@ See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment).
 
 ### 6.1 Health and metrics
 
-`/health` has three answers.
+`/health` (`[health] path`) has three answers.
 `200` carries a JSON body whose `status` is `ok` and whose `node` is this node's name, and a process with `[server] process_index` set adds `process_index`.
 `503` carries the same body with `status` set to `degraded`.
 A process that is gone, or whose listener refuses, gives no answer.
-The degraded body names the node, because `/health` is public and unsecured, and the process logs the failed dependency in a warn line and its recovery in an info line.
-The metrics and traffic documents are `type` `perf` and `type` `traffic` log lines, so no HTTP path serves them and no credential is involved.
+The degraded body names the node only, because `/health` is public, and the process logs the failed dependency in a warn line and its recovery in an info line.
+The metrics and traffic documents are log lines of `type` `perf` and `type` `traffic`.
 
 ### 6.2 Publishing a generation
 
@@ -574,13 +567,11 @@ A backend 4xx or 5xx is rendered from the configured error route, and an empty p
 Each item below is enforced by the process that owns that step.
 
 - TLS on the public listener, terminated by m6-http
-- Every credential gate asks m6-auth-server's `POST /check` under a 50 ms deadline, and the answer is used once: a route `require` and a source node's `/genid`.
-  Nothing caches a decision
-- A revoked credential or a role change counts from the next request
-- `/health` is public, and its degraded body names the node only
+- Every credential gate asks m6-auth-server's `POST /check` and uses the answer once (section 7), so a revoked credential or a role change counts from the next request
+- `/health` is public, and its degraded body names the node only (section 6.1)
 - Path traversal: `..` in any URL path or route param is answered 404, and a param with invalid characters is answered 400
 - Symlink guard in m6-file (section 3.3): a symlink escaping `site_dir` is answered 404
-- Rate limiting on login: 5 failed attempts per 15 minutes per IP
+- Login rate limit: 5 failed attempts per 15 minutes per client address (section 3.4)
 - `site.toml` contains no secrets.
   Secrets live in the system config or a `secrets_file`
 
@@ -597,29 +588,28 @@ Table 5 lists the exit codes.
 | 2 | Config or usage error, including a QUIC or shared-port bind failure |
 
 **Table 5: the exit codes every m6 process uses.**
-A failed QUIC or shared-port bind is exit 2 (`m6-http/src/main.rs:7469`), and a failed TLS, status or h2c bind is exit 1 (`m6-http/src/main.rs:7561`, `:7587`, `:7610`).
+A failed QUIC or shared-port bind is exit 2, and a failed TLS, status or h2c bind is exit 1 ([`docs/m6-http.md`](docs/m6-http.md) §13).
 
 ---
 
 ## 11. RFC compliance
 
-m6 was audited clause by clause against RFC 9110, 9111, 9112, 9113 and 9114 in September 2026.
-Every defect the audit found in message framing and smuggling, RFC 9110 semantics, RFC 9111 caching and denial of service is fixed, with tests.
-`CHANGELOG.md` records each fix and how it was verified.
+m6 was audited against the HTTP RFCs in September 2026, and `CHANGELOG.md` records each fix and how it was verified.
+Table 6 gives the conformance scores.
+
+| Tester | Score | Floor |
+|--------|-------|-------|
+| h2spec against m6-http | **146/146** | 146 |
+| h3spec against m6-http | **47/49** | 47 |
+
+**Table 6: h2spec and h3spec scores for m6-http, and the floors CI enforces on every pull request.**
+The two h3spec failures are QPACK stream errors in quiche, argued in full in `tools/conformance-scores.txt`.
 
 ### 11.1 Still open
 
-- Most of the HTTP/2 frame, stream and flow-control findings, the HTTP/2 client behaviour findings, the HTTP/3 integration findings and the auth extension findings
-- The cache key omits scheme and authority.
-  That is safe where no response varies by Host and unsafe for multi-tenant use.
-  `should_cache` refuses to store anything whose `Vary` names a field other than `Accept-Encoding`
-
-### 11.2 The structural question
-
-The audit offered two options: replace the hand-written HTTP/2 machinery with a maintained codec, or build it out with a frame-validation table, a stream state machine, flow-control ledgers, HPACK directionality, fuzzing and h2spec.
-
-m6 built it out: h2spec scores **146/146** and h3spec **47/49**, with floors that CI enforces on every pull request.
-The two h3spec failures are QPACK stream errors in quiche, argued in full in `tools/conformance-scores.txt`.
+The cache key is `(path, query, content-encoding)` and omits scheme and authority.
+It is safe where no response varies by `Host` and unsafe for multi-tenant use.
+`should_cache` refuses to store a response whose `Vary` names a field other than `Accept-Encoding`.
 
 ---
 
@@ -642,11 +632,10 @@ The two h3spec failures are QPACK stream errors in quiche, argued in full in `to
 - MFA / WebAuthn
 - Several cores in one m6-http process: each process runs one event loop and its own cache, so a node adds processes that each cache separately.
   `[server] reuse_port` lets several processes share the public port, and `docs/m6-site-toml.md` §4.2 gives its limits
-- HTTP/2 server push and 103 Early Hints, both removed on 2026-09-18 (section 12.1)
+- Large-file serving: m6-file does not use `sendfile`
+- HTTP/2 server push and 103 Early Hints (section 12.1)
 
 ### 12.1 Why there is no server push or 103 Early Hints
-
-Both existed in m6 through 1.9.0 and were removed in 1.10.0.
 
 **HTTP/2 push.**
 The server cannot see the client's cache, so it sends bytes to a returning visitor who already has them.
@@ -655,9 +644,7 @@ A `PUSH_PROMISE` received from a client is a connection error, per RFC 9113 8.4.
 **103 Early Hints.**
 Its value is the time between a request arriving and the response being ready, so a browser can fetch subresources during backend think-time.
 m6 caches server side, so on a cache hit the response is ready immediately.
-A hit costs about 2.2 µs inside m6 (`docs/BENCHMARKS.md` section 6), so the 103 and the final response go out microseconds apart.
-
-**A backend that has think-time** can declare what the page needs with `<link rel=preload>` and `rel=modulepreload`, and the server can promote those declarations into `Link` response headers or a 103.
+A hit costs about 2.2 µs inside m6 (`docs/BENCHMARKS.md` §6), so the 103 and the final response go out microseconds apart.
 
 ---
 
@@ -666,10 +653,9 @@ A hit costs about 2.2 µs inside m6 (`docs/BENCHMARKS.md` section 6), so the 103
 m6-http is a single-threaded, in-process-cached, TLS-terminating reverse proxy.
 A cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal.
 
-**Two quantities:** a cache hit costs **~2.2 µs** inside m6 (its own timer, confirmed against a running server), and an end-to-end HTTP/2 cache hit on the benchmark host costs **225.7 to 259.2 µs**, TLS, loopback and the client included.
+A cache hit costs **~2.2 µs** inside m6 (its own timer, `hit_p50_ns` on a running server).
+An end-to-end HTTP/2 cache hit on the benchmark host costs **225.7 to 259.2 µs**, TLS, loopback and the client included.
 On that host HTTP/2 answers a cache hit 2.6 to 3 times faster than HTTP/1.1 ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)).
-
-**Limits:** multi-core scale within one instance, and large-file serving (no `sendfile`).
 
 [`docs/POSITIONING.md`](docs/POSITIONING.md) compares m6 with nginx, HAProxy, Envoy, H2O, OpenResty, Varnish and Pingora, with capability columns from each project's own documentation and nothing run like-for-like.
 
@@ -677,7 +663,7 @@ On that host HTTP/2 answers a cache hit 2.6 to 3 times faster than HTTP/1.1 ([`d
 
 ## 14. Documentation
 
-Table 6 lists every document in [`docs/`](docs/) and what it holds.
+Table 7 lists every document in [`docs/`](docs/) and what it holds.
 
 | Document | Contents |
 |---|---|
@@ -697,12 +683,13 @@ Table 6 lists every document in [`docs/`](docs/) and what it holds.
 | [`docs/m6-auth-cli.md`](docs/m6-auth-cli.md) | m6-auth-cli reference |
 | [`docs/m6-auth-lib.md`](docs/m6-auth-lib.md) | m6-auth library API |
 | [`docs/m6-md.md`](docs/m6-md.md) | m6-md Markdown processor |
+| [`docs/m6-monitor.md`](docs/m6-monitor.md) | m6-monitor reference |
 | [`docs/m6-testing.md`](docs/m6-testing.md) | What checks m6, how to run it, and the h2spec and h3spec procedure |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Raw benchmark numbers, end to end |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | What each component costs, which change changed it, and the conditions every figure was taken under |
 | [`docs/POSITIONING.md`](docs/POSITIONING.md) | Competitive analysis |
 
-**Table 6: every document in `docs/` and what it holds.**
+**Table 7: every document in `docs/` and what it holds.**
 The user guide runs a site, and the architecture document gives the reasons behind the design.
 
 ---
@@ -714,4 +701,4 @@ cargo build --release --workspace
 ```
 
 Requirements are in section 1.
-Next read [`docs/m6-user-guide.md`](docs/m6-user-guide.md) and [`docs/m6-architecture.md`](docs/m6-architecture.md).
+Next, read [`docs/m6-user-guide.md`](docs/m6-user-guide.md) and [`docs/m6-architecture.md`](docs/m6-architecture.md).

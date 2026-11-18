@@ -1,12 +1,8 @@
 # Testing m6
 
-Four layers check m6, and they differ in what does the judging.
-
-Numbers are not here.
-Conformance floors are in `tools/conformance-scores.txt` and performance numbers in [`PERFORMANCE.md`](PERFORMANCE.md), each beside its argument.
-
-Read section 4 before running h2spec or h3spec by hand.
-Four of its five traps report a failure that is not there.
+Four layers check m6, and each layer has a different judge.
+Section 1 names the four, section 2 gives the commands, section 3 describes the shared test harness, section 4 covers the conformance testers, section 5 lists the integration suites, and section 6 shows the end-to-end run.
+Section 7 states what a green run covers.
 
 ## Contents
 
@@ -20,40 +16,41 @@ Four of its five traps report a failure that is not there.
 
 ## 1. The four layers
 
-Table 1 gives the four.
-Take from it that only the first runs usefully on a laptop.
+Table 1 gives the four layers.
+Only the first runs fully on a laptop.
 
 | layer | what it proves | where it runs |
 |---|---|---|
 | unit and integration tests | m6's code does what m6 intends | laptop, build host, *CI* (continuous integration) |
-| conformance, h1spec h2spec h3spec | m6 does what the *RFC* (Request for Comments) says | build host and CI, needs the testers installed |
+| conformance, h1spec h2spec h3spec | m6 does what the *RFC* (Request for Comments) documents say | build host and CI, needs the testers installed |
 | the examples | m6's interfaces work for code outside m6 | build host and CI, needs the `m6-examples` checkout |
-| performance | a change did not cost latency | build host only, needs a quiet machine |
+| performance | a change did not cost latency | build host, needs a quiet machine |
 
 **Table 1: the four layers, what each proves, and where each runs.**
-The third column is a constraint: a layer runs only where what it needs is present.
+A layer runs only where what it needs is present.
 
-Conformance is judged by three implementations nobody here wrote.
-A test written by the same hand as the code repeats the same misreading of the RFC twice and passes both times.
+Three testers nobody on m6 wrote judge conformance.
+A test written by the author of the code repeats the author's misreading of an RFC in both places and passes.
 
 ## 2. Running the checks
 
 Table 2 gives the commands.
-Take from it that only the last one runs everything.
+Only the last one runs everything.
 
 | command | what it runs |
 |---|---|
 | `cargo test --workspace --no-fail-fast` | every unit and integration test |
-| `./check.sh` | dev build, clippy, tests, formatting, conformance, benchmarks (with the release build conformance needs) |
+| `./check.sh` | dev build, clippy, tests, formatting, conformance, benchmarks |
 | `./check.sh --no-bench` | the same without the benchmarks |
-| `tools/conformance.sh [h1\|h2\|h3\|resume]` | one protocol, or all of them with no argument |
+| `tools/conformance.sh [h1\|h2\|h3\|rfc\|resume]` | one stage, or all of them with no argument |
 | `M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh` | all of it, on Linux, with the testers installed |
 
 **Table 2: the five commands, and what each one runs.**
-`cargo test` is the loop while writing code, `check.sh` is the local gate, and `build-host-tests.sh` is what gates a merge, because it adds the performance check and real conformance.
+`cargo test` is the loop while writing code, `check.sh` is the local gate, and `build-host-tests.sh` gates a merge, because it adds the performance check, the examples and conformance without `--allow-missing-tools`.
 
 **On Linux, raise the memlock limit for your account before running them.**
-m6-http pins its memory at start (`[server] lock_memory`, on by default) and an ordinary account's `RLIMIT_MEMLOCK` is 8 MiB, so without the raise every test that starts m6-http stops at start with a `mlockall failed` error that names `RLIMIT_MEMLOCK`.
+m6-http pins its memory at start (`[server] lock_memory`, on by default), and the pin needs an unlimited soft `RLIMIT_MEMLOCK`.
+Without it every test that starts m6-http stops at start with an error that says `Pinning memory needs RLIMIT_MEMLOCK unlimited` and exits 2.
 Add two lines to a file under `/etc/security/limits.d/`, replacing `you` with the account, and log in again:
 
 ```
@@ -61,75 +58,76 @@ you  soft  memlock  unlimited
 you  hard  memlock  unlimited
 ```
 
-CI does the same for the Linux jobs with `sudo prlimit --pid $$ --memlock=unlimited:unlimited` at the top of each step that starts m6-http: the limit is inherited by every process the step's shell starts, so the m6-http the tests spawn has it.
-macOS needs nothing, because it has nothing to pin.
-`lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix` in `m6-http/tests/startup_errors.rs` lowers the limit itself with `ulimit -l 0`, checks the shell it lowered it in reports 0, and passes under any account.
-`a_warm_server_is_resident_within_its_reservation` in `m6-http/tests/heap_resident.rs` measures a warmed m6-http's resident set against its own start-up size plus the reservation it configured, and its minor page faults over 1,000 cache hits, so a pin that makes reserved memory resident fails rather than passing unnoticed.
+CI runs `sudo prlimit --pid $$ --memlock=unlimited:unlimited` at the top of each Linux step that starts m6-http, and every process the step's shell starts inherits the limit.
+macOS has no pin, so it needs nothing.
+`lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix` in `m6-http/tests/startup_errors.rs` lowers the limit itself with `ulimit -l 0` in the shell that starts m6-http.
+`a_warm_server_is_resident_within_its_reservation` in `m6-http/tests/heap_resident.rs` measures a warmed m6-http's resident set against its start-up size plus its configured reservation, and counts its minor page faults over 1,000 cache hits.
 
-Three rules apply to all of them:
+Three rules apply to every command in Table 2:
 
-- **Tests share one machine, not one port.**
-  Every integration suite claims a free loopback port from `testkit::claim_port` and holds it for the service's lifetime, so the suite runs on the harness's default threads.
-  A suite that binds a fixed port, or two test runs at once on one host, reintroduces the 502s and bind failures the claim exists to close.
+- **Tests share one machine.**
+  The suites that start a service claim a free loopback port with `testkit::claim_port` and hold it for the service's lifetime, so they run on the harness's default threads.
+  A suite that binds a fixed port, or two test runs at once on one host, produces 502s and bind failures.
 - **Run the gate on the build host.**
-  The performance check failed its own second run on a laptop because a release build was going at the same time, which moved the readings by half.
-  The conformance testers are not installed on a laptop at all.
+  The performance check measures latency, and a concurrent build moves its readings.
+  The conformance testers are installed on the build host.
 - **A check that cannot measure must fail.**
   `tools/conformance.sh --allow-missing-tools` reports an absent tester as NOT TESTED and says the run proves nothing about that protocol.
-  `check.sh` prints `PASS Conformance` and `All checks passed.` anyway, which is issue #166, so a laptop run tells you nothing about h2 or h3 whatever its last line says.
+  `check.sh` passes that flag, then ends on `Checks INCOMPLETE` and `This run is not a gate` when a tester was absent, so a laptop run tells you nothing about h2 or h3 until the last line says `All checks passed.`
   `build-host-tests.sh` runs without the flag, so the path to a release cannot skip h2 or h3.
 
 ## 3. The shared harness
 
 Every integration suite does the same four things: find a free port, find the binary cargo built for this run, start a service and wait for it to be ready, then read a response at the byte level.
-`m6-core::testkit` is the five modules that do them once.
-Table 3 gives them.
-Take from it that a suite doing any of this itself is a suite reintroducing a failure already fixed.
+`m6-core::testkit` holds five modules that do them once, plus `alloc_count` and `check`.
+Table 3 gives the five.
+A suite that does any of this itself reintroduces a failure the module closes.
 
 | module | provides | the failure it closes |
 |---|---|---|
-| `paths` | `binary`, `exec_scratch_root` | each suite guessing where the binary is, and a test that builds a release binary the run does not need |
+| `paths` | `binary`, `exec_scratch_root` | a suite guessing where the binary is, and a test that builds a release binary the run does not need |
 | `port` | `claim_port`, `PortClaim` | `TcpListener::bind(":0")` read back after the listener drops, which frees the port before the child claims it |
-| `process` | `Service`, killed on drop, both streams drained | a child that outlogs one pipe buffer blocks in `write`, and a dead child's last words go with the pipe |
-| `wait` | `for_tcp`, `for_path` | a fixed sleep, long enough on an idle laptop and not when a dozen stacks start at once |
-| `response` | `read_one` | four byte-level response parsers in the tests, disagreeing |
+| `process` | `Service`, killed on drop, stdout and stderr both drained | a child that logs more than one pipe buffer blocks in `write`, and a dead child's last output goes with the pipe |
+| `wait` | `for_tcp`, `for_path`, `for_unix`, `until` | a fixed sleep, long enough on an idle laptop and too short when a dozen stacks start at once |
+| `response` | `read_one`, `read_response` | each suite parsing responses at the byte level its own way |
 
 **Table 3: the five testkit modules, and the test failure each one closes.**
-Every failure in the third column happened, and each presented as something else: a routing bug, a hang, or a 502.
+Each failure in the third column shows up as something else: a routing bug, a hang, or a 502.
+`alloc_count` is the counting allocator behind the allocation tests, and `check` is a stand-in auth check server for tests.
 
-The harness is behind the `testkit` feature, off by default and enabled in `dev-dependencies` only, so none of it reaches a production binary.
+The harness is behind the `testkit` feature of m6-core, off by default and enabled in `dev-dependencies`, so none of it reaches a production binary.
 
-Two rules come with it, and both are quiet when broken:
+Two rules come with it:
 
 - **Hold a `PortClaim` as long as the service holds the port.**
-  Dropping it early reopens the race it exists to close, which is why it is `#[must_use]` and stored beside its `Service`.
+  Dropping it early reopens the race it closes, which is why it is `#[must_use]` and stored beside its `Service`.
 - **`Service` drains stdout as well as stderr**, because m6's services log to stdout.
 
 **`binary` never runs cargo.**
 It returns a binary of the test's own package from `CARGO_BIN_EXE_<name>`, and a binary of another workspace package from the profile directory next to the running test executable, where `cargo build --workspace --bins` puts it.
-A test that shells out to `cargo build --release` makes the whole suite pay a fat-LTO release build, which was 612 s of a 28-minute `cargo test --workspace`.
+It panics with that command when the binary is missing.
 The gate builds `cargo build --workspace --bins` in the dev profile before `cargo test`, so every binary a test needs is present.
 The scripts do not use `binary`.
-`tools/conformance.sh` and `tools/perfcheck.sh` run `target/release` directly and refuse to start when it is missing, so run `cargo build --workspace --release` before them.
-`bench.sh` builds the release binaries it needs itself. `bench.sh --handshake` measures handshakes only; see the header of `bench.sh` for `BENCH_KEY` and `BENCH_FEATURES`.
+`tools/conformance.sh` runs the dev-profile binaries in `target/debug` (`M6_BIN_DIR` selects another directory) and fails when they are missing, so run `cargo build --workspace --bins` before it.
+`tools/perfcheck.sh` measures `target/release/m6-html` by default (`--cand-bin` selects another), so run `cargo build --workspace --release` before it.
+`bench.sh` builds the release binaries it needs itself.
+`bench.sh --handshake` measures handshakes only, and its header documents `BENCH_KEY` and `BENCH_FEATURES`.
 
 ### 3.1. The accounting-tick test hook
 
-`m6-http` runs its accounting stats every ten seconds, and `Stats::new()` is the whole production value: no config key chooses it.
+`m6-http` writes its accounting stats every ten seconds (`[stats] interval_s`).
+Suites such as `loop_never_waits`, `cache_accounting` and `disk_cache` spawn the real binary and set `M6_TEST_STATS_INTERVAL_SECS` to shorten the tick, because a `#[cfg(test)]` default cannot reach a spawned process.
 
-Two integration suites, `metrics_access` and `loop_never_waits`, assert on the tick and spawn the real binary, so a `#[cfg(test)]` default cannot reach them.
-
-A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` and uses that many seconds when it parses as a positive integer.
-
-A developer who runs a debug `m6-http` by hand inherits the hook: exporting the variable shortens that process's tick, and every metrics line's trace window with it.
-
-A release build does not read the variable, so a released service always ticks at ten seconds.
+A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` in `m6-http/src/main.rs`.
+It uses that many seconds for both the stats and traffic intervals when the value parses as a positive integer.
+Exporting the variable before running a debug `m6-http` by hand shortens that process's tick, and every metrics line's trace window with it.
+A release build does not read the variable.
 
 ## 4. Conformance: h1spec, h2spec and h3spec
 
-Three independent testers check m6 against the *RFC* (Request for Comments) documents.
+Three independent testers check m6 against the RFC documents.
 Table 4 gives them.
-Take from it that HTTP/1.1 has four targets, because there are four HTTP/1.1 implementations in the workspace, while HTTP/2 and HTTP/3 live in m6-http alone.
+HTTP/1.1 has four targets because the workspace has four HTTP/1.1 implementations, and HTTP/2 and HTTP/3 live in m6-http alone.
 
 | tester | source | covers | targets |
 |---|---|---|---|
@@ -138,29 +136,28 @@ Take from it that HTTP/1.1 has four targets, because there are four HTTP/1.1 imp
 | h3spec | `github.com/kazu-yamamoto/h3spec` | RFC 9114 and QUIC | m6-http |
 
 **Table 4: the three conformance testers and what each is pointed at.**
-The last column is the asymmetry: one tester covers four services, the other two cover one.
-
-h1spec was added on 2026-09-11, and its first run found three conventions for header-name case, none of the four parsers checking `Transfer-Encoding`, and m6-file sending a body on a HEAD that 404s.
+One tester covers four services, and each of the other two covers one.
 
 ### 4.1. The script
 
-`tools/conformance.sh` writes a fixture site, starts a loopback instance, runs the tester, parses the score from the tester's own summary line, and compares it to the floor.
+`tools/conformance.sh` writes a fixture site, starts a loopback instance, runs the tester, parses the score from the tester's own summary line, and compares it to the floor in `tools/conformance-scores.txt`.
 
 ```sh
-cargo build --workspace --release     # the script runs binaries, it does not build them
+cargo build --workspace --bins        # the script runs binaries from target/debug
 tools/conformance.sh                  # all of it
 tools/conformance.sh h2               # one protocol
 ```
 
 A run below its floor fails.
-A run above it prints the new number and asks for the floor to be raised by hand, because raising a floor claims an improvement is permanent and belongs in the commit that earned it.
+A run above it prints the new number and asks for the floor to be raised by hand, because a raised floor claims the improvement is permanent and belongs in the commit that earned it.
 A target in the scores file that a full run did not measure fails the run.
 
-The script also runs m6's own RFC tests, for the behaviours an external tester cannot see: a backend's header block split across HTTP/2 frames, the field names m6 writes, `Content-Length` as `1*DIGIT`, and an `If-None-Match` 304. Every test names its RFC section, and `tools/conformance.sh rfc` runs that stage alone.
+The script also runs m6's own RFC tests, for the behaviours an external tester cannot see: a backend's header block split across HTTP/2 frames, the field names m6 writes on HTTP/2 and HTTP/3, `Content-Length` as `1*DIGIT`, an `If-None-Match` 304, a backend that answers before it has read the whole request, and the `Cache-Control` and conditional-request rules.
+Every test names its RFC section, and `tools/conformance.sh rfc` runs that stage alone.
 
 ### 4.2. By hand
 
-Running a tester by hand is for diagnosing a failure the script has already reported.
+Run a tester by hand to diagnose a failure the script has reported.
 
 ```sh
 h2spec -h 127.0.0.1 -p 8443 -t -k --timeout 5
@@ -170,32 +167,30 @@ h3spec -n 127.0.0.1 8443
 `-t` runs h2spec over *TLS* (Transport Layer Security), `-k` accepts the loopback certificate, and `-n` skips h3spec's certificate name check.
 
 Table 5 gives the five traps.
-Take from it that four of them answer confidently and wrongly, with no error to warn you.
+Four of them make a healthy m6 look broken, with no error to warn you.
 
 | # | trap | what it makes a reader believe |
 |---|---|---|
 | 1 | h3spec without `-n` | every HTTP/3 test failed, on a certificate name mismatch |
 | 2 | the rate limiter left on | a wall of HTTP/2 failures, because h2spec opens a connection per test and the limiter is what gets measured |
-| 3 | counting h2spec failures with `grep -c` | double the real number, because the tool redraws each failure line. 98 counted is 49 real |
+| 3 | counting h2spec failures with `grep -c` | double the real number, because the tool redraws each failure line (98 counted is 49 real) |
 | 4 | `grep` without `-a` on h2spec output | nothing, because the output carries control bytes and GNU grep says "binary file matches" |
 | 5 | pointing a tester at a live site | a score nobody else can reproduce |
 
 **Table 5: five traps in running h2spec or h3spec by hand, and what each one makes a reader believe.**
-Trap 1 is a missing flag, trap 2 a configuration default, traps 3 and 4 are reading the output wrongly, and trap 5 is aiming at the wrong target.
+Trap 1 is a missing flag, trap 2 a configuration default, traps 3 and 4 are output misreadings, and trap 5 is a wrong target.
 
 Two of them need more than a row:
 
 - **Trap 2 is set by a configuration default.**
   `tools/conformance.sh` writes `[rate_limit] enabled = false` into its fixture, and a hand-run instance needs the same, or `requests_per_min` raised and restored after.
-  The same trap invalidated the first benchmark run this project took.
 - **Trap 5 risks more than the reading.**
-  h2spec deliberately sends malformed frames, and a three-byte frame could once kill this process outright (F076 in [`CHANGELOG.md`](../CHANGELOG.md)).
-  A result measured against a private live site is also unreproducible by anyone else, which makes it an assertion.
+  h2spec deliberately sends malformed frames, and a result measured against a private live site cannot be reproduced by anyone else.
 
 ## 5. Where the tests are
 
 Table 6 gives a selection of the integration suites, by crate.
-Take from it that a claim about a behaviour in the selection can be traced to the file that checks it, while `tests/` holds more suites than this table lists.
+A behaviour in the table traces to the file that checks it, and each `tests/` directory holds more suites than the table lists.
 
 | crate | integration suites |
 |---|---|
@@ -207,80 +202,36 @@ Take from it that a claim about a behaviour in the selection can be traced to th
 | m6-auth-cli | `integration.rs` |
 | m6-monitor | `lifecycle.rs`, `tunnel.rs`, `history.rs` |
 
-**Table 6: the integration suites, by crate.**
-Unit tests are not listed, because they sit in `src/` beside the code they cover.
+**Table 6: a selection of the integration suites, by crate.**
+Unit tests are absent from the table because they sit in `src/` beside the code they cover.
 
-Each crate carries its own fixtures under `<crate>/tests/fixtures/`.
-m6-html's holds `site.toml`, `configs/`, `templates/`, `content/posts/` and `data/`.
-m6-file's holds a config and an `assets/` tree.
-m6-http's holds a `site/` directory with `site.toml` and a certificate, plus `system.toml`, because m6-http takes both a site directory and a system config.
-
-### 5.1. What this document does not list, and why
-
-A per-service list of behaviours used to sit here, about 120 rows over four services, written before the code as a plan.
-No row had ever been checked against the suites above, so a reader took a line like "SIGTERM twice, immediate exit" as a test that runs.
-Three of those rows named a run under the address and leak sanitisers, and no suite checked them.
-
-**Every row of that list has now been checked against the suites, on issue #165.**
-An unverified specification in `docs/` reads as a statement about what m6 does, so the list stayed on the issue while each row was checked.
-Of its 126 rows, 54 had a test whose assertion was read, 38 described real behaviour that no test checked, and 34 no longer described the code.
-The 38 untested behaviours were filed as issues #288 to #298 and #328 to #333, and the tests for #288 to #298 are now in the suites.
-The rows that no longer describe the code are listed on the issue with the reason for each, and are not carried forward.
-
-Table 6 is the answer to what checks m6: the suites, and the code in them.
+Each crate carries its fixtures under `<crate>/tests/fixtures/`.
+m6-html's holds `site.toml`, `configs/`, `templates/`, `content/posts/`, `data/` and `route_params/`.
+m6-file's holds `site.toml`, `m6-file-test.conf`, `content/posts/` and `assets/`.
+m6-http's holds `site/site.toml` and `system.toml`, because m6-http takes both a site directory and a system config.
 
 ## 6. End to end
 
-The real end-to-end suite is example 05 in `m6-examples`, which CI runs over the whole running stack on every pull request.
-Below is the shape of it, for running by hand while diagnosing a failure.
+The end-to-end suite is example 05 in `m6-examples`, and its `test.sh` checks the whole running stack.
+CI runs it on every pull request, and `tools/build-host-tests.sh` runs it on the build host.
+[`m6-user-guide.md`](m6-user-guide.md) section 6 describes the example, and a failure in `test.sh` is diagnosed by starting the stack with `setup.sh` and `dev.sh` from `examples/05-cms` and requesting the routes by hand.
 
-```sh
-# Start the stack. m6-http takes a site directory AND a system config.
-m6-html        site/ site/configs/m6-html.conf &
-m6-file        site/ site/configs/m6-file.conf &
-m6-auth-server site/ site/configs/m6-auth.conf &
-m6-http        site/ site/system.toml &
-
-# Every public route answers 200.
-for path in / /blog /blog/hello-world /assets/style.css; do
-  curl -sk -o /dev/null -w "%{http_code} $path\n" "https://localhost:8443$path"
-done
-
-# A protected route with no token answers 401.
-curl -sk -o /dev/null -w "%{http_code}\n" "https://localhost:8443/admin/dashboard"
-
-# Log in, then use the token.
-TOKEN=$(curl -sk -X POST "https://localhost:8443/auth/login" \
-  -d '{"username":"admin","password":"..."}' | jq -r .access_token)
-curl -sk -o /dev/null -w "%{http_code}\n" \
-  -H "Authorization: Bearer $TOKEN" "https://localhost:8443/admin/dashboard"
-
-# An unknown path answers 404 with the error route's HTML.
-curl -sk -o /dev/null -w "%{http_code}\n" "https://localhost:8443/does-not-exist"
-
-# Every log line is valid JSON.
-journalctl -u m6-http -o cat | jq . > /dev/null
-```
-
-That last line is a check in its own right.
-A log line that is not valid JSON is a line no log pipeline will read, and it stays invisible until something needs the logs.
-Section 7 closes on what none of the four layers reaches.
+Every log line m6 writes is one JSON object (see [`m6-log.md`](m6-log.md)), so `journalctl -u m6-http -o cat | jq . > /dev/null` is a check on a service run under systemd.
+A log line that is not valid JSON is a line no log pipeline reads.
 
 ## 7. Summary
 
-A green run means what it means only if you know which of the four layers ran.
-m6's own tests run anywhere, `m6-core::testkit` is what stops them failing for reasons that are not the code, conformance needs the testers installed, and performance needs quiet.
-Running a tester by hand needs Table 5 first.
+A green run covers the layers that ran, and Section 1 says which those are.
+m6's own tests run anywhere, `m6-core::testkit` keeps them from failing for reasons outside the code, conformance needs the testers installed, and performance needs a quiet machine.
+Table 5 applies before any hand run of a tester.
 
-The address and leak sanitisers run in their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and on pull requests to it, and by hand once the file is on `main`.
+The address and leak sanitisers run in `.github/workflows/sanitizer.yml`, on pushes to `develop`, on pull requests to it, and by hand (`workflow_dispatch`).
 Its workspace run does not enable four off-by-default m6-core features (`multipart`, `email`, `flash`, `csrf`), so the sanitisers do not instrument that code.
 
-One gap is open, and it is not a documentation problem:
-
-- **No fuzzing**, anywhere in `check.sh`, `tools/build-host-tests.sh` or CI, in a codebase that hand-writes three protocol parsers.
+Nothing in `check.sh`, `tools/build-host-tests.sh` or the CI workflows fuzzes the three hand-written protocol parsers.
 
 Table 7 gives the documents that own what this one leaves out.
-Take from it that every number omitted here has a file responsible for it.
+Every number omitted here has a file responsible for it.
 
 | document | covers |
 |---|---|
@@ -291,4 +242,4 @@ Take from it that every number omitted here has a file responsible for it.
 | [`m6-user-guide.md`](m6-user-guide.md) | the eleven examples, including example 05's end-to-end suite |
 
 **Table 7: further reading, and what each document covers.**
-The first two are the files a conformance or performance claim has to be checked against.
+The first two are the files a conformance or performance claim is checked against.

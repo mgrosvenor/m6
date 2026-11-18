@@ -5,7 +5,7 @@ It creates, changes and deletes users, groups, roles and API (*Application Progr
 It also runs the session step of a key rotation.
 
 This page is the reference for every command, flag, config key and exit code.
-Section 9 gives the order for a fresh install, and section 10 names the documents that own the material around the database.
+Section 9 gives the order for a fresh install.
 
 **Contents**
 
@@ -18,23 +18,18 @@ Section 9 gives the order for a fresh install, and section 10 names the document
 7. [Sessions](#7-sessions)
 8. [Exit codes](#8-exit-codes)
 9. [Bootstrap sequence](#9-bootstrap-sequence)
-10. [Where to read next](#10-where-to-read-next)
 
 ## 1. What m6-auth-cli is for
 
 m6-auth-cli opens the SQLite file that m6-auth owns and edits its rows directly.
-m6-auth-cli exists for two jobs: creating the first administrator before m6-auth-server starts, and managing users, groups and tokens while the site runs.
+It has two jobs: creating the first administrator before m6-auth-server starts, and managing users, groups and tokens while the site runs.
 
-The direct access is what makes both jobs possible.
 m6-auth-cli calls `m6_auth::Db::open`, the same function m6-auth-server calls.
 That call creates the database file and its tables when they are absent, so a first install needs no separate schema step.
-The same call sets a 5 second busy timeout.
-The Concurrent access section of [`m6-auth-lib.md`](m6-auth-lib.md) owns the cross-process rules.
-
-A second writer is the only case that waits.
+It also sets a 5 second busy timeout.
 A write that cannot take the lock within that timeout fails with a `database is locked` error and exit code 1.
-Each invocation opens the database, runs one command and exits, so a retry after m6-auth-server's write finishes succeeds.
-Section 2 gives the parts of a command.
+Each invocation opens the database, runs one command and exits, so a retry after the other writer finishes succeeds.
+The Concurrent access section of [`m6-auth-lib.md`](m6-auth-lib.md) gives the cross-process rules.
 
 ## 2. The command line
 
@@ -57,22 +52,20 @@ Take from it that the entity selects which commands are available.
 **Table 1: the four parts of an m6-auth-cli command line.** The first three are required, and `[args] [flags]` belongs to the command.
 
 Arguments are positional and are read from the left, so the name comes before the flags.
-A flag written before the name is read as the name, and `user add --role admin` creates a user called `--role`.
+`user add --role admin` creates a user called `--role`.
 
 `--version` or `-V` anywhere in the arguments prints the tag form, `v1.16.0-rc.1`, and exits 0, before the config file is read.
 `--version-full` prints one `<crate> - <full SemVer>` line per m6 crate in the binary, starting with `m6-auth-cli`, and exits 0 at the same point.
-The argument count is checked next: a call with fewer than three arguments prints the usage block to stderr and exits 2.
+A call with fewer than three arguments after the program name prints the usage block to stderr and exits 2.
 An unknown entity or command also exits 2, after the config file is read and the database is opened.
 
 `--json` on an `ls` command prints JSON in place of the table.
 
-The config file named by the first argument is the subject of section 3.
-
 ## 3. The config file
 
 m6-auth-cli reads one TOML file, the same `m6-auth.conf` that m6-auth-server reads.
-Table 2 gives the keys m6-auth-cli reads.
-Take from it that the user and group commands need only `[storage]`.
+Table 2 gives the keys it reads.
+Take from it that the user and group commands need `[storage]` and `[tokens] issuer`, and only `token create` needs `[keys]`.
 
 | key | required | default | used for |
 |---|---|---|---|
@@ -82,16 +75,15 @@ Take from it that the user and group commands need only `[storage]`.
 | `[keys] private_key` | `token create` only | none | signing the token |
 | `[keys] public_key` | `token create` only | none | loading the key pair |
 
-**Table 2: the config keys m6-auth-cli reads.** Only `token create` needs the two key entries.
+**Table 2: the config keys m6-auth-cli reads.** Without `[keys]`, `token create` exits 1 with `config missing [keys] section`.
 
 Every path in the file is absolute, and a relative one exits 2 naming the setting.
 m6-auth-cli creates the directory that holds the database when it is missing.
 Run it as the service's user, for example `sudo -u m6`, so every file it creates beside the database stays the service's.
 `token create` reads the private key the config names, so with a key delivered by `LoadCredential` it runs while m6-auth-server runs.
 
-Every other key is ignored by m6-auth-cli.
-The token lifetimes belong to m6-auth-server, and [`m6-auth.md`](m6-auth.md) owns the full config.
-Section 4 starts the commands with users.
+Every other key is ignored.
+[`m6-auth.md`](m6-auth.md) owns the full config and the token lifetimes.
 
 ## 4. Users
 
@@ -118,19 +110,15 @@ Roles are free text.
 Neither m6-auth-cli nor the m6-auth library validates a role, so a mistyped name creates a new role silently.
 A route's `require = "role:admin"` in `site.toml` is where a role gains meaning, and [`m6-site-toml.md`](m6-site-toml.md) owns that form.
 
-`user roles` reads and changes the list.
-With no `--set` or `--unset` it prints the roles, comma separated, and exits 0.
+`user roles` with no `--set` or `--unset` prints the roles, comma separated, and exits 0.
 `--set` adds a role that is absent and leaves one that is present in place, and `--unset` removes it.
 Both flags may repeat and may be combined in one command.
 
 `user del` removes the user row, and the schema removes the user's memberships, refresh tokens and API token records with it.
-Refresh sessions end at once because m6-auth-server checks a refresh token against the database.
-A JWT that was already issued keeps working until its `exp`, and section 6 gives the cutoff after it.
+m6-auth-server answers `POST /check` 401 for a deleted user, so a JWT issued to that user is refused at once, before its `exp`.
 
 `user ls --json` prints one JSON array.
 Each object carries `id`, `username`, `roles`, `groups` and `created_at`.
-
-Group commands follow the same pattern, and section 5 gives them.
 
 ## 5. Groups
 
@@ -150,7 +138,7 @@ Take from it that `group ls` counts the members, and only `group member add` and
 **Table 4: the six group commands.** `member` is a subcommand of `group`, so it follows the entity and precedes its own command.
 
 Group names are unique, and adding a name that exists fails with exit 1.
-A membership row holds the user and the group, so it has no roles of its own: the ROLES column in `group member ls` is each user's global role list.
+A membership row holds the user and the group, so the ROLES column in `group member ls` is each user's global role list.
 
 `group member del` exits 0 when the user is not a member, because the delete matches no row.
 A script cannot read exit 0 as proof that a membership existed.
@@ -158,12 +146,11 @@ A script cannot read exit 0 as proof that a membership existed.
 Deleting a group removes its membership rows and leaves the users in place.
 `group ls --json` prints objects with `id`, `name` and `members`, where `members` is the list of usernames, and `group member ls --json` prints full user objects.
 
-Section 6 gives the token commands, which read the same database through a different table.
-
 ## 6. API tokens
 
 Three commands mint, list and revoke API tokens.
-A token is a *JWT* (JSON Web Token) signed with the m6-auth keys, so m6-http checks it locally with the same `require` rules it uses for a session token.
+A token is a *JWT* (JSON Web Token) signed with the m6-auth keys.
+m6-http asks the check service about it with the same `require` rules it uses for a session token.
 
 Table 5 gives the three commands.
 Take from it that `token create` is the only command that prints a token.
@@ -180,26 +167,23 @@ Take from it that `token create` is the only command that prints a token.
 Its messages go to stderr, so `TOKEN=$(m6-auth-cli ... token create ...)` captures the token alone.
 The name defaults to `api-token`.
 The *TTL* (time to live) defaults to 365 days.
-`--ttl-days` takes a whole number of days, and a value that is not a number exits 1.
+`--ttl-days` takes a whole number of days, and any other value exits 1.
+`--ttl-days 0` sets `exp` to the second of minting, so the token is refused from the next second, because m6-auth-server allows zero leeway past `exp`.
 
-m6-auth-server refuses a token at `POST /check` with zero leeway past `exp`.
-`--ttl-days 0` sets `exp` to the current second, so that token is refused at once.
-
-The claims in the token carry the user id, username, roles and groups as they stood at that moment, and the configured issuer and audience.
-A later role change does not alter an issued token, because `POST /check` answers the database's current roles and groups.
-The token's `jti` is a fresh identifier for this mint, and at this tip it names no row.
+The claims carry the user id, username, roles and groups as they stood at that moment, and the configured issuer and audience.
+`POST /check` answers the database's current roles and groups, so a later role change takes effect without a new token.
+The token's `jti` is a fresh identifier for this mint and names no row.
 The database stores a SHA-256 hash of the token, so the token text cannot be recovered after the command ends.
 
-`token ls` lists every record the user has, ordered by `created_at`, newest first.
-The list includes a token whose `exp` has passed.
+`token ls` lists every record the user has, newest `created_at` first, including a token whose `exp` has passed.
 The table columns are ID, NAME, CREATED and EXPIRES, and `--json` gives the fields `id`, `user_id`, `username`, `name`, `created_at` and `expires_at`.
 An empty list prints the header and a note on stderr.
 
-`token revoke` deletes the record, and the JWT keeps working until its `exp`, because the token is checked by its signature and claims.
-`--ttl-days 1` limits that window to a day, and the row that `token ls` shows is the only record of the token afterwards.
+`token revoke` deletes the record, and the JWT keeps working until its `exp`, because `POST /check` verifies the token's signature, kind, issuer, audience and expiry and never reads the token record.
+`--ttl-days 1` limits that window to a day.
+To end a token at once, delete its user with `user del`.
 
 The sequence from minting a token to guarding a route with it is example 10 in [`m6-user-guide.md`](m6-user-guide.md).
-Section 8 gives the exit codes these commands return.
 
 ## 7. Sessions
 
@@ -208,11 +192,8 @@ It takes no argument and reports the number of rows it deleted.
 
 The command is the second step of a key rotation, after the new key files are written and before the server restarts.
 It ends every refresh token, so a stolen one cannot renew access.
-A login after the command creates a new row, which works at the restart.
+A login after the command creates a new row.
 [`m6-auth.md` section 4.2](m6-auth.md#42-key-rotation) gives the three steps of the procedure.
-
-This is the interim form of the `sessions revoke-all` step in the auth API design.
-The auth generation, the new epoch and list key, and the cache acknowledgement arrive with the token-rules step, so this version reports the rows it deleted and waits for nothing.
 
 ## 8. Exit codes
 
@@ -228,14 +209,12 @@ Take from it that code 2 is the only code that guarantees no command ran.
 
 **Table 6: the three exit codes, their meanings and examples.**
 
-`--version` or `-V` anywhere in the arguments returns 0 before the config file or the database is read, so code 0 does not prove that a command ran. `--version-full` returns 0 at the same point for the same reason.
+`--version` and `--version-full` return 0 before the config file or the database is read, so code 0 does not prove that a command ran.
 A database that cannot be created or opened fails with code 1 before an entity or command is matched, so code 1 does not prove that a command ran either.
-Code 2 covers a bad argument count and an unreadable config before the database is opened, and an unknown entity or command after it, so a mistyped command can still create the database file and its directory.
+An unknown entity or command exits 2 after the database is opened, so a mistyped command can still create the database file and its directory.
 
-A matched command that is missing its argument exits 1, because the check runs inside the command.
-`user add` with no name is the example, and `group member` with no subcommand exits 2 because that check runs before a command is matched.
-
-Section 9 puts the commands in the order a first install needs them.
+A matched command that is missing its argument exits 1, because the check runs inside the command: `user add` with no name is the example.
+`group member` with no subcommand exits 2, because that check runs before a command is matched.
 
 ## 9. Bootstrap sequence
 
@@ -254,27 +233,5 @@ m6-auth-cli configs/m6-auth.conf group member add editors admin
 
 `user add` prompts for the password twice, so the block runs interactively.
 A script can pass `--password` instead, with the warning in section 4.
-
 Start m6-auth-server after the database exists.
-[`m6-auth.md`](m6-auth.md) owns the key paths and the rest of the m6-auth-server config.
-
 Example 04 in [`m6-user-guide.md`](m6-user-guide.md) wraps the same steps in a setup script.
-Its key commands write the SEC1 form, so add the `openssl pkcs8` step from `m6-auth.md` section 4.3.
-Section 10 names the documents that own the rest.
-
-## 10. Where to read next
-
-This page covers the commands and stops at the edge of the database.
-Table 7 gives the documents that own the material around it.
-Take from it that every fact left out here has a named owner.
-
-| document | owns |
-|---|---|
-| [`m6-auth.md`](m6-auth.md) | the m6-auth-server config, the token lifetimes and key rotation |
-| [`m6-auth-lib.md`](m6-auth-lib.md) | the library API, and the argument for more than one process on one SQLite file |
-| [`m6-user-guide.md`](m6-user-guide.md) | example 04's setup script and example 10, the API token walkthrough |
-
-**Table 7: the documents that own what this page leaves out.** Start with the user guide for a working site, and use this page for the command in front of you.
-
-Each command reports its result on stdout or stderr, and section 8 tells a script which exit code to expect.
-That is the whole interface: the config file, the commands, the flags and the three exit codes.

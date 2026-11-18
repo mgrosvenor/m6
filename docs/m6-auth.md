@@ -2,7 +2,7 @@
 
 `m6-auth-server` is the authentication service in m6.
 It checks a username and password, issues *JWT* (JSON Web Token) access and refresh tokens, renews an access token, revokes a refresh token, and publishes the signing public key.
-m6-http asks this service for the identity on a protected route, so login, refresh, logout and check reach it.
+m6-http asks this service for the identity on a protected route.
 
 This page is the reference for the service binary.
 The library crate has its own page in [`m6-auth-lib.md`](m6-auth-lib.md), the administrative tool in [`m6-auth-cli.md`](m6-auth-cli.md), and the route and `[auth]` configuration in [`m6-site-toml.md`](m6-site-toml.md).
@@ -10,7 +10,7 @@ The crate manifest is `m6-auth-server/Cargo.toml`.
 
 Auth is optional.
 A site whose routes declare no `require` and whose configuration declares no `[auth]` runs no token check and needs neither this service nor a signing key.
-Section 2 states what the service owns, and section 13 lists the documents that own the rest.
+Section 2 states what the service owns, and section 13 lists the documents that cover the rest.
 
 ## 1. Contents
 
@@ -35,7 +35,7 @@ Section 2 begins with what the service owns.
 
 `m6-auth-server` owns five routes on two Unix sockets: login, refresh, logout and the public key on the primary socket, and check on the check socket.
 Table 1 gives them.
-Take from it that every route is literal, so the service has no route configuration of its own.
+Take from it that every route is a literal path, so the service has no route configuration.
 
 | method | path | listener | what it does | success |
 |---|---|---|---|---|
@@ -47,84 +47,70 @@ Take from it that every route is literal, so the service has no route configurat
 
 **Table 1: the five routes, the listener each answers on, what each does, and what success returns.**
 
-The method column is part of the contract.
-A `GET` on login, refresh or logout does not match the route.
+A `GET` on login, refresh or logout matches no route.
 
 ### 2.1. The two listeners
 
-The primary socket is the one the service has always bound, and it serves the four login routes.
-The check socket serves `/check` and nothing else.
+The primary socket serves the four login routes.
+The check socket serves `/check`.
+A route requested on the other socket answers 404, and `POST /genid` on the check socket answers 404.
 
 The check socket path is derived from the primary path: the same directory, the same file name, and the prefix `check-`.
-`/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`, so a deployment's existing login glob `/run/m6/m6-auth*.sock` matches the primary and never the check socket.
-The upgrade therefore adds a socket and moves none that already dials the primary.
-`M6_CHECK_SOCKET_OVERRIDE` sets the path outright, as `M6_SOCKET_OVERRIDE` does for the primary, because a test cannot write to `/run/m6`.
+`/run/m6/m6-auth.sock` gives `/run/m6/check-m6-auth.sock`, so the login glob `/run/m6/m6-auth*.sock` matches the primary socket only.
+`M6_CHECK_SOCKET_OVERRIDE` sets the check path outright, and `M6_SOCKET_OVERRIDE` sets the primary path, for a test that cannot write to `/run/m6`.
 
-The two listeners are selected by two flags.
-Neither flag binds both sockets, which is the upgrade path and keeps one process serving exactly what it serves today.
+Two flags select the listeners.
+With neither flag, one process binds both sockets.
 `--login-only` binds the primary socket and starts no check listener.
 `--check-only` binds the check socket and starts no login listener.
 Both flags together stop the start with exit 2, naming both.
 
-A second socket is the mechanism because m6 has no shared Unix listener: `[server] reuse_port` is a TCP and QUIC feature of m6-http, and `m6_core::net::listen_unix` has no reuse option.
-The two names are separate binds with separate accept queues.
+Both sockets of a one-process start feed one event loop and one connection table.
+A `/check` that arrives during a login waits for that login's bcrypt verify (cost 12).
+Two processes, one per flag, have two loops, and the check loop runs no bcrypt because `/auth/login` is absent from its routes.
+`m6-user-guide.md` section 7.4 gives the deployment that runs them as two units.
 
-**Two listeners in one process do not isolate `/check` from a login's bcrypt.**
-The two sockets feed one event loop and one connection table, so a `/check` that arrives during a login waits for that login's password verify, which is 273 ms at cost 12 in a release build.
-The second process is what removes that tail: with `/auth/login` absent from the check process's listener, the check loop runs no bcrypt, and a check process and a login process then have separate loops.
-`docs/m6-user-guide.md` section 7.4 gives the deployment that runs them as two units.
-
-The two processes do not load the same material.
+The two processes load different material.
 A process that binds the primary socket signs tokens and writes users, so it reads `[keys] private_key`, applies the auth schema and opens the database read-write.
-A process started with `--check-only` decodes a token and reads users, so it reads only `[keys] public_key`, applies no schema and opens the database through `m6_core::sqlite::open_read_only`, whose `PRAGMA query_only` refuses every write.
-The check side therefore needs a database that the login side created once, and a missing file or schema stops it at start with exit 2.
-It never creates the database.
+A process started with `--check-only` decodes a token and reads users, so it reads only `[keys] public_key`, applies no schema and opens the database through `m6_auth::Db::open_read_only`, which sets `PRAGMA query_only` so every write fails.
+The login side creates the database and schema once, and a check process with a missing file or schema stops at start with exit 2.
 Deliver `auth.pub` to the check unit and both key files to the login unit.
 
 The service owns the signing keys, the token lifetimes, the rate limiter and one database connection, all built at start.
-It does not manage users or groups.
-`m6-auth-cli` (the *CLI*, command-line interface) writes those rows directly, and the service reads them at login and refresh.
+`m6-auth-cli` (the *CLI*, command-line interface) writes the users and groups, and the service reads them at login, refresh and check.
 
-In a deployment, m6-http forwards a login, refresh or logout request to the service over the primary Unix socket.
-The kernel supplies no client address on that socket.
-Section 10 explains what it uses instead, and section 3 gives the two socket paths.
+m6-http forwards a login, refresh or logout request to the service over the primary Unix socket.
+A Unix socket supplies no client address, so section 10 gives the address the rate limiter uses.
 
 ## 3. Command line
 
 `m6-auth-server` takes a site directory and a config path.
 Table 2 gives the arguments and flags.
-Take from it that every flag is optional and the two positional arguments are required.
+Take from it that the two positional arguments are required and every flag is optional.
 
 | argument or flag | meaning |
 |---|---|
 | `<site-dir>` | the site root, used to find the default `site.toml` |
 | `<config-path>` | the service config, normally `configs/m6-auth.conf` |
 | `--log-level <level>` | overrides the configured log level for this run |
-| `--dump-config` | prints the core configuration and any routes declared in the config, validates the auth table and the key files, then exits |
+| `--dump-config` | prints the site directory, config paths, socket, server settings and routes, validates the auth tables and the key files, then exits |
 | `--version` or `-V` | prints the tag form, `v1.16.0-rc.1`, then exits |
 | `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, starting with `m6-auth-server`, then exits |
 | `--login-only` | binds the primary socket and serves the four login routes |
 | `--check-only` | binds the check socket and serves `/check` |
 
-**Table 2: the two positional arguments and the six flags.**
+**Table 2: the two positional arguments and the flags.**
 
-For this binary the dump covers the site directory, the config paths, the socket, the server settings and any routes declared in the config.
-The output does not list the `[storage]`, `[tokens]`, `[keys]` or `[rate_limit]` sections, or the five routes the service registers.
-The dump reads those sections with the same code the start reads, including the key material, so a config the start refuses exits 2 here too.
+The dump prints the settings core owns, and it validates `[storage]`, `[tokens]`, `[keys]` and `[rate_limit]` with the code the start runs, including the key files, so a config the start refuses exits 2 here too.
 
 A missing positional argument prints the usage line and exits 2.
-`--login-only` and `--check-only` together print one line naming both and exit 2.
 
-The socket path comes from the config file's stem, so `configs/m6-auth.conf` becomes `/run/m6/m6-auth.sock`.
-The check socket is derived beside it with the `check-` prefix, so the same config gives `/run/m6/check-m6-auth.sock`.
-The directory `/run/m6` is created at startup, and a stale socket file at either path is removed before the bind.
-`M6_SOCKET_OVERRIDE` and `M6_CHECK_SOCKET_OVERRIDE` set the two paths outright for a test that cannot write to `/run/m6`.
+The primary socket path comes from the config file's stem, so `configs/m6-auth.conf` gives `/run/m6/m6-auth.sock`.
+The check socket takes the `check-` prefix beside it, so the same config gives `/run/m6/check-m6-auth.sock`.
+The bind creates a missing parent directory and replaces a stale socket file at the path.
 
 The service logs to stdout as *JSON* (JavaScript Object Notation) lines, and `[log] level` in `site.toml` sets how much it writes.
-Logging is core's, so every m6 service writes the same lifecycle lines.
-Section 11.3 lists the lines this service adds.
-
-The config path decides the socket name.
+Section 11.3 lists the lines this service adds to core's lifecycle lines.
 
 ## 4. Configuration
 
@@ -147,21 +133,16 @@ Take from it that `[storage]` and `[keys]` are the required sections, that the i
 **Table 3: the config keys and their defaults.**
 
 Every path in this file is absolute.
-A relative path stops the service at startup with exit 2, and the error names the setting.
-The check is `secret_path` in `m6-core/src/config.rs`.
+A relative path stops the service at startup with exit 2, and the error names the setting (`secret_path`, `m6-core/src/config.rs:553`).
 
 The `issuer` falls back to `[site] domain` in the `site.toml` that the optional `site_toml` key names.
 When neither the config nor that file names one, the start stops with exit 2 and the error names `[tokens] issuer`.
 The `site_toml` key is core's, and it defaults to `<site-dir>/site.toml`.
 
-The audience is the deployment's name, and it is the issuer when `[tokens] audience` is unset.
-A token minted for one deployment is refused at another even when the two share the signing key.
+The audience is the issuer when `[tokens] audience` is unset.
+A token carries its `aud`, so a deployment with another audience refuses it even when the two share the signing key.
 
-The service reads the database path, the token lifetimes, the issuer, the audience and the rate limit once at startup.
-A change to any of them after startup is logged with the text "restart m6-auth-server to apply it", and the running value stays.
-
-The two-listener split adds no config key.
-The flags in Table 2 select the listeners, and the socket paths come from the config path and the two environment overrides.
+The service reads this file once at startup, and a change takes a restart.
 
 A complete config:
 
@@ -185,18 +166,14 @@ max_attempts = 5                  # failed logins per address
 window_secs  = 900                # 15 minutes
 ```
 
-The keys come from the unit's `LoadCredential` lines and the database from `StateDirectory=m6-auth`, as `m6-user-guide.md` section 7.2 sets out.
-The two-unit layout there gives the check unit its own config at `/etc/m6/check/m6-auth.conf`, which is this file with `private_key` removed and the login unit name in `public_key` replaced by the check unit name.
+`m6-user-guide.md` section 7.2 sets out the `LoadCredential` and `StateDirectory` lines that supply the keys and the database directory.
+The check unit's config at `/etc/m6/check/m6-auth.conf` is this file with `private_key` removed and the login unit name in `public_key` replaced by the check unit name.
 
 ### 4.1. Keys and paths
 
 The private key signs every token and the public key verifies them.
 The service reads both files at startup and keeps them in memory.
-Both paths are absolute.
-
-The pair is checked at load.
-The service signs a probe token with the private key and verifies it with the public key.
-A pair that does not match stops startup with exit 2.
+The login side signs a probe token with the private key and verifies it with the public key, and a pair that does not match stops startup with exit 2.
 Section 4.2 covers what a rotation does to tokens already issued.
 
 ### 4.2. Key rotation
@@ -204,29 +181,23 @@ Section 4.2 covers what a rotation does to tokens already issued.
 A rotation has three steps: write the new key pair in `/etc/m6`, run `m6-auth-cli <config> sessions revoke-all`, and restart m6-auth-server and m6-http.
 systemd copies a credential when the unit starts, so each restart delivers the new files.
 
-A successful rotation changes the signing key immediately after the restart.
-From then on, m6-http refuses an access token signed with the old key at the next request with 401, and a browser sees the error response.
+The service signs with the new key from the restart.
+An access token signed with the old key fails its signature check, so `/check` answers 401 at the next request.
 
-`sessions revoke-all` ends every refresh token.
-It deletes every `refresh_tokens` row in one transaction.
-The refresh route matches an opaque token by its stored SHA-256 hash and reads the row, so a deleted row refuses the next refresh even though the token itself is unchanged.
-A key change alone leaves a refresh token usable until its `exp`, so the command is the step that ends a stolen one.
-Run the command and the restart together with the key change, as one rotation.
-
-The command is the interim form of the `sessions revoke-all` step in the auth API design.
-That design adds an auth generation, a new epoch and list key, and an acknowledgement from every cache.
-This version holds no decision list on any node, so deleting the rows is the whole effect of the command and it waits for nothing.
+`sessions revoke-all` ends every refresh token by deleting every `refresh_tokens` row.
+The refresh route matches the SHA-256 hash of the token to a row, so a deleted row refuses the next refresh.
+A key change alone leaves a refresh token usable until its `exp`, because the refresh route never checks a signature (section 5.2).
+The command is therefore the step that ends a stolen refresh token.
 
 Section 4.3 gives the key formats and the commands that generate them.
 
 ### 4.3. Key generation
 
 An *EC* (elliptic curve) P-256 key produces ES256 tokens, and an *RSA* (Rivest-Shamir-Adleman) key produces RS256 tokens.
-The service picks the algorithm from the private key at load, so the key type is the only choice.
+The service picks the algorithm from the private key at load.
 
-An EC key must be PKCS#8, whose PEM tag is `PRIVATE KEY`.
-`openssl ecparam` writes a SEC1 key tagged `EC PRIVATE KEY`, and the signing library refuses that tag at startup.
-Convert the SEC1 key to PKCS#8 before use, and keep the embedded public key that the signing library needs.
+An EC private key is PKCS#8, whose PEM tag is `PRIVATE KEY`.
+`openssl ecparam` writes a SEC1 key tagged `EC PRIVATE KEY`, so the block below converts it with `openssl pkcs8`.
 Choose one of the two blocks.
 
 ```sh
@@ -245,31 +216,28 @@ openssl rsa -in auth.pem -pubout -out auth.pub
 chmod 644 auth.pub   # optional: m6-http may run as another user
 ```
 
-The private key file must be readable by the user the service runs as and by no one else.
-The umask at creation gives that without a window in which the key is world-readable.
-The same recipe is in `m6-auth-cli/tests/integration.rs`, which generates a key pair for the token tests.
-The config's `[keys]` paths name the two files it produces.
-The conversion matters: a PKCS#8 key written directly by LibreSSL's `genpkey` can omit the embedded public key and fail at signing, which is why the test goes through SEC1.
+The private key file is readable by the user the service runs as and by no one else, and the `umask 077` gives that from the moment of creation.
+`m6-auth-cli/tests/integration.rs:30` uses the same SEC1 route because a PKCS#8 key that LibreSSL's `genpkey` writes directly can omit the embedded public key and fail at signing.
+The config's `[keys]` paths name the two files the block produces.
 
-Section 4 gave the config surface, the path rules, the rotation steps and the key formats.
-Section 5 turns to the HTTP API, where those keys produce tokens.
+Section 5 turns to the HTTP API, where these keys produce tokens.
 
 ## 5. HTTP API
 
-The service exposes five routes over *HTTP* (Hypertext Transfer Protocol), and the content type decides the response shape.
-The five routes form the service's *API* (application programming interface).
+The service's *API* (application programming interface) is the five routes of Table 1 over *HTTP* (Hypertext Transfer Protocol).
+The content type of a login or refresh request decides the response shape.
 This section gives each route's request and response, beginning with login.
 
 ### 5.1. Login
 
 `POST /auth/login` accepts a form body or a JSON body, chosen by `Content-Type`.
-A request with `application/json` takes the JSON path.
-A request with `application/x-www-form-urlencoded`, or any other content type, takes the form path.
+A `Content-Type` containing `application/json` takes the JSON path.
+Any other content type takes the form path.
 
 A form login sends `username`, `password` and an optional `next`.
 
 Table 4 gives the form responses.
-Take from it that the two credential outcomes are redirects, and a blocked address gets a 429 that the browser displays.
+Take from it that both credential outcomes are redirects and a blocked address gets a 429.
 
 | condition | status | body or headers |
 |---|---|---|
@@ -279,17 +247,16 @@ Take from it that the two credential outcomes are redirects, and a blocked addre
 
 **Table 4: the three form login outcomes.**
 
-The two cookies carry `HttpOnly`, `Secure`, `SameSite=Lax` and a `Max-Age` from the token lifetime.
-
+Both cookies carry `HttpOnly`, `Secure` and `SameSite=Lax`.
 The session cookie has `Path=/` and `Max-Age=<access_ttl>`.
 The refresh cookie has `Path=/auth/refresh` and `Max-Age=<refresh_ttl>`.
-The `next` value starts with `/`, and its second byte is neither `/` nor `\`, which is the whole check.
-A value that passes is used as the `Location` header, and the service falls back to `/` when `next` is absent or fails that check.
+A `next` value passes when it starts with `/` and its second byte is neither `/` nor `\` (`is_same_origin_path`, `m6-core/src/http.rs:249`).
+A passing value is the `Location`, and `/` is the `Location` when `next` is absent or fails.
 
 A *JSON* (JavaScript Object Notation) login sends `{"username": "...", "password": "..."}`.
 On success it answers 200 with the tokens in the body and sets no cookies.
 Table 5 gives the JSON responses.
-Take from it that a JSON client owns its tokens and a browser lets the cookies do the work.
+Take from it that each outcome has its own status and error code.
 
 | condition | status | body |
 |---|---|---|
@@ -300,14 +267,13 @@ Take from it that a JSON client owns its tokens and a browser lets the cookies d
 
 **Table 5: the four JSON login outcomes.**
 
-`expires_in` is `access_ttl` in seconds, and the refresh token is the same token the form path puts in its cookie.
-
-The login stores the refresh token's SHA-256 hash with an expiry of `now + refresh_ttl`, and clears the address's failure count after a correct password.
+`expires_in` is `access_ttl` in seconds.
+A correct password clears the address's failure count and stores the refresh token's SHA-256 hash with an expiry of `now + refresh_ttl`.
 The access token carries the user's groups and roles as they are at login.
 
 ### 5.2. Refresh
 
-`POST /auth/refresh` issues a new access token from a refresh token, and it leaves the refresh token in place.
+`POST /auth/refresh` issues a new access token from a refresh token and leaves the refresh token valid.
 A browser sends the `refresh` cookie, and a JSON client sends `{"refresh_token": "..."}`.
 
 A browser refresh answers 302.
@@ -316,7 +282,7 @@ The response sets a new session cookie.
 A missing, invalid or expired refresh token answers 302 to `/login`.
 
 Table 6 gives the JSON refresh responses.
-Take from it that a failed refresh is a 401 and a bad body is a 400, so a JSON client can tell the two apart.
+Take from it that a failed refresh is a 401 and a malformed body is a 400.
 
 | condition | status | body |
 |---|---|---|
@@ -326,51 +292,41 @@ Take from it that a failed refresh is a 401 and a bad body is a 400, so a JSON c
 
 **Table 6: the three JSON refresh outcomes.**
 
-The service hashes the opaque token and matches the SHA-256 hash to the `refresh_tokens` row.
-It loads the user for current groups and roles.
-This path never verifies the token's signature, so a key change alone does not refuse a refresh token.
-
-A refresh token is a JWT with `type` set to `refresh`.
-The service does not rotate it on refresh, so the same refresh token works until it expires.
+The service matches the SHA-256 hash of the token to the `refresh_tokens` row, which carries the expiry, and loads the user for current groups and roles.
+The route verifies no signature, so a key change alone leaves a refresh token usable.
+The refresh token stays the same across refreshes and works until its expiry or a revoke.
 Section 6 gives both token shapes.
 
 ### 5.3. Logout
 
 `POST /auth/logout` clears the browser's cookies, and a bearer request revokes refresh tokens.
-A browser sends no `refresh` cookie to this path, because that cookie's `Path` is `/auth/refresh`.
-The service clears both cookies and answers 302 to `/`, and a browser logout therefore revokes no refresh row, so the refresh token stays valid until its `exp`.
-A JSON client sends `Authorization: Bearer <access token>`, and the service deletes every refresh token for that user and answers 204.
+The browser path needs no valid session and answers 302 to `/` with both cookies cleared.
+A browser sends no `refresh` cookie to this path because that cookie's `Path` is `/auth/refresh`, so a browser logout revokes no refresh row and the refresh token stays valid until its `exp`.
+A JSON client sends `Authorization: Bearer <access token>`.
+The service decodes the access token, deletes every refresh token of that user and answers 204.
+An invalid bearer token also gets 204 and revokes nothing.
 
-The browser path does not require a valid session.
-The JSON path decodes the access token to find the user.
-An invalid bearer token still gets 204, and the service revokes nothing.
-
-Access tokens stay valid until their `exp`.
-The service keeps no access-token revocation list.
-The bearer path stops the next refresh by deleting the refresh rows, and the browser path leaves them in place.
+An access token stays valid at the service until its `exp`, and the service keeps no access-token revocation list.
 
 ### 5.4. Public key
 
 `GET /auth/public-key` returns the current public key as a PEM body with `Content-Type: application/x-pem-file`.
-The route is unauthenticated, and it serves the key that is loaded, so a rotation changes the body after the service restarts.
-
-m6-http holds no key and does not call this route.
-The route exists for any other client that needs the key without filesystem access.
+The route is unauthenticated and serves the loaded key, so a rotation changes the body after the restart.
+Any client that needs the key without filesystem access reads it here.
 
 ### 5.5. Check
 
 `POST /check` answers the current identity for an access token.
 It takes `Authorization: Bearer <access token>` and returns `sub`, `username`, `roles` and `groups` read from the database.
-The answer is the decision for this request only, with no cache hint: nothing caches a decision, so a revocation counts from the next request.
+The 200 carries `Cache-Control: no-store`, and nothing caches the answer, so a role change or a revocation counts from the next request.
 A route with `require` calls it, and the edge applies that route's requirement to the identity in the answer.
 
 A missing, invalid or expired token is 401 `{"error":"unauthorised"}`.
-A user who is not in the database, including a deleted user, is the same 401 rather than an empty role list.
-A locked database is 503 `{"error":"unavailable"}` at once, because the caller's deadline is shorter than this service's one-second deferral.
-The 401 and 503 are distinct: the 401 refuses this request, and the 503 reports a database the service could not read.
+A user who is absent from the database, including a deleted user, is the same 401.
+A locked database is 503 `{"error":"unavailable"}` at once, because m6-http's 50 ms deadline is shorter than this service's one-second deferral.
+The 401 refuses this request, and the 503 reports a database the service could not read.
 
-Login, refresh, logout, the public key and check are the whole HTTP surface.
-Section 6 gives the token contents those routes produce, and section 7 gives the m6-http checks that consume them.
+Section 6 gives the token contents these routes produce, and section 7 gives the m6-http checks that consume them.
 
 ## 6. Tokens
 
@@ -379,7 +335,7 @@ The service issues two kinds of *JWT* (JSON Web Token): an access token for a re
 Every token names its kind in the header `typ`: `at+jwt` for an access token, `m6-api+jwt` for an API token and `m6-refresh+jwt` for a refresh token.
 A token with no `typ`, or any other value including the library's default `JWT`, is refused.
 Table 7 gives the claims.
-Take from it that the access token carries the identity, groups and roles, and the refresh token carries enough to find the user.
+Take from it that the access token carries the identity, groups and roles, and the refresh token carries the user id and name.
 
 | claim | access token | refresh token | meaning |
 |---|---|---|---|
@@ -396,21 +352,17 @@ Take from it that the access token carries the identity, groups and roles, and t
 
 **Table 7: the claims in each token.**
 
-The `type` claim marks a refresh token for a reader that does not look at the header.
-The `typ` header is what the service checks, and `POST /check` accepts `at+jwt` and `m6-api+jwt` and refuses `m6-refresh+jwt` before it reads the claims.
-The `jti` is new at every mint and unique per mint. At this tip it names no row: the table that can end a token by its `jti` is part of the shelved token-rules work.
-`sid` is absent for the same reason, because it names a session row this schema does not have.
+The `type` claim marks a refresh token for a reader that ignores the header.
+`POST /check` checks the `typ` header, accepts `at+jwt` and `m6-api+jwt`, and refuses `m6-refresh+jwt` before it reads the claims.
+The `jti` is new at every mint, and the service stores nothing by it.
 
-The algorithm follows the key: an EC P-256 key gives ES256, and an RSA key gives RS256.
-The `alg` header is set from the key at startup.
-The service checks the signature, `typ`, `iss`, `aud`, `exp` and the presence of `iss`, `aud`, `sub`, `exp`, `iat` and `jti` in `POST /check`, and on refresh and the JSON logout path.
+The `alg` header follows the key: an EC P-256 key gives ES256, and an RSA key gives RS256.
+`POST /check` and the JSON logout path check the signature, `typ`, `iss`, `aud` and `exp`, and require `iss`, `aud`, `sub`, `exp`, `iat` and `jti` to be present.
 The leeway is zero, so a token is refused at the second `exp` names.
-m6-http no longer decodes the token, so the algorithm and the key are this service's business.
 
-The access token's groups and roles are a snapshot at issue time.
-`POST /check` answers the database's current roles and groups, so a role change or a revocation counts from the next request.
+The groups and roles in an access token are a snapshot at issue time.
+`POST /check` answers the database's current roles and groups.
 
-The two token shapes are the contract between this service and its clients.
 Section 7 gives the m6-http configuration, and section 8 gives the identity a backend receives.
 
 ## 7. m6-http integration
@@ -443,59 +395,55 @@ path = "/auth/refresh"
 backend = "m6-auth"
 ```
 
-The login glob matches the primary socket and never the check socket, because the check socket's name begins with `check-`.
-A deployment can keep the login backend unchanged while it splits the service into two processes.
+The login glob matches the primary socket only, because the check socket's name begins with `check-`.
+The same login backend serves one process or two.
 
 `[auth] backend` names the check backend.
-m6-http probes each member once at start: 401 or 503 passes, 404 stops the start, and a refused connection warns.
-A route with `require` sends one `POST /check` per protected request, under a 50 ms deadline, and applies the route's requirement to the identity in the answer.
+m6-http probes each member once at start: 401 or 503 passes, 404 stops the start, and a refused connection warns (`m6-http.md` startup step 8).
+A route with `require` sends one `POST /check` per protected request under a 50 ms deadline.
 No credential is 401 with no call, a 401 from this service is 401, an identity without the requirement is 403, and a check that cannot be made is 503 with `Retry-After: 1`.
-Nothing caches the answer, so a role change or a revocation counts from the next request.
 
-The same check covers a source node's `/genid`, so its claims see a role change or a revocation from the next request too.
 The token sources, the `require` forms and the outcomes of a route with `require` are in [`m6-http.md`](m6-http.md) and [`m6-site-toml.md`](m6-site-toml.md).
-The header the edge sets carries the identity this service answered, and section 8 shows what a backend does with it.
+Section 8 shows what a backend receives.
 
 ## 8. Renderer integration
 
 A backend receives the identity in the `X-Auth-Claims` header, and m6 turns it into the `auth_*` request-dictionary keys.
 The keys exist only on a route with `require` and an identity that passed the check, so a backend that needs a claim on every request declares `require` on the route.
-The key names are in [`m6-core-reference.md`](m6-core-reference.md) §4.6.
+The key names are in [`m6-core-reference.md`](m6-core-reference.md) section 4.6.
 
-The authority's answer, the edge's `require` match and the backend keys are one chain.
-Section 9 covers the database that holds the users the chain begins with.
+Section 9 covers the database that holds the users behind that identity.
 
 ## 9. Storage
 
 The service stores users, groups, memberships and refresh tokens in *SQLite*.
 The `m6-auth` library owns the schema, the password hashes and every query.
-The service opens one connection through `m6_auth::Db::open` at start and keeps it for the life of the process.
+A process that binds the primary socket opens one connection through `m6_auth::Db::open` at start and keeps it for the life of the process.
 A database that cannot be opened stops the service with exit 2, and the error names the path.
 
 `Db::open` sets *WAL* (write-ahead logging), a 5-second busy timeout and foreign keys.
 WAL lets readers and one writer proceed together.
 The service sets the busy timeout to zero after that open, because a wait in the one loop holds every connection behind it.
 A statement that meets another process's lock returns `SQLITE_BUSY` at once.
-The loop defers that request and tries it again every 5 ms while it serves the other connections.
-A request that is still locked after one second is answered with 503 and `Retry-After: 1`.
-A retried login does not verify the password twice, because the retry keeps the user the first attempt verified.
+The loop defers that request and retries it every 5 ms while it serves the other connections.
+A request still locked after one second is answered with 503 and `Retry-After: 1`.
+A retried login keeps the user the first attempt verified, so it runs bcrypt once.
 `m6-auth-cli` keeps the 5-second wait, because it serves one command at a time.
-Each process has one connection and one loop.
+
 A login holds its process for its bcrypt verify, so every connection in that process waits.
 A check-only process has no login route, so that wait never reaches `/check`.
 
-The database path is the `[storage] path` key, an absolute path.
-The service creates the parent directory when it is missing.
+The database path is the absolute `[storage] path`.
+A missing parent directory stops the start with exit 2, and the error names the setting and the directory.
 `m6-auth-cli` and a custom renderer use the same library and the same file, so a user created by the CLI is visible at the next login.
 
-The database is the shared state.
 Section 10 covers the one piece of state the service keeps in memory.
 
 ## 10. Rate limiting
 
 The login route limits failed passwords by client address.
 Table 3 gives the two `[rate_limit]` keys, and the defaults are 5 failures in 900 seconds.
-Take from it that the throttle is configuration, and a restart clears it.
+Take from it that both keys are configuration and a restart clears the counts.
 
 `window_secs = 0` makes every count expire at once, which turns the throttle off.
 
@@ -506,43 +454,40 @@ The value is the whole seconds until the window ends, rounded up, so it is never
 The window is measured from the most recent failure, so five failures each inside the window use up the budget however long the series takes.
 A block lifts after `window_secs` with no further failure.
 
-The login listener is a Unix socket, so the service takes the value of `X-Forwarded-For`, then `X-Real-IP`.
+The login listener is a Unix socket, so the service keys the count on the value of `X-Forwarded-For`, then `X-Real-IP`.
 When neither is present, the address is the string `unix`.
-m6-http sets the forwarded header and strips any client-supplied copy.
-m6-http sends exactly one address in it, on HTTP/1.1 and HTTP/2, so behind m6-http the `unix` bucket is never used.
-A direct caller can set the header, so the service's socket must be reachable only by m6-http.
+m6-http strips any client-supplied `X-Forwarded-For` and sets one address in it, on HTTP/1.1 and HTTP/2, so behind m6-http every request has its own address.
+A direct caller can set the header, so only m6-http may reach the service's socket.
 
-The counts live in memory.
-A restart forgets them, and section 4 gives the restart rule for the two keys.
-The service runs one login process per site, so one count covers every login.
+The counts live in memory, and a restart forgets them.
+Each login process keeps its own counts.
 A check-only process never touches the limiter, because `/auth/login` is not on its listener.
-The source comment says that brute force slow enough to survive restarts is left to the firewall.
+Brute force slow enough to survive restarts is a firewall matter.
 The tests `forwarded_addresses_select_the_rate_limit_bucket`, `requests_without_a_forwarded_address_share_one_bucket` and `a_restart_forgets_the_failure_counts` in `m6-auth-server/tests/integration.rs` pin these limits.
-The unit test `failures_spread_across_more_than_one_window_exhaust_the_budget` in `m6-auth-server/src/rate_limit.rs` pins the window's start and its rollover.
+The unit test `failures_spread_across_more_than_one_window_exhaust_the_budget` in `m6-auth-server/src/rate_limit.rs` pins the window's start.
 
-The throttle bounds one route and one address at a time.
-Section 11 covers the process around it.
+Section 11 covers the process around the limiter.
 
 ## 11. Lifecycle
 
-The service runs one process and one event loop, with one or two Unix sockets and a signal handler.
+Each process runs one event loop on one or two Unix sockets.
 This section gives the signals, the exit codes and the log lines, beginning with the signals.
 
 ### 11.1. Signals
 
-Table 8 gives the two signals.
-Take from it that both shutdown signals exit 0 and remove the sockets the process bound.
+Table 8 gives the shutdown signals.
+Take from it that a second signal forces the exit.
 
-| signal | first receipt | later receipt |
+| signal | first receipt | second receipt |
 |---|---|---|
-| `SIGTERM` or `SIGINT` | stop accepting, remove the sockets, exit 0 | the same, and the second signal ends the process at once if the first has not |
+| `SIGTERM` or `SIGINT` | leave the loop, remove the sockets, exit 0 | exit 0 at once |
 
-**Table 8: the signals the service handles.**
+**Table 8: the shutdown signals and what each receipt does.**
 
 ### 11.2. Exit codes
 
 Table 9 gives the exit codes.
-Take from it that a configuration fault fails the start, and a request fault becomes an HTTP status.
+Take from it that a configuration fault exits 2 at start.
 
 | code | meaning |
 |---|---|
@@ -552,13 +497,12 @@ Take from it that a configuration fault fails the start, and a request fault bec
 
 **Table 9: the process exit codes.**
 
-A request that fails after startup returns a 4xx or 5xx response, and the process keeps running.
+A request that fails after startup returns a 4xx or 5xx response and the process keeps running.
 
 ### 11.3. Logging
 
 The service writes one line per event to stdout, in JSON by default.
-It logs the route outcomes and the core lifecycle lines.
-Table 10 gives the events.
+Table 10 gives the events it adds to core's lifecycle lines.
 Take from it that every login attempt is recorded with the address and every failure with a reason.
 
 | event | level | fields |
@@ -567,21 +511,18 @@ Take from it that every login attempt is recorded with the address and every fai
 | login failure | warn | `ip`, `reason` |
 | rate limit exceeded | warn | `ip` |
 | token refresh | info | `user_id` |
-| logout | info | `user_id` for the bearer path |
+| logout | info | `user_id` on the bearer path, none on the browser path |
 
 **Table 10: the log events this service adds to the core lifecycle lines.**
 
-The service never logs a password, a token or key material.
+The service logs no password, token or key material.
 
-A change to a startup-only value is logged at warn level, and section 4 gives the restart rule.
-
-Signals, exit codes and logs are the process contract.
-Section 12 states what the service does not do.
+Section 12 states what the service leaves out.
 
 ## 12. Limits
 
-The service covers password login, token refresh, logout and key publication.
-It does not implement the features in this list, and each one is a scope boundary:
+The service covers password login, token refresh, logout, key publication and the identity check.
+It does not implement these features:
 
 - OAuth 2.0 or OpenID Connect provider.
 - *SAML* (Security Assertion Markup Language).
@@ -590,18 +531,16 @@ It does not implement the features in this list, and each one is a scope boundar
 - Passkeys or WebAuthn.
 - Password reset by email, which a custom renderer can add with the *SMTP* (Simple Mail Transfer Protocol) support in core and the `m6-auth` library.
 
-A feature that changes the token contract belongs in this service.
 A feature that builds on the existing tokens belongs in a renderer.
-The six items above are the scope, and section 13 collects the documents that own the details this page leaves out.
+Section 13 lists the documents that cover the rest.
 
 ## 13. Summary and further reading
 
-`m6-auth-server` turns a password into a short-lived access token and a refresh token, and answers the current identity on `POST /check` for a protected route.
-The service has five routes, one or two listeners, one config file and one SQLite database.
-The rotation steps and the two path rules are in section 4.
+`m6-auth-server` turns a password into an access token and a refresh token, and answers the current identity on `POST /check` for a protected route.
+It has five routes, one or two listeners, one config file and one SQLite database.
 
 Table 11 gives the documents that own what this page leaves out.
-Take from it that every number and every contract has a file responsible for it.
+Take from it that each topic this page leaves out has one owning document.
 
 | document | covers |
 |---|---|
@@ -610,12 +549,7 @@ Take from it that every number and every contract has a file responsible for it.
 | [`m6-site-toml.md`](m6-site-toml.md) | `[auth]`, `[[backend]]`, `[[route]]` and `require` |
 | [`m6-http.md`](m6-http.md) | m6-http internals, including the edge check and the cache |
 | [`m6-core-reference.md`](m6-core-reference.md) | the request dictionary and the renderer API |
-| [`m6-architecture.md`](m6-architecture.md) | why the edge verifies tokens and why the header is stripped |
+| [`m6-architecture.md`](m6-architecture.md) | the edge check and why `X-Auth-Claims` and `X-Forwarded-For` are stripped from inbound requests |
 | `m6-auth-server/Cargo.toml` | the crate's dependencies and features |
 
 **Table 11: further reading, and what each document covers.**
-
-The first three are the pages a deployment reads beside this one.
-
-A change to those routes or claims changes this page.
-The rest of the page is the detail behind them.
