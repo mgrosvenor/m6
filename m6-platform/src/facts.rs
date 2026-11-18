@@ -38,6 +38,7 @@
 //! network, so one call is a fixed number of small file reads and system calls.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::ser::SerializeStruct;
@@ -801,6 +802,109 @@ pub fn parse_cgroup_cpu_v1(quota: &str, period: &str) -> Option<Option<CpuLimit>
     }))
 }
 
+// ── Reading a cgroup ─────────────────────────────────────────────────────────
+//
+// The mount point is not the process's group. A service runs in a scope or a
+// container directory, and the limit that applies is a file in that directory
+// or in the nearest parent above it. `/proc/self/cgroup` names the directory,
+// and the readers below take the mount point as a parameter so the walk is
+// held by fixture tests rather than by the host's own cgroup.
+
+/// The group `/proc/self/cgroup` names in the cgroup v2 hierarchy.
+///
+/// cgroup v2 writes one line, `0::<path>`, and a hybrid host writes it beside
+/// its v1 controller lines. `None` means there is no v2 hierarchy to walk,
+/// which is a v1-only host rather than a failure.
+pub fn parse_self_cgroup_v2(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let Some(path) = line.trim().strip_prefix("0::") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.starts_with('/') {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// `group`'s directory under a hierarchy mounted at `root`.
+///
+/// Only normal components are joined, so a path that arrived with `..` in it
+/// cannot walk out of the hierarchy.
+fn cgroup_dir(root: &Path, group: &str) -> PathBuf {
+    let mut dir = root.to_path_buf();
+    for part in Path::new(group).components() {
+        if let std::path::Component::Normal(name) = part {
+            dir.push(name);
+        }
+    }
+    dir
+}
+
+/// The first `file` found in `group`'s own directory or an ancestor's, up to
+/// the hierarchy root.
+///
+/// A group's own file can be absent: a directory whose controller is not
+/// enabled there has no `memory.max`, and the setting in force is the nearest
+/// ancestor's. The walk starts at the group and ends at the mount point, whose
+/// own file is a real answer and not a reason to give up. `None` means no
+/// directory from the group to the root has a readable file.
+///
+/// The mount point is a parameter, so a test reads its own fixture directory
+/// and needs no cgroup of its own. On Linux the caller passes
+/// `/sys/fs/cgroup` and the path [`parse_self_cgroup_v2`] read.
+pub fn read_cgroup_file(root: &Path, group: &str, file: &str) -> Option<String> {
+    let mut dir = cgroup_dir(root, group);
+    loop {
+        match std::fs::read_to_string(dir.join(file)) {
+            Ok(text) => return Some(text),
+            // A file that is not there is the case the walk exists for. Any
+            // other error is a file that really cannot be read, and an
+            // ancestor's setting is not this group's, so it is not the answer.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        if dir.as_path() == root || !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// The cgroup memory limit for `group` under a hierarchy mounted at `root`.
+///
+/// `max` is a known value meaning the group sets no limit, and it answers
+/// `Fact::Known(None)`. A number is the limit in bytes and answers
+/// `Fact::Known(Some(bytes))`. `Fact::Unknown` is a file that could not be
+/// read or did not hold a number, and it is the only answer a reader may take
+/// as "could not look".
+pub fn read_cgroup_memory(root: &Path, group: &str) -> Fact<Option<u64>> {
+    match read_cgroup_file(root, group, "memory.max") {
+        Some(text) => match parse_cgroup_memory_max(&text) {
+            Some(limit) => Fact::Known(limit),
+            None => Fact::Unknown("the cgroup memory.max is not a number"),
+        },
+        None => Fact::Unknown("cannot read the cgroup memory.max or any parent's"),
+    }
+}
+
+/// The cgroup CPU quota for `group` under a hierarchy mounted at `root`.
+///
+/// `max <period>` means the group sets no quota and answers `Fact::Known(None)`.
+/// A `<quota> <period>` pair is the quota in the kernel's microseconds,
+/// `Fact::Known(Some(limit))`. `Fact::Unknown` is a file that could not be read
+/// or did not hold a pair, and it is the only answer a reader may take as
+/// "could not look".
+pub fn read_cgroup_cpu(root: &Path, group: &str) -> Fact<Option<CpuLimit>> {
+    match read_cgroup_file(root, group, "cpu.max") {
+        Some(text) => match parse_cgroup_cpu_max(&text) {
+            Some(limit) => Fact::Known(limit),
+            None => Fact::Unknown("the cgroup cpu.max is not a quota and period"),
+        },
+        None => Fact::Unknown("cannot read the cgroup cpu.max or any parent's"),
+    }
+}
+
 /// The virtualisation type from the DMI strings and the CPU's `hypervisor`
 /// flag.
 ///
@@ -1162,6 +1266,229 @@ mod tests {
             }))
         );
         assert_eq!(parse_cgroup_cpu_v1("200000\n", "0\n"), None);
+    }
+
+    // ── The cgroup readers, over a fixture hierarchy ─────────────────────────
+    //
+    // Every test below builds the hierarchy it reads under a temporary
+    // directory and passes that directory as the mount point, so no test reads
+    // the host's /sys and all of them run on a host with no cgroups at all.
+
+    /// A fixture hierarchy: `(path, text)` pairs, each written under a fresh
+    /// temporary directory that stands in for `/sys/fs/cgroup`.
+    fn hierarchy(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a fixture directory");
+        for (path, text) in files {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().expect("a parent directory"))
+                .expect("a cgroup directory");
+            std::fs::write(&file, text).expect("a fixture file");
+        }
+        dir
+    }
+
+    /// A session scope is the case the owner's host reported: `/proc/self/cgroup`
+    /// names it and its own `memory.max` reads `max`.
+    #[test]
+    fn the_process_group_comes_from_the_v2_line() {
+        let text = "0::/user.slice/user-1001.slice/session-13.scope\n";
+        assert_eq!(
+            parse_self_cgroup_v2(text).as_deref(),
+            Some("/user.slice/user-1001.slice/session-13.scope")
+        );
+        // A hybrid host writes the v1 controller lines beside the v2 one.
+        let hybrid = "12:cpu,cpuacct:/user.slice\n4:memory:/user.slice\n\
+                      0::/user.slice/user-1001.slice/session-13.scope\n";
+        assert_eq!(
+            parse_self_cgroup_v2(hybrid).as_deref(),
+            Some("/user.slice/user-1001.slice/session-13.scope")
+        );
+        // A v1-only host has no v2 hierarchy to walk.
+        assert_eq!(parse_self_cgroup_v2("4:memory:/user.slice\n"), None);
+        assert_eq!(parse_self_cgroup_v2(""), None);
+        assert_eq!(parse_self_cgroup_v2("0::not-a-path\n"), None);
+    }
+
+    /// `max` is the kernel saying the group sets no limit. It is a known
+    /// answer, and collapsing it into `Unknown` loses the difference between
+    /// unlimited and unreadable.
+    #[test]
+    fn a_fixture_reading_max_is_a_known_unlimited_memory() {
+        let dir = hierarchy(&[("user.slice/memory.max", "max\n")]);
+        assert_eq!(
+            read_cgroup_memory(dir.path(), "/user.slice"),
+            Fact::Known(None)
+        );
+    }
+
+    /// A number is the limit, in bytes.
+    #[test]
+    fn a_fixture_reading_a_number_is_the_memory_limit() {
+        let dir = hierarchy(&[("user.slice/memory.max", "536870912\n")]);
+        assert_eq!(
+            read_cgroup_memory(dir.path(), "/user.slice"),
+            Fact::Known(Some(536_870_912))
+        );
+    }
+
+    /// `max <period>` is the kernel saying the group has no quota.
+    #[test]
+    fn a_fixture_reading_max_cpu_is_a_known_no_quota() {
+        let dir = hierarchy(&[("session.scope/cpu.max", "max 100000\n")]);
+        assert_eq!(
+            read_cgroup_cpu(dir.path(), "/session.scope"),
+            Fact::Known(None)
+        );
+    }
+
+    /// `<quota> <period>` is the quota, in the kernel's microseconds.
+    #[test]
+    fn a_fixture_reading_a_quota_and_period_is_the_cpu_limit() {
+        let dir = hierarchy(&[("session.scope/cpu.max", "200000 100000\n")]);
+        assert_eq!(
+            read_cgroup_cpu(dir.path(), "/session.scope"),
+            Fact::Known(Some(CpuLimit {
+                quota_micros: 200_000,
+                period_micros: 100_000,
+            }))
+        );
+    }
+
+    /// A group whose own file is missing takes the nearest parent's, and not
+    /// a higher one, so the walk goes in one direction only.
+    #[test]
+    fn a_missing_file_at_the_leaf_reads_the_nearest_parent_that_has_one() {
+        let dir = hierarchy(&[
+            ("memory.max", "max\n"),
+            ("user.slice/memory.max", "1073741824\n"),
+            ("user.slice/session.scope/cpu.max", "50000 100000\n"),
+            ("cpu.max", "max 100000\n"),
+        ]);
+        assert_eq!(
+            read_cgroup_memory(dir.path(), "/user.slice/session.scope"),
+            Fact::Known(Some(1_073_741_824)),
+            "the parent has the file and the root's `max` is further away"
+        );
+        assert_eq!(
+            read_cgroup_cpu(dir.path(), "/user.slice/session.scope"),
+            Fact::Known(Some(CpuLimit {
+                quota_micros: 50_000,
+                period_micros: 100_000,
+            }))
+        );
+    }
+
+    /// The walk ends at the hierarchy root, and the root's own `max` is the
+    /// answer. A walk that reached the root and then fell through to `Unknown`
+    /// would report a host with no limit as a host that could not be read.
+    #[test]
+    fn the_walk_ends_at_the_root_and_the_root_answers() {
+        let dir = hierarchy(&[("memory.max", "max\n"), ("cpu.max", "max 100000\n")]);
+        assert_eq!(
+            read_cgroup_memory(dir.path(), "/user.slice/session.scope"),
+            Fact::Known(None)
+        );
+        assert_eq!(
+            read_cgroup_cpu(dir.path(), "/user.slice/session.scope"),
+            Fact::Known(None)
+        );
+    }
+
+    /// No file anywhere is the one case that is unknown, and it says what was
+    /// tried.
+    #[test]
+    fn a_file_missing_everywhere_is_unknown_with_a_reason() {
+        let dir = hierarchy(&[("user.slice/other.txt", "not a limit\n")]);
+        let memory = read_cgroup_memory(dir.path(), "/user.slice/session.scope");
+        assert_eq!(
+            memory,
+            Fact::Unknown("cannot read the cgroup memory.max or any parent's")
+        );
+        let cpu = read_cgroup_cpu(dir.path(), "/user.slice/session.scope");
+        assert_eq!(
+            cpu,
+            Fact::Unknown("cannot read the cgroup cpu.max or any parent's")
+        );
+        assert!(!memory.is_known() && !cpu.is_known());
+    }
+
+    /// A path that is not a cgroup at all is unknown rather than a zero, and a
+    /// mount point that is a file rather than a directory is the same.
+    #[test]
+    fn a_directory_that_is_not_a_cgroup_is_unknown() {
+        let dir = hierarchy(&[("README", "no cgroup here\n")]);
+        assert_eq!(
+            read_cgroup_memory(dir.path(), "/user.slice/session.scope"),
+            Fact::Unknown("cannot read the cgroup memory.max or any parent's")
+        );
+        let file = dir.path().join("README");
+        assert_eq!(
+            read_cgroup_cpu(&file, "/"),
+            Fact::Unknown("cannot read the cgroup cpu.max or any parent's")
+        );
+    }
+
+    /// The walk stops at the mount point it was given. A fixture root's parent
+    /// is not a cgroup, and a file there must not be read.
+    #[test]
+    fn the_walk_never_leaves_the_hierarchy_root() {
+        let outer = tempfile::tempdir().expect("a fixture directory");
+        std::fs::write(outer.path().join("memory.max"), "512\n").expect("a file above the root");
+        let root = outer.path().join("cgroup");
+        std::fs::create_dir_all(root.join("user.slice")).expect("a group directory");
+        assert_eq!(
+            read_cgroup_memory(&root, "/user.slice/session.scope"),
+            Fact::Unknown("cannot read the cgroup memory.max or any parent's")
+        );
+    }
+
+    /// A group path cannot walk out of the mount point, whatever it holds.
+    #[test]
+    fn a_group_path_cannot_escape_the_hierarchy_root() {
+        let outer = tempfile::tempdir().expect("a fixture directory");
+        std::fs::write(outer.path().join("memory.max"), "512\n").expect("a file above the root");
+        let root = outer.path().join("cgroup");
+        std::fs::create_dir_all(&root).expect("a group directory");
+        assert_eq!(
+            read_cgroup_memory(&root, "/../../"),
+            Fact::Unknown("cannot read the cgroup memory.max or any parent's")
+        );
+    }
+
+    /// A file that exists and does not hold the fact is unknown with the parse
+    /// reason, never read as a limit of zero.
+    #[test]
+    fn a_file_that_is_not_a_limit_is_unknown() {
+        let dir = hierarchy(&[("memory.max", "lots\n"), ("cpu.max", "200000\n")]);
+        assert_eq!(
+            read_cgroup_memory(dir.path(), "/"),
+            Fact::Unknown("the cgroup memory.max is not a number")
+        );
+        assert_eq!(
+            read_cgroup_cpu(dir.path(), "/"),
+            Fact::Unknown("the cgroup cpu.max is not a quota and period")
+        );
+    }
+
+    /// Unlimited and unreadable serialise differently, so a monitor can print
+    /// "unlimited" for one and "I could not look" for the other.
+    #[test]
+    fn unlimited_and_unreadable_serialise_differently() {
+        let unlimited: Fact<Option<u64>> = Fact::Known(None);
+        let unreadable: Fact<Option<u64>> =
+            Fact::Unknown("cannot read the cgroup memory.max or any parent's");
+        assert_eq!(
+            serde_json::to_string(&unlimited).expect("serialise"),
+            r#"{"known":null}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&unreadable).expect("serialise"),
+            r#"{"unknown":"cannot read the cgroup memory.max or any parent's"}"#
+        );
+        assert_ne!(
+            serde_json::to_string(&unlimited).expect("serialise"),
+            serde_json::to_string(&unreadable).expect("serialise")
+        );
     }
 
     /// The DMI names a hypervisor, a bare machine, and an unnamed hypervisor,
