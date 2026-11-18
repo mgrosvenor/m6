@@ -398,15 +398,7 @@ impl Drop for ServingCheck {
 }
 
 fn not_found(stream: &mut UnixStream) -> std::io::Result<()> {
-    let body = br#"{"error":"not found"}"#;
-    write!(
-        stream,
-        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body)?;
-    let _ = stream.shutdown(Shutdown::Both);
-    Ok(())
+    response(stream, 404, "Not Found", br#"{"error":"not found"}"#)
 }
 
 fn write_reply(stream: &mut UnixStream, reply: &Reply) -> std::io::Result<()> {
@@ -462,18 +454,26 @@ fn wait(after: Duration) {
     let _ = poll.poll(&mut events, Some(after));
 }
 
+/// Write one whole answer, head and body, in a single `write_all`.
+///
+/// A client may close as soon as it has the head: m6-http's start probe reads
+/// to the blank line, takes the status and closes. A head written in pieces
+/// and a body written after it lets that close land between the two writes,
+/// and the body's write then fails with `EPIPE`. One buffer, as a real server
+/// sends it, means the head never arrives without its body.
 fn response(
     stream: &mut UnixStream,
     status: u16,
     reason: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
-    write!(
-        stream,
+    let mut answer = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    )?;
-    stream.write_all(body)?;
+    )
+    .into_bytes();
+    answer.extend_from_slice(body);
+    stream.write_all(&answer)?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(())
 }
