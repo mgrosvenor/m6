@@ -19,7 +19,9 @@ It opens with the rule, then the contracts, then the ports and the tests.
 Platform-specific code lives in `m6-platform/src/` and nowhere else.
 `src/lib.rs` holds the API and the shared code, `src/linux.rs` and `src/macos.rs` hold the two implementations, selected once by OS family and never by CPU.
 A family with no file fails to build with a message naming the file a port adds.
-The gate test `m6-platform/tests/platform_gate.rs` refuses, in every other `.rs` file and manifest of the workspace, tests included: a `cfg` that names a platform, the crates `mio`, `nix`, `rustix` and `libc`, a direct `Instant::now()` or `SystemTime::now()` outside tests, and a read of a systemd-only variable.
+The gate test `m6-platform/tests/platform_gate.rs` refuses, in every other `.rs` file and manifest of the workspace, tests included: a `cfg` that names a platform, the crates `mio`, `nix`, `rustix` and `libc`, a direct `Instant::now()` or `SystemTime::now()` outside tests, a read of a systemd-only variable, and a read of a host fact.
+That last rule covers a `/proc`, `/sys` or os-release path, `uname`, the host name, the interface table, an rlimit and a `sysctl`.
+The one call site for the start-up facts is `m6_core::platform::host_facts()`, and the gate refuses an OS read anywhere else.
 Supported means built and tested in CI: macOS arm64, Linux x86_64 and Linux arm64.
 The rule is the whole design, and the contracts below are what it protects.
 
@@ -47,10 +49,18 @@ Table 1 lists them.
 | `process::virtual_bytes` and `process::resident_bytes` | the process's address space and its resident set, in bytes, or `None` where the platform keeps no such report | `VmSize` and `VmRSS` of `/proc/self/status` | `None` |
 | `process::page_size` | the size of one memory page, a power of two of at least 4 KiB, the unit `m6-core`'s bounded buffers are sized in | 4 KiB on x86_64 | 16 KiB on arm64 |
 | `host` | memory, load, uptime, disk space and interface counters are real values, an unreadable source is `None` or an empty list, never a row of zeros | `/proc` and `/sys` | `sysinfo` with its default features off, so no thread starts |
-| `process` facts | thread count, open descriptors, alive, listening on TCP, root, and the worker range reading the host's certificate store leaves | `/proc/<pid>`; the store is a file read and leaves no thread | `proc_pidinfo`, `lsof`; the Security framework leaves three or four |
+| `facts::host_facts` | one reading at start of the host name, the FQDN, every interface address with its name and scope, the OS and kernel, the CPU model and count, total memory, page size and huge-page setting, the rlimits, `somaxconn` and cgroup limits, the time zone, clock source and boot time, and the virtualisation type. Never fails and never panics. A fact the host will not give is `Unknown` with a reason, so a reader can tell it from an empty value | `/etc/os-release`, `/proc/meminfo`, `/proc/cpuinfo`, `/proc/stat`, `/proc/sys/net/core/somaxconn`, `/sys/kernel/mm/transparent_hugepage/enabled`, `/sys/fs/cgroup`, `/sys/class/dmi/id`, `/sys/devices/system/clocksource`, `uname`, `gethostname`, `getifaddrs`, `getrlimit` | `SystemVersion.plist`, `kern.boottime`, `kern.ipc.somaxconn`, `machdep.cpu.brand_string`, `hw.memsize`, `hw.model`, `kern.hv_vmm_present`, `uname`, `gethostname`, `getifaddrs`, `getrlimit` |
+| `process` facts | thread count, open descriptors, alive, listening on TCP, root, another process's resident, virtual and locked memory and its minor page faults, and the worker range reading the host's certificate store leaves. A count that cannot be read is an error, never a zero | `/proc/<pid>`; the store is a file read and leaves no thread | `proc_pidinfo`, `lsof`; no memory or fault report for another process, so those are an error; the Security framework leaves three or four |
 | directories | `runtime_dir` is `/run/m6`, `temp_dir` honours `TMPDIR`, `socket_scratch_root` is the short root a socket scratch directory goes under whatever `TMPDIR` is, `scratch_dir` permits exec, `create_private` gives 0700 and 0600 | the same | the same |
 
 Table 1: each item of the layer, its contract, and the mechanism behind it on each OS.
+
+`facts::host_facts` is the one reading of a host a service is not polling, and it is called once at start.
+Its groups are `Fact` values all the way down, so a host that will say how many CPUs it has but not which model does not lose the count.
+A fact that could not be read serialises as `{"unknown": "reason"}` rather than being left out, so a reader can tell an unknown fact from an absent key.
+The boot time is RFC 3339 in UTC from `write_rfc3339_utc`, the one date text m6 writes.
+The address scope is a documented heuristic: a `wg` name or a `utun` name is WireGuard, a private range is private, and the rest is public.
+The one read that can block is the resolver lookup for the FQDN, and it is skipped when the host name already carries its domain.
 
 Three things are stated and not normalised.
 A writable report may repeat on macOS after the peer acknowledges data, because kqueue re-arms the filter and epoll does not. A loop that writes until `WouldBlock` pays one failed write for it.
@@ -111,7 +121,7 @@ Table 3 maps them.
 
 | suite | file | holds |
 |---|---|---|
-| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), what a spawned child inherits and an interrupted harness (2), sockets (13), clock (2), limits (2), host and process facts (13), directories (5) |
+| the contract | `m6-platform/tests/platform_contract.rs` | readiness (17 cases), child exit (8), what a spawned child inherits and an interrupted harness (2), sockets (13), clock (2), limits (2), host and process facts (14, including the start-up facts), directories (8) |
 | signals | `m6-platform/tests/platform_signals.rs` | the 8 signal cases, in its own `main` so the mask is set before any thread |
 | the gate | `m6-platform/tests/platform_gate.rs` | the rule in section 1 |
 | the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with 17 behavioural checks including zero allocations, a shutdown that drains and queued clients served once descriptors free |

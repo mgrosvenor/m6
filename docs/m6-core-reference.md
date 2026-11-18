@@ -141,7 +141,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `monitoring` | `/health`, and the metrics and traffic documents: `HealthReport`, `PerfReport`, `TrafficReport` and `LoggingHealth`. |
 | | `resolve` | Reverse DNS with forward confirmation, `Ptr` re-exported. The lookup is `dns::Confirm`, driven by a service's loop. |
 | | `dns` | `Confirm`, `Query`, `Ptr` and `nameserver`: one DNS question on its own non-blocking UDP socket. |
-| | `platform` | The platform layer, the one crate that knows the operating system: readiness, the clock, signals, a child's exit, sockets, limits, directories, host and process facts. `docs/m6-platform.md`. Its `host` module is what the machine is doing: load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. |
+| | `platform` | The platform layer, the one crate that knows the operating system: readiness, the clock, signals, a child's exit, sockets, limits, directories, host and process facts. `docs/m6-platform.md`. Its `host` module is what the machine is doing: load, memory, disk, thermal, net, diskstats, pressure, *TCP* and file descriptors. Its `facts` module is what the host says it is, read once at start: `host_facts()`. |
 | | `tls` | How long the loaded certificate has left and its fingerprint: `not_after_unix`, `Fingerprint`, `record_loaded`, `loaded` and `TlsCertificate`. |
 | | `firewall` | `FirewallState` from nftables' own JSON. |
 | | `wireguard` | `Handshakes` from `wg show <if> latest-handshakes` output. |
@@ -845,6 +845,27 @@ Two readings carry a rule:
 - **The space a service can use is `f_bavail`.** `f_bfree` counts the blocks reserved for root, typically 5%, and `disk()` reports `f_bavail` (`m6-platform/src/host.rs:208`).
 
 The module sets no threshold: a monitoring service decides what 80% means (`m6-platform/src/host.rs:1`).
+
+### 8.5.1. `platform::facts`
+
+**`host_facts() -> HostFacts`** reads what the host says it is, once, at start (`m6-platform/src/facts.rs:324`).
+It never fails and never panics.
+Reached as `m6_core::platform::host_facts()`.
+
+**`Fact<T>` is either `Known(T)` or `Unknown(&'static str)`** (`m6-platform/src/facts.rs:64`).
+The reason is a short static phrase naming what was tried, such as `cannot read /proc/meminfo`, so a monitor can print why a fact is unknown rather than omit the key.
+`HostFacts` carries the host name, the *FQDN*, every interface address with its name and scope, the OS, the kernel, the CPU, the memory, the limits, the clock and the virtualisation type (`m6-platform/src/facts.rs:122`).
+A group read from more than one source keeps each member a `Fact`, so a host that answers the CPU count and not the model loses neither.
+
+The serialised form is `{"known": value}` or `{"unknown": "reason"}`, so every key is present in a start-up record.
+A `clock.boot_time` that is known is *RFC 3339* in *UTC*, written by `write_rfc3339_utc` (`m6-platform/src/lib.rs:229`), the same date text the log line writes.
+
+The reads that are the same on both families are in `facts.rs`: the host name and its canonical name, `uname`, the interface table through `getifaddrs`, the page size, the time zone, the open-file limit and the parsers.
+The reads that differ are one function each in `linux.rs` and `macos.rs`: `host_os_facts`, `host_cpu`, `host_memory`, `host_limits`, `host_clock` and `host_virtualization`.
+Linux reads `/etc/os-release`, `/proc` and `/sys`, and macOS reads `SystemVersion.plist` and the kernel through `sysctlbyname`.
+
+A fact the host will not give is not an error: a container can hide `/proc` and `/sys`, and a kernel can decline to name its clock source.
+The parsers are public and pure, so a missing file, malformed text and a rolling release with no `VERSION_ID` are held on any target.
 
 ### 8.6. `tls`
 
