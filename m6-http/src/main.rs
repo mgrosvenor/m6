@@ -490,7 +490,7 @@ impl ServerState {
             .into_iter()
             .map(|(name, total)| health::PoolHealth { name, total })
             .collect();
-        let outcome = health::PerfReport::build_authorised(
+        let report = health::PerfReport::build(
             health::PerfSubject {
                 process_index: self.config.server.process_index,
                 node: &self.config.node.name,
@@ -499,20 +499,13 @@ impl ServerState {
                 url_backends: self.pool_manager.url_backend_names(),
                 host_path: &self.config.site_dir,
             },
-            || self.stats.snapshot(),
+            self.stats.snapshot(),
         );
-        match outcome {
-            health::PerfOutcome::Ok(report) => match self.config.genid.as_ref() {
-                Some(genid_config) => health::perf_document(
-                    &report,
-                    Some((&self.genid, genid_config, self.disk_perf())),
-                ),
-                None => health::perf_document(&report, None),
-            },
-            // `build_authorised` has one outcome: the report. The fallback is
-            // here so a future variant cannot silently produce a line that is
-            // not the document.
-            _ => serde_json::json!({"error": "report unavailable"}),
+        match self.config.genid.as_ref() {
+            Some(genid_config) => {
+                health::perf_document(&report, Some((&self.genid, genid_config, self.disk_perf())))
+            }
+            None => health::perf_document(&report, None),
         }
     }
 }
@@ -1488,7 +1481,7 @@ fn is_status_path(state: &ServerState, path: &str) -> bool {
 /// The answer to any other path on the status listener: the 404 of a disabled
 /// endpoint, which says nothing about the site.
 fn status_refusal() -> RequestOutcome {
-    let (code, headers, body) = health::PerfOutcome::Disabled.into_response();
+    let (code, headers, body) = health::not_found();
     RequestOutcome::Ready(
         code,
         headers,
@@ -5179,7 +5172,7 @@ fn handle_request_inner(
             // anything is forwarded. The source authorises the call.
             if let genid::Role::Cache(_) = &state.genid {
                 if !health::genid_address_ok(client_ip, from_internal) {
-                    let (code, headers, body) = health::PerfOutcome::Disabled.into_response();
+                    let (code, headers, body) = health::not_found();
                     return RequestOutcome::Ready(
                         code,
                         headers,

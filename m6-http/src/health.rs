@@ -17,7 +17,7 @@ use std::net::IpAddr;
 use crate::config::GenidConfig;
 use crate::stats::Iface;
 
-pub use m6_core::monitoring::{HealthReport, PerfOutcome, PerfReport, PerfSubject, PoolHealth};
+pub use m6_core::monitoring::{not_found, HealthReport, PerfReport, PerfSubject, PoolHealth};
 
 /// Backend name tagged onto a `/health` response.
 pub const HEALTH_BACKEND: &str = "health";
@@ -609,7 +609,7 @@ pub enum Gate {
 impl Gate {
     /// The 404 an endpoint answers when it is not configured.
     fn disabled() -> Self {
-        let (code, headers, body) = PerfOutcome::Disabled.into_response();
+        let (code, headers, body) = not_found();
         Gate::Refused(code, headers, body)
     }
 }

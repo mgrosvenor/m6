@@ -103,7 +103,7 @@ const CHANNEL_RESERVOIR: usize = 1024;
 fn is_self_generated(backend: &str) -> bool {
     matches!(
         backend,
-        "cache" | "method-check" | "health" | "perf" | "error" | "error-local"
+        "cache" | "method-check" | "health" | "error" | "error-local"
     )
 }
 

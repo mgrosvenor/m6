@@ -802,17 +802,13 @@ The figures stay off the public interface because the journal is not public: a n
 The answer covers the m6-http process and the dependency flags the process already holds: an edge's origin is the follower's own `down` bit, so the answer reads a flag and makes no probe.
 A socket pool keeps no per-member health state, so a dead member is found when a request connects to it and that request takes the next member.
 
-`PerfReport::build_authorised(subject, snapshot)`, `PerfOutcome`,
+`PerfReport::build(subject, metrics)`, `not_found()`,
 `is_monitoring_endpoint(backend)`, `HEALTH_BACKEND`.
 
-`PerfReport::build_authorised` builds the report with no access check, for the
-periodic metrics line.
-`PerfOutcome::Unauthorised` and `PerfOutcome::Forbidden` answer with
-`m6_core::http::token_refusal`, the one definition of a token check's refusal:
-401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` for no or a bad
-credential, 403 `{"error":"forbidden"}` for the wrong role or group.
-No m6-http route serves the metrics document, so only the tests construct these
-two variants.
+`PerfReport::build` builds the report with no access check, for the periodic
+metrics line.
+`not_found()` is the 404 a disabled or unknown monitoring path answers, with
+the metrics headers and no credential challenge.
 m6-http uses `is_monitoring_endpoint` to keep a `/health` poll out of the site
 counters, described in `docs/m6-http.md`.
 

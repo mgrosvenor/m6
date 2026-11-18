@@ -404,32 +404,6 @@ pub struct PerfReport {
     pub host: crate::platform::host::HostSnapshot,
 }
 
-/// Outcome of a metrics document build.
-pub enum PerfOutcome {
-    /// A traffic document. The traffic line is written from `TrafficReport`
-    /// directly, so nothing builds this variant now.
-    ///
-    /// The report is built from the window of events `m6-http` logged itself,
-    /// which allocates a record per retained event on a cache miss. It is kept
-    /// out of the metrics document for the same reason the metrics are kept
-    /// off `/health`: the cost profiles differ, and a reader that wants the
-    /// traffic summary asks for it by name.
-    /// Boxed: `TrafficReport` is far larger than every other variant here, so
-    /// carrying it inline made the whole enum that size even when the outcome
-    /// was a one-word error.
-    Traffic(Box<TrafficReport>),
-    /// No document. The answer is a 404, with no credential challenge.
-    Disabled,
-    /// A refusal: no credential, or one that does not verify.
-    Unauthorised,
-    /// A refusal: the credential verifies but lacks the required claim.
-    Forbidden,
-    /// Boxed for the same reason as `Traffic`: `PerfReport` is 608 bytes
-    /// against the 24 of the largest error variant, and an inline copy made
-    /// every `PerfOutcome` that size.
-    Ok(Box<PerfReport>),
-}
-
 /// What a report is about: the node, and the live facts to report on it.
 pub struct PerfSubject<'a> {
     pub node: &'a str,
@@ -444,10 +418,7 @@ pub struct PerfSubject<'a> {
 impl PerfReport {
     /// The report itself, for the caller that writes the metrics line.
     /// Nothing here checks access.
-    pub fn build_authorised(
-        subject: PerfSubject<'_>,
-        snapshot: impl FnOnce() -> StatsSnapshot,
-    ) -> PerfOutcome {
+    pub fn build(subject: PerfSubject<'_>, metrics: StatsSnapshot) -> PerfReport {
         let PerfSubject {
             process_index,
             node,
@@ -456,11 +427,7 @@ impl PerfReport {
             url_backends,
             host_path,
         } = subject;
-        // `snapshot` is a closure so the reservoir sort happens once, here,
-        // when the document is built.
-        // Read at build time, like the reservoir sort: an ordinary request
-        // never causes a /proc read either.
-        PerfOutcome::Ok(Box::new(PerfReport {
+        PerfReport {
             process_index,
             node: node.to_string(),
             build: build_id().clone(),
@@ -474,9 +441,9 @@ impl PerfReport {
             tls: crate::tls::loaded(),
             tls_unreadable: crate::tls::unreadable(),
             logging: Some(LoggingHealth::read()),
-            metrics: snapshot(),
+            metrics,
             host: crate::platform::host::snapshot(host_path),
-        }))
+        }
     }
 }
 
@@ -496,32 +463,10 @@ pub fn perf_headers() -> Vec<(String, String)> {
     ]
 }
 
-impl PerfOutcome {
-    pub fn into_response(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        match self {
-            // The token check's refusal is one definition, in `http`: the same
-            // bytes whichever route asked.
-            PerfOutcome::Unauthorised => crate::http::token_refusal(false),
-            PerfOutcome::Forbidden => crate::http::token_refusal(true),
-            other => {
-                let headers = perf_headers();
-                match other {
-                    PerfOutcome::Disabled => (404, headers, br#"{"error":"not found"}"#.to_vec()),
-                    PerfOutcome::Ok(report) => {
-                        let body = serde_json::to_vec(&report)
-                            .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-                        (200, headers, body)
-                    }
-                    PerfOutcome::Traffic(report) => {
-                        let body = serde_json::to_vec(&report)
-                            .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-                        (200, headers, body)
-                    }
-                    PerfOutcome::Unauthorised | PerfOutcome::Forbidden => unreachable!(),
-                }
-            }
-        }
-    }
+/// The 404 a disabled or unknown monitoring path answers, with the metrics
+/// headers. It names no credential, so it advertises no door.
+pub fn not_found() -> (u16, Vec<(String, String)>, Vec<u8>) {
+    (404, perf_headers(), br#"{"error":"not found"}"#.to_vec())
 }
 
 #[cfg(test)]
@@ -582,10 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_outcome_is_a_404_with_no_door() {
+    fn not_found_is_a_404_with_no_door() {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
-        let (code, _, body) = PerfOutcome::Disabled.into_response();
+        let (code, _, body) = not_found();
         assert_eq!(code, 404);
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
     }
@@ -595,7 +540,7 @@ mod tests {
     /// never receives, and a release tag alone cannot tell two builds apart.
     #[test]
     fn the_report_carries_the_running_build_identity() {
-        let out = PerfReport::build_authorised(
+        let out = PerfReport::build(
             PerfSubject {
                 process_index: None,
                 node: "origin",
@@ -604,10 +549,9 @@ mod tests {
                 url_backends: vec![],
                 host_path: Path::new("/"),
             },
-            snap,
+            snap(),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
+        let body = serde_json::to_vec(&out).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let version = v["build"]["version"].as_str().expect("a version");
         let parsed = semver::Version::parse(version).expect("the full form must be SemVer 2.0.0");
@@ -693,7 +637,7 @@ mod tests {
         // A real payload with the field taken out, rather than a hand-written
         // fixture: a fixture only proves the fixture parses, and the first attempt
         // at one failed on unrelated required fields of StatsSnapshot.
-        let out = PerfReport::build_authorised(
+        let out = PerfReport::build(
             PerfSubject {
                 process_index: None,
                 node: "origin",
@@ -702,9 +646,9 @@ mod tests {
                 url_backends: vec![],
                 host_path: Path::new("/"),
             },
-            snap,
+            snap(),
         );
-        let (_, _, body) = out.into_response();
+        let body = serde_json::to_vec(&out).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v.as_object_mut().unwrap().remove("build").is_some());
         let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
@@ -716,7 +660,7 @@ mod tests {
     }
 
     fn metrics_document_json() -> serde_json::Value {
-        let out = PerfReport::build_authorised(
+        let out = PerfReport::build(
             PerfSubject {
                 process_index: None,
                 node: "origin",
@@ -725,9 +669,9 @@ mod tests {
                 url_backends: vec![],
                 host_path: Path::new("/"),
             },
-            snap,
+            snap(),
         );
-        let (_, _, body) = out.into_response();
+        let body = serde_json::to_vec(&out).unwrap();
         serde_json::from_slice(&body).unwrap()
     }
 
@@ -752,7 +696,7 @@ mod tests {
 
     #[test]
     fn the_report_builds_with_no_credential() {
-        let out = PerfReport::build_authorised(
+        let out = PerfReport::build(
             PerfSubject {
                 process_index: None,
                 node: "origin",
@@ -761,40 +705,16 @@ mod tests {
                 url_backends: vec![],
                 host_path: Path::new("/"),
             },
-            snap,
+            snap(),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
+        let body = serde_json::to_vec(&out).unwrap();
         let p: PerfReport = serde_json::from_slice(&body).expect("a report");
         assert_eq!(p.node, "origin");
     }
 
     #[test]
-    fn forbidden_is_a_403_with_no_store_and_no_www_authenticate() {
-        let (code, headers, body) = PerfOutcome::Forbidden.into_response();
-        assert_eq!(code, 403);
-        assert_eq!(body, br#"{"error":"forbidden"}"#);
-        let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
-        assert!(has("X-Robots-Tag"));
-        assert!(!has("WWW-Authenticate"));
-        assert!(headers
-            .iter()
-            .any(|(n, v)| n == "Cache-Control" && v == "no-store"));
-    }
-
-    #[test]
-    fn an_unauthorised_outcome_is_a_401_with_a_scheme_hint() {
-        let (code, headers, body) = PerfOutcome::Unauthorised.into_response();
-        assert_eq!(code, 401);
-        assert_eq!(body, br#"{"error":"unauthorised"}"#);
-        assert!(headers
-            .iter()
-            .any(|(n, v)| n.eq_ignore_ascii_case("WWW-Authenticate") && v == "Bearer"));
-    }
-
-    #[test]
     fn a_built_report_carries_the_metrics() {
-        let out = PerfReport::build_authorised(
+        let out = PerfReport::build(
             PerfSubject {
                 process_index: None,
                 node: "origin",
@@ -806,10 +726,9 @@ mod tests {
                 url_backends: vec!["origin".to_string()],
                 host_path: Path::new("/"),
             },
-            snap,
+            snap(),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
+        let body = serde_json::to_vec(&out).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["node"], "origin");
         assert_eq!(parsed["uptime_s"], 11);
