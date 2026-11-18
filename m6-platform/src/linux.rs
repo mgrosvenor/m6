@@ -13,7 +13,8 @@ use super::facts::{self, ClockFacts, CpuFacts, CpuLimit, Fact, Limits, MemoryFac
 use super::host::{
     parse_cgroup_memory, parse_diskstats, parse_loadavg, parse_meminfo, parse_net_dev,
     parse_netstat, parse_pressure, parse_sockstat_into, parse_thermal_millidegrees, parse_uptime,
-    DiskIo, LoadAverage, Memory, NetDevice, Pressure, TcpHealth, ThermalZone,
+    DiskIo, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice, Pressure, Source,
+    TcpHealth, ThermalZone,
 };
 use super::process::ProcessMemory;
 use super::Signal;
@@ -518,6 +519,166 @@ pub(super) fn thermal_zones() -> Vec<ThermalZone> {
 
 pub(super) fn uptime() -> Option<std::time::Duration> {
     parse_uptime(&std::fs::read_to_string("/proc/uptime").ok()?)
+}
+
+/// What a [`super::host::HostReader`] keeps between steps on Linux: the facts
+/// fixed at start, and one buffer every read reuses.
+pub(super) struct HostState {
+    /// The cgroup's `memory.current` and the limit read once from its
+    /// `memory.max`. `None` when no limit applies, so memory is the host's.
+    cgroup_memory: Option<(std::path::PathBuf, u64)>,
+    /// Each thermal zone's `temp`, in the order of the snapshot's list.
+    zones: Vec<std::path::PathBuf>,
+    buf: String,
+}
+
+impl HostState {
+    pub(super) fn new() -> HostState {
+        let group = self_cgroup();
+        let group = group.as_deref().unwrap_or("/");
+        let root = Path::new(CGROUP_V2);
+        let cgroup_memory =
+            facts::find_cgroup_file(root, group, "memory.max").and_then(|(_, max)| {
+                let (current_path, current) =
+                    facts::find_cgroup_file(root, group, "memory.current")?;
+                let limit = parse_cgroup_memory(&max, &current)?.total_bytes;
+                Some((current_path, limit))
+            });
+        HostState {
+            cgroup_memory,
+            zones: Vec::new(),
+            buf: String::with_capacity(16 * 1024),
+        }
+    }
+
+    /// The thermal zones and their names, listed once: the set is fixed by
+    /// the hardware. A zone whose `temp` cannot be read now is left out, as
+    /// [`thermal_zones`] leaves it out.
+    pub(super) fn thermal_zones(&mut self) -> Vec<ThermalZone> {
+        let mut found: Vec<(ThermalZone, std::path::PathBuf)> = Vec::new();
+        if let Ok(dir) = std::fs::read_dir("/sys/class/thermal") {
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with("thermal_zone") {
+                    continue;
+                }
+                let path = entry.path();
+                let temp = path.join("temp");
+                let Some(celsius) = std::fs::read_to_string(&temp)
+                    .ok()
+                    .and_then(|s| parse_thermal_millidegrees(&s))
+                else {
+                    continue;
+                };
+                let label = std::fs::read_to_string(path.join("type"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or(name);
+                found.push((
+                    ThermalZone {
+                        name: label,
+                        celsius,
+                    },
+                    temp,
+                ));
+            }
+        }
+        found.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        let (zones, paths) = found.into_iter().unzip();
+        self.zones = paths;
+        zones
+    }
+
+    /// Read one source into `snapshot`: one file, opened, read and closed.
+    pub(super) fn read(&mut self, source: Source, snapshot: &mut HostSnapshot) {
+        let buf = &mut self.buf;
+        match source {
+            Source::Load => snapshot.load = read_into("/proc/loadavg", buf).and_then(parse_loadavg),
+            Source::Memory => {
+                snapshot.memory = match &self.cgroup_memory {
+                    Some((current, limit)) => read_into(current, buf)
+                        .and_then(|text| text.trim().parse::<u64>().ok())
+                        .map(|used| Memory {
+                            total_bytes: *limit,
+                            available_bytes: limit.saturating_sub(used),
+                            source: MemorySource::Cgroup,
+                        }),
+                    None => read_into("/proc/meminfo", buf).and_then(parse_meminfo),
+                }
+            }
+            Source::Uptime => {
+                snapshot.uptime_s = read_into("/proc/uptime", buf)
+                    .and_then(parse_uptime)
+                    .map(|d| d.as_secs())
+            }
+            Source::Net => {
+                snapshot.net = read_into("/proc/net/dev", buf)
+                    .map(parse_net_dev)
+                    .unwrap_or_default()
+            }
+            Source::DiskIo => {
+                snapshot.disks = read_into("/proc/diskstats", buf)
+                    .map(parse_diskstats)
+                    .unwrap_or_default()
+            }
+            Source::CpuPressure => {
+                snapshot.cpu_pressure =
+                    read_into("/proc/pressure/cpu", buf).and_then(parse_pressure)
+            }
+            Source::IoPressure => {
+                snapshot.io_pressure = read_into("/proc/pressure/io", buf).and_then(parse_pressure)
+            }
+            Source::MemoryPressure => {
+                snapshot.memory_pressure =
+                    read_into("/proc/pressure/memory", buf).and_then(parse_pressure)
+            }
+            // The sockstat half is merged into the netstat half, as
+            // [`tcp_health`] merges it, and is kept across a netstat read.
+            Source::Netstat => {
+                snapshot.tcp = read_into("/proc/net/netstat", buf).map(|text| {
+                    let mut fresh = parse_netstat(text);
+                    if let Some(old) = &snapshot.tcp {
+                        fresh.sockets_used = old.sockets_used;
+                        fresh.tcp_inuse = old.tcp_inuse;
+                        fresh.tcp_time_wait = old.tcp_time_wait;
+                        fresh.tcp_orphan = old.tcp_orphan;
+                    }
+                    fresh
+                })
+            }
+            Source::Sockstat => {
+                if let (Some(tcp), Some(text)) =
+                    (snapshot.tcp.as_mut(), read_into("/proc/net/sockstat", buf))
+                {
+                    parse_sockstat_into(text, tcp);
+                }
+            }
+            // A zone that cannot be read this time keeps its last reading.
+            Source::Thermal(zone) => {
+                if let (Some(path), Some(slot)) =
+                    (self.zones.get(zone), snapshot.thermal.get_mut(zone))
+                {
+                    if let Some(celsius) = read_into(path, buf).and_then(parse_thermal_millidegrees)
+                    {
+                        slot.celsius = celsius;
+                    }
+                }
+            }
+            // Read by the generic reader on every target.
+            Source::Disk | Source::Descriptors => {}
+        }
+    }
+}
+
+/// A small kernel file into `buf`, replacing what it held: open, read to the
+/// end, close. Read through `take`, which skips the size probe a `File` makes
+/// first: a `/proc` file reports a size of zero, so the probe is two wasted
+/// system calls.
+fn read_into(path: impl AsRef<Path>, buf: &mut String) -> Option<&str> {
+    use std::io::Read;
+    buf.clear();
+    let file = std::fs::File::open(path).ok()?;
+    file.take(u64::MAX).read_to_string(buf).ok()?;
+    Some(buf.as_str())
 }
 
 // ── Host facts ───────────────────────────────────────────────────────────────

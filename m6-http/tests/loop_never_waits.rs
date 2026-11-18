@@ -943,6 +943,20 @@ impl H1KeepAlive {
 /// accounting tick flushes it, so this waits rather than reading a stale one:
 /// every caller has already waited for a tick, so the line is there.
 fn perf_event_loop(fx: &Fixture) -> Vec<(String, u64)> {
+    next_event_loop(fx)
+        .iter()
+        .map(|trigger| {
+            (
+                trigger["name"].as_str().unwrap_or_default().to_string(),
+                trigger["count"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// The event-loop figures of the next metrics line this fixture has not read,
+/// one JSON object per trigger.
+fn next_event_loop(fx: &Fixture) -> Vec<serde_json::Value> {
     let after = fx.perf_lines.get();
     let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
@@ -959,16 +973,7 @@ fn perf_event_loop(fx: &Fixture) -> Vec<(String, u64)> {
                         .then(|| v["fields"]["perf"]["metrics"]["event_loop"].clone())
                 })
                 .expect("the newest metrics line");
-            let triggers = trigger.as_array().expect("the event-loop figures");
-            return triggers
-                .iter()
-                .map(|trigger| {
-                    (
-                        trigger["name"].as_str().unwrap_or_default().to_string(),
-                        trigger["count"].as_u64().unwrap_or(0),
-                    )
-                })
-                .collect();
+            return trigger.as_array().expect("the event-loop figures").clone();
         }
         if Instant::now() >= deadline {
             panic!("no metrics line within the deadline\n--- m6-http ---\n{output}");
@@ -2274,6 +2279,60 @@ fn an_idle_m6_http_wakes_about_once_a_second() {
     assert!(
         timeouts >= 1,
         "an idle m6-http woke {timeouts} times on its timeout trigger over one 2 s report; the loop must wake on its 1 s accounting tick\n{loops:?}\n--- m6-http ---\n{}",
+        fx.service.output()
+    );
+}
+
+/// The metrics turn never stalls the loop.
+///
+/// The turn that writes the metrics line builds the whole document, and it
+/// used to read the host block in the same turn: a dozen `/proc` and `/sys`
+/// files and over a hundred system calls, which held every request that
+/// arrived meanwhile. The block is now kept current one source per accounting
+/// tick, and the document is serialised straight into the log buffer, so no
+/// turn of an idle node, the metrics turn included, works for long.
+///
+/// The bound is read from the loop's own trace: each metrics line carries the
+/// longest work of each trigger over its window, and the metrics turn of the
+/// window before is one of them. A turn the loop takes every window shows in
+/// every window, and a preemption by a busy host shows in one, so the bound is
+/// held by the median window of five. 2 ms on a release build, which is the
+/// build the bound is about. A debug build runs the same code unoptimised and
+/// is given 10 ms.
+#[test]
+fn the_metrics_turn_stays_under_two_milliseconds() {
+    let fx = Fixture::start(1, 30, "statsturn");
+    // Requests first, so the reservoirs and channel tables the line reports
+    // hold samples to sort.
+    let mut conn = H1KeepAlive::connect(fx.port());
+    for _ in 0..200 {
+        let (status, body) = conn.request("/fast", &[]);
+        assert_eq!(status, 200, "GET /fast: {body}");
+    }
+    // Skip the window the requests fell in: from here on the loop is idle but
+    // for its own ticks, the metrics turn and the host reads among them.
+    next_event_loop(&fx);
+    next_event_loop(&fx);
+    let mut worst: Vec<u64> = (0..5)
+        .map(|_| {
+            next_event_loop(&fx)
+                .iter()
+                .filter_map(|trigger| trigger["work_max_ns"].as_u64())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    worst.sort_unstable();
+    eprintln!("longest turn per window, sorted, ns: {worst:?}");
+    let bound_ns: u64 = if cfg!(debug_assertions) {
+        10_000_000
+    } else {
+        2_000_000
+    };
+    assert!(
+        worst[2] < bound_ns,
+        "the longest turn of the median window took {} ns, bound {bound_ns} ns; per window, sorted: {worst:?}\n--- m6-http ---\n{}",
+        worst[2],
         fx.service.output()
     );
 }

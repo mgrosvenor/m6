@@ -552,21 +552,135 @@ pub struct HostSnapshot {
 ///
 /// `disk_path` selects the filesystem to report; pass the one the service
 /// actually writes to, which is not necessarily `/`.
+///
+/// All at once, through a [`HostReader`]'s first pass. A loop that reports the
+/// host repeatedly keeps a `HostReader` and steps it instead.
 pub fn snapshot(disk_path: &Path) -> HostSnapshot {
-    HostSnapshot {
-        load: load_average(),
-        cpus: cpu_count(),
-        memory: memory(),
-        disk: disk(disk_path),
-        thermal: thermal_zones(),
-        uptime_s: uptime().map(|d| d.as_secs()),
-        net: net_devices(),
-        disks: disk_io(),
-        cpu_pressure: pressure("cpu"),
-        io_pressure: pressure("io"),
-        memory_pressure: pressure("memory"),
-        tcp: tcp_health(),
-        fds: file_descriptors(),
+    HostReader::new(disk_path).snapshot
+}
+
+// ── The host reader: one source per step ─────────────────────────────────────
+
+/// One reading of the host block. A [`HostReader`] reads exactly one per step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Load,
+    Memory,
+    Disk,
+    Uptime,
+    Net,
+    DiskIo,
+    CpuPressure,
+    IoPressure,
+    MemoryPressure,
+    /// `/proc/net/netstat`, the first half of [`HostSnapshot::tcp`].
+    Netstat,
+    /// `/proc/net/sockstat`, the second half, merged into the first.
+    Sockstat,
+    Descriptors,
+    /// One thermal zone, by its place in [`HostSnapshot::thermal`].
+    Thermal(usize),
+}
+
+/// Every source but the thermal zones, in the order a pass reads them.
+const SOURCES: [Source; 12] = [
+    Source::Load,
+    Source::Memory,
+    Source::Disk,
+    Source::Uptime,
+    Source::Net,
+    Source::DiskIo,
+    Source::CpuPressure,
+    Source::IoPressure,
+    Source::MemoryPressure,
+    Source::Netstat,
+    Source::Sockstat,
+    Source::Descriptors,
+];
+
+/// The host block, kept current one source at a time.
+///
+/// [`snapshot`] reads every source at once: on Linux that is about twenty
+/// files and well over a hundred system calls, which is a stall when a
+/// service's one event loop pays for it in one turn. A `HostReader` splits the
+/// same work. The facts that are constant for the life of the process are read
+/// once in [`HostReader::new`]: the CPU count, the descriptor limits, the
+/// cgroup memory limit and where its usage is read, and the list of thermal
+/// zones with their names. Each [`HostReader::step`] then reads one source,
+/// which is one small file, one `statvfs` or one descriptor listing, and
+/// updates that part of the snapshot in place.
+///
+/// The snapshot always holds a complete block: `new` reads a full pass before
+/// it returns, and a step replaces one reading with a newer one. The readings
+/// in it were taken up to one pass apart, which is the cost of never reading
+/// them all in one turn.
+pub struct HostReader {
+    snapshot: HostSnapshot,
+    disk_path: std::path::PathBuf,
+    fd_limits: Option<(u64, u64)>,
+    state: os::HostState,
+    next: usize,
+}
+
+impl HostReader {
+    /// Read the constant facts, then one full pass. For start-up, before a
+    /// loop runs: this is the one call that does all of the reading at once.
+    pub fn new(disk_path: &Path) -> HostReader {
+        let mut state = os::HostState::new();
+        let snapshot = HostSnapshot {
+            cpus: cpu_count(),
+            thermal: state.thermal_zones(),
+            ..HostSnapshot::default()
+        };
+        let mut reader = HostReader {
+            snapshot,
+            disk_path: disk_path.to_path_buf(),
+            fd_limits: super::process::fd_limits().ok(),
+            state,
+            next: 0,
+        };
+        for _ in 0..reader.sources() {
+            reader.step();
+        }
+        reader
+    }
+
+    /// How many steps make one pass.
+    pub fn sources(&self) -> usize {
+        SOURCES.len() + self.snapshot.thermal.len()
+    }
+
+    /// Read the next source into the snapshot, and say which it was.
+    pub fn step(&mut self) -> Source {
+        let source = SOURCES
+            .get(self.next)
+            .copied()
+            .unwrap_or_else(|| Source::Thermal(self.next - SOURCES.len()));
+        self.next = (self.next + 1) % self.sources();
+        let snapshot = &mut self.snapshot;
+        match source {
+            Source::Disk => snapshot.disk = disk(&self.disk_path),
+            Source::Descriptors => {
+                snapshot.fds = match (
+                    super::process::open_descriptors(std::process::id()),
+                    self.fd_limits,
+                ) {
+                    (Ok(open), Some((soft, hard))) => Some(FileDescriptors {
+                        open: open as u64,
+                        soft_limit: soft,
+                        hard_limit: hard,
+                    }),
+                    _ => None,
+                }
+            }
+            other => self.state.read(other, snapshot),
+        }
+        source
+    }
+
+    /// The host block as the last steps left it.
+    pub fn snapshot(&self) -> &HostSnapshot {
+        &self.snapshot
     }
 }
 
@@ -866,6 +980,23 @@ enp1s0: 2929071615 3102200    0    0    0     0          0         0 3105995619 
 
     /// Everything is optional and a snapshot on a machine missing any of it
     /// is an ordinary snapshot, not a failure.
+    /// A reader reads one source a step, every source once a pass, and starts
+    /// the next pass at the first again. Break: a step that reads two sources,
+    /// or a pass that skips a thermal zone.
+    #[test]
+    fn a_reader_reads_one_source_a_step_and_every_source_a_pass() {
+        let mut reader = HostReader::new(Path::new("/"));
+        let zones = reader.snapshot().thermal.len();
+        assert_eq!(reader.sources(), SOURCES.len() + zones);
+        let pass: Vec<Source> = (0..reader.sources()).map(|_| reader.step()).collect();
+        let mut want: Vec<Source> = SOURCES.to_vec();
+        want.extend((0..zones).map(Source::Thermal));
+        assert_eq!(pass, want);
+        assert_eq!(reader.step(), SOURCES[0]);
+        assert!(reader.snapshot().cpus >= 1);
+        assert!(reader.snapshot().disk.is_some(), "statvfs of / answers");
+    }
+
     #[test]
     fn a_snapshot_serialises_with_whatever_it_could_read() {
         let s = snapshot(Path::new("/"));

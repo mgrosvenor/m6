@@ -659,83 +659,139 @@ pub struct DiskPerf<'a> {
     pub state: crate::disk_cache::LoadState,
 }
 
-/// The metrics document, with this node's generation and disk blocks added, as
-/// JSON.
+/// The metrics document, with this node's generation and disk blocks added.
 ///
 /// One definition for the metrics line, which carries exactly this document in
 /// `fields.perf`.
 ///
-/// The blocks are inserted into the report this node already built, so
-/// `m6-core` keeps no notion of a generation or a disk cache: it hands over the
+/// The blocks sit beside the report this node already built, so `m6-core`
+/// keeps no notion of a generation or a disk cache: it hands over the
 /// monitoring payload and m6-http adds the fields that are this binary's. A
 /// source reports the ID it owns and the peers that read it. A cache node
 /// reports the ID it follows, where it follows it from, and whether that
 /// upstream is answering.
 ///
+/// It is `Serialize` and borrows what it reports, so the log line writes it
+/// field by field into its buffer with no JSON tree built first.
+///
 /// `None` is a node with no `[genid]` table: the report alone, which is what
 /// such a node's metrics document has always carried.
-pub fn perf_document(
-    report: &PerfReport,
-    genid: Option<(&crate::genid::Role, &GenidConfig, Option<DiskPerf<'_>>)>,
-) -> serde_json::Value {
-    let mut value = serde_json::to_value(report)
-        .unwrap_or_else(|_| serde_json::json!({"error": "serialisation failed"}));
-    let Some((role, config, disk)) = genid else {
-        return value;
+pub fn perf_document<'a>(
+    report: &'a PerfReport,
+    genid: Option<(
+        &'a crate::genid::Role,
+        &'a GenidConfig,
+        Option<DiskPerf<'a>>,
+    )>,
+) -> PerfDocument<'a> {
+    let now = m6_core::platform::now();
+    let (genid, disk_cache) = match genid {
+        None => (None, None),
+        Some((role, config, disk)) => (
+            Some(genid_block(role, config, now)),
+            disk.map(|disk| DiskCacheBlock {
+                dir_bytes: disk.writer.dir_bytes(),
+                queued: disk.queued,
+                written_last_tick: disk.writer.written_last_tick(),
+                written_bytes_last_tick: disk.writer.written_bytes_last_tick(),
+                skipped_full: disk.writer.skipped_full(),
+                ticks: disk.writer.ticks(),
+                tick_last_ns: disk.writer.tick_last_ns(),
+                loaded_entries: disk.loaded_entries,
+                loaded_bad: disk.loaded_bad,
+                state: disk.state.as_str(),
+            }),
+        ),
     };
-    if let Some(object) = value.as_object_mut() {
-        object.insert("genid".to_string(), genid_block(role, config));
-        if let Some(disk) = disk {
-            let writer = disk.writer;
-            object.insert(
-                "disk_cache".to_string(),
-                serde_json::json!({
-                    "dir_bytes": writer.dir_bytes(),
-                    "queued": disk.queued,
-                    "written_last_tick": writer.written_last_tick(),
-                    "written_bytes_last_tick": writer.written_bytes_last_tick(),
-                    "skipped_full": writer.skipped_full(),
-                    "ticks": writer.ticks(),
-                    "tick_last_ns": writer.tick_last_ns(),
-                    "loaded_entries": disk.loaded_entries,
-                    "loaded_bad": disk.loaded_bad,
-                    "state": disk.state.as_str(),
-                }),
-            );
-        }
+    PerfDocument {
+        report,
+        genid,
+        disk_cache,
     }
-    value
 }
 
-/// The `genid` object the metrics document adds, by role.
-fn genid_block(role: &crate::genid::Role, config: &GenidConfig) -> serde_json::Value {
+/// What [`perf_document`] returns: the report's own fields, then the blocks.
+#[derive(serde::Serialize)]
+pub struct PerfDocument<'a> {
+    #[serde(flatten)]
+    report: &'a PerfReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genid: Option<GenidBlock<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_cache: Option<DiskCacheBlock>,
+}
+
+/// The `disk_cache` object.
+#[derive(serde::Serialize)]
+struct DiskCacheBlock {
+    dir_bytes: u64,
+    queued: usize,
+    written_last_tick: usize,
+    written_bytes_last_tick: u64,
+    skipped_full: u64,
+    ticks: u64,
+    tick_last_ns: u64,
+    loaded_entries: usize,
+    loaded_bad: usize,
+    state: &'static str,
+}
+
+/// The `genid` object, by role.
+#[derive(serde::Serialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+enum GenidBlock<'a> {
+    Source {
+        id: Decimal,
+        sequence_running: bool,
+        peers: Vec<GenidPeer>,
+    },
+    Cache {
+        id: Option<Decimal>,
+        upstream: &'a str,
+        upstream_down: bool,
+        upstream_rtt_ms: Option<f64>,
+        last_ok_s: Option<u64>,
+    },
+}
+
+/// One peer that read a source's ID.
+#[derive(serde::Serialize)]
+struct GenidPeer {
+    addr: IpAddr,
+    last_get_s: u64,
+}
+
+/// A generation ID, written as a decimal string, as it always has been.
+struct Decimal(u64);
+
+impl serde::Serialize for Decimal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+fn genid_block<'a>(
+    role: &crate::genid::Role,
+    config: &'a GenidConfig,
+    now: std::time::Instant,
+) -> GenidBlock<'a> {
     match role {
-        crate::genid::Role::Source(g) => {
-            let peers: Vec<serde_json::Value> = g
-                .peers(m6_core::platform::now())
+        crate::genid::Role::Source(g) => GenidBlock::Source {
+            id: Decimal(g.current()),
+            sequence_running: g.sequence_running(),
+            peers: g
+                .peers(now)
                 .into_iter()
-                .map(|(ip, last_get_s)| {
-                    serde_json::json!({"addr": ip.to_string(), "last_get_s": last_get_s})
-                })
-                .collect();
-            serde_json::json!({
-                "role": "source",
-                "id": g.current().to_string(),
-                "sequence_running": g.sequence_running(),
-                "peers": peers,
-            })
-        }
-        crate::genid::Role::Cache(f) => {
-            let now = m6_core::platform::now();
-            serde_json::json!({
-                "role": "cache",
-                "id": f.current().map(|id| id.to_string()),
-                "upstream": config.upstream.as_deref().unwrap_or(""),
-                "upstream_down": f.down(),
-                "upstream_rtt_ms": f.rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
-                "last_ok_s": f.last_ok_s(now),
-            })
-        }
+                .map(|(addr, last_get_s)| GenidPeer { addr, last_get_s })
+                .collect(),
+        },
+        crate::genid::Role::Cache(f) => GenidBlock::Cache {
+            id: f.current().map(Decimal),
+            upstream: config.upstream.as_deref().unwrap_or(""),
+            upstream_down: f.down(),
+            upstream_rtt_ms: f.rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
+            last_ok_s: f.last_ok_s(now),
+        },
     }
 }
 

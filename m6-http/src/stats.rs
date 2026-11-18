@@ -50,9 +50,9 @@ pub fn log_traffic(report: &impl serde::Serialize) -> bool {
 /// metrics line does not depend on analytics being enabled.
 ///
 /// The document comes from this service's own builder, `perf_document`, so a
-/// metric added there is on the line. The nested value is written by
-/// `serde_json` through `Line::json`: bounded by the line's buffer, not by the
-/// string field cap.
+/// metric added there is on the line. The document is written by `serde_json`
+/// through `Line::json`, field by field into the line's buffer with no JSON
+/// tree built first: bounded by the line's buffer, not by the string field cap.
 ///
 /// The monitor reads the line from mon's journal, where its `M6_TYPE` is
 /// `perf`.
@@ -63,7 +63,7 @@ pub fn log_traffic(report: &impl serde::Serialize) -> bool {
 ///
 /// Answers whether the Sink was open. It is open after start and before stop,
 /// so the caller ignores it.
-pub fn log_perf(document: &serde_json::Value) -> bool {
+pub fn log_perf(document: &impl serde::Serialize) -> bool {
     m6_core::log::with_operational(|sink| {
         m6_core::log::Line::begin(sink, m6_core::log::Level::Info, PERF_LOG_MESSAGE)
             .kind(m6_core::log::Type::Perf)
@@ -1050,17 +1050,34 @@ impl Stats {
 /// Slice-based percentiles, for the per-channel reservoirs (which are a
 /// different fixed size from the aggregate ones).
 fn percentiles_n(samples: &[u64], n: usize) -> (u64, u64, u64, u64) {
+    let mut scratch = [0u64; RESERVOIR];
+    let n = n.min(samples.len()).min(RESERVOIR);
+    scratch[..n].copy_from_slice(&samples[..n]);
+    order_statistics(&mut scratch[..n])
+}
+
+/// Exact `(p0, p50, p99, p100)` of `buf`, reordering it, and `(0, 0, 0, 0)`
+/// when it is empty.
+///
+/// Selection rather than a sort: the line needs four ranks, not the whole
+/// order, and `select_nth_unstable` finds one in linear time where a sort of a
+/// full reservoir is `n log n`. The ranks are the ones the sort read.
+fn order_statistics(buf: &mut [u64]) -> (u64, u64, u64, u64) {
+    let n = buf.len();
     if n == 0 {
         return (0, 0, 0, 0);
     }
-    let mut buf: Vec<u64> = samples[..n].to_vec();
-    buf.sort_unstable();
-    (
-        buf[0],
-        buf[(n - 1) * 50 / 100],
-        buf[(n - 1) * 99 / 100],
-        buf[n - 1],
-    )
+    let (i50, i99) = ((n - 1) * 50 / 100, (n - 1) * 99 / 100);
+    let p0 = buf.iter().copied().min().unwrap_or(0);
+    let p100 = buf.iter().copied().max().unwrap_or(0);
+    let p99 = *buf.select_nth_unstable(i99).1;
+    // Everything before rank 99 is now at most p99, so rank 50 is found there.
+    let p50 = if i50 < i99 {
+        *buf[..i99].select_nth_unstable(i50).1
+    } else {
+        p99
+    };
+    (p0, p50, p99, p100)
 }
 
 /// Sort the first `n` samples and return exact (p0, p50, p99, p100).
@@ -1091,17 +1108,12 @@ fn percentiles_ring(
     if n == 0 {
         return (0, 0, 0, 0);
     }
-    let mut buf: Vec<u64> = Vec::with_capacity(n);
+    let mut scratch = [0u64; RESERVOIR];
     // Walk back from the newest. `+ RESERVOIR` keeps the subtraction in usize.
-    for k in 1..=n {
-        buf.push(samples[(idx + RESERVOIR - k) & (RESERVOIR - 1)]);
+    for (k, slot) in scratch[..n].iter_mut().enumerate() {
+        *slot = samples[(idx + RESERVOIR - 1 - k) & (RESERVOIR - 1)];
     }
-    buf.sort_unstable();
-    let p0 = buf[0];
-    let p50 = buf[(n - 1) * 50 / 100];
-    let p99 = buf[(n - 1) * 99 / 100];
-    let p100 = buf[n - 1];
-    (p0, p50, p99, p100)
+    order_statistics(&mut scratch[..n])
 }
 
 #[cfg(test)]

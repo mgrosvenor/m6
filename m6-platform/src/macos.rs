@@ -13,7 +13,8 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
 use super::facts::{self, ClockFacts, CpuFacts, Fact, Limits, MemoryFacts, OsFacts};
 use super::host::{
-    DiskIo, LoadAverage, Memory, MemorySource, NetDevice, Pressure, TcpHealth, ThermalZone,
+    DiskIo, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice, Pressure, Source,
+    TcpHealth, ThermalZone,
 };
 use super::process::ProcessMemory;
 use super::Signal;
@@ -296,7 +297,11 @@ pub(super) fn page_faults(pid: u32) -> io::Result<u64> {
 // absent here, and absent is an empty list or `None`, never a row of zeros.
 
 pub(super) fn net_devices() -> Vec<NetDevice> {
-    let nets = sysinfo::Networks::new_with_refreshed_list();
+    interface_rows(&sysinfo::Networks::new_with_refreshed_list())
+}
+
+/// The rows of `sysinfo`'s interface table, sorted by name.
+fn interface_rows(nets: &sysinfo::Networks) -> Vec<NetDevice> {
     let mut out: Vec<NetDevice> = nets
         .iter()
         .map(|(name, data)| NetDevice {
@@ -345,6 +350,11 @@ pub(super) fn load_average() -> Option<LoadAverage> {
 /// under memory pressure, which would read as a host with no memory.
 pub(super) fn memory() -> Option<Memory> {
     let mut s = sysinfo::System::new();
+    memory_of(&mut s)
+}
+
+/// Memory from a `sysinfo` view the caller keeps, refreshed here.
+fn memory_of(s: &mut sysinfo::System) -> Option<Memory> {
     s.refresh_memory();
     let total = s.total_memory();
     if total == 0 {
@@ -363,6 +373,52 @@ pub(super) fn thermal_zones() -> Vec<ThermalZone> {
 
 pub(super) fn uptime() -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(sysinfo::System::uptime()))
+}
+
+/// What a [`super::host::HostReader`] keeps between steps on macOS: the
+/// `sysinfo` views, made once, so a step refreshes one instead of building it.
+/// The interface list is fixed at start, as the Linux reader fixes its thermal
+/// zones.
+pub(super) struct HostState {
+    system: sysinfo::System,
+    networks: sysinfo::Networks,
+}
+
+impl HostState {
+    pub(super) fn new() -> HostState {
+        HostState {
+            system: sysinfo::System::new(),
+            networks: sysinfo::Networks::new_with_refreshed_list(),
+        }
+    }
+
+    /// No thermal reading without IOKit, so the list is empty.
+    pub(super) fn thermal_zones(&mut self) -> Vec<ThermalZone> {
+        Vec::new()
+    }
+
+    /// Read one source into `snapshot`. The sources macOS has no reading for
+    /// stay absent.
+    pub(super) fn read(&mut self, source: Source, snapshot: &mut HostSnapshot) {
+        match source {
+            Source::Load => snapshot.load = load_average(),
+            Source::Memory => snapshot.memory = memory_of(&mut self.system),
+            Source::Uptime => snapshot.uptime_s = uptime().map(|d| d.as_secs()),
+            Source::Net => {
+                self.networks.refresh();
+                snapshot.net = interface_rows(&self.networks);
+            }
+            Source::DiskIo
+            | Source::CpuPressure
+            | Source::IoPressure
+            | Source::MemoryPressure
+            | Source::Netstat
+            | Source::Sockstat
+            | Source::Thermal(_)
+            | Source::Disk
+            | Source::Descriptors => {}
+        }
+    }
 }
 
 // ── Host facts ───────────────────────────────────────────────────────────────

@@ -848,6 +848,8 @@ A truncated reply is a failure, because an A, AAAA or PTR answer fits in UDP.
 
 **`snapshot(disk_path) -> HostSnapshot`** assembles every reading below into the struct the metrics document publishes.
 
+**`HostReader`** keeps a `HostSnapshot` current inside an event loop. `HostReader::new(disk_path)` reads the facts fixed for the process once (CPU count, descriptor limits, the cgroup memory limit, the thermal zones) and one full pass. Each `step()` then reads one `Source`, one file or one call, and returns which. `snapshot()` borrows the block.
+
 Readers are platform-gated and return `None`, an empty `Vec` or a core count of 1 when the host gives nothing, so a missing reading leaves the rest of the snapshot intact: `load_average`, `memory`, `disk`, `cpu_count`, `thermal_zones`, `uptime`, `net_devices`, `disk_io`, `pressure(resource)`, `tcp_health` and `file_descriptors`.
 
 Pure parsers over the text these files contain, tested on any platform: `parse_loadavg`, `parse_meminfo`, `parse_cgroup_memory`, `parse_thermal_millidegrees`, `parse_uptime`, `parse_net_dev`, `parse_diskstats`, `parse_pressure`, `parse_netstat` and `parse_sockstat_into`.

@@ -705,7 +705,7 @@ Table 22 gives each cost before and after the change.
 | what | before | after | what changed |
 |---|---|---|---|
 | the traffic line, per minute of event loop | 78.6 ms | **13.4 ms** | a full window of 32,768 events across 2,000 clients. Each marker list is one case-insensitive aho-corasick automaton, and the summary reads the window's slots in place instead of building a record per event |
-| the metrics line, per ten seconds | 438 us | **81 us** | the host block, a dozen `/proc` and `/sys` reads, is read once a minute and repeated on the lines between, at 362 us |
+| the metrics turn, per ten seconds | 438 us | **80 us** | no host read in the turn. `HostReader` reads one host source per one-second tick, 1.5 us or less each on macOS except the interface table at 466 us, and the document is serialised straight into the log buffer |
 | `Bounded` pop, 50,000 entries | 79.4 ms | **0.18 ms** | pop moved every remaining entry down one place. It is now a ring index (`VecDeque`), so pop is constant time |
 
 **Table 22: costs of the event loop's accounting lines and of the `Bounded` queue, before and after.**

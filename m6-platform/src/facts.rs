@@ -833,10 +833,17 @@ fn cgroup_dir(root: &Path, group: &str) -> PathBuf {
 /// and needs no cgroup of its own. On Linux the caller passes
 /// `/sys/fs/cgroup` and the path [`parse_self_cgroup_v2`] read.
 pub fn read_cgroup_file(root: &Path, group: &str, file: &str) -> Option<String> {
+    find_cgroup_file(root, group, file).map(|(_, text)| text)
+}
+
+/// As [`read_cgroup_file`], with the path the file was found at, for a reader
+/// that reads the same file again later without walking.
+pub fn find_cgroup_file(root: &Path, group: &str, file: &str) -> Option<(PathBuf, String)> {
     let mut dir = cgroup_dir(root, group);
     loop {
-        match std::fs::read_to_string(dir.join(file)) {
-            Ok(text) => return Some(text),
+        let path = dir.join(file);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => return Some((path, text)),
             // A file that is not there is the case the walk exists for. Any
             // other error is a file that really cannot be read, and an
             // ancestor's setting is not this group's, so it is not the answer.

@@ -395,11 +395,11 @@ struct ServerState {
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
     /// correction, a VM resuming) cannot make uptime jump or go negative.
     started: std::time::Instant,
-    /// The metrics document's host block and when it was read. The block is
-    /// read at most once a minute: it is a dozen /proc and /sys reads, the
-    /// costliest part of the document, and the line goes out every ten
-    /// seconds.
-    host: Option<(std::time::Instant, m6_core::platform::host::HostSnapshot)>,
+    /// The metrics document's host block, kept current one source per
+    /// accounting tick. Read whole, the block is a dozen /proc and /sys files
+    /// and over a hundred system calls, which stalled the loop for the whole
+    /// of the turn that read it.
+    host: m6_core::platform::host::HostReader,
     /// The last events this process logged, for the traffic report.
     ///
     /// A ring allocated at start, pushed once per logged event and never
@@ -484,58 +484,40 @@ impl ServerState {
     /// copies of a metric list is how a metric gets added to one and not the
     /// other.
     ///
-    /// Allocation: the report build sorts the reservoirs, reads the host and
-    /// the TLS registry, and this path also builds one JSON value so the
-    /// generation and disk blocks can join the report's own object. It runs on
-    /// the accounting tick and never on an ordinary request.
-    /// The host block for the metrics document, read again once it is a
-    /// minute old.
-    fn host_snapshot(&mut self) -> m6_core::platform::host::HostSnapshot {
-        let now = m6_core::platform::now();
-        match &self.host {
-            Some((read_at, host)) if !host_read_due(*read_at, now) => host.clone(),
-            _ => {
-                let host = m6_core::platform::host::snapshot(&self.config.site_dir);
-                self.host = Some((now, host.clone()));
-                host
-            }
-        }
-    }
-
-    fn perf_document(&mut self) -> serde_json::Value {
-        let host = self.host_snapshot();
+    /// No system call: the host block is the one the accounting tick keeps
+    /// current, and the rest is this process's own counters. It runs on the
+    /// metrics tick and never on an ordinary request.
+    fn perf_report(&self) -> health::PerfReport {
         let pools: Vec<health::PoolHealth> = self
             .pool_manager
             .pool_health()
             .into_iter()
             .map(|(name, total)| health::PoolHealth { name, total })
             .collect();
-        let report = health::PerfReport::build(
+        health::PerfReport::build(
             health::PerfSubject {
                 process_index: self.config.server.process_index,
                 node: &self.config.node.name,
                 uptime_s: self.started.elapsed().as_secs(),
                 pools,
                 url_backends: self.pool_manager.url_backend_names(),
-                host,
+                host: self.host.snapshot().clone(),
             },
             self.stats.snapshot(),
-        );
-        match self.config.genid.as_ref() {
-            Some(genid_config) => {
-                health::perf_document(&report, Some((&self.genid, genid_config, self.disk_perf())))
-            }
-            None => health::perf_document(&report, None),
-        }
+        )
     }
-}
 
-/// How often the metrics document's host block is read again.
-const HOST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Whether a host block read at `read_at` is old enough to read again.
-fn host_read_due(read_at: std::time::Instant, now: std::time::Instant) -> bool {
-    now.duration_since(read_at) >= HOST_INTERVAL
+    /// Write the metrics line: the report, and this node's generation and
+    /// disk blocks, serialised straight into the log buffer.
+    fn log_perf(&self) {
+        let report = self.perf_report();
+        let genid = self
+            .config
+            .genid
+            .as_ref()
+            .map(|genid_config| (&self.genid, genid_config, self.disk_perf()));
+        m6_http_lib::stats::log_perf(&health::perf_document(&report, genid));
+    }
 }
 
 /// Whether a route is worth warming. Split out so it can be tested without a
@@ -3305,6 +3287,8 @@ fn event_loop(
         if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
             m6_core::log::tick(m6_core::platform::wall());
             m6_core::alloc::note_growth();
+            // One host source a tick: one small file, never the whole block.
+            state.host.step();
             last_log_tick = now2;
         }
 
@@ -3342,8 +3326,7 @@ fn event_loop(
         // the previous tick's.
         if state.stats.maybe_emit(state.pool_manager.total_members()) {
             state.stats.set_event_loop(trace.report());
-            let document = state.perf_document();
-            m6_http_lib::stats::log_perf(&document);
+            state.log_perf();
         }
 
         // The traffic summary has its own cadence: its report describes a
@@ -7705,6 +7688,8 @@ fn run(args: Vec<String>) -> i32 {
     // they carry is still the site's. The writer is told the ID now, so the
     // generation's directory is kept and every other one is queued for
     // removal over the slices that follow.
+    // The host block's one full read, at start, before the loop runs.
+    let host = m6_core::platform::host::HostReader::new(&config.site_dir);
     let (pending_disk, loaded_entries, loaded_bad, disk_state) =
         match (config.cache_dir.as_deref(), disk.as_mut()) {
             (Some(dir), Some(writer)) => match disk_cache::load(dir, cache.max_bytes()) {
@@ -7764,7 +7749,7 @@ fn run(args: Vec<String>) -> i32 {
         rate_limiter: RateLimiter::new(),
         error_pages: HashMap::new(),
         started: m6_core::platform::now(),
-        host: None,
+        host,
         traffic: health::TrafficWindow::new(),
         lookup_key_buf: String::with_capacity(512),
         alt_svc_line,
@@ -7856,23 +7841,6 @@ fn initial_stats(interval_s: u64, traffic_interval_s: u64) -> Stats {
     }
     Stats::with_interval(std::time::Duration::from_secs(interval_s))
         .with_traffic_interval(std::time::Duration::from_secs(traffic_interval_s))
-}
-
-#[cfg(test)]
-mod host_cadence_tests {
-    use super::*;
-
-    /// The metrics line goes out every ten seconds and its host block is
-    /// read once a minute: five lines repeat the block and the sixth reads it.
-    #[test]
-    fn the_host_block_is_read_once_a_minute() {
-        let read_at = m6_core::platform::now();
-        let line = std::time::Duration::from_secs(10);
-        let due: Vec<bool> = (1..=6)
-            .map(|n| host_read_due(read_at, read_at + line * n))
-            .collect();
-        assert_eq!(due, [false, false, false, false, false, true]);
-    }
 }
 
 #[cfg(test)]
