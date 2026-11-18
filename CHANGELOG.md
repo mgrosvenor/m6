@@ -47,7 +47,8 @@ The released versions, newest first:
 `--version-full` prints one line per m6 crate in the binary, the binary first, each as `<crate> - <full SemVer>` with that crate's own commit and dirty flag.
 The workspace version moves to `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
 The start-up and shutdown recovery record is in the same release.
-The monitor's use of these fields and the hash deletions are later changes in the same workstream.
+The monitor reads the record from the same journal it already follows and checks each run against what the deploy recorded.
+The hash deletions are later changes in the same workstream.
 
 ### Added
 
@@ -81,6 +82,22 @@ The monitor's use of these fields and the hash deletions are later changes in th
 - `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
 - The recovery record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included.
 - The record from a real binary is quoted in the worker report, and the largest line and line count from the rendered production and staging configs are measured rather than estimated.
+
+### Added
+
+- **`m6-monitor` reads `type=startup` and `type=shutdown` on its one long-lived `journalctl --follow` child**, beside `type=perf` and `type=traffic`. Four `M6_TYPE` matches, one child, and no second follower. The start-up record is grouped by its `run_id` and attributed by the record's own `node` field, or by the hostname on its platform line, plus its own `app` field. `_HOSTNAME` is not read.
+- **The monitor checks each run and reports a finding with a severity.** A dirty build outside `dev`, a pre-release on `prod`, a version that differs from the deploy's recorded release, and a config sha256 that differs from the rendered file are `Fault`. A complete count that disagrees with the lines received, and a record that never closed, are `Fault`. An unexpected restart is `Warn` and quotes the previous run's shutdown reason. A node whose kernel, OS, CPU or memory differs from its peers is `Warn`. Versions are parsed with the `semver` crate, never compared as strings.
+- **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
+
+### Changed
+
+- **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
+- **`[monitor]` carries two more keys:** `environment` and `expected_deploy_file`. A monitor config that names neither keeps its previous behaviour and gains two warnings per check, one that says the environment is not declared and one that says the deploy's expected values cannot be read.
+
+### Verified
+
+- `m6-monitor`'s own suite adds fake journal lines that produce every finding: a dirty version on prod, a pre-release on prod, a version mismatch, a stale config sha, a completed record whose count disagrees, a record that never completes, an unexpected restart with and without a shutdown reason, a restart during a deploy, a peer kernel drift, a decided fact that differs from the deploy, a missing expectation file, and a clean run that produces no finding.
+- Each finding's test asserts the level and the value it names. Every run finding's text carries the run id and the app, because one function builds all of them, and the test for a version mismatch asserts that prefix.
 
 ---
 

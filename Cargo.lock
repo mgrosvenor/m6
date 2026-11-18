@@ -2219,6 +2219,7 @@ dependencies = [
  "m6-core",
  "m6-platform",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

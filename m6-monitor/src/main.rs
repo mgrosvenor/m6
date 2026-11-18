@@ -1,8 +1,8 @@
 //! `m6-monitor`: one page that says how the fleet is.
 //!
 //! Runs at origin, polls every node's `/health` over the backbone, reads every
-//! node's metrics and traffic documents from mon's own journal, and serves the
-//! digest. These routes:
+//! node's metrics and traffic documents and every start-up record from mon's
+//! own journal, and serves the digest. These routes:
 //!
 //!   GET /          the page
 //!   GET /digest    the same thing as JSON, for anything that is not a person
@@ -51,6 +51,7 @@ mod fleet;
 mod history;
 mod journal;
 mod poll;
+mod startup;
 mod tunnel;
 
 use std::path::Path;
@@ -243,6 +244,8 @@ fn run_service() -> Result<()> {
             .limits()
             .get(&m6_core::limits::UPSTREAM_REQUEST)
             .clone(),
+        expected_file: fleet.expected_deploy_path(site.site_dir()),
+        environment: fleet.environment.clone(),
     });
 
     // The journal is where a node's metrics and traffic lines are read from.
@@ -860,6 +863,9 @@ fn publish(
     };
     let at_ms = history::now_ms();
     let mut d = digest::build(&polled.readings, thresholds, now_iso8601());
+    // The start-up record's checks: the deploy's expectation file and the
+    // journal's own records, judged beside every other reading.
+    startup::judge(&mut d, &polled.startup);
     let h = history.digest();
     if let Some(f) = history::finding(&h) {
         d.add_finding(f);
@@ -928,6 +934,10 @@ fn run_check(config_path: &Path) -> Result<()> {
         m6_core::dns::nameserver()?,
         check::MAX_LOOKUPS_PER_CHECK,
     )?;
+    // The deploy's expectation file, resolved the same way the journal
+    // directory is: against the config file's own directory.
+    let site_dir = config_path.parent().unwrap_or(Path::new("."));
+    poller.set_expected_file(fleet.expected_deploy_path(site_dir));
     // The metrics and traffic documents are read from the journal before the
     // poll, until every node has both or the settle bound passes. A one-shot
     // tool may wait here, so this is a bounded read rather than a loop turn.
@@ -940,7 +950,8 @@ fn run_check(config_path: &Path) -> Result<()> {
     );
     let mut out = poller.out();
     let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
-    let d = digest::build(&polled.readings, &thresholds, now_iso8601());
+    let mut d = digest::build(&polled.readings, &thresholds, now_iso8601());
+    startup::judge(&mut d, &polled.startup);
     // The report goes through `print!`, so stop the log first: it flushes and
     // puts stdout back to the blocking flag the process started with.
     m6_core::log::stop()?;

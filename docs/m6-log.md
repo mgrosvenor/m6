@@ -193,7 +193,7 @@ journalctl M6_TYPE=perf -o json
 ```
 
 `m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=200`, `--output=json` and `--directory <dir>`, and adds `--follow` in the running monitor.
-It filters on `M6_TYPE=perf` and `M6_TYPE=traffic`.
+It filters on `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`, so one child carries the four types.
 The native fields are the monitor's input.
 
 Detection is one platform fact.

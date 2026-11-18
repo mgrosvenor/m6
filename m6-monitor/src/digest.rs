@@ -152,6 +152,10 @@ pub struct Digest {
     /// fleet config), empty otherwise and then absent from the JSON.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub process_groups: Vec<ProcessGroup>,
+    /// The start-up record of each node and app, with the deploy's expected
+    /// values beside it. Filled by `startup::judge` after this build, so the
+    /// two readers of the journal cannot disagree about what a record says.
+    pub startup: crate::startup::StartupDigest,
 }
 
 /// One node's processes added together: the node's real traffic, where one
@@ -1557,6 +1561,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             .next(),
         history: None,
         process_groups: process_groups(readings),
+        startup: crate::startup::StartupDigest::default(),
     }
 }
 

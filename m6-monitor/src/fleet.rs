@@ -172,6 +172,32 @@ pub struct Fleet {
     /// without a second number to maintain.
     #[serde(default)]
     pub health_last_ok_max_age_s: Option<u64>,
+    /// This monitor's environment: `dev`, `staging` or `prod`. Optional.
+    ///
+    /// It decides two rules from the start-up record's version, and nothing
+    /// else: a dirty build is refused anywhere but `dev`, and a pre-release is
+    /// refused on `prod`. The value is the deployment's declaration, like
+    /// `journal_dir`, so no site name enters this crate.
+    ///
+    /// Absent, the monitor falls back to the `environment` in the deploy's
+    /// expectation file. With neither, the two rules cannot be judged and the
+    /// check says so once instead of guessing.
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// The deploy's record of what it expects on each node: a version and a
+    /// config sha256 per app, plus whether a deploy is in progress. Optional.
+    ///
+    /// The deploy writes it and the monitor only reads it. The path comes from
+    /// this key and is resolved against the site directory, so no deployment
+    /// path is compiled into the crate.
+    ///
+    /// The shape is documented in `docs/m6-monitor.md` section 5: JSON, a
+    /// `nodes` map, an `apps` map under each node, and a `version`, `config`
+    /// and optional `decided` block under each app. A file that does not exist
+    /// yet is a state the check reports as "waiting for the deploy side",
+    /// never a refusal to start.
+    #[serde(default)]
+    pub expected_deploy_file: Option<String>,
 }
 
 /// The seconds between polls, read from the top level of the service config.
@@ -320,6 +346,22 @@ impl Fleet {
             );
         }
         Ok(path)
+    }
+
+    /// The deploy's expectation file, resolved against the site directory.
+    ///
+    /// `None` when `[monitor] expected_deploy_file` is not set. A path that
+    /// does not exist is not a refusal: the file is the deploy side's to
+    /// write, and the check reports it as waiting rather than stopping the
+    /// monitor.
+    pub fn expected_deploy_path(&self, site_dir: &Path) -> Option<std::path::PathBuf> {
+        let configured = self.expected_deploy_file.as_deref()?;
+        let path = std::path::PathBuf::from(configured);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            site_dir.join(path)
+        })
     }
 
     /// Load from the service's own config file.

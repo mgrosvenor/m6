@@ -25,6 +25,10 @@ m6-core    = { path = "../m6-core", default-features = false, features = ["sqlit
 anyhow     = "1"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Version comparison for the start-up record's checks: a pre-release, a dirty
+# build and a version that differs from the deploy's record are parsed, never
+# compared as strings.
+semver     = "1"
 
 toml       = "0.8"
 # The monitor's own outgoing TLS client: it builds one ClientConfig at start

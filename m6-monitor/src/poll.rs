@@ -8,7 +8,9 @@
 //! The metrics and traffic documents are steps too, and they read mon's
 //! journal, where the line carries `perf` or `traffic` on `M6_TYPE` and names
 //! its node in the document's own `node` field. Nothing is asked of a node for
-//! them.
+//! them. The start-up and shutdown lines arrive on the same reader and are kept
+//! beside the two documents, so a poll carries the current run of each node and
+//! app as well.
 //!
 //! # A poll is a table of steps, not a thread per node
 //!
@@ -201,6 +203,11 @@ pub enum Out {
 }
 
 /// Why the loop came back: still working, or the poll finished.
+// A poll's result is built once and held from `finish` to `publish`, and it
+// carries every reading of the fleet. Boxing the large variant would put an
+// indirection on every field read for no gain, the reason `Out` carries the
+// same allowance below.
+#[allow(clippy::large_enum_variant)]
 pub enum Progress {
     Working,
     Done(Polled),
@@ -212,6 +219,9 @@ pub struct Polled {
     pub verdicts: Verdicts,
     /// When the poll finished.
     pub at: Instant,
+    /// The start-up records the journal carried and the deploy's expected
+    /// values, read at the same poll as everything else.
+    pub startup: crate::startup::Facts,
 }
 
 /// The poll in flight.
@@ -266,6 +276,11 @@ pub struct Setup {
     pub upstream_read: m6_core::limits::Limit,
     /// The `upstream_request` limit each node's request slot follows.
     pub upstream_request: m6_core::limits::Limit,
+    /// `[monitor] expected_deploy_file`, resolved. `None` when the key is not
+    /// set, which the check reports as "no deploy record configured".
+    pub expected_file: Option<std::path::PathBuf>,
+    /// `[monitor] environment`, when the config declares one.
+    pub environment: Option<String>,
 }
 
 /// Every node's own view, driven by a service's loop.
@@ -283,6 +298,12 @@ pub struct Poller {
     wg_max_age_s: u64,
     upstream_read: m6_core::limits::Limit,
     upstream_request: m6_core::limits::Limit,
+    /// The deploy's expected values, re-read at each poll so a deploy lands
+    /// without a monitor restart.
+    expectations: crate::startup::Expectations,
+    expected_state: crate::startup::ExpectedState,
+    expected_file: Option<std::path::PathBuf>,
+    environment: Option<String>,
     running: Running,
     last_start: Option<Instant>,
     /// The deadlines for the outgoing slots, indexed by their table position.
@@ -307,6 +328,14 @@ impl Poller {
     /// Why the journal reader is not running, or `None` while it is.
     pub fn set_journal_state(&mut self, unavailable: Option<String>) {
         self.latest.unavailable = unavailable;
+    }
+
+    /// Point the poller at the deploy's expectation file.
+    ///
+    /// A one-shot run knows the config's directory, so it resolves the key
+    /// itself. The service passes the resolved path in its `Setup`.
+    pub fn set_expected_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.expected_file = path;
     }
 
     /// Read the journal once for `--check`. `None` means the directory could
@@ -339,7 +368,10 @@ impl Poller {
             lookup_cap,
             upstream_read,
             upstream_request,
+            expected_file,
+            environment,
         } = setup;
+        let (expectations, expected_state) = crate::startup::load(expected_file.as_deref());
         let readings = nodes
             .iter()
             .map(|n| NodeReading {
@@ -389,6 +421,10 @@ impl Poller {
             wg_max_age_s,
             upstream_read,
             upstream_request,
+            expectations,
+            expected_state,
+            expected_file,
+            environment,
             running,
             last_start: None,
             out_timeouts: Timeouts::new(slots, timeout),
@@ -463,6 +499,12 @@ impl Poller {
         self.running.dns_started = false;
         self.running.dns_left = 0;
         self.last_start = Some(now);
+        // The deploy rewrites its record around a deploy, so the monitor reads
+        // it once per poll rather than once per process. A file that vanished
+        // or arrived is a state the check reports, never a poll failure.
+        let (expectations, expected_state) = crate::startup::load(self.expected_file.as_deref());
+        self.expectations = expectations;
+        self.expected_state = expected_state;
         #[cfg(feature = "count-allocations")]
         {
             self.running.alloc_start = m6_core::testkit::alloc_count::now();
@@ -1263,11 +1305,25 @@ impl Poller {
             "fleet poll allocations"
         );
         let verdicts = self.cache.verdicts(&self.readings);
+        let startup = crate::startup::Facts {
+            runs: self.latest.startup.views(now),
+            expectations: self.expectations.clone(),
+            expected_state: self.expected_state.clone(),
+            expected_path: self
+                .expected_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            environment: self.environment.clone(),
+            cut: self.latest.startup.cut,
+            orphan_shutdowns: self.latest.startup.orphan_shutdowns,
+            journal_unavailable: self.latest.unavailable.clone(),
+        };
         self.running.active = false;
         Ok(Progress::Done(Polled {
             readings: self.readings.clone(),
             verdicts,
             at: now,
+            startup,
         }))
     }
 }
@@ -1292,6 +1348,8 @@ pub fn one_shot_poller(
         lookup_cap,
         upstream_read: m6_core::limits::Limit::builtin(&m6_core::limits::UPSTREAM_READ),
         upstream_request: m6_core::limits::Limit::builtin(&m6_core::limits::UPSTREAM_REQUEST),
+        expected_file: None,
+        environment: fleet.environment.clone(),
     }))
 }
 
@@ -1454,6 +1512,8 @@ mod tests {
             wg_handshakes_file: None,
             tunnel_handshake_max_age_s: 600,
             health_last_ok_max_age_s: None,
+            environment: None,
+            expected_deploy_file: None,
         }
     }
 

@@ -9,7 +9,9 @@
 //! Apart from section H's tunnel check, every figure comes from one of two
 //! places: the node's own `/health`, and mon's journal. Each node streams its
 //! metrics and traffic lines there, and each line carries `perf` or `traffic`
-//! on `M6_TYPE` with the node named in the document. This process runs no
+//! on `M6_TYPE` with the node named in the document. The same journal carries
+//! each run's start-up record and its shutdown line, which the STARTUP section
+//! renders. This process runs no
 //! command on a node, and it does not read an analytics log over the wire. The
 //! one command it runs is `journalctl`, here, against mon's copy of the
 //! journals.
@@ -258,6 +260,127 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             }
             let _ = writeln!(o);
         }
+    }
+
+    // ── STARTUP ──────────────────────────────────────────────────────────────
+    //
+    // The newest start-up record of each node and app. It answers the two
+    // questions the other sections cannot: what release each process is
+    // running, and which config file it actually read. The deploy's own
+    // expected values sit beside it, so a difference is visible here as well as
+    // in the verdict.
+    let _ = writeln!(
+        o,
+        "\nSTARTUP  (the newest start-up record of each node and app, from the journal; \
+         the expected values from the deploy's record)"
+    );
+    if d.startup.runs.is_empty() {
+        match d.startup.journal_unavailable.as_deref() {
+            Some(reason) => {
+                let _ = writeln!(
+                    o,
+                    "  (no start-up record: the journal reader is not running: {reason})"
+                );
+            }
+            None => {
+                let _ = writeln!(o, "  (no start-up record in the journal)");
+            }
+        }
+    }
+    for run in &d.startup.runs {
+        let labelled = match run.process_index {
+            Some(index) => format!("{}/{index}", run.app),
+            None => run.app.clone(),
+        };
+        let config = if run.config.is_empty() {
+            "-".to_string()
+        } else {
+            run.config
+                .iter()
+                .map(|(role, sha)| format!("{role}={sha}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let label = if run.state == "complete" {
+            "ok"
+        } else {
+            "FAULT"
+        };
+        let _ = writeln!(
+            o,
+            "  {:<8} {:<12} {:<6} {:<26} started {}",
+            run.node, labelled, label, run.version, run.started_at
+        );
+        let complete = match run.complete_lines {
+            Some(lines) => format!("{lines}"),
+            None => "-".to_string(),
+        };
+        let _ = writeln!(
+            o,
+            "           run {}, config {config}, {}/{} line(s)",
+            run.run_id, run.lines, complete
+        );
+        if let Some(shutdown) = &run.shutdown {
+            let _ = writeln!(
+                o,
+                "           last shutdown {:?} after {}ms",
+                shutdown.reason, shutdown.uptime_ms
+            );
+        }
+    }
+    match d.startup.expected_state.as_str() {
+        "loaded" => {
+            let _ = writeln!(
+                o,
+                "  deploy record {}: loaded, environment {}, deploy in progress {}",
+                d.startup.expected_file.as_deref().unwrap_or("-"),
+                d.startup.environment.as_deref().unwrap_or("?"),
+                match d.startup.deploy_in_progress {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unknown",
+                }
+            );
+        }
+        "missing" => {
+            let _ = writeln!(
+                o,
+                "  deploy record {}: waiting for the deploy side (the file does not exist yet)",
+                d.startup.expected_file.as_deref().unwrap_or("-")
+            );
+        }
+        "not_configured" => {
+            let _ = writeln!(
+                o,
+                "  no deploy record configured: set [monitor] expected_deploy_file to the file the deploy writes"
+            );
+        }
+        state => {
+            let _ = writeln!(
+                o,
+                "  deploy record {}: FAULT, {state}{}",
+                d.startup.expected_file.as_deref().unwrap_or("-"),
+                d.startup
+                    .expected_error
+                    .as_deref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    if d.startup.cut_records > 0 {
+        let _ = writeln!(
+            o,
+            "  {} start-up record(s) were cut by the journal tail and are not shown",
+            d.startup.cut_records
+        );
+    }
+    if d.startup.orphan_shutdowns > 0 {
+        let _ = writeln!(
+            o,
+            "  {} shutdown line(s) had no start-up record, so they name no run",
+            d.startup.orphan_shutdowns
+        );
     }
 
     // ── A. logging ───────────────────────────────────────────────────────────
@@ -1303,6 +1426,54 @@ mod tests {
 
     pub(super) fn digest() -> Digest {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
+    }
+
+    /// The STARTUP section names each node's and app's current run, with the
+    /// version, the start time and the config sha. A monitor that reported a
+    /// version without the sha could not answer which file produced it.
+    #[test]
+    fn the_startup_section_shows_version_start_and_config_sha() {
+        let mut d = digest();
+        d.startup.runs.push(crate::startup::RunDigest {
+            node: "origin".into(),
+            app: "m6-http".into(),
+            process_index: None,
+            run_id: "1794968180857-37684".into(),
+            version: "1.16.0+abc123".into(),
+            tag: Some("v1.16.0".into()),
+            started_at: "2026-11-18T02:16:20.858965Z".into(),
+            config: [("config".to_string(), "aa11".to_string())]
+                .into_iter()
+                .collect(),
+            config_paths: Default::default(),
+            lines: 4,
+            complete_lines: Some(4),
+            state: "complete".into(),
+            shutdown: None,
+            previous_run_id: None,
+        });
+        d.startup.expected_state = "missing".into();
+        d.startup.expected_file = Some("/run/m6/expected.json".into());
+        let text = super::render(&d, &[], &Default::default());
+        assert!(text.contains("STARTUP"), "{text}");
+        assert!(text.contains("origin"), "the node is named: {text}");
+        assert!(text.contains("m6-http"), "the app is named: {text}");
+        assert!(
+            text.contains("1.16.0+abc123"),
+            "the version is shown: {text}"
+        );
+        assert!(
+            text.contains("2026-11-18T02:16:20.858965Z"),
+            "the start time is shown: {text}"
+        );
+        assert!(
+            text.contains("config=aa11"),
+            "the config sha is shown: {text}"
+        );
+        assert!(
+            text.contains("waiting for the deploy side"),
+            "a missing deploy record is said: {text}"
+        );
     }
 
     /// The PROCESSES section exists only for a node polled as processes, and
