@@ -11,7 +11,7 @@
     reason = "test code: threads, sleeps and blocking clients drive the service from outside"
 )]
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use m6_http_lib::forward::HttpRequest;
@@ -76,10 +76,7 @@ fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i
         Command::new(testkit::binary("m6-http"))
             .arg(site)
             .arg(config)
-            .env("RUST_LOG", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .env("RUST_LOG", "info"),
     )
     .expect("spawn m6-http");
     let exited = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {

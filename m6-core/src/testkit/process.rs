@@ -8,10 +8,19 @@
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
+
+use crate::platform::process::{Child, Io, Streams};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Stdin from `/dev/null`, stdout and stderr to pipes this process reads.
+const PIPED_OUTPUT: Streams = Streams {
+    stdin: Io::Null,
+    stdout: Io::Piped,
+    stderr: Io::Piped,
+};
 
 /// A child that is killed and reaped when its owner is dropped.
 ///
@@ -25,9 +34,11 @@ pub struct Running {
 
 impl Running {
     /// Spawn `cmd` under the same rules `Service::spawn` uses, and own the
-    /// child so a panic cannot leave it behind.
+    /// child so a panic cannot leave it behind. Stdin is `/dev/null`, and
+    /// stdout and stderr are pipes the caller reads, for example with
+    /// `take().wait_with_output()`.
     pub fn spawn(cmd: &mut Command) -> std::io::Result<Running> {
-        let child = crate::platform::process::spawn(cmd.stdin(Stdio::null()))?;
+        let child = crate::platform::process::spawn(cmd, PIPED_OUTPUT)?;
         Ok(Running { child: Some(child) })
     }
 
@@ -91,18 +102,15 @@ impl Service {
     /// The caller configures the command (program, arguments, environment);
     /// this overrides only the standard streams, which it must own.
     pub fn spawn(name: &str, cmd: &mut Command) -> Service {
-        // Once per test process, before its first child: no inherited
-        // descriptor (a test lock, a listener) reaches a service it starts.
+        // Once per test process, before its first child. `spawn` gives the
+        // child its three streams and nothing else, so this covers what a test
+        // runs with `std::process::Command` directly, such as `--dump-config`.
         static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         SWEPT.get_or_init(|| {
             let _ = crate::platform::process::close_inherited_on_exec();
         });
-        let mut child = crate::platform::process::spawn(
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-        )
-        .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+        let mut child = crate::platform::process::spawn(cmd, PIPED_OUTPUT)
+            .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let mut drains = Vec::with_capacity(2);

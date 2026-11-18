@@ -38,7 +38,17 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+
+use m6_core::platform::process::{Child, Io, Streams};
+
+/// A backend's stdout is not read, and its stderr is drained into the failure
+/// message.
+const BACKEND_STREAMS: Streams = Streams {
+    stdin: Io::Inherit,
+    stdout: Io::Null,
+    stderr: Io::Piped,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -516,9 +526,8 @@ backend = "example"
         let mut backend = BackendGuard {
             child: Some(
                 m6_core::platform::process::spawn(
-                    backend_command(lang, base, &sock)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::piped()),
+                    &mut backend_command(lang, base, &sock),
+                    BACKEND_STREAMS,
                 )
                 .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
             ),

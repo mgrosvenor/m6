@@ -16,7 +16,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -253,10 +253,7 @@ fn run_until_exit(site: &Path, config: &Path) -> (Option<i32>, String) {
         Command::new(binary("m6-http"))
             .arg(site)
             .arg(config)
-            .env("RUST_LOG", "info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .env("RUST_LOG", "info"),
     )
     .expect("spawn m6-http");
     let exited = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {

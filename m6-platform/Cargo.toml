@@ -27,6 +27,9 @@ nix     = { version = "0.31", features = ["feature", "hostname", "signal", "poll
 # Socket construction with the options every m6 socket needs. `all` for
 # `SO_NOSIGPIPE` on macOS.
 socket2 = { version = "0.6", features = ["all"] }
+# `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT` on macOS, `close_range` and
+# `waitpid` with the raw status, none of which `nix` wraps.
+libc    = "0.2"
 # The host readings are published as JSON by a monitoring service.
 serde   = { version = "1", features = ["derive"] }
 

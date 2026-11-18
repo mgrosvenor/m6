@@ -578,7 +578,47 @@ mod child_exit {
 
 mod spawn {
     use super::*;
+    use m6_platform::process::{Io, Streams};
     use std::process::{Command, Stdio};
+
+    /// Every standard stream to `/dev/null`.
+    const NO_STREAMS: Streams = Streams {
+        stdin: Io::Null,
+        stdout: Io::Null,
+        stderr: Io::Null,
+    };
+
+    /// C11. Break: `spawn` by fork and exec on macOS, as `std`'s
+    /// `Command::spawn` does whenever a `pre_exec` is set. The child keeps the
+    /// listener, holds the port in LISTEN after this process has closed it,
+    /// and the rebind below fails with `Address already in use`.
+    ///
+    /// On macOS a socket is created, and marked close-on-exec by a second call.
+    /// A spawn by another thread between the two copies a listener with no
+    /// close-on-exec flag. `dup` makes that state on demand: the duplicate
+    /// carries no flag. So this is the race with its window held open, rather
+    /// than a thread that hits the window some of the time.
+    #[test]
+    fn a_listener_without_close_on_exec_is_not_inherited() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let bare = platform::fd::dup(&listener).expect("a duplicate with no close-on-exec");
+        let mut child = process::spawn(Command::new("sleep").arg("30"), NO_STREAMS).expect("spawn");
+        let listening = process::listens_on_tcp(child.id());
+        drop(bare);
+        drop(listener);
+        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !listening.expect("the child's sockets can be read"),
+            "the child holds a TCP listener it was never given"
+        );
+        assert!(
+            rebound.is_ok(),
+            "port {port} is still bound after this process closed its listener: {rebound:?}"
+        );
+    }
 
     /// C9. Break: a child that holds a descriptor above stderr after `exec`, so
     /// a lock this process holds outlives it.
@@ -611,10 +651,12 @@ mod spawn {
                     "--nocapture",
                     "spawn::a_spawned_child_reports_what_it_inherited",
                 ])
-                .env("M6_TEST_INHERITED_LOCK", &path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
+                .env("M6_TEST_INHERITED_LOCK", &path),
+            Streams {
+                stdin: Io::Null,
+                stdout: Io::Piped,
+                stderr: Io::Piped,
+            },
         )
         .expect("spawn");
         drop(held);
@@ -725,8 +767,8 @@ mod spawn {
     #[test]
     #[ignore = "run by an_interrupted_harness_leaves_no_server in its own process group"]
     fn an_interrupted_harness_leaves_no_server_inside() {
-        let mut server = process::spawn(Command::new("sleep").arg("30").stdin(Stdio::null()))
-            .expect("start the server");
+        let mut server =
+            process::spawn(Command::new("sleep").arg("30"), NO_STREAMS).expect("start the server");
         println!("server {}", server.id());
         let _ = server.wait();
     }

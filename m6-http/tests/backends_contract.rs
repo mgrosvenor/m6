@@ -32,7 +32,9 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+
+use m6_core::platform::process::{Child, Io, Streams};
 use std::time::{Duration, Instant};
 
 /// Where the examples live, and the one payload file they all serve.
@@ -439,9 +441,13 @@ impl Backend {
             }
         };
 
-        let child =
-            m6_core::platform::process::spawn(cmd.stdout(Stdio::null()).stderr(Stdio::piped()))
-                .unwrap_or_else(|e| panic!("cannot spawn {} example: {e}", lang.dir()));
+        let streams = Streams {
+            stdin: Io::Inherit,
+            stdout: Io::Null,
+            stderr: Io::Piped,
+        };
+        let child = m6_core::platform::process::spawn(&mut cmd, streams)
+            .unwrap_or_else(|e| panic!("cannot spawn {} example: {e}", lang.dir()));
 
         let b = Backend {
             lang,

@@ -35,9 +35,12 @@
 //! stop, so no `journalctl --follow` outlives the monitor.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::Command;
+
+use m6_core::platform::process::{Child, Io, Streams};
 use std::time::{Duration, Instant};
 
 use m6_core::limits::{Bounded, Limit};
@@ -634,7 +637,7 @@ pub struct Reader {
     /// `--follow` for the service, off for `--check`, which reads once.
     follow: bool,
     child: Option<Child>,
-    stdout: Option<ChildStdout>,
+    stdout: Option<File>,
     /// The one line being assembled, bounded by a named limit.
     line: Bounded<u8>,
     /// A line past the limit is dropped, and its bytes are ignored until its
@@ -816,17 +819,21 @@ impl Reader {
             .arg("M6_TYPE=perf")
             .arg("M6_TYPE=traffic")
             .arg("M6_TYPE=startup")
-            .arg("M6_TYPE=shutdown")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .arg("M6_TYPE=shutdown");
         command
     }
 
     /// Start the child, and put it back on a longer backoff when it fails.
     fn start(&mut self, now: Instant) {
         let mut command = self.command();
-        match m6_core::platform::process::spawn(&mut command) {
+        // Only stdout is read. Stderr goes nowhere, as a reader that stops
+        // draining it would otherwise stall journalctl.
+        let streams = Streams {
+            stdin: Io::Null,
+            stdout: Io::Piped,
+            stderr: Io::Null,
+        };
+        match m6_core::platform::process::spawn(&mut command, streams) {
             Ok(mut child) => {
                 let Some(stdout) = child.stdout.take() else {
                     let _ = child.kill();
@@ -990,11 +997,15 @@ mod tests {
             "a test reader".into(),
             &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
         );
-        let mut child = Command::new("sh")
-            .args(["-c", "printf 'one\\n'"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("a child");
+        let mut child = m6_core::platform::process::spawn(
+            Command::new("sh").args(["-c", "printf 'one\\n'"]),
+            Streams {
+                stdin: Io::Null,
+                stdout: Io::Piped,
+                stderr: Io::Null,
+            },
+        )
+        .expect("a child");
         reader.stdout = child.stdout.take();
         reader.child = Some(child);
         let fd = reader.fd().expect("the pipe");
@@ -1018,11 +1029,15 @@ mod tests {
         );
         reader.follow = false;
         reader.stopped = None;
-        let mut child = Command::new("sh")
-            .args(["-c", script])
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("a child");
+        let mut child = m6_core::platform::process::spawn(
+            Command::new("sh").args(["-c", script]),
+            Streams {
+                stdin: Io::Null,
+                stdout: Io::Piped,
+                stderr: Io::Null,
+            },
+        )
+        .expect("a child");
         reader.stdout = child.stdout.take();
         reader.child = Some(child);
         reader

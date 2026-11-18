@@ -7,7 +7,7 @@
 //! another kqueue system (FreeBSD, OpenBSD) starts from this file.
 
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
@@ -519,4 +519,221 @@ fn sysctl_timeval(name: &str) -> Option<u64> {
         .and_then(|c| c.value_as::<nix::libc::timeval>())
         .ok()?;
     u64::try_from(value.tv_sec).ok()
+}
+
+// Two file actions in libSystem since macOS 10.7 and 10.15 that the `libc`
+// crate does not declare.
+extern "C" {
+    fn posix_spawn_file_actions_addinherit_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        fd: libc::c_int,
+    ) -> libc::c_int;
+    fn posix_spawn_file_actions_addchdir_np(
+        actions: *mut libc::posix_spawn_file_actions_t,
+        path: *const libc::c_char,
+    ) -> libc::c_int;
+}
+
+/// A `posix_spawn` return code as an error.
+fn spawn_check(code: libc::c_int) -> io::Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(code))
+    }
+}
+
+/// A string for the C side, refusing an interior NUL as `std` does.
+fn c_string(bytes: &[u8]) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "an argument holds a NUL byte"))
+}
+
+/// The file actions and attributes of one spawn, destroyed on every path out.
+struct SpawnSetup {
+    actions: libc::posix_spawn_file_actions_t,
+    attrs: libc::posix_spawnattr_t,
+}
+
+impl Drop for SpawnSetup {
+    fn drop(&mut self) {
+        // SAFETY: both were initialised by `SpawnSetup::new`, and this is their
+        // one destroy.
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut self.actions);
+            libc::posix_spawnattr_destroy(&mut self.attrs);
+        }
+    }
+}
+
+impl SpawnSetup {
+    fn new() -> io::Result<Box<SpawnSetup>> {
+        // Boxed, so the two objects never move after `init`.
+        let mut setup = Box::new(SpawnSetup {
+            actions: std::ptr::null_mut(),
+            attrs: std::ptr::null_mut(),
+        });
+        // SAFETY: each pointer is to a field of the box, valid for the call.
+        // A failed first init leaves nothing to destroy, so the box is forgotten.
+        unsafe {
+            let code = libc::posix_spawn_file_actions_init(&mut setup.actions);
+            if code != 0 {
+                std::mem::forget(setup);
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            let code = libc::posix_spawnattr_init(&mut setup.attrs);
+            if code != 0 {
+                libc::posix_spawn_file_actions_destroy(&mut setup.actions);
+                std::mem::forget(setup);
+                return Err(io::Error::from_raw_os_error(code));
+            }
+        }
+        Ok(setup)
+    }
+}
+
+/// [`crate::process::spawn`] on macOS: `posix_spawnp` with
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT`, so the child holds the three streams named
+/// here and no other descriptor of this process, whatever its close-on-exec
+/// flag. The mask is emptied and every managed signal and SIGPIPE is set to
+/// its default disposition by the spawn's own attributes.
+pub(super) fn spawn(
+    cmd: &mut std::process::Command,
+    streams: crate::process::Streams,
+) -> io::Result<(u32, [Option<std::fs::File>; 3])> {
+    use crate::process::Io;
+    use std::os::unix::ffi::OsStrExt;
+
+    let program = c_string(cmd.get_program().as_bytes())?;
+    let mut argv = vec![program.clone()];
+    for arg in cmd.get_args() {
+        argv.push(c_string(arg.as_bytes())?);
+    }
+    let mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+        std::env::vars_os().collect();
+    for (key, value) in cmd.get_envs() {
+        match value {
+            Some(value) => env.insert(key.to_os_string(), value.to_os_string()),
+            None => env.remove(key),
+        };
+    }
+    let mut envp = Vec::with_capacity(env.len());
+    for (key, value) in &env {
+        let mut pair = key.as_bytes().to_vec();
+        pair.push(b'=');
+        pair.extend_from_slice(value.as_bytes());
+        envp.push(c_string(&pair)?);
+    }
+    let cwd = cmd
+        .get_current_dir()
+        .map(|dir| c_string(dir.as_os_str().as_bytes()))
+        .transpose()?;
+    let null = c_string(b"/dev/null")?;
+
+    let mut setup = SpawnSetup::new()?;
+    // The parent's end of each piped stream, and the child's end, which this
+    // process closes once the child holds its copy.
+    let mut parent_ends: [Option<std::fs::File>; 3] = [None, None, None];
+    let mut child_ends: Vec<OwnedFd> = Vec::new();
+    for (fd, io) in [streams.stdin, streams.stdout, streams.stderr]
+        .into_iter()
+        .enumerate()
+    {
+        let fd = fd as libc::c_int;
+        // SAFETY: `setup.actions` is initialised, and every pointer passed is
+        // valid for the call.
+        unsafe {
+            match io {
+                Io::Inherit => spawn_check(posix_spawn_file_actions_addinherit_np(
+                    &mut setup.actions,
+                    fd,
+                ))?,
+                Io::Null => {
+                    let flags = if fd == 0 {
+                        libc::O_RDONLY
+                    } else {
+                        libc::O_WRONLY
+                    };
+                    spawn_check(libc::posix_spawn_file_actions_addopen(
+                        &mut setup.actions,
+                        fd,
+                        null.as_ptr(),
+                        flags,
+                        0,
+                    ))?;
+                }
+                Io::Piped => {
+                    let (read, write) = nix::unistd::pipe()?;
+                    let (parent, child) = if fd == 0 {
+                        (write, read)
+                    } else {
+                        (read, write)
+                    };
+                    nix::fcntl::fcntl(
+                        &parent,
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+                    )?;
+                    spawn_check(libc::posix_spawn_file_actions_adddup2(
+                        &mut setup.actions,
+                        child.as_raw_fd(),
+                        fd,
+                    ))?;
+                    parent_ends[fd as usize] = Some(parent.into());
+                    child_ends.push(child);
+                }
+            }
+        }
+    }
+    if let Some(dir) = &cwd {
+        // SAFETY: as above.
+        spawn_check(unsafe {
+            posix_spawn_file_actions_addchdir_np(&mut setup.actions, dir.as_ptr())
+        })?;
+    }
+
+    let mut defaults = super::managed();
+    defaults.add(nix::sys::signal::Signal::SIGPIPE);
+    let empty = nix::sys::signal::SigSet::empty();
+    let flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT
+        | libc::POSIX_SPAWN_SETSIGMASK
+        | libc::POSIX_SPAWN_SETSIGDEF;
+    // SAFETY: `setup.attrs` is initialised, and the two sets outlive the calls,
+    // which copy them.
+    unsafe {
+        spawn_check(libc::posix_spawnattr_setflags(
+            &mut setup.attrs,
+            flags as libc::c_short,
+        ))?;
+        spawn_check(libc::posix_spawnattr_setsigmask(
+            &mut setup.attrs,
+            empty.as_ref(),
+        ))?;
+        spawn_check(libc::posix_spawnattr_setsigdefault(
+            &mut setup.attrs,
+            defaults.as_ref(),
+        ))?;
+    }
+
+    let mut argv_ptrs: Vec<*mut libc::c_char> =
+        argv.iter().map(|a| a.as_ptr().cast_mut()).collect();
+    argv_ptrs.push(std::ptr::null_mut());
+    let mut envp_ptrs: Vec<*mut libc::c_char> =
+        envp.iter().map(|e| e.as_ptr().cast_mut()).collect();
+    envp_ptrs.push(std::ptr::null_mut());
+    let mut pid: libc::pid_t = 0;
+    // SAFETY: every pointer is to a live, NUL-terminated string or a
+    // null-terminated array of them, and `setup` holds initialised actions and
+    // attributes. `posix_spawnp` reads them and writes the pid.
+    spawn_check(unsafe {
+        libc::posix_spawnp(
+            &mut pid,
+            program.as_ptr(),
+            &setup.actions,
+            &setup.attrs,
+            argv_ptrs.as_ptr(),
+            envp_ptrs.as_ptr(),
+        )
+    })?;
+    drop(child_ends);
+    Ok((pid as u32, parent_ends))
 }

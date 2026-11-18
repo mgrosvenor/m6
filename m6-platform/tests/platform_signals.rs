@@ -10,7 +10,7 @@
 //! supported target. Each case names the wrong implementation that must fail
 //! it.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use libtest_mimic::{Arguments, Failed, Trial};
@@ -133,9 +133,12 @@ fn a_signal_sent_before_the_poll_is_delivered(signals: &mut Signals) {
 fn a_spawned_child_still_dies_on_sigterm() {
     use std::os::unix::process::ExitStatusExt;
     let mut child = process::spawn(
-        Command::new("bash")
-            .args(["-c", "echo up; exec sleep 30"])
-            .stdout(Stdio::piped()),
+        Command::new("bash").args(["-c", "echo up; exec sleep 30"]),
+        process::Streams {
+            stdin: process::Io::Null,
+            stdout: process::Io::Piped,
+            stderr: process::Io::Inherit,
+        },
     )
     .expect("spawn a child");
     // The child has exec'd sleep once its one line has been written.

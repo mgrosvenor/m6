@@ -22,7 +22,9 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+
+use m6_core::platform::process::{Child, Io, Streams};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -81,10 +83,12 @@ impl Server {
         if let Some(m) = max_conns {
             cmd.env("ECHO_MAX_CONNS", m.to_string());
         }
-        cmd.stderr(Stdio::piped());
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        let mut child = platform::process::spawn(&mut cmd).expect("spawn echo");
+        let streams = Streams {
+            stdin: Io::Null,
+            stdout: Io::Null,
+            stderr: Io::Piped,
+        };
+        let mut child = platform::process::spawn(&mut cmd, streams).expect("spawn echo");
         let mut stderr = child.stderr.take().expect("stderr");
 
         // The first line carries the bound address.

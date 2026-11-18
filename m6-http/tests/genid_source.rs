@@ -257,10 +257,7 @@ impl Fixture {
         for arg in extra {
             cmd.arg(arg);
         }
-        let mut child = m6_core::testkit::process::Running::spawn(
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped()),
-        )
-        .expect("spawn m6-http");
+        let mut child = m6_core::testkit::process::Running::spawn(&mut cmd).expect("spawn m6-http");
         let exited = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             child.child().try_wait().expect("try_wait").is_some()
         });

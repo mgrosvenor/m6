@@ -4,8 +4,9 @@
 //! one way a service spawns a child, so the child is not affected by the
 //! service's signal handling.
 
+use std::fs::File;
 use std::io;
-use std::process::{Child, Command};
+use std::process::{Command, ExitStatus, Output};
 
 use super::os;
 
@@ -103,46 +104,216 @@ pub fn fd_limits() -> io::Result<(u64, u64)> {
     Ok((soft, hard))
 }
 
+/// Where one of a child's standard streams goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Io {
+    /// The parent's own descriptor for that stream.
+    Inherit,
+    /// `/dev/null`.
+    Null,
+    /// A pipe, whose parent end is the matching field of [`Child`].
+    Piped,
+}
+
+/// The child's three standard streams, the only descriptors it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Streams {
+    pub stdin: Io,
+    pub stdout: Io,
+    pub stderr: Io,
+}
+
+/// A child started by [`spawn`].
+///
+/// The same calls as `std::process::Child`. Dropping it neither kills nor
+/// reaps the process, as with `std`, so an owner that wants it gone calls
+/// [`Child::kill`] and [`Child::wait`].
+#[derive(Debug)]
+pub struct Child {
+    pid: u32,
+    status: Option<ExitStatus>,
+    /// The parent's end of a piped stdin.
+    pub stdin: Option<File>,
+    /// The parent's end of a piped stdout.
+    pub stdout: Option<File>,
+    /// The parent's end of a piped stderr.
+    pub stderr: Option<File>,
+}
+
+impl Child {
+    /// The child's process id.
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    /// Send SIGKILL. `Ok` when the child has already been reaped.
+    pub fn kill(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        let pid = nix::unistd::Pid::from_raw(self.pid as i32);
+        match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Wait for the child to exit and reap it. Closes a piped stdin first, so a
+    /// child that reads to the end is not waiting on this process.
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        drop(self.stdin.take());
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let status = reap(self.pid, 0)?.expect("a blocking wait returns a status");
+        self.status = Some(status);
+        Ok(status)
+    }
+
+    /// The exit status when the child has exited, reaping it, and `None` while
+    /// it runs.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let status = reap(self.pid, libc::WNOHANG)?;
+        self.status = status;
+        Ok(status)
+    }
+
+    /// Read every byte of the piped stdout and stderr, then wait. The two are
+    /// read together, so a child that fills one pipe while this process reads
+    /// the other cannot stall either.
+    pub fn wait_with_output(mut self) -> io::Result<Output> {
+        drop(self.stdin.take());
+        let (stdout, stderr) = read_both(self.stdout.take(), self.stderr.take())?;
+        let status = self.wait()?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// `waitpid` on one child, retried on `EINTR`. `None` only with `WNOHANG` and a
+/// child still running.
+fn reap(pid: u32, flags: libc::c_int) -> io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut raw: libc::c_int = 0;
+    loop {
+        // SAFETY: `raw` is a valid out-pointer for the call's duration, and the
+        // pid is this process's own child.
+        let got = unsafe { libc::waitpid(pid as libc::pid_t, &mut raw, flags) };
+        if got == -1 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if got == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(ExitStatus::from_raw(raw)));
+    }
+}
+
+/// Read two optional pipes to their end, polling both so neither blocks the
+/// other.
+fn read_both(out: Option<File>, err: Option<File>) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    let mut pipes = [(out, Vec::new()), (err, Vec::new())];
+    let mut buf = [0u8; 8192];
+    loop {
+        let open: Vec<usize> = (0..2).filter(|&i| pipes[i].0.is_some()).collect();
+        if open.is_empty() {
+            break;
+        }
+        let ready: Vec<usize> = {
+            let mut fds: Vec<PollFd> = open
+                .iter()
+                .map(|&i| {
+                    PollFd::new(
+                        pipes[i].0.as_ref().expect("open").as_fd(),
+                        PollFlags::POLLIN,
+                    )
+                })
+                .collect();
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+            open.iter()
+                .zip(fds.iter())
+                .filter(|(_, fd)| fd.revents().is_some_and(|r| !r.is_empty()))
+                .map(|(&i, _)| i)
+                .collect()
+        };
+        for i in ready {
+            let (pipe, data) = &mut pipes[i];
+            let file = pipe.as_mut().expect("open");
+            match file.read(&mut buf) {
+                Ok(0) => *pipe = None,
+                Ok(n) => data.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    let [(_, out), (_, err)] = pipes;
+    Ok((out, err))
+}
+
 /// Spawn `cmd` as every m6 process must: with no signal blocked or ignored in
-/// the child, and no descriptor of this process above stderr.
+/// the child, and no descriptor of this process but the three `streams`.
+///
+/// `cmd` gives the program, its arguments, environment changes and working
+/// directory. Its own stdio settings are not read: `streams` is the one place
+/// the child's standard streams are chosen.
 ///
 /// A service blocks SIGTERM and SIGINT for its own loop
 /// ([`super::Signals`]), and on macOS ignores them as well. A child inherits
-/// both across `exec` on every supported target, so a child spawned with
-/// `Command::spawn` alone would ignore the SIGTERM that stops it. This clears
-/// the mask and restores the two default dispositions between fork and
-/// exec, which is the one thing `pre_exec` is for here.
+/// both across `exec` on every supported target, so the child starts with an
+/// empty mask and the default disposition for every managed signal and SIGPIPE.
 ///
-/// A child also inherits every descriptor of this process that is not marked
-/// close-on-exec, and a test's lock file or a listener held that way outlives
-/// the test in a server it started. [`close_inherited_on_exec`], run once at
-/// start by `block()` (and by a test harness before its first spawn), marks
-/// them, so the child starts with its three standard streams and whatever
-/// `cmd` set up for it. The child stays in this process's group, so an
-/// interrupt from a terminal reaches it as well.
-pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
-    use nix::sys::signal::{signal, SigHandler, SigSet};
-    use std::os::unix::process::CommandExt;
-    // SAFETY: the closure runs in the child between fork and exec and calls
-    // only `pthread_sigmask` and `sigaction`, both async-signal-safe. It
-    // installs `SIG_DFL`, which is no handler code, allocates nothing and
-    // takes no lock.
-    unsafe {
-        cmd.pre_exec(|| {
-            SigSet::empty().thread_set_mask()?;
-            for sig in super::managed().iter() {
-                signal(sig, SigHandler::SigDfl)?;
-            }
-            Ok(())
-        });
-    }
-    cmd.spawn()
+/// **No other descriptor reaches the child, whichever thread opened it and
+/// whatever its close-on-exec flag.** A descriptor left open across `exec`
+/// outlives the test or service that owned it, in a server it started: a test's
+/// listener held that way keeps its port bound, and connections to the port
+/// land in a process that never accepts them. On macOS a socket is not created
+/// close-on-exec. The flag is set by a second call, so another thread's fork
+/// between the two inherits it. macOS therefore spawns with `posix_spawn` and
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT`, which closes everything the spawn does not
+/// name. Linux creates every descriptor close-on-exec in one call, and the
+/// child also marks every descriptor above stderr close-on-exec with
+/// `close_range` before it runs the program, so a descriptor something cleared
+/// the flag on is not inherited either.
+pub fn spawn(cmd: &mut Command, streams: Streams) -> io::Result<Child> {
+    let (pid, [stdin, stdout, stderr]) = os::spawn(cmd, streams)?;
+    Ok(Child {
+        pid,
+        status: None,
+        stdin,
+        stdout,
+        stderr,
+    })
 }
 
 /// Mark every descriptor above stderr close-on-exec, so no child inherits it.
 /// Once, at start, while the process is one thread: `block()` does it for a
-/// service, and a test harness does it before its first spawn. A descriptor
-/// opened later by Rust is close-on-exec already.
+/// service, and a test harness does it before its first spawn.
+///
+/// This covers a child started by anything other than [`spawn`], such as a
+/// `std::process::Command` run directly. [`spawn`] itself needs no sweep: it
+/// gives the child its three standard streams and nothing else. A descriptor
+/// opened later by Rust is close-on-exec on Linux, where the flag is set in the
+/// same call that creates it. On macOS a socket gets the flag in a second call,
+/// so a fork by another thread between the two inherits it, which is why
+/// [`spawn`] uses `posix_spawn` there.
 pub fn close_inherited_on_exec() -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     use std::os::fd::BorrowedFd;

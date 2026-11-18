@@ -2231,6 +2231,7 @@ dependencies = [
 name = "m6-platform"
 version = "1.16.0-rc.1"
 dependencies = [
+ "libc",
  "libproc",
  "libtest-mimic",
  "mio",
