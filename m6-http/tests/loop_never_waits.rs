@@ -565,13 +565,7 @@ impl Fixture {
 
         let service = Service::spawn(
             "m6-http",
-            Command::new(binary("m6-http"))
-                .arg(&site)
-                .arg(&system)
-                // The accounting tick is a fixed ten seconds in production. This
-                // suite waits on it, so a debug build shortens it through the
-                // test-only variable.
-                .env("M6_TEST_STATS_INTERVAL_SECS", "2"),
+            Command::new(binary("m6-http")).arg(&site).arg(&system),
         );
         let mut service = service;
         service.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
@@ -617,8 +611,12 @@ fn site_with(log_level: &str, server: &str, backends: &str, routes: &str) -> Str
     )
 }
 
+/// The suite's site config. The accounting tick is ten seconds by default and
+/// these tests wait on it, so `[stats]` sets two: a release build does not read
+/// the debug-only `M6_TEST_STATS_INTERVAL_SECS`, and a test that set only the
+/// variable would measure a ten-second report in release.
 fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
-    site_with(
+    let site = site_with(
         "info",
         &format!("backend_timeout_secs = {backend_timeout_secs}"),
         &format!("[[backend]]\nname = \"app\"\nsockets = \"{glob}\""),
@@ -627,7 +625,8 @@ fn site_toml(glob: &str, backend_timeout_secs: u64) -> String {
          [[route]]\npath = \"/large\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/echo\"\nbackend = \"app\"\n\n\
          [[route]]\npath = \"/miss/{id}\"\nbackend = \"app\"",
-    )
+    );
+    format!("{site}\n[stats]\ninterval_s = 2\ntraffic_interval_s = 2\n")
 }
 
 /// The one fake authority every fixture points at, started on first use.
@@ -2248,8 +2247,8 @@ fn a_backend_host_that_does_not_resolve_is_a_startup_error() {
 
 /// An idle m6-http wakes about once a second, not a hundred times.
 ///
-/// The report covers the 2 s accounting interval this fixture sets through the
-/// test-only variable, so the plan's mark of two wake-ups a second is four over
+/// The report covers the 2 s accounting interval this fixture sets in
+/// `[stats]`, so the plan's mark of two wake-ups a second is four over
 /// a report, and half a second is one. The removed 10 ms cap gave about 100 a
 /// second, 200 over the same report.
 #[test]

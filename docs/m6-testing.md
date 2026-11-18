@@ -116,7 +116,8 @@ The scripts do not use `binary`.
 ### 3.1. The accounting-tick test hook
 
 `m6-http` writes its accounting stats every ten seconds (`[stats] interval_s`).
-Suites such as `loop_never_waits`, `cache_accounting` and `disk_cache` spawn the real binary and set `M6_TEST_STATS_INTERVAL_SECS` to shorten the tick, because a `#[cfg(test)]` default cannot reach a spawned process.
+Suites such as `cache_accounting` and `disk_cache` spawn the real binary and set `M6_TEST_STATS_INTERVAL_SECS` to shorten the tick, because a `#[cfg(test)]` default cannot reach a spawned process.
+`loop_never_waits` sets `[stats] interval_s` in its `site.toml` instead, because it asserts on wakes per report and must measure the same report in a release run.
 
 A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` in `m6-http/src/main.rs`.
 It uses that many seconds for both the stats and traffic intervals when the value parses as a positive integer.
