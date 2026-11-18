@@ -41,15 +41,20 @@
 //! cannot be mistaken for a real node and a missing key would look like a
 //! record written before this field existed.
 //!
-//! # Redaction is by type, not by name
+//! # Redaction
 //!
-//! There are two mechanisms, and neither contains a list of names:
+//! There are three mechanisms:
 //!
 //! - [`crate::config::Secret`] is a type. A config field declared with it
 //!   serialises as `<redacted>` wherever the record would otherwise read it.
 //! - A value whose dotted key was supplied by the **secrets file** is redacted,
 //!   because the file's role is the type. The value is never copied into a
 //!   [`Setting`] at all.
+//! - A value with no type, which is a `site.toml` table the process does not
+//!   parse or a key a service reads for itself, is redacted when its key names
+//!   a credential. [`names_a_secret`] is the rule. Without it a `password` in a
+//!   table no m6 struct owns was written in plain text, because nothing typed
+//!   it.
 //!
 //! A path that names a secret file is a plain setting, so `tls_key =
 //! "/etc/m6/tls.key"` is logged and the key's bytes never are.
@@ -1275,11 +1280,45 @@ fn decompose_object(
 }
 
 fn setting_for(path: &str, value: &Value, trace: &ConfigTrace) -> Setting {
-    if trace.is_secret(path) {
+    if trace.is_secret(path) || names_a_secret(last_key(path)) {
         Setting::secret(trace.source(path))
     } else {
         Setting::new(value.clone(), trace.source(path))
     }
+}
+
+/// The last key of a dotted section path: `smtp.password` gives `password`
+/// and `route[2]` gives `route`.
+fn last_key(path: &str) -> &str {
+    let key = path.rsplit('.').next().unwrap_or(path);
+    key.split('[').next().unwrap_or(key)
+}
+
+/// The words a key holds when its value is a credential.
+const SECRET_WORDS: [&str; 5] = ["password", "secret", "token", "credential", "private_key"];
+
+/// The endings of a key whose value is where a secret is, not the secret.
+const PATH_ENDINGS: [&str; 5] = ["_path", "_paths", "_file", "_files", "_dir"];
+
+/// Whether a config key names a credential.
+///
+/// This is the rule for a value that no type describes: a table in `site.toml`
+/// that the process does not parse, or a key a service reads for itself. Such a
+/// value reaches the record as plain TOML, so [`crate::config::Secret`] cannot
+/// mark it, and the key's name is the only thing left to judge it by. A key
+/// holding `password`, `secret`, `token`, `credential` or `private_key` is
+/// redacted. A key that names where a secret is kept, ending in `_path`,
+/// `_file` or `_dir`, is a setting and is logged, as is any `public_key`.
+///
+/// The test `m6-core/tests/secret_fields.rs` holds every typed config field to
+/// the same rule, so a typed field this rule would name is declared
+/// [`crate::config::Secret`] and the two cannot disagree.
+pub fn names_a_secret(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    if key.contains("public_key") || PATH_ENDINGS.iter().any(|end| key.ends_with(end)) {
+        return false;
+    }
+    SECRET_WORDS.iter().any(|word| key.contains(word)) || key.contains("privatekey")
 }
 
 /// Convert a TOML value to the JSON value a record carries.

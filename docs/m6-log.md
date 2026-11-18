@@ -345,10 +345,14 @@ A setting's `source` is one of `file`, `default`, `env` or `flag`, in that order
 Every key is present, including the keys the file did not set and the application filled in.
 A default is never omitted because it equals the value in use, so a later release that changes a default changes the record, which is the point.
 
-Redaction is by type, and there is no list of names.
+Redaction has three rules, and each one writes `<redacted>` in place of the value.
 A config field declared `m6_core::Secret<T>` serialises as `<redacted>`, so no writer can pass it to a line.
 A value whose key came from the file named by `secrets_file` is also `<redacted>`, because the file's role is the type.
+A value with no type, such as a `site.toml` table the process does not parse or a key a service reads for itself, is `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`.
+`m6_core::startup::names_a_secret` is that rule, and a test holds every typed config field to it.
 A path that names a secret file is a plain setting and is logged, and the bytes of the secret never are.
+A key ending in `_path`, `_file` or `_dir`, and any `public_key`, is such a path.
+A key the name rule calls a credential is redacted even when its value is a path, for example m6-auth-server's `[keys] private_key`, because a value with no type cannot say which it holds.
 
 A declared flag marked secret is `<redacted>` in the invocation line, and its `argv` entry is redacted in place, so the reader still sees that the flag was passed.
 A command line can therefore never carry a password into the record.

@@ -29,7 +29,8 @@ struct TokensConfig {
 
 #[derive(Deserialize, Default)]
 struct KeysConfig {
-    private_key: String,
+    /// A path, typed as one, because the key's bytes are never in the config.
+    private_key: PathBuf,
     public_key: String,
 }
 
@@ -72,10 +73,10 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
         .unwrap_or_else(|| issuer.clone());
 
     let (private_key_path, public_key_path) = match cfg.keys {
-        Some(k) if !k.private_key.is_empty() => (
+        Some(k) if !k.private_key.as_os_str().is_empty() => (
             Some(m6_core::config::secret_path(
                 "[keys] private_key",
-                &k.private_key,
+                &k.private_key.to_string_lossy(),
             )?),
             Some(m6_core::config::secret_path(
                 "[keys] public_key",

@@ -127,6 +127,69 @@ pub struct CodeRoute {
     pub method: RouteMethod,
 }
 
+/// The files a service's start-up record names, for [`record_sections`].
+pub struct RecordFiles<'a> {
+    /// The site directory the service was started on.
+    pub site_dir: &'a Path,
+    /// The service's own config file.
+    pub config_path: &'a Path,
+    /// The `site.toml` the service read.
+    pub site_toml: &'a Path,
+    /// `site.toml` as parsed, or `None` when it could not be read or parsed.
+    pub site_value: Option<&'a toml::Value>,
+}
+
+/// Every `config_section` a [`Site`] service writes in its start-up record.
+///
+/// The service config's sections come first, with the log level and the socket
+/// path the process is using, and then one section per `site.toml` table. A
+/// test builds the record through this function, so it reads exactly what a
+/// running service writes.
+pub fn record_sections(
+    config: &crate::config::RendererConfig,
+    files: RecordFiles<'_>,
+    trace: &ConfigTrace,
+    level: crate::log::Level,
+    socket_path: &Path,
+) -> Vec<crate::startup::Section> {
+    let mut sections = config.startup_sections(files.site_dir, trace);
+    for section in &mut sections {
+        section.file = Some(files.config_path.display().to_string());
+    }
+    // The effective log level is the one the process is using, not the one the
+    // service config's table happens to carry: site.toml and --log-level are
+    // later in the order.
+    if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
+        log_section.set(
+            "level",
+            crate::startup::Setting::new(
+                level.text().to_ascii_lowercase(),
+                trace.source("log.level"),
+            ),
+        );
+    }
+    // The socket path is a decided fact, derived from the config path unless
+    // the environment replaced it. Its source is how an operator tells the two
+    // apart.
+    if let Some(server) = sections.iter_mut().find(|s| s.path == "server") {
+        server.set(
+            "socket_path",
+            crate::startup::Setting::decided(
+                socket_path.display().to_string(),
+                trace.source("server.socket_path"),
+            ),
+        );
+    }
+    if let Some(site_value) = files.site_value {
+        let mut from_site = crate::startup::sections_from_toml("", site_value, trace);
+        for section in &mut from_site {
+            section.file = Some(files.site_toml.display().to_string());
+        }
+        sections.append(&mut from_site);
+    }
+    sections
+}
+
 /// What [`Site::handle`] did with a request.
 pub enum Handled {
     /// Answered: a template page, a 404, an error. Already finished.
@@ -481,41 +544,18 @@ impl Site {
             let argv: Vec<String> = std::env::args().collect();
             let invocation = StartupInvocation::read(&argv, SITE_FLAGS, SITE_ENV, &mut trace);
             let (own, linked) = crate::startup::app_identity();
-            let mut sections = config.startup_sections(&site_dir, &trace);
-            for section in &mut sections {
-                section.file = Some(config_path.display().to_string());
-            }
-            // The effective log level is the one the process is using, not the
-            // one the service config's table happens to carry: site.toml and
-            // --log-level are later in the order.
-            if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
-                log_section.set(
-                    "level",
-                    crate::startup::Setting::new(
-                        level.text().to_ascii_lowercase(),
-                        trace.source("log.level"),
-                    ),
-                );
-            }
-            // The socket path is a decided fact, derived from the config path
-            // unless the environment replaced it. Its source is how an operator
-            // tells the two apart.
-            if let Some(server) = sections.iter_mut().find(|s| s.path == "server") {
-                server.set(
-                    "socket_path",
-                    crate::startup::Setting::decided(
-                        socket_path.display().to_string(),
-                        trace.source("server.socket_path"),
-                    ),
-                );
-            }
-            if let Some(site_value) = &site_value {
-                let mut from_site = crate::startup::sections_from_toml("", site_value, &trace);
-                for section in &mut from_site {
-                    section.file = Some(site_toml.display().to_string());
-                }
-                sections.append(&mut from_site);
-            }
+            let sections = record_sections(
+                &config,
+                RecordFiles {
+                    site_dir: &site_dir,
+                    config_path: &config_path,
+                    site_toml: &site_toml,
+                    site_value: site_value.as_ref(),
+                },
+                &trace,
+                level,
+                &socket_path,
+            );
             Some(
                 StartupRecord::new(name, own, linked, argv)
                     .invocation(invocation, trace.clone())

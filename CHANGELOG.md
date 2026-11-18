@@ -106,6 +106,11 @@ The release also deletes the executable hash and moves the monitor's build-drift
 - `m6-monitor`'s own suite adds fake journal lines that produce every finding: a dirty version on prod, a pre-release on prod, a version mismatch, a stale config sha, a completed record whose count disagrees, a record that never completes, an unexpected restart with and without a shutdown reason, a restart during a deploy, a peer kernel drift, a decided fact that differs from the deploy, a missing expectation file, and a clean run that produces no finding.
 - Each finding's test asserts the level and the value it names. Every run finding's text carries the run id and the app, because one function builds all of them, and the test for a version mismatch asserts that prefix.
 
+### Security
+
+- **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. A key ending in `_path`, `_file` or `_dir`, and any `public_key`, is a path and is still logged.
+- `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
+
 ---
 
 ## 1.16.0, 2026-11-18

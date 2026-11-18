@@ -61,7 +61,9 @@ pub struct RelayConfig {
     /// this config. `None`: plain SMTP, accepted only when `host` is a loopback
     /// name.
     pub starttls: Option<Arc<rustls::ClientConfig>>,
-    pub credentials: Option<(String, String)>,
+    /// The user name and password for `AUTH`. A [`crate::Secret`], so the pair
+    /// cannot reach a log line through this config.
+    pub credentials: Option<crate::Secret<(String, String)>>,
     /// The longest one message may take, from connect to the reply to its data.
     pub timeout: Duration,
 }
@@ -112,7 +114,7 @@ impl Relay {
             ehlo,
             tls: cfg.starttls.clone(),
             name,
-            credentials: cfg.credentials.clone(),
+            credentials: cfg.credentials.as_ref().map(|c| c.expose().clone()),
             timeout: cfg.timeout,
         })
     }
@@ -1286,7 +1288,7 @@ mod tests {
             host: "localhost".into(),
             port,
             starttls: Some(client_config),
-            credentials: Some(("user".into(), "pass".into())),
+            credentials: Some(crate::Secret::new(("user".into(), "pass".into()))),
             timeout: Duration::from_secs(10),
         })
         .expect("relay");
@@ -1329,7 +1331,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port,
             starttls: None,
-            credentials: Some(("user".into(), "pass".into())),
+            credentials: Some(crate::Secret::new(("user".into(), "pass".into()))),
             timeout: Duration::from_secs(10),
         })
         .expect("relay");
@@ -1360,7 +1362,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port,
             starttls: Some(tls),
-            credentials: Some(("user".into(), "pass".into())),
+            credentials: Some(crate::Secret::new(("user".into(), "pass".into()))),
             timeout: Duration::from_secs(5),
         })
         .expect("relay");

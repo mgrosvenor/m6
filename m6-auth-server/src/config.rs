@@ -27,8 +27,9 @@ struct TokensConfig {
 #[derive(Debug, Deserialize)]
 struct KeysConfig {
     /// Required only by a process that serves the login routes, which sign.
-    /// The check side reads the public key and never this one.
-    private_key: Option<String>,
+    /// The check side reads the public key and never this one. A path, typed
+    /// as one, because the key's bytes are never in the config.
+    private_key: Option<PathBuf>,
     public_key: String,
 }
 
@@ -116,7 +117,7 @@ impl AuthConfig {
             .keys
             .private_key
             .as_deref()
-            .map(|path| m6_core::config::secret_path("[keys] private_key", path))
+            .map(|path| m6_core::config::secret_path("[keys] private_key", &path.to_string_lossy()))
             .transpose()?;
         let public_key_path =
             m6_core::config::secret_path("[keys] public_key", &raw.keys.public_key)?;

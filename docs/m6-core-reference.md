@@ -414,7 +414,7 @@ A host that did not name itself writes an empty `node` and the reason in `node_u
 
 A value the secrets file supplied is `<redacted>`.
 A field declared `Secret<T>` is `<redacted>` wherever it appears.
-Neither mechanism carries a list of names.
+A value with no type is `<redacted>` when `startup::names_a_secret` names its key, which covers a `site.toml` table the process does not parse.
 
 
 ## 5. Request and response

@@ -7443,7 +7443,8 @@ fn run(args: Vec<String>) -> i32 {
         config
             .genid
             .as_ref()
-            .and_then(|genid| genid.token.as_deref()),
+            .and_then(|genid| genid.token.as_ref())
+            .map(|token| token.expose().as_str()),
     ) {
         (Some(idx), Some(token)) => {
             let mut buf = Vec::with_capacity(256);

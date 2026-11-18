@@ -2096,6 +2096,7 @@ dependencies = [
  "sha2",
  "slug",
  "socket2",
+ "syn 2.0.119",
  "tempfile",
  "tera",
  "thiserror 1.0.69",

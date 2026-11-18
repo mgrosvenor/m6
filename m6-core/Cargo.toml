@@ -157,6 +157,9 @@ libtest-mimic = "0.8"
 # a `time::OffsetDateTime` and rcgen does not re-export the type.
 rcgen     = "0.13"
 time      = "0.3"
+# The secret-field test reads every config struct's fields from the source.
+# syn 2 is already in the lockfile through serde_derive.
+syn       = { version = "2", features = ["full", "visit"] }
 
 # The echo programs prove the loop serves with no heap allocation outside table
 # growth. They use the counting allocator behind `testkit`. They are `[[bin]]`

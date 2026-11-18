@@ -67,9 +67,10 @@ pub struct GenidConfig {
     /// The bearer token a heartbeat sends, read from `token_file` at load.
     ///
     /// `serde(skip)` in both directions: it must never be printed by
-    /// `--dump-config`, and it must not be settable inline from TOML.
+    /// `--dump-config`, and it must not be settable inline from TOML. It is a
+    /// [`m6_core::Secret`] as well, so no other path can print it either.
     #[serde(skip)]
-    pub token: Option<String>,
+    pub token: Option<m6_core::Secret<String>>,
     /// How long between heartbeats. Cache node only, default 10 s.
     #[serde(rename = "heartbeat_secs", serialize_with = "serialize_secs")]
     pub heartbeat: std::time::Duration,
@@ -1633,7 +1634,7 @@ pub fn load_traced(
                     }
                     (
                         Some(name.to_string()),
-                        Some(token),
+                        Some(m6_core::Secret::new(token)),
                         std::time::Duration::from_secs(secs),
                     )
                 }
@@ -3226,7 +3227,7 @@ domain = "test.example.com"
         let g = cfg.genid.as_ref().expect("[genid] present");
         assert_eq!(g.upstream.as_deref(), Some("origin"));
         assert_eq!(
-            g.token.as_deref(),
+            g.token.as_ref().map(|t| t.expose().as_str()),
             Some("read-token"),
             "the file is trimmed"
         );
@@ -3240,6 +3241,41 @@ domain = "test.example.com"
         // The token is a credential: `--dump-config` must never print it.
         let dumped = serde_json::to_string(&cfg).expect("serialise");
         assert!(!dumped.contains("read-token"), "{dumped}");
+    }
+
+    /// The start-up record of a cache node, which holds m6-http's one
+    /// credential, carries neither the token nor its `Debug` form. Every other
+    /// field of the config is in the record, so the check reads a full record.
+    #[test]
+    fn the_startup_record_carries_no_genid_token() {
+        let (dir, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+            "SECRET-genid-token",
+        );
+        let cfg = r.expect("a cache node loads");
+        let (_, trace) = load_traced(dir.path(), &dir.path().join("system.toml"))
+            .expect("the same config loads with its trace");
+        let record = startup::Record::new(
+            "m6-http",
+            m6_core::build_info::identity(),
+            m6_core::build_info::linked(),
+            vec!["m6-http".to_string()],
+        )
+        .trace(trace.clone())
+        .sections(cfg.startup_sections(&trace))
+        .host(startup::HostReport::unknown("a test host knows nothing"));
+        let path = dir.path().join("record.jsonl");
+        let mut sink = m6_core::log::Sink::file(&path).expect("a file sink");
+        record.write(&mut sink);
+        sink.finish().expect("the sink flushes");
+        let text = std::fs::read_to_string(&path).expect("the record is text");
+        assert!(
+            text.contains("origin"),
+            "the genid section is recorded: {text}"
+        );
+        assert!(!text.contains("SECRET-genid-token"), "{text}");
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("SECRET-genid-token"), "{debug}");
     }
 
     #[test]

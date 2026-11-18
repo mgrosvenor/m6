@@ -397,6 +397,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use m6_core::email::{lettre, Relay, RelayConfig, Smtp};
+use m6_core::Secret;
 use m6_core::prelude::*;
 use m6_core::rustls::ClientConfig;
 
@@ -433,7 +434,7 @@ fn load_state(site: &Site) -> Result<Global> {
         None
     };
     let credentials = (!username.is_empty())
-        .then(|| (username.to_string(), password.to_string()));
+        .then(|| Secret::new((username.to_string(), password.to_string())));
     let relay = Relay::new(&RelayConfig {
         host: host.to_string(),
         port,
