@@ -152,6 +152,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 fn print_usage() {
     eprintln!("Usage: m6-auth-cli <config> <entity> <command> [args] [flags]");
+    eprintln!("       m6-auth-cli --version | --version-full");
     eprintln!();
     eprintln!("User commands:");
     eprintln!("  m6-auth-cli <config> user ls [--json]");

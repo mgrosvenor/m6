@@ -278,23 +278,30 @@ One stream carries one line shape, a type on every line, and the size budget of 
 **The start-up record is several `type=startup` lines, and a clean exit adds one `type=shutdown` line.**
 A reader can tell from the log what ran, with what settings, and how it ended.
 The record plus the secrets file reproduces the run, because every other setting is in the record.
-This section gives the line shapes, the run id, the completeness count and the redaction rule.
+The record carries the effective config with every default, each setting's source, the effective `[limits]`, the platform facts and the invocation.
+The secrets file supplies the values the record writes as `<redacted>`.
+The config file sha256s in the record match a run to the exact bytes in git or a backup, and the completeness count says whether the reader has every line.
+`m6-core/tests/startup_record.rs` holds the round trip: a config rebuilt from the record's settings, plus the secrets file, loads with the same effective settings, defaults included.
+This section gives the line shapes, the run id, the completeness count, the redaction rule and the size of the largest measured record.
 
-The record is written once, after logging is open and after every start refusal has passed.
+The record is written once, after logging is open and after every start refusal the configuration can decide, and before the listeners bind.
 A service built on `Site` gets it with no call of its own.
 An application with its own config calls `m6_core::startup::Record::emit` once after `log::init`, and `m6_core::startup::shutdown` once on the clean-exit path.
 Table 7 gives the `part` value on each line.
 
 | `part` | lines | what the line carries |
 |---|---|---|
-| `identity` | one | `app`, `version` as the full SemVer string, `tag` as the tag form, and `crates`: one `"<crate> - <semver>"` string per m6 crate in the binary, the binary first |
-| `invocation` | one | `argv`, `flags` and `environment`. Every declared flag and variable is listed, and an unset one has a null `value` |
+| `identity` | one | `app`, `version` as the full SemVer string, `tag` as the tag form, and `crates`: one `"<crate> - <semver>"` string per m6 crate in the binary, the binary's own name first |
+| `invocation` | one | `argv`, `flags` and `environment`. Every declared flag and variable is listed, and an unset one has a null `value`. A passed flag carries its argument, or `true` for a flag that takes none |
 | `config_file` | one per file | `role` (`config`, `secrets` or `site`), `path`, and `sha256` of the bytes as read |
 | `config_section` | one per table | `section`, the table's dotted path, `file` when the record knows it, and `settings`: every key with its `value` and `source` |
 | `platform` | one | `host`, the machine's facts from `m6_core::platform::host_facts()`, `limits`, every named limit's `start`, `max` and `source`, and `decided`, the facts the process chose such as the socket it bound |
 | `complete` | one | `lines`, the number of `startup` lines in the record including this one |
 
 **Table 7: the `part` values of the start-up record.**
+
+The first `crates` entry is the binary's own name, which is not always its package's name.
+Eight binaries share the `m6-http` package, so `m6-bench --version-full` names `m6-bench` first and lists `m6-http` second.
 
 Every line repeats the keys in Table 8.
 A line is self-contained, so a reader that filters one `part` still knows which application and run it belongs to.
@@ -317,6 +324,7 @@ The node is read once, when the platform line's host facts are read, and every l
 A host renamed while the run is in progress therefore cannot make the run's lines disagree.
 A host that did not name itself writes an empty `node` and the reason in `node_unknown`.
 Both keys are present, so a reader can tell an unnamed host from a record written before the field existed.
+The value is the platform facts' `hostname`, so two services on one host report one node.
 
 The run id is set once at start.
 A reader groups the lines of one run with one filter:
@@ -341,6 +349,11 @@ The platform line keeps `host` and `decided` apart because they answer different
 `decided` is what this process chose to do with the machine, so a monitor compares it against the deploy's own record: a socket path, a bind, a process index or a memory lock that differs from what was deployed is a finding.
 One line carries both so a reader of one record sees the machine and the decision together.
 
+The host block is `HostFacts` from `m6_core::platform::host_facts()`.
+`cpu`, `memory` and `clock` are un-nested structs whose members are `Fact`s, rather than one `Fact` around the whole group, because each group is read from two or three sources and an outer `Fact` would let one failed read hide the others (`m6-platform/src/facts.rs`).
+On a cgroup v2 host, the cgroup limits in that block are read at the group `/proc/self/cgroup` names, and the walk stops at the nearest parent that has the file, so `limits.cgroup_memory` and `limits.cgroup_cpu` answer for the group the process runs in (`m6-platform/src/linux.rs`).
+A group that sets no limit is `{"known": null}`, and a file that cannot be read is `{"unknown": "reason"}`, so a reader can tell unlimited from unreadable.
+
 A setting's `source` is one of `file`, `default`, `env` or `flag`, in that order of precedence from weakest to strongest.
 Every key is present, including the keys the file did not set and the application filled in.
 A default is never omitted because it equals the value in use, so a later release that changes a default changes the record, which is the point.
@@ -351,15 +364,18 @@ A value whose key came from the file named by `secrets_file` is also `<redacted>
 A value with no type, such as a `site.toml` table the process does not parse or a key a service reads for itself, is `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`.
 `m6_core::startup::names_a_secret` is that rule, and a test holds every typed config field to it.
 A path that names a secret file is a plain setting and is logged, and the bytes of the secret never are.
-A key ending in `_path`, `_file` or `_dir`, and any `public_key`, is such a path.
+A key ending in `_path`, `_paths`, `_file`, `_files` or `_dir`, and any key holding `public_key`, is such a path.
+The rule matches the key case-insensitively and anywhere in the key, so `[email] password_hint` is redacted and `[tls] cert_file` is not.
 A key the name rule calls a credential is redacted even when its value is a path, for example m6-auth-server's `[keys] private_key`, because a value with no type cannot say which it holds.
 
 A declared flag marked secret is `<redacted>` in the invocation line, and its `argv` entry is redacted in place, so the reader still sees that the flag was passed.
 A command line can therefore never carry a password into the record.
 
 A clean exit writes one `shutdown` line with the same `run_id`, `node`, `uptime_ms` and `reason`.
+The line carries `run_id`, `app`, `version`, `node`, `uptime_ms`, `reason`, `message` and `type=shutdown`, and `node_unknown` when the host did not name itself.
 `Lifecycle::complete` writes it with reason `signal`.
 A forced second signal writes it with reason `forced`.
+m6-md writes `pass complete` or `pass failed`, because its run is one conversion pass rather than a service loop.
 A process that never wrote a start-up record writes no shutdown line, because there is no run for it to belong to.
 
 Section 9.1 gives a measured record and the size question.
@@ -378,9 +394,16 @@ The record is many lines for exactly this reason: the largest line stays well un
 
 **Table 9: the record measured from the largest rendered configs, with the line count and the longest line in bytes.**
 
-The measurement is taken from the rendered tree through the same writer a process uses, so these are bytes the record produces rather than an estimate.
-The largest is 71 lines and 42,865 bytes, and its longest line is 4,273 bytes, which is the platform line.
+The measurement is taken from the rendered staging and production trees through the same writer a process uses, so these are bytes the record produces rather than an estimate.
+It ran on this macOS arm64 host, over m6-file's service config and the site's `site.toml` in each tree.
+The largest is the staging tree's m6-file record: 71 lines and 42,865 bytes, and its longest line is 4,273 bytes, which is the platform line.
+That line is 6.5% of the 65,536-byte `[limits] journal_line`.
+The real m6-file run measured its platform line at 4,303 bytes because that run's `decided` block also carried the socket path, so the rendered figure and a live one differ by the decisions a process adds.
 Every config section is under 900 bytes.
 The platform line is the longest because a host reports its addresses, kernel and limits, so it is where a record grows first.
 The 64 KiB `[limits] journal_line` holds it with more than 60 KiB to spare.
 The line count is the reason the record is many lines: one line per table keeps the largest line at a few percent of the limit however many routes a site declares.
+
+The monitor's rendered config still carried `[log] format = "text"`, a key this release refuses, so the measurement removed that one key in memory.
+The record is that config minus the key, and a service started from the file as it stands would exit 2 naming the key.
+The staging m6-monitor record is 64 lines and 34,920 bytes, with a longest line of 4,276 bytes.

@@ -1,6 +1,6 @@
-/// m6-md — convert a directory of Markdown files into a single JSON params file.
+/// m6-md: convert a directory of Markdown files into a single JSON params file.
 ///
-/// Usage: m6-md <input-dir> --output <file> [--log-level <level>]
+/// Usage: m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-full]
 ///
 /// Each *.md file may begin with a TOML frontmatter block delimited by +++.
 /// Files beginning with _ are skipped (drafts/partials convention).
@@ -220,7 +220,7 @@ fn run(args: Vec<String>) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("usage error: {e}");
-            eprintln!("Usage: m6-md <input-dir> --output <file> [--log-level <level>]");
+            eprintln!("Usage: m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-full]");
             return 2;
         }
     };

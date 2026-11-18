@@ -1030,7 +1030,7 @@ pub fn args(default_addr: &str, default_n: usize) -> (String, usize) {
             "--no-resume" => i += 1,
             other => {
                 eprintln!(
-                    "usage: [--addr HOST:PORT] [--n COUNT] [--no-resume]   (unexpected: {other})"
+                    "usage: [--addr HOST:PORT] [--n COUNT] [--no-resume] [--version] [--version-full]   (unexpected: {other})"
                 );
                 std::process::exit(2);
             }

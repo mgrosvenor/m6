@@ -197,6 +197,11 @@ The deploy writes that record and the monitor only reads it, so the expected val
 A relative path resolves against the monitor's site directory, and `--check` resolves it against the config file's directory, the same rule `journal_dir` follows.
 A file that does not exist is a state, not a refusal to start.
 The check prints `waiting for the deploy side` and adds one warning that says so, and it adds no per-run finding for the values it could not compare.
+A file that exists and cannot be read is a Fault, because the deploy wrote something and the monitor could not use it.
+A monitor with no `expected_deploy_file` key is a warning too, and it says that no run's version, config sha256 or decided facts are checked.
+
+**The deploy-side writer of this file is not implemented.** It is not in this repository, and the deploy repository had no writer at this release.
+Until one exists, the file is absent in practice, the monitor prints `waiting for the deploy side`, and every comparison against the deploy's record waits with it.
 
 Table 3.1 gives the shape, which is *JSON*.
 
@@ -378,6 +383,10 @@ Table 7: where each part of the digest comes from.
 | `perf_error` | the journal reader |
 | `startup` | the start-up records and the deploy's expectation file (section 8.1) |
 
+Version drift compares the release part of `version`, before the `+`, because SemVer 2.0.0 gives build metadata no precedence.
+Build drift compares the metadata, which is the commit the node's binary was built from.
+Two nodes on one release built from different commits are build drift and no version drift, and a node whose version carries no metadata counts as build drift rather than agreement.
+
 `Thresholds` carries the limits the build judges against: load per CPU 2.0, memory 0.9, disk 0.8, thermal 80 C, certificate expiry 21 days, the tunnel handshake age, and the age of the last 200.
 
 `check::render` prints the same reading as text.
@@ -385,6 +394,19 @@ HEALTH comes first, one line per node with this poll's `/health` answer and the 
 PROCESSES follows when the fleet declares `processes`, and STARTUP follows that.
 STARTUP gives each node's and app's current run: the version, the run id, the start time the record states, the sha256 of every config file it read, and the number of journal lines the monitor ingested for the run, with the shutdown line when there is one.
 A run that replaced an earlier one also prints `previous: <run id>, shut down <reason> at <time>`, or `previous: <run id>, no shutdown recorded`, marked `[info]` for an expected restart and `[WARN: unexpected restart]` for the rest.
+One run with two config files, a clean shutdown and an expected restart before it prints this, with the sha256 values abbreviated to `<sha256>` and every other character what the section writes:
+
+```text
+  origin   m6-http      ok     1.16.0-rc.1+3a639b7e5f55   started 2026-11-18T02:16:20.858965Z
+           run 1794968180857-37684, config config=<sha256> site=<sha256>, 4/4 line(s)
+           5 line(s) ingested
+           last shutdown "signal" after 32ms
+           previous: 1794968120857-37600, shut down signal at 2026-11-18T02:16:19.000000Z  [info]
+```
+
+A run that replaced an earlier one without a shutdown line reads `previous: <run id>, no shutdown recorded  [WARN: unexpected restart]`.
+A record that never closed reads `FAULT` on its line with the number of lines it received.
+The section also says when the journal tail cut records and when shutdown lines named no run.
 The rest is sections A to I: A LOGGING, B PERFORMANCE, C HOST, D SECURITY AND TRAFFIC, E CRAWLERS, F CACHE HEADERS, G CONNECTION SETUP, H TUNNELS, and I HISTORY.
 Section A judges the node's own log from the traffic document's `logging`, and `LoggingHealth::is_blind` faults a log silent for more than 40 seconds.
 
@@ -395,6 +417,8 @@ A config the fleet parser refuses exits 1 with the parser's message, and a servi
 ### 8.1 The start-up checks
 
 The `startup` object carries each run the journal holds and the state of the deploy's record.
+It carries `environment`, `expected_file`, `expected_state`, `expected_error`, `deploy_in_progress`, `cut_records`, `orphan_shutdowns`, `journal_unavailable` and `runs`.
+Each run carries `node`, `app`, `process_index`, `run_id`, `version`, `tag`, `started_at`, `config`, `config_paths`, `lines`, `complete_lines`, `state`, `shutdown` and `previous_run_id`.
 Table 7.1 gives every check, the reference it is judged against, and its severity.
 
 Table 7.1: the checks on the start-up record.
@@ -403,14 +427,30 @@ Table 7.1: the checks on the start-up record.
 |---|---|---|
 | the build's metadata contains `.dirty` | the environment, refused anywhere but `dev` | Fault |
 | the version carries a pre-release | the environment, refused on `prod` | Fault |
-| the version differs from the deploy's recorded release | the deploy's record, parsed with `semver` | Fault |
-| a config file's sha256 differs, or a recorded role has no line | the deploy's record | Fault |
-| a decided fact differs from the deploy's record | the deploy's record | Fault |
+| the version is not SemVer | the version itself, before any rule | Fault |
+| the version differs from the deploy's recorded release, build metadata included | the deploy's record, parsed with `semver` | Fault |
+| the deploy's recorded version is not SemVer | the deploy's record | Fault |
+| a config file's sha256 differs | the deploy's record | Fault |
+| a config role the deploy recorded has no `config_file` line | the deploy's record | Fault |
+| a decided fact differs from the deploy's record, or the record carries no such fact | the deploy's record | Fault |
 | the `complete` count differs from the lines received | the record itself | Fault |
 | a record never wrote its `complete` line | the record itself | Fault |
+| the deploy's expectation file exists and cannot be read | the file | Fault |
 | a new run id replaced an older run | whether a deploy is in progress and the previous run wrote a shutdown line | Warn |
 | a node's kernel, OS, CPU or memory differs from its peers | the other nodes' platform lines | Warn |
-| a run's version, config or decided facts cannot be compared | the deploy's record is absent, unreadable or silent about that node or app | Warn |
+| the deploy's expectation file is not configured | the monitor's config | Warn |
+| the deploy's expectation file does not exist | the file | Warn |
+| the deploy's record names no expectation for this node | the deploy's record | Warn |
+| the deploy's record names no expectation for this app on this node | the deploy's record | Warn |
+| the record read a config role the deploy recorded no sha256 for | the deploy's record | Warn |
+| no environment is set by the monitor or the deploy's record | the monitor's config and the deploy's record | Warn |
+| the monitor's environment differs from the deploy's record | the two declarations | Warn |
+| the record names no node and its platform line reports no hostname | the record itself | Warn |
+
+A finding about the deploy's record or the environment rather than one run names node `monitor`.
+The other findings name the record's node, its run id and the fact, so a reader can act on one without opening the node.
+A missing expectation file is a warning and no refusal to start.
+An unreadable one is a fault, because the deploy wrote something the monitor could not use.
 
 A restart is expected only when the deploy's record says a deploy is in progress and the previous run wrote a shutdown line.
 An unexpected restart quotes the previous run's id and, when it wrote one, the shutdown reason, its time and the uptime.
@@ -419,7 +459,6 @@ The entry's `restart` is `info` for an expected restart and `warn` for an unexpe
 `ingested_lines` is the raw count of journal lines the monitor read for the run's id: the start-up lines, any replay of them from the journal tail, and the shutdown line. `lines` counts the start-up lines alone.
 Without the deploy's record the monitor cannot claim or deny a deploy, so it treats a restart with a shutdown line as expected and the missing record has its own warning.
 
-Every finding names the node, the run id and the fact, so a reader can act on it without opening the node.
 A record that never closed is reported under the run it was, with the number of lines it received, and it stays in the report while it is one of the 32 most recent unfinished records.
 
 Section 9 turns to the file that keeps those readings.

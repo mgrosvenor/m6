@@ -27,7 +27,7 @@ m6-md takes one input directory and one output path, and Table 1 gives every arg
 Take from it that an ordinary run needs those two arguments and nothing else.
 
 ```sh
-m6-md <input-dir> --output <file> [--log-level <level>]
+m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-full]
 ```
 
 | argument or flag | required | what it does |

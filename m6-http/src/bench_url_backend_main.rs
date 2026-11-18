@@ -71,7 +71,7 @@ fn parse_args() -> Args {
         i += 1;
     }
     if a.proto.is_empty() || a.addr.is_empty() {
-        eprintln!("usage: bench-url-backend --proto <http|https|h2c|h2s> --addr HOST:PORT [--cert C --key K]");
+        eprintln!("usage: bench-url-backend --proto <http|https|h2c|h2s> --addr HOST:PORT [--cert C --key K] [--version] [--version-full]");
         std::process::exit(1);
     }
     a

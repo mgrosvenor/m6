@@ -402,7 +402,7 @@ pub fn run(args: &[String], env: &BTreeMap<String, String>) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "usage: m6-perf-ab <rounds-file> <history-file> <threshold-pct> <max-ci-width-pct> <rounds> <requests> <load-before> <load-after> <pinned 0|1> <client-cpu> <server-cpu>"
+    "usage: m6-perf-ab <rounds-file> <history-file> <threshold-pct> <max-ci-width-pct> <rounds> <requests> <load-before> <load-after> <pinned 0|1> <client-cpu> <server-cpu> [--version] [--version-full]"
 }
 
 /// A load average is optional: `uptime` can fail, and the record then holds

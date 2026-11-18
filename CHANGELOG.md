@@ -44,40 +44,48 @@ The released versions, newest first:
 
 **Every m6 binary reports the build it is running, from constants fixed at compile time.**
 `--version` prints the tag form, `v1.16.0-rc.1`, and nothing else.
-`--version-full` prints one line per m6 crate in the binary, the binary first, each as `<crate> - <full SemVer>` with that crate's own commit and dirty flag.
-The workspace version moves to `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
+`--version-full` prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary's own name first, with that crate's own commit and dirty flag.
+The workspace version is `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
+A dirty tree carries `.dirty` in the build metadata only, and a build with no git carries `+unknown`.
 The start-up and shutdown recovery record is in the same release.
-The monitor reads the record from the same journal it already follows and checks each run against what the deploy recorded.
+The platform layer supplies the record's host facts and the process facts, and the monitor reads the record from the journal it already follows and checks each run against what the deploy recorded.
 The release also deletes the executable hash and moves the monitor's build-drift check onto the commit in the version string.
+Three gaps remain, and the Not measured section lists each.
+
+### Migration
+
+An operator makes four changes.
+
+1. `--version` now prints the tag form and nothing else. A script that parsed the `m6-http 1.16.0` line reads `v1.16.0` instead. A deploy reads `--version-full` or the metrics line for the build identity.
+2. The workspace version is `1.16.0-rc.1`. The staging pin moves to the `v1.16.0-rc.1` tag. The release commit sets `1.16.0` and is tagged `v1.16.0`.
+3. A monitor that names neither `[monitor] environment` nor `[monitor] expected_deploy_file` keeps running and gains two warnings per check. Set the first to `dev`, `staging` or `prod`, and the second to the file the deploy writes.
+4. A monitor's history file rebuilds its `build` table under migration 3 the first time this release opens it. The old build rows are dropped, because their `hash` was an executable md5 this release no longer reads and their `version` carried no build metadata, so no old row is comparable with a new one. Every `health` row survives, and one that named a discarded build keeps its figures with `build_id` set to `NULL`. The open writes one `type=event` line that says the table was rebuilt and why.
 
 ### Added
 
-- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The build helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain`. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
-- `--version-full`, one `<crate> - <full SemVer with build metadata>` line per m6 crate in the binary. Each line comes from that crate's own build-time constants, so a binary that links crates built from different commits shows the difference instead of hiding it.
+- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain`. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
+- `--version-full`, one `<crate> - <full SemVer with build metadata>` line per m6 crate in the binary. Each line comes from that crate's own build-time constants, so a binary that links crates built from different commits shows both commits instead of reporting one for the whole binary.
 - A test that parses the full form with the `semver` crate, and a test that holds each binary's crate list against the workspace dependency graph from `cargo metadata`.
+- `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.
+- The start-up recovery record: several `type=startup` lines sharing one `run_id`, then one `type=shutdown` line on a clean exit. The parts are the identity (`app`, full version, every m6 crate), the invocation (argv, the declared flags, every declared environment variable), one line per config file with its sha256 as read, one line per config table with every key, its effective value and its source (`file`, `default`, `env` or `flag`), one line for the platform facts and the effective `[limits]`, and a completeness line carrying the number of lines in the record.
+- `m6_core::startup`, the writer. A service built on `Site` gets the record and the shutdown line with no call of its own. An application with its own config calls `startup::Record::emit` once after `log::init` and `startup::shutdown` once on a clean exit. `version_flags!` registers the binary's identity as well, so the identity line names the binary rather than m6-core.
+- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. A value with no type is redacted by its key's name, under Security below.
+- `m6_core::config::load_traced` and `m6_http_lib::config::load_traced`, which return the effective config and the trace of which file, flag or environment variable set each key. `load` keeps its signature and delegates.
+- `m6_core::platform::host_facts()` and `m6_core::platform::Fact<T>`, one reading of the host at start behind one API. A fact is `{"known": value}` or `{"unknown": "reason"}`, and an unknown fact is never an absent key.
+- `m6_core::platform::process::memory_usage` and `page_faults`, so a test that reads another process's memory goes through the platform layer rather than reading `/proc`.
+- **`m6-monitor` reads `type=startup` and `type=shutdown` on its one long-lived `journalctl --follow` child**, beside `type=perf` and `type=traffic`. Four `M6_TYPE` matches, one child, and no second follower. The start-up record is grouped by its `run_id` and attributed by the record's own `node` field, or by the hostname on its platform line, plus its own `app` field. `_HOSTNAME` is not read.
+- **The monitor checks each run and reports a finding with a severity.** A dirty build outside `dev`, a pre-release on `prod`, a version that differs from the deploy's recorded release, and a config sha256 that differs from the rendered file are `Fault`. A complete count that disagrees with the lines received, and a record that never closed, are `Fault`. An unexpected restart is `Warn` and quotes the previous run's shutdown reason. A node whose kernel, OS, CPU or memory differs from its peers is `Warn`. Versions are parsed with the `semver` crate, never compared as strings.
+- **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
+- **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
 
 ### Changed
 
 - `--version` no longer prints the crate name and the bare version. It prints `v1.16.0-rc.1` or `v1.16.0`, which matches the git tag and carries no build metadata, even on a dirty tree. A script that parsed the old `m6-http 1.16.0` line must read the new tag form.
 - The workspace version is `1.16.0-rc.1`. `Cargo.lock` carries the same version for every member, and `cargo metadata --locked` agrees with it.
 - Every m6 binary takes both flags: `m6-http`, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`, `m6-file`, `m6-html`, `m6-md`, `m6-monitor`, `m6-auth-server` and `m6-auth-cli`. The examples and the site applications adopt the same two lines in a later change.
-- The `type=perf` line's `build.version` now carries the commit, `1.16.0-rc.1+abc123def456` or `1.16.0-rc.1+abc123def456.dirty`, and `build.hash` is gone. A fleet check compares the release part before the `+` for version drift and the build metadata for build drift, so one release built twice from one tag is still reported as build drift.
-
-### Removed
-
-- The md5 of the running executable: `BuildId.hash`, `executable_md5()` and the 64 KiB chunked read it did at start. The process reports the commit fixed at build time instead, so one tag built twice is still distinguishable and no process reads its own bytes for identity. The `md-5` dependency leaves `m6-core` with it.
-
-### Added
-
-- `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.
-- The start-up recovery record: several `type=startup` lines sharing one `run_id`, then one `type=shutdown` line on a clean exit. The parts are the identity (`app`, full version, every m6 crate), the invocation (argv, the declared flags, every declared environment variable), one line per config file with its sha256 as read, one line per config table with every key, its effective value and its source (`file`, `default`, `env` or `flag`), one line for the platform facts and the effective `[limits]`, and a completeness line carrying the number of lines in the record.
-- `m6_core::startup`, the writer. A service built on `Site` gets the record and the shutdown line with no call of its own. An application with its own config calls `startup::Record::emit` once after `log::init` and `startup::shutdown` once on a clean exit. `version_flags!` registers the binary's identity as well, so the identity line names the binary rather than m6-core.
-- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. A value with no type is redacted by its key's name, under Security below.
-- `m6_core::config::load_traced` and `m6_http_lib::config::load_traced`, which return the effective config and the trace of which file, flag or environment variable set each key. `load` keeps its signature and delegates.
-
-### Changed
-
-- A clean exit written through `Lifecycle::complete` now writes one `type=shutdown` line before the completion line. A forced second signal writes it with reason `forced`. A process that never wrote a start-up record writes no shutdown line.
+- The `type=perf` line's `build.version` now carries the full SemVer string with its commit, and `build.hash` is gone. A fleet check compares the release part before the `+` for version drift and the build metadata for build drift, so one release built twice from one tag is still reported as build drift.
+- The monitor's build-drift check reads the commit from that version metadata. Version drift compares the release part before the `+`, because SemVer 2.0.0 gives build metadata no precedence, and build drift compares the metadata.
+- A clean exit written through `Lifecycle::complete` now writes one `type=shutdown` line before the completion line. A forced second signal writes it with reason `forced`. m6-md writes `pass complete` or `pass failed`. A process that never wrote a start-up record writes no shutdown line.
 - Every `type=startup` line and the `type=shutdown` line carry `node`, the platform facts' `hostname`, read once at start rather than per line. A host that did not name itself writes an empty `node` and the reason in `node_unknown`, so the key is present and a reader can tell the record from one written before the field existed.
 - Every service start writes the start-up record to the one log stream. An operator who filters `type=event` sees the same operational lines as before. An operator who counts all lines sees the record, which is what a reader needs to recover the run.
 - The record reports an empty `[smtp] password` and any other value the secrets file supplied as `<redacted>`. A path to a secret file is logged as a setting, and the file's bytes never are.
@@ -85,37 +93,11 @@ The release also deletes the executable hash and moves the monitor's build-drift
 - `Record::new(app, argv)` takes the registered identity, decides the host and starts from the default limits by itself. `startup::record_log_level` writes the running log level into the `log` section. The platform line always carries the limits, the defaults when a service has no `[limits]` table.
 - `PerfReport::build(subject, metrics)` returns the report, `monitoring::not_found()` is the 404 a monitoring path answers, and `PerfOutcome` is gone with its three variants nothing built.
 - `TrafficSummary::from_views` and `TrafficReport::from_views` summarise borrowed `RequestView`s, from a parsed record or from the traffic window's slot. `AnalyticsRecord::from_parts` and its `truncated` flag are gone.
+- `cpu`, `memory` and `clock` in the host facts are un-nested structs whose members are `Fact`s, rather than one `Fact` around the group. Each group is read from two or three sources, and an outer `Fact` would let one failed read hide the others.
+- The cgroup limits are read at the group `/proc/self/cgroup` names, and the walk stops at the nearest parent with the file. A group that sets no limit is `{"known": null}`, and a file that cannot be read is `{"unknown": "reason"}`, so a reader can tell unlimited from unreadable.
+- `cfg(target_os)` outside `m6-platform` is zero. The platform layer holds every OS read in the workspace's Rust crates. The measurement scripts still read `/proc` and `sysctl` through their own code.
 - **The traffic line costs m6-http's event loop 13.4 ms a minute, from 78.6 ms**, for a full window of 32,768 events across 2,000 clients (release, M4). Each marker list is one case-insensitive aho-corasick automaton, and the summary reads the window's slots in place instead of building a record per event.
 - **The metrics line costs the loop 81 us every ten seconds, from 438 us.** The host block, a dozen `/proc` and `/sys` reads, is read once a minute and repeated on the lines between, at 362 us on the M4.
-
-### Verified
-
-- `cargo test --workspace --no-fail-fast` passes. The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
-- The monitor's four drift tests hold the swapped input: two nodes reporting `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` produce one build-drift finding and no version-drift finding, and a node with no build metadata counts as drift rather than agreement.
-- `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
-- The recovery record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included. The same file holds every part to the one node the platform facts name, the shutdown line to the same node, and an unnamed host to an empty `node` with its reason.
-- The record from a real binary is quoted in the worker report, and the largest line and line count from the rendered production and staging configs are measured rather than estimated.
-
-### Added
-
-- **`m6-monitor` reads `type=startup` and `type=shutdown` on its one long-lived `journalctl --follow` child**, beside `type=perf` and `type=traffic`. Four `M6_TYPE` matches, one child, and no second follower. The start-up record is grouped by its `run_id` and attributed by the record's own `node` field, or by the hostname on its platform line, plus its own `app` field. `_HOSTNAME` is not read.
-- **The monitor checks each run and reports a finding with a severity.** A dirty build outside `dev`, a pre-release on `prod`, a version that differs from the deploy's recorded release, and a config sha256 that differs from the rendered file are `Fault`. A complete count that disagrees with the lines received, and a record that never closed, are `Fault`. An unexpected restart is `Warn` and quotes the previous run's shutdown reason. A node whose kernel, OS, CPU or memory differs from its peers is `Warn`. Versions are parsed with the `semver` crate, never compared as strings.
-- **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
-
-### Changed
-
-- **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
-- **`[monitor]` carries two more keys:** `environment` and `expected_deploy_file`. A monitor config that names neither keeps its previous behaviour and gains two warnings per check, one that says the environment is not declared and one that says the deploy's expected values cannot be read.
-
-### Verified
-
-- `m6-monitor`'s own suite adds fake journal lines that produce every finding: a dirty version on prod, a pre-release on prod, a version mismatch, a stale config sha, a completed record whose count disagrees, a record that never completes, an unexpected restart with and without a shutdown reason, a restart during a deploy, a peer kernel drift, a decided fact that differs from the deploy, a missing expectation file, and a clean run that produces no finding.
-- Each finding's test asserts the level and the value it names. Every run finding's text carries the run id and the app, because one function builds all of them, and the test for a version mismatch asserts that prefix.
-
-### Security
-
-- **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. A key ending in `_path`, `_file` or `_dir`, and any `public_key`, is a path and is still logged.
-- `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
 
 ### Fixed
 
@@ -135,15 +117,39 @@ The release also deletes the executable hash and moves the monitor's build-drift
 - **A secret flag given as `--flag=value` is redacted.** Only the two-argument form was, so the one-argument form put the secret in the invocation line. Both read as the flag's value and both are redacted in place.
 - **`Bounded` pops in constant time.** A queue's pop moved every remaining entry down one place. Popping 50,000 entries took 79.4 ms before and 0.18 ms after.
 
+### Removed
+
+- The md5 of the running executable: `BuildId.hash`, `executable_md5()` and the 64 KiB chunked read it did at start. The process reports the commit fixed at build time instead, so one tag built twice is still distinguishable and no process reads its own bytes for identity.
+- `md-5` from `m6-core`, whose only user was `executable_md5()`. Nothing else in the workspace declared or used it.
+
+### Security
+
+- **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. The rule matches the key case-insensitively and anywhere in the key. A key ending in `_path`, `_paths`, `_file`, `_files` or `_dir`, and any key holding `public_key`, is a path and is still logged.
+- `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
 
 ### Verified
 
+- The release tree at `616ab561` measured 2,484 passed, 0 failed on the build host, with no warning and clean rustdoc, and the history reset landed on top of it. The record and monitor branches measured 2,456 passed, 0 failed, 13 ignored across 129 test binaries on this macOS arm64 host at `1f61df6c`, and the cgroup change measured 2,436 passed, 0 failed at its own tip.
+- The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
+- The monitor's four drift tests hold the swapped input: two nodes reporting `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` produce one build-drift finding and no version-drift finding, and a node with no build metadata counts as drift rather than agreement.
+- `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
+- The recovery record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included. The same file holds every part to the one node the platform facts name, the shutdown line to the same node, and an unnamed host to an empty `node` with its reason.
+- The record from a real binary is quoted in the worker report, and the largest line and line count from the rendered production and staging configs are measured rather than estimated.
 - `m6-core/tests/startup_secrets.rs` fills every key of a service config, its secrets file and a `site.toml` with distinct sentinels, builds the record through `site::record_sections`, and finds none of the 12 credential sentinels in any line and every one of the 23 distinct setting sentinels. With the name rule switched off it reports 8 leaked credentials, `[email] password` among them.
 - `m6-core/tests/secret_fields.rs` reads more than 30 config structs from the workspace source and finds no credential-named field outside `Secret<T>`, a path type or a nested table.
+- The monitor's own suite adds fake journal lines that produce every finding: a dirty version on prod, a pre-release on prod, a version mismatch, a stale config sha, a completed record whose count disagrees, a record that never completes, an unexpected restart with and without a shutdown reason, a restart during a deploy, a peer kernel drift, a decided fact that differs from the deploy, a missing expectation file, and a clean run that produces no finding. Each finding's test asserts the level and the value it names.
 - On macOS, 20 starts of a dev m6-http before the merges and 20 after, read from the service's own log timestamps: `complete` to `m6-http started` 277 ms before and 8 ms after.
 - Each fix above has a test that fails on the code before it and passes after. `append_frame_writes_the_frame_in_every_profile` fails under `--profile release-asserts` with the old frame writer.
 - A release build of m6-http answered `curl --http2` over TLS with HTTP/2 200.
 - In journal mode 500 lines are 500 datagrams, one per line as the journal's native protocol requires. The flush in `log_perf` and `log_traffic` adds no send: 500 lines with a flush every 100 lines cost the same 523 sends as with none, on a macOS datagram pair whose reader drained between lines.
+- `m6-platform` holds `platform_gate` at 9 of 9 and the contract suite at 64 tests with 4 ignored.
+
+### Not measured
+
+- **Linux on this host.** Every platform and cgroup run above is macOS arm64. The Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are formatted and parsed but not type-checked, because this host has only the `aarch64-apple-darwin` standard library and no rustup. The first Linux CI job that runs `cargo check --workspace --all-targets`, `platform_gate` and `platform_contract` is the proof.
+- **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. No writer exists in the deploy repository at this release, so no version or config sha256 is compared in practice.
+- **A physically mixed-commit binary.** The mechanism and the metadata test are the evidence, and a source tarball's `+unknown` is unit-tested.
+
 ---
 
 ## 1.16.0, 2026-11-18

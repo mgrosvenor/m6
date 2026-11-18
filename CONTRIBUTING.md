@@ -108,10 +108,48 @@ It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of
 
 **A release candidate carries the SemVer pre-release field.** On `develop` the workspace version is `X.Y.Z-rc.N`, and each candidate built from `develop` for staging is tagged `vX.Y.Z-rc.N`.
 The release commit sets `X.Y.Z` and is tagged `vX.Y.Z`.
-A binary reports the two forms. `--version` prints `vX.Y.Z-rc.N` or `vX.Y.Z`, which matches the tag and carries no build metadata.
-`--version-full` prints `X.Y.Z-rc.N+<commit>` per m6 crate, with `.dirty` appended on an uncommitted tree, so a build that mixes commits shows it.
+A plain version therefore means the release candidate became the release: `1.16.0` is the release that `1.16.0-rc.1` was promoted to, and no second build is cut for it.
+
+**The version alone says which of the three a build is.** A `-rc.N` is a develop build for staging, a plain `X.Y.Z` is the release, and a `.dirty` in the build metadata is an uncommitted test build.
+The dirty marker is build metadata, so `--version` never carries it. A reader that needs it asks `--version-full` or reads the metrics line's `version`.
+A dirty build outside a development machine is a finding, and a pre-release build on production is a finding. `m6-monitor` reports both as faults.
+
+**A binary reports the version two ways.** `--version` prints the tag form and nothing else, `vX.Y.Z-rc.N` or `vX.Y.Z`, with no crate name and no build metadata. A dirty tree still prints the tag form.
+`--version-full` prints one line per m6 crate in the binary, the binary's own name first, each as `<crate> - <full SemVer with build metadata>`.
+A line comes from that crate's own build-time constants, so a mixed build shows two commits instead of reporting one commit for the whole binary.
+The build metadata is the twelve-character commit, with `.dirty` appended on a tree with uncommitted changes. A build with no git, which is a source tarball, reads `1.16.0-rc.1+unknown`.
 The commit and the dirty flag are build metadata, which SemVer allows and ignores when comparing precedence.
-A deploy refuses a `.dirty` build outside a development machine and refuses a pre-release on production.
+
+On the release tree at `3a639b7e`, `m6-http` prints:
+
+```text
+$ m6-http --version
+v1.16.0-rc.1
+$ m6-http --version-full
+m6-http - 1.16.0-rc.1+3a639b7e5f55
+m6-core - 1.16.0-rc.1+3a639b7e5f55
+m6-log - 1.16.0-rc.1+3a639b7e5f55
+m6-platform - 1.16.0-rc.1+3a639b7e5f55
+```
+
+A binary whose name differs from its package's name prints its own name first and the package second, so `m6-bench --version-full` prints:
+
+```text
+m6-bench - 1.16.0-rc.1+3a639b7e5f55
+m6-http - 1.16.0-rc.1+3a639b7e5f55
+m6-core - 1.16.0-rc.1+3a639b7e5f55
+m6-log - 1.16.0-rc.1+3a639b7e5f55
+m6-platform - 1.16.0-rc.1+3a639b7e5f55
+```
+
+A mixed build shows two commits, for example:
+
+```text
+m6-http - 1.16.0-rc.1+3a639b7e5f55
+m6-core - 1.16.0-rc.1+82a819001c85
+```
+
+The first line names the binary, from `CARGO_BIN_NAME`, which is not always its package's name. Eight binaries share the `m6-http` package, so each names itself first and lists `m6-http` second.
 
 ### 4.2. A speed change
 
