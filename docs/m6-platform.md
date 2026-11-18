@@ -3,16 +3,17 @@
 `m6-platform` is the one crate in m6 that knows which operating system (*OS*) it runs on.
 m6-core re-exports it as `m6_core::platform`, so a service links m6-core alone.
 This page states each contract the layer makes, how Linux and macOS meet it, how a port is added, and which tests hold it all.
-It opens with the rule, then the contracts, the service managers, the ports and the tests.
+It opens with the rule, then the contracts, the service managers, the ports and the tests, and closes with a summary.
 
 ## Contents
 
-1. The rule
-2. The contracts
-3. Service managers
-4. Future ports
-5. Adding a port
-6. The tests
+1. [The rule](#1-the-rule)
+2. [The contracts](#2-the-contracts)
+3. [Service managers](#3-service-managers)
+4. [Future ports](#4-future-ports)
+5. [Adding a port](#5-adding-a-port)
+6. [The tests](#6-the-tests)
+7. [Summary](#7-summary)
 
 ## 1. The rule
 
@@ -61,7 +62,7 @@ Read a row left to right: the contract is what every target guarantees, and the 
 | `process` facts | thread count, open descriptors, alive, listening on TCP, root, another process's resident, virtual and locked memory and its minor page faults, and the worker range that reading the host's certificate store leaves. A count that cannot be read is an error | `/proc/<pid>`, and the certificate store is a file read that leaves no thread | `proc_pidinfo` and `lsof`, no memory or fault report for another process (an error), and the Security framework leaves three or four worker threads |
 | directories | `runtime_dir` is `/run/m6`, `temp_dir` honours `TMPDIR`, `socket_scratch_root` is the short root a socket scratch directory goes under whatever `TMPDIR` is, `scratch_dir` permits exec, `create_private` gives 0700 on a parent it creates and 0600 on the file | the same | the same |
 
-Table 1: each item of the layer, its contract, and the mechanism behind it on each OS.
+**Table 1: each item of the layer, its contract, and the mechanism behind it on each OS.**
 
 `m6-http` meets the `net::connect_unix` contract as follows.
 A full queue or a refused connect moves the request to the next member of the backend pool.
@@ -118,7 +119,7 @@ Table 2 lists them.
 | several instances | `M6_SOCKET_OVERRIDE` per unit | `M6_SOCKET_OVERRIDE` per plist |
 | logs | stdout to the journal, which rotates | stdout to `StandardOutPath`, which `newsyslog` rotates |
 
-Table 2: what a service needs from its manager and how each one provides it.
+**Table 2: what a service needs from its manager and how each one provides it.**
 
 m6 never talks to a service manager and relies on none to create anything.
 No binary reads `CREDENTIALS_DIRECTORY`, `NOTIFY_SOCKET`, `LISTEN_FDS`, `WATCHDOG_USEC`, `INVOCATION_ID`, `STATE_DIRECTORY` or `RUNTIME_DIRECTORY`, and the gate refuses a read of any of them.
@@ -155,6 +156,13 @@ Table 3 maps them.
 | the gate | `m6-platform/tests/platform_gate.rs` | the rule in section 1 |
 | the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with checks that include zero allocations, a shutdown that drains and queued clients served once descriptors free |
 
-Table 3: where each contract is held.
+**Table 3: where each contract is held.**
 
 Each test of the contract names, in a comment, the wrong implementation that must fail it.
+
+## 7. Summary
+
+`m6-platform` holds every operating-system read and call in the workspace, and a gate test refuses one anywhere else.
+Each contract in Table 1 is stated in a service's terms, met on Linux and macOS, and held by the suites in Table 3, so a port adds one file and passes the same tests.
+[`m6-core-reference.md`](m6-core-reference.md) §8.5 and §8.5.1 give the host readings and facts as a service calls them, and [`m6-log.md`](m6-log.md) §9 shows where the facts are written.
+

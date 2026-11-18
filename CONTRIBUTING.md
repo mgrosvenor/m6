@@ -45,8 +45,9 @@ The types are `feat`, `fix`, `perf`, `docs`, `refactor`, `test` and `chore`.
 
 ## 3. What has to pass
 
-A change merges into `develop` after every check in Table 2 passes on Linux.
+A change merges into `develop` after every check in Table 2 passes.
 Table 2 lists each check with the *CI* (continuous integration) job that runs it.
+The build and tests job runs on Linux x86_64, and two more jobs repeat its build, test, clippy and rustdoc checks on macOS arm64 and Linux arm64.
 
 | check | CI job |
 |---|---|
@@ -57,6 +58,8 @@ Table 2 lists each check with the *CI* (continuous integration) job that runs it
 | rustdoc silent (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`, then with `--all-features`) | build and tests |
 | clippy silent (`tools/clippy.sh`) | clippy |
 | h1, h2 and h3 conformance at or above the recorded floors (`tools/conformance.sh`) | h1, h2, h3 conformance |
+| the HTTP/2 unit tests and h2spec with debug assertions off, in the `release-asserts` profile | h1, h2, h3 conformance |
+| the same build and tests on the other two supported platforms | macOS arm64 build and tests, Linux arm64 build and tests |
 | dependencies (`cargo deny check`) | advisories, licences, duplicates |
 | shellcheck clean at warning level | shell scripts |
 | a teardown kills only a pid this run recorded (`tools/check-kill-safety.sh`) | shell scripts |
@@ -66,9 +69,10 @@ Table 2 lists each check with the *CI* (continuous integration) job that runs it
 | the minimum supported Rust version in `Cargo.toml` builds the workspace | minimum supported Rust version |
 
 **Table 2: the checks a merge must pass, and the CI job that runs each one.**
-Take from it that five checks run in the build and tests job, and the other nine run in eight more jobs.
+Take from it that five checks run in the build and tests job, and the rest run in ten more jobs.
 
 The workspace test run does not compile m6-core's off-by-default features, so CI builds and tests m6-core with every feature on.
+Every other check builds the dev profile, where a `debug_assert!` argument runs, so the conformance job also builds the `release-asserts` profile: the dev profile with debug assertions off, as in a release binary ([`docs/m6-testing.md`](docs/m6-testing.md) §4.3).
 The performance check runs on the build host, because it needs a quiet machine.
 The address and leak sanitisers run in their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and on pull requests to it.
 That workflow is advisory: a finding in code older than the pull request leaves the merge clear.
@@ -116,8 +120,8 @@ A dirty build anywhere but the dev environment is a finding, and so is a pre-rel
 
 ### 4.2. Reading a build's version
 
-A binary reports its version two ways.
-`--version` prints the tag form, `vX.Y.Z-rc.N` or `vX.Y.Z`, with no crate name and no build metadata, on a dirty tree too.
+Every m6 binary reports its version two ways, before it reads any configuration, and exits 0.
+`--version` (or `-V`) prints the tag form, `vX.Y.Z-rc.N` or `vX.Y.Z`, with no crate name and no build metadata, on a dirty tree too.
 `--version-full` prints one line per m6 crate in the binary, the binary's own name first, each as `<crate> - <full SemVer with build metadata>`.
 A reader that needs the dirty marker uses `--version-full` or the `version` field of the start-up record.
 

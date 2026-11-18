@@ -2,11 +2,12 @@
 
 m6-log writes one process's log as JSON lines through one sink.
 The sink writes stdout, and under systemd it writes journald's native socket as one datagram per line.
-A top-level `type` names what a line carries, so a reader selects the metrics, the traffic summary, the request rows or the operational events on that one key.
+A top-level `type` names what a line carries, so a reader selects the metrics, the traffic document, the request rows or the operational events on that one key.
 The per-line path has no thread, no channel and no lock, and `m6-log/tests/no_allocation.rs` carries 700,000 lines at zero allocations.
 
 This page describes the line and its six types (section 1), the size budget (section 2), the buffering and the loss on a crash (section 3), and the levels and the macros (section 4).
-It then describes the journal datagram (section 5), dropped-line counting (section 6), the calls a service's loop makes (section 7), where the crate fits (section 8), and the start-up and shutdown recovery record (section 9).
+It then describes the journal datagram (section 5), dropped-line counting (section 6), the calls a service's loop makes (section 7), where the crate fits (section 8), and the start-up record with its shutdown line (section 9).
+Section 10 names the documents that read what this page writes.
 
 ## Contents
 
@@ -18,7 +19,8 @@ It then describes the journal datagram (section 5), dropped-line counting (secti
 6. [Dropped-line counting](#6-dropped-line-counting)
 7. [The loop's calls](#7-the-loops-calls)
 8. [Where it fits](#8-where-it-fits)
-9. [The recovery record](#9-the-recovery-record)
+9. [The start-up record](#9-the-start-up-record)
+10. [Summary](#10-summary)
 
 ## 1. The line
 
@@ -32,7 +34,7 @@ In it, the six kinds share one stream and one line shape.
 |---|---|---|
 | `event` | an operational message at any level | any service, through a macro or `Line` |
 | `perf` | the metrics document, nested under `fields.perf` | m6-http at `[stats].interval_s`, ten seconds by default, through `log_perf` in `m6-http/src/stats.rs` |
-| `traffic` | the traffic summary, nested under `fields.traffic` | m6-http at `[stats].traffic_interval_s`, one minute by default, through `log_traffic` in `m6-http/src/stats.rs` |
+| `traffic` | the traffic document, nested under `fields.traffic` | m6-http at `[stats].traffic_interval_s`, one minute by default, through `log_traffic` in `m6-http/src/stats.rs` |
 | `access` | one per-request row, with `message` `request` or `monitor` | m6-http's analytics writer, through `write_request_line`, `write_monitor_line` and `write_rate_limited_line` in `m6-http/src/analytics.rs` |
 | `startup` | one part of the start-up record: identity, invocation, a config file, a config section, the platform facts, or the completeness count | `m6-core/src/startup.rs`, once at start |
 | `shutdown` | the clean exit: the same `run_id`, the uptime and the reason | `m6-core/src/startup.rs`, from `Lifecycle::complete` or `startup::shutdown` |
@@ -183,7 +185,7 @@ journalctl M6_TYPE=perf -o json
 `m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=200`, `--output=json` and `--directory <dir>`, and adds `--follow` in the running monitor.
 It filters on `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`, so one child carries the four types.
 
-`journal_stream() in `m6-platform/src/lib.rs` reads `JOURNAL_STREAM`.
+`journal_stream()` in `m6-platform/src/lib.rs` reads `JOURNAL_STREAM`.
 systemd sets the variable on a unit whose stdout it wired to the journal.
 When it is set, `Journal::open` connects to `$XDG_RUNTIME_DIR/systemd/journal/socket` if that socket exists, and to `/run/systemd/journal/socket` otherwise.
 The choice is made once, in `init`.
@@ -247,7 +249,7 @@ m6-core re-exports it as `m6_core::log` and adds `watch`, the one piece that nee
 Each service's own loop supplies the tick, the token and the stop.
 `Sink::file` in `m6-log/src/sink.rs` serves a test or a bench that writes a line to a file, and the process logger never calls it.
 
-## 9. The recovery record
+## 9. The start-up record
 
 **The start-up record is several `type=startup` lines, and a clean exit adds one `type=shutdown` line.**
 A reader can tell from the log what ran, with what settings, and how it ended.
@@ -322,10 +324,8 @@ The platform line keeps `host` and `decided` apart because they answer different
 `decided` is what this process chose to do with the machine, so a monitor compares it against the deploy's own record: a socket path, a bind, a process index or a memory lock that differs from what was deployed is a finding.
 One line carries both so a reader of one record sees the machine and the decision together.
 
-The host block is `HostFacts` from `m6_core::platform::host_facts()`.
-`cpu`, `memory` and `clock` are structs whose members are each a `Fact`, because each group is read from two or three sources and one failed read must not hide the others (`m6-platform/src/facts.rs`).
-On a cgroup v2 host, the cgroup limits in that block are read at the group `/proc/self/cgroup` names, and the walk stops at the nearest parent that has the file, so `limits.cgroup_memory` and `limits.cgroup_cpu` answer for the group the process runs in (`m6-platform/src/linux.rs`).
-A group that sets no limit is `{"known": null}`, and a file that cannot be read is `{"unknown": "reason"}`.
+The host block is `HostFacts` from `m6_core::platform::host_facts()`, and every fact in it is `{"known": value}` or `{"unknown": "reason"}`, so every key is present.
+[`m6-platform.md`](m6-platform.md) §2 gives each fact, its source on Linux and macOS, and the cgroup rule.
 
 A setting's `source` is one of `file`, `default`, `env` or `flag`, in that order of precedence from weakest to strongest.
 Every key is present, including the keys the file did not set and the application filled in.
@@ -347,7 +347,7 @@ A clean exit writes one `shutdown` line with the same `run_id`, `node`, `uptime_
 The line carries `run_id`, `app`, `version`, `node`, `uptime_ms`, `reason`, `message` and `type=shutdown`, and `node_unknown` when the host did not name itself.
 `Lifecycle::complete` writes it with reason `signal`.
 A forced second signal writes it with reason `forced`.
-m6-md writes `pass complete` or `pass failed`, because its run is one conversion pass rather than a service loop.
+m6-md writes `pass complete` or `pass failed`, because its run is one conversion pass.
 A process that never wrote a start-up record writes no shutdown line.
 
 Section 9.1 gives the size of the record.
@@ -359,3 +359,20 @@ Every line is far below `[limits] journal_line` (64 KiB by default) and below th
 One line per config table keeps a line short however many routes a site declares, and `a_table_of_routes_is_one_line_per_route_not_one_long_line` in `m6-core/tests/startup_record.rs` asserts that the longest line of a two-route record is under `[limits] journal_line`.
 The platform line is where a record grows first, because it carries the host's addresses, kernel and limits.
 The ignored test `measured_record_from_a_rendered_tree` in the same file prints the line count, the byte count and the longest line for any rendered config, through the writer a process uses.
+
+## 10. Summary
+
+One m6 process writes one stream of JSON lines, and the `type` on each line names what it carries.
+Under systemd each line is one journal datagram whose `M6_TYPE` repeats that word, a line is never split, and a refused line is counted and reported.
+The start-up record and the shutdown line let a reader recover what ran, with what settings, and how it ended.
+
+Table 9 names the documents that own what this page leaves out.
+
+| document | owns |
+|---|---|
+| [`m6-http.md`](m6-http.md) §11 | the metrics and traffic documents inside the `perf` and `traffic` lines |
+| [`m6-monitor.md`](m6-monitor.md) §2 and §7.1 | the reader that follows the journal, and the checks it makes on each start-up record |
+| [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 | every `[limits]` entry, `log_buffer`, `log_field` and `journal_line` among them |
+| [`m6-core-reference.md`](m6-core-reference.md) §4.9 | the `m6_core::startup` interface an application calls |
+
+**Table 9: the documents that read or configure what m6-log writes.**

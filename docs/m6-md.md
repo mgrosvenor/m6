@@ -35,9 +35,11 @@ m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-f
 | `--version`, `-V` | no | Print the tag form, `v1.16.0-rc.1`, and exit 0. |
 | `--version-full` | no | Print one `<crate> - <full SemVer>` line per m6 crate in the binary, then exit 0. |
 
-**Table 1: every command-line argument and flag, whether it is required, and what it does.** The two version flags write no file.
+**Table 1: every command-line argument and flag, whether it is required, and what it does.**
+The two version flags write no file.
 
-A successful run logs to stdout as one JSON object per line, and usage and runtime errors go to stderr as plain text.
+A successful run logs one JSON object per line to stdout, or to journald's native socket under systemd, and usage and runtime errors go to stderr as plain text.
+The log opens with the start-up record and closes with one `type=shutdown` line whose reason is `pass complete` or `pass failed` ([`m6-log.md`](m6-log.md) §9).
 Section 3 describes the input directory.
 
 ## 3. Input files

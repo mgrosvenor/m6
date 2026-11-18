@@ -109,7 +109,7 @@ The primary socket path comes from the config file's stem, so `configs/m6-auth.c
 The check socket takes the `check-` prefix beside it, so the same config gives `/run/m6/check-m6-auth.sock`.
 The bind creates a missing parent directory and replaces a stale socket file at the path.
 
-The service logs to stdout as *JSON* (JavaScript Object Notation) lines, and `[log] level` in `site.toml` sets how much it writes.
+The service writes *JSON* (JavaScript Object Notation) lines to stdout, or to journald's native socket under systemd, and `[log] level` in `site.toml` sets how much it writes.
 Section 11.3 lists the lines this service adds to core's lifecycle lines.
 
 ## 4. Configuration
@@ -501,7 +501,7 @@ A request that fails after startup returns a 4xx or 5xx response and the process
 
 ### 11.3. Logging
 
-The service writes one line per event to stdout, in JSON by default.
+The service writes one JSON line per event to its one log stream, which [`m6-log.md`](m6-log.md) describes.
 Table 10 gives the events it adds to core's lifecycle lines.
 Take from it that every login attempt is recorded with the address and every failure with a reason.
 
@@ -516,6 +516,7 @@ Take from it that every login attempt is recorded with the address and every fai
 **Table 10: the log events this service adds to the core lifecycle lines.**
 
 The service logs no password, token or key material.
+Its start-up record writes `<redacted>` for `[keys] private_key`, because the record's name rule treats any key holding `private_key` as a credential, even when its value is a path ([`m6-log.md`](m6-log.md) §9).
 
 Section 12 states what the service leaves out.
 

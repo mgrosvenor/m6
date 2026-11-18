@@ -29,13 +29,13 @@ Section 8 covers the history file, and section 9 says where the crate sits.
 Every figure the monitor reports is one of two things: a document a node wrote as a log line, or a node's answer to `GET /health`.
 Table 1 gives both inputs, what each carries, and how current it is.
 
-Table 1: the two inputs and what each one carries.
-
 | input | read by | what it carries | how current |
 |---|---|---|---|
 | the journal | `journal::Reader` in `m6-monitor/src/journal.rs` | each node's metrics document and traffic document: host figures, requests, cache, *TLS* chains, crawlers, firewall state | the newest line the journal holds |
 | the journal | `journal::Startup` in the same module | one start-up record per run: identity, invocation, a sha256 per config file, every setting with its source, the host facts, the decided facts, then the completeness count, and the shutdown line on a clean exit | the newest record the journal holds, plus every record that never closed |
 | `GET /health` | `poll::Step::Health` in `m6-monitor/src/poll.rs` | liveness, the `ok` or `degraded` answer, the node's own name, its process index, and the round trip from this host | once per poll |
+
+**Table 1: the two inputs and what each one carries.**
 
 Each node ships its journal to the monitor host with `systemd-journal-upload`, and `systemd-journal-remote` keeps every peer's journal in one directory, which `[monitor] journal_dir` names.
 The two documents arrive as log lines with `type` `perf` and `type` `traffic`.
@@ -128,8 +128,6 @@ Section 4 puts both inputs in the order one poll reaches them.
 A poll is a table of steps the loop drives, one slot per node, with no thread and no blocking call.
 Table 2 lists the steps in the order a node reaches them.
 
-Table 2: the steps of one poll, in order.
-
 | step | what it does | where |
 |---|---|---|
 | `Health` | `GET {base_path}/health` on the node's public address, or on its status port for an entry expanded from `processes` | `Poller::begin_step` |
@@ -138,6 +136,8 @@ Table 2: the steps of one poll, in order.
 | `Header(i)` | one declared header check, a `GET` on the node's public address | `Poller::begin_step` |
 | the tunnel probe | up to three non-blocking connects to the node's `tunnel.address`, after the node's requests | `tunnel::PROBES_PER_POLL` |
 | the crawler lookups | reverse and forward *DNS* lookups for the addresses in a sighting | `check::VerdictCache` |
+
+**Table 2: the steps of one poll, in order.**
 
 Only `Health` and `Header` send a request, so a fleet with no header checks declared makes exactly one request per node per poll.
 A header check runs on a node whose `role` its entry lists, and on process 0 of a `processes` node, because the public face is one per node (`Poller::next_header`).
@@ -160,8 +160,6 @@ Section 5 lists the keys that decide all of this.
 The monitor reads its own keys under `[monitor]`, its poll interval from the top level, and its buffers from `[limits]`.
 Table 3 lists the `[monitor]` keys, their defaults, and what each one decides.
 
-Table 3: the `[monitor]` keys.
-
 | key | default | what it decides |
 |---|---|---|
 | `nodes` | required, at least one | the fleet, as `[[monitor.nodes]]` entries |
@@ -176,6 +174,8 @@ Table 3: the `[monitor]` keys.
 | `health_last_ok_max_age_s` | three poll intervals | the age above which a node's last 200 is flagged |
 | `environment` | absent | `dev`, `staging` or `prod`. A dirty build is refused anywhere but `dev`, and a pre-release is refused on `prod` |
 | `expected_deploy_file` | absent | the deploy's record of what it expects on each node, resolved against the site directory |
+
+**Table 3: the `[monitor]` keys.**
 
 A key under `[monitor]` outside Table 3 stops the start with exit 2, because `Fleet` in `m6-monitor/src/fleet.rs` carries `deny_unknown_fields`.
 `poll_interval_s` is a top-level key with a default of 30 seconds, and `[monitor] poll_interval_s` is refused the same way.
@@ -200,8 +200,6 @@ A monitor with no `expected_deploy_file` key gets a warning too, saying that no 
 
 Table 4 gives the shape, which is JSON.
 
-Table 4: the deploy's expectation file.
-
 | field | type | what it says |
 |---|---|---|
 | `environment` | string, optional | `dev`, `staging` or `prod`, used when `[monitor] environment` is not set |
@@ -211,6 +209,8 @@ Table 4: the deploy's expectation file.
 | `apps.<app>.version` | string, required | the full SemVer the deploy shipped, build metadata included |
 | `apps.<app>.config` | object, role to sha256 | the sha256 of every config file the deploy rendered |
 | `apps.<app>.decided` | object, optional | the decided facts the deploy recorded, such as `socket_path`, `bind`, `process_index` or `lock_memory` |
+
+**Table 4: the deploy's expectation file.**
 
 The keys of `nodes` and `apps` are the ones the record itself carries: the node is the record's `node` field, or the hostname on its platform line, and the app is the record's `app` field.
 A node polled as several processes may key an app as `<app>/<index>`, and that entry wins over the plain `<app>`.
@@ -238,8 +238,6 @@ Unknown fields are refused, so a deploy-side typo fails the read.
 
 Table 5 gives the keys of one fleet entry.
 
-Table 5: the keys of one `[[monitor.nodes]]` entry.
-
 | key | default | what it is |
 |---|---|---|
 | `name` | required | the node's name, which the journal is read by and the report shows |
@@ -248,6 +246,8 @@ Table 5: the keys of one `[[monitor.nodes]]` entry.
 | `tunnel.address` | absent | an IP address and port on the WireGuard tunnel |
 | `tunnel.public_key` | absent | the peer's public key, for the handshake check. Without it the round trip is measured and the node reports a fault, because its handshake cannot be checked |
 | `processes` | absent | how many `[server] process_index` processes the node runs on its shared port |
+
+**Table 5: the keys of one `[[monitor.nodes]]` entry.**
 
 `processes` expands one entry into `<name>/<index>` entries, each polling `tunnel.address` with its port raised by the index, so it needs that address.
 A node without `processes`, or with `processes = 1`, is polled as one address.
@@ -282,8 +282,6 @@ Section 6 turns to what the service answers.
 The monitor serves five routes on one unix socket and has no listener.
 Table 6 gives the routes and what each answers.
 
-Table 6: the five routes.
-
 | route | answer |
 |---|---|
 | `GET /` | the page, rendered once per poll, status 503 while the digest's level is `Fault` |
@@ -291,6 +289,8 @@ Table 6: the five routes.
 | `GET /check` | the report as text, with the age of the reading or a `STALE:` line first |
 | `GET /history` | the poll history as paged JSON Lines |
 | `GET /crawlers` | the crawler sightings as paged JSON Lines |
+
+**Table 6: the five routes.**
 
 The socket is `/run/m6/<config stem>.sock` (`socket_path_from_config` in `m6-core/src/server.rs`), so a config file named `m6-monitor.conf` gives `/run/m6/m6-monitor.sock`.
 `M6_SOCKET_OVERRIDE` replaces that path.
@@ -313,8 +313,6 @@ Section 7 says what the digest and the check contain.
 One `digest::build` call turns a finished poll into the digest that every route serves.
 Table 7 gives each part of the digest and the input it came from.
 
-Table 7: where each part of the digest comes from.
-
 | digest field | source |
 |---|---|
 | `name`, `role`, `url` | the fleet config |
@@ -332,6 +330,8 @@ Table 7: where each part of the digest comes from.
 | `history` | the history file |
 | `perf_error` | the journal reader |
 | `startup` | the start-up records and the deploy's expectation file (section 7.1) |
+
+**Table 7: where each part of the digest comes from.**
 
 Version drift compares the release part of `version`, before the `+`, because SemVer 2.0.0 gives build metadata no precedence.
 Build drift compares the metadata, which is the commit the node's binary was built from.
@@ -372,8 +372,6 @@ It carries `environment`, `expected_file`, `expected_state`, `expected_error`, `
 Each run carries `node`, `app`, `process_index`, `run_id`, `version`, `tag`, `started_at`, `config`, `config_paths`, `lines`, `ingested_lines`, `complete_lines`, `state`, `shutdown`, `previous_run_id`, `previous_shutdown` and `restart`.
 Table 8 gives every check, the reference it is judged against, and its severity.
 
-Table 8: the checks on the start-up record.
-
 | check | reference | severity |
 |---|---|---|
 | the build's metadata contains `.dirty` | the environment, refused anywhere but `dev` | Fault |
@@ -397,6 +395,8 @@ Table 8: the checks on the start-up record.
 | no environment is set by the monitor or the deploy's record | the monitor's config and the deploy's record | Warn |
 | the monitor's environment differs from the deploy's record | the two declarations | Warn |
 | the record names no node and its platform line reports no hostname | the record itself | Warn |
+
+**Table 8: the checks on the start-up record.**
 
 A finding about the deploy's record or the environment names node `monitor`.
 The other findings name the record's node, its run id and the fact, so a reader can act on one without opening the node.

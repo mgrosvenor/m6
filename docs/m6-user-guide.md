@@ -1436,13 +1436,23 @@ curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/cms"
 # 401
 ```
 
-`/health` answers 200 while every dependency it reads is answering, 503 with `{"status":"degraded","node":"<name>"}` while one is failing, and no answer at all when the process is gone.
-The degraded body names the node and no dependency, because the endpoint is public and unsecured.
+`/health` answers 200 while every dependency it reads is answering and 503 while one is failing, and [`m6-http.md`](m6-http.md) §11 gives both bodies.
 
 Without `-k`, `curl` verifies the certificate chain, hostname and expiry, so these codes also prove the TLS boundary.
 
 The `/cms` route is protected, so a plain `curl` gets a 401.
 A browser, which sends `Accept: text/html`, gets a 302 to `/login`.
+
+Then confirm which build each m6 binary is, on the server:
+
+```bash
+/usr/local/bin/m6-http --version
+/usr/local/bin/m6-http --version-full
+```
+
+`--version` prints the tag the binary was built from, such as `v1.16.0-rc.1`.
+`--version-full` prints one line per m6 crate the binary links, each with its commit, and `.dirty` for a tree with uncommitted changes.
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) §4.2 gives both forms.
 
 ### 7.7. Logs
 
@@ -1460,29 +1470,37 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 Every m6 log line is JSON, so `journalctl -u m6-http -o cat | jq .` parses every one.
 
-Under systemd each line is also one datagram on journald's native socket, carrying four fields beside the JSON: `PRIORITY` from the level, `M6_TYPE` from the line's `type`, `SYSLOG_IDENTIFIER` from the program's name and `MESSAGE` with the whole line.
-So the journal filters natively, and the JSON is still self-describing:
+Under systemd each line is one datagram on journald's native socket, and its `M6_TYPE` field carries the line's `type`, so the journal filters without parsing the JSON:
 
 ```bash
 journalctl -u m6-http M6_TYPE=perf
 journalctl -u m6-http M6_TYPE=access --since -1h
 journalctl -u m6-http -o json M6_TYPE=perf | jq -r .MESSAGE | jq .
+journalctl -u m6-http M6_TYPE=startup -o cat
 ```
+
+The last command prints the start-up record of every run: the build, the invocation, the sha256 of each config file, every setting with its source, and the host facts.
+[`m6-log.md`](m6-log.md) gives the six values of `type` in section 1, the datagram's fields in section 5 and the record in section 9.
 
 ### 7.8. Rotating the logs
 
 Nothing in m6 rotates logs.
-Every unit logs to stdout, journald holds it, and `systemd-journald` rotates its own files under `/var/log/journal` by size and age.
+Every unit logs to journald, and `systemd-journald` rotates its own files under `/var/log/journal` by size and age.
 The analytics lines are on the same stream, with `type` `access`, so they rotate with everything else.
 Section 7.7 lists the reads.
 
 ### 7.9. What the monitor reads
 
-m6-monitor polls each node's public `/health` for liveness and reads every node's metrics and traffic documents from the monitor host's journal.
+m6-monitor polls each node's public `/health` for liveness and reads every node's metrics and traffic documents and start-up records from the monitor host's journal.
 Each node streams its journal to the monitor host with `systemd-journal-upload`, and `systemd-journal-remote` keeps it under `/var/log/journal/remote`, one file per peer address.
 `[monitor] journal_dir` names that directory and defaults to `/var/log/journal/remote`.
 [`m6-monitor.md`](m6-monitor.md) sections 2 and 3 give how the reader follows the journal, attributes each line to a node and restarts after a failure.
 The monitor needs no token.
+
+Two more keys let the monitor judge each start-up record.
+`[monitor] environment` says whether the fleet is `dev`, `staging` or `prod`, so a dirty build outside `dev` and a pre-release on `prod` are faults.
+`[monitor] expected_deploy_file` names a JSON file the deploy writes with the version and config sha256 it shipped to each node, and the monitor reports any run that differs.
+[`m6-monitor.md`](m6-monitor.md) section 5.1 gives the file's shape and section 7.1 every check.
 
 ### 7.10. Monitor history
 

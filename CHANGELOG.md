@@ -14,7 +14,6 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 The released versions, newest first:
 
 - [1.16.0-rc.1, 2026-11-18](#1160-rc1-2026-11-18)
-- [1.16.0, 2026-11-18](#1160-2026-11-18)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
 - [1.13.0, 2026-10-02](#1130-2026-10-02)
@@ -42,137 +41,38 @@ The released versions, newest first:
 
 ## 1.16.0-rc.1, 2026-11-18
 
+**m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
+Every log line carries a `type`, and under systemd each line is one datagram on journald's native socket.
+`/perf` and `/traffic` are removed on every node, and the two documents are read from the `type=perf` and `type=traffic` lines.
+A config that still names a removed key stops the service at start with exit 2.
+This release also fixes the cache storage rule and the refresh-token lifetime, and gives every auth token a kind, an audience and an id.
+Migration lists the nine changes an operator makes, and Removed lists every removal.
+
+**Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit. That refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
+
 **Every m6 binary reports the build it is running, from constants fixed at compile time.**
 `--version` prints the tag form, `v1.16.0-rc.1`, and nothing else.
 `--version-full` prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary's own name first, with that crate's own commit and dirty flag.
 The workspace version is `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
 A dirty tree carries `.dirty` in the build metadata only, and a build with no git carries `+unknown`.
-The start-up and shutdown recovery record is in the same release.
+The start-up record and its shutdown line are in the same release.
 The platform layer supplies the record's host facts and the process facts, and the monitor reads the record from the journal it already follows and checks each run against what the deploy recorded.
 The release also deletes the executable hash and moves the monitor's build-drift check onto the commit in the version string.
 Three gaps remain, and the Not measured section lists each.
 
 ### Migration
 
-An operator makes four changes.
-
-1. `--version` now prints the tag form and nothing else. A script that parsed the `m6-http 1.16.0` line reads `v1.16.0` instead. A deploy reads `--version-full` or the metrics line for the build identity.
-2. The workspace version is `1.16.0-rc.1`. The staging pin moves to the `v1.16.0-rc.1` tag. The release commit sets `1.16.0` and is tagged `v1.16.0`.
-3. A monitor that names neither `[monitor] environment` nor `[monitor] expected_deploy_file` keeps running and gains two warnings per check. Set the first to `dev`, `staging` or `prod`, and the second to the file the deploy writes.
-4. A monitor's history file rebuilds its `build` table under migration 3 the first time this release opens it. The old build rows are dropped, because their `hash` was an executable md5 this release no longer reads and their `version` carried no build metadata, so no old row is comparable with a new one. Every `health` row survives, and one that named a discarded build keeps its figures with `build_id` set to `NULL`. The open writes one `type=event` line that says the table was rebuilt and why.
-
-### Added
-
-- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain --untracked-files=no`, so a cargo git-dependency checkout, which holds an untracked `.cargo-ok`, is not marked dirty. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
-- `--version-full`, one `<crate> - <full SemVer with build metadata>` line per m6 crate in the binary. Each line comes from that crate's own build-time constants, so a binary that links crates built from different commits shows both commits instead of reporting one for the whole binary.
-- A test that parses the full form with the `semver` crate, and a test that holds each binary's crate list against the workspace dependency graph from `cargo metadata`.
-- `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.
-- The start-up recovery record: several `type=startup` lines sharing one `run_id`, then one `type=shutdown` line on a clean exit. The parts are the identity (`app`, full version, every m6 crate), the invocation (argv, the declared flags, every declared environment variable), one line per config file with its sha256 as read, one line per config table with every key, its effective value and its source (`file`, `default`, `env` or `flag`), one line for the platform facts and the effective `[limits]`, and a completeness line carrying the number of lines in the record.
-- `m6_core::startup`, the writer. A service built on `Site` gets the record and the shutdown line with no call of its own. An application with its own config calls `startup::Record::emit` once after `log::init` and `startup::shutdown` once on a clean exit. `version_flags!` registers the binary's identity as well, so the identity line names the binary rather than m6-core. `Record::node_name(name)` states the application's configured node on every line, which m6-http takes from `[node] name`.
-- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. A value with no type is redacted by its key's name, under Security below.
-- `m6_core::config::load_traced` and `m6_http_lib::config::load_traced`, which return the effective config and the trace of which file, flag or environment variable set each key. `load` keeps its signature and delegates.
-- `m6_core::platform::host_facts()` and `m6_core::platform::Fact<T>`, one reading of the host at start behind one API. A fact is `{"known": value}` or `{"unknown": "reason"}`, and an unknown fact is never an absent key.
-- `m6_core::platform::process::memory_usage` and `page_faults`, so a test that reads another process's memory goes through the platform layer rather than reading `/proc`.
-- **`m6-monitor` reads `type=startup` and `type=shutdown` on its one long-lived `journalctl --follow` child**, beside `type=perf` and `type=traffic`. Four `M6_TYPE` matches, one child, and no second follower. The start-up record is grouped by its `run_id` and attributed by the record's own `node` field, or by the hostname on its platform line, plus its own `app` field. `_HOSTNAME` is not read.
-- **The monitor checks each run and reports a finding with a severity.** A dirty build outside `dev`, a pre-release on `prod`, a version that differs from the deploy's recorded release, and a config sha256 that differs from the rendered file are `Fault`. A complete count that disagrees with the lines received, and a record that never closed, are `Fault`. An unexpected restart is `Warn` and quotes the previous run's shutdown reason. A node whose kernel, OS, CPU or memory differs from its peers is `Warn`. Versions are parsed with the `semver` crate, never compared as strings.
-- **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
-- **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
-
-### Changed
-
-- `--version` no longer prints the crate name and the bare version. It prints `v1.16.0-rc.1` or `v1.16.0`, which matches the git tag and carries no build metadata, even on a dirty tree. A script that parsed the old `m6-http 1.16.0` line must read the new tag form.
-- The workspace version is `1.16.0-rc.1`. `Cargo.lock` carries the same version for every member, and `cargo metadata --locked` agrees with it.
-- Every m6 binary takes both flags: `m6-http`, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`, `m6-file`, `m6-html`, `m6-md`, `m6-monitor`, `m6-auth-server` and `m6-auth-cli`. The examples and the site applications adopt the same two lines in a later change.
-- The `type=perf` line's `build.version` now carries the full SemVer string with its commit, and `build.hash` is gone. A fleet check compares the release part before the `+` for version drift and the build metadata for build drift, so one release built twice from one tag is still reported as build drift.
-- The monitor's build-drift check reads the commit from that version metadata. Version drift compares the release part before the `+`, because SemVer 2.0.0 gives build metadata no precedence, and build drift compares the metadata.
-- A clean exit written through `Lifecycle::complete` now writes one `type=shutdown` line before the completion line. A forced second signal writes it with reason `forced`. m6-md writes `pass complete` or `pass failed`. A process that never wrote a start-up record writes no shutdown line.
-- Every `type=startup` line and the `type=shutdown` line carry `node`, the node the run is on, read once at start rather than per line. It is the application's configured node name when its config names one, which is `[node] name` for m6-http, and the platform facts' `hostname` otherwise. `node_source` says `configured`, `hostname` or `none`, so a claimed identity is never mistaken for an inferred one, and two instances on one host that name themselves differently are two nodes. A host that did not name itself writes an empty `node` and the reason in `node_unknown`, so the key is present and a reader can tell the record from one written before the field existed.
-- Every service start writes the start-up record to the one log stream. An operator who filters `type=event` sees the same operational lines as before. An operator who counts all lines sees the record, which is what a reader needs to recover the run.
-- The record reports an empty `[smtp] password` and any other value the secrets file supplied as `<redacted>`. A path to a secret file is logged as a setting, and the file's bytes never are.
-- `version_flags!` registers the binary's identity for the start-up record as well as answering the version flags, and `startup_identity!` is gone. An application that called both keeps the first line and deletes the second. The m6-examples applications and a site's own binaries make that one-line change when they take this release.
-- `Record::new(app, argv)` takes the registered identity, decides the host and starts from the default limits by itself. `startup::record_log_level` writes the running log level into the `log` section. The platform line always carries the limits, the defaults when a service has no `[limits]` table.
-- `PerfReport::build(subject, metrics)` returns the report, `monitoring::not_found()` is the 404 a monitoring path answers, and `PerfOutcome` is gone with its three variants nothing built.
-- `TrafficSummary::from_views` and `TrafficReport::from_views` summarise borrowed `RequestView`s, from a parsed record or from the traffic window's slot. `AnalyticsRecord::from_parts` and its `truncated` flag are gone.
-- `cpu`, `memory` and `clock` in the host facts are un-nested structs whose members are `Fact`s, rather than one `Fact` around the group. Each group is read from two or three sources, and an outer `Fact` would let one failed read hide the others.
-- The cgroup limits are read at the group `/proc/self/cgroup` names, and the walk stops at the nearest parent with the file. A group that sets no limit is `{"known": null}`, and a file that cannot be read is `{"unknown": "reason"}`, so a reader can tell unlimited from unreadable.
-- `cfg(target_os)` outside `m6-platform` is zero. The platform layer holds every OS read in the workspace's Rust crates. The measurement scripts still read `/proc` and `sysctl` through their own code.
-- **The traffic line costs m6-http's event loop 13.4 ms a minute, from 78.6 ms**, for a full window of 32,768 events across 2,000 clients (release, M4). Each marker list is one case-insensitive aho-corasick automaton, and the summary reads the window's slots in place instead of building a record per event.
-- **The metrics line costs the loop 81 us every ten seconds, from 438 us.** The host block, a dozen `/proc` and `/sys` reads, is read once a minute and repeated on the lines between, at 362 us on the M4.
-
-### Fixed
-
-- **m6-http's start no longer waits between its record's `complete` line and `m6-http started`.** On Linux the probe deadline test measured 4.3 to 4.9 s for its 2 s probe. The time was the md5 of the running executable, read in full at start, which the deletion of the executable hash in this release removes. On macOS the same interval was 277 ms for a 30 MB dev build before and 8 ms after, and spawn to `m6-http started` went from 283 ms to 14 ms (median of 20 starts each). `auth_startup.rs` now holds the interval under 1 s.
-- **`--version-full` names the binary on its first line.** It named the package, so the seven extra binaries of the m6-http package, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2` and `m6-probe-h3`, each printed `m6-http - ...` first. The macro reads `CARGO_BIN_NAME` at the binary's own call site, and such a binary lists the package second because it links the package's library. The start-up record's identity uses the same name. `m6-core/tests/version_flag.rs` runs all seven.
-- **`/check` and `/digest` show how the previous run ended on every restart, not only an unexpected one.** STARTUP prints `previous: <run id>, shut down <reason> at <time>`, or `no shutdown recorded`, marked `[info]` for an expected restart and `[WARN: unexpected restart]` otherwise. Each run in `/digest` carries `previous_shutdown` as `{reason, at, uptime_ms}` or `null`, and `restart` as `info` or `warn`. Only the unexpected restart is a finding, at `Warn` as before.
-- **Each run in `/digest` carries `ingested_lines`**, the raw count of journal lines the monitor read for its run id, replays and the shutdown line included, beside `lines`, the start-up lines alone.
-- **The monitor's history file rebuilds its `build` table in schema migration 3, and the build rows before it are not comparable.** A build row is now `(binary, release, commit, dirty)`, the tag and the build metadata kept apart with the dirty flag as an integer, so a reader answers "which build was this node running" from four columns and the drift check compares `release` for version drift and `commit` with `dirty` for build drift. The previous rows are dropped. Their `hash` was an md5 of an executable that is no longer read, and their `version` was a bare release with no build metadata, so an old row and a new one share no comparable fact. A `health` row that named a discarded build keeps every figure and has `build_id` set to `NULL`, and the open that migrates writes one `type=event` line saying the table was rebuilt and why. `/history` lines carry `binary`, `release`, `commit` and `dirty` in place of `binary` and `version`. The schema version stays at 3 because `1.16.0-rc.1` has not shipped, so no released file can be at 3. A test builds a real version 2 file from the migration 1 and 2 SQL, opens it, and checks that the build rows are gone, every health row survives with a `NULL` build, and every other table, row and column is unchanged.
-- **The host facts read no network.** The FQDN of a host whose name has no domain came from `getaddrinfo` with `AI_CANONNAME`, which sends a DNS query and waits out the resolver's timeout, 5 s per server by the glibc default, when the resolver does not answer. The FQDN now comes from the host name when it carries a domain, and otherwise from the `/etc/hosts` line that lists the host, or it is unknown with the reason.
-- **A release build of m6-http sends HTTP/2 frames.** `append_frame` wrote each frame inside two `debug_assert!` calls, which a release build compiles out, so the release binary sent no HTTP/2 frame at all. Every dev-profile test and the dev-profile h2spec run passed. The writes now always run. `m6-core/tests/debug_assert_purity.rs` fails when any `debug_assert!` argument in the workspace calls a mutating method, and CI's conformance job builds the new `release-asserts` profile, the dev profile with debug assertions off, and runs the HTTP/2 unit tests and h2spec against it.
-- **A peer that fills `h2_send` loses its own connection, and the process stays up.** HEADERS and control frames are not paced, so a client that opened many header-only streams and never read could fill the area to its maximum. The HPACK encode then panicked, and with `panic = "abort"` that ended m6-http for every client. A refused write is now recorded and the next flush closes that one connection with an error naming `[limits.h2_send]`.
-- **A full journal queue keeps the native journal.** A send that met a full journald queue (`EAGAIN` on Linux, `ENOBUFS` on macOS) counted as a failure and moved the process to stdout until a restart. The line now stays buffered for the next flush. Only a socket that is gone or refuses moves the sink to stdout.
-- **Every dropped-count line reaches the journal.** The journal path never cleared a drained report, so after the first report every later count of lost lines went unreported.
-- **SIGUSR1 no longer ends a service.** It left the managed signal set with the log reopen, so a rotation hook that still sends it killed the process with no shutdown record. It is blocked again and discarded when read.
-- **The monitor deregisters the journal pipe before closing it**, the order the documentation already gave, so a closed descriptor number cannot be reused by a socket that the deregistration would then remove.
-- **`m6-monitor --check` no longer reports the journal reader as not running after a read that worked.** The one-shot read's normal end, journalctl printing its tail and exiting 0, was recorded as the reader stopping. A non-zero exit is still the reason reported.
-- **A secret flag given as `--flag=value` is redacted.** Only the two-argument form was, so the one-argument form put the secret in the invocation line. Both read as the flag's value and both are redacted in place.
-- **`Bounded` pops in constant time.** A queue's pop moved every remaining entry down one place. Popping 50,000 entries took 79.4 ms before and 0.18 ms after.
-
-### Removed
-
-- The md5 of the running executable: `BuildId.hash`, `executable_md5()` and the 64 KiB chunked read it did at start. The process reports the commit fixed at build time instead, so one tag built twice is still distinguishable and no process reads its own bytes for identity.
-- `md-5` from `m6-core`, whose only user was `executable_md5()`. Nothing else in the workspace declared or used it.
-
-### Security
-
-- **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. The rule matches the key case-insensitively and anywhere in the key. A key ending in `_path`, `_paths`, `_file`, `_files` or `_dir`, and any key holding `public_key`, is a path and is still logged.
-- `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
-
-### Verified
-
-- The release tree at `616ab561` measured 2,484 passed, 0 failed on the build host, with no warning and clean rustdoc, and the history reset landed on top of it. The record and monitor branches measured 2,456 passed, 0 failed, 13 ignored across 129 test binaries on this macOS arm64 host at `1f61df6c`, and the cgroup change measured 2,436 passed, 0 failed at its own tip.
-- The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
-- The monitor's four drift tests hold the swapped input: two nodes reporting `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` produce one build-drift finding and no version-drift finding, and a node with no build metadata counts as drift rather than agreement.
-- `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
-- The recovery record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included. The same file holds every part to the one node read from the platform facts, marked `hostname`, two configured names on one host to two nodes, marked `configured`, the shutdown line to the same node, and an unnamed host to an empty `node` with its reason and `none`.
-- `m6-http/tests/startup_node.rs` runs the real binary twice on one host, with `[node] name = "edge-a"` and `"edge-b"`, and asserts that each record states its own configured node with `node_source` `configured`, that neither states the other, and that both platform lines carry the one hostname.
-- The record from a real binary is quoted in the worker report, and the largest line and line count from the rendered production and staging configs are measured rather than estimated.
-- `m6-core/tests/startup_secrets.rs` fills every key of a service config, its secrets file and a `site.toml` with distinct sentinels, builds the record through `site::record_sections`, and finds none of the 12 credential sentinels in any line and every one of the 23 distinct setting sentinels. With the name rule switched off it reports 8 leaked credentials, `[email] password` among them.
-- `m6-core/tests/secret_fields.rs` reads more than 30 config structs from the workspace source and finds no credential-named field outside `Secret<T>`, a path type or a nested table.
-- The monitor's own suite adds fake journal lines that produce every finding: a dirty version on prod, a pre-release on prod, a version mismatch, a stale config sha, a completed record whose count disagrees, a record that never completes, an unexpected restart with and without a shutdown reason, a restart during a deploy, a peer kernel drift, a decided fact that differs from the deploy, a missing expectation file, and a clean run that produces no finding. Each finding's test asserts the level and the value it names.
-- On macOS, 20 starts of a dev m6-http before the merges and 20 after, read from the service's own log timestamps: `complete` to `m6-http started` 277 ms before and 8 ms after.
-- Each fix above has a test that fails on the code before it and passes after. `append_frame_writes_the_frame_in_every_profile` fails under `--profile release-asserts` with the old frame writer.
-- A release build of m6-http answered `curl --http2` over TLS with HTTP/2 200.
-- In journal mode 500 lines are 500 datagrams, one per line as the journal's native protocol requires. The flush in `log_perf` and `log_traffic` adds no send: 500 lines with a flush every 100 lines cost the same 523 sends as with none, on a macOS datagram pair whose reader drained between lines.
-- `m6-platform` holds `platform_gate` at 9 of 9 and the contract suite at 64 tests with 4 ignored.
-
-### Not measured
-
-- **Linux on this host.** Every platform and cgroup run above is macOS arm64. The Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are formatted and parsed but not type-checked, because this host has only the `aarch64-apple-darwin` standard library and no rustup. The first Linux CI job that runs `cargo check --workspace --all-targets`, `platform_gate` and `platform_contract` is the proof.
-- **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. No writer exists in the deploy repository at this release, so no version or config sha256 is compared in practice.
-- **A physically mixed-commit binary.** The mechanism and the metadata test are the evidence, and a source tarball's `+unknown` is unit-tested.
-
----
-
-## 1.16.0, 2026-11-18
-
-**m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
-Every log line carries a `type`, and under systemd each line is one datagram on journald's native socket.
-`/perf` and `/traffic` are removed on every node, and the two documents are read from the `type=perf` and `type=traffic` lines.
-A config that still names a removed key stops the service at start with exit 2.
-This release also fixes the cache storage rule and the refresh-token lifetime, and gives every auth token a kind, an audience and an id.
-Migration lists the five changes an operator makes, and Removed lists every removal.
-
-**Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit; that refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
-
-### Migration
-
-An operator makes five changes.
+An operator makes nine changes.
 
 1. Read the `type=perf` or `type=traffic` line from the journal where a script read `/perf` or `/traffic`. `m6-monitor` already reads them this way, and a firewall-stats collector moves to the `type=traffic` line.
 2. Enable `systemd-journal-upload` on every node and `systemd-journal-remote` on the monitor host.
 3. Delete every key listed under Removed, or the service exits 2 naming the key.
 4. Run `m6-auth-cli sessions revoke-all` after a key rotation.
 5. Set `[tokens] issuer` to the deployment's name.
+6. `--version` now prints the tag form and nothing else. A script that parsed the `m6-http 1.16.0` line reads `v1.16.0` instead. A deploy reads `--version-full` or the metrics line for the build identity.
+7. The workspace version is `1.16.0-rc.1`. The staging pin moves to the `v1.16.0-rc.1` tag. The release commit sets `1.16.0` and is tagged `v1.16.0`.
+8. A monitor that names neither `[monitor] environment` nor `[monitor] expected_deploy_file` keeps running and gains two warnings per check. Set the first to `dev`, `staging` or `prod`, and the second to the file the deploy writes.
+9. A monitor's history file rebuilds its `build` table under migration 3 the first time this release opens it. The old build rows are dropped, because their `hash` was an executable md5 this release no longer reads and their `version` carried no build metadata, so no old row is comparable with a new one. Every `health` row survives, and one that named a discarded build keeps its figures with `build_id` set to `NULL`. The open writes one `type=event` line that says the table was rebuilt and why.
 
 The entries below give the detail behind each step and the behaviour changes that need no config edit.
 
@@ -288,10 +188,10 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **`bench.sh --mixed` measures hot-hit p50 and p99 while new full TLS handshakes arrive at a set rate.**
 `./bench.sh --mixed [--mixed-rates 0,50,100,200,500] [--mixed-seconds 10]` reuses `m6-bench`'s existing hit client (one kept-alive HTTP/1.1 connection, the same timer and `percentile` rule) and puts a second load generator beside it: one new TCP connection and one fresh full handshake per arrival, scheduled against absolute deadlines (`start + i/rate`), not a sleep between calls.
-Each load handshake builds a new `ClientConfig`, so no ticket is offered and nothing resumes even though the server installs a ticketer; the run prints the load's own `resumed` count (which must be 0) and a shared-config probe that shows the server would resume if a client offered a ticket (1 of 2 handshakes resumed).
+Each load handshake builds a new `ClientConfig`, so no ticket is offered and nothing resumes even though the server installs a ticketer. The run prints the load's own `resumed` count (which must be 0) and a shared-config probe that shows the server would resume if a client offered a ticket (1 of 2 handshakes resumed).
 The achieved rate is printed beside the target, `reached=no` when it is more than 2% under, and handshake p50/p99 are measured around the whole `probe::tls_handshake` call so a rate met by queueing shows in them.
 The hit connection is held for the whole window (`bench.sh` raises `[server] max_requests_per_connection` for this suite), and a reconnect on it, a resumed load handshake or a non-hit response fails the run.
-Verified on macOS arm64 (Apple M4, 10 cores, release, ring, ECDSA P-256) with all five rates reached exactly on a quiet-enough window (1-minute load average 4.3 to 4.9): hot-hit p50 was 17.2 to 20.6 us and p99 31.4 to 39.8 us up to 200 handshakes/s, and at 500/s p99 rose to 199.5 us (5.0x the 0/s baseline) while hit throughput fell from 50.5k/s to 27.8k/s (-45%); that rate's handshake p99 was 7.06 ms against 0.53 ms at 50/s, so the generator was queueing, not under-delivering.
+Verified on macOS arm64 (Apple M4, 10 cores, release, ring, ECDSA P-256) with all five rates reached exactly on a quiet-enough window (1-minute load average 4.3 to 4.9): hot-hit p50 was 17.2 to 20.6 us and p99 31.4 to 39.8 us up to 200 handshakes/s, and at 500/s p99 rose to 199.5 us (5.0x the 0/s baseline) while hit throughput fell from 50.5k/s to 27.8k/s (-45%), and that rate's handshake p99 was 7.06 ms against 0.53 ms at 50/s, so the generator was queueing, not under-delivering.
 
 **The gate scripts make ECDSA P-256 certificates, the key type production should run.** `tools/conformance.sh`, `bench.sh` and `tools/memcalls-site.sh` made RSA-2048 ones, so the gates measured a handshake about 4 times dearer than production's (about 410 us against 90 us of server CPU, release build on macOS arm64). `BENCH_KEY=rsa` keeps RSA for `bench.sh`.
 Verified by running `bench.sh --handshake` and the conformance resumption stage on the new certificates (below).
@@ -300,7 +200,7 @@ Verified by running `bench.sh --handshake` and the conformance resumption stage 
 `./bench.sh --handshake [--handshake-n N]` times a full handshake, a resumed one and, for h3, a 0-RTT request over h1, h2 (TCP and TLS 1.3) and h3 (QUIC), and reads m6-http's own CPU time before and after each run to report server CPU per handshake.
 `BENCH_KEY=rsa` keeps RSA-2048, where the default is ECDSA P-256.
 `cargo bench -p m6-http --bench handshake_parts` runs a rustls client and server in one thread, times only the server's calls, and prints the ClientHello phase and the Finished phase, the key exchange groups, the signature, a ticket encryption and the flight size, for ECDSA and RSA keys.
-The bench measures the tree's one provider, aws-lc-rs, because 7f96b2f made that the only provider the workspace builds; the provider comparison this bench was written for is not a build option here.
+The bench measures the tree's one provider, aws-lc-rs, because 7f96b2f made that the only provider the workspace builds. The provider comparison this bench was written for is not a build option here.
 `cert-compression` turns on rustls' brotli and zlib, so the listener answers a client that advertises RFC 8879 compression.
 Nothing on the request path changes. QUIC does not use this provider: quiche carries BoringSSL.
 Verified on macOS arm64, release and dev builds: the full-handshake server CPU on ECDSA P-256 was 100 us per handshake over h1 on aws-lc-rs, 63 us of it inside rustls, 959 m6-http tests pass, and `tls_resumption` passes.
@@ -522,319 +422,20 @@ The value is computed once per certificate when the chain is loaded, in `tls::re
 With `[monitor] one_certificate` set, a node whose leaf fingerprint differs is a fault, which is how a two-node fleet and a same-expiry reissue can be read, and a node that reports an expiry but no fingerprint is warned about instead of counted as agreement.
 Verified on 2026-11-16 on a macOS sandbox: `tls_reload` and the new unit tests pass, the fingerprint of two certificates issued into one second differs while their `notAfter` is equal, and each of the five new tests fails when its half is removed (no fingerprint computed at load, no fingerprint in the digest, the declaration ignored).
 
-### Security
-
-**Auth tokens name their kind, deployment and id, and `[tokens] issuer` no longer defaults to `localhost`.**
-Every token carries a `typ` header: `at+jwt` for a session access token, `m6-api+jwt` for an `m6-auth-cli token create` token and `m6-refresh+jwt` for a refresh token.
-`POST /check` accepts the first two and refuses a refresh token, a token with no `typ` and the library's default `typ: JWT`.
-Every token carries `aud`, from the new `[tokens] audience` key, which defaults to the issuer.
-Every token carries `jti`, a fresh identifier for each mint.
-The access token still carries `groups` and `roles`, and `POST /check` continues to answer the database's current lists.
-`POST /check` keeps its `sub`, `username`, `roles` and `groups` body, and `Retry-After` is unchanged.
-`sid` is absent because it names a refresh-token row this schema does not have.
-`jti` is carried but names no row, because the row that can end a token is part of the shelved token-rules work.
-No table, trigger or `/auth/v1/` path is added.
-
-**A cache no longer stores a response it is not allowed to store: a route's `cache` override cannot remove the backend's `no-store` or `private`, and a response to a request carrying `Authorization` or the `session` cookie is never stored.**
-`apply_route_cache` deleted every `Cache-Control` field and wrote the route's value, so a cache route configured `cache = "public, max-age=600"` turned an origin's `private` or `no-store` into `public` before `reply_rule` made the store decision.
-A protected page fetched through that cache was stored and replayed to an anonymous visitor with no check.
-RFC 9111 3.5 says a cache must not store a response it is not allowed to store.
-`request_permits_storage` read request `Cache-Control: no-store` alone.
-RFC 9111 5.2.2.5 forbids a shared cache from storing a response to a request that carried `Authorization`, and the `session` cookie is this deployment's browser credential, so both now refuse the store.
-The auth API design's Table 11 is the one permitted case, a protected response stored under the origin's requirement, and this tip has no such route, so every credentialed request is refused.
-Verified on 2026-11-17 on a macOS sandbox: `a_route_cache_override_cannot_make_a_no_store_response_storable` fails before the fix with `the route override removed the backend's no-store: Cache-Control: "public, max-age=60"` and passes after.
-`a_response_to_a_request_carrying_authorization_is_never_stored` and `a_response_to_a_request_carrying_a_session_cookie_is_never_stored` fail before the fix with the stored reply served to the anonymous second request, and pass after.
-`a_credential_in_the_request_forbids_storage` fails on the first `authorization` case before the fix and passes after.
-`docs/m6-http.md` section 4 and section 7 and `docs/m6-site-toml.md` Table 10 state both rules.
-
-**A key rotation now ends every outstanding refresh token: `m6-auth-cli sessions revoke-all` deletes every `refresh_tokens` row, and `docs/m6-auth.md` section 4.2 gives that command as a step of the rotation.**
-`/auth/refresh` identifies a refresh token by its stored SHA-256 hash and reads the row, and it never checks the token's signature.
-A key change alone therefore left every refresh token usable until its `exp`, so a stolen token renewed access after the operator rotated the key.
-The command deletes every row in one transaction, so the next refresh finds no row and answers 401.
-The documentation promised the opposite before this change: it said the service verified the refresh token's signature with the current key, which it does not.
-This is the interim form of the auth API design's `sessions revoke-all`.
-That design adds an auth generation, a new epoch and list key, and an acknowledgement from every cache, and those arrive with the token-rules step.
-This version holds no decision list on any node, so the deletion is the whole effect and the command waits for nothing.
-Verified on 2026-11-17 on a macOS sandbox: `sessions_revoke_all_ends_refresh_tokens_across_a_key_rotation` logs in, writes a new key pair, restarts the server, runs the command and gets 401 from the next refresh.
-With the CLI change removed the same test fails with exit 100 and `error: unknown entity: sessions`.
-`test_sessions_revoke_all_deletes_every_users_rows` deletes three rows across two users.
-The existing rotation tests still pass: a key change alone leaves a refresh token usable, and a token minted after it refreshes.
-
-**rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host. The update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
-
-**A login throttle blocks five wrong passwords even when the series takes longer than `window_secs`.**
-The count was anchored at the first failure, so the fifth failure could reset it to one and the sixth was answered 302 instead of 429.
-The example's development config sets a five-second window, and an unoptimised password check takes about a second, so five wrong passwords span more than five seconds on a loaded host.
-The window is now measured from the most recent failure, and a block lifts after `window_secs` with no further failure.
-Verified with `failures_spread_across_more_than_one_window_exhaust_the_budget`, which fails with the first-failure window restored, and with example 05's 98 checks on the running stack.
-
-**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
-Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
-A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.
-Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5x` and an empty value with `Connection: close`, and asserts each is answered 400 with the connection closed. On the old parser the `+5` case is answered with nothing inside the read bound, so that case fails.
-
-**SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected. No configuration changes.
-
-**HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
-Only the compressed header block was bounded, at 256 KiB, and HPACK lets one byte stand for a table entry of up to 4096 bytes, so a block under that cap could decode to a far larger header list.
-The list is now counted as RFC 9113 6.5.2 defines it while it is decoded, and a field is kept only while the list is within the limit, so a request keeps at most 64 KiB of header fields, as RFC 9113 6.5.2 counts them, however far its block would decode. It is answered 431 and RST_STREAM on its own stream after it is decoded in full, so the HPACK table stays in step and other streams are unaffected.
-Verified with `a_header_list_over_the_limit_is_answered_431_on_its_stream`, `the_server_settings_advertise_the_header_list_limit` and `an_amplified_block_never_holds_more_than_the_limit_in_memory`, which fail without the change and pass with it (a 6,009-byte block made the old decoder keep 8 MB of fields), and with a request exactly at the limit still served.
-
-**A query key or form field can no longer replace a path parameter, and m6-file serves only the file its route's pattern addresses (#279).**
-Core checked every path parameter for `..` and stray characters, then added each query parameter to the same request dictionary under the same name.
-A request such as `GET /assets/a.css?relpath=../config` therefore reached m6-file with the unchecked query value as `relpath`, and m6-file served the file it named, outside the site directory.
-Core now leaves a path parameter in place when a query key or form field has its name.
-**Behaviour change:** a template that read a query value under a path parameter's name now gets the path value, and reads the query value as `query.<name>`.
-m6-file now reads `relpath`, `filename` and each `root` placeholder only when the route's pattern captures that name, and checks each with core's path-parameter rule (a slash only in a `{*name}` capture). A name the pattern does not capture is never taken from the query, so `?relpath=` on a `{filename}` route cannot pick a file in a subdirectory, and a `root` placeholder the pattern does not capture is a 404.
-Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query_relpath_cannot_choose_a_file_on_a_filename_route`, which send those requests over HTTP. The first fails on the previous code with `200 OK` and the service's config in the body. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
-
-**A site-relative file helper follows no symlink out of the site directory, and a refused write creates nothing outside it (#346).**
-`Request::validated_path` rejected `..` in the string and never resolved the path, so `read_json`, `write_json`, `write_json_atomic`, `list_json` and the multipart `write_bytes` reached `data/linked/file.json` through a symlinked directory to a file outside the site.
-`write_json` then called `create_dir_all` on that path, so a refused write created the missing directories outside the site before writing.
-The helpers now call one shared `m6_core::path::resolve_within`, which canonicalises the site root, canonicalises the deepest existing ancestor of the requested path, appends the components that do not exist yet, and refuses the result unless it starts with the resolved root.
-A dangling symlink counts as existing and is refused, so a write cannot create its target outside the site.
-A symlink that resolves back inside is accepted, which keeps a site that links `data` to `storage/data` working.
-`..`, a leading `/` and a Windows prefix are still refused.
-Verified with `read_json_refuses_a_symlinked_directory_that_leaves_the_site`, `write_json_refuses_a_symlinked_directory_before_creating_anything` (which asserts the outside directory is still empty), `in_site_symlinked_directory_still_reads_and_writes` and `read_json_still_refuses_dotdot`. The first two return the outside file and `Ok` with the previous lexical check restored.
-
-**m6-file refuses a path whose symlinked directory leaves the site, on plain and tail routes (#339).**
-`escapes_site_dir` called `symlink_metadata` on the last component only, so `GET /assets/linked/secret.css` with `assets/linked` pointing outside the site was served: the final component was a regular file and the check stopped there.
-`serve` now resolves the path through core's `resolve_within`, checks the resolved path against the resolved site root, and reads the file it resolved.
-A directory symlink that stays inside the site still resolves inside and is served.
-Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
-
-### Fixed
-
-**The examples job's teardown stops the `dev.sh` it started, by pid and start time, in place of `pgrep -f` on the directory.**
-The run step writes the pid and its `ps` start time to `.ci-dev.pid`, and the `Stop the stack` step compares the start time before signalling, so a pid that now belongs to another process is left alone.
-The build host's example 05 cleanup does the same: it stops the recorded `dev.sh`, reaps the service pids `dev.sh` wrote to `logs/.own-stack.pids` when `examples/own.sh` is present, and waits for the shell in place of killing everything whose command line mentions the directory.
-This removes the last `pgrep -f` teardown from m6's tree.
-Verified on 2026-11-16 on this Mac: `tools/check-kill-safety.sh` names both sites before the change and none after, `bash -n` parses the build-host script, and the workflow parses as YAML.
-
-**`m6-monitor --dump-config` now reads and validates its fleet, so a config that names a removed key in `[[monitor.nodes]]` fails the dump with the start's exit 2 and message.**
-The monitor answered `--dump-config` in m6-core's shared parser, which reads the framework table and the routes and never builds the `Fleet`.
-A rendered config carrying `perf_token_file` under a node entry therefore dumped clean and exit 2 came at start, so a coherence check that runs the dump called the deployment accepted while the monitor refused to start.
-m6-core gains one deferred mode: `Site::load_deferring_dump` records the flag, the service reads its own config with the statements the start reads, and `Site::dump` prints from the `Site` it built.
-`m6-monitor` stops in that sequence after the fleet and the history keys, and before it resolves a name, opens the history file or binds the socket.
-`m6-auth-server` uses the same mode and stops after `[storage]`, `[tokens]`, `[keys]` and the key files, before the database opens, where its dump previously read none of them.
-Verified on a macOS sandbox: `dump_config_refuses_a_removed_node_key` makes the dump and the start print the same `unknown field` message and exit 2, `dump_config_accepts_a_valid_config` reads the `ok:` line a deploy's check reads, and `m6-auth-server --dump-config` on a config with no `[keys]` refuses with the start's `missing field` message where it printed `ok` before.
-
-**The three chrono-family advisories are ignored in `deny.toml`, with the reason recorded there.** RUSTSEC-2026-0543 covers `chrono`, RUSTSEC-2026-0555 covers `chrono-tz` and RUSTSEC-2026-0559 covers `chrono-tz-build`. Each is an `informational = "unmaintained"` notice with an empty `patched` list, and none describes a vulnerability. `chrono` is replaced with `jiff` or `time` after the release.
-
-**`h1_tls_hit` read 2,003 on the build host against a budget of 2,001, and the three calls were in the fixed part of the 2N run, in its one TLS handshake. The row reads its counter after the warm-up now.**
-The request path makes exactly two calls per request, both rustls's record buffers: dhat over K = 1,000 and K = 2,000 on this host put +1,000 on those two stacks and 0 on every other site.
-The build host's N = 1,000 run counted 2,188 calls, which is this host's own N figure, and its 2N = 2,000 run counted 4,191, three calls above this host's 4,188, so the three extra calls were in that run's fixed part and none was in a request.
-A handshake's counted calls move with the number of reads its flight arrives in: one unsplit handshake cost 139 or 140 calls on this host, and 141 or 142 when the ClientHello arrived in two reads, with dhat putting the two extra calls on rustls's `DeframerVecBuffer::prepare_read` and the last on aws-lc-rs's signature buffer.
-`M6_ALLOC_MARK_AFTER=1` makes the server log the counter at the first turn after the warm-up response is on the wire, and `tests/allocations.rs` subtracts that reading from the stop reading in each run, so the handshake, the backend connection and the warm-up request are outside the measured window.
-The budget stays 2,001 and no request path changed.
-Verified on macOS against a dev build with `--features count-allocations`: twenty runs of the row before the mark read 2.001 four times, 2.000 eleven times and 1.999 five times, with the variation in the fixed part of one run and never in a request, and ten runs after it read 2.000 every time, with the N = 1,000 window at 2,001 calls and the 2N = 2,000 window at 4,001. A break that adds one allocation per cached hit makes those windows 3,001 and 6,001 and the row fails against the budget.
-
-**Three `cache_accounting` tests each took exactly 10 seconds to pass, and the time was two fixed waits in the fixture's teardown.**
-`ServingCheck::drop` woke its worker by connecting to the check socket, and `Stack` dropped its `TempDir` first, so the socket file was gone, the connect failed, and the worker sat out the rest of `SERVE_BOUND`, the ten-second accept deadline.
-The fixture also declared its `PortClaim` before its `Service`, so the claim's `Drop` spent all five seconds of its bind retry while the service still held the port.
-The five-second wait overlapped the ten-second deadline, which is why the visible constant was ten seconds rather than fifteen.
-`ServingCheck` owns a socket pair now: the worker waits on the listener and on one end of the pair in one reactor, and `Drop` writes a byte to the other end, so the teardown waits on an event rather than on the deadline.
-`Stack` declares the service first, then the check authority, then the port claim, with the directory last, which is the order their lifetimes need.
-Verified on macOS: the four tests in that binary read 10.762 s, 10.762 s, 10.769 s and 11.608 s before, and 0.833 s, 0.861 s, 0.862 s and 1.615 s after.
-
-**`h1_tls_hit` read 2.001 in five of twenty runs against a budget of 2,000, and its budget is 2,001 for one call of TLS handshake variation that is aws-lc-rs's.**
-The request path still makes exactly two calls per request. dhat over a 2.001 run and a 2.000 run differs at one stack and nowhere else: `EVP_PKEY::sign`'s `vec![0u8; sig_len]` in aws-lc-rs, through `ec::key_pair::EcdsaKeyPair::sign` and rustls's `emit_certificate_verify_tls13` in the TLS 1.3 CertificateVerify.
-`EVP_PKEY::sign` allocates the signature buffer at the maximum DER length and shrinks it to the length the signature took, so a handshake whose DER signature is shorter than 72 bytes makes one more call than one whose signature is exactly 72.
-That is one call per run, not per request: between K = 1,000 and K = 2,000 dhat puts +1,000 on each of the two per-request rustls record buffers and 0 on every other site.
-Before the provider switch the row needed no allowance because ring's ECDSA signer made the one `Vec` at the signature's actual length, so the DER length could not move the count, and fourteen runs read 2.000. aws-lc-rs became the one provider at 7f96b2f, and its signer added the maximum-size buffer and the shrink.
-Verified on macOS against a dev build with `--features count-allocations`: twenty runs read 2.001 five times, 2.000 ten times and 1.999 five times. Every extreme was one call in one run: the 2.001 runs read N = 2,187 against 2N = 4,188, most 2.000 runs read 2,188 against 4,188, one 2.000 run read 2,187 against 4,187, and the 1.999 runs read 2,188 against 4,187. The comment in `tests/allocations.rs` names the call and says it is per run.
-
-**A cache node with no generation ID retries a failed heartbeat on the next tick, and a confirmed disk copy writes the `disk cache kept` line.**
-A heartbeat is a request with the backend deadline, so a loaded host or a stalled guest can miss one answer. The node then waited the whole configured interval before asking again. At `heartbeat_secs = 3600` one timeout left a node with no ID for an hour, and a node with no ID cannot serve a request because the store rule needs the ID a reply was dispatched under. A failure now schedules the next heartbeat one loop tick away while the node holds no ID, and the configured interval once it does. A disk copy installed unverified after a timeout is confirmed by the next answer that names the same ID, and that transition now logs `disk cache kept`, the same line the settle path already wrote, so the metrics line and the log agree. No config key and no route changes. Verified: the new `a_node_with_no_id_retries_a_failed_heartbeat` fails at `STARTUP_BOUND` (60 s) without the retry and passes in 1.8 s with it, `a_restart_with_the_source_down_serves_the_disk_copy` asserts the kept line on the confirmation, and three consecutive full workspace runs under 16 CPU burners passed with zero failures.
-**The HTTP/1.1 close path allocated, so `h1_tls_hit` carried a 2,003 budget for a row that makes 2,000 calls.** `http11::advance_tls` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")` when a peer closed a TLS connection, and that constructor boxes its message, so every teardown inside the counted window added calls and the row's figure moved with when the shutdown landed. It builds the error from its kind now, which allocates nothing, so closing a connection costs nothing of ours. The error's text is std's "unexpected end of file" where it was "closed", and no h1 code logs it: the drive loop matches the kind and closes. Verified on macOS against a dev build with `--features count-allocations`: fourteen runs of the row after the change read 2.000 every time, N = 1,000 counted 2,169 calls and 2N = 2,000 counted 4,169, against 2,178 and 4,178 before, so the fixed part of each run fell by nine calls and the budget is 2,000. The request path is unchanged and still allocates none of m6's own.
-**A check-only `m6-auth-server` answers the reserved `/genid` with the house 404, not 204.**
-`Site` answers the reserved path before routing, so the listener test in `run_route` never saw it and the reload arm had no side test: with `--check-only`, `POST /genid` on the check socket answered 204 and ran the start path again, and `GET /genid` answered 405.
-The loop now answers any `/genid` on the check side with the route-less house 404 before `Site` runs, so a process that serves only `/check` cannot be told to reload.
-The other paths are unchanged: `/perf`, `/traffic`, `/ready` and `/health` are not routes of this service and answer 404 on both sockets, the four login routes answer 404 on the check socket, and `/check` answers 404 on the login socket.
-Every wrong-socket answer is the route-less house 404, so it carries no route `Cache-Control` and no route headers and is indistinguishable from an unknown path.
-Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `POST /genid` on a `--check-only` process answered `204 No Content` with `Cache-Control: no-store`, `GET /genid` answered 405, and `POST /auth/login` on the check socket answered 404 with `Cache-Control: no-store` where `POST /nope` carried none. After, all of them are the house 404 with no `Cache-Control`, and `genid_on_a_check_only_process_is_404`, `each_path_answers_on_one_socket_only` and `a_wrong_socket_404_carries_no_route_headers` pin it.
-
-**`h2_tls_hit` read 3.002 on Linux and failed a budget of 3,001 because the HTTP/2 close path allocated, and it reads 3,000 now.** `Http2Conn::fill_recv` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")`, and that constructor boxes its message, so every connection torn down inside the counted window added a call to `tests/allocations.rs`'s stop count. How many teardowns land in a window moves with when the shutdown arrives: dhat between two 1,100-request runs of the same binary differed by 3 calls at that site and by 1 at rustls's received-plaintext copy, which is how a row that makes 3,000 calls per 1,000 requests read 3.002 and failed on a host where the same row had read 2.999 to 3.001. Both close paths, `H2Io::Tls` and `H2Io::Plain`, now build the error from its kind, which allocates nothing, and the line a trace log prints for it reads std's "unexpected end of file". The request path is unchanged and still allocates none of m6's own. Verified on macOS against a dev build with `--features count-allocations`: fourteen runs of the row read 3,000 twelve times, 3,001 once and 2,999 once, and the fixed part of each run fell by exactly 3 calls (N = 1,000 read 3,222 before and 3,219 after, 2N = 2,000 read 6,222 before and 6,219 after). The call the 3,001 budget allows is one more TLS record received in a run than that run's baseline, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue. That corrects the 1.15.0 entry's account of the same call as a chunk-queue growth seen only in the 2N run: the growth is one call in the 100-request and the 1,100-request profiles of both runs, so it cancels in the difference, and the call above 3,000 is a record boundary.
-
-**`[server] lock_memory` pinned every mapping the allocator had reserved, so m6-http held 1,229 MiB where the base build held 96 MiB, and the kernel's out-of-memory killer killed it.** `mlockall(MCL_CURRENT | MCL_FUTURE)` populates every current mapping and marks every later one to be populated, and mimalloc reserves 1 GiB of address space by default (`MI_DEFAULT_ARENA_RESERVE`, 1024*1024 KiB) on top of the `[limits.heap_reserve]` reservation, so the lock made 1.2 GiB resident that the load never touched. The build host measured 1,259,140 KiB resident with 1,062,912 KiB of it on transparent huge pages, against 95,856 KiB for the base build, while mimalloc's own committed figure was 328,269,824 bytes and the process's mapped size was 1,271,664 KiB. m6-http logged `heap: 1216 MiB on huge pages, memory pinned`, and 13 m6-http processes and 7 more of the build account's login session were killed. The pin is now `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`, so a page is locked when the load first faults it and memory that is reserved and unused stays unresident. A page a cache hit reads was faulted during the warm-up and stays locked, so the hit path still takes zero minor page faults. `MCL_ONFAULT` is Linux 4.4 or newer, and availability is checked by asking the kernel: a kernel that does not know the flag fails the call with `EINVAL`, which is answered with an error naming the version and `lock_memory = false` rather than a fallback that pins every mapping. `LimitMEMLOCK=infinity` is what the unit sets, and a finite limit is refused at start with the error that names it. The refusal is owner policy, so the requirement is one error at start for every limit and every process, including a privileged process the kernel would have allowed. The kernel enforces the limit itself: `mlockall` with `MCL_CURRENT` refuses the call when `mm->total_vm` is over the soft `RLIMIT_MEMLOCK` (`mm/mlock.c`), and under `MCL_FUTURE` every later `mmap` and `brk` calls `mlock_future_ok`, which refuses a mapping that would take `mm->locked_vm` past the same soft limit (`mm/mmap.c`). The kernel cannot half-pin the process. The guard now reads the soft limit, the one the kernel enforces, so `LimitMEMLOCK=8M:infinity` is refused at start too, where the hard-limit check this replaces let it through. m6-http now logs its resident set and address space on either side of the pin (`memory: N MiB resident of M MiB mapped`), and `m6-platform`'s `process::resident_bytes` and `process::virtual_bytes` report them. `a_warm_server_is_resident_within_its_reservation` in `m6-http/tests/heap_resident.rs` warms a real m6-http with cache hits against a counting origin and holds the resident set to the process's own pre-pin size plus the reservation its config asks for plus a tenth, checks `VmLck` is above zero so a run with no pin at all cannot pass, and requires zero minor faults over 1,000 hits after the warm-up. The bound also has an absolute ceiling of 192 MiB from the small-cache run, so a regression that raises the pre-pin resident set as well as the formula still fails. The same test can be run against an eager pin by dropping `MCL_ONFAULT` in a throwaway worktree, and it then fails near 1.2 GiB. Verified on macOS: the workspace builds with zero warnings, clippy is silent, `cargo nextest run --workspace --no-fail-fast` passes 2,308 tests, and the doc tests and the platform gate pass. The Linux resident set, the minor-fault count and the strace table have not run yet.
-
-**Two refusal tests could not refuse, and the measurement tools' site answered the load with 429.** `lock_memory_under_a_lowered_limit_refuses_naming_the_limit_and_the_fix` and `lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix` lowered `RLIMIT_MEMLOCK` with `sh -c "ulimit -S -H -l 0"`. On Ubuntu `sh` is dash, which rejects that call (`ulimit: error setting limit (Invalid argument)`), exits 2 and leaves the limit unchanged, so the first test's child ran under the account's own limit and `mlockall` succeeded where the test expected a refusal, and the second saw the shell's error instead of the service's. Both now use `ulimit -l 0`, which sets both limits, and both check that the limit reads 0 before they rely on it, so a shell that accepts the command and changes nothing fails the test with that reason. `tools/memcalls-site.sh` generated a site with m6-http's default rate limit of 300 requests a minute, so a 10,000 request load was answered 429 after the first 300 and the counters measured the refusal path. The generated site now sets `[rate_limit] enabled = false`. Verified on macOS against a dev build: the load of 400 requests to `/` was answered 299 `200`s and 101 `429`s with the old site and 400 `200`s with the new one, `m6-http --dump-config` shows `"enabled": true` against `false`, the dash failure is reproduced with `/bin/dash` (exit 2, `ulimit: error setting limit (Invalid argument)`) while the corrected command prints 0, and the platform test fails under dash before the change ("the shell did not lower RLIMIT_MEMLOCK") and passes after it. `tools/memcalls.sh` now also prints `mapped`, `locked` and `anon-huge` beside `rss`, so a pin that makes reserved memory resident shows `rss` at `mapped` in its own output.
-
-**`bench.sh` measured an HTTP/1.1 handshake and called it a cache hit.** Its HTTP/1.1 latency client opened a new TCP and TLS connection for every request, so the row read about 1.3 ms against 0.09 ms for HTTP/2, a tenfold gap on the same cached page. Nothing was slow in m6-http: its accepted sockets already set `TCP_NODELAY`, and a hit is written as one TLS flush. `m6-bench` now sends HTTP/1.1 over one kept-alive connection like a browser, reconnecting outside the timed region before the server's per-connection request cap, and labels the old row "new connection per request, includes TLS handshake". The path and URL-backend HTTP/1.1 rows use the kept-alive client too. A new suite, `--h1-vs-h2`, runs both in one process and fails if the kept-alive HTTP/1.1 p50 exceeds twice HTTP/2's. Verified on macOS against a dev build, 2000 requests: HTTP/1.1 keep-alive p50 58 us, p99 115 to 175 us. HTTP/1.1 new connection p50 1309 to 1359 us, p99 1467 to 1643 us. HTTP/2 p50 90 us, p99 130 to 135 us. HTTP/3 p50 137 us. h2c p50 73 us. The ratio is 0.64 against a limit of 2. Setting the limit to 0.5 makes the suite print FAIL and exit non-zero. Removing `set_nodelay` from the accept path does not trip it on loopback, because a hit is a single write.
-
-**`bench.sh` runs again.** It copied a certificate fixture that no longer exists, wrote a `[log] format` key the config now refuses, built m6-html and m6-file in a call that `--bin` restricted away, and let the per-address rate limit answer the load generator 429. It now makes its own throwaway certificate, drops the key, builds in two calls and turns `[rate_limit]` off. `BENCH_PROFILE=debug` runs the dev build to check the script. Numbers come only from the default release build. Verified on macOS against a dev build: all suites pass and print their latency tables, with no 429, and `m6-http --dump-config` accepts the generated config.
-**The login 429 from `m6-auth-server` carries the remaining window in `Retry-After`, not a hard-coded 60 seconds.** `[rate_limit] window_secs` defaults to 900, so a blocked client was told to come back in a minute when the block could last fifteen, and a deployment with a shorter window was told a wait longer than the window itself. The header is now the whole seconds until the window ends, rounded up, so it is never below the true wait and never above `window_secs`. `docs/m6-auth.md` Table 4 and section 10 state the same. Verified: `t04b_retry_after_follows_the_configured_window` drives two servers with `window_secs` 120 and 900 to a block and reads the header at each window, and against the old constant it fails with "Retry-After 60 is not close to window_secs 120".
-
-**Lifecycle tests wait for the service's own `<name> started` line before they send a signal, not for its socket file.** `m6-monitor`'s `lifecycle_is_clean_with_history_on` failed "did not exit within 5s of SIGTERM" 4 times in 480 runs under a parallel `cargo build --workspace`: the socket is created before the service sets up its signals, and on macOS a SIGTERM that arrives in that window is discarded. The services are unchanged. `Service::wait_for_started` waits for the line the service logs after its signal handling is in place, and `assert_app_lifecycle` and the service test helpers that spawn `m6-monitor`, `m6-auth-server`, `m6-html` and `m6-file` call it after `wait_for_path`. Verified: 0 failures in 720 runs of that test under the same load.
-
-**An HTTP/2 response longer than the send queue no longer stops after 32,768 bytes.** `flush_pending_streams` frames one 16 KiB queue per pass, and the connection wrote it and returned. A socket that took every byte never stopped being writable, so it never reported a new writable edge, and the edge-triggered loop did not run the flush again. A client that announces large windows, as a browser does, sends no WINDOW_UPDATE while a body is in flight, so nothing else woke the connection. The status and the content-length arrived, then 32,768 bytes, then nothing, for any response over 32 KiB. `send_until_blocked` now frames and writes until the socket would block or nothing is left that the windows allow, which is what an edge-triggered loop needs, and the writable edge it waits for arrives when the kernel drains below its mark. The tests `rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` fetch each size through m6-http with a client that announces browser-sized windows, and the h3 tests of the same sizes pin that HTTP/3 was never affected. On Linux the three h2 tests fail at the base and stop at ten seconds, and all six pass with the fix.
-
-**`Smtp::fd()` returns `Option<RawFd>` and no longer panics, and a loop ignores an outgoing event for a slot that is no longer sending.** A client that left freed its slot and closed the slot's `Smtp`, and the slot's outgoing-token event, already in the same poll batch, then called `drive()`, saw the interest change and reregistered `fd()`, which panicked with "no connection" and stopped the service. `fd()` is `None` before `start` and after `close` or a finished delivery. `Option` was chosen over a deregister-and-reregister helper on `Smtp` because the loop already owns the registry and the slot state, so the type needs no second way to say "no socket", and `if let Some(fd)` is the form a caller already writes. The loops in `m6-core/tests/email_in_the_loop.rs` and `email_allocs.rs` now return early on an outgoing event when the slot is not `Sending`, and `docs/m6-core-reference.md` and `docs/m6-user-guide.md` state the rule. This is an API change to `fd()` only for callers that used it on a closed slot. Verified: `an_outgoing_event_after_the_client_left_is_ignored` frees the slot and then handles its outgoing event in fixed order, and it panics with "no connection" when the guard is removed and passes with it.
-
-**Four tests that failed on a loaded host now wait on the event they need, and pass under load (a defect in each, none a retry or a longer timeout).** `m6-auth-server`'s three rate-limit tests and `t04_login_rate_limited_429` logged in as a user that does not exist, which makes the server run a cost-12 bcrypt verify per attempt, CPU work that a loaded host stretched past the 10 s read deadline ("no response within 10s"). They now log in as a seeded user with a cost-4 hash and a wrong password, the same failure path, a sixty-fourth of the work. `m6-core`'s `half_close_drains_then_closes` set its read timeout after half-closing, when the server may already have closed and macOS refuses `setsockopt` on a closed peer (`EINVAL`, panic at `recv_exact`). It sets the timeout first. `m6-monitor`'s `the_monitor_runs_one_thread` accepted two thread counts 100 ms apart that agreed, and short-lived start-up threads made that reading 6 or a history 2 higher. It now waits until the count reaches the settled range (loop plus the platform's certificate-store workers), and a thread that never leaves, such as one per node, still fails it. Verified under load (load average 50 to 130, with parallel `cargo build --workspace`): before, 2 of 3 auth tests failed in 3 of 6 runs, `half_close` failed 2 of 20 runs and the monitor test 3 of 48 runs. After, 4 of 4, 20 of 20 and 80 of 80 runs pass.
-
-**Every buffer and queue the audit found unbounded, shrinking, or silently dropping is on a named limit with a `start`, a `max` and one rule.**
-The rule is: allocate `start`, grow by doubling only when a write does not fit, clamp at `max`, keep the size, log one line on each growth, and refuse past `max` with an error that names the limit, the size needed, what was refused and the key and file to raise.
-Twenty-six limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from `[limits.<name>]` in a service's config and in m6-http's system config.
-- m6-core: the HTTP/1.1 slot's read buffer (`request_body`) and write buffer (`response_buffer`) no longer shrink after a large request, a request past the maximum is 413 and a response past it is 500.
-  The upstream client's read buffer (`upstream_read`) and request buffer (`upstream_request`, which had no bound) refuse past their maximums.
-  The compressor's and minifier's input (`compress_output`, `minify_output`) and the SMTP reply buffer (`smtp_reply`, a fixed buffer that failed when full) follow limits, and so do the connection table (`connections`) and the ndjson page (`ndjson_page`).
-- m6-http: `edge_request`, `edge_response` (which had no bound), `h2_recv` (no bound), `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes` and `connections`.
-- m6-log: `log_buffer` grows from 16 KiB to 1 MiB where it was fixed and dropped lines, and `log_field` replaces the 1024-byte cut.
-- m6-monitor: `history_queue`, and its node requests follow `upstream_read` and `upstream_request`.
-- m6-file: `tail_read`, the page size of a tail response and the window a last-N-lines request scans.
-Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory, which is now twice the concurrency cap (200 where it was 128) so it stays above the cap whatever the cap is, and the idle URL connection pool, which closes a spare connection and loses no work.
-Verified by a test per limit that fills it past its maximum and reads the refusal: `m6-core/tests/server_conn.rs`, `m6-core/src/limits.rs`, `m6-core/src/client.rs`, `m6-core/src/email.rs`, `m6-core/src/site.rs`, `m6-log/tests/limits_refuse.rs`, `m6-log/tests/escaping.rs`, `m6-http/src/http11.rs`, `m6-http/src/http2.rs`, `m6-http/src/rate_limit.rs`, `m6-monitor/src/history.rs` and `m6-file/src/handler.rs`.
-The hot cache hit still allocates nothing (`m6-http --features count-allocations --test allocations`), and the page-path budgets in `site_allocs` and `request_allocs` are unchanged.
-m6-http conformance (h1spec, h2spec, h3spec) was not run on macOS and must be run on Linux.
-
-**A monitor poll on any path is counted as monitor traffic, not as a visitor (#107).** The channel table had two interfaces, so a header check on `/capabilities`, a `/health` poll, or any other monitoring request arrived in `http/*/external` and moved the visitor hit rate while no visitor had moved. The metrics line now reports `http/*/monitor` beside `http/*/external` and `http/*/internal`. `/health` is identified by its backend name, and every other path by the peer's address class. A monitor runs on the private network, so its poll arrives from a private address, while a real visitor's address is public after NAT. The class comes from the listener socket and the peer address the connection proved, so it reads no header and needs no configuration key. Three tests pin the three populations. `a_monitor_poll_on_another_path_is_not_external_traffic` fails as external traffic when the private-peer class is removed, `a_real_external_request_stays_external` fails as monitor when the class is over-broad, and `an_internal_backbone_request_stays_internal` fails as external when the internal socket is classified by its forwarded peer address instead.
-
-**The HTTP conformance gate runs again.** `tools/conformance.sh` still wrote `[log] format`, which is now refused, and started the redirect listener with analytics on and no log directory, which is now refused too, so the gate measured nothing for h1's redirect listener, h2 or h3. It now writes neither, and runs the dev-profile build (`target/debug`, or `M6_BIN_DIR`) like every other gate. CI builds `--bins` for it instead of `--release`. `tools/backend-bench.py` no longer writes `[log] format` either. Verified on Linux: h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49 (the recorded floor), resumption and early data as before.
-
-**A source node's `M6-Genid` header no longer makes an HTTP/2 response unreadable.**
-The header was serialised with its title-case name in the HPACK block, and RFC 9113 8.2.1 requires lower-case field names.
-A strict client rejected the HEADERS frame as a protocol error and read no body, so a page that HTTP/1.1 served as 2671 bytes arrived as 0 over HTTP/2.
-The HTTP/2 and HTTP/3 serialisers now write the lower-case spelling.
-quiche already lower-cases the names it encodes, so HTTP/3 was correct on the wire, and the change there removes the dependence on that normalisation.
-Verified with `h2_serves_the_same_body_as_h1` and `h3_serves_the_same_body_as_h1`, which fetch the same cached page through a real m6-http process and compare it with HTTP/1.1.
-The h2 test fails on the previous code with a protocol error from a strict h2 client and passes after the fix.
-
-**An HTTP/3 response no longer carries the backend's connection-specific fields, which cost the whole body.**
-m6-http copied every field of a backend's HTTP/1.1 reply into the h3 field section, including `Connection: close`, which m6-html sends because it closes its connection after each page.
-RFC 9114 4.2 makes a response carrying a connection-specific field malformed, and a client MUST treat it as such: nghttp3 (curl) reset the stream and read no body, so example 08's `/logs`, 1454 bytes over HTTP/1.1, arrived as 200 with zero bytes over HTTP/3.
-HTTP/1.1 must carry the field and HTTP/2's serialiser already dropped it. Both now take the connection-specific set from `m6_http_lib::fields::is_connection_specific`, which covers `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding` and `Upgrade` (RFC 9113 8.2.2, RFC 9114 4.2).
-Verified with `rfc9114_4_2_h3_serves_the_same_body_as_h1_when_the_backend_closes`, which serves a no-store page from a backend that closes its connection, fetches it over HTTP/1.1, HTTP/2 and HTTP/3 and compares the three bodies: 2671 bytes on h1 and h2 with a reset stream on h3 before the fix, 2671 on all three after it.
-On the examples' 08 stack with curl, `/logs` went from `200, 0 bytes` to `200, 1454 bytes`.
-
-**A service writes its access line at the default log level (#179).**
-`Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
-It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.
-Verified with `an_access_line_is_logged_at_the_default_level`, which finds no line on the previous code and an INFO line after it.
-
-**A split body-less HTTP/2 backend response is forwarded instead of a 502 (#315).**
-A backend that put END_STREAM on a HEADERS frame and finished the header block in CONTINUATION frames had its stream completed before the block ended, so the reply was failed as "stream ended without headers" and the edge answered 502.
-The client now completes a stream only when the header block ends and END_STREAM has been seen, as RFC 9113 sections 4.3 and 6.2 require, in the shared h2c and h2s path.
-Verified with `a_split_bodyless_response_is_forwarded`, which sees a 502 on the previous code and the backend's 200 after it.
-
-**A backend's early response is forwarded instead of a 502.**
-When a backend answered before it had read the whole request body (a 413 for an oversized upload, for example) and then closed, m6 treated the failed write as the result and answered 502, and on Linux the reply was lost.
-The client now reads a reply the backend has already sent before it reports a write error, over plain and TLS connections, and the backend's own status reaches the client.
-Verified: the socket and m6-http early-response tests on Linux and macOS (on Linux, 0 of 10 passed before the fix and 10 of 10 after).
-
-**The test kit's scratch directory and port claims work on any host, so the suite has no list of known failures.**
-`m6_core::testkit` chose `/var/tmp` for scratch files whether or not the process could write there, and kept port claims per build, so two builds on one host could claim the same port and one test reached the other's server.
-Scratch files now go to the first of `TMPDIR`, `/var/tmp` and the system temp directory that can create, write and run a file, and port claims live in one directory per user that every build shares.
-Verified: the full workspace suite on Linux and macOS with no failure.
-
-**m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
-Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed.
-It is now malformed at ingress and its stream is reset, as RFC 9113 8.1.1 and RFC 9114 4.1.2 require.
-A request refused when forwarded, for example one with a CR or LF in a header value, no longer counts against the backend.
-A member's failure count now counts transport failures in a row: a completed exchange clears it, and the backoff is capped before it is computed.
-
-**On SIGTERM or SIGINT a service stops accepting, removes its socket and exits, without waiting for requests in progress (#338).**
-A restart on a deploy cuts off a request that is still running, and that is accepted: the supervisor starts the service again at once.
-Waiting for accepted requests took a request counter, a condition variable, a deadline setting and a shutdown hook, and gained nothing a restart does not already do.
-The m6-html shutdown test now holds a request open at SIGTERM and again at SIGINT, and asserts only that the service exits 0 within five seconds with its socket removed.
-The test harness's `Service::wait_for_exit` and `terminate` now also wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
-Migration: `ThreadPool::drain`, `ThreadPool::in_flight`, `ServerConfig::drain_timeout`, `server::DEFAULT_DRAIN_TIMEOUT_SECS`, `[server] drain_timeout_s` and the `on_destroy` registration on `AppWithGlobal` and `AppWithState` are removed, along with the shutdown hook they fed. A caller does nothing: a `drain_timeout_s` key left in a config is ignored, and a service that needs durable state must not depend on a shutdown hook, because none runs.
-
-**The config reloader reports a rename of a service's config once, and decides what changed from the file's bytes, mode, owner and modification time (#300).**
-A rename over the config showed to `stat` a moment before its inotify event was queued, so a poll in that gap reported the change and the event reported it again. The old file's `ctime` also changes just before the name moves, which a second `stat` read as another change. The fingerprint is now a hash of the bytes with the mode, owner and modification time, and leaves out the inode and `ctime`, so a rename's transient state, which has the old bytes and times, is no change and the finished rename is one. Each check opens a file once. A check runs on every event from the watcher, named or not, and once a second. The first change after quiet is still reported at once and bursts are held as before. A `touch`, a `chmod` and a same-length rewrite in one timestamp tick are each a change. A `touch` forces a reload only when it moves the modification time, so on a filesystem with one-second timestamps a second touch in the same second, with unchanged bytes, is not seen.
-Verified on the build host: a test that renames over a watched config 300 times under CPU load failed in 19 of 20 runs on the old code and passed in 20 of 20 on this release's code, and deterministic tests cover each kind of change, including a config reached through a symlink whose target directory is swapped.
-
-**`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
-It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.
-
-**JavaScript labelled `text/javascript` is now compressed by default (#186).**
-The default tables disagreed. `text/javascript` was minified but missing from the default compression types, and the `.js` and `.mjs` extensions map to that label, so every script was minified and sent uncompressed. It now gets the same levels as `application/javascript` (brotli 6, gzip 6), and a test keeps the two default tables in step.
-A site that switched compression off by setting brotli and gzip to 0 on each default type, and declares `compresses = false` for its backend, must now set `text/javascript` to 0 as well. Until it does, the service refuses to start or reload with "compresses = false, but this service DOES compress".
-Verified by a request-level test that asks for `text/javascript` with `Accept-Encoding: br` and expects a brotli response, and by a test that the two default tables list the same types. Both fail on the old tables.
-
-**The edge now skips an informational (1xx) response from a backend and returns the final one (#100).**
-A backend that sent `103 Early Hints` ahead of its answer had the 103 taken for the response, so the fetch failed. The HTTP/1.1 reader and both HTTP/2 backbone clients now drop any 1xx other than 101 (RFC 9110 15.2) and fail the fetch as a bad gateway after eight of them, so a backend cannot hold a worker by sending them without end. Before this, an HTTP/2 client carried a 103's fields into the final response, which the edge could then cache.
-Verified by new loopback backend tests for each reader, which fail before the change and pass after it, covering a 103 ahead of the final response, a head that arrives one byte at a time, and the bound at eight and nine.
-
-**CI runs example 05's integration test after its stack is up (#277).**
-The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.
-Verified by this pull request's own CI run.
-
-**The signal-mask guard fails closed (#178).**
-When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
-
-**URL backends and HTTP/2 upstreams no longer block or wait on a timer.** An http:// or https:// backend ran each request on its own thread with a new TCP and TLS connection, and its reply was noticed on a 10 ms poll. An h2c or h2s upstream connected, and for h2s completed its TLS handshake, inside the event loop, so an unreachable upstream stalled every request on the node. All of them now connect, write and read in the loop, http(s) connections are reused, and backend_timeout_secs applies to HTTP/2 upstream streams too. An idle m6-http wakes about once a second instead of 100 times.
-
-**A backend that refuses a request no longer takes its pool member out of rotation.** When a backend closed the connection while m6-http was still sending the request (m6-file answering an oversized header, then closing without draining it), m6-http marked the member failed and backed it off for a second, so the next request to that backend answered 502. A member that never received the whole request is now released. A member that took the whole request and then failed, a silent member and a refused connect still back off.
-
-### Docs
-
-**`docs/PERFORMANCE.md` now carries a measured breakdown of a TLS 1.3 handshake, with the crypto, kernel and m6 shares, the loopback price, the cipher-suite and provider comparison, the hit distribution under handshake load, and the system-call cost.**
-
-**The docs now state the four cache counts, the HTTP/2 send loop and m6-file's tail mode, and drop five claims the code no longer meets.**
-The README's 8 KiB stack header buffer and its two out-of-scope items (per-address rate limiting, shared-port scaling), the m6-file page's "no route can set `Cache-Control`" and "tracked as #126", and the head-limit refusal named 431 where the code sends 400 and 414.
-Verified by loading each configuration example with `--dump-config` of the matching binary.
-
-**The README, `docs/m6-http.md`, `docs/m6-site-toml.md`, `docs/m6-testing.md`, `docs/m6-user-guide.md` and one changelog count now match the code.**
-The renderer library is `m6-core`, because `m6-render` was deleted.
-The monitor population excludes loopback, and a public address is monitor only on `/health`.
-The `[health]` table has two access keys.
-The certificate comparison groups on the fingerprint.
-`m6-file` computes `Cache-Control` from the query string.
-The route-method change names seven end-to-end tests.
-Verified by counting the tests, reading the classifying code and running `tools/check-commit-hashes.sh`.
-
-**`README.md` follows the documentation ruleset, and its example check count, its backend pool description and its configuration example now match the code (#128).**
-Fifteen numbered sections, a contents list, and every table and figure numbered, captioned and referenced.
-The install section says 98 checks, which is what example 05's suite reports and what this file's earlier entries record.
-Backend pools say round robin, because `m6-http/src/pool.rs` chooses the next member in turn.
-The configuration example is split into `site.toml` and the system config, because `[server] tls_cert`, `tls_key` and `[auth] backend` belong to the system config, a key in the wrong file stops the start with exit 2, and the system config needs `[node]`.
-The `m6-auth-cli` synopsis gains `user roles`, `group member ls` and `passwd --password`.
-
-**The event loop is described once, in `docs/m6-architecture.md` §1.10,** with m6-http's own loop in `docs/m6-http.md` pointing at it. Two false claims went: that backend calls have no timeout (`backend_timeout_secs` exists, default 30) and that m6-http is "single-threaded epoll" by name. `CONTRIBUTING.md` says which loop changes need approval: a new disallowed-method exception, a thread, or an allocation on the loop's path.
-
-**`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
-
-**`docs/m6-http.md` documents m6-http's HTTP/2 denial-of-service behaviour: the Rapid Reset concurrency cap, send-side flow control on the backbone clients, the five-state stream machine and the known gaps (#160).**
-Documentation only. Each claim names the function or test that enforces it.
-
-**The m6-auth-cli reference follows the documentation ruleset, and its token defaults, config keys, key format and exit codes now match the binary (#138).**
-
-**The m6-md reference follows the documentation ruleset, and its params snapshot and watch-mode first pass now match the binary (#150).**
-
-**`docs/m6-auth-lib.md` follows the documentation ruleset, and its storage description now matches the code (#139).**
-
-**`docs/m6-backend-protocol.md` no longer states two MUSTs that the reference `App` does not meet (#200).**
-The proxy's user must be able to connect to the backend socket, with `0660` and a shared group preferred and `0666` allowed only inside a restricted directory. A backend may support persistent connections for clients that ask for them, and must close after responding to a request that carries `Connection: close`, which the proxy sends. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
-
-**Source comments in m6-http, m6-monitor and `tools/conformance.sh` no longer carry one deployment's hosts or measurements, and the HTTP/1.1 module header states the keep-alive the code implements (#190, #189 in part).**
-Comments only.
-
-**The build-host gate runs example 05's end-to-end test after its stack is up (#273).**
-The examples unit-test step skips `blog_site_end_to_end`, which needs certificates and the running stack, and the gate runs `cargo test -p render-cms --test integration` once that stack answers, counting a failure into the examples result.
-
-**Source comments in m6-core and m6-file no longer carry a deployment's names, per-node sizes or deployed versions, and no longer use "load-bearing" (#189, #190).**
-Comments only.
-
-**`docs/m6-backend-protocol.md` now follows the documentation ruleset, and its claims match the code (#142).**
-
-**The user guide's install section, Example 01 and Example 02 now match the released examples and follow the documentation ruleset (#156).**
-
-**The user guide's Examples 03 and 04 now match the released examples and follow the documentation ruleset (#156).**
-
-**docs/POSITIONING.md no longer carries the withdrawn 22.0 µs and 158,323 req/s figures, and its cross-server tables are replaced by a caveated capability comparison (#192, #158).**
-
-**`docs/m6-backend-examples.md` follows the documentation ruleset, and it now agrees with the backend protocol that compression is the backend's job and matches `docs/BENCHMARKS.md` and `tools/build-host-tests.sh` (#141).**
-
-**`docs/m6-architecture.md` now names `M6_SOCKET_OVERRIDE` as the one environment variable a service reads, and the `socket_path_from_config` doc comment points at that page (#187).**
-
-**The user guide's Example 05 (CMS blog) now matches the released example and follows the documentation ruleset (#156).**
-
-**`docs/m6-site-toml.md` part 1 follows the documentation ruleset, and it now says that a secrets file refuses a key set in both files and that `[server]` and `[auth]` belong in the system config (#154).**
-
-**CHANGELOG.md's preamble and its 1.15.0, 1.14.0, 1.13.0 and 1.12.1 entries now follow the documentation ruleset (#129).**
-
-**The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
+- `m6_core::build_info`, the version mechanism an app uses with one build script line and one call. The helper emits the crate's `CARGO_PKG_VERSION`, the twelve-character commit from `git rev-parse --short=12 HEAD`, and a dirty flag from `git status --porcelain --untracked-files=no`, so only a modified or staged tracked file marks a build dirty. Git being absent, which is a source tarball, produces `unknown` and does not fail the build.
+- `--version-full`, one `<crate> - <full SemVer with build metadata>` line per m6 crate in the binary. Each line comes from that crate's own build-time constants, so a binary that links crates built from different commits shows both commits.
+- A test that parses the full form with the `semver` crate, and a test that holds each binary's crate list against the workspace dependency graph from `cargo metadata`.
+- `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.
+- The start-up record: several `type=startup` lines sharing one `run_id`, then one `type=shutdown` line on a clean exit. The parts are the identity (`app`, full version, every m6 crate), the invocation (argv, the declared flags, every declared environment variable), one line per config file with its sha256 as read, one line per config table with every key, its effective value and its source (`file`, `default`, `env` or `flag`), one line for the platform facts and the effective `[limits]`, and a completeness line carrying the number of lines in the record.
+- `m6_core::startup`, the writer. A service built on `Site` gets the record and the shutdown line with no call of its own. An application with its own config calls `startup::Record::emit` once after `log::init` and `startup::shutdown` once on a clean exit. `version_flags!` registers the binary's identity as well, so the identity line names the binary. `Record::node_name(name)` states the application's configured node on every line, which m6-http takes from `[node] name`.
+- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. A value with no type is redacted by its key's name, under Security below.
+- `m6_core::config::load_traced` and `m6_http_lib::config::load_traced`, which return the effective config and the trace of which file, flag or environment variable set each key. `load` keeps its signature and delegates.
+- `m6_core::platform::host_facts()` and `m6_core::platform::Fact<T>`, one reading of the host at start behind one API. A fact is `{"known": value}` or `{"unknown": "reason"}`, and an unknown fact is never an absent key.
+- `m6_core::platform::process::memory_usage` and `page_faults`, so a test that reads another process's memory goes through the platform layer.
+- **`m6-monitor` reads `type=startup` and `type=shutdown` on its one long-lived `journalctl --follow` child**, beside `type=perf` and `type=traffic`. Four `M6_TYPE` matches, one child, and no second follower. The start-up record is grouped by its `run_id` and attributed by the record's own `node` field, or by the hostname on its platform line, plus its own `app` field. `_HOSTNAME` is not read.
+- **The monitor checks each run and reports a finding with a severity.** A dirty build outside `dev`, a pre-release on `prod`, a version that differs from the deploy's recorded release, and a config sha256 that differs from the rendered file are `Fault`. A complete count that disagrees with the lines received, and a record that never closed, are `Fault`. An unexpected restart is `Warn` and quotes the previous run's shutdown reason. A node whose kernel, OS, CPU or memory differs from its peers is `Warn`. Versions are parsed with the `semver` crate.
+- **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
+- **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
 
 ### Changed
 
@@ -1073,6 +674,277 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 **One platform layer.** m6 named the operating system, or an OS crate, in every service loop, three thread counters, a Linux-only test, the host readings and the bench tools. They now live in one crate, `m6-platform`, re-exported as `m6_core::platform` and selected by OS family: readiness over mio, the clock, a shutdown or reload request as a descriptor, a child's exit as a descriptor (pidfd on Linux, kqueue on macOS), sockets with the right options, the open-file and socket-path limits, host and process facts. A gate test refuses platform conditionals, OS crates, direct clock reads and service-manager variables anywhere else. One shared contract suite and the echo reference app run unchanged on macOS arm64, Linux x86_64 and Linux arm64, and CI builds and tests all three. A child a service spawned inherited its blocked signals (and on macOS the ignored disposition) and could not be stopped: fixed. The thread-based `ShutdownHandle` is removed. Known limitation: when a process runs out of file descriptors, connections already queued wait until the next new connection arrives.
 
+- `--version` no longer prints the crate name and the bare version. It prints `v1.16.0-rc.1` or `v1.16.0`, which matches the git tag and carries no build metadata, even on a dirty tree. A script that parsed the old `m6-http 1.16.0` line must read the new tag form.
+- The workspace version is `1.16.0-rc.1`. `Cargo.lock` carries the same version for every member, and `cargo metadata --locked` agrees with it.
+- Every m6 binary takes both flags: `m6-http`, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`, `m6-file`, `m6-html`, `m6-md`, `m6-monitor`, `m6-auth-server` and `m6-auth-cli`. The examples and the site applications adopt the same two lines in a later change.
+- The `type=perf` line's `build.version` now carries the full SemVer string with its commit, and `build.hash` is gone. A fleet check compares the release part before the `+` for version drift and the build metadata for build drift, so one release built twice from one tag is still reported as build drift.
+- The monitor's build-drift check reads the commit from that version metadata. Version drift compares the release part before the `+`, because SemVer 2.0.0 gives build metadata no precedence, and build drift compares the metadata.
+- A clean exit written through `Lifecycle::complete` now writes one `type=shutdown` line before the completion line. A forced second signal writes it with reason `forced`. m6-md writes `pass complete` or `pass failed`. A process that never wrote a start-up record writes no shutdown line.
+- Every `type=startup` line and the `type=shutdown` line carry `node`, the node the run is on, read once at start. It is the application's configured node name when its config names one, which is `[node] name` for m6-http, and the platform facts' `hostname` otherwise. `node_source` says `configured`, `hostname` or `none`, so a claimed identity is never mistaken for an inferred one, and two instances on one host that name themselves differently are two nodes. A host that did not name itself writes an empty `node` and the reason in `node_unknown`, so the key is present and a reader can tell the record from one written before the field existed.
+- Every service start writes the start-up record to the one log stream. An operator who filters `type=event` sees the same operational lines as before. An operator who counts all lines sees the record, which is what a reader needs to recover the run.
+- The record reports an empty `[smtp] password` and any other value the secrets file supplied as `<redacted>`. A path to a secret file is logged as a setting, and the file's bytes never are.
+- `version_flags!` registers the binary's identity for the start-up record as well as answering the version flags, and `startup_identity!` is gone. An application that called both keeps the first line and deletes the second. The m6-examples applications and a site's own binaries make that one-line change when they take this release.
+- `Record::new(app, argv)` takes the registered identity, decides the host and starts from the default limits by itself. `startup::record_log_level` writes the running log level into the `log` section. The platform line always carries the limits, the defaults when a service has no `[limits]` table.
+- `PerfReport::build(subject, metrics)` returns the report, `monitoring::not_found()` is the 404 a monitoring path answers, and `PerfOutcome` is gone with its three variants nothing built.
+- `TrafficSummary::from_views` and `TrafficReport::from_views` summarise borrowed `RequestView`s, from a parsed record or from the traffic window's slot. `AnalyticsRecord::from_parts` and its `truncated` flag are gone.
+- `cpu`, `memory` and `clock` in the host facts are un-nested structs whose members are `Fact`s. Each group is read from two or three sources, and an outer `Fact` would let one failed read hide the others.
+- The cgroup limits are read at the group `/proc/self/cgroup` names, and the walk stops at the nearest parent with the file. A group that sets no limit is `{"known": null}`, and a file that cannot be read is `{"unknown": "reason"}`, so a reader can tell unlimited from unreadable.
+- `cfg(target_os)` outside `m6-platform` is zero. The platform layer holds every OS read in the workspace's Rust crates. The measurement scripts still read `/proc` and `sysctl` through their own code.
+- **The traffic line costs m6-http's event loop 13.4 ms a minute, from 78.6 ms**, for a full window of 32,768 events across 2,000 clients (release, M4). Each marker list is one case-insensitive aho-corasick automaton, and the summary reads the window's slots in place, with no record built per event.
+- **The metrics line costs the loop 81 us every ten seconds, from 438 us.** The host block, a dozen `/proc` and `/sys` reads, is read once a minute and repeated on the lines between, at 362 us on the M4.
+
+### Fixed
+
+**The examples job's teardown stops the `dev.sh` it started, by pid and start time, in place of `pgrep -f` on the directory.**
+The run step writes the pid and its `ps` start time to `.ci-dev.pid`, and the `Stop the stack` step compares the start time before signalling, so a pid that now belongs to another process is left alone.
+The build host's example 05 cleanup does the same: it stops the recorded `dev.sh`, reaps the service pids `dev.sh` wrote to `logs/.own-stack.pids` when `examples/own.sh` is present, and waits for the shell in place of killing everything whose command line mentions the directory.
+This removes the last `pgrep -f` teardown from m6's tree.
+Verified on 2026-11-16 on this Mac: `tools/check-kill-safety.sh` names both sites before the change and none after, `bash -n` parses the build-host script, and the workflow parses as YAML.
+
+**`m6-monitor --dump-config` now reads and validates its fleet, so a config that names a removed key in `[[monitor.nodes]]` fails the dump with the start's exit 2 and message.**
+The monitor answered `--dump-config` in m6-core's shared parser, which reads the framework table and the routes and never builds the `Fleet`.
+A rendered config carrying `perf_token_file` under a node entry therefore dumped clean and exit 2 came at start, so a coherence check that runs the dump called the deployment accepted while the monitor refused to start.
+m6-core gains one deferred mode: `Site::load_deferring_dump` records the flag, the service reads its own config with the statements the start reads, and `Site::dump` prints from the `Site` it built.
+`m6-monitor` stops in that sequence after the fleet and the history keys, and before it resolves a name, opens the history file or binds the socket.
+`m6-auth-server` uses the same mode and stops after `[storage]`, `[tokens]`, `[keys]` and the key files, before the database opens, where its dump previously read none of them.
+Verified on a macOS sandbox: `dump_config_refuses_a_removed_node_key` makes the dump and the start print the same `unknown field` message and exit 2, `dump_config_accepts_a_valid_config` reads the `ok:` line a deploy's check reads, and `m6-auth-server --dump-config` on a config with no `[keys]` refuses with the start's `missing field` message where it printed `ok` before.
+
+**The three chrono-family advisories are ignored in `deny.toml`, with the reason recorded there.** RUSTSEC-2026-0543 covers `chrono`, RUSTSEC-2026-0555 covers `chrono-tz` and RUSTSEC-2026-0559 covers `chrono-tz-build`. Each is an `informational = "unmaintained"` notice with an empty `patched` list, and none describes a vulnerability. `chrono` is replaced with `jiff` or `time` after the release.
+
+**`h1_tls_hit` read 2,003 on the build host against a budget of 2,001, and the three calls were in the fixed part of the 2N run, in its one TLS handshake. The row reads its counter after the warm-up now.**
+The request path makes exactly two calls per request, both rustls's record buffers: dhat over K = 1,000 and K = 2,000 on this host put +1,000 on those two stacks and 0 on every other site.
+The build host's N = 1,000 run counted 2,188 calls, which is this host's own N figure, and its 2N = 2,000 run counted 4,191, three calls above this host's 4,188, so the three extra calls were in that run's fixed part and none was in a request.
+A handshake's counted calls move with the number of reads its flight arrives in: one unsplit handshake cost 139 or 140 calls on this host, and 141 or 142 when the ClientHello arrived in two reads, with dhat putting the two extra calls on rustls's `DeframerVecBuffer::prepare_read` and the last on aws-lc-rs's signature buffer.
+`M6_ALLOC_MARK_AFTER=1` makes the server log the counter at the first turn after the warm-up response is on the wire, and `tests/allocations.rs` subtracts that reading from the stop reading in each run, so the handshake, the backend connection and the warm-up request are outside the measured window.
+The budget stays 2,001 and no request path changed.
+Verified on macOS against a dev build with `--features count-allocations`: twenty runs of the row before the mark read 2.001 four times, 2.000 eleven times and 1.999 five times, with the variation in the fixed part of one run and never in a request, and ten runs after it read 2.000 every time, with the N = 1,000 window at 2,001 calls and the 2N = 2,000 window at 4,001. A break that adds one allocation per cached hit makes those windows 3,001 and 6,001 and the row fails against the budget.
+
+**Three `cache_accounting` tests each took exactly 10 seconds to pass, and the time was two fixed waits in the fixture's teardown.**
+`ServingCheck::drop` woke its worker by connecting to the check socket, and `Stack` dropped its `TempDir` first, so the socket file was gone, the connect failed, and the worker sat out the rest of `SERVE_BOUND`, the ten-second accept deadline.
+The fixture also declared its `PortClaim` before its `Service`, so the claim's `Drop` spent all five seconds of its bind retry while the service still held the port.
+The five-second wait overlapped the ten-second deadline, which is why the visible constant was ten seconds rather than fifteen.
+`ServingCheck` owns a socket pair now: the worker waits on the listener and on one end of the pair in one reactor, and `Drop` writes a byte to the other end, so the teardown waits on an event rather than on the deadline.
+`Stack` declares the service first, then the check authority, then the port claim, with the directory last, which is the order their lifetimes need.
+Verified on macOS: the four tests in that binary read 10.762 s, 10.762 s, 10.769 s and 11.608 s before, and 0.833 s, 0.861 s, 0.862 s and 1.615 s after.
+
+**`h1_tls_hit` read 2.001 in five of twenty runs against a budget of 2,000, and its budget is 2,001 for one call of TLS handshake variation that is aws-lc-rs's.**
+The request path still makes exactly two calls per request. dhat over a 2.001 run and a 2.000 run differs at one stack and nowhere else: `EVP_PKEY::sign`'s `vec![0u8; sig_len]` in aws-lc-rs, through `ec::key_pair::EcdsaKeyPair::sign` and rustls's `emit_certificate_verify_tls13` in the TLS 1.3 CertificateVerify.
+`EVP_PKEY::sign` allocates the signature buffer at the maximum DER length and shrinks it to the length the signature took, so a handshake whose DER signature is shorter than 72 bytes makes one more call than one whose signature is exactly 72.
+That is one call per run, not per request: between K = 1,000 and K = 2,000 dhat puts +1,000 on each of the two per-request rustls record buffers and 0 on every other site.
+Before the provider switch the row needed no allowance because ring's ECDSA signer made the one `Vec` at the signature's actual length, so the DER length could not move the count, and fourteen runs read 2.000. aws-lc-rs became the one provider at 7f96b2f, and its signer added the maximum-size buffer and the shrink.
+Verified on macOS against a dev build with `--features count-allocations`: twenty runs read 2.001 five times, 2.000 ten times and 1.999 five times. Every extreme was one call in one run: the 2.001 runs read N = 2,187 against 2N = 4,188, most 2.000 runs read 2,188 against 4,188, one 2.000 run read 2,187 against 4,187, and the 1.999 runs read 2,188 against 4,187. The comment in `tests/allocations.rs` names the call and says it is per run.
+
+**A cache node with no generation ID retries a failed heartbeat on the next tick, and a confirmed disk copy writes the `disk cache kept` line.**
+A heartbeat is a request with the backend deadline, so a loaded host or a stalled guest can miss one answer. The node then waited the whole configured interval before asking again. At `heartbeat_secs = 3600` one timeout left a node with no ID for an hour, and a node with no ID cannot serve a request because the store rule needs the ID a reply was dispatched under. A failure now schedules the next heartbeat one loop tick away while the node holds no ID, and the configured interval once it does. A disk copy installed unverified after a timeout is confirmed by the next answer that names the same ID, and that transition now logs `disk cache kept`, the same line the settle path already wrote, so the metrics line and the log agree. No config key and no route changes. Verified: the new `a_node_with_no_id_retries_a_failed_heartbeat` fails at `STARTUP_BOUND` (60 s) without the retry and passes in 1.8 s with it, `a_restart_with_the_source_down_serves_the_disk_copy` asserts the kept line on the confirmation, and three consecutive full workspace runs under 16 CPU burners passed with zero failures.
+**The HTTP/1.1 close path allocated, so `h1_tls_hit` carried a 2,003 budget for a row that makes 2,000 calls.** `http11::advance_tls` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")` when a peer closed a TLS connection, and that constructor boxes its message, so every teardown inside the counted window added calls and the row's figure moved with when the shutdown landed. It builds the error from its kind now, which allocates nothing, so closing a connection costs nothing of ours. The error's text is std's "unexpected end of file" where it was "closed", and no h1 code logs it: the drive loop matches the kind and closes. Verified on macOS against a dev build with `--features count-allocations`: fourteen runs of the row after the change read 2.000 every time, N = 1,000 counted 2,169 calls and 2N = 2,000 counted 4,169, against 2,178 and 4,178 before, so the fixed part of each run fell by nine calls and the budget is 2,000. The request path is unchanged and still allocates none of m6's own.
+**A check-only `m6-auth-server` answers the reserved `/genid` with the house 404, not 204.**
+`Site` answers the reserved path before routing, so the listener test in `run_route` never saw it and the reload arm had no side test: with `--check-only`, `POST /genid` on the check socket answered 204 and ran the start path again, and `GET /genid` answered 405.
+The loop now answers any `/genid` on the check side with the route-less house 404 before `Site` runs, so a process that serves only `/check` cannot be told to reload.
+The other paths are unchanged: `/perf`, `/traffic`, `/ready` and `/health` are not routes of this service and answer 404 on both sockets, the four login routes answer 404 on the check socket, and `/check` answers 404 on the login socket.
+Every wrong-socket answer is the route-less house 404, so it carries no route `Cache-Control` and no route headers and is indistinguishable from an unknown path.
+Verified on 2026-11-17 on a macOS sandbox against the real binary: before, `POST /genid` on a `--check-only` process answered `204 No Content` with `Cache-Control: no-store`, `GET /genid` answered 405, and `POST /auth/login` on the check socket answered 404 with `Cache-Control: no-store` where `POST /nope` carried none. After, all of them are the house 404 with no `Cache-Control`, and `genid_on_a_check_only_process_is_404`, `each_path_answers_on_one_socket_only` and `a_wrong_socket_404_carries_no_route_headers` pin it.
+
+**`h2_tls_hit` read 3.002 on Linux and failed a budget of 3,001 because the HTTP/2 close path allocated, and it reads 3,000 now.** `Http2Conn::fill_recv` built `io::Error::new(io::ErrorKind::UnexpectedEof, "closed")`, and that constructor boxes its message, so every connection torn down inside the counted window added a call to `tests/allocations.rs`'s stop count. How many teardowns land in a window moves with when the shutdown arrives: dhat between two 1,100-request runs of the same binary differed by 3 calls at that site and by 1 at rustls's received-plaintext copy, which is how a row that makes 3,000 calls per 1,000 requests read 3.002 and failed on a host where the same row had read 2.999 to 3.001. Both close paths, `H2Io::Tls` and `H2Io::Plain`, now build the error from its kind, which allocates nothing, and the line a trace log prints for it reads std's "unexpected end of file". The request path is unchanged and still allocates none of m6's own. Verified on macOS against a dev build with `--features count-allocations`: fourteen runs of the row read 3,000 twelve times, 3,001 once and 2,999 once, and the fixed part of each run fell by exactly 3 calls (N = 1,000 read 3,222 before and 3,219 after, 2N = 2,000 read 6,222 before and 6,219 after). The call the 3,001 budget allows is one more TLS record received in a run than that run's baseline, which is one `Payload::into_vec` in `CommonState::take_received_plaintext` and can grow rustls's received-plaintext chunk queue. That corrects the 1.15.0 entry's account of the same call as a chunk-queue growth seen only in the 2N run: the growth is one call in the 100-request and the 1,100-request profiles of both runs, so it cancels in the difference, and the call above 3,000 is a record boundary.
+
+**`[server] lock_memory` pinned every mapping the allocator had reserved, so m6-http held 1,229 MiB where the base build held 96 MiB, and the kernel's out-of-memory killer killed it.** `mlockall(MCL_CURRENT | MCL_FUTURE)` populates every current mapping and marks every later one to be populated, and mimalloc reserves 1 GiB of address space by default (`MI_DEFAULT_ARENA_RESERVE`, 1024*1024 KiB) on top of the `[limits.heap_reserve]` reservation, so the lock made 1.2 GiB resident that the load never touched. The build host measured 1,259,140 KiB resident with 1,062,912 KiB of it on transparent huge pages, against 95,856 KiB for the base build, while mimalloc's own committed figure was 328,269,824 bytes and the process's mapped size was 1,271,664 KiB. m6-http logged `heap: 1216 MiB on huge pages, memory pinned`, and 13 m6-http processes and 7 more of the build account's login session were killed. The pin is now `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`, so a page is locked when the load first faults it and memory that is reserved and unused stays unresident. A page a cache hit reads was faulted during the warm-up and stays locked, so the hit path still takes zero minor page faults. `MCL_ONFAULT` is Linux 4.4 or newer, and availability is checked by asking the kernel: a kernel that does not know the flag fails the call with `EINVAL`, which is answered with an error naming the version and `lock_memory = false` rather than a fallback that pins every mapping. `LimitMEMLOCK=infinity` is what the unit sets, and a finite limit is refused at start with the error that names it. The refusal is owner policy, so the requirement is one error at start for every limit and every process, including a privileged process the kernel would have allowed. The kernel enforces the limit itself: `mlockall` with `MCL_CURRENT` refuses the call when `mm->total_vm` is over the soft `RLIMIT_MEMLOCK` (`mm/mlock.c`), and under `MCL_FUTURE` every later `mmap` and `brk` calls `mlock_future_ok`, which refuses a mapping that would take `mm->locked_vm` past the same soft limit (`mm/mmap.c`). The kernel cannot half-pin the process. The guard now reads the soft limit, the one the kernel enforces, so `LimitMEMLOCK=8M:infinity` is refused at start too, where the hard-limit check this replaces let it through. m6-http now logs its resident set and address space on either side of the pin (`memory: N MiB resident of M MiB mapped`), and `m6-platform`'s `process::resident_bytes` and `process::virtual_bytes` report them. `a_warm_server_is_resident_within_its_reservation` in `m6-http/tests/heap_resident.rs` warms a real m6-http with cache hits against a counting origin and holds the resident set to the process's own pre-pin size plus the reservation its config asks for plus a tenth, checks `VmLck` is above zero so a run with no pin at all cannot pass, and requires zero minor faults over 1,000 hits after the warm-up. The bound also has an absolute ceiling of 192 MiB from the small-cache run, so a regression that raises the pre-pin resident set as well as the formula still fails. The same test can be run against an eager pin by dropping `MCL_ONFAULT` in a throwaway worktree, and it then fails near 1.2 GiB. Verified on macOS: the workspace builds with zero warnings, clippy is silent, `cargo nextest run --workspace --no-fail-fast` passes 2,308 tests, and the doc tests and the platform gate pass. The Linux resident set, the minor-fault count and the strace table have not run yet.
+
+**Two refusal tests could not refuse, and the measurement tools' site answered the load with 429.** `lock_memory_under_a_lowered_limit_refuses_naming_the_limit_and_the_fix` and `lock_memory_with_too_low_a_limit_exits_2_naming_the_limit_and_the_fix` lowered `RLIMIT_MEMLOCK` with `sh -c "ulimit -S -H -l 0"`. On Ubuntu `sh` is dash, which rejects that call (`ulimit: error setting limit (Invalid argument)`), exits 2 and leaves the limit unchanged, so the first test's child ran under the account's own limit and `mlockall` succeeded where the test expected a refusal, and the second saw the shell's error instead of the service's. Both now use `ulimit -l 0`, which sets both limits, and both check that the limit reads 0 before they rely on it, so a shell that accepts the command and changes nothing fails the test with that reason. `tools/memcalls-site.sh` generated a site with m6-http's default rate limit of 300 requests a minute, so a 10,000 request load was answered 429 after the first 300 and the counters measured the refusal path. The generated site now sets `[rate_limit] enabled = false`. Verified on macOS against a dev build: the load of 400 requests to `/` was answered 299 `200`s and 101 `429`s with the old site and 400 `200`s with the new one, `m6-http --dump-config` shows `"enabled": true` against `false`, the dash failure is reproduced with `/bin/dash` (exit 2, `ulimit: error setting limit (Invalid argument)`) while the corrected command prints 0, and the platform test fails under dash before the change ("the shell did not lower RLIMIT_MEMLOCK") and passes after it. `tools/memcalls.sh` now also prints `mapped`, `locked` and `anon-huge` beside `rss`, so a pin that makes reserved memory resident shows `rss` at `mapped` in its own output.
+
+**`bench.sh` measured an HTTP/1.1 handshake and called it a cache hit.** Its HTTP/1.1 latency client opened a new TCP and TLS connection for every request, so the row read about 1.3 ms against 0.09 ms for HTTP/2, a tenfold gap on the same cached page. Nothing was slow in m6-http: its accepted sockets already set `TCP_NODELAY`, and a hit is written as one TLS flush. `m6-bench` now sends HTTP/1.1 over one kept-alive connection like a browser, reconnecting outside the timed region before the server's per-connection request cap, and labels the old row "new connection per request, includes TLS handshake". The path and URL-backend HTTP/1.1 rows use the kept-alive client too. A new suite, `--h1-vs-h2`, runs both in one process and fails if the kept-alive HTTP/1.1 p50 exceeds twice HTTP/2's. Verified on macOS against a dev build, 2000 requests: HTTP/1.1 keep-alive p50 58 us, p99 115 to 175 us. HTTP/1.1 new connection p50 1309 to 1359 us, p99 1467 to 1643 us. HTTP/2 p50 90 us, p99 130 to 135 us. HTTP/3 p50 137 us. h2c p50 73 us. The ratio is 0.64 against a limit of 2. Setting the limit to 0.5 makes the suite print FAIL and exit non-zero. Removing `set_nodelay` from the accept path does not trip it on loopback, because a hit is a single write.
+
+**`bench.sh` runs again.** It copied a certificate fixture that no longer exists, wrote a `[log] format` key the config now refuses, built m6-html and m6-file in a call that `--bin` restricted away, and let the per-address rate limit answer the load generator 429. It now makes its own throwaway certificate, drops the key, builds in two calls and turns `[rate_limit]` off. `BENCH_PROFILE=debug` runs the dev build to check the script. Numbers come only from the default release build. Verified on macOS against a dev build: all suites pass and print their latency tables, with no 429, and `m6-http --dump-config` accepts the generated config.
+**The login 429 from `m6-auth-server` carries the remaining window in `Retry-After`, not a hard-coded 60 seconds.** `[rate_limit] window_secs` defaults to 900, so a blocked client was told to come back in a minute when the block could last fifteen, and a deployment with a shorter window was told a wait longer than the window itself. The header is now the whole seconds until the window ends, rounded up, so it is never below the true wait and never above `window_secs`. `docs/m6-auth.md` Table 4 and section 10 state the same. Verified: `t04b_retry_after_follows_the_configured_window` drives two servers with `window_secs` 120 and 900 to a block and reads the header at each window, and against the old constant it fails with "Retry-After 60 is not close to window_secs 120".
+
+**Lifecycle tests wait for the service's own `<name> started` line before they send a signal, not for its socket file.** `m6-monitor`'s `lifecycle_is_clean_with_history_on` failed "did not exit within 5s of SIGTERM" 4 times in 480 runs under a parallel `cargo build --workspace`: the socket is created before the service sets up its signals, and on macOS a SIGTERM that arrives in that window is discarded. The services are unchanged. `Service::wait_for_started` waits for the line the service logs after its signal handling is in place, and `assert_app_lifecycle` and the service test helpers that spawn `m6-monitor`, `m6-auth-server`, `m6-html` and `m6-file` call it after `wait_for_path`. Verified: 0 failures in 720 runs of that test under the same load.
+
+**An HTTP/2 response longer than the send queue no longer stops after 32,768 bytes.** `flush_pending_streams` frames one 16 KiB queue per pass, and the connection wrote it and returned. A socket that took every byte never stopped being writable, so it never reported a new writable edge, and the edge-triggered loop did not run the flush again. A client that announces large windows, as a browser does, sends no WINDOW_UPDATE while a body is in flight, so nothing else woke the connection. The status and the content-length arrived, then 32,768 bytes, then nothing, for any response over 32 KiB. `send_until_blocked` now frames and writes until the socket would block or nothing is left that the windows allow, which is what an edge-triggered loop needs, and the writable edge it waits for arrives when the kernel drains below its mark. The tests `rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` fetch each size through m6-http with a client that announces browser-sized windows, and the h3 tests of the same sizes pin that HTTP/3 was never affected. On Linux the three h2 tests fail at the base and stop at ten seconds, and all six pass with the fix.
+
+**`Smtp::fd()` returns `Option<RawFd>` and no longer panics, and a loop ignores an outgoing event for a slot that is no longer sending.** A client that left freed its slot and closed the slot's `Smtp`, and the slot's outgoing-token event, already in the same poll batch, then called `drive()`, saw the interest change and reregistered `fd()`, which panicked with "no connection" and stopped the service. `fd()` is `None` before `start` and after `close` or a finished delivery. `Option` was chosen over a deregister-and-reregister helper on `Smtp` because the loop already owns the registry and the slot state, so the type needs no second way to say "no socket", and `if let Some(fd)` is the form a caller already writes. The loops in `m6-core/tests/email_in_the_loop.rs` and `email_allocs.rs` now return early on an outgoing event when the slot is not `Sending`, and `docs/m6-core-reference.md` and `docs/m6-user-guide.md` state the rule. This is an API change to `fd()` only for callers that used it on a closed slot. Verified: `an_outgoing_event_after_the_client_left_is_ignored` frees the slot and then handles its outgoing event in fixed order, and it panics with "no connection" when the guard is removed and passes with it.
+
+**Four tests that failed on a loaded host now wait on the event they need, and pass under load (a defect in each, none a retry or a longer timeout).** `m6-auth-server`'s three rate-limit tests and `t04_login_rate_limited_429` logged in as a user that does not exist, which makes the server run a cost-12 bcrypt verify per attempt, CPU work that a loaded host stretched past the 10 s read deadline ("no response within 10s"). They now log in as a seeded user with a cost-4 hash and a wrong password, the same failure path, a sixty-fourth of the work. `m6-core`'s `half_close_drains_then_closes` set its read timeout after half-closing, when the server may already have closed and macOS refuses `setsockopt` on a closed peer (`EINVAL`, panic at `recv_exact`). It sets the timeout first. `m6-monitor`'s `the_monitor_runs_one_thread` accepted two thread counts 100 ms apart that agreed, and short-lived start-up threads made that reading 6 or a history 2 higher. It now waits until the count reaches the settled range (loop plus the platform's certificate-store workers), and a thread that never leaves, such as one per node, still fails it. Verified under load (load average 50 to 130, with parallel `cargo build --workspace`): before, 2 of 3 auth tests failed in 3 of 6 runs, `half_close` failed 2 of 20 runs and the monitor test 3 of 48 runs. After, 4 of 4, 20 of 20 and 80 of 80 runs pass.
+
+**Every buffer and queue the audit found unbounded, shrinking, or silently dropping is on a named limit with a `start`, a `max` and one rule.**
+The rule is: allocate `start`, grow by doubling only when a write does not fit, clamp at `max`, keep the size, log one line on each growth, and refuse past `max` with an error that names the limit, the size needed, what was refused and the key and file to raise.
+Twenty-six limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from `[limits.<name>]` in a service's config and in m6-http's system config.
+- m6-core: the HTTP/1.1 slot's read buffer (`request_body`) and write buffer (`response_buffer`) no longer shrink after a large request, a request past the maximum is 413 and a response past it is 500.
+  The upstream client's read buffer (`upstream_read`) and request buffer (`upstream_request`, which had no bound) refuse past their maximums.
+  The compressor's and minifier's input (`compress_output`, `minify_output`) and the SMTP reply buffer (`smtp_reply`, a fixed buffer that failed when full) follow limits, and so do the connection table (`connections`) and the ndjson page (`ndjson_page`).
+- m6-http: `edge_request`, `edge_response` (which had no bound), `h2_recv` (no bound), `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes` and `connections`.
+- m6-log: `log_buffer` grows from 16 KiB to 1 MiB where it was fixed and dropped lines, and `log_field` replaces the 1024-byte cut.
+- m6-monitor: `history_queue`, and its node requests follow `upstream_read` and `upstream_request`.
+- m6-file: `tail_read`, the page size of a tail response and the window a last-N-lines request scans.
+Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory, which is now twice the concurrency cap (200 where it was 128) so it stays above the cap whatever the cap is, and the idle URL connection pool, which closes a spare connection and loses no work.
+Verified by a test per limit that fills it past its maximum and reads the refusal: `m6-core/tests/server_conn.rs`, `m6-core/src/limits.rs`, `m6-core/src/client.rs`, `m6-core/src/email.rs`, `m6-core/src/site.rs`, `m6-log/tests/limits_refuse.rs`, `m6-log/tests/escaping.rs`, `m6-http/src/http11.rs`, `m6-http/src/http2.rs`, `m6-http/src/rate_limit.rs`, `m6-monitor/src/history.rs` and `m6-file/src/handler.rs`.
+The hot cache hit still allocates nothing (`m6-http --features count-allocations --test allocations`), and the page-path budgets in `site_allocs` and `request_allocs` are unchanged.
+m6-http conformance (h1spec, h2spec, h3spec) was not run on macOS and must be run on Linux.
+
+**A monitor poll on any path is counted as monitor traffic, not as a visitor (#107).** The channel table had two interfaces, so a header check on `/capabilities`, a `/health` poll, or any other monitoring request arrived in `http/*/external` and moved the visitor hit rate while no visitor had moved. The metrics line now reports `http/*/monitor` beside `http/*/external` and `http/*/internal`. `/health` is identified by its backend name, and every other path by the peer's address class. A monitor runs on the private network, so its poll arrives from a private address, while a real visitor's address is public after NAT. The class comes from the listener socket and the peer address the connection proved, so it reads no header and needs no configuration key. Three tests pin the three populations. `a_monitor_poll_on_another_path_is_not_external_traffic` fails as external traffic when the private-peer class is removed, `a_real_external_request_stays_external` fails as monitor when the class is over-broad, and `an_internal_backbone_request_stays_internal` fails as external when the internal socket is classified by its forwarded peer address instead.
+
+**The HTTP conformance gate runs again.** `tools/conformance.sh` still wrote `[log] format`, which is now refused, and started the redirect listener with analytics on and no log directory, which is now refused too, so the gate measured nothing for h1's redirect listener, h2 or h3. It now writes neither, and runs the dev-profile build (`target/debug`, or `M6_BIN_DIR`) like every other gate. CI builds `--bins` for it instead of `--release`. `tools/backend-bench.py` no longer writes `[log] format` either. Verified on Linux: h1spec 32/32 on all four targets, h2spec 146/146, h3spec 47/49 (the recorded floor), resumption and early data as before.
+
+**A source node's `M6-Genid` header no longer makes an HTTP/2 response unreadable.**
+The header was serialised with its title-case name in the HPACK block, and RFC 9113 8.2.1 requires lower-case field names.
+A strict client rejected the HEADERS frame as a protocol error and read no body, so a page that HTTP/1.1 served as 2671 bytes arrived as 0 over HTTP/2.
+The HTTP/2 and HTTP/3 serialisers now write the lower-case spelling.
+quiche already lower-cases the names it encodes, so HTTP/3 was correct on the wire, and the change there removes the dependence on that normalisation.
+Verified with `h2_serves_the_same_body_as_h1` and `h3_serves_the_same_body_as_h1`, which fetch the same cached page through a real m6-http process and compare it with HTTP/1.1.
+The h2 test fails on the previous code with a protocol error from a strict h2 client and passes after the fix.
+
+**An HTTP/3 response no longer carries the backend's connection-specific fields, which cost the whole body.**
+m6-http copied every field of a backend's HTTP/1.1 reply into the h3 field section, including `Connection: close`, which m6-html sends because it closes its connection after each page.
+RFC 9114 4.2 makes a response carrying a connection-specific field malformed, and a client MUST treat it as such: nghttp3 (curl) reset the stream and read no body, so example 08's `/logs`, 1454 bytes over HTTP/1.1, arrived as 200 with zero bytes over HTTP/3.
+HTTP/1.1 must carry the field and HTTP/2's serialiser already dropped it. Both now take the connection-specific set from `m6_http_lib::fields::is_connection_specific`, which covers `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding` and `Upgrade` (RFC 9113 8.2.2, RFC 9114 4.2).
+Verified with `rfc9114_4_2_h3_serves_the_same_body_as_h1_when_the_backend_closes`, which serves a no-store page from a backend that closes its connection, fetches it over HTTP/1.1, HTTP/2 and HTTP/3 and compares the three bodies: 2671 bytes on h1 and h2 with a reset stream on h3 before the fix, 2671 on all three after it.
+On the examples' 08 stack with curl, `/logs` went from `200, 0 bytes` to `200, 1454 bytes`.
+
+**A service writes its access line at the default log level (#179).**
+`Site::handle` logged "request complete" at debug, below the default level of info, so a service that left its level alone had no access line.
+It now logs at info, one line per request as a web server's access log does, and `[log] level` decides whether the destination keeps it.
+Verified with `an_access_line_is_logged_at_the_default_level`, which finds no line on the previous code and an INFO line after it.
+
+**A split body-less HTTP/2 backend response is forwarded instead of a 502 (#315).**
+A backend that put END_STREAM on a HEADERS frame and finished the header block in CONTINUATION frames had its stream completed before the block ended, so the reply was failed as "stream ended without headers" and the edge answered 502.
+The client now completes a stream only when the header block ends and END_STREAM has been seen, as RFC 9113 sections 4.3 and 6.2 require, in the shared h2c and h2s path.
+Verified with `a_split_bodyless_response_is_forwarded`, which sees a 502 on the previous code and the backend's 200 after it.
+
+**A backend's early response is forwarded instead of a 502.**
+When a backend answered before it had read the whole request body (a 413 for an oversized upload, for example) and then closed, m6 treated the failed write as the result and answered 502, and on Linux the reply was lost.
+The client now reads a reply the backend has already sent before it reports a write error, over plain and TLS connections, and the backend's own status reaches the client.
+Verified: the socket and m6-http early-response tests on Linux and macOS (on Linux, 0 of 10 passed before the fix and 10 of 10 after).
+
+**The test kit's scratch directory and port claims work on any host, so the suite has no list of known failures.**
+`m6_core::testkit` chose `/var/tmp` for scratch files whether or not the process could write there, and kept port claims per build, so two builds on one host could claim the same port and one test reached the other's server.
+Scratch files now go to the first of `TMPDIR`, `/var/tmp` and the system temp directory that can create, write and run a file, and port claims live in one directory per user that every build shares.
+Verified: the full workspace suite on Linux and macOS with no failure.
+
+**m6-http refuses an HTTP/2 or HTTP/3 request whose `:path` contains a space or a control byte, as HTTP/1.1 already does, and a request it will not forward no longer counts against a backend.**
+Such a request passed ingress and was refused only when forwarded, after a pool member had been chosen, and the refusal marked that member failed.
+It is now malformed at ingress and its stream is reset, as RFC 9113 8.1.1 and RFC 9114 4.1.2 require.
+A request refused when forwarded, for example one with a CR or LF in a header value, no longer counts against the backend.
+A member's failure count now counts transport failures in a row: a completed exchange clears it, and the backoff is capped before it is computed.
+
+**On SIGTERM or SIGINT a service stops accepting, removes its socket and exits, without waiting for requests in progress (#338).**
+A restart on a deploy cuts off a request that is still running, and that is accepted: the supervisor starts the service again at once.
+Waiting for accepted requests took a request counter, a condition variable, a deadline setting and a shutdown hook, and gained nothing a restart does not already do.
+The m6-html shutdown test now holds a request open at SIGTERM and again at SIGINT, and asserts only that the service exits 0 within five seconds with its socket removed.
+The test harness's `Service::wait_for_exit` and `terminate` now also wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
+Migration: `ThreadPool::drain`, `ThreadPool::in_flight`, `ServerConfig::drain_timeout`, `server::DEFAULT_DRAIN_TIMEOUT_SECS`, `[server] drain_timeout_s` and the `on_destroy` registration on `AppWithGlobal` and `AppWithState` are removed, along with the shutdown hook they fed. A caller does nothing: a `drain_timeout_s` key left in a config is ignored, and a service that needs durable state must not depend on a shutdown hook, because none runs.
+
+**The config reloader reports a rename of a service's config once, and decides what changed from the file's bytes, mode, owner and modification time (#300).**
+A rename over the config showed to `stat` a moment before its inotify event was queued, so a poll in that gap reported the change and the event reported it again. The old file's `ctime` also changes just before the name moves, which a second `stat` read as another change. The fingerprint is now a hash of the bytes with the mode, owner and modification time, and leaves out the inode and `ctime`, so a rename's transient state, which has the old bytes and times, is no change and the finished rename is one. Each check opens a file once. A check runs on every event from the watcher, named or not, and once a second. The first change after quiet is still reported at once and bursts are held as before. A `touch`, a `chmod` and a same-length rewrite in one timestamp tick are each a change. A `touch` forces a reload only when it moves the modification time, so on a filesystem with one-second timestamps a second touch in the same second, with unchanged bytes, is not seen.
+Verified on the build host: a test that renames over a watched config 300 times under CPU load failed in 19 of 20 runs on the old code and passed in 20 of 20 on this release's code, and deterministic tests cover each kind of change, including a config reached through a symlink whose target directory is swapped.
+
+**`a_burst_of_writes_is_at_most_two_reloads` no longer fails on a busy machine (#299).**
+It wrote the config three times 10 ms apart and expected at most two reloads, but the reloader only merges a write that lands within 20 ms of the last report, so on a loaded runner a late write was rightly reported a third time. The test now spaces its writes 5 ms apart (longer than the service loop takes to wake and reload, so it is unlikely to merge them by itself), times each burst, and judges only one that fitted inside the window, retrying up to five times. Verified on the build host, 20 runs each: 20 passes with four CPU-bound processes running, and 20 failures reporting three reloads with the reloader's hold removed.
+
+**JavaScript labelled `text/javascript` is now compressed by default (#186).**
+The default tables disagreed. `text/javascript` was minified but missing from the default compression types, and the `.js` and `.mjs` extensions map to that label, so every script was minified and sent uncompressed. It now gets the same levels as `application/javascript` (brotli 6, gzip 6), and a test keeps the two default tables in step.
+A site that switched compression off by setting brotli and gzip to 0 on each default type, and declares `compresses = false` for its backend, must now set `text/javascript` to 0 as well. Until it does, the service refuses to start or reload with "compresses = false, but this service DOES compress".
+Verified by a request-level test that asks for `text/javascript` with `Accept-Encoding: br` and expects a brotli response, and by a test that the two default tables list the same types. Both fail on the old tables.
+
+**The edge now skips an informational (1xx) response from a backend and returns the final one (#100).**
+A backend that sent `103 Early Hints` ahead of its answer had the 103 taken for the response, so the fetch failed. The HTTP/1.1 reader and both HTTP/2 backbone clients now drop any 1xx other than 101 (RFC 9110 15.2) and fail the fetch as a bad gateway after eight of them, so a backend cannot hold a worker by sending them without end. Before this, an HTTP/2 client carried a 103's fields into the final response, which the edge could then cache.
+Verified by new loopback backend tests for each reader, which fail before the change and pass after it, covering a 103 ahead of the final response, a head that arrives one byte at a time, and the bound at eight and nine.
+
+**CI runs example 05's integration test after its stack is up (#277).**
+The examples' unit-test step ran `cargo test --workspace` in m6-examples before example 05's `dev.sh` had created the dev certificate and auth database. Since m6-examples #11 that test fails on missing prerequisites instead of skipping, so every pull request failed. The step now skips that test, and the example 05 step runs it once the stack answers, as m6-examples' own CI does.
+Verified by this pull request's own CI run.
+
+**The signal-mask guard fails closed (#178).**
+When the thread's signal mask cannot be read, a service now refuses to start instead of assuming SIGTERM is blocked.
+
+**URL backends and HTTP/2 upstreams no longer block or wait on a timer.** An http:// or https:// backend ran each request on its own thread with a new TCP and TLS connection, and its reply was noticed on a 10 ms poll. An h2c or h2s upstream connected, and for h2s completed its TLS handshake, inside the event loop, so an unreachable upstream stalled every request on the node. All of them now connect, write and read in the loop, http(s) connections are reused, and backend_timeout_secs applies to HTTP/2 upstream streams too. An idle m6-http wakes about once a second instead of 100 times.
+
+**A backend that refuses a request no longer takes its pool member out of rotation.** When a backend closed the connection while m6-http was still sending the request (m6-file answering an oversized header, then closing without draining it), m6-http marked the member failed and backed it off for a second, so the next request to that backend answered 502. A member that never received the whole request is now released. A member that took the whole request and then failed, a silent member and a refused connect still back off.
+
+- **m6-http's start no longer waits between its record's `complete` line and `m6-http started`.** On Linux the probe deadline test measured 4.3 to 4.9 s for its 2 s probe. The time was the md5 of the running executable, read in full at start, which the deletion of the executable hash in this release removes. On macOS the same interval was 277 ms for a 30 MB dev build before and 8 ms after, and spawn to `m6-http started` went from 283 ms to 14 ms (median of 20 starts each). `auth_startup.rs` now holds the interval under 1 s.
+- **`--version-full` names the binary on its first line.** It named the package, so the seven extra binaries of the m6-http package, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2` and `m6-probe-h3`, each printed `m6-http - ...` first. The macro reads `CARGO_BIN_NAME` at the binary's own call site, and such a binary lists the package second because it links the package's library. The start-up record's identity uses the same name. `m6-core/tests/version_flag.rs` runs all seven.
+- **`/check` and `/digest` show how the previous run ended on every restart, not only an unexpected one.** STARTUP prints `previous: <run id>, shut down <reason> at <time>`, or `no shutdown recorded`, marked `[info]` for an expected restart and `[WARN: unexpected restart]` otherwise. Each run in `/digest` carries `previous_shutdown` as `{reason, at, uptime_ms}` or `null`, and `restart` as `info` or `warn`. Only the unexpected restart is a finding, at `Warn` as before.
+- **Each run in `/digest` carries `ingested_lines`**, the raw count of journal lines the monitor read for its run id, replays and the shutdown line included, beside `lines`, the start-up lines alone.
+- **The monitor's history file rebuilds its `build` table in schema migration 3, and the build rows before it are not comparable.** A build row is now `(binary, release, commit, dirty)`, the tag and the build metadata kept apart with the dirty flag as an integer, so a reader answers "which build was this node running" from four columns and the drift check compares `release` for version drift and `commit` with `dirty` for build drift. The previous rows are dropped. Their `hash` was an md5 of an executable that is no longer read, and their `version` was a bare release with no build metadata, so an old row and a new one share no comparable fact. A `health` row that named a discarded build keeps every figure and has `build_id` set to `NULL`, and the open that migrates writes one `type=event` line saying the table was rebuilt and why. `/history` lines carry `binary`, `release`, `commit` and `dirty` in place of `binary` and `version`. The schema version stays at 3 because `1.16.0-rc.1` has not shipped, so no released file can be at 3. A test builds a real version 2 file from the migration 1 and 2 SQL, opens it, and checks that the build rows are gone, every health row survives with a `NULL` build, and every other table, row and column is unchanged.
+- **The host facts read no network.** The FQDN of a host whose name has no domain came from `getaddrinfo` with `AI_CANONNAME`, which sends a DNS query and waits out the resolver's timeout, 5 s per server by the glibc default, when the resolver does not answer. The FQDN now comes from the host name when it carries a domain, and otherwise from the `/etc/hosts` line that lists the host, or it is unknown with the reason.
+- **A release build of m6-http sends HTTP/2 frames.** `append_frame` wrote each frame inside two `debug_assert!` calls, which a release build compiles out, so the release binary sent no HTTP/2 frame at all. Every dev-profile test and the dev-profile h2spec run passed. The writes now always run. `m6-core/tests/debug_assert_purity.rs` fails when any `debug_assert!` argument in the workspace calls a mutating method, and CI's conformance job builds the new `release-asserts` profile, the dev profile with debug assertions off, and runs the HTTP/2 unit tests and h2spec against it.
+- **A peer that fills `h2_send` loses its own connection, and the process stays up.** HEADERS and control frames are not paced, so a client that opened many header-only streams and never read could fill the area to its maximum. The HPACK encode then panicked, and with `panic = "abort"` that ended m6-http for every client. A refused write is now recorded and the next flush closes that one connection with an error naming `[limits.h2_send]`.
+- **A full journal queue keeps the native journal.** A send that met a full journald queue (`EAGAIN` on Linux, `ENOBUFS` on macOS) counted as a failure and moved the process to stdout until a restart. The line now stays buffered for the next flush. Only a socket that is gone or refuses moves the sink to stdout.
+- **Every dropped-count line reaches the journal.** The journal path never cleared a drained report, so after the first report every later count of lost lines went unreported.
+- **SIGUSR1 no longer ends a service.** It left the managed signal set with the log reopen, so a rotation hook that still sends it killed the process with no shutdown record. It is blocked again and discarded when read.
+- **The monitor deregisters the journal pipe before closing it**, the order the documentation already gave, so a closed descriptor number cannot be reused by a socket that the deregistration would then remove.
+- **`m6-monitor --check` no longer reports the journal reader as not running after a read that worked.** The one-shot read's normal end, journalctl printing its tail and exiting 0, was recorded as the reader stopping. A non-zero exit is still the reason reported.
+- **A secret flag given as `--flag=value` is redacted.** Only the two-argument form was, so the one-argument form put the secret in the invocation line. Both read as the flag's value and both are redacted in place.
+- **`Bounded` pops in constant time.** A queue's pop moved every remaining entry down one place. Popping 50,000 entries took 79.4 ms before and 0.18 ms after.
+- **A crate built as a cargo git dependency is no longer marked dirty.** Cargo writes an untracked `.cargo-ok` into every git checkout, and the dirty flag counted untracked files, so every binary built from a pinned m6 revision printed `+<commit>.dirty` in `--version-full`. Dirty now means a modified or staged tracked file. A test builds a throwaway repository and holds that an untracked file leaves it clean and that a modified or staged tracked file makes it dirty. A crate that depends on m6 by `git = "file://..."` printed `.dirty` before and does not after.
+- **`loop_never_waits` sets its accounting tick in `[stats]`.** The idle-wake test shortened the tick only through `M6_TEST_STATS_INTERVAL_SECS`, which a release build does not read. A release run therefore measured a 10 s report against a 2 s bound and failed, while the loop woke once a second as designed. The fixture now writes `interval_s = 2` and `traffic_interval_s = 2` into its `site.toml`, which both profiles read.
+- **The test kit's fake `/check` writes each answer in one write.** It wrote the head in pieces and the body after it. m6-http's start probe reads to the end of the head and closes, so a fast release build could close between the two writes, and the fake's body write failed with `EPIPE`. A 100 ms pause between head and body reproduced it every time. One buffer and one `write_all` leave no gap.
+
+### Docs
+
+**`docs/PERFORMANCE.md` now carries a measured breakdown of a TLS 1.3 handshake, with the crypto, kernel and m6 shares, the loopback price, the cipher-suite and provider comparison, the hit distribution under handshake load, and the system-call cost.**
+
+**The docs now state the four cache counts, the HTTP/2 send loop and m6-file's tail mode, and drop five claims the code no longer meets.**
+The README's 8 KiB stack header buffer and its two out-of-scope items (per-address rate limiting, shared-port scaling), the m6-file page's "no route can set `Cache-Control`" and "tracked as #126", and the head-limit refusal named 431 where the code sends 400 and 414.
+Verified by loading each configuration example with `--dump-config` of the matching binary.
+
+**The README, `docs/m6-http.md`, `docs/m6-site-toml.md`, `docs/m6-testing.md`, `docs/m6-user-guide.md` and one changelog count now match the code.**
+The renderer library is `m6-core`, because `m6-render` was deleted.
+The monitor population excludes loopback, and a public address is monitor only on `/health`.
+The `[health]` table has two access keys.
+The certificate comparison groups on the fingerprint.
+`m6-file` computes `Cache-Control` from the query string.
+The route-method change names seven end-to-end tests.
+Verified by counting the tests, reading the classifying code and running `tools/check-commit-hashes.sh`.
+
+**`README.md` follows the documentation ruleset, and its example check count, its backend pool description and its configuration example now match the code (#128).**
+Fifteen numbered sections, a contents list, and every table and figure numbered, captioned and referenced.
+The install section says 98 checks, which is what example 05's suite reports and what this file's earlier entries record.
+Backend pools say round robin, because `m6-http/src/pool.rs` chooses the next member in turn.
+The configuration example is split into `site.toml` and the system config, because `[server] tls_cert`, `tls_key` and `[auth] backend` belong to the system config, a key in the wrong file stops the start with exit 2, and the system config needs `[node]`.
+The `m6-auth-cli` synopsis gains `user roles`, `group member ls` and `passwd --password`.
+
+**The event loop is described once, in `docs/m6-architecture.md` §1.10,** with m6-http's own loop in `docs/m6-http.md` pointing at it. Two false claims went: that backend calls have no timeout (`backend_timeout_secs` exists, default 30) and that m6-http is "single-threaded epoll" by name. `CONTRIBUTING.md` says which loop changes need approval: a new disallowed-method exception, a thread, or an allocation on the loop's path.
+
+**`docs/m6-core-reference.md` sections 1 to 5 follow the documentation ruleset, and the module and line counts, the `RouteConfig` fields and the watcher description now match the code (#144).**
+
+**`docs/m6-http.md` documents m6-http's HTTP/2 denial-of-service behaviour: the Rapid Reset concurrency cap, send-side flow control on the backbone clients, the five-state stream machine and the known gaps (#160).**
+Documentation only. Each claim names the function or test that enforces it.
+
+**The m6-auth-cli reference follows the documentation ruleset, and its token defaults, config keys, key format and exit codes now match the binary (#138).**
+
+**The m6-md reference follows the documentation ruleset, and its params snapshot and watch-mode first pass now match the binary (#150).**
+
+**`docs/m6-auth-lib.md` follows the documentation ruleset, and its storage description now matches the code (#139).**
+
+**`docs/m6-backend-protocol.md` no longer states two MUSTs that the reference `App` does not meet (#200).**
+The proxy's user must be able to connect to the backend socket, with `0660` and a shared group preferred and `0666` allowed only inside a restricted directory. A backend may support persistent connections for clients that ask for them, and must close after responding to a request that carries `Connection: close`, which the proxy sends. `docs/m6-backend-examples.md` and `docs/m6-app-anatomy.md` now say the same.
+
+**Source comments in m6-http, m6-monitor and `tools/conformance.sh` no longer carry one deployment's hosts or measurements, and the HTTP/1.1 module header states the keep-alive the code implements (#190, #189 in part).**
+Comments only.
+
+**The build-host gate runs example 05's end-to-end test after its stack is up (#273).**
+The examples unit-test step skips `blog_site_end_to_end`, which needs certificates and the running stack, and the gate runs `cargo test -p render-cms --test integration` once that stack answers, counting a failure into the examples result.
+
+**Source comments in m6-core and m6-file no longer carry a deployment's names, per-node sizes or deployed versions, and no longer use "load-bearing" (#189, #190).**
+Comments only.
+
+**`docs/m6-backend-protocol.md` now follows the documentation ruleset, and its claims match the code (#142).**
+
+**The user guide's install section, Example 01 and Example 02 now match the released examples and follow the documentation ruleset (#156).**
+
+**The user guide's Examples 03 and 04 now match the released examples and follow the documentation ruleset (#156).**
+
+**docs/POSITIONING.md no longer carries the withdrawn 22.0 µs and 158,323 req/s figures, and its cross-server tables are replaced by a caveated capability comparison (#192, #158).**
+
+**`docs/m6-backend-examples.md` follows the documentation ruleset, and it now agrees with the backend protocol that compression is the backend's job and matches `docs/BENCHMARKS.md` and `tools/build-host-tests.sh` (#141).**
+
+**`docs/m6-architecture.md` now names `M6_SOCKET_OVERRIDE` as the one environment variable a service reads, and the `socket_path_from_config` doc comment points at that page (#187).**
+
+**The user guide's Example 05 (CMS blog) now matches the released example and follows the documentation ruleset (#156).**
+
+**`docs/m6-site-toml.md` part 1 follows the documentation ruleset, and it now says that a secrets file refuses a key set in both files and that `[server]` and `[auth]` belong in the system config (#154).**
+
+**CHANGELOG.md's preamble and its 1.15.0, 1.14.0, 1.13.0 and 1.12.1 entries now follow the documentation ruleset (#129).**
+
+**The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
+
 ### Removed
 
 **`/perf` and `/traffic` are removed on every node, and `/health` is the only built-in monitoring endpoint.** `[server] status_bind` answers `/health` alone, the traffic cache behind the old answer goes with it, and `m6-http/tests/metrics_access.rs` is deleted.
@@ -1100,10 +972,119 @@ m6-http's bundled webpki-roots store, a second store beside the host's.
 
 **App, its builders, AppContext, with_thread_state and `[thread_pool]` are gone: m6-core is not a framework.** Every service writes its own main with its own event loop, and m6-core supplies the parts: h1::ServerConn, site::Site, net::listen_unix, and the event module's Signals, Timeouts, Slots and LoopTrace (see docs/m6-app-anatomy.md). The params cache takes no lock.
 
+- The md5 of the running executable: `BuildId.hash`, `executable_md5()` and the 64 KiB chunked read it did at start. The process reports the commit fixed at build time instead, so one tag built twice is still distinguishable and no process reads its own bytes for identity.
+- `md-5` from `m6-core`, whose only user was `executable_md5()`. Nothing else in the workspace declared or used it.
+
+### Security
+
+**Auth tokens name their kind, deployment and id, and `[tokens] issuer` no longer defaults to `localhost`.**
+Every token carries a `typ` header: `at+jwt` for a session access token, `m6-api+jwt` for an `m6-auth-cli token create` token and `m6-refresh+jwt` for a refresh token.
+`POST /check` accepts the first two and refuses a refresh token, a token with no `typ` and the library's default `typ: JWT`.
+Every token carries `aud`, from the new `[tokens] audience` key, which defaults to the issuer.
+Every token carries `jti`, a fresh identifier for each mint.
+The access token still carries `groups` and `roles`, and `POST /check` continues to answer the database's current lists.
+`POST /check` keeps its `sub`, `username`, `roles` and `groups` body, and `Retry-After` is unchanged.
+`sid` is absent because it names a refresh-token row this schema does not have.
+`jti` is carried but names no row, because the row that can end a token is part of the shelved token-rules work.
+No table, trigger or `/auth/v1/` path is added.
+
+**A cache no longer stores a response it is not allowed to store: a route's `cache` override cannot remove the backend's `no-store` or `private`, and a response to a request carrying `Authorization` or the `session` cookie is never stored.**
+`apply_route_cache` deleted every `Cache-Control` field and wrote the route's value, so a cache route configured `cache = "public, max-age=600"` turned an origin's `private` or `no-store` into `public` before `reply_rule` made the store decision.
+A protected page fetched through that cache was stored and replayed to an anonymous visitor with no check.
+RFC 9111 3.5 says a cache must not store a response it is not allowed to store.
+`request_permits_storage` read request `Cache-Control: no-store` alone.
+RFC 9111 5.2.2.5 forbids a shared cache from storing a response to a request that carried `Authorization`, and the `session` cookie is this deployment's browser credential, so both now refuse the store.
+The auth API design's Table 11 is the one permitted case, a protected response stored under the origin's requirement, and this tip has no such route, so every credentialed request is refused.
+Verified on 2026-11-17 on a macOS sandbox: `a_route_cache_override_cannot_make_a_no_store_response_storable` fails before the fix with `the route override removed the backend's no-store: Cache-Control: "public, max-age=60"` and passes after.
+`a_response_to_a_request_carrying_authorization_is_never_stored` and `a_response_to_a_request_carrying_a_session_cookie_is_never_stored` fail before the fix with the stored reply served to the anonymous second request, and pass after.
+`a_credential_in_the_request_forbids_storage` fails on the first `authorization` case before the fix and passes after.
+`docs/m6-http.md` section 4 and section 7 and `docs/m6-site-toml.md` Table 10 state both rules.
+
+**A key rotation now ends every outstanding refresh token: `m6-auth-cli sessions revoke-all` deletes every `refresh_tokens` row, and `docs/m6-auth.md` section 4.2 gives that command as a step of the rotation.**
+`/auth/refresh` identifies a refresh token by its stored SHA-256 hash and reads the row, and it never checks the token's signature.
+A key change alone therefore left every refresh token usable until its `exp`, so a stolen token renewed access after the operator rotated the key.
+The command deletes every row in one transaction, so the next refresh finds no row and answers 401.
+The documentation promised the opposite before this change: it said the service verified the refresh token's signature with the current key, which it does not.
+This is the interim form of the auth API design's `sessions revoke-all`.
+That design adds an auth generation, a new epoch and list key, and an acknowledgement from every cache, and those arrive with the token-rules step.
+This version holds no decision list on any node, so the deletion is the whole effect and the command waits for nothing.
+Verified on 2026-11-17 on a macOS sandbox: `sessions_revoke_all_ends_refresh_tokens_across_a_key_rotation` logs in, writes a new key pair, restarts the server, runs the command and gets 401 from the next refresh.
+With the CLI change removed the same test fails with exit 100 and `error: unknown entity: sessions`.
+`test_sessions_revoke_all_deletes_every_users_rows` deletes three rows across two users.
+The existing rotation tests still pass: a key change alone leaves a refresh token usable, and a token minted after it refreshes.
+
+**rustix 1.1.4 to 1.1.6 (RUSTSEC-2026-0486).** rustix's xattr functions marked unwritten bytes as initialised when given a zero-length buffer. Found by `cargo deny check` on the build host. The update is the advisory's fix. `deny.toml` no longer allows the OpenSSL licence, since nothing in the tree uses OpenSSL now.
+
+**A login throttle blocks five wrong passwords even when the series takes longer than `window_secs`.**
+The count was anchored at the first failure, so the fifth failure could reset it to one and the sixth was answered 302 instead of 429.
+The example's development config sets a five-second window, and an unoptimised password check takes about a second, so five wrong passwords span more than five seconds on a loaded host.
+The window is now measured from the most recent failure, and a block lifts after `window_secs` with no further failure.
+Verified with `failures_spread_across_more_than_one_window_exhaust_the_budget`, which fails with the first-failure window restored, and with example 05's 98 checks on the running stack.
+
+**A `Content-Length` field value is now `1*DIGIT` only, so a `+5` is refused instead of read as 5 (RFC 9110 8.6).**
+Rust's integer parser accepts a leading `+`, so a client could send `Content-Length: +5` and make the server wait for five bytes that never came, once per request, on a connection it kept open.
+A value that is not all digits is now a malformed message, answered 400 with the connection closed: `+5` is refused, and `-5`, `5x` and an empty value stay refused as they already were.
+Verified with `malformed_content_length_values_are_rejected`, which sends `+5`, `-5`, `5x` and an empty value with `Connection: close`, and asserts each is answered 400 with the connection closed. On the old parser the `+5` case is answered with nothing inside the read bound, so that case fails.
+
+**SQLite dependency updated for RUSTSEC-2026-0459.** `rusqlite` moves to 0.41 and `libsqlite3-sys` to 0.39, which bundles SQLite 3.54.1, the release the advisory names as fixed. The bundled SQLite in m6-auth, m6-auth-server, m6-auth-cli and m6-core's `sqlite` feature is affected. No configuration changes.
+
+**HTTP/2 now advertises SETTINGS_MAX_HEADER_LIST_SIZE and refuses a request whose decoded header list is over 64 KiB with a 431 (#162).**
+Only the compressed header block was bounded, at 256 KiB, and HPACK lets one byte stand for a table entry of up to 4096 bytes, so a block under that cap could decode to a far larger header list.
+The list is now counted as RFC 9113 6.5.2 defines it while it is decoded, and a field is kept only while the list is within the limit, so a request keeps at most 64 KiB of header fields, as RFC 9113 6.5.2 counts them, however far its block would decode. It is answered 431 and RST_STREAM on its own stream after it is decoded in full, so the HPACK table stays in step and other streams are unaffected.
+Verified with `a_header_list_over_the_limit_is_answered_431_on_its_stream`, `the_server_settings_advertise_the_header_list_limit` and `an_amplified_block_never_holds_more_than_the_limit_in_memory`, which fail without the change and pass with it (a 6,009-byte block made the old decoder keep 8 MB of fields), and with a request exactly at the limit still served.
+
+**A query key or form field can no longer replace a path parameter, and m6-file serves only the file its route's pattern addresses (#279).**
+Core checked every path parameter for `..` and stray characters, then added each query parameter to the same request dictionary under the same name.
+A request such as `GET /assets/a.css?relpath=../config` therefore reached m6-file with the unchecked query value as `relpath`, and m6-file served the file it named, outside the site directory.
+Core now leaves a path parameter in place when a query key or form field has its name.
+**Behaviour change:** a template that read a query value under a path parameter's name now gets the path value, and reads the query value as `query.<name>`.
+m6-file now reads `relpath`, `filename` and each `root` placeholder only when the route's pattern captures that name, and checks each with core's path-parameter rule (a slash only in a `{*name}` capture). A name the pattern does not capture is never taken from the query, so `?relpath=` on a `{filename}` route cannot pick a file in a subdirectory, and a `root` placeholder the pattern does not capture is a 404.
+Verified with `l2_query_relpath_cannot_replace_the_path_parameter` and `l2_query_relpath_cannot_choose_a_file_on_a_filename_route`, which send those requests over HTTP. The first fails on the previous code with `200 OK` and the service's config in the body. `a_dotdot_relpath_in_the_dictionary_is_404` covers m6-file's own check.
+
+**A site-relative file helper follows no symlink out of the site directory, and a refused write creates nothing outside it (#346).**
+`Request::validated_path` rejected `..` in the string and never resolved the path, so `read_json`, `write_json`, `write_json_atomic`, `list_json` and the multipart `write_bytes` reached `data/linked/file.json` through a symlinked directory to a file outside the site.
+`write_json` then called `create_dir_all` on that path, so a refused write created the missing directories outside the site before writing.
+The helpers now call one shared `m6_core::path::resolve_within`, which canonicalises the site root, canonicalises the deepest existing ancestor of the requested path, appends the components that do not exist yet, and refuses the result unless it starts with the resolved root.
+A dangling symlink counts as existing and is refused, so a write cannot create its target outside the site.
+A symlink that resolves back inside is accepted, which keeps a site that links `data` to `storage/data` working.
+`..`, a leading `/` and a Windows prefix are still refused.
+Verified with `read_json_refuses_a_symlinked_directory_that_leaves_the_site`, `write_json_refuses_a_symlinked_directory_before_creating_anything` (which asserts the outside directory is still empty), `in_site_symlinked_directory_still_reads_and_writes` and `read_json_still_refuses_dotdot`. The first two return the outside file and `Ok` with the previous lexical check restored.
+
+**m6-file refuses a path whose symlinked directory leaves the site, on plain and tail routes (#339).**
+`escapes_site_dir` called `symlink_metadata` on the last component only, so `GET /assets/linked/secret.css` with `assets/linked` pointing outside the site was served: the final component was a regular file and the check stopped there.
+`serve` now resolves the path through core's `resolve_within`, checks the resolved path against the resolved site root, and reads the file it resolved.
+A directory symlink that stays inside the site still resolves inside and is served.
+Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 200 with the outside bytes when the old last-component check is restored, and `a_symlinked_directory_inside_the_site_is_served`, which serves a site that links `assets` to `static/assets`. `a_dotdot_relpath_in_the_dictionary_is_404` still refuses `..`.
+
+- **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. The rule matches the key case-insensitively and anywhere in the key. A key ending in `_path`, `_paths`, `_file`, `_files` or `_dir`, and any key holding `public_key`, is a path and is still logged.
+- `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
+
 ### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
 - No test uses a live public name.
+
+- The release tree at `616ab561` measured 2,484 passed, 0 failed on the build host, with no warning and clean rustdoc, and the history reset landed on top of it. The record and monitor branches measured 2,456 passed, 0 failed, 13 ignored across 129 test binaries on a macOS arm64 host at `1f61df6c`, and the cgroup change measured 2,436 passed, 0 failed at its own tip.
+- The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
+- The monitor's four drift tests hold the swapped input: two nodes reporting `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` produce one build-drift finding and no version-drift finding, and a node with no build metadata counts as drift.
+- `cargo build --bins` prints no warning.
+- The start-up record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included. The same file holds every part to the one node read from the platform facts, marked `hostname`, two configured names on one host to two nodes, marked `configured`, the shutdown line to the same node, and an unnamed host to an empty `node` with its reason and `none`.
+- `m6-http/tests/startup_node.rs` runs the real binary twice on one host, with `[node] name = "edge-a"` and `"edge-b"`, and asserts that each record states its own configured node with `node_source` `configured`, that neither states the other, and that both platform lines carry the one hostname.
+- The ignored test `measured_record_from_a_rendered_tree` in `m6-core/tests/startup_record.rs` prints the line count, the byte count and the longest line of the record for any rendered config, through the writer a process uses.
+- `m6-core/tests/startup_secrets.rs` fills every key of a service config, its secrets file and a `site.toml` with distinct sentinels, builds the record through `site::record_sections`, and finds none of the 12 credential sentinels in any line and every one of the 23 distinct setting sentinels. With the name rule switched off it reports 8 leaked credentials, `[email] password` among them.
+- `m6-core/tests/secret_fields.rs` reads more than 30 config structs from the workspace source and finds no credential-named field outside `Secret<T>`, a path type or a nested table.
+- The monitor's own suite adds fake journal lines that produce every finding: a dirty version on prod, a pre-release on prod, a version mismatch, a stale config sha, a completed record whose count disagrees, a record that never completes, an unexpected restart with and without a shutdown reason, a restart during a deploy, a peer kernel drift, a decided fact that differs from the deploy, a missing expectation file, and a clean run that produces no finding. Each finding's test asserts the level and the value it names.
+- On macOS, 20 starts of a dev m6-http before the merges and 20 after, read from the service's own log timestamps: `complete` to `m6-http started` 277 ms before and 8 ms after.
+- Each fix above has a test that fails on the code before it and passes after. `append_frame_writes_the_frame_in_every_profile` fails under `--profile release-asserts` with the old frame writer.
+- A release build of m6-http answered `curl --http2` over TLS with HTTP/2 200.
+- In journal mode 500 lines are 500 datagrams, one per line as the journal's native protocol requires. The flush in `log_perf` and `log_traffic` adds no send: 500 lines with a flush every 100 lines cost the same 523 sends as with none, on a macOS datagram pair whose reader drained between lines.
+- `m6-platform` holds `platform_gate` at 9 of 9 and the contract suite at 64 tests with 4 ignored.
+
+### Not measured
+
+- **Linux on the development host.** Every platform and cgroup run above is macOS arm64. On that host the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are formatted and parsed but not type-checked, because it has only the `aarch64-apple-darwin` standard library and no rustup. The first Linux CI job that runs `cargo check --workspace --all-targets`, `platform_gate` and `platform_contract` is the proof.
+- **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. m6 ships no writer of the file, so until a deployment writes one no version or config sha256 is compared.
+- **A physically mixed-commit binary.** The mechanism and the metadata test are the evidence, and a source tarball's `+unknown` is unit-tested.
 
 ---
 

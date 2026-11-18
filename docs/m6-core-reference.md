@@ -108,7 +108,7 @@ Table 2 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
 | | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `Bounded<T>`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
 | | `build_info` | `BuildIdentity`, the `build_identity!` macro, `emit` for a service's `build.rs`, `linked` and `handle_version_flags` for `--version` and `--version-full`. The constants are fixed at build time and the type comes from `m6-platform`. |
-| | `startup` | `Record`, `RunId`, `Section`, `Setting`, `Source` and `ConfigTrace`: the start-up and shutdown recovery record. One call at start and one at a clean exit. `docs/m6-log.md` section 9 gives the line shapes. |
+| | `startup` | `Record`, `RunId`, `Section`, `Setting`, `Source` and `ConfigTrace`: the start-up record and its shutdown line. One call at start and one at a clean exit. `docs/m6-log.md` section 9 gives the line shapes. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | | `client` | `Upstream`, `Addr`, `TlsClient`, `Reply` and `system_roots`: one outgoing HTTP request a loop drives. `Endpoint` is behind `http-client`. |
 | | `email` | `Relay`, `RelayConfig`, `Smtp` and `SmtpError`: an SMTP client a loop drives. Feature `email`. |
@@ -246,7 +246,7 @@ The shutdown line is then lost.
 The only signal a service acts on is a termination: SIGTERM or SIGINT, read from one descriptor.
 The first stops the loop, and a second before the loop has ended forces an exit.
 SIGUSR1 is read and discarded.
-Every log line goes to stdout, so no signal reopens a log file.
+Every log line goes to stdout or to journald's native socket, so no signal reopens a log file.
 
 ### 4.5. `render` and `template`
 
@@ -402,14 +402,9 @@ The record takes the effective config as sections and a `ConfigTrace` that label
 `Invocation::read` reads the declared flags and environment variables and records the settings they replaced.
 `LimitsReport::read` records every named limit's start, max and source, and `Record::limits` replaces the default with a service's own.
 `record_log_level` writes the level the process runs at into the `log` section, because `site.toml` and `--log-level` come after the config file.
-`HostReport::decided` is the platform line's host block, from `m6_core::platform::host_facts()`.
-A fact in it is `{"known": value}` or `{"unknown": reason}`, so every key is present.
-The record writes one `node` on every start-up line and on the shutdown line, fixed once when the record is built.
-It is the application's configured node name when `Record::node_name` was given one, and the host facts' `hostname` otherwise, and `node_source` says `configured`, `hostname` or `none`.
-A host that did not name itself writes an empty `node` and the reason in `node_unknown`.
-
-A field declared `Secret<T>` is `<redacted>` wherever it appears, and so is a value the secrets file supplied.
-A value with no type is `<redacted>` when `startup::names_a_secret` names its key, which covers a `site.toml` table the process does not parse.
+`HostReport::decided` is the platform line's host block, from `m6_core::platform::host_facts()` (section 8.5.1).
+A config field that holds a credential is declared `m6_core::Secret<T>`, which serialises as `<redacted>`, and `startup::names_a_secret` is the name rule for a value with no type.
+[`m6-log.md`](m6-log.md) §9 gives what the record writes: every line's keys, the `node` rule and the three redaction rules.
 
 Section 5 turns to the objects a handler receives and returns.
 
@@ -780,7 +775,7 @@ The `LOG` arm calls `flush()`.
 
 `m6-http` emits analytics through `m6_core::log`'s `Line`, and the line has the keys `timestamp` and `fields.user_agent`.
 `AnalyticsRecord` and `AnalyticsFields` define that line, `Serialize` as well as `Deserialize` so the write side can adopt them.
-`RequestView` is one request as the traffic summary reads it, borrowed from a parsed record (`AnalyticsRecord::view`) or from the traffic window's slot, with its time as a `Stamp`, the envelope's text or Unix microseconds.
+`RequestView` is one request as the traffic document reads it, borrowed from a parsed record (`AnalyticsRecord::view`) or from the traffic window's slot, with its time as a `Stamp`, the envelope's text or Unix microseconds.
 `RequestView.truncated` is the window's own fact that a cap cut the path or user agent, and a parsed record never sets it.
 `parse_analytics(...)` reads a stream.
 `PeriodicStats::parse(line)` reads the `periodic stats` log line, `strip_ansi` first because the journal carries colour.
@@ -1019,5 +1014,12 @@ This section records what the crate and its migration still leave undone.
 
 - **Ad-hoc case-insensitive header lookups remain outside core.** They are in `m6-http`: `cache.rs`, `http2.rs`, `redirect.rs`, `security.rs` and `main.rs`, and each is a local lookup that the one `headers` module can replace.
 
-This is the end of the reference.
+---
+
+## Summary
+
+m6-core is the one crate a service links, and it supplies the parts of a service.
+Sections 4 and 5 cover the modules that build a service and the ones that read a request and write a response.
+Sections 6 to 8 cover HTTP semantics, content and observability, section 9 the errors every module returns, and section 10 the test kit.
+Section 11 lists what the crate still lacks.
 `m6-architecture.md` explains why each module exists, and `CHANGELOG.md` lists what changed in each release.

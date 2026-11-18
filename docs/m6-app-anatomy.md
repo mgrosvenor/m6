@@ -301,11 +301,12 @@ Table 3 gives the flags.
 |---|---|
 | `--log-level LEVEL` | overrides both configuration sources for the level. §4 gives the precedence |
 | `--dump-config` | loads the configuration exactly as the service would, prints what it resolved to with every route and what would answer it, and exits |
-| `--version`, `-V` | prints the tag form of the build's version, `v1.16.0-rc.1`, and exits 0. It carries no crate name and no build metadata, so it matches the git tag even on a dirty tree |
-| `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary first under its own name from `CARGO_BIN_NAME`, each from that crate's own build-time constants. A binary named apart from its package, such as `m6-bench`, lists the package second. A mixed build shows two commits |
+| `--version`, `-V` | prints the tag form of the build's version, `v1.16.0-rc.1`, and exits 0 |
+| `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary's own name first, and exits 0 |
 
 **Table 3: the flags a service answers, and what each one is for.**
 Take from it that the two version flags need no site directory and no configuration, and that `--dump-config` and `--log-level` are handled by `Site::load`.
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) §4.2 gives both version forms with examples.
 
 The version flags come from two lines in the service.
 Its `build.rs` calls the one build helper, and its `main` calls the one macro that answers both flags before it parses anything else:
@@ -366,7 +367,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 11 of `m6-architecture.md` |
+| `[minification]` | core | on or off per MIME type, plus `inline_js`. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 9 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info` |
 | `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 and Table 6 |
 | `[[route]]` | core | the configuration route table, §5 |
@@ -456,7 +457,7 @@ A key under `[limits]` that is not in the table stops the process at start with 
 | `log_buffer` | bytes | 16 KiB | 1 MiB | every process | one log destination's buffer | the line is refused |
 | `log_field` | bytes | 8 KiB | 8 KiB | every process | one string field of a log line | the line is refused |
 | `history_queue` | polls | 8 | 1024 | m6-monitor | polls held while the history file is locked | the new poll is refused |
-| `journal_line` | bytes | 64 KiB | 4 MiB | m6-monitor | one line read from the journal, a whole metrics or traffic document with its JSON wrapper | the line is dropped and counted |
+| `journal_line` | bytes | 64 KiB | 4 MiB | m6-monitor | one line read from the journal, such as a whole metrics document with its JSON wrapper | the line is dropped and counted |
 | `edge_request` | bytes | 4 KiB | 32 MiB | m6-http | one HTTP/1.1 connection's read buffer, so the largest request | 413 |
 | `edge_response` | bytes | 512 B | 128 MiB | m6-http | one HTTP/1.1 connection's write buffer, so the largest response held | 500 |
 | `h2_recv` | bytes | 16 KiB | 4 MiB | m6-http | one HTTP/2 connection's read buffer | the connection closes |
@@ -471,6 +472,7 @@ A key under `[limits]` that is not in the table stops the process at start with 
 
 **Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
 Take from it that every limit is one `start` and one `max`, and that the last column says what happens past `max`.
+The start-up record's platform line lists every limit a process runs with, its `start`, its `max` and whether each came from the file or the default ([`m6-log.md`](m6-log.md) §9).
 
 The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 400 (414 for a request line).
 The HTTP/2 reset memory is twice the concurrency cap (200 streams at the cap of 100), so it stays above the cap and has no key of its own.
@@ -665,6 +667,10 @@ Every service logs the same three lines under its own name, and `Lifecycle` emit
 The name comes from `site.name()`, the literal the service passes to `Site::load`, and the started line carries the socket.
 One emitter makes a search of a journal for `shutdown complete` mean the same thing for every unit.
 `on_signal` writes the signal line before the loop breaks, so it precedes the completion line in the log.
+
+Two structured records frame the three lines.
+`Site::prepare` writes the start-up record, several `type=startup` lines, before the socket is bound, and `Lifecycle::complete` writes one `type=shutdown` line, with the run's `run_id`, its uptime and its reason, before the completion line.
+[`m6-log.md`](m6-log.md) §9 gives both, and [`m6-core-reference.md`](m6-core-reference.md) §4.9 the two calls an application with its own config makes instead.
 
 ### 6.3 Under load and under a supervisor
 

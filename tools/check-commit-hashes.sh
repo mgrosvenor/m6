@@ -28,6 +28,11 @@
 #   - A UUID segment: 550e8400-e29b-41d4-a716-446655440000
 #   - A content hash in an ETag, or a versioned-asset query (?v=...)
 #   - An illustrative build string, "build 0123456789ab"
+#   - SemVer build metadata: the hex directly after "+" in
+#     MAJOR.MINOR.PATCH[-pre]+HEX, optionally followed by ".dirty", as in
+#     1.16.0-rc.1+abc123def456. The examples in the documents show the shape of
+#     a version string, and the metadata names no commit. The same token
+#     anywhere else on a line is still a commit reference.
 #
 # A hash that exists is live. A hash that does not exist is a failure unless it
 # is listed below as known dead history, and then it is printed every run so the
@@ -112,8 +117,30 @@ is_commit_candidate() { # token line has_hex_letter -> 0 if the token can be a c
   # An illustrative build string, "build 0123456789ab".
   [[ $line == *"build $tok"* ]] && return 1
 
+  # SemVer build metadata: MAJOR.MINOR.PATCH[-pre]+TOKEN[.dirty].
+  local semver_re="[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?\\+$tok(\\.dirty)?([^0-9A-Za-z.-]|\\.[^0-9A-Za-z]|\\.?$)"
+  [[ $line =~ $semver_re ]] && return 1
+
   return 0
 }
+
+# --self-test: the classifier on fixed lines, no git needed.
+if [[ ${1:-} == "--self-test" ]]; then
+  fail=0
+  expect() { # want(0 commit, 1 not) token line
+    local rc=0
+    is_commit_candidate "$2" "$3" 1 || rc=$?
+    if [[ $rc -ne $1 ]]; then echo "self-test FAIL: $2 in: $3" >&2; fail=1; fi
+  }
+  expect 1 abc123def456 "m6-http - 1.16.0-rc.1+abc123def456"
+  expect 1 abc123def456 "m6-http - 1.16.0+abc123def456.dirty"
+  expect 1 bbbbbbbbbbbb 'two nodes reporting `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` drift'
+  expect 0 abc123def456 "fixed in abc123def456"
+  expect 0 abc123def456 "version 1.16.0 built from abc123def456"
+  expect 0 abc123def456 "1.16.0+abc123def456abc is not it, abc123def456 is"
+  [[ $fail -eq 0 ]] && echo "self-test OK"
+  exit $fail
+fi
 
 # ── Scan ──────────────────────────────────────────────────────────────────────
 files=0

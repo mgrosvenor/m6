@@ -6,7 +6,7 @@ The only process in an m6 deployment that listens on a public port, unless `[ser
 The sections run from the process's surface to its protocols.
 §1 to §13 cover the CLI, startup, pools, routing, forwarding, limits, caching, the generation ID, errors, auth, monitoring, signals and exit codes.
 §14 to §16 cover H2C, H2S and the HTTP/2 denial-of-service bounds.
-§17 to §19 cover the event loop, logging and dependencies.
+§17 to §19 cover the event loop, logging and dependencies, and §20 closes with where to read next.
 
 ## Contents
 
@@ -29,6 +29,7 @@ The sections run from the process's surface to its protocols.
 17. [Event Loop](#17-event-loop)
 18. [Logging](#18-logging)
 19. [Dependencies](#19-dependencies)
+20. [Summary](#20-summary)
 
 ---
 
@@ -68,24 +69,27 @@ m6-http starts in this order, before it serves a request.
    It carries `[node]`, the `[server]` node keys, `[auth]`, `[genid]`, `[cache]` and `[limits]`, and nothing else.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
-4. If `[auth]` is declared, take the check backend it names.
+4. Open the log and write the start-up record, the `type=startup` lines that [`m6-log.md`](m6-log.md) §9 gives.
+   `--dump-config` prints the merged config and exits 0 before this step, so a config check writes no record.
+   A refusal in a later step exits after the record, so the record shows the settings that were refused.
+5. If `[auth]` is declared, take the check backend it names.
    `backend` is required and names the socket backend that answers `/check` (`AuthConfig` in `m6-http/src/config.rs`).
-   Step 8 probes it.
-5. Read the generation state.
+   Step 9 probes it.
+6. Read the generation state.
    A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
-6. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
-7. Resolve every URL backend host once.
+7. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
+8. Resolve every URL backend host once.
    A name that does not resolve is exit 2.
-8. Probe every member of the `[auth] backend` pool, when `[auth]` is declared.
+9. Probe every member of the `[auth] backend` pool, when `[auth]` is declared.
    The probe sends one `POST /check` with no credential.
    A 401 or 503 passes, because a checker that refuses or is busy is there.
    A 404 is exit 2, naming the setting, the backend and the socket, because that address is not an auth server.
    A connect failure or a timeout warns and skips that member, so a node can start while its checker is replaced.
    If no member answers 401 or 503 and at least one answered another status, the start is exit 2 and names the backend.
-9. Bind the TLS and QUIC sockets on `[server].bind`.
+10. Bind the TLS and QUIC sockets on `[server].bind`.
    If `h2c_bind` is set, bind the H2C (plain-TCP HTTP/2) listener on that address.
    The listener is internal when `internal_binds` names it, and then accepts only the peers in `internal_peers`.
-10. Start the event loop.
+11. Start the event loop.
 
 With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_core::platform::net::listen_shared`, before the TLS configuration is built.
 With `reuse_port_processes` set, Linux also attaches a socket filter to both that picks the process from the client's source address, so one client always reaches one process.
@@ -260,7 +264,8 @@ A status outside Table 1 is answered to the client and not stored, whatever its 
 | `206` | Never, because the key has no `Range` component and a partial representation would replay as a whole one |
 | Every other 4xx, and every 5xx | Never |
 
-*Table 1: the statuses the cache stores, from RFC 9111 3. A public 404 is stored, a 206 never is, and no 5xx is.*
+**Table 1: the statuses the cache stores, from RFC 9111 3.**
+A public 404 is stored, a 206 never is, and no 5xx is.
 
 Table 1 also decides what reaches the disk cache, because only a stored response is written there.
 
@@ -281,7 +286,8 @@ The endpoint answers three methods, as Table 2 lists.
 | `HEAD` | `[genid] read_require` | The `GET` status and headers, with no body |
 | `POST` | `[genid] write_require` | Runs the change sequence, then `200` with the same shape for the new ID |
 
-*Table 2: the methods `/genid` answers on a source. `GET` and `HEAD` need the read claim, `POST` needs the write claim, and each 200 answer carries the ID in `M6-Genid`.*
+**Table 2: the methods `/genid` answers on a source.**
+`GET` and `HEAD` need the read claim, `POST` needs the write claim, and each 200 answer carries the ID in `M6-Genid`.
 
 All three methods in Table 2 require a loopback peer or an internal listener, checked before any token is read.
 Anyone else gets the 404 an unknown path gets.
@@ -392,7 +398,8 @@ The writer reads each entry again at the slice, so an entry replaced since it wa
 | Files removed per slice | 512 |
 | Total size of the directory | `[limits.cache_bytes] max`, 128 MiB by default |
 
-*Table 3: the bounds on the disk writer. A full queue costs the loop about 1 ms per turn, and a write that would pass the size bound is skipped.*
+**Table 3: the bounds on the disk writer.**
+A full queue costs the loop about 1 ms per turn, and a write that would pass the size bound is skipped.
 
 The disk copy is bounded by the memory cache's size, as the last row of Table 3 says.
 A skipped write is logged once per generation at info.
@@ -431,7 +438,7 @@ A node with a cache directory adds a `disk_cache` object to the metrics line, wi
 | `loaded_entries`, `loaded_bad` | Entries the start-time load inserted, and files it deleted |
 | `state` | `kept`, `discarded`, `unverified` or `none`, and `none` until the first heartbeat answers |
 
-*Table 4: the `disk_cache` fields on the metrics line.*
+**Table 4: the `disk_cache` fields on the metrics line.**
 
 ---
 
@@ -457,7 +464,8 @@ Table 5 gives the three modes.
 | `"internal"` | Status code, m6-http-generated minimal HTML |
 | `"custom"` | Status code, error page fetched from `[errors] path` |
 
-*Table 5: the three `[errors] mode` values and the response each produces. `custom` fetches a page and `internal` generates one.*
+**Table 5: the three `[errors] mode` values and the response each produces.**
+`custom` fetches a page and `internal` generates one.
 
 `[errors] path` is required when `mode = "custom"`.
 Startup validation exits 2 if mode is `"custom"` and path is absent.
@@ -535,17 +543,17 @@ With `[server] reuse_port`, `/health` is answered on the shared port, so the pro
 `[server] process_index` and `[server] status_bind` give every process a status listener of its own, at the `status_bind` port plus the index.
 That listener answers `[health].path` and nothing else, and every other path gets the 404 of a disabled endpoint (`is_status_path` and `status_refusal` in `m6-http/src/main.rs`).
 
-`/health` is the only built-in monitoring endpoint.
+`/health` is the only built-in monitoring endpoint, and a request for `/perf` or `/traffic` is routed like any other path.
 `/genid` is the other path m6-http answers itself, on a node whose system config carries `[genid]` (section 8).
-The metrics document and the traffic summary are log lines, as Table 6 gives, so a monitor reads them from the journal.
+The metrics document and the traffic document are log lines, as Table 6 gives, so a monitor reads them from the journal.
 Table 6 also gives the interval key that writes each line.
 
 | line | `type` | target | `fields.message` | interval key |
 |---|---|---|---|---|
 | the metrics document | `perf` | `m6_http::stats` | `stats` | `[stats].interval_s` |
-| the traffic summary | `traffic` | `m6_http::traffic` | `traffic` | `[stats].traffic_interval_s` |
+| the traffic document | `traffic` | `m6_http::traffic` | `traffic` | `[stats].traffic_interval_s` |
 
-*Table 6: the two monitoring lines and the interval key that writes each.*
+**Table 6: the two monitoring lines and the interval key that writes each.**
 
 Under systemd each line is one datagram with `M6_TYPE` set to `perf` or `traffic`, so `journalctl M6_TYPE=perf` reads the metrics lines without parsing the document.
 The JSON line carries the same word in `type`.
@@ -553,6 +561,8 @@ With `[server] reuse_port`, each process writes its own metrics line to the jour
 
 Each line is one JSON object with `type`, `target` and `fields`.
 `fields.perf` holds the whole metrics document from `perf_document` in `m6-http/src/health.rs`, and `fields.traffic` holds the traffic document from `build_report` in the same file.
+The metrics document holds the request, cache and latency figures, the pool and TLS state, the build as `build.version` (the full SemVer string with its commit), and the host's figures.
+The traffic document summarises the last 60 minutes of requests, described at the end of this section.
 The metrics document is the largest document m6 writes, and `m6-log.md` section 2 gives its recorded size and the log buffer limits.
 The `host` section reports that machine's load, CPU count, memory, disks, interfaces and thermal zones, so a node with more of them writes a longer line.
 
@@ -566,7 +576,8 @@ Table 7 lists the key each monitoring reader selects on.
 | the access reader | `type` `access`, one line per request or monitor poll |
 | a liveness reader | `GET /health`, the public endpoint |
 
-*Table 7: the key each monitoring reader selects on. The two documents are found by `type` and the endpoint by its path.*
+**Table 7: the key each monitoring reader selects on.**
+The two documents are found by `type` and the endpoint by its path.
 
 The traffic line carries the last 60 minutes this process served, from a window it keeps in memory and reads no log file for.
 The window holds at most 32,768 events and is allocated at start.
@@ -591,7 +602,10 @@ Table 8 gives what each signal does to m6-http.
 | `SIGTERM` or `SIGINT` | Stop accepting and exit 0, without waiting for requests in progress | Immediate exit 0 |
 | `SIGUSR1` | Discarded | Discarded |
 
-*Table 8: the signals m6-http handles. A second termination signal exits at once.*
+**Table 8: the signals m6-http handles.**
+A second termination signal exits at once.
+
+A clean exit writes one `type=shutdown` line with the run's `run_id`, its uptime and reason `signal`, and a forced exit on the second signal writes reason `forced` ([`m6-log.md`](m6-log.md) §9).
 
 ---
 
@@ -605,7 +619,8 @@ The process exits with one of three codes, and Table 9 gives each with the failu
 | `1` | Runtime error, including a failed TLS, status or H2C listener bind |
 | `2` | Config or usage error, or a failed QUIC or shared-port bind |
 
-*Table 9: the exit codes m6-http uses. A config error and a QUIC or shared-port bind failure exit 2, and a TLS, status or H2C listener bind failure exits 1.*
+**Table 9: the exit codes m6-http uses.**
+A config error and a QUIC or shared-port bind failure exit 2, and a TLS, status or H2C listener bind failure exits 1.
 
 The bind arms in `m6-http/src/main.rs` carry the split: the UDP socket and `listen_shared` return 2, and the TLS, status and H2C listeners return 1.
 Config validation happens before any listener binds, and `[cache].dir` and `lock_memory` are checked after the listeners are open, so a config error also exits 2 from a node whose listeners are bound.
@@ -697,7 +712,8 @@ m6-http answers it with a cap on counted streams, a decay window that holds a ca
 | `RESET_MEMORY` | 200, twice `MAX_CONCURRENT` | Reset stream ids remembered for the slot count and the closed-stream rule |
 | `MAX_REFUSED_STREAK` | 50 | Consecutive REFUSED_STREAM answers before the connection ends |
 
-*Table 10: the four constants that bound a Rapid Reset flood, all in `m6-http/src/http2.rs`. A peer has at most `MAX_CONCURRENT` streams counted at once whether it finishes or cancels them, and loses the connection after `MAX_REFUSED_STREAK` refusals.*
+**Table 10: the four constants that bound a Rapid Reset flood, all in `m6-http/src/http2.rs`.**
+A peer has at most `MAX_CONCURRENT` streams counted at once whether it finishes or cancels them, and loses the connection after `MAX_REFUSED_STREAK` refusals.
 
 The cap counts started streams, because `active_streams` adds the live `streams` map to the client-initiated ids in `recently_reset` that are younger than `RESET_DECAY`.
 `note_reset` records each reset id with its instant and drops the oldest entry at `RESET_MEMORY` (twice `MAX_CONCURRENT`, so 200 at the cap of 100: derived from the cap so it stays above it whatever the cap is, and so it has no config key of its own).
@@ -734,7 +750,8 @@ The checks live in `pump_stream` in `m6-http/src/h2_client.rs`.
 | `conn_send_window` | 65535 | Every DATA frame | Connection WINDOW_UPDATE |
 | `send_window` | The peer's SETTINGS_INITIAL_WINDOW_SIZE | Every DATA frame on the stream | Stream WINDOW_UPDATE |
 
-*Table 11: the two send windows each backbone client keeps. A DATA frame needs credit in both, so a stream-level grant alone cannot open the connection window.*
+**Table 11: the two send windows each backbone client keeps.**
+A DATA frame needs credit in both, so a stream-level grant alone cannot open the connection window.
 
 `pump_stream` takes `conn_send_window.min(send_window)` as its credit and sends frames no larger than the peer's maximum frame size until the credit or the body runs out.
 A stream with no credit keeps its unsent bytes in `pending_body` and returns.
@@ -769,7 +786,8 @@ Table 12 gives the inbound frames each state allows.
 | HalfClosedRemote | The peer sent END_STREAM | WINDOW_UPDATE, RST_STREAM and PRIORITY |
 | Closed | Both sides finished, or a reset ended the stream | WINDOW_UPDATE and RST_STREAM are tolerated. PRIORITY is always allowed. Other frames are STREAM_CLOSED |
 
-*Table 12: the five live HTTP/2 stream states and the inbound frames each allows. On a closed stream, a frame after a reset is a stream error and a frame after END_STREAM is a connection error.*
+**Table 12: the five live HTTP/2 stream states and the inbound frames each allows.**
+On a closed stream, a frame after a reset is a stream error and a frame after END_STREAM is a connection error.
 
 Two RFC states have no arm in `StreamState`.
 `ReservedLocal` and `ReservedRemote` are commented out in `StreamState`, with the RFC rule kept beside each row.
@@ -806,7 +824,8 @@ One HTTP/2 behaviour is absent from the server today, and Table 13 records it.
 |---|---|---|
 | HTTP/2 error codes | The server sends NO_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, STREAM_CLOSED, FRAME_SIZE_ERROR, REFUSED_STREAM, COMPRESSION_ERROR and ENHANCE_YOUR_CALM. It has no path that sends INTERNAL_ERROR, SETTINGS_TIMEOUT, CANCEL, CONNECT_ERROR, INADEQUATE_SECURITY or HTTP_1_1_REQUIRED. The two backbone clients do send CANCEL. | none, recorded here |
 
-*Table 13: the one HTTP/2 behaviour m6-http does not implement. The server sends no CANCEL or INTERNAL_ERROR, and no issue tracks the gap.*
+**Table 13: the one HTTP/2 behaviour m6-http does not implement.**
+The server sends no CANCEL or INTERNAL_ERROR, and no issue tracks the gap.
 
 ---
 
@@ -851,3 +870,13 @@ m6-http's main dependencies are `quiche` (HTTP/3 and QUIC), `rustls` (TLS), `mat
 The edge decodes no token, so m6-http has no JWT dependency, and `[auth] backend` answers `POST /check` (section 10).
 `quiche` is a fork pinned by revision, and `tools/conformance-scores.txt` records why.
 `m6-architecture.md` gives the reasons behind these mechanisms.
+
+---
+
+## 20. Summary
+
+m6-http is the one process on the public port: it terminates TLS on all three HTTP versions, routes to backend pools, caches by path, query and encoding, and asks `POST /check` at every credential gate.
+It reads its two config files once, writes its start-up record, and refuses to start on any setting it cannot honour.
+While it runs, `/health` and `/genid` are the only paths it answers itself, and the metrics and traffic documents leave as log lines.
+[`m6-site-toml.md`](m6-site-toml.md) gives every key, [`m6-log.md`](m6-log.md) the log stream, and [`m6-architecture.md`](m6-architecture.md) the reasons.
+

@@ -106,7 +106,7 @@ Take from it that m6-http is the only process on a public port, and that every o
                     Unix socket         Unix socket     URL backend
                     (same host)         (same host)     http:// https://
                     /run/m6/*.sock      /run/m6/*.sock  h2c:// h2s://
-                              │              │         (remote / edge node)
+                              │              │         (remote / cache node)
           ┌───────────────────┼──────────────┘
           ▼                   ▼                   ▼
     ┌──────────┐       ┌────────────┐     ┌──────────────┐   ┌─────────────┐
@@ -160,10 +160,10 @@ Table 1 lists the four deployment tiers and the components each one adds.
 | 1 | m6-http + m6-html + m6-file | Static sites. Copy files to deploy. |
 | 2 | Tier 1 + external content tool (e.g. `m6-md`) | Generated static sites. |
 | 3 | Tier 2 + custom renderers | Dynamic sites: forms, APIs, CMSes. Any language. |
-| 4 | Tier 3 × N nodes + URL backends | Global edge fleet. Edge nodes proxy to origin via h2s://. |
+| 4 | Tier 3 × N nodes + URL backends | Global fleet. Cache nodes proxy to the origin via h2s://. |
 
 **Table 1: the four deployment tiers and the components each one adds.**
-Tier 4 repeats tier 3 across N nodes, and each edge node reaches the origin through an `h2s://` URL backend.
+Tier 4 repeats tier 3 across N nodes, and each cache node reaches the origin through an `h2s://` URL backend.
 
 ---
 
@@ -198,52 +198,8 @@ Reverse proxy, cache, and router.
 - The service installs `m6_core::alloc::M6Alloc`, which is mimalloc, and takes its `[limits.heap_reserve]` from the OS once at start (section 6.3)
 
 **Benchmark results:**
-
-Table 2 and Table 3 give the end-to-end results, client-observed, from one recorded run.
-Table 2 gives latency for a cache hit and a cache miss through m6-html over each protocol.
-
-| Protocol | Cache hit p50 | Cache hit p99 | Cache miss p50 |
-|----------|--------------:|--------------:|---------------:|
-| HTTP/1.1 | 679.1–687.8 | 951.4–1,011.0 | 4,797.7–5,063.1 |
-| HTTP/2   | 225.7–259.2 | 318.2–369.9 | 4,096.5–4,159.8 |
-| HTTP/3   | 953.6–983.3 | 1,339.5–1,344.5 | 4,329.3–4,617.0 |
-
-**Table 2: end-to-end latency in microseconds, client-observed, for a cache hit and a cache miss through m6-html.**
-Two consecutive runs on 2026-09-06 on a *VPS* (virtual private server) with 4 vCPU Intel Xeon (Skylake), 7 GB of *RAM* (random access memory) and Ubuntu 26.04.1.
-The measured tree is commit `3204e0f`, built with the release profile.
-TLS is 1.3 through rustls, the client is co-located with the server over loopback at concurrency 2, and each suite took 2,000 latency samples.
-Each cell spans the two runs.
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §5 records all four figures per suite, and §4 the full conditions and the command line.
-
-The client and the server share one host over loopback, so the figures exclude the internet round trip.
-A cache hit is 225.7 to 983.3 µs p50 and a cache miss 4,096.5 to 5,063.1 µs, and HTTP/2 is the fastest hit.
-
-Table 3 gives throughput from the same machine, date and method.
-
-| Protocol | req/s |
-|----------|-------|
-| HTTP/1.1 | 1,889–2,085 |
-| HTTP/2   | 6,711–7,154 |
-| HTTP/3   | 1,030–1,047 |
-
-**Table 3: throughput by protocol at concurrency 2, over two runs on the same 4 vCPU VPS on 2026-09-06.**
-The range spans the two runs, and HTTP/2 carries 3.4 to 3.6 times the requests per second of HTTP/1.1.
-
-At concurrency 8 on a 4-core host two identical runs disagreed by 50x, because the load generator starves the server.
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3 gives that diagnosis, §4 the conditions and §5 the per-percentile figures, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) records what each component costs.
-
-Table 4 gives four Criterion microbenchmarks, which measure CPU cost with no I/O.
-
-| Operation | Median | Notes |
-|-----------|--------|-------|
-| `make_lookup_key` | 10.4 ns | Path, query and encoding into a cache key |
-| `cache_hit` | 21.5 ns | Hash lookup, entry present |
-| `cache_miss` | 14.7 ns | Hash lookup, entry absent |
-| `stats_record` | **0.9 ns** | Per-request counter update |
-
-**Table 4: four m6-http critical-path microbenchmarks.**
-A cache lookup costs 14.7 to 21.5 ns and a stats update 0.9 ns.
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §8 records these four as carried over from an earlier run with no machine and no date.
+An end-to-end HTTP/2 cache hit measured 225.7 to 259.2 µs p50 on a 4 vCPU host over loopback, TLS and the client included, and a cache hit costs about 2.2 µs inside m6.
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §5 gives every protocol's latency and throughput with the conditions, §8 the Criterion microbenchmarks, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) what each component costs.
 
 ---
 
@@ -331,24 +287,7 @@ It supplies the loop parts, routing, configuration, the request dictionary and t
 ### 3.7 m6-auth-cli
 
 Bootstrap and management CLI that operates on the SQLite database directly, with the server running or not.
-
-```
-m6-auth-cli <config> user ls [--json]
-m6-auth-cli <config> user add <username> [--role <role>]... [--password <pw>]
-m6-auth-cli <config> user del <username>
-m6-auth-cli <config> user passwd <username> [--password <pw>]
-m6-auth-cli <config> user roles <username> [--set <role>]... [--unset <role>]...
-m6-auth-cli <config> group ls [--json]
-m6-auth-cli <config> group add <name>
-m6-auth-cli <config> group del <name>
-m6-auth-cli <config> group member ls <group> [--json]
-m6-auth-cli <config> group member add <group> <username>
-m6-auth-cli <config> group member del <group> <username>
-m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>]
-m6-auth-cli <config> token ls <username> [--json]
-m6-auth-cli <config> token revoke <token-id>
-m6-auth-cli <config> sessions revoke-all
-```
+It manages users, roles, groups, API tokens and sessions, and [`docs/m6-auth-cli.md`](docs/m6-auth-cli.md) gives every command.
 
 ---
 
@@ -372,7 +311,7 @@ my-site/
 **Figure 3: the site directory layout.**
 The top two entries are configuration, the middle three are the files a backend serves, and `data/` holds state such as the auth database.
 
-All processes log structured JSON to stdout, which systemd captures through journald.
+Every process writes structured JSON lines to stdout, or to journald's native socket under systemd ([`docs/m6-log.md`](docs/m6-log.md) §5), so a site directory holds no log files.
 
 ---
 
@@ -398,7 +337,7 @@ sockets = "/run/m6/m6-html-*.sock"
 name    = "m6-file"
 sockets = "/run/m6/m6-file-*.sock"
 
-# URL backend: forward to a remote origin or edge node
+# URL backend: forward to a remote origin or cache node
 [[backend]]
 name = "origin"
 url  = "h2s://origin.example.com:443"
@@ -475,14 +414,16 @@ Configure it with a `h2s://` URL backend pointing to the origin.
 Each cache node follows the origin's generation ID, so it flushes its own cache when a publish advances the ID.
 See [Example 09](docs/m6-user-guide.md#10-example-09-global-deployment).
 
-### 6.1 Health and metrics
+### 6.1 Health, logs and the build
 
-`/health` (`[health] path`) has three answers.
-`200` carries a JSON body whose `status` is `ok` and whose `node` is this node's name, and a process with `[server] process_index` set adds `process_index`.
-`503` carries the same body with `status` set to `degraded`.
-A process that is gone, or whose listener refuses, gives no answer.
-The degraded body names the node only, because `/health` is public, and the process logs the failed dependency in a warn line and its recovery in an info line.
-The metrics and traffic documents are log lines of `type` `perf` and `type` `traffic`.
+An operator reads a running node through four things, and each has one owning document.
+
+- **`/health`** answers 200 `ok` or 503 `degraded`, and a process that is gone gives no answer. The degraded body names the node only, because `/health` is public. [`docs/m6-http.md`](docs/m6-http.md) §11 gives both bodies and what each one means.
+- **The log** is one stream of JSON lines, and the `type` key on every line names what it carries: `event`, `perf` (the metrics document), `traffic`, `access`, `startup` and `shutdown`. Under systemd each line is one journal datagram, and `M6_TYPE` carries the same word, so `journalctl M6_TYPE=perf` selects the metrics lines. No endpoint serves the metrics or traffic documents. [`docs/m6-log.md`](docs/m6-log.md) §1 and §5 give the line and the datagram.
+- **The start-up record** is written once at every start: the build, the invocation, the sha256 of every config file, every setting with its source, the host facts and the effective `[limits]`, then one `shutdown` line on a clean exit. [`docs/m6-log.md`](docs/m6-log.md) §9 gives its parts.
+- **The version flags.** Every binary answers `--version` with the tag form, such as `v1.16.0-rc.1`, and `--version-full` with one line per m6 crate it links, commit and dirty flag included. [`CONTRIBUTING.md`](CONTRIBUTING.md) §4.2 gives both forms.
+
+m6-monitor reads all four across a fleet: it polls `/health` and follows the journal, and it checks each start-up record against the environment and the deploy's record ([`docs/m6-monitor.md`](docs/m6-monitor.md) §7.1).
 
 ### 6.2 Publishing a generation
 
@@ -574,12 +515,13 @@ Each item below is enforced by the process that owns that step.
 - Login rate limit: 5 failed attempts per 15 minutes per client address (section 3.4)
 - `site.toml` contains no secrets.
   Secrets live in the system config or a `secrets_file`
+- No secret reaches the log: the start-up record writes `<redacted>` for a `Secret<T>` field, for a value from the secrets file, and for an untyped key whose name holds `password`, `secret`, `token`, `credential` or `private_key` ([`docs/m6-log.md`](docs/m6-log.md) §9)
 
 ---
 
 ## 10. Exit Codes
 
-Table 5 lists the exit codes.
+Table 2 lists the exit codes.
 
 | Code | Meaning |
 |------|---------|
@@ -587,7 +529,7 @@ Table 5 lists the exit codes.
 | 1 | Runtime error, including a configured TLS, status or h2c listener that fails to bind |
 | 2 | Config or usage error, including a QUIC or shared-port bind failure |
 
-**Table 5: the exit codes every m6 process uses.**
+**Table 2: the exit codes every m6 process uses.**
 A failed QUIC or shared-port bind is exit 2, and a failed TLS, status or h2c bind is exit 1 ([`docs/m6-http.md`](docs/m6-http.md) §13).
 
 ---
@@ -595,14 +537,14 @@ A failed QUIC or shared-port bind is exit 2, and a failed TLS, status or h2c bin
 ## 11. RFC compliance
 
 m6 was audited against the HTTP RFCs in September 2026, and `CHANGELOG.md` records each fix and how it was verified.
-Table 6 gives the conformance scores.
+Table 3 gives the conformance scores.
 
 | Tester | Score | Floor |
 |--------|-------|-------|
 | h2spec against m6-http | **146/146** | 146 |
 | h3spec against m6-http | **47/49** | 47 |
 
-**Table 6: h2spec and h3spec scores for m6-http, and the floors CI enforces on every pull request.**
+**Table 3: h2spec and h3spec scores for m6-http, and the floors CI enforces on every pull request.**
 The two h3spec failures are QPACK stream errors in quiche, argued in full in `tools/conformance-scores.txt`.
 
 ### 11.1 Still open
@@ -653,44 +595,47 @@ A hit costs about 2.2 µs inside m6 (`docs/BENCHMARKS.md` §6), so the 103 and t
 m6-http is a single-threaded, in-process-cached, TLS-terminating reverse proxy.
 A cache hit is a hash lookup, a reference-count increment, and an AES-GCM seal.
 
-A cache hit costs **~2.2 µs** inside m6 (its own timer, `hit_p50_ns` on a running server).
-An end-to-end HTTP/2 cache hit on the benchmark host costs **225.7 to 259.2 µs**, TLS, loopback and the client included.
-On that host HTTP/2 answers a cache hit 2.6 to 3 times faster than HTTP/1.1 ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)).
-
 [`docs/POSITIONING.md`](docs/POSITIONING.md) compares m6 with nginx, HAProxy, Envoy, H2O, OpenResty, Varnish and Pingora, with capability columns from each project's own documentation and nothing run like-for-like.
 
 ---
 
 ## 14. Documentation
 
-Table 7 lists every document in [`docs/`](docs/) and what it holds.
+Table 4 lists every document in the repository, grouped by the reader it serves, with the question each one answers.
 
-| Document | Contents |
+| Document | What it answers |
 |---|---|
-| [`docs/m6-architecture.md`](docs/m6-architecture.md) | **Why m6 is built this way.** The question it answers, what it gives up, and the reason behind every design decision |
-| [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | Eleven worked examples, start here |
-| [`docs/m6-app-anatomy.md`](docs/m6-app-anatomy.md) | **How to write one.** The shape every m6 service has, and the four contracts it honours |
-| [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | `site.toml` reference |
-| [`docs/m6-site-layout.md`](docs/m6-site-layout.md) | Laying out a site: one root per app |
-| [`docs/m6-file.md`](docs/m6-file.md) | m6-file static file service reference |
+| **Running a site** | |
+| [`docs/m6-user-guide.md`](docs/m6-user-guide.md) | How to build and run a site, through eleven worked examples from a static site to a global fleet. Start here |
+| [`docs/m6-site-toml.md`](docs/m6-site-toml.md) | Every key of `site.toml` and the system config, and which file owns it |
+| [`docs/m6-site-layout.md`](docs/m6-site-layout.md) | How to lay out a site directory: one root per app |
+| [`docs/m6-http.md`](docs/m6-http.md) | What m6-http does: start-up, pools, routing, the cache, the generation ID, `/health`, signals, exit codes and the HTTP/2 bounds |
+| [`docs/m6-file.md`](docs/m6-file.md) | How m6-file resolves and serves a static file, and what it refuses |
+| [`docs/m6-auth.md`](docs/m6-auth.md) | How m6-auth-server issues tokens and answers `POST /check`, with its config, API and limits |
+| [`docs/m6-auth-cli.md`](docs/m6-auth-cli.md) | Every m6-auth-cli command for users, groups, API tokens and sessions |
+| [`docs/m6-md.md`](docs/m6-md.md) | How m6-md turns a directory of Markdown into one JSON file |
+| [`docs/m6-monitor.md`](docs/m6-monitor.md) | How m6-monitor reads a fleet from `/health` and the journal, and every check it reports |
+| [`docs/m6-log.md`](docs/m6-log.md) | What one m6 process writes: the line, its `type`, the journal datagram and the start-up record |
+| **Writing a backend or a service** | |
 | [`docs/m6-backend-protocol.md`](docs/m6-backend-protocol.md) | The wire contract between m6-http and any backend, in any language |
-| [`docs/m6-backend-examples.md`](docs/m6-backend-examples.md) | Six reference backends in C, C++, Go, Python and Rust, and where each one disagrees with the contract |
+| [`docs/m6-backend-examples.md`](docs/m6-backend-examples.md) | Six reference backends in C, C++, Go, Python and Rust, and where each one departs from the contract |
+| [`docs/m6-app-anatomy.md`](docs/m6-app-anatomy.md) | The shape every m6 service has: its two files, command line, config, limits and lifecycle |
 | [`docs/m6-core-reference.md`](docs/m6-core-reference.md) | Every module in m6-core and its interface |
-| [`docs/m6-log.md`](docs/m6-log.md) | What one m6 process writes, and how a line is built without a writer thread |
-| [`docs/m6-platform.md`](docs/m6-platform.md) | The operating-system layer that lets a service link m6-core alone |
-| [`docs/m6-http.md`](docs/m6-http.md) | m6-http internals |
-| [`docs/m6-auth.md`](docs/m6-auth.md) | m6-auth-server reference |
-| [`docs/m6-auth-cli.md`](docs/m6-auth-cli.md) | m6-auth-cli reference |
-| [`docs/m6-auth-lib.md`](docs/m6-auth-lib.md) | m6-auth library API |
-| [`docs/m6-md.md`](docs/m6-md.md) | m6-md Markdown processor |
-| [`docs/m6-monitor.md`](docs/m6-monitor.md) | m6-monitor reference |
-| [`docs/m6-testing.md`](docs/m6-testing.md) | What checks m6, how to run it, and the h2spec and h3spec procedure |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Raw benchmark numbers, end to end |
-| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | What each component costs, which change changed it, and the conditions every figure was taken under |
-| [`docs/POSITIONING.md`](docs/POSITIONING.md) | Competitive analysis |
+| [`docs/m6-auth-lib.md`](docs/m6-auth-lib.md) | The m6-auth library's API, for a renderer that opens the auth database |
+| [`docs/m6-platform.md`](docs/m6-platform.md) | The operating-system layer, its contracts on Linux and macOS, and how a port is added |
+| **Design and measurement** | |
+| [`docs/m6-architecture.md`](docs/m6-architecture.md) | Why m6 is built this way: the question it answers, what it gives up, and the reason behind each decision |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | What each component costs, which change moved it, and the conditions behind every figure |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | The end-to-end benchmark figures and the method behind them |
+| [`docs/POSITIONING.md`](docs/POSITIONING.md) | How m6-http compares with nginx, HAProxy, Envoy, H2O, OpenResty, Varnish and Pingora |
+| **Changing m6** | |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | The branch model, the checks a merge passes, the version policy and how to read a build's version |
+| [`docs/m6-testing.md`](docs/m6-testing.md) | What checks m6, how to run each check, and the conformance procedure |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release, why, and how it was verified |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability |
 
-**Table 7: every document in `docs/` and what it holds.**
-The user guide runs a site, and the architecture document gives the reasons behind the design.
+**Table 4: every m6 document, by the reader it serves.**
+The user guide runs a site, the app anatomy writes a service, and the architecture document gives the reasons behind both.
 
 ---
 

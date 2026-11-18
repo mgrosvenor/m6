@@ -31,7 +31,9 @@ Figure 1 gives the whole scheme. Take from it that no app root contains another 
   bin/                  custom renderer binaries
 ```
 
-**Figure 1: one root per app, with m6-http given the site root.** Each app reads only the directory it is started with. `configs/` and `bin/` sit outside every app root.
+**Figure 1: one root per app, with m6-http given the site root.**
+Each app reads only the directory it is started with.
+`configs/` and `bin/` sit outside every app root.
 
 An app started on `apps/<app>` does not find `site.toml` by itself, because the file is two levels up.
 Each app's config therefore sets `site_toml = "../../site.toml"`, which resolves against the app root.
@@ -138,7 +140,9 @@ Table 1 separates the two failure modes. Take from it that a wrong glob and a wr
 | wrong glob | the routes never exist |
 | wrong `root` | the routes exist and every request returns 404 |
 
-**Table 1: a wrong glob and a wrong `root` fail differently.** A wrong glob removes the route. A wrong `root` keeps the route and empties the response.
+**Table 1: a wrong glob and a wrong `root` fail differently.**
+A wrong glob removes the route.
+A wrong `root` keeps the route and empties the response.
 
 Neither log says which.
 [`m6-file.md`](m6-file.md) covers the resolution in full.
@@ -157,14 +161,17 @@ That difference decides whether the cache can be warmed.
 `is_warmable` skips any route whose path contains `{`, naming `/assets/{*relpath}` as its example, because a pattern is not a *URL* (Uniform Resource Locator) and there is nothing to fetch.
 A wildcard therefore means static assets are never pre-warmed.
 
-Table 2 gives the cost of a wildcard by deployment size. Take from it that the cost multiplies with the number of edges.
+Table 2 gives the cost of a wildcard by deployment size.
+Take from it that the cost multiplies with the number of cache nodes.
 
 | deployment | cost of a wildcard |
 |---|---|
 | one node | one slow first request per file |
-| edge nodes | one round trip to the origin per file, per edge, paid by the first visitor after a restart |
+| cache nodes | one round trip to the origin per file, per cache node, paid by the first visitor after a restart |
 
-**Table 2: the cost of an unwarmed asset, by deployment.** A single node pays once per file. A fleet with edges pays once per file per edge, after every restart.
+**Table 2: the cost of an unwarmed asset, by deployment.**
+A single node pays once per file.
+A fleet pays once per file per cache node, after every restart.
 
 Use a wildcard only where enumeration is impossible, such as a directory whose contents appear at runtime.
 *ACME* (Automatic Certificate Management Environment) challenge tokens are the clear case, and a short-lived path is one you would not want warmed anyway.
@@ -183,12 +190,12 @@ Every step of that assembly is a step that can half-fail on a live box.
 
 ## 6. Summary
 
-A site running more than one m6 app must give each app its own root directory, because a root is a security boundary rather than a convenience.
+A site running more than one m6 app must give each app its own root directory, because a root is a security boundary.
 One shared root leaves a mail relay password one config line away from a static file server, and splitting the roots costs no config change at all.
 m6-http is the single exception, because it serves nothing from disk and its job is to see the tree.
 Two traps remain: a glob and its file are resolved by different processes, and a wildcard route silently disables cache warming.
 
-Related reading:
+Table 3 gives the related reading.
 
 | document | covers |
 |---|---|
