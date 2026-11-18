@@ -22,8 +22,22 @@ use std::time::{Duration, Instant};
 use m6_platform::{self as platform, net, process, Events, Interest, Poll, Token};
 
 /// One bounded wait: what is ready after at most `wait`.
+///
+/// The layer passes `Interrupted` up, and a loop waits again for what is left
+/// (see `Poll::poll`). On Linux a child that exits while another thread is
+/// inside `fork` (every test here runs on its own thread, and `fork` blocks
+/// all signals around itself) leaves a pending `SIGCHLD` that wakes a
+/// different thread's `epoll_wait` with `EINTR`, though no handler is
+/// installed. So the wait is retried for the time that remains.
 fn ready(poll: &mut Poll, events: &mut Events, wait: Duration) -> Vec<(Token, bool, bool)> {
-    poll.poll(events, Some(wait)).expect("poll");
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match poll.poll(events, Some(left)) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            done => break done.expect("poll"),
+        }
+    }
     events
         .iter()
         .map(|ev| (ev.token(), ev.is_readable(), ev.is_writable()))
