@@ -890,6 +890,17 @@ impl Http2Conn {
     }
 
     fn flush_io(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        // A frame refused at the `h2_send` maximum left the queue without a
+        // whole frame, so nothing more may be sent: the connection closes.
+        // Only a peer that stops reading while it asks for more gets here.
+        if let Some(needed) = self.send_buf.overflow() {
+            let refusal = self
+                .send_buf
+                .limit()
+                .exceeded(needed, "an HTTP/2 connection's output");
+            error!("{refusal}");
+            return Err(io::Error::other(refusal));
+        }
         match io {
             H2Io::Tls { tls, stream } => {
                 // Write send_buf to rustls in a loop, draining encrypted records to the
@@ -2995,10 +3006,14 @@ pub(crate) fn append_frame(
     head[3] = ftype;
     head[4] = flags;
     head[5..9].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-    // The `h2_send` maximum is above any frame the flusher can build: the
-    // pacing mark stops it below `start` and `max` is far above one frame.
-    debug_assert!(send_buf.put(&head), "an h2 frame header fits the send area");
-    debug_assert!(send_buf.put(payload), "an h2 frame fits the send area");
+    // The pacing mark keeps DATA below the `h2_send` start, but HEADERS and
+    // control frames are not paced, so a peer that never reads can fill the
+    // area to its maximum. A refused write is recorded in the area itself
+    // (`Bounded::overflow`) and the connection's next flush closes it, see
+    // `Http2Conn::flush_io`. The payload is not written after a refused head.
+    if send_buf.put(&head) {
+        send_buf.put(payload);
+    }
 }
 
 fn setting_bytes(buf: &mut Vec<u8>, id: u16, val: u32) {
@@ -5641,6 +5656,22 @@ mod tests {
             DEFAULT_MAX_FRAME as usize,
             "one pass frames one frame"
         );
+    }
+
+    /// `append_frame` writes the frame in every build profile. It once wrote
+    /// both halves inside a debug assertion, which a release build compiles
+    /// out, so the shipped binary sent no HTTP/2 frame at all. Run under
+    /// `cargo test --release` this is the test that catches it.
+    #[test]
+    fn append_frame_writes_the_frame_in_every_profile() {
+        use m6_core::limits::{Bounded, Limit, H2_SEND};
+
+        let mut buf: Bounded<u8> = Bounded::new(&Limit::custom(&H2_SEND, 64, 1024));
+        append_frame(&mut buf, TYPE_PING, 0, 0, &[7; 8]);
+        assert_eq!(buf.len(), FRAME_HDR + 8, "the frame was not written");
+        assert_eq!(u24_be(&buf[0..3]), 8);
+        assert_eq!(buf[3], TYPE_PING);
+        assert_eq!(&buf[FRAME_HDR..], &[7; 8]);
     }
 
     /// The bound frames one queue per pass, so a connection whose socket takes

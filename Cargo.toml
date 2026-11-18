@@ -128,3 +128,14 @@ debug = 1
 
 [profile.alloc-attribution.package."*"]
 debug = 1
+
+# The dev profile with debug assertions off, as in a release build. A
+# `debug_assert!` argument is compiled out of a release binary, so a write
+# inside one runs in every dev-profile test and never in production. HTTP/2's
+# frame writer did that and the release build sent no frame at all. CI's
+# conformance job builds this profile and runs h2spec and the HTTP/2 unit tests
+# against it, at dev-profile build speed, without the fat-LTO release build.
+[profile.release-asserts]
+inherits = "dev"
+debug-assertions = false
+overflow-checks = true

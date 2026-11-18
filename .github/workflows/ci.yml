@@ -550,6 +550,19 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           ./tools/conformance.sh
 
+      # Debug assertions off, as in a release build. Everything above runs the
+      # dev profile, where a `debug_assert!` argument runs. A write inside one
+      # vanishes from a release binary, and HTTP/2's frame writer once did that:
+      # the shipped m6-http sent no HTTP/2 frame while every dev-profile check
+      # passed. The `release-asserts` profile is the dev profile with debug
+      # assertions off, so this costs a dev-speed build, not a fat-LTO one.
+      - name: HTTP/2 without debug assertions
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo build --workspace --bins --profile release-asserts
+          cargo test -p m6-http --lib --profile release-asserts http2
+          M6_BIN_DIR="$PWD/target/release-asserts" ./tools/conformance.sh h2
+
   dependencies:
     name: advisories, licences, duplicates
     runs-on: ubuntu-latest
