@@ -1229,13 +1229,21 @@ mod sockets {
             .deregister_fd(first.as_raw_fd())
             .expect("deregister first");
         drop(first);
+        // A child another test thread has forked and not yet exec'd holds a
+        // copy of the stopped socket, and the kernel still hashes a datagram
+        // to it, where nobody reads. So send until one arrives at `second`.
         let client = std::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("client socket");
-        client
-            .send_to(b"after", addr)
-            .expect("send after one socket stopped");
-        let waits = ready(&mut poll, &mut events, SOON);
-        assert!(!waits.is_empty(), "the port is dead after the stop");
+        let deadline = Instant::now() + SOON;
+        loop {
+            client
+                .send_to(b"after", addr)
+                .expect("send after one socket stopped");
+            if !ready(&mut poll, &mut events, QUIET).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the port is dead after the stop");
+        }
         drain(&second, "second", &mut got);
         assert_eq!(
             got.last().map(String::as_str),
