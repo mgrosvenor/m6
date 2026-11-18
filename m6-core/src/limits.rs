@@ -755,7 +755,7 @@ impl std::ops::Deref for Bounded<u8> {
 
 impl std::ops::DerefMut for Bounded<u8> {
     fn deref_mut(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
+        self.items.as_mut_slices().0
     }
 }
 
@@ -765,11 +765,6 @@ impl Bounded<u8> {
         let (bytes, rest) = self.items.as_slices();
         debug_assert!(rest.is_empty(), "a byte area is kept in one piece");
         bytes
-    }
-
-    /// The written bytes, for a writer that fills them in place.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.items.as_mut_slices().0
     }
 
     /// Append `bytes`. Returns false, having recorded the size needed, when

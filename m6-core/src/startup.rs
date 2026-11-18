@@ -211,13 +211,6 @@ pub fn run_id() -> RunId {
     *RUN.get_or_init(RunId::now)
 }
 
-/// The run id if a record has been written, for a caller that must not create
-/// one. [`shutdown`] uses this so a process that never wrote a startup record
-/// writes no shutdown line either.
-pub fn current_run_id() -> Option<RunId> {
-    RUN.get().copied()
-}
-
 fn unix_millis(now: std::time::SystemTime) -> u64 {
     now.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -330,12 +323,6 @@ impl Section {
             settings: BTreeMap::new(),
             file: None,
         }
-    }
-
-    /// Say which config file this table came from.
-    pub fn in_file(mut self, file: impl Into<String>) -> Section {
-        self.file = Some(file.into());
-        self
     }
 
     /// Add one key.
@@ -1005,11 +992,6 @@ impl Record {
         self
     }
 
-    /// The config files that were read.
-    pub fn trace_files(&self) -> &[ConfigFile] {
-        self.trace.files()
-    }
-
     /// The sections, for a test that compares two records.
     pub fn recorded_sections(&self) -> &[Section] {
         &self.sections
@@ -1226,21 +1208,6 @@ pub fn write_shutdown_into(
         .str("reason", reason)
         .str("message", "shutdown")
         .end();
-}
-
-/// The uptime the shutdown line would report, for a test.
-pub fn uptime_ms() -> Option<u64> {
-    let _ = IDENTITY.get()?;
-    Some(
-        STARTED
-            .get()
-            .map_or(0, |started| started.elapsed().as_millis() as u64),
-    )
-}
-
-/// Whether a startup record has been written in this process.
-pub fn recorded() -> bool {
-    IDENTITY.get().is_some()
 }
 
 // ── Turning an effective config into sections ───────────────────────────────
