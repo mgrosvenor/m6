@@ -211,7 +211,8 @@ fn priority(level: Level) -> &'static [u8] {
     }
 }
 
-/// The type of one line, read from its last key.
+/// The type of one line, read from its last key, and `event` for a line
+/// some other writer handed the Sink.
 ///
 /// [`crate::Line::end`] writes `,"type":"<word>"}` and a newline last, so the
 /// word is found by walking back from the end. Reading the tail this way
@@ -229,18 +230,13 @@ fn kind_of(line: &[u8]) -> Type {
         return Type::Event;
     };
     let (key, word) = (&body[..quote], &body[quote + 1..]);
-    if word.is_empty() || !key.ends_with(b",\"type\":") {
+    if !key.ends_with(b",\"type\":") {
         return Type::Event;
     }
-    match word {
-        b"perf" => Type::Perf,
-        b"access" => Type::Access,
-        b"traffic" => Type::Traffic,
-        b"startup" => Type::Startup,
-        b"shutdown" => Type::Shutdown,
-        b"event" => Type::Event,
-        _ => Type::Event,
-    }
+    Type::ALL
+        .into_iter()
+        .find(|kind| kind.text().as_bytes() == word)
+        .unwrap_or(Type::Event)
 }
 
 /// The level and the type of one line, read from the bytes m6-log wrote.
@@ -254,25 +250,15 @@ fn header(line: &[u8]) -> (Level, Type) {
     /// 11, so the level word starts at 52.
     const LEVEL_AT: usize = 14 + 27 + 11;
     let prefix = b"{\"timestamp\":\"";
-    let level = if line.starts_with(prefix) {
-        match line.get(LEVEL_AT..).and_then(|rest| {
-            ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
+    let level = line
+        .strip_prefix(prefix.as_slice())
+        .and_then(|_| line.get(LEVEL_AT..))
+        .and_then(|rest| {
+            Level::ALL
                 .into_iter()
-                .position(|word| rest.starts_with(word.as_bytes()))
-                .map(|index| index as u8)
-        }) {
-            Some(index) => [
-                Level::Error,
-                Level::Warn,
-                Level::Info,
-                Level::Debug,
-                Level::Trace,
-            ][index as usize],
-            None => Level::Info,
-        }
-    } else {
-        Level::Info
-    };
+                .find(|level| rest.starts_with(level.text().as_bytes()))
+        })
+        .unwrap_or(Level::Info);
     (level, kind_of(line))
 }
 

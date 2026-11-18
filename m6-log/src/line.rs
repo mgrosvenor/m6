@@ -46,6 +46,17 @@ pub enum Type {
 }
 
 impl Type {
+    /// Every type, for a reader that maps the written word back through
+    /// [`Type::text`].
+    pub const ALL: [Type; 6] = [
+        Type::Event,
+        Type::Perf,
+        Type::Access,
+        Type::Traffic,
+        Type::Startup,
+        Type::Shutdown,
+    ];
+
     /// The word written to the line's `type` key.
     pub fn text(self) -> &'static str {
         match self {
@@ -76,6 +87,16 @@ pub enum Level {
 }
 
 impl Level {
+    /// Every level, most severe first, for a reader that maps the written
+    /// word back through [`Level::text`].
+    pub const ALL: [Level; 5] = [
+        Level::Error,
+        Level::Warn,
+        Level::Info,
+        Level::Debug,
+        Level::Trace,
+    ];
+
     /// The word written to the line's `level` key.
     pub fn text(self) -> &'static str {
         match self {
