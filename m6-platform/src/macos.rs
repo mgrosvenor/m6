@@ -463,67 +463,37 @@ pub(super) fn host_virtualization() -> Fact<String> {
     }
 }
 
-/// A `sysctl` string value at `name`.
-fn sysctl_string(name: &str) -> Option<String> {
-    let name = std::ffi::CString::new(name).ok()?;
-    let mut size: nix::libc::size_t = 0;
-    // SAFETY: the name is a live C string. A null old value and zero old length
-    // ask only for the size, and the call writes nothing.
-    let rc = unsafe {
-        nix::libc::sysctlbyname(
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size == 0 {
-        return None;
-    }
-    let mut bytes = vec![0u8; size];
-    // SAFETY: `bytes` has exactly the size the call just asked for, and the
-    // call writes at most `size` bytes into it.
-    let rc = unsafe {
-        nix::libc::sysctlbyname(
-            name.as_ptr(),
-            bytes.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    bytes.truncate(size);
-    while bytes.last() == Some(&0) {
-        bytes.pop();
-    }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+/// The value at `name`, through the `sysctl` crate.
+fn sysctl_value(name: &str) -> Option<sysctl::CtlValue> {
+    use sysctl::Sysctl;
+    sysctl::Ctl::new(name).and_then(|c| c.value()).ok()
 }
 
-/// A `sysctl` `u64` value at `name`.
+/// A `sysctl` string value at `name`.
+fn sysctl_string(name: &str) -> Option<String> {
+    match sysctl_value(name)? {
+        sysctl::CtlValue::String(s) => Some(s.trim_end_matches('\0').to_string()),
+        _ => None,
+    }
+}
+
+/// A `sysctl` unsigned value at `name`, whatever width the OID has.
 fn sysctl_u64(name: &str) -> Option<u64> {
-    let name = std::ffi::CString::new(name).ok()?;
-    let mut value: u64 = 0;
-    let mut size = std::mem::size_of::<u64>();
-    // SAFETY: `value` is a live `u64` and `size` is its size in bytes. The
-    // kernel writes a value of the OID's own width, which for these names is
-    // 8 bytes.
-    let rc = unsafe {
-        nix::libc::sysctlbyname(
-            name.as_ptr(),
-            (&mut value as *mut u64).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0).then_some(value)
+    match sysctl_value(name)? {
+        sysctl::CtlValue::U64(n) | sysctl::CtlValue::Ulong(n) => Some(n),
+        sysctl::CtlValue::Uint(n) => Some(u64::from(n)),
+        sysctl::CtlValue::S64(n) | sysctl::CtlValue::Long(n) => u64::try_from(n).ok(),
+        sysctl::CtlValue::Int(n) => u64::try_from(n).ok(),
+        _ => None,
+    }
 }
 
 /// A `sysctl` `i32` value at `name`.
+///
+/// A raw `sysctlbyname`, where the others go through the `sysctl` crate. The
+/// crate checks the OID's flags before it reads, and it refuses
+/// `kern.hv_vmm_present` with `NoReadAccess` on macOS 26 although the kernel
+/// answers the read.
 fn sysctl_i32(name: &str) -> Option<i32> {
     let name = std::ffi::CString::new(name).ok()?;
     let mut value: i32 = 0;
@@ -544,24 +514,9 @@ fn sysctl_i32(name: &str) -> Option<i32> {
 /// The seconds since the epoch of a `struct timeval` sysctl, such as
 /// `kern.boottime`.
 fn sysctl_timeval(name: &str) -> Option<u64> {
-    let name = std::ffi::CString::new(name).ok()?;
-    let mut value: nix::libc::timeval = nix::libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut size = std::mem::size_of::<nix::libc::timeval>();
-    // SAFETY: `value` is a live `timeval` and `size` is its size in bytes.
-    let rc = unsafe {
-        nix::libc::sysctlbyname(
-            name.as_ptr(),
-            (&mut value as *mut nix::libc::timeval).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
+    use sysctl::Sysctl;
+    let value = sysctl::Ctl::new(name)
+        .and_then(|c| c.value_as::<nix::libc::timeval>())
+        .ok()?;
     u64::try_from(value.tv_sec).ok()
 }
