@@ -180,66 +180,52 @@ pub struct HealthReport {
     pub node: String,
 }
 
-/// What is running: the binary's name, its version, and a hash of its bytes.
+/// What is running: the binary's name and the full version it was built from.
 ///
-/// **A hash alone is not an identity.** That was the first shape of #105 and it
-/// was wrong: an opaque number on its own could be a hash of anything, and a
-/// reader who sees two of them differ learns that something differs, not what.
-/// Keyed to the name and the version it becomes the answer to a question an
-/// operator actually asks, which is "what is this node running".
-///
-/// The three carry different information and none is redundant:
+/// The two carry different information and neither is redundant:
 ///
 /// - `name` says WHICH binary. A node runs several, and "the node is on 1.10.0"
 ///   has never been one fact. A fleet can have m6-http and its renderers built
 ///   from different trees, and before this nothing could express that.
-/// - `version` says which release it claims to be. It is what an operator reads
-///   and what release notes are written against.
-/// - `hash` says which BUILD it actually is. Rust is not byte-reproducible, so
-///   one tag built twice gives two binaries reporting one version. Two nodes
-///   can then agree on a version and run different bytes, and only the hash
-///   shows it.
+/// - `version` is the full SemVer 2.0.0 string with build metadata, for example
+///   `1.16.0-rc.1+abc123def456` or `1.16.0-rc.1+abc123def456.dirty`. The part
+///   before the `+` is the release an operator reads and release notes are
+///   written against. The build metadata is the commit the binary was built
+///   from, so one tag built twice reports two different strings. Rust is not
+///   byte-reproducible, and this is the difference a release tag alone cannot
+///   show.
 ///
-/// `hash` and not `md5`: the algorithm is how the value is produced, not what it
-/// means, and naming the field after it makes changing it a wire break for every
-/// reader. It IS md5 today, because that is the number the surrounding tooling
-/// already compares: a deployment records md5 per node and refuses a promotion
-/// when two nodes disagree. A second hash of the same bytes under another
-/// algorithm would give an operator two numbers and answer nothing.
+/// Both come from compile-time constants, so reporting them reads no file. The
+/// commit comes from the build script's `git rev-parse --short=12 HEAD`, and a
+/// source tarball with no git reports `unknown`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildId {
-    /// The binary's own name, e.g. `"m6-http"`, from its crate at compile time.
+    /// The binary's own name, e.g. `"m6-http"`, from the running executable.
     pub name: String,
-    /// The m6 release this was built against. Same value, and the same
-    /// reasoning, as the `version` field this replaced.
+    /// The m6 release this was built against, as full SemVer with build
+    /// metadata. Same reasoning as the `version` field always had, plus the
+    /// commit the hash used to carry.
     pub version: String,
-    /// Hex md5 of the running executable. Empty when it could not be read, which
-    /// the monitor renders as unknown and counts as drift rather than agreement.
-    pub hash: String,
 }
 
 /// This process's own [`BuildId`], computed once.
 ///
-/// Computed once and cached for the life of the process, which is correct and
-/// not merely cheap: a deploy replaces the file on disk while this process keeps
-/// running the bytes it started with, and the bytes it started with are the
-/// honest answer to "what is serving". Re-reading per request would report the
-/// NEW binary while still running the old one, which is exactly the lie this is
-/// here to prevent.
+/// The version is m6-core's build-time identity, which is the m6 release: for
+/// the workspace binaries that is their own version, and for a service linking
+/// core from a git tag it is that tag, which is the more useful answer for a
+/// service whose own version says nothing about which m6 it is built against.
+/// The commit in its build metadata is what tells two builds of one tag apart.
 ///
 /// The name comes from the running executable rather than from a compile-time
 /// constant, because the constant available to a library is m6-core's own name
-/// and the answer wanted is the binary's. The version is m6-core's, which is the
-/// m6 release: for the workspace binaries that is their own version, and for a
-/// service linking core from a git tag it is that tag, which is the more useful
-/// answer for a service whose own version says nothing about which m6 it is
-/// built against.
+/// and the answer wanted is the binary's. The read is cached for the life of the
+/// process so the periodic metrics document does not pay for it, and the name
+/// reported is the binary that started rather than whatever file a deploy put at
+/// that path afterwards.
 ///
 /// The serving binary calls this once with its other start-time constants,
 /// before any listener binds, so the periodic metrics document never pays for
-/// the read. A lazily cached constant costs whichever code path asks first, and
-/// after the metrics document moved onto the periodic line that path was the
-/// first accounting tick.
+/// the read.
 pub fn build_id() -> &'static BuildId {
     static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| BuildId {
@@ -247,46 +233,8 @@ pub fn build_id() -> &'static BuildId {
             .ok()
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_default(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        hash: executable_md5(),
+        version: crate::build_info::identity().full(),
     })
-}
-
-/// Hex md5 of this process's own executable, or empty if it cannot be read.
-///
-/// Read in chunks rather than with `fs::read`, which would allocate the whole
-/// binary: m6-http is tens of megabytes and this runs on a 1 cpu node with the
-/// event loop about to start.
-///
-/// Empty on any failure, which is a real possibility under confinement and must
-/// never take the metrics document down: a node that cannot say what it is
-/// running is still a node that can report its latency. The monitor reads an
-/// empty hash as unknown and counts it as drift rather than as agreement.
-fn executable_md5() -> String {
-    use md5::{Digest, Md5};
-    use std::io::Read;
-
-    let Ok(path) = std::env::current_exe() else {
-        return String::new();
-    };
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let mut hasher = Md5::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // A partial read is worse than none: it produces a
-            // plausible-looking hash of a prefix, which compares unequal
-            // across two nodes running identical binaries and reports drift
-            // that is not there.
-            Err(_) => return String::new(),
-        }
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 impl HealthReport {
@@ -379,18 +327,22 @@ pub struct PerfReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_index: Option<u32>,
     pub node: String,
-    /// What this node is running: name, version and build hash.
+    /// What this node is running: the binary's name and the full version it was
+    /// built from.
     ///
-    /// [`BuildId`] says why the three fields differ and why the hash is md5.
-    /// The version stays because without one the only way to learn what a node
-    /// runs was to ssh in and ask the binary, so "every node runs the pinned
-    /// release" was an invariant nothing could check. Four written records
-    /// can disagree about one fleet with none of them matching it: a deploy
-    /// repository pinning one tag, its captured config naming that tag with an
-    /// artefact hash matching nothing running, a release log naming an older
-    /// tag, and every node serving a fourth. No node has to be faulty for that.
-    /// Nothing can observe the truth, so the records rot without anyone being
-    /// wrong on purpose.
+    /// [`BuildId`] says why the two fields differ. The version stays because
+    /// without one the only way to learn what a node runs was to ssh in and ask
+    /// the binary, so "every node runs the pinned release" was an invariant
+    /// nothing could check. Four written records can disagree about one fleet
+    /// with none of them matching it: a deploy repository pinning one tag, its
+    /// captured config naming that tag with an artefact hash matching nothing
+    /// running, a release log naming an older tag, and every node serving a
+    /// fourth. No node has to be faulty for that. Nothing can observe the truth,
+    /// so the records rot without anyone being wrong on purpose.
+    ///
+    /// The commit in the version string's build metadata is what tells two
+    /// builds of one tag apart. It is fixed at compile time, so this payload
+    /// costs no file read.
     ///
     /// `serde(default)` so a node older than this change deserialises to an empty
     /// `BuildId` instead of making the whole payload unparseable to an
@@ -638,10 +590,9 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
     }
 
-    /// The build identity reaches the wire, whole. An aggregator cannot report
-    /// drift it never receives, and each of the three parts answers a different
-    /// question: which binary, which release it claims to be, which build it
-    /// actually is.
+    /// The build identity reaches the wire, whole, and the commit travels in
+    /// the version string's build metadata. An aggregator cannot report drift it
+    /// never receives, and a release tag alone cannot tell two builds apart.
     #[test]
     fn the_report_carries_the_running_build_identity() {
         let out = PerfReport::build_authorised(
@@ -658,11 +609,37 @@ mod tests {
         let (code, _, body) = out.into_response();
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["build"]["version"].as_str(),
-            Some(env!("CARGO_PKG_VERSION"))
+        let version = v["build"]["version"].as_str().expect("a version");
+        let parsed = semver::Version::parse(version).expect("the full form must be SemVer 2.0.0");
+        let expected =
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("workspace version is SemVer");
+        assert_eq!(parsed.major, expected.major);
+        assert_eq!(parsed.minor, expected.minor);
+        assert_eq!(parsed.patch, expected.patch);
+        assert_eq!(parsed.pre, expected.pre, "the release part is the tag");
+
+        // The metadata is the commit the build script read, and a source
+        // tarball has no git and says `unknown`. A dirty build appends
+        // `.dirty`. Any other shape means the version string is malformed.
+        let metadata = parsed.build.as_str();
+        let mut parts = metadata.split('.');
+        let commit = parts.next().expect("build metadata is not empty");
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 12 && commit.chars().all(|c| c.is_ascii_hexdigit())),
+            "build metadata {metadata:?} must start with a twelve-character commit or `unknown`"
         );
-        assert!(!v["build"]["version"].as_str().unwrap().is_empty());
+        assert!(
+            parts.next().is_none_or(|rest| rest == "dirty") && parts.next().is_none(),
+            "build metadata {metadata:?} is the commit with an optional `.dirty`"
+        );
+
+        // The hash field is gone from the wire, not merely empty. A reader that
+        // still expects it is reading a document no node sends.
+        assert!(
+            v["build"].get("hash").is_none(),
+            "the executable hash must not be on the wire: {version:?}"
+        );
 
         // The name is the RUNNING binary's, not m6-core's. A library cannot
         // know the binary's name at compile time, so this reads the executable,
@@ -674,46 +651,36 @@ mod tests {
             "the name must come from the running executable, not from the \
              library's own CARGO_PKG_NAME: every service would report m6-core"
         );
-
-        // The hash is the md5 of this very binary. Checked against a hash taken
-        // here rather than against a constant, which would pin whatever the
-        // code produced on the day and prove only that it has not changed.
-        // This is the property that makes the field worth having: it must equal
-        // `md5sum` of the artefact.
-        use md5::{Digest, Md5};
-        let exe = std::env::current_exe().expect("a test binary has a path");
-        let expected = format!("{:x}", Md5::digest(std::fs::read(&exe).unwrap()));
-        assert_eq!(v["build"]["hash"].as_str(), Some(expected.as_str()));
-        assert_eq!(expected.len(), 32, "hex md5 is 32 characters");
     }
 
-    /// Two builds of one tag report the same version and different hashes. That
-    /// is the whole reason the hash is there, so it is asserted rather than
-    /// assumed: a version comparison cannot see this and a hash comparison can.
+    /// Two builds of one tag report the same release and different commits.
+    /// That is the whole reason the build metadata is there, so it is asserted
+    /// rather than assumed: comparing the release tag alone cannot see this and
+    /// comparing the metadata can.
     ///
-    /// Simulated by hashing two different byte strings, because the real case
-    /// needs two compilations of one source and Rust gives no way to force that
-    /// in a unit test. What is being pinned is the CLAIM: same version, different
-    /// bytes, and only the hash distinguishes them.
+    /// The real case needs two compilations of one source, so the claim is
+    /// pinned on the strings a build script produces.
     #[test]
-    fn one_version_two_builds_differ_only_in_the_hash() {
-        use md5::{Digest, Md5};
+    fn one_version_two_builds_differ_only_in_the_build_metadata() {
         let a = BuildId {
             name: "m6-http".into(),
-            version: "1.10.0".into(),
-            hash: format!("{:x}", Md5::digest(b"build one")),
+            version: "1.16.0-rc.1+aaaaaaaaaaaa".into(),
         };
         let b = BuildId {
-            hash: format!("{:x}", Md5::digest(b"build two")),
+            version: "1.16.0-rc.1+bbbbbbbbbbbb".into(),
             ..a.clone()
         };
 
-        assert_eq!(a.version, b.version, "same tag");
+        assert_eq!(
+            a.version.split('+').next(),
+            b.version.split('+').next(),
+            "same tag"
+        );
         assert_eq!(a.name, b.name, "same binary");
-        assert_ne!(a.hash, b.hash, "different bytes");
+        assert_ne!(a.version, b.version, "different commits");
         assert_ne!(
             a, b,
-            "a fleet holding these two is NOT uniform, and comparing versions \
+            "a fleet holding these two is NOT uniform, and comparing the tag \
              alone would call it uniform."
         );
     }
@@ -1405,8 +1372,7 @@ mod perf_line_size_tests {
             node: "edge-b-with-a-long-name".to_string(),
             build: BuildId {
                 name: "m6-http".to_string(),
-                version: "1.15.0".to_string(),
-                hash: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+                version: "1.15.0+0123456789ab".to_string(),
             },
             uptime_s: u64::MAX,
             pools: ["m6-html", "m6-file", "render-cms"]

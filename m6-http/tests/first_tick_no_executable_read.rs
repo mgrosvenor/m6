@@ -1,17 +1,11 @@
-//! The first accounting tick reads no executable.
+//! The build identity on the first metrics tick is fixed at compile time.
 //!
-//! The build identity's hash is the md5 of the bytes the process started from,
-//! so it is a start-time constant. It used to be computed by whichever code
-//! path asked first. After the metrics document moved onto the periodic line
-//! that path became the first tick, one interval after start, which read the
-//! whole binary inside the serving loop.
-//!
-//! This test proves the placement without a timer. It runs its own copy of
-//! `m6-http`, removes that copy once the listener is up, then waits for the
-//! first metrics line. The line must still carry a full 32-character hash. A
-//! tick that computed the hash would find the file gone and report an empty
-//! hash, so the assertion pins the read to start-up. It stays true when the
-//! binary doubles in size, and it does not measure a duration.
+//! The identity used to be the md5 of the bytes the process started from, read
+//! once at start. This test still proves the placement without a timer. It runs
+//! its own copy of `m6-http`, removes that copy once the listener is up, then
+//! waits for the first metrics line. The line must carry the full SemVer with
+//! the commit in its build metadata. The executable those bytes would have come
+//! from is gone, so this pins the identity to compile-time constants.
 
 #![allow(
     clippy::disallowed_methods,
@@ -58,16 +52,14 @@ fn system_toml(dir: &Path, port: u16) -> String {
 /// first tick cannot fire before the executable is removed.
 const FIRST_TICK_SECS: u64 = 10;
 
-/// The first metrics line's `build.hash`, once one exists.
-fn first_perf_hash(output: &str) -> Option<String> {
+/// The first metrics line's `build` object, once one exists.
+fn first_perf_build(output: &str) -> Option<serde_json::Value> {
     for line in output.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if v["type"] == "perf" {
-            return v["fields"]["perf"]["build"]["hash"]
-                .as_str()
-                .map(str::to_string);
+            return Some(v["fields"]["perf"]["build"].clone());
         }
     }
     None
@@ -111,9 +103,10 @@ fn the_first_tick_reads_no_executable() {
     assert!(!copy.exists(), "the executable must be gone");
 
     // A line written before the removal would make this test prove nothing:
-    // the hash could have been computed then and reported later. Under the
-    // ten-second interval the first tick cannot have come yet, and if start-up
-    // ever takes that long this assertion says so instead of passing vacuously.
+    // the identity could have been read from the file then and reported later.
+    // Under the ten-second interval the first tick cannot have come yet, and if
+    // start-up ever takes that long this assertion says so instead of passing
+    // vacuously.
     assert_eq!(
         perf_lines(&service.output()),
         0,
@@ -122,32 +115,46 @@ fn the_first_tick_reads_no_executable() {
     );
 
     let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
-    let mut hash = None;
+    let mut build = None;
     while Instant::now() < deadline {
         service.assert_alive("waiting for the first metrics line");
-        hash = first_perf_hash(&service.output());
-        if hash.is_some() {
+        build = first_perf_build(&service.output());
+        if build.is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let hash = hash.unwrap_or_else(|| {
+    let build = build.unwrap_or_else(|| {
         panic!(
             "the first metrics line never appeared\n--- output ---\n{}",
             service.output()
         )
     });
-    assert_eq!(
-        hash.len(),
-        32,
-        "the first metrics line's build hash must be the md5 the process computed \
-         at start-up, and an empty or short hash means a tick read an executable \
-         that is no longer there\n--- output ---\n{}",
+    let version = build["version"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the first metrics line's build must carry a version string\n--- output ---\n{}",
+            service.output()
+        )
+    });
+    let (_, metadata) = version.split_once('+').unwrap_or_else(|| {
+        panic!(
+            "build version {version:?} must carry the commit in its build metadata\
+             \n--- output ---\n{}",
+            service.output()
+        )
+    });
+    let commit = metadata.split('.').next().expect("metadata is not empty");
+    assert!(
+        commit == "unknown"
+            || (commit.len() == 12 && commit.chars().all(|c| c.is_ascii_hexdigit())),
+        "build metadata {metadata:?} must start with a twelve-character commit or `unknown`\
+         \n--- output ---\n{}",
         service.output()
     );
     assert!(
-        hash.chars().all(|c| c.is_ascii_hexdigit()),
-        "build hash {hash:?} is not hex"
+        build.get("hash").is_none(),
+        "the executable hash must not be on the wire\n--- output ---\n{}",
+        service.output()
     );
 }

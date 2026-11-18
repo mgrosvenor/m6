@@ -48,7 +48,7 @@ The released versions, newest first:
 The workspace version moves to `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
 The start-up and shutdown recovery record is in the same release.
 The monitor reads the record from the same journal it already follows and checks each run against what the deploy recorded.
-The hash deletions are later changes in the same workstream.
+The release also deletes the executable hash and moves the monitor's build-drift check onto the commit in the version string.
 
 ### Added
 
@@ -61,6 +61,11 @@ The hash deletions are later changes in the same workstream.
 - `--version` no longer prints the crate name and the bare version. It prints `v1.16.0-rc.1` or `v1.16.0`, which matches the git tag and carries no build metadata, even on a dirty tree. A script that parsed the old `m6-http 1.16.0` line must read the new tag form.
 - The workspace version is `1.16.0-rc.1`. `Cargo.lock` carries the same version for every member, and `cargo metadata --locked` agrees with it.
 - Every m6 binary takes both flags: `m6-http`, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`, `m6-file`, `m6-html`, `m6-md`, `m6-monitor`, `m6-auth-server` and `m6-auth-cli`. The examples and the site applications adopt the same two lines in a later change.
+- The `type=perf` line's `build.version` now carries the commit, `1.16.0-rc.1+abc123def456` or `1.16.0-rc.1+abc123def456.dirty`, and `build.hash` is gone. A fleet check compares the release part before the `+` for version drift and the build metadata for build drift, so one release built twice from one tag is still reported as build drift.
+
+### Removed
+
+- The md5 of the running executable: `BuildId.hash`, `executable_md5()` and the 64 KiB chunked read it did at start. The process reports the commit fixed at build time instead, so one tag built twice is still distinguishable and no process reads its own bytes for identity. The `md-5` dependency leaves `m6-core` with it.
 
 ### Added
 
@@ -80,6 +85,7 @@ The hash deletions are later changes in the same workstream.
 ### Verified
 
 - `cargo test --workspace --no-fail-fast` passes. The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
+- The monitor's four drift tests hold the swapped input: two nodes reporting `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` produce one build-drift finding and no version-drift finding, and a node with no build metadata counts as drift rather than agreement.
 - `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
 - The recovery record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included. The same file holds every part to the one node the platform facts name, the shutdown line to the same node, and an unnamed host to an empty `node` with its reason.
 - The record from a real binary is quoted in the worker report, and the largest line and line count from the rendered production and staging configs are measured rather than estimated.

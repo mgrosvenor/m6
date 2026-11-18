@@ -251,22 +251,29 @@ pub struct NodeDigest {
     /// relabelled.
     pub reported_node: Option<String>,
     pub rtt_ms: Option<f64>,
-    /// The m6 release the node is running, from the metrics document. `None`
-    /// when the node predates the field, which reads as "cannot say" and never
-    /// as agreement: a fleet where one node is silent about its version is
+    /// The m6 release the node is running, as the full SemVer string from the
+    /// metrics document, for example `1.16.0-rc.1+abc123def456`. `None` when
+    /// the node predates the field, which reads as "cannot say" and never as
+    /// agreement: a fleet where one node is silent about its version is
     /// exactly the case the drift check must not call uniform.
     pub version: Option<String>,
     /// Which binary reported the version, from the metrics document. A node
     /// runs several and "the node is on 1.10.0" has never been one fact.
     pub binary: Option<String>,
-    /// The hash of the build actually running, from the metrics document.
+    /// The commit the node's binary was built from, taken from the build
+    /// metadata of the version string.
     ///
-    /// This is what the version cannot say. Rust is not byte-reproducible, so
-    /// one tag built twice gives two binaries reporting one version: two
+    /// This is what the release tag cannot say. Rust is not byte-reproducible,
+    /// so one tag built twice gives two binaries reporting one version: two
     /// hosts can run different builds of `v1.10.0` while every reading
-    /// available to an operator says the fleet agrees. `None` on a
-    /// node too old to say, which counts as drift rather than agreement for the
-    /// same reason the version does.
+    /// available to an operator says the fleet agrees. `None` on a node whose
+    /// version carries no build metadata, which counts as drift rather than
+    /// agreement for the same reason the version does.
+    ///
+    /// The field keeps its name and its place in the digest and history schema,
+    /// where it is the value that tells two build rows for one binary and
+    /// version apart. What changed is where it comes from: the commit in the
+    /// version string, not a hash the node read from its own executable.
     pub hash: Option<String>,
     pub uptime_s: Option<u64>,
     pub host_uptime_s: Option<u64>,
@@ -826,6 +833,23 @@ pub(crate) fn fmt_uptime(secs: u64) -> String {
     }
 }
 
+/// The release part of a SemVer string: everything before the `+` build
+/// metadata.
+///
+/// Version drift compares this, because SemVer 2.0.0 gives build metadata no
+/// precedence. `1.16.0-rc.1+aaaa` and `1.16.0-rc.1+bbbb` are one release built
+/// twice, which is build drift and not version drift.
+fn release(version: &str) -> &str {
+    version.split('+').next().unwrap_or(version)
+}
+
+/// The build metadata of a SemVer string, which is the commit the node's
+/// binary was built from. `None` when the string carries none, which reads as
+/// "cannot say" and counts as drift rather than agreement.
+fn build_metadata(version: &str) -> Option<&str> {
+    version.split_once('+').map(|(_, metadata)| metadata)
+}
+
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
@@ -980,8 +1004,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // Empty rather than absent on a node older than the field, so each
             // part is reported as unknown instead of as an empty string. The
             // three are taken separately on purpose: a node can legitimately
-            // know its version and not its hash, because the hash is read from
-            // the executable at startup and confinement can refuse that.
+            // know its release and not its commit, because the build metadata
+            // is absent on a build made without git.
             let empty_to_none = |s: &String| {
                 if s.is_empty() {
                     None
@@ -991,7 +1015,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             };
             d.version = empty_to_none(&p.build.version);
             d.binary = empty_to_none(&p.build.name);
-            d.hash = empty_to_none(&p.build.hash);
+            d.hash = build_metadata(&p.build.version).map(str::to_string);
             d.uptime_s = Some(p.uptime_s);
             // The soonest expiry in the chain. `min` over an empty list is
             // `None`, which is the answer for a node too old to report the
@@ -1263,6 +1287,10 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     // agreeing while the third is silent is not a uniform fleet, it is an unknown
     // one, and reporting it as uniform is the failure mode this whole change
     // exists to remove.
+    //
+    // Build metadata is excluded from this comparison. SemVer 2.0.0 gives it no
+    // precedence, so two nodes on one tag with different commits are one release
+    // and the check below reports the difference.
     // uptime_s is set exactly when the metrics document was built, so it is
     // the marker for "this node answered" without needing a second flag that
     // could disagree with it.
@@ -1270,7 +1298,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     if reporting.len() > 1 {
         let mut seen: Vec<&str> = reporting
             .iter()
-            .map(|n| n.version.as_deref().unwrap_or("unknown"))
+            .map(|n| release(n.version.as_deref().unwrap_or("unknown")))
             .collect();
         seen.sort_unstable();
         seen.dedup();
@@ -1297,32 +1325,33 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         //
         // Version drift means somebody deployed different releases. Build drift
         // means one release was BUILT TWICE and the fleet holds both: same
-        // source, same tag, different bytes, because Rust is not
+        // source, same tag, different commit, because Rust is not
         // byte-reproducible. That is not a hypothetical and it is not rare. It
-        // happened on 2026-09-20, it was invisible to every reading an operator
-        // had, and it took `md5sum` on four machines to find. The whole reason
-        // the hash is on the wire is so that this check can exist.
+        // happened on 2026-09-20 with two byte builds of one tag, it was
+        // invisible to every reading an operator had, and it took `md5sum` on
+        // four machines to find. The build metadata in the version string is
+        // what makes this check possible without that file read.
         //
-        // Reported only when the versions agree. When they do not, the version
-        // finding above already says the fleet is not uniform and the hashes
+        // Reported only when the releases agree. When they do not, the version
+        // finding above already says the fleet is not uniform and the commits
         // differing is a consequence of it, not a second fault.
         let versions_agree = seen.len() == 1;
-        let mut hashes: Vec<&str> = reporting
+        let mut commits: Vec<&str> = reporting
             .iter()
             .map(|n| n.hash.as_deref().unwrap_or("unknown"))
             .collect();
-        hashes.sort_unstable();
-        hashes.dedup();
-        if versions_agree && hashes.len() > 1 {
+        commits.sort_unstable();
+        commits.dedup();
+        if versions_agree && commits.len() > 1 {
             let detail = reporting
                 .iter()
                 .map(|n| {
-                    // Twelve characters, which is what an operator reading their
-                    // own notes is looking at. The full value
-                    // is in the JSON digest for anything that wants to compare
-                    // exactly.
-                    let h = n.hash.as_deref().unwrap_or("unknown");
-                    format!("{} {}", n.name, &h[..h.len().min(12)])
+                    // Twelve characters, which is the commit an operator
+                    // reading their own notes is looking at. The full build
+                    // metadata is in the JSON digest for anything that wants to
+                    // compare exactly.
+                    let c = n.hash.as_deref().unwrap_or("unknown");
+                    format!("{} {}", n.name, &c[..c.len().min(12)])
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1332,7 +1361,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 text: format!(
                     "build drift across the fleet, all reporting the same version: {detail}. \
                      One release built more than once, so the fleet is running different \
-                     binaries from identical source. The version cannot see this."
+                     binaries from identical source. The build metadata in the version \
+                     string is what shows this."
                 ),
             });
         }
@@ -1579,8 +1609,7 @@ pub(crate) mod tests {
             node: "origin".into(),
             build: m6_core::monitoring::BuildId {
                 name: "m6-http".into(),
-                version: "1.4.0".into(),
-                hash: "0".repeat(32),
+                version: "1.4.0+0123456789ab".into(),
             },
             uptime_s: 100,
             pools,
@@ -1744,12 +1773,12 @@ pub(crate) mod tests {
         p
     }
 
-    /// Same version, a build hash of the caller's choosing. This is the shape
-    /// the 2026-09-20 drift had and the shape a version comparison cannot see.
-    fn perf_built(version: &str, hash: &str) -> PerfReport {
+    /// One release tag, with build metadata of the caller's choosing. This is
+    /// the shape the 2026-09-20 drift had: `1.10.0+aaaaaaaaaaaa` and
+    /// `1.10.0+bbbbbbbbbbbb` are one release tag built twice.
+    fn perf_built(full: &str) -> PerfReport {
         let mut p = perf(plain_host(), vec![]);
-        p.build.version = version.into();
-        p.build.hash = hash.into();
+        p.build.version = full.into();
         p
     }
 
@@ -1778,23 +1807,24 @@ pub(crate) mod tests {
         assert!(drift[0].text.contains("edge-a 1.3.0"), "{}", drift[0].text);
     }
 
-    /// **The case this whole change exists for.** Same version on every node,
-    /// different builds, which is what a fleet looks like when one release has
-    /// been built twice. Rust is not byte-reproducible, so this is the ordinary
-    /// consequence of rebuilding rather than promoting.
+    /// **The case this whole change exists for.** Same release tag on every
+    /// node, different build metadata, which is what a fleet looks like when
+    /// one release has been built twice. Rust is not byte-reproducible, so this
+    /// is the ordinary consequence of rebuilding rather than promoting.
     ///
-    /// Two hosts can run different builds of `v1.10.0` while every reading an
-    /// operator has says the fleet agrees, and the difference is found only by
-    /// running `md5sum` on each machine. This test is the thing that says so.
+    /// Two hosts can run `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` while
+    /// every reading an operator has says the fleet agrees on `1.10.0`. The
+    /// commit in the version string's build metadata is what tells them apart.
     ///
-    /// Verified red before being trusted, per the standing rule: with the hash
-    /// comparison removed it reports nothing at all, because the versions match.
+    /// Verified red before being trusted, per the standing rule: on the code
+    /// that compared whole version strings and had no metadata split, the two
+    /// strings differed and this reported version drift instead of build drift.
     #[test]
     fn one_version_across_two_builds_is_reported_as_build_drift() {
         let d = build(
             &[
-                reading("origin", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
-                reading("edge-a", "ok", Some(perf_built("1.10.0", &"b".repeat(32)))),
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                reading("edge-a", "ok", Some(perf_built("1.10.0+bbbbbbbbbbbb"))),
             ],
             &Thresholds::default(),
             now(),
@@ -1802,7 +1832,7 @@ pub(crate) mod tests {
 
         assert!(
             !d.findings.iter().any(|f| f.text.contains("version drift")),
-            "the versions agree, so the VERSION finding must stay quiet: {:?}",
+            "the release tags agree, so the VERSION finding must stay quiet: {:?}",
             d.findings
         );
 
@@ -1825,17 +1855,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// A node too old to report a hash counts as drift, not as agreement. Two
-    /// nodes agreeing while a third is silent is an unknown fleet, not a uniform
-    /// one, and the version check already takes this position.
+    /// A node that reports no build metadata counts as drift, not as agreement.
+    /// Two nodes agreeing while a third is silent is an unknown fleet, not a
+    /// uniform one, and the version check already takes this position.
     #[test]
     fn a_node_that_cannot_say_its_build_is_drift_not_agreement() {
         let d = build(
             &[
-                reading("origin", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
-                // Empty hash: a node older than the field, or one whose
-                // confinement refused it the read.
-                reading("edge-a", "ok", Some(perf_built("1.10.0", ""))),
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                // No build metadata: a node older than the field, or a build
+                // made without git.
+                reading("edge-a", "ok", Some(perf_built("1.10.0"))),
             ],
             &Thresholds::default(),
             now(),
@@ -1848,15 +1878,15 @@ pub(crate) mod tests {
     }
 
     /// Version drift is reported ONCE, not twice. Different releases have
-    /// different binaries by construction, so reporting build drift beside it
+    /// different commits by construction, so reporting build drift beside it
     /// would name a consequence as a second fault and tell an operator to look
     /// in two places for one problem.
     #[test]
     fn version_drift_does_not_also_report_build_drift() {
         let d = build(
             &[
-                reading("origin", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
-                reading("edge-a", "ok", Some(perf_built("1.9.0", &"b".repeat(32)))),
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                reading("edge-a", "ok", Some(perf_built("1.9.0+bbbbbbbbbbbb"))),
             ],
             &Thresholds::default(),
             now(),
@@ -1872,7 +1902,7 @@ pub(crate) mod tests {
         );
         assert!(
             !d.findings.iter().any(|f| f.text.contains("build drift")),
-            "the hashes differ because the versions do; that is one fault: {:?}",
+            "the commits differ because the releases do; that is one fault: {:?}",
             d.findings
         );
     }

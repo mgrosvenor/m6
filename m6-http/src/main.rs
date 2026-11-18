@@ -7479,14 +7479,10 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // This process's build identity, the md5 of the bytes it was started from,
-    // is a start-time constant like the ones above. Computing it here, with the
-    // other start-time work and before any listener exists, keeps it off the
-    // accounting tick. The value is cached per process, so the first caller
-    // pays for it. Since the metrics document moved onto the periodic line
-    // that caller was the first tick, one interval after start, which read the
-    // whole binary inside the serving loop. The value and when it is used are
-    // unchanged.
+    // This process's build identity is fixed at compile time, so reporting it
+    // reads no executable. Caching the running binary's name here, with the
+    // other start-time work and before any listener exists, keeps that one read
+    // off the accounting tick.
     m6_core::monitoring::build_id();
 
     // Bind the QUIC UDP socket. With [server] reuse_port the TLS listener is
