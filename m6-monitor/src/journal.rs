@@ -720,7 +720,9 @@ impl Reader {
     /// Read a one-shot run to its end, handing every line to `each`.
     pub fn drain(&mut self, mut each: impl FnMut(&[u8])) {
         while self.stdout.is_some() {
-            self.read(m6_core::platform::now(), &mut each);
+            if self.read(m6_core::platform::now(), &mut each) == Event::Exited {
+                self.retire();
+            }
         }
     }
 
@@ -732,7 +734,10 @@ impl Reader {
 
     /// Start the child again when its backoff has passed.
     pub fn restart_if_due(&mut self, now: Instant) {
-        if self.child.is_none() && self.restart_at.is_some_and(|at| now >= at) {
+        if self.child.is_none()
+            && self.stdout.is_none()
+            && self.restart_at.is_some_and(|at| now >= at)
+        {
             self.start(now);
         }
     }
@@ -870,8 +875,11 @@ impl Reader {
 
     /// Record why the reader stopped, kill what is left of the child, and
     /// schedule the next start on a doubling backoff.
+    ///
+    /// The pipe stays open: the loop deregisters its descriptor first and
+    /// [`Reader::retire`] closes it, so the number cannot be reused by a
+    /// socket that the deregistration would then remove.
     fn stop(&mut self, reason: &str, now: Instant) {
-        self.stdout = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -972,6 +980,35 @@ mod tests {
     /// The two record types are two more matches on the one child the two
     /// documents already use. A second follower would be a second process, a
     /// second tail and a second backoff, and this is the test that refuses it.
+    /// A child that exits leaves its pipe open until `retire`, so the loop
+    /// can deregister the descriptor before the number is free for reuse.
+    /// The reader once closed it inside `read`, before the loop deregistered.
+    #[test]
+    fn an_exited_child_keeps_its_descriptor_until_retire() {
+        let mut reader = Reader::unavailable(
+            "a test reader".into(),
+            &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
+        );
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'one\\n'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("a child");
+        reader.stdout = child.stdout.take();
+        reader.child = Some(child);
+        let fd = reader.fd().expect("the pipe");
+        let mut lines = 0;
+        let now = m6_core::platform::now();
+        while reader.read(now, |_| lines += 1) != Event::Exited {}
+        assert_eq!(lines, 1);
+        assert_eq!(reader.fd(), Some(fd), "the descriptor is still open");
+        assert!(reader.stopped.is_some(), "the reason is recorded");
+        reader.restart_if_due(now + MAX_BACKOFF * 2);
+        assert_eq!(reader.fd(), Some(fd), "no restart before retire");
+        reader.retire();
+        assert_eq!(reader.fd(), None, "retire closes it");
+    }
+
     #[test]
     fn the_one_follower_reads_all_four_line_types() {
         let reader = Reader::unavailable(
