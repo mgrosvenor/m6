@@ -20,7 +20,10 @@ name = "m6_platform"
 mio     = { version = "1", features = ["os-poll", "os-ext", "net"] }
 # Safe system calls: signal masks, signalfd and kqueue, poll, statvfs,
 # rlimits, if_nametoindex, waitpid, dup and fcntl.
-nix     = { version = "0.31", features = ["signal", "poll", "event", "fs", "resource", "net", "process", "user", "mman"] }
+# Safe system calls: signal masks, signalfd and kqueue, poll, statvfs,
+# rlimits, if_nametoindex, waitpid, dup and fcntl. `feature` is what makes
+# `sys::utsname` (`uname`) available to the host facts.
+nix     = { version = "0.31", features = ["feature", "hostname", "signal", "poll", "event", "fs", "resource", "net", "process", "user", "mman"] }
 # Socket construction with the options every m6 socket needs. `all` for
 # `SO_NOSIGPIPE` on macOS.
 socket2 = { version = "0.6", features = ["all"] }

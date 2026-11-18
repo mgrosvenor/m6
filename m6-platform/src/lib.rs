@@ -6,8 +6,9 @@
 //! whether systemd owns stdout ([`journal_stream`]),
 //! a shutdown or reload request ([`Signals`]), a child's exit
 //! ([`ChildExit`]), sockets with the right options ([`net`]), facts about a
-//! process and the host ([`process`], [`host`]), the open-file limit, the
-//! unix socket path limit and the directories a service and its tests use.
+//! process and the host ([`process`], [`host`]), what the host says it is
+//! ([`host_facts`]), the open-file limit, the unix socket path limit and the
+//! directories a service and its tests use.
 //!
 //! One implementation file per OS family holds the code that differs:
 //! `src/linux.rs` and `src/macos.rs`. They are selected once, below,
@@ -46,10 +47,15 @@ compile_error!(
 );
 
 pub mod build_info;
+pub mod facts;
 pub mod fd;
 pub mod host;
 pub mod net;
 pub mod process;
+
+/// The start-up facts, re-exported at the crate root so the call site is one
+/// name on every target: `m6_core::platform::host_facts()`.
+pub use facts::{host_facts, HostFacts};
 
 // ── Readiness ────────────────────────────────────────────────────────────────
 
@@ -211,6 +217,54 @@ pub fn now() -> Instant {
 #[inline]
 pub fn wall() -> SystemTime {
     SystemTime::now()
+}
+
+/// Write `YYYY-MM-DDTHH:MM:SS`, in UTC, for a Unix second, into `out`. The
+/// caller appends a fraction and `Z`, or writes `out[..19]` and a `Z`.
+///
+/// This is the one date text m6 writes, so a log timestamp and a host fact
+/// parse the same way. `out[19]` is set to NUL, which is why the buffer is 20
+/// bytes for 19 characters. A year outside 0 to 9999 is clamped, which is the
+/// only answer for a clock that far from the epoch.
+pub fn write_rfc3339_utc(seconds: u64, out: &mut [u8; 20]) {
+    let days = (seconds / 86_400) as i64;
+    let rest = (seconds % 86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    let year = year.clamp(0, 9999) as u32;
+    write2(out, 0, year / 100);
+    write2(out, 2, year % 100);
+    out[4] = b'-';
+    write2(out, 5, month);
+    out[7] = b'-';
+    write2(out, 8, day);
+    out[10] = b'T';
+    write2(out, 11, rest / 3_600);
+    out[13] = b':';
+    write2(out, 14, rest % 3_600 / 60);
+    out[16] = b':';
+    write2(out, 17, rest % 60);
+    out[19] = 0;
+}
+
+fn write2(out: &mut [u8; 20], at: usize, value: u32) {
+    out[at] = b'0' + (value / 10) as u8;
+    out[at + 1] = b'0' + (value % 10) as u8;
+}
+
+/// The day `z` days after 1970-01-01, as (year, month, day).
+///
+/// Howard Hinnant's `civil_from_days`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 // ── The service manager ──────────────────────────────────────────────────────
@@ -611,5 +665,23 @@ mod tests {
             usable.clone(),
         ]);
         assert_eq!(chosen, Some(usable));
+    }
+
+    /// The date text is RFC 3339 in UTC, and the epoch, a leap day and the end
+    /// of a year all land on the numbers a reader expects.
+    #[test]
+    fn the_date_text_is_rfc3339_utc() {
+        let mut out = [0u8; 20];
+        for (seconds, expected) in [
+            (0, "1970-01-01T00:00:00"),
+            (1_767_225_600, "2026-01-01T00:00:00"),
+            // 2024-02-29T12:34:56Z, the leap day.
+            (1_709_210_096, "2024-02-29T12:34:56"),
+            // The last second of 1999.
+            (946_684_799, "1999-12-31T23:59:59"),
+        ] {
+            write_rfc3339_utc(seconds, &mut out);
+            assert_eq!(&out[..19], expected.as_bytes(), "{seconds}");
+        }
     }
 }

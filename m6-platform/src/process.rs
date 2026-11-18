@@ -233,3 +233,31 @@ pub fn open_descriptors(pid: u32) -> io::Result<usize> {
 pub fn listens_on_tcp(pid: u32) -> io::Result<bool> {
     os::listens_on_tcp(pid)
 }
+
+/// One process's memory as the kernel accounts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemory {
+    /// The resident set in bytes: the pages the kernel holds in RAM for it.
+    pub resident_bytes: u64,
+    /// The address space in bytes: every mapping, resident or not.
+    pub virtual_bytes: u64,
+    /// The bytes pinned in RAM by `mlock`, `mlockall` or `mlock2`.
+    pub locked_bytes: u64,
+}
+
+/// The memory the kernel accounts to `pid`, read from outside the process.
+///
+/// `Err` for a pid that is gone, and on a platform whose kernel keeps no such
+/// report for another process, so a check that cannot measure fails rather
+/// than reading zero. On Linux it is `VmRSS`, `VmSize` and `VmLck` of
+/// `/proc/<pid>/status`. macOS keeps no equivalent, so it is `Err` there.
+pub fn memory_usage(pid: u32) -> io::Result<ProcessMemory> {
+    os::memory_usage(pid)
+}
+
+/// The minor page faults `pid` has taken. A test warms a service and then
+/// requires this not to move, which is how it proves the hot path took no page
+/// it had not already touched. `Err` where the kernel keeps no such report.
+pub fn page_faults(pid: u32) -> io::Result<u64> {
+    os::page_faults(pid)
+}

@@ -112,23 +112,24 @@ fn a_warm_server_is_resident_within_its_reservation() {
         assert_eq!(conn.get("/").expect("warm-up request"), 200);
     }
 
-    // The process's resident set, read while it runs: /proc is this process's
-    // view of another and the numbers are gone once the child exits. The
-    // resident set is the number the bound holds. `VmLck` is the mapped size
-    // rather than the resident set, so this test reads it only to show that a
-    // pin is in force, and never compares it with the bound.
-    let rss = status_kib(pid, "VmRSS:").expect("VmRSS") * 1024;
-    let mapped = status_kib(pid, "VmSize:").expect("VmSize") * 1024;
-    let locked = status_kib(pid, "VmLck:").expect("VmLck") * 1024;
+    // The process's resident set, read while it runs through the platform
+    // layer: the numbers are gone once the child exits. The resident set is the
+    // number the bound holds. `VmLck` is the mapped size rather than the
+    // resident set, so this test reads it only to show that a pin is in force,
+    // and never compares it with the bound.
+    let memory = m6_core::platform::process::memory_usage(pid).expect("memory usage");
+    let rss = memory.resident_bytes as usize;
+    let mapped = memory.virtual_bytes as usize;
+    let locked = memory.locked_bytes as usize;
 
     // The hot path, after the warm-up: a cache hit must take no page fault. A
     // pin that locks pages one at a time as they are touched leaves this at
     // zero, because every page a hit reads was faulted during the warm-up.
-    let faults_before = minor_faults(pid);
+    let faults_before = m6_core::platform::process::page_faults(pid).expect("minor faults");
     for _ in 0..HOT {
         assert_eq!(conn.get("/").expect("hot request"), 200);
     }
-    let faults_after = minor_faults(pid);
+    let faults_after = m6_core::platform::process::page_faults(pid).expect("minor faults");
     assert_eq!(
         faults_after - faults_before,
         0,
@@ -361,30 +362,7 @@ fn serve(mut stream: std::os::unix::net::UnixStream, seen: &AtomicUsize) {
     let _ = stream.flush();
 }
 
-// ── This process's view of another: /proc ────────────────────────────────────
-
-/// One integer field of `/proc/<pid>/status`, in KiB.
-fn status_kib(pid: u32, field: &str) -> Option<usize> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix(field))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// The process's minor page faults, field 10 of `/proc/<pid>/stat`. Field 2 is
-/// the command in parentheses, which may hold spaces, so the count starts after
-/// the last `)`.
-fn minor_faults(pid: u32) -> u64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
-    let rest = &stat[stat.rfind(')').expect("comm") + 1..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // The first field after the command is the state, which is field 3, so
-    // minflt (field 10) is the eighth of the remaining ones.
-    fields[7].parse().expect("minflt")
-}
+// ── The process's numbers, from its log ─────────────────────────────────────
 
 /// One integer field of a JSON log line.
 fn json_field(output: &str, key: &str) -> Option<u64> {

@@ -8,11 +8,13 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
+use super::facts::{self, ClockFacts, CpuFacts, CpuLimit, Fact, Limits, MemoryFacts, OsFacts};
 use super::host::{
     parse_cgroup_memory, parse_diskstats, parse_loadavg, parse_meminfo, parse_net_dev,
     parse_netstat, parse_pressure, parse_sockstat_into, parse_thermal_millidegrees, parse_uptime,
     DiskIo, LoadAverage, Memory, NetDevice, Pressure, TcpHealth, ThermalZone,
 };
+use super::process::ProcessMemory;
 use super::Signal;
 
 // ── Signals ──────────────────────────────────────────────────────────────────
@@ -386,6 +388,46 @@ pub(super) fn listens_on_tcp(pid: u32) -> io::Result<bool> {
     Ok(false)
 }
 
+/// `VmRSS`, `VmSize` and `VmLck` of `/proc/<pid>/status`, in bytes. The file
+/// writes them in KiB and the kernel's label says `kB`, which is KiB.
+pub(super) fn memory_usage(pid: u32) -> io::Result<ProcessMemory> {
+    let path = format!("/proc/{pid}/status");
+    let text = std::fs::read_to_string(&path)?;
+    let field = |name: &str| -> io::Result<u64> {
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or_else(|| io::Error::other(format!("{path} has no {name}")))?;
+        let kib: u64 = value
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| io::Error::other(format!("{path}: {name} is not a number")))?;
+        Ok(kib.saturating_mul(1024))
+    };
+    Ok(ProcessMemory {
+        resident_bytes: field("VmRSS:")?,
+        virtual_bytes: field("VmSize:")?,
+        locked_bytes: field("VmLck:")?,
+    })
+}
+
+/// Field 10 of `/proc/<pid>/stat`, the minor page faults. The command in field
+/// 2 is in parentheses and may hold spaces, so the fields start after the last
+/// `)`, where the first is field 3.
+pub(super) fn page_faults(pid: u32) -> io::Result<u64> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(&path)?;
+    let command_end = stat
+        .rfind(')')
+        .ok_or_else(|| io::Error::other(format!("{path} has no command")))?;
+    stat[command_end + 1..]
+        .split_whitespace()
+        .nth(7)
+        .and_then(|faults| faults.parse().ok())
+        .ok_or_else(|| io::Error::other(format!("{path} has no minor fault count")))
+}
+
 // ── Host readings: the /proc and /sys readers, moved from host.rs ────────────
 
 pub(super) fn net_devices() -> Vec<NetDevice> {
@@ -464,6 +506,176 @@ pub(super) fn thermal_zones() -> Vec<ThermalZone> {
 
 pub(super) fn uptime() -> Option<std::time::Duration> {
     parse_uptime(&std::fs::read_to_string("/proc/uptime").ok()?)
+}
+
+// ── Host facts ───────────────────────────────────────────────────────────────
+//
+// The start-up facts that differ from macOS. The reads that are the same on
+// both supported families, and every parser, are in `facts.rs`. A fact that
+// cannot be read is `Fact::Unknown` with a reason naming the file or call that
+// did not answer.
+
+/// The OS product name and version, from `/etc/os-release`. A system that has
+/// moved the file to `/usr/lib/os-release` still answers.
+pub(super) fn host_os_facts() -> Fact<OsFacts> {
+    const RELEASE: &str = "/etc/os-release";
+    const FALLBACK: &str = "/usr/lib/os-release";
+    let text = match facts::read_file(RELEASE, "cannot read /etc/os-release") {
+        Fact::Known(text) => Fact::Known(text),
+        Fact::Unknown(_) => facts::read_file(
+            FALLBACK,
+            "cannot read /etc/os-release or /usr/lib/os-release",
+        ),
+    };
+    facts::parse(text, facts::parse_os_release, "/etc/os-release has no NAME")
+}
+
+/// The CPU model, from `/proc/cpuinfo`, and the number of CPUs this process
+/// may run on.
+pub(super) fn host_cpu() -> CpuFacts {
+    CpuFacts {
+        model: facts::parse(
+            facts::read_file("/proc/cpuinfo", "cannot read /proc/cpuinfo"),
+            facts::parse_cpuinfo_model,
+            "/proc/cpuinfo has no CPU model",
+        ),
+        count: facts::cpu_count(),
+    }
+}
+
+/// Total memory, the page size and the huge-page setting.
+pub(super) fn host_memory() -> MemoryFacts {
+    MemoryFacts {
+        total_bytes: facts::parse(
+            facts::read_file("/proc/meminfo", "cannot read /proc/meminfo"),
+            facts::parse_meminfo_total,
+            "/proc/meminfo has no MemTotal",
+        ),
+        page_size: facts::page_size(),
+        huge_pages: facts::parse(
+            facts::read_file(
+                "/sys/kernel/mm/transparent_hugepage/enabled",
+                "cannot read /sys/kernel/mm/transparent_hugepage/enabled",
+            ),
+            facts::parse_hugepage_setting,
+            "/sys/kernel/mm/transparent_hugepage/enabled names no setting",
+        ),
+    }
+}
+
+/// The rlimits, the listen backlog cap and the cgroup limits.
+pub(super) fn host_limits() -> Limits {
+    use nix::sys::resource::{getrlimit, Resource};
+    Limits {
+        memlock: match getrlimit(Resource::RLIMIT_MEMLOCK) {
+            Ok((soft, _hard)) => Fact::Known(soft),
+            Err(_) => Fact::Unknown("getrlimit(RLIMIT_MEMLOCK) failed"),
+        },
+        nofile: facts::nofile(),
+        somaxconn: facts::parse(
+            facts::read_file(
+                "/proc/sys/net/core/somaxconn",
+                "cannot read /proc/sys/net/core/somaxconn",
+            ),
+            |text| text.trim().parse::<u32>().ok(),
+            "/proc/sys/net/core/somaxconn is not a number",
+        ),
+        cgroup_memory: cgroup_memory(),
+        cgroup_cpu: cgroup_cpu(),
+    }
+}
+
+/// The cgroup memory limit, from cgroup v2's `memory.max` or cgroup v1's
+/// `memory.limit_in_bytes`.
+fn cgroup_memory() -> Fact<Option<u64>> {
+    const V2: &str = "/sys/fs/cgroup/memory.max";
+    const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+    let v2 = facts::read_file(V2, "cannot read /sys/fs/cgroup/memory.max");
+    if v2.is_known() {
+        return facts::parse(
+            v2,
+            facts::parse_cgroup_memory_max,
+            "/sys/fs/cgroup/memory.max is not a number",
+        );
+    }
+    let v1 = facts::read_file(V1, "cannot read the cgroup memory limit");
+    facts::parse(
+        v1,
+        facts::parse_cgroup_memory_limit_in_bytes,
+        "the cgroup memory limit is not a number",
+    )
+}
+
+/// The cgroup CPU quota, from cgroup v2's `cpu.max` or cgroup v1's
+/// `cpu.cfs_quota_us` and `cpu.cfs_period_us`.
+fn cgroup_cpu() -> Fact<Option<CpuLimit>> {
+    const V2: &str = "/sys/fs/cgroup/cpu.max";
+    const QUOTA: &str = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us";
+    const PERIOD: &str = "/sys/fs/cgroup/cpu/cpu.cfs_period_us";
+    let v2 = facts::read_file(V2, "cannot read /sys/fs/cgroup/cpu.max");
+    if v2.is_known() {
+        return facts::parse(
+            v2,
+            facts::parse_cgroup_cpu_max,
+            "/sys/fs/cgroup/cpu.max is not a quota and period",
+        );
+    }
+    let quota = facts::read_file(QUOTA, "cannot read the cgroup CPU quota");
+    let period = facts::read_file(PERIOD, "cannot read the cgroup CPU quota");
+    match (quota, period) {
+        (Fact::Known(quota), Fact::Known(period)) => {
+            match facts::parse_cgroup_cpu_v1(&quota, &period) {
+                Some(limit) => Fact::Known(limit),
+                None => Fact::Unknown("the cgroup v1 CPU quota is not a quota and period"),
+            }
+        }
+        (Fact::Unknown(reason), _) | (_, Fact::Unknown(reason)) => Fact::Unknown(reason),
+    }
+}
+
+/// The time zone, the kernel's clock source and the boot time.
+pub(super) fn host_clock() -> ClockFacts {
+    const SOURCE: &str = "/sys/devices/system/clocksource/clocksource0/current_clocksource";
+    ClockFacts {
+        timezone: facts::timezone(),
+        source: facts::parse(
+            facts::read_file(SOURCE, "cannot read the kernel clock source"),
+            |text| match text.trim() {
+                "" => None,
+                source => Some(source.to_string()),
+            },
+            "the kernel clock source file is empty",
+        ),
+        boot_time: facts::parse(
+            facts::read_file("/proc/stat", "cannot read /proc/stat"),
+            facts::parse_btime,
+            "/proc/stat has no btime",
+        ),
+    }
+}
+
+/// The virtualisation type, from the DMI strings and the CPU's `hypervisor`
+/// flag.
+pub(super) fn host_virtualization() -> Fact<String> {
+    const VENDOR: &str = "/sys/class/dmi/id/sys_vendor";
+    const PRODUCT: &str = "/sys/class/dmi/id/product_name";
+    let vendor = facts::read_file(VENDOR, "cannot read /sys/class/dmi/id/sys_vendor");
+    let product = facts::read_file(PRODUCT, "cannot read /sys/class/dmi/id/product_name");
+    let cpuinfo = facts::read_file("/proc/cpuinfo", "cannot read /proc/cpuinfo");
+    if vendor.reason().is_some() && product.reason().is_some() && cpuinfo.reason().is_some() {
+        return Fact::Unknown("cannot read /sys/class/dmi/id or /proc/cpuinfo");
+    }
+    let hypervisor = cpuinfo
+        .known()
+        .is_some_and(|text| facts::parse_hypervisor_flag(text));
+    match facts::parse_virtualization(
+        vendor.known().map(String::as_str),
+        product.known().map(String::as_str),
+        hypervisor,
+    ) {
+        Some(kind) => Fact::Known(kind),
+        None => Fact::Unknown("the DMI strings name no virtualisation"),
+    }
 }
 
 #[cfg(test)]
