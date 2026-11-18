@@ -394,7 +394,8 @@ pub struct PerfReport {
     #[serde(default)]
     pub logging: Option<LoggingHealth>,
     pub metrics: StatsSnapshot,
-    /// The machine underneath: load, memory, disk, temperature, uptime.
+    /// The machine underneath: load, memory, disk, temperature, uptime. m6-http
+    /// reads it once a minute and repeats it on the lines between.
     ///
     /// Here rather than in a document of its own because an aggregator wants
     /// one document per node, and because these are the numbers you want *next
@@ -410,7 +411,10 @@ pub struct PerfSubject<'a> {
     pub uptime_s: u64,
     pub pools: Vec<PoolHealth>,
     pub url_backends: Vec<String>,
-    pub host_path: &'a std::path::Path,
+    /// The host block, which the caller reads at its own, slower cadence:
+    /// [`crate::platform::host::snapshot`] costs far more than the rest of the
+    /// document.
+    pub host: crate::platform::host::HostSnapshot,
     /// This process's `[server] process_index`, if it has one.
     pub process_index: Option<u32>,
 }
@@ -425,7 +429,7 @@ impl PerfReport {
             uptime_s,
             pools,
             url_backends,
-            host_path,
+            host,
         } = subject;
         PerfReport {
             process_index,
@@ -442,7 +446,7 @@ impl PerfReport {
             tls_unreadable: crate::tls::unreadable(),
             logging: Some(LoggingHealth::read()),
             metrics,
-            host: crate::platform::host::snapshot(host_path),
+            host,
         }
     }
 }
@@ -547,7 +551,7 @@ mod tests {
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
             snap(),
         );
@@ -644,7 +648,7 @@ mod tests {
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
             snap(),
         );
@@ -667,7 +671,7 @@ mod tests {
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
             snap(),
         );
@@ -703,7 +707,7 @@ mod tests {
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
             snap(),
         );
@@ -724,7 +728,7 @@ mod tests {
                     total: 1,
                 }],
                 url_backends: vec!["origin".to_string()],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
             snap(),
         );
