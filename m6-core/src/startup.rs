@@ -131,11 +131,18 @@ pub fn app_identity() -> (BuildIdentity, Vec<BuildIdentity>) {
 ///
 /// The first line answers the two flags. The second tells the record what the
 /// binary is, because m6-core cannot read another crate's build constants.
+///
+/// The identity is named for the binary, as `--version-full`'s first line is.
 #[macro_export]
 macro_rules! startup_identity {
-    ($linked:expr $(,)?) => {
-        $crate::startup::set_app_identity($crate::build_info::build_identity!(), $linked)
-    };
+    ($linked:expr $(,)?) => {{
+        let (own, linked) = $crate::build_info::for_binary(
+            env!("CARGO_BIN_NAME"),
+            $crate::build_info::build_identity!(),
+            $linked,
+        );
+        $crate::startup::set_app_identity(own, linked)
+    }};
 }
 
 // ── The run id ──────────────────────────────────────────────────────────────

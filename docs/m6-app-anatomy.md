@@ -301,7 +301,7 @@ Table 3 gives the flags. `--version` and `--version-full` are answered at the to
 | `--log-level LEVEL` | overrides both configuration sources for the level. §4 gives the precedence |
 | `--dump-config` | loads the configuration exactly as the service would, prints what it resolved to with every route and what would answer it, and exits |
 | `--version`, `-V` | prints the tag form of the build's version, `v1.16.0-rc.1`, and exits 0. It carries no crate name and no build metadata, so it matches the git tag even on a dirty tree |
-| `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary first, each from that crate's own build-time constants. A mixed build shows two commits |
+| `--version-full` | prints one `<crate> - <full SemVer>` line per m6 crate in the binary, the binary first under its own name from `CARGO_BIN_NAME`, each from that crate's own build-time constants. A binary named apart from its package, such as `m6-bench`, lists the package second. A mixed build shows two commits |
 
 **Table 3: the flags a service answers, and what each one is for.**
 Take from it that `--dump-config` is the only one that reads the configuration, and that the two version flags are the only ones that run without it.

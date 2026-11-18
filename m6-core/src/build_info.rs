@@ -43,6 +43,27 @@ pub fn linked() -> Vec<BuildIdentity> {
     )
 }
 
+/// The identity a binary reports first, and the m6 crates listed after it.
+///
+/// The first is the package's identity under the binary's name. A binary whose
+/// name is not its package's, such as `m6-bench` in the m6-http package, lists
+/// the package next, because the package's library is an m6 crate the binary
+/// links.
+pub fn for_binary(
+    bin: &'static str,
+    package: BuildIdentity,
+    linked: Vec<BuildIdentity>,
+) -> (BuildIdentity, Vec<BuildIdentity>) {
+    let own = package.named(bin);
+    if bin == package.name {
+        return (own, linked);
+    }
+    let mut rest = Vec::with_capacity(linked.len() + 1);
+    rest.push(package);
+    rest.extend(linked);
+    (own, rest)
+}
+
 /// Answer `--version` or `--version-full` and exit, or return to the caller.
 ///
 /// `--version` prints the tag form of `own`, `v1.16.0-rc.1`, and nothing else.
@@ -69,14 +90,21 @@ pub fn handle_version_flags(own: BuildIdentity, linked: &[BuildIdentity]) {
     }
 }
 
-/// Answer the two version flags for the crate that calls it.
+/// Answer the two version flags for the binary that calls it.
 ///
 /// The macro reads the caller's own `env!` constants and takes the linked list
-/// it is given. m6-core is the only crate that implements the answer, so no app
+/// it is given. The first line names the binary, from `CARGO_BIN_NAME`, because
+/// one package can build several: m6-http's package builds `m6-bench` and five
+/// more. m6-core is the only crate that implements the answer, so no app
 /// formats a version string.
 #[macro_export]
 macro_rules! version_flags {
-    ($linked:expr $(,)?) => {
-        $crate::build_info::handle_version_flags($crate::build_info::build_identity!(), &$linked)
-    };
+    ($linked:expr $(,)?) => {{
+        let (own, linked) = $crate::build_info::for_binary(
+            env!("CARGO_BIN_NAME"),
+            $crate::build_info::build_identity!(),
+            $linked,
+        );
+        $crate::build_info::handle_version_flags(own, &linked)
+    }};
 }

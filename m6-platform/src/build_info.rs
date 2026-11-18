@@ -68,6 +68,15 @@ impl BuildIdentity {
         full
     }
 
+    /// The same identity under another name.
+    ///
+    /// A package can hold several binaries, so `--version-full` names the
+    /// binary with `CARGO_BIN_NAME` at the binary's own call site and keeps
+    /// the package's version and commit.
+    pub const fn named(self, name: &'static str) -> Self {
+        Self { name, ..self }
+    }
+
     /// One `--version-full` line: `<crate> - <full SemVer>`.
     pub fn line(&self) -> String {
         format!("{} - {}", self.name, self.full())

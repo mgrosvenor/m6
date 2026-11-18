@@ -242,9 +242,9 @@ fn version_full_names_the_binary_first_and_every_linked_m6_crate() {
 
         let (first_name, _) = split_line(lines[0]);
         assert_eq!(
-            first_name, bin.package,
-            "{}: --version-full must name the binary's crate first",
-            bin.name
+            first_name, bin.name,
+            "{}: --version-full must name the binary first, not its package {}",
+            bin.name, bin.package
         );
 
         let mut listed = BTreeSet::new();
@@ -286,10 +286,54 @@ fn version_full_names_the_binary_first_and_every_linked_m6_crate() {
             "{}: --version-full did not list m6-core: {stdout:?}",
             bin.name
         );
+        let mut expected_listed = bin.linked.clone();
+        expected_listed.insert(bin.name.clone());
         assert_eq!(
-            listed, bin.linked,
+            listed, expected_listed,
             "{}: --version-full lists a crate the binary does not link, or misses \
              one it does",
+            bin.name
+        );
+    }
+}
+
+/// The seven binaries that share the m6-http package each name themselves on
+/// the first line, and the package second. Before, all seven printed
+/// `m6-http - ...` first, so `m6-bench --version-full` could not be told from
+/// the server's.
+#[test]
+fn every_binary_of_a_shared_package_names_itself_first() {
+    let shared: Vec<&Binary> = binaries()
+        .iter()
+        .filter(|bin| bin.package == "m6-http" && bin.name != bin.package)
+        .collect();
+    let names: BTreeSet<&str> = shared.iter().map(|bin| bin.name.as_str()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "bench-url-backend",
+            "m6-bench",
+            "m6-bench-detail",
+            "m6-perf-ab",
+            "m6-probe-h1",
+            "m6-probe-h2",
+            "m6-probe-h3",
+        ]),
+        "the m6-http package's other binaries"
+    );
+    for bin in shared {
+        let stdout = run(&bin.name, "--version-full");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines[0].starts_with(&format!("{} - ", bin.name)),
+            "{}: the first line names the binary: {stdout:?}",
+            bin.name
+        );
+        assert!(
+            lines
+                .get(1)
+                .is_some_and(|line| line.starts_with("m6-http - ")),
+            "{}: the second line names the package it is built from: {stdout:?}",
             bin.name
         );
     }
