@@ -876,6 +876,66 @@ pub(super) fn host_virtualization() -> Fact<String> {
     }
 }
 
+/// [`crate::process::spawn`] on Linux: `std`'s spawn, with the child's
+/// signals reset and every descriptor above stderr marked close-on-exec
+/// between fork and exec.
+///
+/// Every descriptor `std` opens is close-on-exec from the call that creates
+/// it, so the `close_range` is for a descriptor something else cleared the
+/// flag on. A kernel older than 5.11, which has no `CLOSE_RANGE_CLOEXEC`,
+/// skips it and keeps `std`'s guarantee alone.
+pub(super) fn spawn(
+    cmd: &mut std::process::Command,
+    streams: crate::process::Streams,
+) -> io::Result<(u32, [Option<std::fs::File>; 3])> {
+    use crate::process::Io;
+    use nix::sys::signal::{signal, SigHandler, SigSet, Signal};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    fn stdio(io: Io) -> Stdio {
+        match io {
+            Io::Inherit => Stdio::inherit(),
+            Io::Null => Stdio::null(),
+            Io::Piped => Stdio::piped(),
+        }
+    }
+    cmd.stdin(stdio(streams.stdin))
+        .stdout(stdio(streams.stdout))
+        .stderr(stdio(streams.stderr));
+    // SAFETY: the closure runs in the child between fork and exec and calls
+    // only `pthread_sigmask`, `sigaction` and the `close_range` system call,
+    // all async-signal-safe. It allocates nothing and takes no lock.
+    unsafe {
+        cmd.pre_exec(|| {
+            SigSet::empty().thread_set_mask()?;
+            for sig in super::managed().iter() {
+                signal(sig, SigHandler::SigDfl)?;
+            }
+            signal(Signal::SIGPIPE, SigHandler::SigDfl)?;
+            let marked = libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            );
+            if marked == -1 {
+                let e = io::Error::last_os_error();
+                if !matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+                    return Err(e);
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let stdin = child.stdin.take().map(|p| OwnedFd::from(p).into());
+    let stdout = child.stdout.take().map(|p| OwnedFd::from(p).into());
+    let stderr = child.stderr.take().map(|p| OwnedFd::from(p).into());
+    Ok((pid, [stdin, stdout, stderr]))
+}
+
 #[cfg(test)]
 mod tests {
     //! The reuseport steering, on real sockets. Linux only: this module is part
@@ -1048,64 +1108,4 @@ mod tests {
             [true, true]
         );
     }
-}
-
-/// [`crate::process::spawn`] on Linux: `std`'s spawn, with the child's
-/// signals reset and every descriptor above stderr marked close-on-exec
-/// between fork and exec.
-///
-/// Every descriptor `std` opens is close-on-exec from the call that creates
-/// it, so the `close_range` is for a descriptor something else cleared the
-/// flag on. A kernel older than 5.11, which has no `CLOSE_RANGE_CLOEXEC`,
-/// skips it and keeps `std`'s guarantee alone.
-pub(super) fn spawn(
-    cmd: &mut std::process::Command,
-    streams: crate::process::Streams,
-) -> io::Result<(u32, [Option<std::fs::File>; 3])> {
-    use crate::process::Io;
-    use nix::sys::signal::{signal, SigHandler, SigSet, Signal};
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-
-    fn stdio(io: Io) -> Stdio {
-        match io {
-            Io::Inherit => Stdio::inherit(),
-            Io::Null => Stdio::null(),
-            Io::Piped => Stdio::piped(),
-        }
-    }
-    cmd.stdin(stdio(streams.stdin))
-        .stdout(stdio(streams.stdout))
-        .stderr(stdio(streams.stderr));
-    // SAFETY: the closure runs in the child between fork and exec and calls
-    // only `pthread_sigmask`, `sigaction` and the `close_range` system call,
-    // all async-signal-safe. It allocates nothing and takes no lock.
-    unsafe {
-        cmd.pre_exec(|| {
-            SigSet::empty().thread_set_mask()?;
-            for sig in super::managed().iter() {
-                signal(sig, SigHandler::SigDfl)?;
-            }
-            signal(Signal::SIGPIPE, SigHandler::SigDfl)?;
-            let marked = libc::syscall(
-                libc::SYS_close_range,
-                3 as libc::c_uint,
-                libc::c_uint::MAX,
-                libc::CLOSE_RANGE_CLOEXEC,
-            );
-            if marked == -1 {
-                let e = io::Error::last_os_error();
-                if !matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
-                    return Err(e);
-                }
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    let stdin = child.stdin.take().map(|p| OwnedFd::from(p).into());
-    let stdout = child.stdout.take().map(|p| OwnedFd::from(p).into());
-    let stderr = child.stderr.take().map(|p| OwnedFd::from(p).into());
-    Ok((pid, [stdin, stdout, stderr]))
 }
