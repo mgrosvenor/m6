@@ -865,7 +865,7 @@ fn sample_user_agents<'a>(uas: impl IntoIterator<Item = &'a str>) -> Vec<String>
     let mut v: Vec<&str> = uas.into_iter().collect();
     v.sort_unstable();
     v.truncate(USER_AGENTS_KEPT);
-    v.into_iter().map(|ua| reportable_user_agent(ua)).collect()
+    v.into_iter().map(reportable_user_agent).collect()
 }
 
 /// One user agent as a report may print it: one line, visible characters,
