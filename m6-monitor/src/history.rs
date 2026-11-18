@@ -2410,7 +2410,10 @@ mod tests {
         s.write(&make(T0, &[reading("a")])).unwrap();
         let mut r = reading("a");
         if let Some(p) = r.perf.as_mut() {
-            p.build.hash = "f".repeat(32);
+            // The same release tag, rebuilt from a different commit. The build
+            // row is keyed on the commit in the version's build metadata, so
+            // this must be a second row.
+            p.build.version = "1.4.0+ffffffffffff".into();
         }
         s.write(&make(T0 + 30_000, &[r])).unwrap();
         assert_eq!(count(&s, "build"), 2);

@@ -434,11 +434,11 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         // section of its own: the question "is this node the one that is behind"
         // is asked at the same moment as "is this node the busy one".
         //
-        // Name, version AND build hash, because the version alone cannot tell
-        // two builds of one tag apart and reading three identical version
-        // strings is exactly what "the fleet agrees" looks like while it
-        // does not. Twelve characters of the hash: enough to compare by
-        // eye and the prefix an operator's notes would quote.
+        // Name, full version AND the commit from its build metadata, because
+        // the release tag alone cannot tell two builds of one tag apart and
+        // reading identical release strings is exactly what "the fleet agrees"
+        // looks like while it does not. Twelve characters of the commit: enough
+        // to compare by eye and the prefix an operator's notes would quote.
         //
         // The certificate is on this line too, for the same reason: "how long
         // has this node got" is asked beside "what is it running", and a
@@ -450,7 +450,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         // cannot tell two certificates apart when they expire on the same day,
         // and issue #275 is that: a reader comparing two nodes needs the
         // identity, not only the countdown. Twelve characters, like the build
-        // hash, enough to compare by eye.
+        // commit, enough to compare by eye.
         let _ = writeln!(
             o,
             "        {} {} build {} cert {} fp {}",
@@ -1114,7 +1114,7 @@ fn verdict_lines(c: &m6_core::monitoring::CrawlerReport, verdicts: &Verdicts) ->
 /// Seconds left on a certificate, as days.
 ///
 /// Days because that is the unit renewal is discussed in, and a bare `12d` next
-/// to a build hash is read correctly without a legend. Separate from `fmt_uptime`
+/// to a build commit is read correctly without a legend. Separate from `fmt_uptime`
 /// because this number goes negative and that one cannot: an expired
 /// certificate reads `EXPIRED 3d ago`, which is a different sentence from a
 /// small positive number and has to look like one on a line being skimmed.
