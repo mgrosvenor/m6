@@ -24,9 +24,10 @@
 //! A configured value of another size is rounded up with one warning, and a
 //! value that cannot work refuses to start.
 //!
-//! This is a type, not an allocator: one [`Bounded`] owns one `Vec` and is both
-//! a page area and a queue.
+//! This is a type, not an allocator: one [`Bounded`] owns one `VecDeque` and is
+//! both a page area and a queue.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -607,13 +608,14 @@ fn split_unit(bytes: usize) -> (usize, &'static str) {
 /// more than `max` fails and leaves the size needed in [`Bounded::overflow`],
 /// so the caller can build the refusal with [`Limit::exceeded`] and the name of
 /// what it was writing. A queue push past `max` hands the item back with that
-/// error. A byte area reads from index 0; a queue reads from `head`.
+/// error.
+///
+/// The storage is a ring, so a queue's pop is O(1). A byte area is kept in one
+/// piece after every write, because a caller reads it as one slice.
 #[derive(Debug)]
 pub struct Bounded<T> {
     limit: Limit,
-    items: Vec<T>,
-    /// The FIFO read index. Always 0 for a byte area.
-    head: usize,
+    items: VecDeque<T>,
     /// The logical capacity, never shrunk.
     cap: usize,
     /// The size the last refused write or push needed.
@@ -627,8 +629,7 @@ impl<T> Bounded<T> {
     pub fn new(limit: &Limit) -> Self {
         Self {
             limit: limit.clone(),
-            items: Vec::with_capacity(limit.start()),
-            head: 0,
+            items: VecDeque::with_capacity(limit.start()),
             cap: limit.start(),
             overflow: None,
             what: String::new(),
@@ -655,11 +656,11 @@ impl<T> Bounded<T> {
 
     /// The bytes or entries held.
     pub fn len(&self) -> usize {
-        self.items.len() - self.head
+        self.items.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.items.is_empty()
     }
 
     /// The size the container has grown to, in bytes or entries.
@@ -676,16 +677,15 @@ impl<T> Bounded<T> {
     /// Empty the container for the next use. The capacity stays.
     pub fn clear(&mut self) {
         self.items.clear();
-        self.head = 0;
         self.overflow = None;
     }
 
     /// Drop the first `n` items or bytes and keep the capacity. The byte path's
-    /// send buffer uses this after a partial write.
+    /// send buffer uses this after a partial write. What is left stays in one
+    /// piece.
     pub fn drain_front(&mut self, n: usize) {
         let n = n.min(self.items.len());
         self.items.drain(..n);
-        self.head = 0;
     }
 
     /// Make room for `needed` bytes or entries in all, or record the refusal.
@@ -713,22 +713,19 @@ impl<T> Bounded<T> {
 
     /// The oldest item without removing it.
     pub fn front(&self) -> Option<&T> {
-        self.items.get(self.head)
+        self.items.front()
     }
 
     /// Remove and return the oldest item.
     pub fn pop_front(&mut self) -> Option<T> {
-        if self.head >= self.items.len() {
-            return None;
-        }
-        Some(self.items.remove(self.head))
+        self.items.pop_front()
     }
 
     pub fn contains(&self, item: &T) -> bool
     where
         T: PartialEq,
     {
-        self.items[self.head..].contains(item)
+        self.items.contains(item)
     }
 
     /// Add `item` at the back. Past the maximum the queue is unchanged and the
@@ -740,41 +737,39 @@ impl<T> Bounded<T> {
             // nothing.
             self.set_what(what);
         }
-        if self.head > 0 {
-            self.items.drain(..self.head);
-            self.head = 0;
-        }
         if !self.reserve_total(needed) {
             return Err((item, self.limit.exceeded(needed, what)));
         }
-        self.items.push(item);
+        self.items.push_back(item);
         Ok(())
     }
 }
 
-impl<T> std::ops::Deref for Bounded<T> {
-    type Target = [T];
+impl std::ops::Deref for Bounded<u8> {
+    type Target = [u8];
 
-    fn deref(&self) -> &[T] {
-        &self.items[self.head..]
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
-impl<T> std::ops::DerefMut for Bounded<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.items[self.head..]
+impl std::ops::DerefMut for Bounded<u8> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
     }
 }
 
 impl Bounded<u8> {
     /// The bytes written since the last [`Bounded::clear`].
     pub fn as_bytes(&self) -> &[u8] {
-        &self.items[self.head..]
+        let (bytes, rest) = self.items.as_slices();
+        debug_assert!(rest.is_empty(), "a byte area is kept in one piece");
+        bytes
     }
 
     /// The written bytes, for a writer that fills them in place.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.items[self.head..]
+        self.items.as_mut_slices().0
     }
 
     /// Append `bytes`. Returns false, having recorded the size needed, when
@@ -783,7 +778,10 @@ impl Bounded<u8> {
         if !self.reserve_total(self.len() + bytes.len()) {
             return false;
         }
-        self.items.extend_from_slice(bytes);
+        self.items.extend(bytes);
+        // A write after `drain_front` can wrap the ring. Readers take the
+        // area as one slice, so it is put back in one piece here.
+        self.items.make_contiguous();
         true
     }
 }
@@ -1062,6 +1060,36 @@ mod tests {
         q.clear();
         assert_eq!(q.capacity(), 4, "the queue never shrinks");
         assert_eq!(q.overflow(), None);
+    }
+
+    /// A queue pops from a ring: FIFO order holds across many wraps, the
+    /// capacity stays at its limit, and a byte area drained from the front
+    /// and written again still reads as one slice.
+    #[test]
+    fn a_queue_pops_in_order_across_wraps_and_a_byte_area_stays_whole() {
+        let mut q = Bounded::<u32>::new(&Limit::custom(&REFRESH_QUEUE, 4, 4));
+        let mut next = 0;
+        for i in 0..1000 {
+            q.push_back(i, "an item").unwrap();
+            if q.len() == 4 {
+                assert_eq!(q.pop_front(), Some(next));
+                next += 1;
+            }
+        }
+        assert_eq!(q.capacity(), 4);
+        assert_eq!(q.items.capacity(), 4, "pops free room in place");
+
+        let mut bytes = Bounded::<u8>::new(&Limit::custom(&REQUEST_BODY, 8, 8));
+        for round in 0u8..50 {
+            assert!(bytes.extend_from_slice(&[round, round, round]));
+            bytes.drain_front(2);
+            assert!(bytes.len() <= 8);
+            assert_eq!(bytes.as_bytes().last(), Some(&round));
+            assert_eq!(bytes.as_bytes().len(), bytes.len(), "one slice");
+            if bytes.len() > 4 {
+                bytes.drain_front(bytes.len());
+            }
+        }
     }
 
     /// The collapse: one `Bounded<T>` is a byte area and a queue. If a second
