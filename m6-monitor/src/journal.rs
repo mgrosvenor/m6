@@ -756,6 +756,10 @@ impl Reader {
             };
             let read = m6_core::platform::fd::read(stdout, &mut chunk);
             let count = match read {
+                Ok(0) if !self.follow => {
+                    self.finish_once();
+                    return Event::Exited;
+                }
                 Ok(0) => {
                     self.stop("journalctl exited", now);
                     return Event::Exited;
@@ -871,6 +875,20 @@ impl Reader {
             }
             Err(e) => self.stop(&format!("journalctl could not start: {e}"), now),
         }
+    }
+
+    /// A one-shot run read to its end. journalctl printing its tail and
+    /// exiting with success is the normal end, so `stopped` stays clear. Any
+    /// other exit, such as a directory it could not read, is the reason.
+    fn finish_once(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        self.stopped = match child.wait() {
+            Ok(status) if status.success() => None,
+            Ok(status) => Some(format!("journalctl {status}")),
+            Err(e) => Some(format!("journalctl could not be waited for: {e}")),
+        };
     }
 
     /// Record why the reader stopped, kill what is left of the child, and
@@ -1007,6 +1025,42 @@ mod tests {
         assert_eq!(reader.fd(), Some(fd), "no restart before retire");
         reader.retire();
         assert_eq!(reader.fd(), None, "retire closes it");
+    }
+
+    /// A one-shot reader whose child runs `script` in place of journalctl.
+    fn once_running(script: &str) -> Reader {
+        let mut reader = Reader::unavailable(
+            "a test reader".into(),
+            &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
+        );
+        reader.follow = false;
+        reader.stopped = None;
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("a child");
+        reader.stdout = child.stdout.take();
+        reader.child = Some(child);
+        reader
+    }
+
+    /// `--check` reads the journal once. The child printing its tail and
+    /// exiting is the normal end, and once read as "not running", so every
+    /// `--check` reported the reader unavailable.
+    #[test]
+    fn a_one_shot_read_that_ends_normally_is_not_unavailable() {
+        let mut reader = once_running("printf 'one\\ntwo\\n'");
+        let mut lines = 0;
+        reader.drain(|_| lines += 1);
+        assert_eq!(lines, 2);
+        assert_eq!(reader.stopped, None);
+        assert_eq!(reader.restarts, 0, "a one-shot run schedules no restart");
+
+        let mut failed = once_running("exit 3");
+        failed.drain(|_| {});
+        let reason = failed.stopped.clone().expect("a failed run is the reason");
+        assert!(reason.contains('3'), "{reason}");
     }
 
     #[test]
