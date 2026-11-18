@@ -15,7 +15,8 @@ Every number below carries the machine it came from and the method that produced
 6. [Where a TLS handshake goes](#6-where-a-tls-handshake-goes)
 7. [Certificate compression and the QUIC amplification limit](#7-certificate-compression-and-the-quic-amplification-limit)
 8. [Reproducing these measurements](#8-reproducing-these-measurements)
-9. [What is not measured](#9-what-is-not-measured)
+9. [Three per-component costs this release changed](#9-three-per-component-costs-this-release-changed)
+10. [What is not measured](#10-what-is-not-measured)
 
 ---
 
@@ -730,7 +731,34 @@ The test returns on macOS before its assertions, so the build host is where it r
 
 ---
 
-## 9. What is not measured
+## 9. Three per-component costs this release changed
+
+Three changes in 1.16.0-rc.1 moved a cost that this document is the authority for, so the
+figures live here as well as in the changelog. Each is release-profile work on the M4 build
+host, and each is a cost the process pays, not a page cost.
+
+| what | before | after | what changed |
+|---|---|---|---|
+| the traffic line, per minute of event loop | 78.6 ms | **13.4 ms** | a full window of 32,768 events across 2,000 clients. Each marker list is one case-insensitive aho-corasick automaton, and the summary reads the window's slots in place instead of building a record per event |
+| the metrics line, per ten seconds | 438 us | **81 us** | the host block, a dozen `/proc` and `/sys` reads, is read once a minute and repeated on the lines between, at 362 us |
+| `Bounded` pop, 50,000 entries | 79.4 ms | **0.18 ms** | pop moved every remaining entry down one place. It is now a ring index, so pop is constant time |
+
+**Table 22: per-component costs this release changed.**
+
+The traffic figure is the one that matters most, because it is the only one that scales with
+traffic: 78.6 ms of a minute is 1.3 percent of the loop, and 13.4 ms is 0.22 percent, so the
+line is four times cheaper per event than it was and it is now below the point where a busy
+cache node notices it. The `Bounded` pop is the largest relative change in the release: a
+queue that cost 79.4 ms to drain now costs 0.18 ms, which is what makes a bounded pool usable
+as the request queue rather than a thing to avoid.
+
+The earlier tables in this document keep their numbering, so Table 22 is out of sequence
+deliberately: Tables 1 to 21 are the measurements the earlier passes took, and this one was
+added after them.
+
+---
+
+## 10. What is not measured
 
 Four gaps remain.
 
@@ -741,7 +769,7 @@ Four gaps remain.
 | the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%, and the gate now compares the candidate against a base build |
 | other machines | Table 3 is one laptop, and no other machine has a copy-removal figure |
 
-**Table 22: what this document does not cover.**
+**Table 23: what this document does not cover.**
 Take from it that throughput has no number at all, and that `tools/perfcheck.sh` supersedes Table 3 for any gating purpose.
 
 The measured position is that core's per-request copying fell by a factor of 280, the static file path no longer allocates what it does not send, the cache lookup costs 125 ns and is flat, and the QUIC handshake completes in one round trip at a conforming amplification factor.
