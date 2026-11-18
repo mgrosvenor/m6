@@ -891,6 +891,15 @@ fn measured_record_from_a_rendered_tree() {
 
 #[test]
 fn a_secret_flag_value_never_reaches_a_line() {
+    let separate = ["--password", "pw-must-never-be-logged"];
+    a_secret_flag_is_redacted(&separate, &["--password", "<redacted>"]);
+    let inline = ["--password=pw-must-never-be-logged"];
+    a_secret_flag_is_redacted(&inline, &["--password=<redacted>"]);
+}
+
+/// Read `args` after the program name and check no line carries the secret,
+/// the argv reads `expected` and the flag's value is redacted.
+fn a_secret_flag_is_redacted(args: &[&str], expected: &[&str]) {
     let dir = tempfile::tempdir().unwrap();
     let (_, config, trace) = fixture(dir.path(), CONFIG);
     let flags = [FlagDecl {
@@ -899,11 +908,10 @@ fn a_secret_flag_value_never_reaches_a_line() {
         setting: None,
         secret: true,
     }];
-    let argv = vec![
-        "m6-service".to_string(),
-        "--password".to_string(),
-        "pw-must-never-be-logged".to_string(),
-    ];
+    let argv: Vec<String> = std::iter::once("m6-service")
+        .chain(args.iter().copied())
+        .map(str::to_string)
+        .collect();
     let mut trace = trace;
     let invocation = Invocation::read(&argv, &flags, &[], &mut trace);
     let record = Record::new(
@@ -921,9 +929,12 @@ fn a_secret_flag_value_never_reaches_a_line() {
         "a secret flag's value is in no line:\n{text}"
     );
     let invocation = lines.iter().find(|l| part(l) == "invocation").unwrap();
+    let argv: Vec<&str> = field(invocation, "argv").as_array().unwrap()[1..]
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
     assert_eq!(
-        field(invocation, "argv")[2].as_str().unwrap(),
-        "<redacted>",
+        argv, expected,
         "the argv entry is redacted, so the reader still sees the flag"
     );
     assert_eq!(

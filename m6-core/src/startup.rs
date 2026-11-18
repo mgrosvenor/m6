@@ -651,12 +651,8 @@ impl Invocation {
         for decl in flags {
             let value = flag_value(argv, decl);
             if decl.secret {
-                // The command line is redacted at the position the value
-                // occupied, so a reader still sees that the flag was passed.
-                if let Some(at) = argv.iter().position(|arg| arg == decl.name) {
-                    if decl.takes_value && at + 1 < read.argv.len() {
-                        read.argv[at + 1] = REDACTED.to_string();
-                    }
+                if decl.takes_value {
+                    redact_flag(&mut read.argv, decl.name);
                 }
             } else if let (Some(value), Some(setting)) = (value.as_deref(), decl.setting) {
                 trace.set_flag(setting, value);
@@ -704,12 +700,35 @@ impl Invocation {
 }
 
 fn flag_value(argv: &[String], decl: &FlagDecl) -> Option<String> {
+    if decl.takes_value {
+        if let Some(value) = argv.iter().find_map(|arg| inline_value(arg, decl.name)) {
+            return Some(value.to_string());
+        }
+    }
     let at = argv.iter().position(|arg| arg == decl.name)?;
     if decl.takes_value {
         argv.get(at + 1).cloned()
     } else {
         Some("true".to_string())
     }
+}
+
+/// Redact every value `name` is given in `argv`, at the position the value
+/// occupied, so a reader still sees that the flag was passed:
+/// `--flag <redacted>` or `--flag=<redacted>`.
+fn redact_flag(argv: &mut [String], name: &str) {
+    for at in 0..argv.len() {
+        if argv[at] == name && at + 1 < argv.len() {
+            argv[at + 1] = REDACTED.to_string();
+        } else if inline_value(&argv[at], name).is_some() {
+            argv[at] = format!("{name}={REDACTED}");
+        }
+    }
+}
+
+/// The value of `arg` when it is `name=value`, the one-argument form.
+fn inline_value<'a>(arg: &'a str, name: &str) -> Option<&'a str> {
+    arg.strip_prefix(name)?.strip_prefix('=')
 }
 
 // ── The node ────────────────────────────────────────────────────────────────
