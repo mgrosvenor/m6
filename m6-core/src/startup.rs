@@ -257,10 +257,6 @@ impl Serialize for Source {
 pub struct Setting {
     pub value: Value,
     pub source: Source,
-    /// Whether this is a config key a rebuilt config should carry. A decided
-    /// fact such as the derived socket path is recorded with its source but is
-    /// not a key in any file, so the round trip skips it.
-    pub rebuild: bool,
 }
 
 impl Setting {
@@ -269,7 +265,6 @@ impl Setting {
         Setting {
             value: value.into(),
             source,
-            rebuild: true,
         }
     }
 
@@ -278,18 +273,6 @@ impl Setting {
         Setting {
             value: Value::String(REDACTED.to_string()),
             source,
-            rebuild: true,
-        }
-    }
-
-    /// A fact the start decided rather than a config key, such as the derived
-    /// socket path. It is recorded with its source and is not rebuilt into a
-    /// config file.
-    pub fn decided(value: impl Into<Value>, source: Source) -> Setting {
-        Setting {
-            value: value.into(),
-            source,
-            rebuild: false,
         }
     }
 
@@ -1004,31 +987,6 @@ impl Record {
         (4 + self.trace.files().len() + self.sections.len()) as u64
     }
 
-    /// The reachable config: the record's sections as TOML, with the effective
-    /// `[limits]` table added.
-    ///
-    /// A redacted setting is skipped, because its value never entered the
-    /// record and comes from the secrets file. A decided fact such as the
-    /// derived socket path is skipped, because it is not a config key. Loading
-    /// the result produces the same effective settings, defaults included.
-    pub fn to_toml(&self) -> toml::Table {
-        let mut table = sections_to_toml(&self.sections);
-        if let Some(limits) = &self.limits {
-            let mut named = toml::Table::new();
-            for (name, limit) in &limits.limits {
-                let mut entry = toml::Table::new();
-                entry.insert(
-                    "start".to_string(),
-                    toml::Value::Integer(limit.start as i64),
-                );
-                entry.insert("max".to_string(), toml::Value::Integer(limit.max as i64));
-                named.insert((*name).to_string(), toml::Value::Table(entry));
-            }
-            table.insert("limits".to_string(), toml::Value::Table(named));
-        }
-        table
-    }
-
     /// Write every line into `sink`, and return the run id they share.
     ///
     /// This is the writer a test calls with a file sink. A production process
@@ -1337,144 +1295,5 @@ fn quote_key(key: &str) -> String {
         key.to_string()
     } else {
         format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
-    }
-}
-
-// ── Rebuilding a config from a record ───────────────────────────────────────
-
-/// Rebuild a TOML table from a record's sections, for the round-trip test and
-/// for an operator recovering a run.
-///
-/// A redacted setting is skipped: its value comes from the secrets file, which
-/// the record never contained. Every other setting is written at its recorded
-/// path with its recorded value, so loading the result produces the same
-/// effective config, defaults and all.
-pub fn sections_to_toml(sections: &[Section]) -> toml::Table {
-    let mut root = toml::Table::new();
-    for section in sections {
-        if section.path == "root" {
-            for (key, setting) in &section.settings {
-                if setting.rebuild && !setting.is_redacted() && !setting.value.is_null() {
-                    root.insert(key.clone(), json_to_toml(&setting.value));
-                }
-            }
-            continue;
-        }
-        for (key, setting) in &section.settings {
-            if !setting.rebuild || setting.is_redacted() || setting.value.is_null() {
-                continue;
-            }
-            insert_path(&mut root, &section.path, key, json_to_toml(&setting.value));
-        }
-    }
-    root
-}
-
-fn insert_path(root: &mut toml::Table, path: &str, key: &str, value: toml::Value) {
-    insert_into(root, &split_path(path), key, value);
-}
-
-fn insert_into(table: &mut toml::Table, segments: &[Segment], key: &str, value: toml::Value) {
-    let Some(first) = segments.first() else {
-        table.insert(key.to_string(), value);
-        return;
-    };
-    let Segment::Key(name) = first else {
-        // A path never starts with an index: an array section is `name[0]`.
-        return;
-    };
-    if let Some(Segment::Index(index)) = segments.get(1) {
-        let array = table
-            .entry(name.clone())
-            .or_insert_with(|| toml::Value::Array(Vec::new()));
-        let array = array
-            .as_array_mut()
-            .expect("an array section's parent is an array");
-        while array.len() <= *index {
-            array.push(toml::Value::Table(toml::Table::new()));
-        }
-        let element = array[*index]
-            .as_table_mut()
-            .expect("an array section's element is a table");
-        insert_into(element, &segments[2..], key, value);
-    } else {
-        let child = table
-            .entry(name.clone())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let child = child
-            .as_table_mut()
-            .expect("a table section's parent is a table");
-        insert_into(child, &segments[1..], key, value);
-    }
-}
-
-enum Segment {
-    Key(String),
-    Index(usize),
-}
-
-fn split_path(path: &str) -> Vec<Segment> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut chars = path.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => quoted = !quoted,
-            '\\' if quoted => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            '.' if !quoted => {
-                push_segment(&mut out, &mut current);
-            }
-            '[' if !quoted => {
-                push_segment(&mut out, &mut current);
-                let mut digits = String::new();
-                for c in chars.by_ref() {
-                    if c == ']' {
-                        break;
-                    }
-                    digits.push(c);
-                }
-                if let Ok(index) = digits.parse() {
-                    out.push(Segment::Index(index));
-                }
-            }
-            other => current.push(other),
-        }
-    }
-    push_segment(&mut out, &mut current);
-    out
-}
-
-fn push_segment(out: &mut Vec<Segment>, current: &mut String) {
-    if current.is_empty() {
-        return;
-    }
-    out.push(Segment::Key(std::mem::take(current)));
-}
-
-fn json_to_toml(value: &Value) -> toml::Value {
-    match value {
-        Value::Null => toml::Value::String(String::new()),
-        Value::Bool(b) => toml::Value::Boolean(*b),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                toml::Value::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                toml::Value::Float(f)
-            } else {
-                toml::Value::String(n.to_string())
-            }
-        }
-        Value::String(s) => toml::Value::String(s.clone()),
-        Value::Array(items) => toml::Value::Array(items.iter().map(json_to_toml).collect()),
-        Value::Object(map) => toml::Value::Table(
-            map.iter()
-                .map(|(key, child)| (key.clone(), json_to_toml(child)))
-                .collect(),
-        ),
     }
 }

@@ -174,7 +174,7 @@ pub fn record_sections(
     if let Some(server) = sections.iter_mut().find(|s| s.path == "server") {
         server.set(
             "socket_path",
-            crate::startup::Setting::decided(
+            crate::startup::Setting::new(
                 socket_path.display().to_string(),
                 trace.source("server.socket_path"),
             ),

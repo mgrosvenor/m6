@@ -379,26 +379,7 @@ impl RendererConfig {
     /// Every effective setting, split into bounded sections for the start-up
     /// record, with each value's source from `trace`.
     pub fn startup_sections(&self, site_dir: &Path, trace: &ConfigTrace) -> Vec<Section> {
-        let mut sections = startup::sections_from_value("", &self.effective_json(site_dir), trace);
-        // A route's `cache` value is a default unless the file set it, and
-        // `cache_explicit` is derived from that. Rebuilding a config writes a
-        // default explicitly, which would turn the derived flag true, so the
-        // implicit pair is recorded but not rebuilt: the parser recomputes the
-        // same value.
-        for (index, route) in self.routes.iter().enumerate() {
-            let path = format!("route[{index}]");
-            if let Some(section) = sections.iter_mut().find(|s| s.path == path) {
-                if let Some(setting) = section.settings.get_mut("cache_explicit") {
-                    setting.rebuild = false;
-                }
-                if !route.cache_explicit {
-                    if let Some(setting) = section.settings.get_mut("cache") {
-                        setting.rebuild = false;
-                    }
-                }
-            }
-        }
-        sections
+        startup::sections_from_value("", &self.effective_json(site_dir), trace)
     }
 }
 
