@@ -72,7 +72,7 @@ The release also deletes the executable hash and moves the monitor's build-drift
 - `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.
 - The start-up recovery record: several `type=startup` lines sharing one `run_id`, then one `type=shutdown` line on a clean exit. The parts are the identity (`app`, full version, every m6 crate), the invocation (argv, the declared flags, every declared environment variable), one line per config file with its sha256 as read, one line per config table with every key, its effective value and its source (`file`, `default`, `env` or `flag`), one line for the platform facts and the effective `[limits]`, and a completeness line carrying the number of lines in the record.
 - `m6_core::startup`, the writer. A service built on `Site` gets the record and the shutdown line with no call of its own. An application with its own config calls `startup::Record::emit` once after `log::init` and `startup::shutdown` once on a clean exit. Site applications and examples call `startup_identity!` beside `version_flags!` so the identity line names the binary rather than m6-core.
-- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. There is no list of secret names.
+- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. A value with no type is redacted by its key's name, under Security below.
 - `m6_core::config::load_traced` and `m6_http_lib::config::load_traced`, which return the effective config and the trace of which file, flag or environment variable set each key. `load` keeps its signature and delegates.
 
 ### Changed
@@ -120,6 +120,12 @@ The release also deletes the executable hash and moves the monitor's build-drift
 - **The monitor's history file drops the `build` table's `hash` column in schema migration 3.** `hash` stored the commit that `version` already carries as its build metadata, so a build row is now `(binary, version)` and every reader takes the commit from `version`. `/history` lines lose the `hash` key and `/digest` nodes lose `hash`. SQLite refuses `DROP COLUMN` on a column in a `UNIQUE` constraint, so the migration rebuilds the table, keeps every row's id, and points a `health` row at the surviving row when two builds differed only in `hash`. A test opens a schema 2 file and checks that every other table and column is unchanged.
 - **The host facts read no network.** The FQDN of a host whose name has no domain came from `getaddrinfo` with `AI_CANONNAME`, which sends a DNS query and waits out the resolver's timeout, 5 s per server by the glibc default, when the resolver does not answer. The FQDN now comes from the host name when it carries a domain, and otherwise from the `/etc/hosts` line that lists the host, or it is unknown with the reason.
 
+
+### Verified
+
+- `m6-core/tests/startup_secrets.rs` fills every key of a service config, its secrets file and a `site.toml` with distinct sentinels, builds the record through `site::record_sections`, and finds none of the 12 credential sentinels in any line and every one of the 23 distinct setting sentinels. With the name rule switched off it reports 8 leaked credentials, `[email] password` among them.
+- `m6-core/tests/secret_fields.rs` reads more than 30 config structs from the workspace source and finds no credential-named field outside `Secret<T>`, a path type or a nested table.
+- On macOS, 20 starts of a dev m6-http before the merges and 20 after, read from the service's own log timestamps: `complete` to `m6-http started` 277 ms before and 8 ms after.
 ---
 
 ## 1.16.0, 2026-11-18
