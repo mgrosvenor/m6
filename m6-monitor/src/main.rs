@@ -125,9 +125,6 @@ fn main() -> Result<()> {
     // `--version` and `--version-full` answer from constants fixed at build
     // time, before a config path is required. `--check` is read below.
     m6_core::version_flags!(m6_core::build_info::linked());
-    // The start-up record's identity line: the binary first, then each m6
-    // crate it links. The record itself is written once logging is up.
-    m6_core::startup_identity!(m6_core::build_info::linked());
 
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();

@@ -97,7 +97,7 @@ pub const REDACTED: &str = "<redacted>";
 // ── The application's identity ──────────────────────────────────────────────
 
 /// The identity of the binary that is running, registered by
-/// `startup_identity!` beside the version call.
+/// `version_flags!`.
 ///
 /// m6-core cannot know the application's own package name and version, and the
 /// record needs it: the first identity line is the binary, then each m6 crate
@@ -108,7 +108,7 @@ static APP_IDENTITY: OnceLock<(BuildIdentity, Vec<BuildIdentity>)> = OnceLock::n
 
 /// Register the running binary's identity and the m6 crates it links.
 ///
-/// Called by `startup_identity!`, which expands the binary's own build
+/// Called by `version_flags!`, which expands the binary's own build
 /// constants at the call site.
 pub fn set_app_identity(own: BuildIdentity, linked: Vec<BuildIdentity>) {
     let _ = APP_IDENTITY.set((own, linked));
@@ -120,29 +120,6 @@ pub fn app_identity() -> (BuildIdentity, Vec<BuildIdentity>) {
         .get()
         .cloned()
         .unwrap_or_else(|| (crate::build_info::identity(), crate::build_info::linked()))
-}
-
-/// Register this binary for the start-up record, beside `version_flags!`.
-///
-/// ```text
-/// m6_core::version_flags!(m6_core::build_info::linked());
-/// m6_core::startup_identity!(m6_core::build_info::linked());
-/// ```
-///
-/// The first line answers the two flags. The second tells the record what the
-/// binary is, because m6-core cannot read another crate's build constants.
-///
-/// The identity is named for the binary, as `--version-full`'s first line is.
-#[macro_export]
-macro_rules! startup_identity {
-    ($linked:expr $(,)?) => {{
-        let (own, linked) = $crate::build_info::for_binary(
-            env!("CARGO_BIN_NAME"),
-            $crate::build_info::build_identity!(),
-            $linked,
-        );
-        $crate::startup::set_app_identity(own, linked)
-    }};
 }
 
 // ── The run id ──────────────────────────────────────────────────────────────

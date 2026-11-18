@@ -382,7 +382,7 @@ One connection per call, with `Connection: close`, so there is no idle list.
 `build_identity!()` builds a `BuildIdentity` from the `M6_BUILD_*` variables the service's own `build.rs` emitted, so each crate reports its own version, commit and dirty flag.
 `emit()` is the one line in that build script. It runs `git rev-parse --short=12 HEAD` and `git status --porcelain`, and writes `unknown` and a clean tree when git is absent.
 `linked()` returns the calling crate's identity followed by its m6 dependencies' identities, depth first. Each of those crates emitted its own constants, so `--version-full` shows a mixed build.
-`handle_version_flags(own, linked)` prints the tag form for `--version` and the per-crate lines for `--version-full`, then exits. `m6_core::version_flags!` is the one-call form a service uses at the top of `main`. It names the first line for the binary with `CARGO_BIN_NAME` through `for_binary`, so the seven extra binaries of the m6-http package each name themselves and list `m6-http` second.
+`handle_version_flags(own, linked)` prints the tag form for `--version` and the per-crate lines for `--version-full`, then exits. `m6_core::version_flags!` is the one-call form a service uses at the top of `main`, and it also registers the binary's identity for the start-up record. It names the first line for the binary with `CARGO_BIN_NAME` through `for_binary`, so the seven extra binaries of the m6-http package each name themselves and list `m6-http` second.
 `BuildIdentity`, `emit` and `full_lines` come from `m6-platform`, which sits below m6-core.
 
 Section 5 turns to the objects a handler receives and returns.
@@ -396,11 +396,10 @@ Section 5 turns to the objects a handler receives and returns.
 A service built on `Site` gets both with no call of its own: `Site::prepare` writes the record, and `Lifecycle::complete` writes the shutdown line.
 
 An application with its own config and loop makes two calls.
-The identity line names the binary rather than m6-core only when the binary registers itself, which is one line beside the version call:
+The identity line names the binary rather than m6-core only when the binary registers itself, and `version_flags!` at the top of `main` does that as it answers the version flags:
 
 ```rust
 m6_core::version_flags!(m6_core::build_info::linked());
-m6_core::startup_identity!(m6_core::build_info::linked());
 ```
 
 The record takes the effective config as sections and a `ConfigTrace` that labels each setting `file`, `default`, `env` or `flag`.

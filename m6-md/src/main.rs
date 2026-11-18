@@ -210,9 +210,6 @@ fn main() {
     // `--version` and `--version-full` answer before the input directory is
     // required.
     m6_core::version_flags!(m6_core::build_info::linked());
-    // The start-up record's identity line: the binary first, then each m6
-    // crate it links. The record itself is written once logging is up.
-    m6_core::startup_identity!(m6_core::build_info::linked());
 
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run(args));

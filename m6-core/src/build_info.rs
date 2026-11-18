@@ -90,13 +90,17 @@ pub fn handle_version_flags(own: BuildIdentity, linked: &[BuildIdentity]) {
     }
 }
 
-/// Answer the two version flags for the binary that calls it.
+/// Register the binary that calls it and answer the two version flags.
 ///
 /// The macro reads the caller's own `env!` constants and takes the linked list
 /// it is given. The first line names the binary, from `CARGO_BIN_NAME`, because
 /// one package can build several: m6-http's package builds `m6-bench` and five
 /// more. m6-core is the only crate that implements the answer, so no app
 /// formats a version string.
+///
+/// The same identity is registered for the start-up record's identity line
+/// ([`crate::startup::set_app_identity`]), because m6-core cannot read another
+/// crate's build constants and a record without it would name m6-core.
 #[macro_export]
 macro_rules! version_flags {
     ($linked:expr $(,)?) => {{
@@ -105,6 +109,7 @@ macro_rules! version_flags {
             $crate::build_info::build_identity!(),
             $linked,
         );
+        $crate::startup::set_app_identity(own, linked.clone());
         $crate::build_info::handle_version_flags(own, &linked)
     }};
 }
