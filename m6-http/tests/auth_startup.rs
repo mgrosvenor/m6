@@ -107,6 +107,41 @@ fn a_401_from_the_check_backend_starts() {
 }
 
 /// A 503 is a checker that is there and busy, so the node starts.
+/// The start after the record is local work only. The service's own
+/// timestamps put the record's `complete` line and `m6-http started` well
+/// under a second apart when the check backend answers at once.
+///
+/// An md5 of the running executable read the whole binary in that interval:
+/// 277 ms for a 30 MB dev build on macOS, and on Linux, where a dev build
+/// carries its debug information in the binary, the probe deadline test below
+/// measured 4.3 to 4.9 s for its 2 s probe. On Linux a read of that kind fails this
+/// bound. The host facts, read before the record, are held to local reads by
+/// m6-platform's own tests.
+#[test]
+fn the_start_after_the_record_reads_no_whole_binary() {
+    let dir = tempfile::Builder::new()
+        .prefix("m6-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .expect("tempdir");
+    let path = check_socket(dir.path());
+    let mut server = CheckServer::bind(&path).expect("check server");
+    let configs = write_configs(dir.path(), path.to_str().expect("utf-8 socket path"));
+
+    let mut svc = spawn(&configs);
+    serve(&mut server, &svc);
+    svc.wait_for_started(STARTED);
+    let output = svc.output();
+    let complete = seconds_of_day(&output, "\"part\":\"complete\"");
+    let started = seconds_of_day(&output, "m6-http started");
+    let after_record = started - complete;
+    assert!(
+        after_record < 1.0,
+        "m6-http took {after_record:.3}s from its record's complete line to started\n--- output ---\n{output}"
+    );
+    let status = stop(svc);
+    assert_eq!(status.code(), Some(0), "the node did not stop cleanly");
+}
+
 #[test]
 fn a_503_from_the_check_backend_starts() {
     let dir = tempfile::Builder::new()

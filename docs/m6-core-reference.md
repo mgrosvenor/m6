@@ -894,7 +894,7 @@ A group read from more than one source keeps each member a `Fact`, so a host tha
 The serialised form is `{"known": value}` or `{"unknown": "reason"}`, so every key is present in a start-up record.
 A `clock.boot_time` that is known is *RFC 3339* in *UTC*, written by `write_rfc3339_utc` (`m6-platform/src/lib.rs:229`), the same date text the log line writes.
 
-The reads that are the same on both families are in `facts.rs`: the host name and its canonical name, `uname`, the interface table through `getifaddrs`, the page size, the time zone, the open-file limit and the parsers.
+The reads that are the same on both families are in `facts.rs`: the host name and its FQDN from local data, `uname`, the interface table through `getifaddrs`, the page size, the time zone, the open-file limit and the parsers.
 The reads that differ are one function each in `linux.rs` and `macos.rs`: `host_os_facts`, `host_cpu`, `host_memory`, `host_limits`, `host_clock` and `host_virtualization`.
 Linux reads `/etc/os-release`, `/proc` and `/sys`, and macOS reads `SystemVersion.plist` and the kernel through `sysctlbyname`.
 

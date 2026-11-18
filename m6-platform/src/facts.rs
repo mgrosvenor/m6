@@ -26,7 +26,7 @@
 //! # Where the answers come from
 //!
 //! The reads that are the same on both supported families are here: the host
-//! name and the canonical name, `uname`, the interface table, the page size,
+//! name and the FQDN from local data, `uname`, the interface table, the page size,
 //! the time zone, the open-file limit, and a file reader that turns a missing
 //! file into an unknown fact. The reads that differ are one function each in
 //! `linux.rs` and `macos.rs`: `os_facts`, `cpu`, `memory`, `limits`, `clock`
@@ -319,12 +319,10 @@ impl Serialize for BootTime<'_> {
 ///
 /// The cost is a fixed set of small reads: about a dozen files and four system
 /// calls on Linux, and six `sysctl` calls plus three system calls on macOS,
-/// plus one resolver lookup when the host name has no domain part. Measured on
-/// an idle macOS arm64 host it is 150 to 200 microseconds once warm and 300 to
-/// 700 microseconds on the first call, and the interface table is the largest
-/// single read at 55 to 85 microseconds. The one read that can block is that
-/// resolver lookup, and it is skipped whenever the host name already contains
-/// a dot.
+/// plus a read of `/etc/hosts` when the host name has no domain part. Measured
+/// on an idle macOS arm64 host it is 150 to 200 microseconds once warm and 300
+/// to 700 microseconds on the first call, and the interface table is the
+/// largest single read at 55 to 85 microseconds. No read goes to the network.
 pub fn host_facts() -> HostFacts {
     let hostname = hostname();
     HostFacts {
@@ -355,12 +353,15 @@ fn hostname() -> Fact<String> {
     }
 }
 
-/// The fully qualified name.
+/// The fully qualified name, from local data only.
 ///
 /// A host name that already contains a dot is its own FQDN, and that is the
-/// common case on the hosts m6 is deployed on, so no lookup is made. Otherwise
-/// the resolver is asked for the canonical name, which is one lookup at start.
-/// A name with no domain part is an ordinary answer for a host that has none.
+/// common case. Otherwise the answer is the line of `/etc/hosts` that names the
+/// host, and the first name on it that carries a domain. No resolver is asked:
+/// `getaddrinfo` here sent a DNS query at every start of a host with a short
+/// name, and a resolver that does not answer holds the start for its whole
+/// timeout, 5 s per server with the glibc default. A host that names its
+/// domain nowhere local reports the FQDN as unknown, with the reason.
 fn fqdn(hostname: &Fact<String>) -> Fact<String> {
     let Some(name) = hostname.known() else {
         return Fact::Unknown("the host name could not be read");
@@ -368,45 +369,31 @@ fn fqdn(hostname: &Fact<String>) -> Fact<String> {
     if name.contains('.') {
         return Fact::Known(name.clone());
     }
-    let Ok(name) = std::ffi::CString::new(name.as_str()) else {
-        return Fact::Unknown("the host name holds a NUL byte");
-    };
-    let mut hints: nix::libc::addrinfo = unsafe { std::mem::zeroed() };
-    hints.ai_family = nix::libc::AF_UNSPEC;
-    hints.ai_socktype = nix::libc::SOCK_STREAM;
-    hints.ai_flags = nix::libc::AI_CANONNAME;
-    let mut result: *mut nix::libc::addrinfo = std::ptr::null_mut();
-    // SAFETY: every pointer is either null or points to a live value of the
-    // type the call expects, and the hints are fully initialised above. The
-    // list the call returns is freed once it has been read.
-    let rc =
-        unsafe { nix::libc::getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut result) };
-    if rc != 0 || result.is_null() {
-        return Fact::Unknown("the host name did not resolve to a canonical name");
+    match std::fs::read_to_string("/etc/hosts") {
+        Ok(hosts) => match fqdn_from_hosts(name, &hosts) {
+            Some(fqdn) => Fact::Known(fqdn),
+            None => Fact::Unknown("the host name has no domain and /etc/hosts gives none"),
+        },
+        Err(_) => Fact::Unknown("the host name has no domain and /etc/hosts cannot be read"),
     }
-    let mut canonical = None;
-    let mut node = result;
-    while !node.is_null() {
-        // SAFETY: `node` is a node of the list `getaddrinfo` returned.
-        let info = unsafe { &*node };
-        if !info.ai_canonname.is_null() {
-            // SAFETY: `ai_canonname` is a NUL terminated string when set.
-            let name = unsafe { std::ffi::CStr::from_ptr(info.ai_canonname) };
-            let name = name.to_string_lossy().into_owned();
-            if name.contains('.') {
-                canonical = Some(name);
-                break;
-            }
+}
+
+/// The first name with a domain on the `/etc/hosts` line that lists `name`.
+///
+/// A line is an address and then names, the canonical name first, and `#`
+/// starts a comment. Names compare without regard to case, as DNS names do.
+fn fqdn_from_hosts(name: &str, hosts: &str) -> Option<String> {
+    hosts.lines().find_map(|line| {
+        let line = line.split('#').next().unwrap_or_default();
+        let names: Vec<&str> = line.split_whitespace().skip(1).collect();
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            return None;
         }
-        node = info.ai_next;
-    }
-    // SAFETY: `result` is the list `getaddrinfo` returned and has not been
-    // freed. Every node was only read.
-    unsafe { nix::libc::freeaddrinfo(result) };
-    match canonical {
-        Some(name) => Fact::Known(name),
-        None => Fact::Unknown("the host has no domain name"),
-    }
+        names
+            .iter()
+            .find(|n| n.contains('.'))
+            .map(|n| n.to_string())
+    })
 }
 
 /// The kernel's release and version, through `uname`.
@@ -1016,6 +1003,42 @@ mod tests {
             Fact::Known(name) => assert!(!name.is_empty()),
             Fact::Unknown(reason) => assert!(!reason.is_empty()),
         }
+    }
+
+    /// The FQDN comes from the `/etc/hosts` line that lists the host, and a
+    /// host that line does not give a domain is not given one.
+    #[test]
+    fn the_fqdn_is_read_from_the_hosts_file_only() {
+        let hosts = "\
+127.0.0.1   localhost
+# 10.0.0.9 edge-a.example.com edge-a
+127.0.1.1   edge-a.example.com edge-a   # this host
+10.0.0.2    origin
+";
+        assert_eq!(
+            fqdn_from_hosts("edge-a", hosts).as_deref(),
+            Some("edge-a.example.com")
+        );
+        assert_eq!(
+            fqdn_from_hosts("EDGE-A", hosts).as_deref(),
+            Some("edge-a.example.com"),
+            "a host name compares without regard to case"
+        );
+        assert_eq!(
+            fqdn_from_hosts("origin", hosts),
+            None,
+            "a line with no domain"
+        );
+        assert_eq!(
+            fqdn_from_hosts("edge-b", hosts),
+            None,
+            "no line names the host"
+        );
+        assert_eq!(
+            fqdn(&Fact::Known("edge-a.example.com".to_string())),
+            Fact::Known("edge-a.example.com".to_string()),
+            "a name with a dot is its own FQDN, with no read at all"
+        );
     }
 
     /// The kernel is either read or reported, never a panic.

@@ -111,6 +111,11 @@ The release also deletes the executable hash and moves the monitor's build-drift
 - **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. A key ending in `_path`, `_file` or `_dir`, and any `public_key`, is a path and is still logged.
 - `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
 
+### Fixed
+
+- **m6-http's start no longer waits between its record's `complete` line and `m6-http started`.** On Linux the probe deadline test measured 4.3 to 4.9 s for its 2 s probe. The time was the md5 of the running executable, read in full at start, which the deletion of the executable hash in this release removes. On macOS the same interval was 277 ms for a 30 MB dev build before and 8 ms after, and spawn to `m6-http started` went from 283 ms to 14 ms (median of 20 starts each). `auth_startup.rs` now holds the interval under 1 s.
+- **The host facts read no network.** The FQDN of a host whose name has no domain came from `getaddrinfo` with `AI_CANONNAME`, which sends a DNS query and waits out the resolver's timeout, 5 s per server by the glibc default, when the resolver does not answer. The FQDN now comes from the host name when it carries a domain, and otherwise from the `/etc/hosts` line that lists the host, or it is unknown with the reason.
+
 ---
 
 ## 1.16.0, 2026-11-18

@@ -1581,11 +1581,11 @@ mod facts {
 
     /// H17. One reading costs microseconds, not milliseconds. The number is
     /// printed for the record and the bound catches only the two things that
-    /// would make it a start-up cost: a resolver stall in the FQDN lookup, and
-    /// a reader that walks something large.
+    /// would make it a start-up cost: a network read, such as a resolver
+    /// lookup for the FQDN, and a reader that walks something large.
     ///
-    /// Break: a loop over `/proc/net/dev` per interface, or a lookup on a
-    /// host name that already carries its domain.
+    /// Break: a loop over `/proc/net/dev` per interface, or a resolver lookup
+    /// for a host name with no domain.
     #[test]
     fn host_facts_is_read_once_and_costs_microseconds() {
         let start = std::time::Instant::now();
