@@ -1700,9 +1700,22 @@ mod directories {
         let script = dir.path().join("run.sh");
         std::fs::write(&script, "#!/bin/bash\necho ran\n").expect("write");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let out = std::process::Command::new(&script)
-            .output()
-            .expect("exec from the scratch directory");
+        // A thread that forks while this one writes holds the script's write
+        // descriptor until its own `exec`, and Linux refuses to run the file
+        // until then (`ETXTBSY`). That is a wait for the other `exec`, not a
+        // `noexec` mount, so retry only that refusal.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let out = loop {
+            match std::process::Command::new(&script).output() {
+                Err(e)
+                    if e.kind() == io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                done => break done.expect("exec from the scratch directory"),
+            }
+        };
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
     }
 
