@@ -691,20 +691,11 @@ pub fn parse_cpuinfo_model(text: &str) -> Option<String> {
     None
 }
 
-/// `MemTotal` from `/proc/meminfo`, in bytes. The kernel's `kB` label means
-/// KiB, so the number is multiplied by 1024.
+/// `MemTotal` from `/proc/meminfo`, in bytes, read by
+/// [`crate::host::meminfo_bytes`].
 pub fn parse_meminfo_total(text: &str) -> Option<u64> {
-    for line in text.lines() {
-        let Some((key, rest)) = line.split_once(':') else {
-            continue;
-        };
-        if key.trim() != "MemTotal" {
-            continue;
-        }
-        let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
-        return Some(kib.saturating_mul(1024));
-    }
-    None
+    let [total] = crate::host::meminfo_bytes(text, ["MemTotal"]);
+    total
 }
 
 /// The active setting of `/sys/kernel/mm/transparent_hugepage/enabled`, which

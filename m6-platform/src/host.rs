@@ -134,22 +134,7 @@ impl Memory {
 /// Parse `/proc/meminfo`. Values are in kB despite the kernel's `kB` label
 /// meaning KiB, so they are multiplied by 1024.
 pub fn parse_meminfo(s: &str) -> Option<Memory> {
-    let mut total = None;
-    let mut available = None;
-    let mut free = None;
-    for line in s.lines() {
-        let (key, rest) = line.split_once(':')?;
-        let kb: u64 = match rest.split_whitespace().next().and_then(|v| v.parse().ok()) {
-            Some(v) => v,
-            None => continue,
-        };
-        match key {
-            "MemTotal" => total = Some(kb * 1024),
-            "MemAvailable" => available = Some(kb * 1024),
-            "MemFree" => free = Some(kb * 1024),
-            _ => {}
-        }
-    }
+    let [total, available, free] = meminfo_bytes(s, ["MemTotal", "MemAvailable", "MemFree"]);
     // MemAvailable has been present since Linux 3.14. Falling back to MemFree
     // understates what is obtainable, so it is a last resort rather than a
     // silent equivalent.
@@ -160,17 +145,36 @@ pub fn parse_meminfo(s: &str) -> Option<Memory> {
     })
 }
 
+/// The named `/proc/meminfo` values, in bytes, in one pass. The kernel's `kB`
+/// label means KiB, so each number is multiplied by 1024. The one reader of
+/// the file's format, for the host snapshot and the host facts.
+pub fn meminfo_bytes<const N: usize>(text: &str, keys: [&str; N]) -> [Option<u64>; N] {
+    let mut found = [None; N];
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(at) = keys.iter().position(|k| *k == key.trim()) else {
+            continue;
+        };
+        if let Some(kib) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            found[at] = Some(kib.saturating_mul(1024));
+        }
+    }
+    found
+}
+
 /// Interpret cgroup v2 `memory.max` and `memory.current`.
 ///
 /// `memory.max` is the literal string `max` when no limit applies, which is
 /// the case for the root cgroup on an ordinary VM. Returning `None` then is
 /// correct and means "ask the host instead", not "failed to read".
 pub fn parse_cgroup_memory(max: &str, current: &str) -> Option<Memory> {
-    let max = max.trim();
-    if max == "max" {
-        return None;
-    }
-    let total: u64 = max.parse().ok()?;
+    let total = crate::facts::parse_cgroup_memory_max(max)??;
     let used: u64 = current.trim().parse().ok()?;
     Some(Memory {
         total_bytes: total,
