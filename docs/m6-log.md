@@ -360,15 +360,15 @@ The record is many lines for exactly this reason: the largest line stays well un
 
 | tree | service and config files | lines | bytes | longest line |
 |---|---|---|---|---|
-| production | m6-file, its service config and the site's `site.toml` | 71 | 43,083 | 4,279 |
-| staging | m6-file, its service config and the site's `site.toml` | 71 | 43,309 | 4,279 |
-| production | m6-monitor, its service config and the site's `site.toml` | 64 | 35,140 | 4,282 |
-| staging | m6-monitor, its service config and the site's `site.toml` | 64 | 35,322 | 4,282 |
+| production | m6-file, its service config and the site's `site.toml` | 71 | 42,639 | 4,273 |
+| staging | m6-file, its service config and the site's `site.toml` | 71 | 42,865 | 4,273 |
+| production | m6-monitor, its service config and the site's `site.toml` | 64 | 34,738 | 4,276 |
+| staging | m6-monitor, its service config and the site's `site.toml` | 64 | 34,920 | 4,276 |
 
 **Table 9: the record measured from the largest rendered configs, with the line count and the longest line in bytes.**
 
 The measurement is taken from the rendered tree through the same writer a process uses, so these are bytes the record produces rather than an estimate.
-The largest is 71 lines and 43,309 bytes, and its longest line is 4,279 bytes, which is the platform line.
+The largest is 71 lines and 42,865 bytes, and its longest line is 4,273 bytes, which is the platform line.
 Every config section is under 900 bytes.
 The platform line is the longest because a host reports its addresses, kernel and limits, so it is where a record grows first.
 The 64 KiB `[limits] journal_line` holds it with more than 60 KiB to spare.
