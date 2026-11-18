@@ -855,19 +855,16 @@ pub struct Record {
     trace: ConfigTrace,
     sections: Vec<Section>,
     host: HostReport,
-    limits: Option<LimitsReport>,
+    limits: LimitsReport,
     decisions: Map<String, Value>,
 }
 
 impl Record {
-    /// A record for `app`, built from the process's own identity and the m6
-    /// crates linked into it.
-    pub fn new(
-        app: impl Into<String>,
-        own: BuildIdentity,
-        linked: Vec<BuildIdentity>,
-        argv: Vec<String>,
-    ) -> Record {
+    /// A record for `app`: the identity `version_flags!` registered, the host
+    /// the platform layer decides, and the default limits. A service with a
+    /// `[limits]` table replaces them with [`Record::limits`].
+    pub fn new(app: impl Into<String>, argv: Vec<String>) -> Record {
+        let (own, linked) = app_identity();
         Record {
             run_id: RunId::now(),
             app: app.into(),
@@ -876,8 +873,8 @@ impl Record {
             invocation: Invocation::default(),
             trace: ConfigTrace::new(),
             sections: Vec::new(),
-            host: HostReport::unknown("the platform layer was not asked"),
-            limits: None,
+            host: HostReport::decided(),
+            limits: LimitsReport::read(&Limits::default(), &ConfigTrace::new()),
             decisions: Map::new(),
             argv,
         }
@@ -940,7 +937,7 @@ impl Record {
 
     /// The effective limits.
     pub fn limits(mut self, limits: LimitsReport) -> Record {
-        self.limits = Some(limits);
+        self.limits = limits;
         self
     }
 
@@ -1030,11 +1027,7 @@ impl Record {
                 .end();
         }
 
-        let limits = self
-            .limits
-            .as_ref()
-            .map(|report| json!(report.limits))
-            .unwrap_or(Value::Null);
+        let limits = json!(self.limits.limits);
         self.base(sink, next(), "platform")
             .json("host", &self.host.facts)
             .json("limits", &limits)
@@ -1143,6 +1136,18 @@ pub fn write_shutdown_into(
         .str("reason", reason)
         .str("message", "shutdown")
         .end();
+}
+
+/// Record the log level the process runs at in the `log` section, sourced
+/// from `trace`. The config file's `[log]` table is not the last word:
+/// `site.toml` and `--log-level` come later in the order.
+pub fn record_log_level(sections: &mut [Section], level: crate::log::Level, trace: &ConfigTrace) {
+    if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
+        log_section.set(
+            "level",
+            Setting::new(level.text().to_ascii_lowercase(), trace.source("log.level")),
+        );
+    }
 }
 
 // ── Turning an effective config into sections ───────────────────────────────

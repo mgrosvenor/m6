@@ -3255,15 +3255,10 @@ domain = "test.example.com"
         let cfg = r.expect("a cache node loads");
         let (_, trace) = load_traced(dir.path(), &dir.path().join("system.toml"))
             .expect("the same config loads with its trace");
-        let record = startup::Record::new(
-            "m6-http",
-            m6_core::build_info::identity(),
-            m6_core::build_info::linked(),
-            vec!["m6-http".to_string()],
-        )
-        .trace(trace.clone())
-        .sections(cfg.startup_sections(&trace))
-        .host(startup::HostReport::unknown("a test host knows nothing"));
+        let record = startup::Record::new("m6-http", vec!["m6-http".to_string()])
+            .trace(trace.clone())
+            .sections(cfg.startup_sections(&trace))
+            .host(startup::HostReport::unknown("a test host knows nothing"));
         let path = dir.path().join("record.jsonl");
         let mut sink = m6_core::log::Sink::file(&path).expect("a file sink");
         record.write(&mut sink);

@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use crate::log::{error, warn};
 use crate::startup::{
-    ConfigRole, ConfigTrace, EnvDecl, FlagDecl, HostReport, Invocation as StartupInvocation,
-    LimitsReport, Record as StartupRecord,
+    ConfigRole, ConfigTrace, EnvDecl, FlagDecl, Invocation as StartupInvocation, LimitsReport,
+    Record as StartupRecord,
 };
 use anyhow::Context;
 use serde_json::{Map, Value};
@@ -156,18 +156,7 @@ pub fn record_sections(
     for section in &mut sections {
         section.file = Some(files.config_path.display().to_string());
     }
-    // The effective log level is the one the process is using, not the one the
-    // service config's table happens to carry: site.toml and --log-level are
-    // later in the order.
-    if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
-        log_section.set(
-            "level",
-            crate::startup::Setting::new(
-                level.text().to_ascii_lowercase(),
-                trace.source("log.level"),
-            ),
-        );
-    }
+    crate::startup::record_log_level(&mut sections, level, trace);
     // The socket path is a decided fact, derived from the config path unless
     // the environment replaced it. Its source is how an operator tells the two
     // apart.
@@ -543,7 +532,6 @@ impl Site {
         let startup_record = if mode == StartMode::Service {
             let argv: Vec<String> = std::env::args().collect();
             let invocation = StartupInvocation::read(&argv, SITE_FLAGS, SITE_ENV, &mut trace);
-            let (own, linked) = crate::startup::app_identity();
             let sections = record_sections(
                 &config,
                 RecordFiles {
@@ -557,10 +545,9 @@ impl Site {
                 &socket_path,
             );
             Some(
-                StartupRecord::new(name, own, linked, argv)
+                StartupRecord::new(name, argv)
                     .invocation(invocation, trace.clone())
                     .sections(sections)
-                    .host(HostReport::decided())
                     .limits(LimitsReport::read(&config.limits, &trace))
                     .decision("socket_path", socket_path.display().to_string()),
             )

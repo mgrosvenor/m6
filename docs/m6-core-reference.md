@@ -402,10 +402,12 @@ The identity line names the binary rather than m6-core only when the binary regi
 m6_core::version_flags!(m6_core::build_info::linked());
 ```
 
+`Record::new(app, argv)` starts the record with the identity `version_flags!` registered, the host from `HostReport::decided`, and the default limits.
 The record takes the effective config as sections and a `ConfigTrace` that labels each setting `file`, `default`, `env` or `flag`.
 `ConfigTrace::add_config_file` records a file's path, its role and its sha256 as read.
 `Invocation::read` reads the declared flags and environment variables and records the settings they replaced.
-`LimitsReport::read` records every named limit's start, max and source.
+`LimitsReport::read` records every named limit's start, max and source, and `Record::limits` replaces the default with a service's own.
+`record_log_level` writes the level the process runs at into the `log` section, because `site.toml` and `--log-level` come after the config file.
 `HostReport::decided` is the platform line's host block, from `m6_core::platform::host_facts()`.
 The tagged shape is kept: a fact is `{"known": value}` or `{"unknown": reason}`, so an unknown fact is never an absent key.
 The record reads the same facts' `hostname` once, when the report is built, and writes it as `node` on every start-up line and on the shutdown line.

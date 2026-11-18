@@ -163,16 +163,11 @@ fn no_credential_sentinel_reaches_any_record_line() {
         Level::Info,
         &site_dir.join("m6-service.sock"),
     );
-    let record = Record::new(
-        "m6-service",
-        m6_core::build_info::identity(),
-        m6_core::build_info::linked(),
-        vec!["m6-service".to_string()],
-    )
-    .trace(trace.clone())
-    .sections(sections)
-    .host(HostReport::unknown("a test host knows nothing"))
-    .limits(LimitsReport::read(&config.limits, &trace));
+    let record = Record::new("m6-service", vec!["m6-service".to_string()])
+        .trace(trace.clone())
+        .sections(sections)
+        .host(HostReport::unknown("a test host knows nothing"))
+        .limits(LimitsReport::read(&config.limits, &trace));
 
     let path = dir.path().join("record.jsonl");
     let mut sink = m6_core::log::Sink::file(&path).expect("a file sink");

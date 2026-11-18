@@ -7319,21 +7319,11 @@ fn run(args: Vec<String>) -> i32 {
         let invocation =
             m6_core::startup::Invocation::read(&argv, STARTUP_FLAGS, startup_env(), &mut trace);
         trace.set_flag("site_dir", &cli.site_dir.display().to_string());
-        let (own, linked) = m6_core::startup::app_identity();
         let mut sections = config.startup_sections(&trace);
-        if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
-            log_section.set(
-                "level",
-                m6_core::startup::Setting::new(
-                    level.text().to_ascii_lowercase(),
-                    trace.source("log.level"),
-                ),
-            );
-        }
-        let record = m6_core::startup::Record::new("m6-http", own, linked, argv)
+        m6_core::startup::record_log_level(&mut sections, level, &trace);
+        let record = m6_core::startup::Record::new("m6-http", argv)
             .invocation(invocation, trace.clone())
             .sections(sections)
-            .host(m6_core::startup::HostReport::decided())
             .limits(m6_core::startup::LimitsReport::read(&config.limits, &trace))
             .decision("bind", config.server.bind.clone())
             .decision(

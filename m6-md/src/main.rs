@@ -258,15 +258,9 @@ fn run(args: Vec<String>) -> i32 {
             },
         ];
         let invocation = m6_core::startup::Invocation::read(&argv, &flags, &[], &mut trace);
-        let (own, linked) = m6_core::startup::app_identity();
-        let record = m6_core::startup::Record::new("m6-md", own, linked, argv)
+        m6_core::startup::Record::new("m6-md", argv)
             .invocation(invocation, trace)
-            .host(m6_core::startup::HostReport::decided())
-            .limits(m6_core::startup::LimitsReport::read(
-                &m6_core::limits::Limits::default(),
-                &m6_core::startup::ConfigTrace::new(),
-            ));
-        record.emit();
+            .emit();
     }
 
     // Run the one pass, then write everything buffered before this tool exits.

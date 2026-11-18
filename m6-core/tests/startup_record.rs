@@ -111,16 +111,11 @@ fn record_from(
         section.file = Some("m6-service.conf".to_string());
     }
     let limits = LimitsReport::read(&config.limits, &trace);
-    Record::new(
-        name,
-        m6_core::build_info::identity(),
-        m6_core::build_info::linked(),
-        argv.to_vec(),
-    )
-    .invocation(invocation, trace.clone())
-    .sections(sections)
-    .host(HostReport::unknown("a test host knows nothing"))
-    .limits(limits)
+    Record::new(name, argv.to_vec())
+        .invocation(invocation, trace.clone())
+        .sections(sections)
+        .host(HostReport::unknown("a test host knows nothing"))
+        .limits(limits)
 }
 
 #[test]
@@ -354,16 +349,11 @@ fn every_setting_carries_its_source() {
             "socket_path",
             Setting::new(socket_value.clone(), trace.source("server.socket_path")),
         );
-    let record = Record::new(
-        "m6-service",
-        m6_core::build_info::identity(),
-        m6_core::build_info::linked(),
-        argv,
-    )
-    .invocation(invocation, trace.clone())
-    .sections(sections)
-    .host(HostReport::unknown("none"))
-    .limits(LimitsReport::read(&config.limits, &trace));
+    let record = Record::new("m6-service", argv)
+        .invocation(invocation, trace.clone())
+        .sections(sections)
+        .host(HostReport::unknown("none"))
+        .limits(LimitsReport::read(&config.limits, &trace));
     std::env::remove_var("M6_SOCKET_OVERRIDE");
 
     let (lines, _) = write(&record);
@@ -842,16 +832,11 @@ fn measured_record_from_a_rendered_tree() {
         site_dir.display().to_string(),
         load_path.display().to_string(),
     ];
-    let record = Record::new(
-        app,
-        m6_core::build_info::identity(),
-        m6_core::build_info::linked(),
-        argv.clone(),
-    )
-    .trace(trace.clone())
-    .sections(sections)
-    .host(HostReport::decided())
-    .limits(LimitsReport::read(&config.limits, &trace));
+    let record = Record::new(app, argv.clone())
+        .trace(trace.clone())
+        .sections(sections)
+        .host(HostReport::decided())
+        .limits(LimitsReport::read(&config.limits, &trace));
     let (lines, text) = write(&record);
 
     let mut sizes: Vec<(usize, String, String)> = text
@@ -914,15 +899,10 @@ fn a_secret_flag_is_redacted(args: &[&str], expected: &[&str]) {
         .collect();
     let mut trace = trace;
     let invocation = Invocation::read(&argv, &flags, &[], &mut trace);
-    let record = Record::new(
-        "m6-service",
-        m6_core::build_info::identity(),
-        m6_core::build_info::linked(),
-        argv,
-    )
-    .invocation(invocation, trace.clone())
-    .sections(config.startup_sections(dir.path(), &trace))
-    .host(HostReport::unknown("none"));
+    let record = Record::new("m6-service", argv)
+        .invocation(invocation, trace.clone())
+        .sections(config.startup_sections(dir.path(), &trace))
+        .host(HostReport::unknown("none"));
     let (lines, text) = write(&record);
     assert!(
         !text.contains("pw-must-never-be-logged"),
