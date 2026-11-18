@@ -606,12 +606,34 @@ fn scratch_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
             .and_then(|()| {
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             })
-            .and_then(|()| std::process::Command::new(&script).output())
+            .and_then(|()| output_of_new_script(&script))
             .map(|out| out.status.success())
             .unwrap_or(false);
         let _ = std::fs::remove_dir_all(&probe);
         ran
     })
+}
+
+/// Run a script this process has just written and wait for its output.
+///
+/// Linux refuses `exec` of a file any process holds open for writing
+/// (`ETXTBSY`). A thread that forks while this one writes inherits the write
+/// descriptor until its own `exec` closes it, so the refusal is real but
+/// lasts only until that `exec`. It is retried until it clears, within a
+/// bound that only a hung `fork` could pass.
+fn output_of_new_script(script: &Path) -> io::Result<std::process::Output> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(script).output() {
+            Err(e)
+                if e.kind() == io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now();
+            }
+            done => return done,
+        }
+    }
 }
 
 /// Create `file` as a private file: its parent with mode 0700 when the parent
@@ -652,6 +674,37 @@ mod tests {
         std::env::set_var("JOURNAL_STREAM", "");
         assert!(!journal_stream(), "an empty value is not a journal");
         std::env::remove_var("JOURNAL_STREAM");
+    }
+
+    /// A script still held open for writing is run once the holder lets go.
+    ///
+    /// Another thread's `fork` holds the write descriptor of a file this one
+    /// just wrote until its own `exec`, and Linux refuses to run the file
+    /// meanwhile (`ETXTBSY`). The holder here is a descriptor kept for 300 ms.
+    /// Break: the first refusal is taken as "this directory cannot run
+    /// programs", so a good scratch directory is skipped.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test code: a thread holds the descriptor for a set time"
+    )]
+    fn a_script_held_open_for_writing_is_run_when_released() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir_in(scratch_dir()).expect("tempdir");
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold the script open for writing");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holder);
+        });
+        let out = output_of_new_script(&script).expect("run once released");
+        assert!(out.status.success());
+        release.join().expect("release");
     }
 
     /// A candidate that exists but cannot be used is skipped.
