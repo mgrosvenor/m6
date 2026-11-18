@@ -501,3 +501,127 @@ fn the_two_arms_define_the_same_items() {
         "the Linux and macOS arms must define the same items"
     );
 }
+
+/// G6. No OS read outside the layer. What a host says about itself is read in
+/// `m6-platform` and reached through its API, so no other crate names a
+/// `/proc`, `/sys` or os-release path, calls `uname`, `gethostname`,
+/// `getifaddrs`, `getrlimit` or `sysctl`, or asks for a resource limit,
+/// itself. Tests are included: a test that reads `/proc` is a second
+/// implementation of a platform fact, and it drifts from the first.
+///
+/// Break: one `std::fs::read_to_string("/proc/meminfo")` in m6-http, or one
+/// `Command::new("uname")` in a test helper.
+#[test]
+fn no_os_read_outside_the_layer() {
+    const READS: [&str; 13] = [
+        "\"/proc",
+        "\"/sys/",
+        "\"/etc/os-release",
+        "\"/etc/localtime",
+        "\"/etc/timezone",
+        "\"uname\"",
+        "uname(",
+        "gethostname(",
+        "getifaddrs(",
+        "getrlimit(",
+        "sysctlbyname(",
+        "Resource::RLIMIT_",
+        "systemd-detect-virt",
+    ];
+    let root = root();
+    let mut found = Vec::new();
+    for rel in rust_files(&root) {
+        if in_layer(&rel) {
+            continue;
+        }
+        found.extend(offending_lines(&root, &rel, &|line| {
+            // A comment may name the path it explains. Only code is a read.
+            if line.trim_start().starts_with("//") {
+                return false;
+            }
+            READS.iter().any(|read| line.contains(read))
+        }));
+    }
+    assert_none("G6 (OS reads)", found);
+}
+
+/// G7. The host-facts API is one un-gated surface. The module and its
+/// crate-root re-export carry no `cfg`, so the call site is the same name on
+/// every target: `m6_core::platform::host_facts()`. G1 is what compiles that
+/// call site on all three jobs, because it refuses a platform `cfg` outside
+/// the layer.
+///
+/// Break: `#[cfg(target_os = "linux")] pub mod facts;`, or an API re-exported
+/// only inside an OS arm, which makes the caller compile on one target and
+/// not another.
+#[test]
+fn the_host_facts_api_is_not_conditional() {
+    let root = root();
+    let text = std::fs::read_to_string(root.join("m6-platform/src/lib.rs")).expect("lib.rs");
+    let lines: Vec<&str> = text.lines().collect();
+    let declared = lines
+        .iter()
+        .position(|line| line.trim() == "pub mod facts;")
+        .expect("the facts module is declared at the crate root");
+    let reexported = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("pub use facts::"))
+        .expect("the facts API is re-exported at the crate root");
+    for (at, what) in [
+        (declared, "pub mod facts;"),
+        (reexported, "pub use facts::"),
+    ] {
+        let previous = lines.get(at.wrapping_sub(1)).copied().unwrap_or_default();
+        assert!(
+            !previous.contains("#[cfg"),
+            "{what} is behind a cfg, so a caller compiles on one target and not another: {previous}"
+        );
+    }
+}
+
+/// G8. The API answers every fact with `Known` or `Unknown`, never a panic,
+/// and the address list may be empty. The call site is this file, which is
+/// compiled by every supported target.
+///
+/// Break: a reader that unwraps a file a container does not have, or one that
+/// reports a zero with no reason, which a reader cannot tell from a real zero.
+#[test]
+fn the_host_facts_api_answers_every_fact() {
+    use m6_platform::facts::Fact;
+
+    fn answered<T>(what: &str, fact: &Fact<T>) {
+        match fact {
+            Fact::Known(_) => {}
+            Fact::Unknown(reason) => assert!(
+                !reason.is_empty(),
+                "{what} is unknown and does not say why, which a reader cannot act on"
+            ),
+        }
+    }
+    let facts = m6_platform::host_facts();
+    answered("hostname", &facts.hostname);
+    answered("fqdn", &facts.fqdn);
+    answered("os", &facts.os);
+    if let Fact::Known(os) = &facts.os {
+        answered("os.version", &os.version);
+    }
+    answered("kernel", &facts.kernel);
+    answered("cpu.model", &facts.cpu.model);
+    answered("cpu.count", &facts.cpu.count);
+    answered("memory.total_bytes", &facts.memory.total_bytes);
+    answered("memory.page_size", &facts.memory.page_size);
+    answered("memory.huge_pages", &facts.memory.huge_pages);
+    answered("limits.memlock", &facts.limits.memlock);
+    answered("limits.nofile", &facts.limits.nofile);
+    answered("limits.somaxconn", &facts.limits.somaxconn);
+    answered("limits.cgroup_memory", &facts.limits.cgroup_memory);
+    answered("limits.cgroup_cpu", &facts.limits.cgroup_cpu);
+    answered("clock.timezone", &facts.clock.timezone);
+    answered("clock.source", &facts.clock.source);
+    answered("clock.boot_time", &facts.clock.boot_time);
+    answered("virtualization", &facts.virtualization);
+    let addresses: &Vec<m6_platform::facts::InterfaceAddress> = &facts.addresses;
+    for address in addresses {
+        assert!(!address.name.is_empty(), "{address:?}");
+    }
+}

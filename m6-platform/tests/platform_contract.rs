@@ -1327,6 +1327,167 @@ mod facts {
         let (low, high) = process::certificate_store_workers();
         assert!(low <= high, "{low}..={high}");
     }
+
+    /// A host fact in its serialised form is exactly one of `{"known": value}`
+    /// or `{"unknown": "reason"}`, and the reason is never empty.
+    fn assert_fact(value: &serde_json::Value, what: &str) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{what} is not a fact: {value}"));
+        let known = object.get("known");
+        let unknown = object.get("unknown");
+        assert!(
+            known.is_some() != unknown.is_some(),
+            "{what} is not exactly one of a value and a reason: {value}"
+        );
+        if let Some(reason) = unknown {
+            let reason = reason
+                .as_str()
+                .unwrap_or_else(|| panic!("{what}: the reason is not a string: {value}"));
+            assert!(!reason.is_empty(), "{what} is unknown with no reason");
+        }
+    }
+
+    /// Every key the start-up record expects is present, every leaf is a fact,
+    /// and the address list may be empty. This is the shape a reader filters
+    /// on, so a missing key is the defect it refuses.
+    fn assert_complete_record(value: &serde_json::Value) {
+        let object = value.as_object().expect("the record is an object");
+        for key in [
+            "hostname",
+            "fqdn",
+            "addresses",
+            "os",
+            "kernel",
+            "cpu",
+            "memory",
+            "limits",
+            "clock",
+            "virtualization",
+        ] {
+            assert!(object.contains_key(key), "no {key} key: {value}");
+        }
+        assert_fact(&object["hostname"], "hostname");
+        assert_fact(&object["fqdn"], "fqdn");
+        assert_fact(&object["os"], "os");
+        if let Some(os) = object["os"].get("known") {
+            assert_fact(&os["version"], "os.version");
+        }
+        assert_fact(&object["kernel"], "kernel");
+        assert_fact(&object["cpu"]["model"], "cpu.model");
+        assert_fact(&object["cpu"]["count"], "cpu.count");
+        assert_fact(&object["memory"]["total_bytes"], "memory.total_bytes");
+        assert_fact(&object["memory"]["page_size"], "memory.page_size");
+        assert_fact(&object["memory"]["huge_pages"], "memory.huge_pages");
+        for key in [
+            "memlock",
+            "nofile",
+            "somaxconn",
+            "cgroup_memory",
+            "cgroup_cpu",
+        ] {
+            assert_fact(&object["limits"][key], key);
+        }
+        assert_fact(&object["clock"]["timezone"], "clock.timezone");
+        assert_fact(&object["clock"]["source"], "clock.source");
+        assert_fact(&object["clock"]["boot_time"], "clock.boot_time");
+        assert_fact(&object["virtualization"], "virtualization");
+        let addresses = object["addresses"].as_array().expect("a list");
+        for row in addresses {
+            let name = row
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or_else(|| panic!("an address with no name: {row}"));
+            assert!(!name.is_empty(), "{row}");
+            assert!(row["address"].is_string(), "{row}");
+            assert!(row["scope"].is_string(), "{row}");
+        }
+    }
+
+    /// H15. The facts this host gives serialise as a complete record, with
+    /// every unknown carrying its reason. The address list may be empty: a
+    /// host with no configured interface is an ordinary answer.
+    ///
+    /// Break: a reader that panics on a file the container does not have, or a
+    /// serialisation that drops a key it could not fill.
+    #[test]
+    fn host_facts_answers_every_fact_and_serialises_every_key() {
+        let facts = m6_platform::host_facts();
+        let value = serde_json::to_value(&facts).expect("host facts serialise");
+        assert_complete_record(&value);
+    }
+
+    /// H16. A host that knows only its host name still serialises a complete
+    /// record: every key present, almost all of them unknown with a reason.
+    /// This is the container with half of `/proc` missing, where the record
+    /// must stay countable and comparable between nodes.
+    ///
+    /// Break: an implementation that omits a key it could not fill, which
+    /// turns a monitoring comparison into a missing-data puzzle.
+    #[test]
+    fn a_host_that_knows_only_its_hostname_is_still_a_complete_record() {
+        use m6_platform::facts::{ClockFacts, CpuFacts, Fact, HostFacts, Limits, MemoryFacts};
+
+        fn unknown<T>() -> Fact<T> {
+            Fact::Unknown("the host said nothing")
+        }
+        let facts = HostFacts {
+            hostname: Fact::Known("host".to_string()),
+            fqdn: unknown(),
+            addresses: Vec::new(),
+            os: unknown(),
+            kernel: unknown(),
+            cpu: CpuFacts {
+                model: unknown(),
+                count: unknown(),
+            },
+            memory: MemoryFacts {
+                total_bytes: unknown(),
+                page_size: unknown(),
+                huge_pages: unknown(),
+            },
+            limits: Limits {
+                memlock: unknown(),
+                nofile: unknown(),
+                somaxconn: unknown(),
+                cgroup_memory: unknown(),
+                cgroup_cpu: unknown(),
+            },
+            clock: ClockFacts {
+                timezone: unknown(),
+                source: unknown(),
+                boot_time: unknown(),
+            },
+            virtualization: unknown(),
+        };
+        let value = serde_json::to_value(&facts).expect("host facts serialise");
+        assert_complete_record(&value);
+        assert_eq!(value["hostname"]["known"], "host");
+        assert_eq!(
+            value["kernel"]["unknown"], "the host said nothing",
+            "an unknown fact keeps the reason it was given"
+        );
+    }
+
+    /// H17. One reading costs microseconds, not milliseconds. The number is
+    /// printed for the record and the bound catches only the two things that
+    /// would make it a start-up cost: a resolver stall in the FQDN lookup, and
+    /// a reader that walks something large.
+    ///
+    /// Break: a loop over `/proc/net/dev` per interface, or a lookup on a
+    /// host name that already carries its domain.
+    #[test]
+    fn host_facts_is_read_once_and_costs_microseconds() {
+        let start = std::time::Instant::now();
+        let facts = m6_platform::host_facts();
+        let elapsed = start.elapsed();
+        println!("H17 host_facts() took {elapsed:?}");
+        std::hint::black_box(&facts);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "host_facts() took {elapsed:?}, which is a start-up cost, not a reading"
+        );
+    }
 }
 
 // ── 8. Directories and private files ─────────────────────────────────────────
