@@ -621,7 +621,20 @@ mod spawn {
         let listening = process::listens_on_tcp(child.id());
         drop(bare);
         drop(listener);
-        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        // A child another test thread has forked and not yet exec'd holds a
+        // copy of the listener (close-on-exec acts only at its exec), so the
+        // port is released a moment later. Retry only `AddrInUse`, to a
+        // deadline: the child above is what must not hold it, and it has
+        // exec'd by the time `spawn` returns.
+        let deadline = Instant::now() + SOON;
+        let rebound = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                done => break done,
+            }
+        };
         let _ = child.kill();
         let _ = child.wait();
         assert!(
