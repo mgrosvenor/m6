@@ -375,7 +375,8 @@ Table 7: where each part of the digest comes from.
 `check::render` prints the same reading as text.
 HEALTH comes first, one line per node with this poll's `/health` answer and the age of its last 200 from the history, and a node past the age limit reads `FAULT` on its line and in the verdict.
 PROCESSES follows when the fleet declares `processes`, and STARTUP follows that.
-STARTUP gives each node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
+STARTUP gives each node's and app's current run: the version, the run id, the start time the record states, the sha256 of every config file it read, and the number of journal lines the monitor ingested for the run, with the shutdown line when there is one.
+A run that replaced an earlier one also prints `previous: <run id>, shut down <reason> at <time>`, or `previous: <run id>, no shutdown recorded`, marked `[info]` for an expected restart and `[WARN: unexpected restart]` for the rest.
 The rest is sections A to I: A LOGGING, B PERFORMANCE, C HOST, D SECURITY AND TRAFFIC, E CRAWLERS, F CACHE HEADERS, G CONNECTION SETUP, H TUNNELS, and I HISTORY.
 Section A judges the node's own log from the traffic document's `logging`, and `LoggingHealth::is_blind` faults a log silent for more than 40 seconds.
 
@@ -404,7 +405,10 @@ Table 7.1: the checks on the start-up record.
 | a run's version, config or decided facts cannot be compared | the deploy's record is absent, unreadable or silent about that node or app | Warn |
 
 A restart is expected only when the deploy's record says a deploy is in progress and the previous run wrote a shutdown line.
-An unexpected restart quotes the previous run's id and, when it wrote one, the shutdown reason and the uptime.
+An unexpected restart quotes the previous run's id and, when it wrote one, the shutdown reason, its time and the uptime.
+Every restart, expected or not, carries `previous_shutdown` in the run's `/digest` entry: `{reason, at, uptime_ms}` from the previous run's shutdown line, or `null` when it wrote none.
+The entry's `restart` is `info` for an expected restart and `warn` for an unexpected one, and only the second is a finding.
+`ingested_lines` is the raw count of journal lines the monitor read for the run's id: the start-up lines, any replay of them from the journal tail, and the shutdown line. `lines` counts the start-up lines alone.
 Without the deploy's record the monitor cannot claim or deny a deploy, so it treats a restart with a shutdown line as expected and the missing record has its own warning.
 
 Every finding names the node, the run id and the fact, so a reader can act on it without opening the node.

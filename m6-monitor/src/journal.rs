@@ -124,6 +124,10 @@ pub struct StartupRecord {
     pub decided: Option<serde_json::Value>,
     /// Every start-up line seen for this run.
     pub lines: u64,
+    /// Every journal line ingested for this run's id: its start-up lines, a
+    /// replay of them, and its shutdown line. Raw, so a reader can compare it
+    /// with `lines` and see a replay or a shutdown arrive.
+    pub ingested: u64,
     /// The `complete` line's count, when it arrived.
     pub declared: Option<u64>,
     /// The shutdown line, when the run wrote one.
@@ -160,6 +164,7 @@ impl StartupRecord {
             host: None,
             decided: None,
             lines: 0,
+            ingested: 0,
             declared: None,
             shutdown: None,
             first_seen,
@@ -210,6 +215,9 @@ pub struct StartupView {
     pub decided: Option<serde_json::Value>,
     /// Start-up lines received for this run.
     pub lines: u64,
+    /// Every journal line ingested for this run's id, replays and the shutdown
+    /// line included.
+    pub ingested: u64,
     /// The `complete` line's count, when it arrived.
     pub complete: Option<u64>,
     pub shutdown: Option<Shutdown>,
@@ -237,6 +245,7 @@ impl StartupRecord {
             host: self.host.clone(),
             decided: self.decided.clone(),
             lines: self.lines,
+            ingested: self.ingested,
             complete: self.declared,
             shutdown: self.shutdown.clone(),
             previous: self.previous.clone(),
@@ -309,8 +318,10 @@ impl Startup {
         };
         let timestamp = line["timestamp"].as_str().unwrap_or_default();
         if !self.pending.contains_key(run_id) {
-            // A finished record, or a replay of one, is not assembled again.
-            if self.current.values().any(|r| r.run_id == run_id) {
+            // A finished record, or a replay of one, is not assembled again,
+            // and its line is still counted as ingested.
+            if let Some(record) = self.current.values_mut().find(|r| r.run_id == run_id) {
+                record.ingested += 1;
                 return;
             }
             if fields["seq"].as_u64() != Some(1) {
@@ -339,6 +350,7 @@ impl Startup {
             return;
         };
         record.lines += 1;
+        record.ingested += 1;
         if let Some(app) = fields["app"].as_str().filter(|a| !a.is_empty()) {
             record.app = app.to_string();
         }
@@ -401,11 +413,13 @@ impl Startup {
         if let Some(mut record) = self.pending.remove(run_id) {
             // The run ended before its `complete` line: a record that never
             // closed, kept so the report can say so.
+            record.ingested += 1;
             record.shutdown = Some(shutdown);
             self.push_failed(record);
             return;
         }
         if let Some(record) = self.current.values_mut().find(|r| r.run_id == run_id) {
+            record.ingested += 1;
             record.shutdown = Some(shutdown);
             return;
         }

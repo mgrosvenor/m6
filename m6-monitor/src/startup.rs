@@ -201,6 +201,9 @@ pub struct RunDigest {
     pub config_paths: BTreeMap<String, String>,
     /// Start-up lines received.
     pub lines: u64,
+    /// Every journal line the monitor ingested for this run's id: the
+    /// start-up lines, any replay of them, and the shutdown line.
+    pub ingested_lines: u64,
     /// The count the `complete` line declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub complete_lines: Option<u64>,
@@ -211,6 +214,15 @@ pub struct RunDigest {
     pub shutdown: Option<ShutdownDigest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_run_id: Option<String>,
+    /// How the previous run ended, when there is one: its shutdown line, or
+    /// `null` when it wrote none. Absent when this is the first run seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_shutdown: Option<Option<ShutdownDigest>>,
+    /// `info` for a restart the monitor expected, `warn` for one it did not.
+    /// Absent when there is no previous run, or the run is from the journal
+    /// tail and is not judged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart: Option<&'static str>,
 }
 
 /// One clean exit, as `/digest` carries it.
@@ -293,7 +305,7 @@ pub fn judge(d: &mut Digest, facts: &Facts) {
 
     let mut findings = expectation_findings(facts, environment.as_deref());
     for run in &facts.runs {
-        digest.runs.push(run_digest(run));
+        digest.runs.push(run_digest(run, facts));
         findings.extend(run_findings(run, facts, environment.as_deref()));
     }
     findings.extend(peer_findings(&facts.runs));
@@ -359,7 +371,15 @@ fn expectation_findings(facts: &Facts, environment: Option<&str>) -> Vec<Finding
     out
 }
 
-fn run_digest(run: &StartupView) -> RunDigest {
+fn shutdown_digest(shutdown: &crate::journal::Shutdown) -> ShutdownDigest {
+    ShutdownDigest {
+        reason: shutdown.reason.clone(),
+        uptime_ms: shutdown.uptime_ms,
+        at: shutdown.at.clone(),
+    }
+}
+
+fn run_digest(run: &StartupView, facts: &Facts) -> RunDigest {
     RunDigest {
         node: run.node.clone(),
         app: run.app.clone(),
@@ -371,18 +391,21 @@ fn run_digest(run: &StartupView) -> RunDigest {
         config: run.config.clone(),
         config_paths: run.config_paths.clone(),
         lines: run.lines,
+        ingested_lines: run.ingested,
         complete_lines: run.complete,
         state: if run.complete == Some(run.lines) {
             "complete".to_string()
         } else {
             "incomplete".to_string()
         },
-        shutdown: run.shutdown.as_ref().map(|s| ShutdownDigest {
-            reason: s.reason.clone(),
-            uptime_ms: s.uptime_ms,
-            at: s.at.clone(),
-        }),
+        shutdown: run.shutdown.as_ref().map(shutdown_digest),
         previous_run_id: run.previous.as_ref().map(|p| p.run_id.clone()),
+        previous_shutdown: run
+            .previous
+            .as_ref()
+            .map(|p| p.shutdown.as_ref().map(shutdown_digest)),
+        restart: restart_expected(run, facts)
+            .map(|expected| if expected { "info" } else { "warn" }),
     }
 }
 
@@ -584,35 +607,44 @@ fn check_completeness(run: &StartupView, push: &mut impl FnMut(Level, String)) {
     }
 }
 
-/// Whether a restart is expected, and the finding when it is not.
+/// Whether this run's restart was expected. `None` when there is no previous
+/// run, or the run is from the journal tail and is not judged.
+fn restart_expected(run: &StartupView, facts: &Facts) -> Option<bool> {
+    let previous = run.previous.as_ref()?;
+    if !run.judged {
+        return None;
+    }
+    let deployed = matches!(facts.expected_state, ExpectedState::Loaded);
+    Some(if deployed {
+        facts.expectations.deploy_in_progress && previous.shutdown.is_some()
+    } else {
+        // Without the deploy's record a deploy in progress cannot be claimed
+        // or denied, so a graceful restart is not called unexpected. The
+        // missing record already has its own finding.
+        previous.shutdown.is_some()
+    })
+}
+
+/// The finding for a restart nobody expected. An expected one is `info` in
+/// the run's digest and in `/check`'s previous line, and is not a finding.
 fn check_restart(run: &StartupView, facts: &Facts, push: &mut impl FnMut(Level, String)) {
     let Some(previous) = &run.previous else {
         return;
     };
-    if run.judged {
-        let deployed = matches!(facts.expected_state, ExpectedState::Loaded);
-        let expected = if deployed {
-            facts.expectations.deploy_in_progress && previous.shutdown.is_some()
-        } else {
-            // Without the deploy's record a deploy in progress cannot be
-            // claimed or denied, so a graceful restart is not called
-            // unexpected. The missing record already has its own finding.
-            previous.shutdown.is_some()
-        };
-        if !expected {
-            let why = match &previous.shutdown {
-                Some(shutdown) => format!(
-                    "the previous run {} exited with reason {:?} after {}ms, and no deploy is in progress",
-                    previous.run_id, shutdown.reason, shutdown.uptime_ms
-                ),
-                None => format!(
-                    "the previous run {} wrote no shutdown line, so it did not exit cleanly",
-                    previous.run_id
-                ),
-            };
-            push(Level::Warn, format!("unexpected restart: {why}"));
-        }
+    if restart_expected(run, facts) != Some(false) {
+        return;
     }
+    let why = match &previous.shutdown {
+        Some(shutdown) => format!(
+            "the previous run {} exited with reason {:?} at {} after {}ms, and no deploy is in progress",
+            previous.run_id, shutdown.reason, shutdown.at, shutdown.uptime_ms
+        ),
+        None => format!(
+            "the previous run {} wrote no shutdown line, so it did not exit cleanly",
+            previous.run_id
+        ),
+    };
+    push(Level::Warn, format!("unexpected restart: {why}"));
 }
 
 /// What the deploy's record says about one run.
@@ -1321,6 +1353,117 @@ mod tests {
             "a deploy restarts nodes:\n{}",
             texts(&found)
         );
+    }
+
+    /// Every restart carries how the previous run ended in `/digest`, a
+    /// graceful one at `info` and an unexpected one at `warn`, and each run
+    /// counts the raw lines the monitor ingested for it.
+    #[test]
+    fn every_restart_carries_the_previous_shutdown_and_its_level() {
+        let digest_of = |deploying: bool, shut_down: bool| {
+            let mut latest = Latest::new();
+            let first = run_id(&latest, 1_000);
+            record(
+                &mut latest,
+                &first,
+                "m6-http",
+                "1.16.0+abc123",
+                &[("config", "aa11")],
+                Some(host("6.11.0-1", 8_000_000_000)),
+                serde_json::json!({}),
+                4,
+            );
+            if shut_down {
+                shutdown(&mut latest, &first, "m6-http", "1.16.0+abc123", "signal");
+            }
+            let second = run_id(&latest, 60_000);
+            record(
+                &mut latest,
+                &second,
+                "m6-http",
+                "1.16.0+abc123",
+                &[("config", "aa11")],
+                Some(host("6.11.0-1", 8_000_000_000)),
+                serde_json::json!({}),
+                4,
+            );
+            let mut expected = expectations("m6-http", "1.16.0+abc123", "aa11");
+            expected.deploy_in_progress = deploying;
+            let facts = facts(&mut latest, expected);
+            let mut digest = empty_digest();
+            judge(&mut digest, &facts);
+            let run = digest
+                .startup
+                .runs
+                .iter()
+                .find(|r| r.run_id == second)
+                .expect("the second run is current")
+                .clone();
+            (first, serde_json::to_value(&run).expect("a run serialises"))
+        };
+
+        let (first, graceful) = digest_of(true, true);
+        assert_eq!(graceful["previous_run_id"], first.as_str());
+        assert_eq!(graceful["previous_shutdown"]["reason"], "signal");
+        assert_eq!(
+            graceful["previous_shutdown"]["at"],
+            "2026-11-18T02:17:20.858965Z"
+        );
+        assert_eq!(graceful["previous_shutdown"]["uptime_ms"], 60_000);
+        assert_eq!(graceful["restart"], "info", "a restart during a deploy");
+
+        let (_, outside) = digest_of(false, true);
+        assert_eq!(outside["previous_shutdown"]["reason"], "signal");
+        assert_eq!(outside["restart"], "warn", "a restart outside a deploy");
+
+        let (_, died) = digest_of(true, false);
+        assert!(
+            died["previous_shutdown"].is_null() && died.get("previous_shutdown").is_some(),
+            "a previous run with no shutdown line is null, not absent: {died}"
+        );
+        assert_eq!(died["restart"], "warn", "a run that died");
+
+        assert_eq!(graceful["lines"], 4);
+        assert_eq!(graceful["ingested_lines"], 4);
+    }
+
+    /// The raw count includes what the record count leaves out: a replayed
+    /// start-up line and the shutdown line.
+    #[test]
+    fn the_ingested_count_includes_replays_and_the_shutdown_line() {
+        let mut latest = Latest::new();
+        let id = run_id(&latest, 1_000);
+        record(
+            &mut latest,
+            &id,
+            "m6-http",
+            "1.16.0+abc123",
+            &[("config", "aa11")],
+            Some(host("6.11.0-1", 8_000_000_000)),
+            serde_json::json!({}),
+            4,
+        );
+        latest.ingest(&entry(startup_line(
+            &id,
+            1,
+            "identity",
+            "m6-http",
+            "1.16.0+abc123",
+        )));
+        shutdown(&mut latest, &id, "m6-http", "1.16.0+abc123", "signal");
+        let facts = facts(
+            &mut latest,
+            expectations("m6-http", "1.16.0+abc123", "aa11"),
+        );
+        let mut digest = empty_digest();
+        judge(&mut digest, &facts);
+        let run = &digest.startup.runs[0];
+        assert_eq!((run.lines, run.ingested_lines), (4, 6));
+        assert!(
+            run.previous_shutdown.is_none(),
+            "a first run has no previous"
+        );
+        assert!(run.restart.is_none());
     }
 
     #[test]

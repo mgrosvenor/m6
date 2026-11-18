@@ -320,12 +320,25 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             "           run {}, config {config}, {}/{} line(s)",
             run.run_id, run.lines, complete
         );
+        let _ = writeln!(o, "           {} line(s) ingested", run.ingested_lines);
         if let Some(shutdown) = &run.shutdown {
             let _ = writeln!(
                 o,
                 "           last shutdown {:?} after {}ms",
                 shutdown.reason, shutdown.uptime_ms
             );
+        }
+        if let (Some(previous), Some(how)) = (&run.previous_run_id, &run.previous_shutdown) {
+            let ended = match how {
+                Some(s) => format!("shut down {} at {}", s.reason, s.at),
+                None => "no shutdown recorded".to_string(),
+            };
+            let level = match run.restart {
+                Some("warn") => "  [WARN: unexpected restart]",
+                Some(_) => "  [info]",
+                None => "",
+            };
+            let _ = writeln!(o, "           previous: {previous}, {ended}{level}");
         }
     }
     match d.startup.expected_state.as_str() {
@@ -1447,10 +1460,36 @@ mod tests {
                 .collect(),
             config_paths: Default::default(),
             lines: 4,
+            ingested_lines: 5,
             complete_lines: Some(4),
             state: "complete".into(),
             shutdown: None,
-            previous_run_id: None,
+            previous_run_id: Some("1794968120857-37600".into()),
+            previous_shutdown: Some(Some(crate::startup::ShutdownDigest {
+                reason: "signal".into(),
+                uptime_ms: 60_000,
+                at: "2026-11-18T02:16:19.000000Z".into(),
+            })),
+            restart: Some("info"),
+        });
+        d.startup.runs.push(crate::startup::RunDigest {
+            node: "edge-a".into(),
+            app: "m6-http".into(),
+            process_index: None,
+            run_id: "1794968180900-40000".into(),
+            version: "1.16.0+abc123".into(),
+            tag: Some("v1.16.0".into()),
+            started_at: "2026-11-18T02:16:20.900000Z".into(),
+            config: Default::default(),
+            config_paths: Default::default(),
+            lines: 4,
+            ingested_lines: 4,
+            complete_lines: Some(4),
+            state: "complete".into(),
+            shutdown: None,
+            previous_run_id: Some("1794968000000-39000".into()),
+            previous_shutdown: Some(None),
+            restart: Some("warn"),
         });
         d.startup.expected_state = "missing".into();
         d.startup.expected_file = Some("/run/m6/expected.json".into());
@@ -1470,6 +1509,19 @@ mod tests {
             text.contains("config=aa11"),
             "the config sha is shown: {text}"
         );
+        assert!(
+            text.contains(
+                "previous: 1794968120857-37600, shut down signal at 2026-11-18T02:16:19.000000Z  [info]"
+            ),
+            "a graceful restart names the previous run and its shutdown: {text}"
+        );
+        assert!(
+            text.contains(
+                "previous: 1794968000000-39000, no shutdown recorded  [WARN: unexpected restart]"
+            ),
+            "a run that died is said: {text}"
+        );
+        assert!(text.contains("5 line(s) ingested"), "the raw count: {text}");
         assert!(
             text.contains("waiting for the deploy side"),
             "a missing deploy record is said: {text}"
