@@ -309,10 +309,12 @@ An old history file keeps its dead columns.
 `m6_core::sqlite::migrate` runs only the migrations above the file's `user_version`, so a `health` table made by a release that wrote the `reopen_*` columns is left as it is, and `INSERT_HEALTH` names the columns it writes.
 That is the expected state of a file that predates this release.
 
-Migration 3 drops `hash` from the `build` table, because `version` carries the same commit as its build metadata, and a build row is now `(binary, version)`.
-SQLite refuses `ALTER TABLE build DROP COLUMN hash` while the column is in the table's `UNIQUE` constraint, so the migration rebuilds the table: it copies every row with its id into a new table, drops the old one and renames the new one.
-Two old rows that differed only in `hash` become the first of them, and a `health` row that named the second names the first.
-Every other table and column is left as it was, and `/history` lines no longer carry `hash`.
+Migration 3 rebuilds the history's `build` table with the four columns that name a build, `binary`, `release`, `commit` and `dirty`, and a `UNIQUE` constraint over all four.
+The old rows are not carried across.
+Their `hash` was the md5 of an executable the release no longer reads, and their `version` was a bare release with no build metadata, so an old row and a new row would share no comparable fact while looking alike.
+The table is recreated empty, a `health` row that named a discarded build has `build_id` set to `NULL` and keeps every other figure, and the open writes one `type=event` line that says the table was rebuilt and why.
+A file that predates the migration therefore keeps its polls, its findings, its channels and its hosts, and its build column goes blank from the moment of the upgrade.
+The version stays at 3 because `1.16.0-rc.1` has not shipped, so this migration replaces one that no released file can be at.
 
 Section 7 turns to what the service answers.
 
@@ -365,6 +367,7 @@ Table 7: where each part of the digest comes from.
 | `reported_node` | the `node` field of the `/health` body |
 | `rtt_ms` | the `/health` round trip, connect and TLS included |
 | `version`, `binary` | the metrics document's `build`, the version with the commit as its build metadata |
+| `release`, `commit`, `dirty` | the same version, parsed by the `semver` crate into the release, the build metadata's commit and the `.dirty` flag |
 | `uptime_s`, `host_uptime_s` | the metrics document |
 | `requests_total`, `hit_rate`, the hit and miss percentiles, `backend_errors`, `pools` | the metrics document's `metrics` and `pools` |
 | `load_one`, `cpus`, `memory_used`, `disk_used`, `thermal_max_c` | the metrics document's `host` |

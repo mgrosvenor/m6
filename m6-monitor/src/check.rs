@@ -573,8 +573,10 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         // Name, full version AND the commit from its build metadata, because
         // the release tag alone cannot tell two builds of one tag apart and
         // reading identical release strings is exactly what "the fleet agrees"
-        // looks like while it does not. Twelve characters of the commit: enough
-        // to compare by eye and the prefix an operator's notes would quote.
+        // looks like while it does not. The commit is the metadata's own text,
+        // parsed out with the semver crate, so no display code slices a version
+        // string. The version beside it keeps the `.dirty` suffix that says the
+        // tree it was built from had uncommitted changes.
         //
         // The certificate is on this line too, for the same reason: "how long
         // has this node got" is asked beside "what is it running", and a
@@ -594,9 +596,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             n.version
                 .as_deref()
                 .unwrap_or("unknown (node too old to report it)"),
-            crate::digest::commit(n)
-                .map(|h| &h[..h.len().min(12)])
-                .unwrap_or("unknown"),
+            crate::digest::commit(n).unwrap_or_else(|| "unknown".into()),
             n.cert_expires_in_seconds
                 .map(fmt_cert_expiry)
                 .unwrap_or_else(|| "-".into()),

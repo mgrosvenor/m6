@@ -130,9 +130,9 @@
 //!
 //! ```text
 //! id, at, at_unix_ms, node, level, poll_level, reachable, status, detail,
-//! traffic_error, rtt_ms, binary, version, uptime_s, host_uptime_s,
-//! requests_total, monitor_requests, cache_hits, cache_misses, hit_rate,
-//! backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
+//! traffic_error, rtt_ms, binary, release, commit, dirty, uptime_s,
+//! host_uptime_s, requests_total, monitor_requests, cache_hits, cache_misses,
+//! hit_rate, backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
 //! miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes,
 //! disk_used, disk_total_bytes, thermal_max_c, cert_not_after_unix,
 //! cert_expires_in_s, tunnel, net, channels, findings,
@@ -146,6 +146,25 @@
 //! from response code to count), `forged_bot_requests`, `forgers` and
 //! `crawlers`, each crawler being `user_agent`, `requests`, `client_ips` and
 //! `paths`, and `sightings_dropped`.
+//!
+//! # The build a node was running
+//!
+//! `binary`, `release`, `commit` and `dirty` are the four columns that
+//! identify one build. `release` is the SemVer release without its build
+//! metadata, `commit` is that metadata's commit, and `dirty` is 1 when the
+//! tree the binary was built from had uncommitted changes. A reader answers
+//! "which build was this node running" from the columns. The drift check
+//! compares `release` for version drift and the `(commit, dirty)` pair for
+//! build drift, through [`crate::digest::release`] and
+//! [`crate::digest::commit_and_dirty`], which parse the version with the
+//! `semver` crate.
+//!
+//! A file written before schema 3 loses its build rows when it is opened. Their
+//! `hash` was the md5 of an executable that no longer exists, and their
+//! `version` carried no build metadata, so neither value is comparable with a
+//! build these columns can name. The table is recreated empty. A `health` row
+//! that named a discarded build keeps every figure and loses `build_id`. One
+//! `type=event` line at the migration says both facts.
 //!
 //! The reader opens its own read-only connection and reads a whole page inside
 //! one read transaction, so a prune that commits meanwhile cannot leave a row
@@ -268,27 +287,38 @@ CREATE INDEX IF NOT EXISTS health_ok_node_at ON health (node_id, at_ms)
   WHERE reachable = 1 AND status = 'ok';
 ";
 
-/// The `build` table without `hash`.
+/// Migration 3: the `build` table as the four columns that identify a build,
+/// recreated empty.
 ///
-/// `hash` held the md5 of the node's executable, and then the commit from the
-/// version's build metadata, which `version` already carries. A build is now
-/// `(binary, version)`. `ALTER TABLE build DROP COLUMN hash` is refused because
-/// the column is in the table's `UNIQUE` constraint, so the table is rebuilt the
-/// way SQLite documents for a change `ALTER TABLE` cannot make: a new table, the
-/// rows copied with their ids, the old one dropped and the new one renamed.
-/// Two old rows that differ only in `hash` become one, the first by id, and a
-/// `health` row that named the second names the first.
-const SCHEMA_V3: &str = "
-CREATE TABLE build_v3 (id INTEGER PRIMARY KEY, binary TEXT NOT NULL, version TEXT NOT NULL,
-                       UNIQUE (binary, version)) STRICT;
-INSERT OR IGNORE INTO build_v3 (id, binary, version) SELECT id, binary, version FROM build ORDER BY id;
-UPDATE health SET build_id = (
-    SELECT n.id FROM build o JOIN build_v3 n ON n.binary = o.binary AND n.version = o.version
-    WHERE o.id = health.build_id)
-  WHERE build_id IS NOT NULL AND build_id NOT IN (SELECT id FROM build_v3);
+/// The table before this held `(binary, version, hash)`. `hash` was the md5 of
+/// the node's executable, a mechanism this release deletes, and `version` was a
+/// bare release such as `1.15.0` with no build metadata. Neither column carries
+/// a fact that names a build in the new shape, so no old row can be carried
+/// across: a row saying `(m6-http, 1.15.0, <md5>)` and a row saying
+/// `(m6-http, 1.16.0-rc.1, abc123def456, 0)` would look like two comparable
+/// builds while sharing no fact at all. The table is dropped and created empty,
+/// and the one line [`BUILD_RESET`] says why.
+///
+/// `health` keeps every observation. A row that named a discarded build has
+/// `build_id` set to NULL and keeps every other figure, so the poll survives
+/// and the build attribution goes. The nulling is one statement inside the
+/// migration's transaction, so the foreign-key check
+/// [`m6_core::sqlite::migrate`] runs finds no dangling reference when the
+/// migration ends.
+///
+/// The version stays 3 because `1.16.0-rc.1` has not shipped: no released file
+/// is at 3, and the only files at 3 were written by this same unreleased code.
+/// Replacing the migration is right for those files. Editing a migration that
+/// has shipped is what this avoids.
+const SCHEMA_V3: &str = r#"
+DROP TRIGGER IF EXISTS build_append_only_update;
+DROP TRIGGER IF EXISTS build_append_only_delete;
 DROP TABLE build;
-ALTER TABLE build_v3 RENAME TO build;
-";
+CREATE TABLE build (id INTEGER PRIMARY KEY, binary TEXT NOT NULL, "release" TEXT NOT NULL,
+                    "commit" TEXT NOT NULL, dirty INTEGER NOT NULL CHECK (dirty IN (0,1)),
+                    UNIQUE (binary, "release", "commit", dirty)) STRICT;
+UPDATE health SET build_id = NULL WHERE build_id IS NOT NULL;
+"#;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -304,6 +334,28 @@ const MIGRATIONS: &[Migration] = &[
         sql: SCHEMA_V3,
     },
 ];
+
+/// The one line a file that predates schema 3 writes when it is opened.
+///
+/// The build rows are gone and nothing can bring them back, so the file says
+/// so at the moment it happens. A history that restarts silently reads as a
+/// history that was lost, and an operator who sees build ids go empty would
+/// otherwise have to guess whether the file or the code dropped them.
+const BUILD_RESET: &str = concat!(
+    "the history file was migrated to schema 3: its build table was rebuilt to hold ",
+    "the binary, release, commit and dirty flag, and the previous build rows are ",
+    "not comparable with that shape, so they were dropped and health rows that ",
+    "named one keep their figures with no build"
+);
+
+/// Whether opening a file at `version` must say the build table was rebuilt.
+///
+/// Migration 1 and 2 files held build rows in the old shape and lose them. A
+/// fresh file (version 0) had none to lose and says nothing, and a file already
+/// at 3 is opened without a migration.
+fn announces_build_reset(version: u32) -> bool {
+    (1..3).contains(&version)
+}
 
 /// Lookup tables that are never pruned. `agent` is not here: a user agent is
 /// text a visitor chooses, so its rows go when no sighting names them.
@@ -432,6 +484,41 @@ pub struct CrawlSnapshot {
     pub crawlers: Vec<CrawlerReport>,
 }
 
+/// The build one node was running, as the four columns that name it.
+///
+/// The release and the commit are apart so a reader answers "which build was
+/// this node running" from the row. `release` is the SemVer release without its
+/// build metadata, `commit` is that metadata's commit, and `dirty` is true when
+/// the tree had uncommitted changes. A build with no metadata it can parse has
+/// the release the node reported, the commit `unknown`, and `dirty` false.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildRef {
+    pub binary: String,
+    pub release: String,
+    pub commit: String,
+    pub dirty: bool,
+}
+
+/// The build a node's digest names, in the four facts the history stores.
+///
+/// The version is parsed once, by [`crate::digest::release`] and
+/// [`crate::digest::commit_and_dirty`], so the row carries four facts and no
+/// version string to parse again.
+fn build_ref(n: &NodeDigest) -> Option<BuildRef> {
+    if n.binary.is_none() && n.version.is_none() {
+        return None;
+    }
+    let version = n.version.as_deref().unwrap_or_default();
+    let (commit, dirty) =
+        crate::digest::commit_and_dirty(version).unwrap_or_else(|| ("unknown".to_string(), false));
+    Some(BuildRef {
+        binary: n.binary.clone().unwrap_or_default(),
+        release: crate::digest::release(version),
+        commit,
+        dirty,
+    })
+}
+
 /// One node's row in a poll.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
@@ -442,9 +529,8 @@ pub struct Row {
     pub detail: Option<String>,
     pub traffic_error: Option<String>,
     pub rtt_ms: Option<f64>,
-    /// The binary and its full version. The version carries the commit as
-    /// its build metadata, so the pair names one build.
-    pub build: Option<(String, String)>,
+    /// The build the node was running, as the four facts that name it.
+    pub build: Option<BuildRef>,
     pub uptime_s: Option<i64>,
     pub host_uptime_s: Option<i64>,
     pub requests_total: Option<i64>,
@@ -492,9 +578,7 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
         .map(|f| f.level)
         .max()
         .unwrap_or(Level::Ok);
-    let present = |s: &Option<String>| s.clone().unwrap_or_default();
-    let build = (n.binary.is_some() || n.version.is_some())
-        .then(|| (present(&n.binary), present(&n.version)));
+    let build = build_ref(n);
     let mut out = Row {
         node: n.name.clone(),
         level: level_i(level),
@@ -658,8 +742,51 @@ struct Store {
     channels: Interner,
     ifaces: Interner,
     agents: Interner,
-    builds: Interner,
+    builds: Builds,
     last_crawl_at: HashMap<i64, i64>,
+}
+
+/// The ids of the build rows the file holds, keyed by the four facts.
+///
+/// A build's key carries text and the `dirty` integer, so it keeps its own
+/// small cache.
+#[derive(Default)]
+struct Builds {
+    ids: HashMap<String, i64>,
+}
+
+impl Builds {
+    /// The id of a build row, inserted when the file has not seen that build.
+    ///
+    /// The four facts are the table's uniqueness constraint, so one build
+    /// reported by every node on every poll is one row.
+    fn id(&mut self, tx: &Transaction, b: &BuildRef) -> rusqlite::Result<i64> {
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            b.binary,
+            b.release,
+            b.commit,
+            u8::from(b.dirty)
+        );
+        if let Some(id) = self.ids.get(&key) {
+            return Ok(*id);
+        }
+        tx.prepare_cached(
+            r#"INSERT INTO build (binary, "release", "commit", dirty) VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT DO NOTHING"#,
+        )?
+        .execute(params![b.binary, b.release, b.commit, b.dirty])?;
+        let id = tx
+            .prepare_cached(
+                r#"SELECT id FROM build WHERE binary = ?1 AND "release" = ?2 AND "commit" = ?3
+                   AND dirty = ?4"#,
+            )?
+            .query_row(params![b.binary, b.release, b.commit, b.dirty], |r| {
+                r.get(0)
+            })?;
+        self.ids.insert(key, id);
+        Ok(id)
+    }
 }
 
 /// What one write did, for the status.
@@ -699,7 +826,13 @@ impl Store {
     fn open(cfg: &Config) -> anyhow::Result<Self> {
         make_private(&cfg.file)?;
         let mut conn = sqlite::open(&cfg.file)?;
+        // Read before the migrations, because a file that predates schema 3 is
+        // the only one that loses rows, and only that open says so.
+        let was = sqlite::schema_version(&conn)?;
         sqlite::migrate(&mut conn, MIGRATIONS)?;
+        if announces_build_reset(was) {
+            m6_core::log::info!("{BUILD_RESET}");
+        }
         for t in LOOKUP_TABLES {
             sqlite::append_only(&conn, t)?;
         }
@@ -741,10 +874,7 @@ impl Store {
                 "INSERT INTO agent (user_agent) VALUES (?1) ON CONFLICT DO NOTHING",
                 "SELECT id FROM agent WHERE user_agent = ?1",
             ),
-            builds: Interner::new(
-                "INSERT INTO build (binary, version) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-                "SELECT id FROM build WHERE binary = ?1 AND version = ?2",
-            ),
+            builds: Builds::default(),
             last_crawl_at,
         })
     }
@@ -755,10 +885,10 @@ impl Store {
             &mut self.channels,
             &mut self.ifaces,
             &mut self.agents,
-            &mut self.builds,
         ] {
             c.ids.clear();
         }
+        self.builds.ids.clear();
     }
 
     /// When each node last answered `/health` with 200, by node name.
@@ -816,7 +946,7 @@ impl Store {
         for r in &b.rows {
             let node_id = self.nodes.id(&tx, &[&r.node])?;
             let build_id = match &r.build {
-                Some((bin, ver)) => Some(self.builds.id(&tx, &[bin, ver])?),
+                Some(build) => Some(self.builds.id(&tx, build)?),
                 None => None,
             };
             let t = r.tunnel.as_ref();
@@ -1522,7 +1652,11 @@ pub struct PageRow {
     pub traffic_error: Option<String>,
     pub rtt_ms: Option<f64>,
     pub binary: Option<String>,
-    pub version: Option<String>,
+    pub release: Option<String>,
+    pub commit: Option<String>,
+    /// 1 when the tree the binary was built from had uncommitted changes.
+    /// `null` when the row names no build at all.
+    pub dirty: Option<i64>,
     pub uptime_s: Option<i64>,
     pub host_uptime_s: Option<i64>,
     pub requests_total: Option<i64>,
@@ -1557,9 +1691,10 @@ pub struct PageRow {
 
 const HEALTH_SELECT: &str =
     "SELECT h.id, h.at_ms, n.name, h.level, p.level, h.reachable, h.status, \
-h.detail, h.traffic_error, h.rtt_ms, b.binary, b.version, h.uptime_s, h.host_uptime_s, \
-h.requests_total, h.monitor_requests, h.cache_hits, h.cache_misses, h.backend_errors, \
-h.hit_samples, h.hit_p50_ns, h.hit_p99_ns, h.miss_samples, h.miss_p50_ns, h.miss_p99_ns, \
+h.detail, h.traffic_error, h.rtt_ms, b.binary, b.\"release\", b.\"commit\", b.dirty, \
+h.uptime_s, h.host_uptime_s, h.requests_total, h.monitor_requests, h.cache_hits, \
+h.cache_misses, h.backend_errors, h.hit_samples, h.hit_p50_ns, h.hit_p99_ns, \
+h.miss_samples, h.miss_p50_ns, h.miss_p99_ns, \
 h.load_one, h.cpus, h.memory_used, h.memory_total_bytes, h.disk_used, h.disk_total_bytes, \
 h.thermal_max_c, h.cert_not_after_unix, h.tunnel_rtt_ms, h.tunnel_rtt_n, h.tunnel_probe, \
 h.tunnel_probe_error, h.tunnel_handshake, h.tunnel_handshake_age_s, h.tunnel_handshake_detail, \
@@ -1650,20 +1785,20 @@ pub fn health_page(
         let limit = iu(rows);
         let mapped = stmt.query_map(params![from_ms, to_ms, node, a_at, a_id, limit], |r| {
             let at: i64 = r.get(1)?;
-            let hits: Option<i64> = r.get(16)?;
-            let misses: Option<i64> = r.get(17)?;
-            let cert: Option<i64> = r.get(32)?;
-            let tunnel_probe: Option<String> = r.get(35)?;
+            let hits: Option<i64> = r.get(18)?;
+            let misses: Option<i64> = r.get(19)?;
+            let cert: Option<i64> = r.get(34)?;
+            let tunnel_probe: Option<String> = r.get(37)?;
             let tunnel = match tunnel_probe {
                 None => None,
                 Some(probe) => Some(TunnelOut {
-                    rtt_ms: r.get(33)?,
-                    rtt_n: r.get(34)?,
+                    rtt_ms: r.get(35)?,
+                    rtt_n: r.get(36)?,
                     probe,
-                    probe_error: r.get(36)?,
-                    handshake: r.get(37)?,
-                    handshake_age_s: r.get(38)?,
-                    handshake_detail: r.get(39)?,
+                    probe_error: r.get(38)?,
+                    handshake: r.get(39)?,
+                    handshake_age_s: r.get(40)?,
+                    handshake_detail: r.get(41)?,
                 }),
             };
             Ok(PageRow {
@@ -1679,28 +1814,30 @@ pub fn health_page(
                 traffic_error: r.get(8)?,
                 rtt_ms: r.get(9)?,
                 binary: none_if_empty(r.get(10)?),
-                version: none_if_empty(r.get(11)?),
-                uptime_s: r.get(12)?,
-                host_uptime_s: r.get(13)?,
-                requests_total: r.get(14)?,
-                monitor_requests: r.get(15)?,
+                release: none_if_empty(r.get(11)?),
+                commit: none_if_empty(r.get(12)?),
+                dirty: r.get(13)?,
+                uptime_s: r.get(14)?,
+                host_uptime_s: r.get(15)?,
+                requests_total: r.get(16)?,
+                monitor_requests: r.get(17)?,
                 cache_hits: hits,
                 cache_misses: misses,
                 hit_rate: rate(hits, misses),
-                backend_errors: r.get(18)?,
-                hit_samples: r.get(19)?,
-                hit_p50_ns: r.get(20)?,
-                hit_p99_ns: r.get(21)?,
-                miss_samples: r.get(22)?,
-                miss_p50_ns: r.get(23)?,
-                miss_p99_ns: r.get(24)?,
-                load_one: r.get(25)?,
-                cpus: r.get(26)?,
-                memory_used: r.get(27)?,
-                memory_total_bytes: r.get(28)?,
-                disk_used: r.get(29)?,
-                disk_total_bytes: r.get(30)?,
-                thermal_max_c: r.get(31)?,
+                backend_errors: r.get(20)?,
+                hit_samples: r.get(21)?,
+                hit_p50_ns: r.get(22)?,
+                hit_p99_ns: r.get(23)?,
+                miss_samples: r.get(24)?,
+                miss_p50_ns: r.get(25)?,
+                miss_p99_ns: r.get(26)?,
+                load_one: r.get(27)?,
+                cpus: r.get(28)?,
+                memory_used: r.get(29)?,
+                memory_total_bytes: r.get(30)?,
+                disk_used: r.get(31)?,
+                disk_total_bytes: r.get(32)?,
+                thermal_max_c: r.get(33)?,
                 cert_not_after_unix: cert,
                 cert_expires_in_s: cert.map(|c| c - at / 1000),
                 tunnel,
@@ -1708,7 +1845,7 @@ pub fn health_page(
                 channels: Vec::new(),
                 findings: Vec::new(),
                 other_findings: Vec::new(),
-                poll_id: r.get(40)?,
+                poll_id: r.get(42)?,
             })
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
@@ -2144,6 +2281,52 @@ mod tests {
             .unwrap()
     }
 
+    /// The tables migration 1 and 2 create, in their creation order.
+    const TABLES: [&str; 13] = [
+        "node",
+        "channel",
+        "iface",
+        "agent",
+        "build",
+        "poll",
+        "poll_finding",
+        "health",
+        "health_channel",
+        "health_net",
+        "crawl_window",
+        "crawl_sighting",
+        "crawl_status",
+    ];
+
+    /// The rows one SQL statement returns, as raw values, so a test compares
+    /// what the file holds without a struct in the way.
+    fn rows_of(c: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = c.prepare(sql).unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Every row of one table, ordered by its own text, so a before-and-after
+    /// comparison does not depend on the row order a table happens to have.
+    fn every_row(c: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut rows = rows_of(c, &format!("SELECT * FROM {table}"));
+        rows.sort_by_key(|r| format!("{r:?}"));
+        rows
+    }
+
+    fn columns_of(c: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = c
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn a_fresh_install_creates_the_directory_file_and_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -2161,6 +2344,12 @@ mod tests {
             .collect();
         assert_eq!(tables.len(), 13, "{tables:?}");
         assert!(tables.iter().all(|(_, strict)| *strict == 1), "{tables:?}");
+        assert_eq!(
+            columns_of(&s.conn, "build"),
+            ["id", "binary", "release", "commit", "dirty"],
+            "a file created at 3 starts with the four build facts"
+        );
+        assert_eq!(count(&s, "build"), 0);
     }
 
     #[test]
@@ -2219,39 +2408,33 @@ mod tests {
         );
     }
 
-    /// A file written by migrations 1 and 2 opens, takes migration 3, and keeps
-    /// every row and every other column. Two builds that differed only in
-    /// `hash` become one, and the health row that named the second names the
-    /// first.
+    /// A version 2 file built by this test from the migration 1 and 2 SQL
+    /// opens at 3 with its build rows gone, its health rows whole, and every
+    /// other row and column unchanged.
+    ///
+    /// The file has rows in every table, so "every other table" is compared
+    /// rather than asserted: a migration that quietly rewrote one of them would
+    /// fail here whatever it did.
     #[test]
-    fn a_file_from_schema_2_drops_the_build_hash_and_keeps_the_rest() {
-        type Rows = Vec<Vec<rusqlite::types::Value>>;
-        fn rows(c: &Connection, sql: &str) -> Rows {
-            let mut stmt = c.prepare(sql).unwrap();
-            let n = stmt.column_count();
-            stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        }
-        fn columns(c: &Connection, table: &str) -> Vec<String> {
-            let mut stmt = c
-                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
-                .unwrap();
-            stmt.query_map([], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        }
+    fn a_version_2_file_is_rebuilt_at_3_and_keeps_every_other_fact() {
+        use rusqlite::types::Value;
 
         let dir = tempfile::tempdir().unwrap();
         let file = cfg(dir.path(), 1).file;
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         {
-            let mut c = Connection::open(&file).unwrap();
-            sqlite::migrate(&mut c, &MIGRATIONS[..2]).unwrap();
+            let c = Connection::open(&file).unwrap();
+            // Migrations 1 and 2 run exactly this SQL, and a migration that has
+            // shipped is never edited, so this makes a real version 2 file with
+            // nothing in it a reader cannot inspect.
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(SCHEMA_V2).unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
             c.execute_batch(
-                "INSERT INTO node (id, name) VALUES (1, 'origin');
+                "INSERT INTO node (id, name) VALUES (1, 'origin'), (2, 'edge-a');
+                 INSERT INTO channel (id, label) VALUES (1, 'http/2/external');
+                 INSERT INTO iface (id, name) VALUES (1, 'wg0');
+                 INSERT INTO agent (id, user_agent) VALUES (1, 'Bot/1.0');
                  INSERT INTO build (id, binary, version, hash) VALUES
                    (1, 'm6-http', '1.15.0', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
                    (2, 'm6-http', '1.15.0', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
@@ -2264,48 +2447,78 @@ mod tests {
                  VALUES
                    (1, 1, 1000, 1, 0, 1, 'ok', NULL, 1.5, 1, 10, 100, 0.25, 'ok'),
                    (2, 1, 1001, 1, 1, 1, 'ok', 'slow', 2.5, 2, 11, 101, 0.5, NULL),
-                   (3, 1, 1002, 1, 2, 0, 'down', 'refused', NULL, 3, NULL, NULL, NULL, NULL),
-                   (4, 1, 1003, 1, 0, 0, 'down', NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+                   (3, 1, 1002, 2, 2, 0, 'down', 'refused', NULL, 3, NULL, NULL, NULL, NULL),
+                   (4, 1, 1003, 2, 0, 0, 'down', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                 INSERT INTO health_channel (health_id, channel_id, requests, hits, misses,
+                   backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
+                   miss_p50_ns, miss_p99_ns)
+                   VALUES (1, 1, 7, 5, 2, 0, 5, 900, 4000, 2, 70000, 90000);
+                 INSERT INTO health_net (health_id, iface_id, rx_bytes, rx_errs, rx_drop,
+                   tx_bytes, tx_errs, tx_drop) VALUES (1, 1, 10, 0, 0, 20, 0, 0);
+                 INSERT INTO crawl_window (id, poll_id, at_ms, node_id, window_minutes,
+                   total_requests, forged_bot_requests, forgers)
+                   VALUES (1, 1, 1000, 1, 60, 50, 0, '[]');
+                 INSERT INTO crawl_sighting (window_id, agent_id, requests, client_ips, paths)
+                   VALUES (1, 1, 12, '[]', '[]');
+                 INSERT INTO crawl_status (window_id, code, requests) VALUES (1, 200, 30);",
             )
             .unwrap();
         }
-        let before = {
+        let before: Vec<(String, Vec<String>, Vec<Vec<Value>>)> = {
             let c = Connection::open(&file).unwrap();
             assert_eq!(sqlite::schema_version(&c).unwrap(), 2);
-            (
-                rows(&c, "SELECT * FROM health ORDER BY id"),
-                rows(&c, "SELECT * FROM poll ORDER BY id"),
-                rows(&c, "SELECT * FROM poll_finding ORDER BY id"),
-                rows(&c, "SELECT * FROM node ORDER BY id"),
-            )
+            TABLES
+                .iter()
+                .map(|t| ((*t).to_string(), columns_of(&c, t), every_row(&c, t)))
+                .collect()
         };
 
         let s = open(dir.path());
         assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
-        assert_eq!(columns(&s.conn, "build"), ["id", "binary", "version"]);
         assert_eq!(
-            rows(&s.conn, "SELECT id, binary, version FROM build ORDER BY id"),
-            rows(
-                &s.conn,
-                "SELECT 1, 'm6-http', '1.15.0' UNION ALL SELECT 3, 'm6-http', '1.16.0-rc.1+abc123def456'"
-            ),
-            "every build keeps its id, binary and version, and the two that differed only in hash are one"
+            columns_of(&s.conn, "build"),
+            ["id", "binary", "release", "commit", "dirty"],
+            "a build is the four facts that name it"
+        );
+        assert_eq!(
+            count(&s, "build"),
+            0,
+            "an old build row names an md5 and a bare release, so no row is carried across"
         );
 
-        let mut health = before.0.clone();
-        // Health row 2 named build 2, which is now build 1.
-        let build_id = columns(&s.conn, "health")
+        // Health keeps every observation. The one column that moves is
+        // build_id, and it moves to NULL because every build it could name was
+        // discarded.
+        let mut health = before
+            .iter()
+            .find(|(t, _, _)| t == "health")
+            .map(|(_, _, r)| r.clone())
+            .expect("health is in the list");
+        let build_id = columns_of(&s.conn, "health")
             .iter()
             .position(|c| c == "build_id")
             .expect("health has build_id");
-        health[1][build_id] = rusqlite::types::Value::Integer(1);
-        assert_eq!(rows(&s.conn, "SELECT * FROM health ORDER BY id"), health);
-        assert_eq!(rows(&s.conn, "SELECT * FROM poll ORDER BY id"), before.1);
         assert_eq!(
-            rows(&s.conn, "SELECT * FROM poll_finding ORDER BY id"),
-            before.2
+            health.iter().filter(|r| r[build_id] != Value::Null).count(),
+            3,
+            "the file named a build in three of its four health rows"
         );
-        assert_eq!(rows(&s.conn, "SELECT * FROM node ORDER BY id"), before.3);
+        for r in &mut health {
+            r[build_id] = Value::Null;
+        }
+        assert_eq!(
+            every_row(&s.conn, "health"),
+            health,
+            "every health row survives and only build_id changes"
+        );
+
+        for (table, columns, rows) in &before {
+            if table == "build" || table == "health" {
+                continue;
+            }
+            assert_eq!(columns_of(&s.conn, table), *columns, "{table} columns");
+            assert_eq!(&every_row(&s.conn, table), rows, "{table} rows");
+        }
 
         assert!(
             sqlite::is_append_only(&s.conn, "build").unwrap(),
@@ -2317,7 +2530,24 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(broken, 0, "every health row names a build that exists");
+        assert_eq!(broken, 0, "no health row names a build that is gone");
+    }
+
+    /// The reset line is written by the open that loses the rows, and by no
+    /// other open: a fresh file had nothing to lose, and a file already at 3
+    /// runs no migration.
+    #[test]
+    fn only_a_file_that_predates_schema_3_announces_the_build_reset() {
+        assert!(!announces_build_reset(0), "a fresh file has no build rows");
+        assert!(announces_build_reset(1), "a version 1 file had build rows");
+        assert!(announces_build_reset(2), "a version 2 file had build rows");
+        assert!(!announces_build_reset(3), "an open at 3 runs no migration");
+        assert!(
+            !BUILD_RESET.contains('\n'),
+            "one log line, so the message carries no newline"
+        );
+        assert!(BUILD_RESET.contains("not comparable"));
+        assert!(BUILD_RESET.contains("dropped"));
     }
 
     #[test]
@@ -2530,20 +2760,43 @@ mod tests {
         assert_eq!(count(&s, "health"), 6);
     }
 
+    /// The release tag is one fact and the commit is another, so two builds of
+    /// one tag are two rows. This is the case the old table keyed on `hash`
+    /// missed when the hash and the version carried the same commit.
     #[test]
-    fn a_new_build_gets_its_own_row() {
+    fn two_builds_that_differ_only_in_commit_are_two_rows() {
+        use rusqlite::types::Value;
+
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path());
         s.write(&make(T0, &[reading("a")])).unwrap();
         let mut r = reading("a");
         if let Some(p) = r.perf.as_mut() {
-            // The same release tag, rebuilt from a different commit. The build
-            // row is keyed on the commit in the version's build metadata, so
-            // this must be a second row.
             p.build.version = "1.4.0+ffffffffffff".into();
         }
         s.write(&make(T0 + 30_000, &[r])).unwrap();
         assert_eq!(count(&s, "build"), 2);
+        assert_eq!(
+            rows_of(
+                &s.conn,
+                r#"SELECT binary, "release", "commit", dirty FROM build ORDER BY id"#
+            ),
+            vec![
+                vec![
+                    Value::Text("m6-http".into()),
+                    Value::Text("1.4.0".into()),
+                    Value::Text("0123456789ab".into()),
+                    Value::Integer(0),
+                ],
+                vec![
+                    Value::Text("m6-http".into()),
+                    Value::Text("1.4.0".into()),
+                    Value::Text("ffffffffffff".into()),
+                    Value::Integer(0),
+                ],
+            ],
+            "the release is one column and the commit is its own"
+        );
         let distinct: i64 = s
             .conn
             .query_row("SELECT count(DISTINCT build_id) FROM health", [], |r| {
@@ -2551,6 +2804,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(distinct, 2);
+    }
+
+    /// A dirty tree is a build of its own: same commit, different bytes. The
+    /// four-column key says so, and comparing the commit alone would not.
+    #[test]
+    fn a_dirty_build_of_one_commit_is_its_own_row() {
+        use rusqlite::types::Value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        s.write(&make(T0, &[reading("a")])).unwrap();
+        let mut r = reading("a");
+        if let Some(p) = r.perf.as_mut() {
+            p.build.version = "1.4.0+0123456789ab.dirty".into();
+        }
+        s.write(&make(T0 + 30_000, &[r])).unwrap();
+        assert_eq!(count(&s, "build"), 2);
+        assert_eq!(
+            rows_of(&s.conn, r#"SELECT "commit", dirty FROM build ORDER BY id"#),
+            vec![
+                vec![Value::Text("0123456789ab".into()), Value::Integer(0)],
+                vec![Value::Text("0123456789ab".into()), Value::Integer(1)],
+            ],
+            "one commit, two builds, and the flag is what tells them apart"
+        );
     }
 
     #[test]
@@ -2790,7 +3068,8 @@ mod tests {
             keys(&v),
             words(
                 "id at at_unix_ms node level poll_level reachable status detail traffic_error \
-                 rtt_ms binary version uptime_s host_uptime_s requests_total monitor_requests \
+                 rtt_ms binary release commit dirty uptime_s host_uptime_s \
+                 requests_total monitor_requests \
                  cache_hits cache_misses hit_rate backend_errors hit_samples hit_p50_ns hit_p99_ns \
                  miss_samples miss_p50_ns miss_p99_ns load_one cpus memory_used memory_total_bytes \
                  disk_used disk_total_bytes thermal_max_c cert_not_after_unix cert_expires_in_s \
@@ -2798,6 +3077,16 @@ mod tests {
             )
         );
         assert_eq!(v["at"], "2027-01-15T08:00:00.000Z");
+        assert_eq!(
+            (
+                v["binary"].as_str(),
+                v["release"].as_str(),
+                v["commit"].as_str()
+            ),
+            (Some("m6-http"), Some("1.4.0"), Some("0123456789ab")),
+            "a reader names the build from four columns and parses no string"
+        );
+        assert_eq!(v["dirty"], 0, "the fixture is a clean build");
         assert!(v["tunnel"].is_null());
         assert!(
             v["cert_expires_in_s"].is_null(),

@@ -822,28 +822,68 @@ pub(crate) fn fmt_uptime(secs: u64) -> String {
     }
 }
 
-/// The release part of a SemVer string: everything before the `+` build
-/// metadata.
+/// The release part of a SemVer string: the version and its pre-release, with
+/// the `+` build metadata dropped.
+///
+/// The string is parsed with the `semver` crate and the release is what the
+/// parser writes without its build metadata, so a reader never has to know
+/// where the `+` is. A string that does not parse is returned whole, because
+/// there is no release in it to name.
 ///
 /// Version drift compares this, because SemVer 2.0.0 gives build metadata no
 /// precedence. `1.16.0-rc.1+aaaa` and `1.16.0-rc.1+bbbb` are one release built
 /// twice, which is build drift and not version drift.
-fn release(version: &str) -> &str {
-    version.split('+').next().unwrap_or(version)
+pub fn release(version: &str) -> String {
+    match semver::Version::parse(version) {
+        Ok(mut v) => {
+            v.build = semver::BuildMetadata::EMPTY;
+            v.to_string()
+        }
+        Err(_) => version.to_string(),
+    }
 }
 
 /// The build metadata of a SemVer string, which is the commit the node's
-/// binary was built from. `None` when the string carries none, which reads as
-/// "cannot say" and counts as drift rather than agreement.
-fn build_metadata(version: &str) -> Option<&str> {
-    version.split_once('+').map(|(_, metadata)| metadata)
+/// binary was built from, with its optional `.dirty` suffix.
+///
+/// `None` when the string does not parse or carries no metadata, which reads
+/// as "cannot say" and counts as drift rather than agreement.
+pub fn build_metadata(version: &str) -> Option<String> {
+    let parsed = semver::Version::parse(version).ok()?;
+    let metadata = parsed.build.as_str();
+    (!metadata.is_empty()).then(|| metadata.to_string())
+}
+
+/// The commit and the dirty flag the build metadata names.
+///
+/// [`m6_core::build_info`] writes the commit and appends `.dirty` when the tree
+/// had uncommitted changes, so `abc123def456.dirty` is a different build from
+/// `abc123def456`: same source, different bytes. The commit is the metadata
+/// before the `.dirty`, and any other metadata is kept whole as the commit so
+/// nothing is silently dropped.
+pub fn commit_and_dirty(version: &str) -> Option<(String, bool)> {
+    let metadata = build_metadata(version)?;
+    Some(match metadata.split_once('.') {
+        Some((commit, "dirty")) => (commit.to_string(), true),
+        _ => (metadata, false),
+    })
 }
 
 /// The commit a node's binary was built from: the build metadata of its
-/// version. `None` on a node whose version carries none, which counts as drift
-/// rather than agreement for the same reason a missing version does.
-pub fn commit(n: &NodeDigest) -> Option<&str> {
-    n.version.as_deref().and_then(build_metadata)
+/// version, without the `.dirty` suffix. `None` on a node whose version carries
+/// none, which counts as drift rather than agreement for the same reason a
+/// missing version does.
+pub fn commit(n: &NodeDigest) -> Option<String> {
+    n.version
+        .as_deref()
+        .and_then(commit_and_dirty)
+        .map(|(c, _)| c)
+}
+
+/// The `(commit, dirty)` pair a node's version names. `None` when it names no
+/// commit, which counts as drift rather than agreement.
+pub fn build_id(n: &NodeDigest) -> Option<(String, bool)> {
+    n.version.as_deref().and_then(commit_and_dirty)
 }
 
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
@@ -1290,7 +1330,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     // could disagree with it.
     let reporting: Vec<&NodeDigest> = nodes.iter().filter(|n| n.uptime_s.is_some()).collect();
     if reporting.len() > 1 {
-        let mut seen: Vec<&str> = reporting
+        let mut seen: Vec<String> = reporting
             .iter()
             .map(|n| release(n.version.as_deref().unwrap_or("unknown")))
             .collect();
@@ -1326,17 +1366,22 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // four machines to find. The build metadata in the version string is
         // what makes this check possible without that file read.
         //
+        // The dirty flag is part of the compared pair. A tree built with
+        // uncommitted changes is a different binary from a clean build of the
+        // same commit, so comparing the commit alone would call the two one
+        // build and miss exactly the case an operator needs named.
+        //
         // Reported only when the releases agree. When they do not, the version
         // finding above already says the fleet is not uniform and the commits
         // differing is a consequence of it, not a second fault.
         let versions_agree = seen.len() == 1;
-        let mut commits: Vec<&str> = reporting
+        let mut builds: Vec<(String, bool)> = reporting
             .iter()
-            .map(|n| commit(n).unwrap_or("unknown"))
+            .map(|n| build_id(n).unwrap_or_else(|| ("unknown".to_string(), false)))
             .collect();
-        commits.sort_unstable();
-        commits.dedup();
-        if versions_agree && commits.len() > 1 {
+        builds.sort_unstable();
+        builds.dedup();
+        if versions_agree && builds.len() > 1 {
             let detail = reporting
                 .iter()
                 .map(|n| {
@@ -1344,8 +1389,13 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                     // reading their own notes is looking at. The full build
                     // metadata is in the JSON digest for anything that wants to
                     // compare exactly.
-                    let c = commit(n).unwrap_or("unknown");
-                    format!("{} {}", n.name, &c[..c.len().min(12)])
+                    let (c, dirty) = build_id(n).unwrap_or_else(|| ("unknown".to_string(), false));
+                    let short: String = c.chars().take(12).collect();
+                    if dirty {
+                        format!("{} {} (dirty)", n.name, short)
+                    } else {
+                        format!("{} {}", n.name, short)
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1844,6 +1894,50 @@ pub(crate) mod tests {
         );
         assert!(
             drift[0].text.contains("edge-a bbbbbbbbbbbb"),
+            "{}",
+            drift[0].text
+        );
+    }
+
+    /// A dirty build is a build of its own: one release, one commit, and a
+    /// tree that had uncommitted changes, so the two binaries can differ. The
+    /// comparison uses the `(commit, dirty)` pair, so this is build drift and
+    /// the release tags agree.
+    #[test]
+    fn a_dirty_build_beside_a_clean_one_is_build_drift_not_version_drift() {
+        let d = build(
+            &[
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                reading(
+                    "edge-a",
+                    "ok",
+                    Some(perf_built("1.10.0+aaaaaaaaaaaa.dirty")),
+                ),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+
+        assert!(
+            !d.findings.iter().any(|f| f.text.contains("version drift")),
+            "the release tags agree, so the VERSION finding must stay quiet: {:?}",
+            d.findings
+        );
+
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("build drift"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert_eq!(drift[0].level, Level::Warn);
+        assert!(
+            drift[0].text.contains("origin aaaaaaaaaaaa"),
+            "{}",
+            drift[0].text
+        );
+        assert!(
+            drift[0].text.contains("edge-a aaaaaaaaaaaa (dirty)"),
             "{}",
             drift[0].text
         );
