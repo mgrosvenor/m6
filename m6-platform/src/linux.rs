@@ -40,8 +40,12 @@ impl Signals {
     }
 
     pub(super) fn read(&mut self) -> Option<Signal> {
-        let info = self.fd.read_signal().ok()??;
-        super::signal_from_signo(info.ssi_signo as i32)
+        loop {
+            let info = self.fd.read_signal().ok()??;
+            if let Some(signal) = super::signal_from_signo(info.ssi_signo as i32) {
+                return Some(signal);
+            }
+        }
     }
 }
 

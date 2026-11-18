@@ -31,7 +31,7 @@ fn main() {
     libtest_mimic::run(&args, tests).exit();
 }
 
-/// The 7 cases, in order: S4 drains what S1 to S4 left, and S4 is last because
+/// The 8 cases, in order: S4 drains what S1 to S4 left, and S4 is last because
 /// it unblocks and restores the mask.
 fn signal_contract() -> Result<(), Failed> {
     let mut signals = Signals::new().expect("Signals::new");
@@ -46,9 +46,10 @@ fn signal_contract() -> Result<(), Failed> {
     a_burst_coalesces_and_none_is_lost(&mut poll, &mut events, &mut signals);
     a_signal_sent_before_the_poll_is_delivered(&mut signals);
     a_spawned_child_still_dies_on_sigterm();
+    sigusr1_is_discarded_and_does_not_end_the_process(&mut poll, &mut events, &mut signals);
     the_process_survives_every_signal_it_handles(&mut poll, &mut events, &mut signals);
     signals_new_refuses_an_unblocked_mask();
-    println!("signal_contract: 7 checks ... ok");
+    println!("signal_contract: 8 checks ... ok");
     Ok(())
 }
 
@@ -153,6 +154,29 @@ fn a_spawned_child_still_dies_on_sigterm() {
         "S5: the child must die of SIGTERM, not inherit an ignored disposition: {status}"
     );
     println!("S4 a_spawned_child_still_dies_on_sigterm ... ok");
+}
+
+// S8. Break: SIGUSR1 left at its default disposition, which ends this
+// process here, or a reader that stops at the discarded signal and leaves the
+// shutdown behind it unread.
+fn sigusr1_is_discarded_and_does_not_end_the_process(
+    poll: &mut Poll,
+    events: &mut Events,
+    signals: &mut Signals,
+) {
+    let status = Command::new("kill")
+        .args(["-USR1", &me().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill -USR1: {status}");
+    platform::send(me(), Signal::Shutdown).expect("send");
+    let got = drain(poll, events, signals, Duration::from_secs(2));
+    assert_eq!(
+        got,
+        [Signal::Shutdown],
+        "S8: SIGUSR1 carries no request and the shutdown after it arrives"
+    );
+    println!("S8 sigusr1_is_discarded_and_does_not_end_the_process ... ok");
 }
 
 // S6. Break: a default disposition left in place, which would have ended the

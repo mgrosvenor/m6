@@ -70,14 +70,18 @@ impl Signals {
             0,
             0,
         );
-        let n = self
-            .kq
-            .kevent(&[], std::slice::from_mut(&mut out), Some(NOW))
-            .ok()?;
-        if n == 0 {
-            return None;
+        loop {
+            let n = self
+                .kq
+                .kevent(&[], std::slice::from_mut(&mut out), Some(NOW))
+                .ok()?;
+            if n == 0 {
+                return None;
+            }
+            if let Some(signal) = super::signal_from_signo(out.ident() as i32) {
+                return Some(signal);
+            }
         }
-        super::signal_from_signo(out.ident() as i32)
     }
 }
 

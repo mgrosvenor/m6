@@ -292,18 +292,19 @@ pub enum Signal {
     Shutdown,
 }
 
-/// SIGTERM and SIGINT as one readable descriptor, registered with
+/// SIGTERM and SIGINT as one readable descriptor, with SIGUSR1 read and
+/// discarded, registered with
 /// [`Registry::register_fd`].
 ///
 /// [`Signals::new`] asserts [`block`] already ran, because a thread started
 /// before the mask is set takes the signal at its default disposition. The
-/// two signals stay blocked for the life of the process. A child inherits
+/// signals stay blocked for the life of the process. A child inherits
 /// that mask across `exec`, so a service spawns children through
 /// [`process::spawn`], which clears it.
 ///
 /// On Linux the descriptor is a `signalfd`, whose read dequeues the signal. On
 /// macOS it is a kqueue registered for `EVFILT_SIGNAL`, which reports a posted
-/// signal and does not dequeue it, so the two are also set to `SIG_IGN` there
+/// signal and does not dequeue it, so they are also set to `SIG_IGN` there
 /// and are discarded once reported.
 pub struct Signals(os::Signals);
 
@@ -337,16 +338,24 @@ pub fn send(pid: u32, what: Signal) -> io::Result<()> {
     Ok(())
 }
 
-/// The two signals the layer owns, as a mask.
+/// The three signals the layer owns, as a mask.
+///
+/// SIGUSR1 carries no request. It once asked a service to reopen its log
+/// files, and those are gone, but a log rotation hook written for that still
+/// sends it. Left at its default disposition it would end the process with no
+/// shutdown record, so it is taken off the default here and discarded when
+/// read.
 fn managed() -> nix::sys::signal::SigSet {
     use nix::sys::signal::Signal as Sig;
     let mut set = nix::sys::signal::SigSet::empty();
     set.add(Sig::SIGTERM);
     set.add(Sig::SIGINT);
+    set.add(Sig::SIGUSR1);
     set
 }
 
-/// Map a signal number to the request it carries.
+/// Map a signal number to the request it carries, `None` for one that
+/// carries none, such as SIGUSR1. A reader skips those and reads on.
 fn signal_from_signo(signo: i32) -> Option<Signal> {
     use nix::sys::signal::Signal as Sig;
     match Sig::try_from(signo).ok()? {
@@ -355,7 +364,7 @@ fn signal_from_signo(signo: i32) -> Option<Signal> {
     }
 }
 
-/// Block the two signals in the calling thread, and mark every descriptor
+/// Block the three signals in the calling thread, and mark every descriptor
 /// this process inherited close-on-exec. The first statement of every `main`,
 /// under the name `m6_core::signal::block`, which delegates here: both are
 /// facts about the process that are set once, while it is still one thread.
@@ -364,13 +373,13 @@ pub fn block() {
     let _ = process::close_inherited_on_exec();
 }
 
-/// Unblock the two signals in the calling thread, so a test can prove the
+/// Unblock the three signals in the calling thread, so a test can prove the
 /// refusal [`require_blocked`] gives. Never called by a service.
 pub fn unblock_for_test() {
     let _ = managed().thread_unblock();
 }
 
-/// Whether the calling thread blocks the two signals.
+/// Whether the calling thread blocks the three signals.
 fn blocked_here() -> bool {
     match nix::sys::signal::SigSet::thread_get_mask() {
         Ok(m) => managed().iter().all(|s| m.contains(s)),

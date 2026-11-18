@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::log::info;
 
-/// Block SIGTERM and SIGINT in the calling thread.
+/// Block SIGTERM, SIGINT and SIGUSR1 in the calling thread.
 ///
 /// **This must be the first statement of `main`.** Not the first interesting
 /// statement: the first one, before logging, before any pool, before anything

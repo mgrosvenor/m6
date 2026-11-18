@@ -595,12 +595,13 @@ Section 12 covers the two signals that stop the process.
 
 ## 12. Signal Handling
 
-m6-http handles two signals, and Table 6 gives what each receipt does.
+m6-http handles three signals, and Table 6 gives what each receipt does.
 A second termination signal exits at once.
 
 | Signal | First receipt | Second receipt |
 |---|---|---|
 | `SIGTERM` or `SIGINT` | Stop accepting, remove the socket if there is one, exit 0, without waiting for requests in progress | Immediate exit |
+| `SIGUSR1` | Discarded. Nothing changes | Discarded |
 
 *Table 6: the signals m6-http handles. Take from it that a second termination signal exits at once.*
 ---
