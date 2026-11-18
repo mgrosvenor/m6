@@ -841,7 +841,7 @@ A VPS commonly has no thermal zone, so `thermal_zones` returns an empty `Vec` (`
 
 Two readings carry a rule:
 
-- **A container's memory limit is the one that applies.** `/proc/meminfo` reports the machine, and `memory()` prefers the cgroup limit when one applies and says which it used in `Memory::source` (`m6-platform/src/host.rs:168`).
+- **A container's memory limit is the one that applies.** `/proc/meminfo` reports the machine, and `memory()` prefers the cgroup limit when one applies and says which it used in `Memory::source` (`m6-platform/src/host.rs:168`). The cgroup files are read at the group `/proc/self/cgroup` names, and at the nearest parent that has them.
 - **The space a service can use is `f_bavail`.** `f_bfree` counts the blocks reserved for root, typically 5%, and `disk()` reports `f_bavail` (`m6-platform/src/host.rs:208`).
 
 The module sets no threshold: a monitoring service decides what 80% means (`m6-platform/src/host.rs:1`).
@@ -866,6 +866,13 @@ Linux reads `/etc/os-release`, `/proc` and `/sys`, and macOS reads `SystemVersio
 
 A fact the host will not give is not an error: a container can hide `/proc` and `/sys`, and a kernel can decline to name its clock source.
 The parsers are public and pure, so a missing file, malformed text and a rolling release with no `VERSION_ID` are held on any target.
+
+**The cgroup limits are read at the process's own group** (`m6-platform/src/facts.rs:881`).
+`/proc/self/cgroup` names the group in the `0::` line, and that path is not the mount point.
+A group with no `memory.max` or `cpu.max` of its own is read at the nearest parent up to `/sys/fs/cgroup`, whose own file is a real answer rather than a reason to give up.
+`read_cgroup_memory` and `read_cgroup_cpu` take the mount point as a parameter (`m6-platform/src/facts.rs:857`), so a test builds a fixture hierarchy in a temporary directory and holds the walk on a host with no cgroups.
+`max` answers `Known(None)`, a number answers `Known(Some(bytes))`, and only a file that cannot be read or parsed answers `Unknown`.
+The two serialise differently, so a monitor prints unlimited for one and the reason for the other.
 
 ### 8.6. `tls`
 

@@ -7,6 +7,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::path::Path;
 
 use super::facts::{self, ClockFacts, CpuFacts, CpuLimit, Fact, Limits, MemoryFacts, OsFacts};
 use super::host::{
@@ -459,12 +460,19 @@ pub(super) fn load_average() -> Option<LoadAverage> {
 }
 
 /// Memory, preferring the limit that actually applies to this process.
+///
+/// The cgroup files are read at the group `/proc/self/cgroup` names and walk
+/// to the nearest parent that has them, so a container's own limit wins over
+/// the root group's `max`, which would otherwise report the machine's memory.
 pub(super) fn memory() -> Option<Memory> {
-    if let (Ok(max), Ok(cur)) = (
-        std::fs::read_to_string("/sys/fs/cgroup/memory.max"),
-        std::fs::read_to_string("/sys/fs/cgroup/memory.current"),
+    let group = self_cgroup();
+    let root = Path::new(CGROUP_V2);
+    let group = group.as_deref().unwrap_or("/");
+    if let (Some(max), Some(current)) = (
+        facts::read_cgroup_file(root, group, "memory.max"),
+        facts::read_cgroup_file(root, group, "memory.current"),
     ) {
-        if let Some(m) = parse_cgroup_memory(&max, &cur) {
+        if let Some(m) = parse_cgroup_memory(&max, &current) {
             return Some(m);
         }
     }
@@ -585,44 +593,64 @@ pub(super) fn host_limits() -> Limits {
     }
 }
 
+/// The mount point of the cgroup v2 hierarchy.
+const CGROUP_V2: &str = "/sys/fs/cgroup";
+
+/// This process's directory in the cgroup v2 hierarchy, from
+/// `/proc/self/cgroup`.
+///
+/// `None` on a host with no v2 hierarchy, and on one that will not show the
+/// file. Both callers then walk from the mount point itself, which is the
+/// answer this code gave every host before the walk existed.
+fn self_cgroup() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    facts::parse_self_cgroup_v2(&text)
+}
+
 /// The cgroup memory limit, from cgroup v2's `memory.max` or cgroup v1's
 /// `memory.limit_in_bytes`.
+///
+/// The v2 file is read at the group `/proc/self/cgroup` names, and at the
+/// nearest parent when the group has no file of its own. Reading it at the
+/// mount point answers the root group's setting, which is the host's and not
+/// this process's.
 fn cgroup_memory() -> Fact<Option<u64>> {
-    const V2: &str = "/sys/fs/cgroup/memory.max";
     const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
-    let v2 = facts::read_file(V2, "cannot read /sys/fs/cgroup/memory.max");
+    let group = self_cgroup();
+    let v2 = facts::read_cgroup_memory(Path::new(CGROUP_V2), group.as_deref().unwrap_or("/"));
     if v2.is_known() {
-        return facts::parse(
-            v2,
-            facts::parse_cgroup_memory_max,
-            "/sys/fs/cgroup/memory.max is not a number",
-        );
+        return v2;
     }
-    let v1 = facts::read_file(V1, "cannot read the cgroup memory limit");
-    facts::parse(
-        v1,
+    let v1 = facts::parse(
+        facts::read_file(V1, "cannot read the cgroup memory limit"),
         facts::parse_cgroup_memory_limit_in_bytes,
         "the cgroup memory limit is not a number",
-    )
+    );
+    // A v2 host answers above. Where neither hierarchy has a limit, the v2
+    // answer names the file and the walk, so it is the one kept.
+    if v1.is_known() {
+        v1
+    } else {
+        v2
+    }
 }
 
 /// The cgroup CPU quota, from cgroup v2's `cpu.max` or cgroup v1's
 /// `cpu.cfs_quota_us` and `cpu.cfs_period_us`.
+///
+/// The v2 file is read at the group `/proc/self/cgroup` names and walks to the
+/// nearest parent that has one, as [`cgroup_memory`] does.
 fn cgroup_cpu() -> Fact<Option<CpuLimit>> {
-    const V2: &str = "/sys/fs/cgroup/cpu.max";
     const QUOTA: &str = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us";
     const PERIOD: &str = "/sys/fs/cgroup/cpu/cpu.cfs_period_us";
-    let v2 = facts::read_file(V2, "cannot read /sys/fs/cgroup/cpu.max");
+    let group = self_cgroup();
+    let v2 = facts::read_cgroup_cpu(Path::new(CGROUP_V2), group.as_deref().unwrap_or("/"));
     if v2.is_known() {
-        return facts::parse(
-            v2,
-            facts::parse_cgroup_cpu_max,
-            "/sys/fs/cgroup/cpu.max is not a quota and period",
-        );
+        return v2;
     }
     let quota = facts::read_file(QUOTA, "cannot read the cgroup CPU quota");
     let period = facts::read_file(PERIOD, "cannot read the cgroup CPU quota");
-    match (quota, period) {
+    let v1 = match (quota, period) {
         (Fact::Known(quota), Fact::Known(period)) => {
             match facts::parse_cgroup_cpu_v1(&quota, &period) {
                 Some(limit) => Fact::Known(limit),
@@ -630,6 +658,11 @@ fn cgroup_cpu() -> Fact<Option<CpuLimit>> {
             }
         }
         (Fact::Unknown(reason), _) | (_, Fact::Unknown(reason)) => Fact::Unknown(reason),
+    };
+    if v1.is_known() {
+        v1
+    } else {
+        v2
     }
 }
 

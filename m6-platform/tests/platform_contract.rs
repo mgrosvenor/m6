@@ -1408,12 +1408,21 @@ mod facts {
     /// every unknown carrying its reason. The address list may be empty: a
     /// host with no configured interface is an ordinary answer.
     ///
+    /// The record is printed so an operator can read what this host answered,
+    /// including the two cgroup limits: `{"known": null}` is unlimited and
+    /// `{"unknown": "reason"}` is a file that could not be read. Run it with
+    /// `--nocapture` in the process's own cgroup.
+    ///
     /// Break: a reader that panics on a file the container does not have, or a
     /// serialisation that drops a key it could not fill.
     #[test]
     fn host_facts_answers_every_fact_and_serialises_every_key() {
         let facts = m6_platform::host_facts();
         let value = serde_json::to_value(&facts).expect("host facts serialise");
+        println!(
+            "H15 host_facts():\n{}",
+            serde_json::to_string_pretty(&facts).expect("host facts serialise")
+        );
         assert_complete_record(&value);
     }
 
