@@ -1128,18 +1128,28 @@ mod sockets {
             .deregister_fd(first.as_raw_fd())
             .expect("deregister first");
         drop(first);
+        // The stopped listener is gone when the last copy of its descriptor
+        // is closed. A child another test thread has forked and not yet
+        // exec'd holds a copy until then, and the kernel still hashes some
+        // connections to it, where nobody accepts. So each connection is
+        // retried, to one deadline, until the remaining listener answers it.
+        let deadline = Instant::now() + SOON;
         for i in 0..8 {
-            let mut client =
-                std::net::TcpStream::connect(addr).expect("connect after one listener stopped");
-            client.set_read_timeout(Some(SOON)).expect("read timeout");
-            let waits = ready(&mut poll, &mut events, SOON);
-            assert!(!waits.is_empty(), "connection {i} after the stop");
-            answer_all(&mut second, b'b', &mut answered);
-            let mut tag = [0u8; 1];
-            client
-                .read_exact(&mut tag)
-                .expect("the remaining listener answers");
-            assert_eq!(tag[0], b'b');
+            loop {
+                let mut client =
+                    std::net::TcpStream::connect(addr).expect("connect after one listener stopped");
+                client.set_read_timeout(Some(SOON)).expect("read timeout");
+                if !ready(&mut poll, &mut events, QUIET).is_empty() {
+                    answer_all(&mut second, b'b', &mut answered);
+                    let mut tag = [0u8; 1];
+                    client
+                        .read_exact(&mut tag)
+                        .expect("the remaining listener answers");
+                    assert_eq!(tag[0], b'b');
+                    break;
+                }
+                assert!(Instant::now() < deadline, "connection {i} after the stop");
+            }
         }
         assert_eq!(answered, 16, "the port is served after the stop");
     }
