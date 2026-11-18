@@ -13,13 +13,18 @@ use crate::sink::Sink;
 
 /// What kind of line this is, written to the top-level `type` key.
 ///
-/// Four kinds, because a reader filters on one key rather than on a target
+/// Six kinds, because a reader filters on one key rather than on a target
 /// and a message that a refactor can rename. `level` keeps the severity, so a
 /// reader asks for `type` `event` with `level` `WARN` rather than for a `warn`
 /// kind that would duplicate it.
 ///
-/// A kind is added only with a line that is genuinely another kind. The traffic
-/// summary that replaces `/traffic` is the fourth.
+/// A kind is added only with a line that is genuinely another kind.
+///
+/// `Startup` and `Shutdown` are the recovery record: several self-contained
+/// `startup` lines sharing one `run_id`, closed by a `complete` line that says
+/// how many the record has, then one `shutdown` line on a clean exit. The
+/// reader filters `type=startup` (or `M6_TYPE=startup` in the journal) and
+/// groups by `run_id`. See `docs/m6-log.md` Table 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
     /// An operational message, at any level.
@@ -32,6 +37,12 @@ pub enum Type {
     /// The periodic traffic summary, which carries the document the old
     /// `/traffic` endpoint answered.
     Traffic,
+    /// One line of the start-up record: identity, invocation, a config file, a
+    /// config section, the decided platform facts, or the completeness line.
+    Startup,
+    /// The one line a clean exit writes: the same `run_id`, the uptime and the
+    /// reason.
+    Shutdown,
 }
 
 impl Type {
@@ -42,6 +53,8 @@ impl Type {
             Type::Perf => "perf",
             Type::Access => "access",
             Type::Traffic => "traffic",
+            Type::Startup => "startup",
+            Type::Shutdown => "shutdown",
         }
     }
 }
@@ -229,7 +242,7 @@ impl<'a> Line<'a> {
     /// Write the line's top-level `type`. [`Type::Event`] is the default, so
     /// only a line that is a different kind calls this.
     ///
-    /// The word is one of three static strings, written straight into the
+    /// The word is one of six static strings, written straight into the
     /// buffer, so a line's type costs no allocation.
     pub fn kind(mut self, kind: Type) -> Self {
         self.kind = kind;

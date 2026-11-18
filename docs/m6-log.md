@@ -7,8 +7,8 @@ A top-level `type` names what a line carries.
 A reader selects the metrics, the traffic summary, the request rows or the operational events on that one key, without parsing a message.
 The per-line path has no thread, no channel and no lock, and `m6-log/tests/no_allocation.rs` carries 700,000 lines at zero allocations.
 
-This page describes the line and its four types (section 1), the size budget (section 2), the buffering and the loss on a crash (section 3), and the levels and the macros (section 4).
-It then describes the journal datagram (section 5), dropped-line counting (section 6), the calls a service's loop makes (section 7), and where the crate fits (section 8).
+This page describes the line and its six types (section 1), the size budget (section 2), the buffering and the loss on a crash (section 3), and the levels and the macros (section 4).
+It then describes the journal datagram (section 5), dropped-line counting (section 6), the calls a service's loop makes (section 7), where the crate fits (section 8), and the start-up and shutdown recovery record (section 9).
 
 ## Contents
 
@@ -20,14 +20,15 @@ It then describes the journal datagram (section 5), dropped-line counting (secti
 6. [Dropped-line counting](#6-dropped-line-counting)
 7. [The loop's calls](#7-the-loops-calls)
 8. [Where it fits](#8-where-it-fits)
+9. [The recovery record](#9-the-recovery-record)
 
 ## 1. The line
 
 Every line is one JSON object and one newline on stdout.
 The object carries four fixed keys and one optional key, and a JSON reader may take them in any order.
 `Type` in `m6-log/src/line.rs` decides the value of the `type` key.
-Table 1 gives the four values of that key and what each line carries.
-Take from it that the four kinds share one stream and one line shape.
+Table 1 gives the six values of that key and what each line carries.
+Take from it that the six kinds share one stream and one line shape.
 
 | `type` | what the line carries | written by |
 |---|---|---|
@@ -35,8 +36,10 @@ Take from it that the four kinds share one stream and one line shape.
 | `perf` | the metrics document, nested under `fields.perf`, that the removed `/perf` endpoint answered | m6-http at `[stats].interval_s`, ten seconds by default, through `log_perf` in `m6-http/src/stats.rs` |
 | `traffic` | the traffic summary, nested under `fields.traffic`, that the removed `/traffic` endpoint answered | m6-http at `[stats].traffic_interval_s`, one minute by default, through `log_traffic` in `m6-http/src/stats.rs` |
 | `access` | one per-request row, with `message` `request` or `monitor` | m6-http's analytics writer, through `write_request_line`, `write_monitor_line` and `write_rate_limited_line` in `m6-http/src/analytics.rs` |
+| `startup` | one part of the start-up record: identity, invocation, a config file, a config section, the platform facts, or the completeness count | `m6-core/src/startup.rs`, once at start |
+| `shutdown` | the clean exit: the same `run_id`, the uptime and the reason | `m6-core/src/startup.rs`, from `Lifecycle::complete` or `startup::shutdown` |
 
-**Table 1: the four values of `type`, the key that names what a line carries.**
+**Table 1: the six values of `type`, the key that names what a line carries.**
 
 `StatsConfig` in `m6-http/src/config.rs` reads `[stats].interval_s` and `[stats].traffic_interval_s`.
 `level` keeps the severity, so a warning is `type` `event` with `level` `WARN`.
@@ -51,7 +54,7 @@ Table 2 gives the top-level keys in the order `Line::end` writes them.
 | `level` | `ERROR`, `WARN`, `INFO`, `DEBUG` or `TRACE` |
 | `fields` | the message and the line's fields, as one JSON object |
 | `target` | the module, crate or subsystem that wrote the line, written only by a line that names one |
-| `type` | one of Table 1's four words, written last |
+| `type` | one of Table 1's six words, written last |
 
 **Table 2: the top-level keys of one line, in written order.**
 
@@ -171,7 +174,7 @@ Take from it that `M6_TYPE` and `PRIORITY` are readable without parsing the JSON
 | field | value |
 |---|---|
 | `PRIORITY` | the level as a syslog priority: `3` error, `4` warning, `6` info, `7` debug and trace |
-| `M6_TYPE` | the line's `type`: `event`, `perf`, `access` or `traffic` |
+| `M6_TYPE` | the line's `type`: `event`, `perf`, `access`, `traffic`, `startup` or `shutdown` |
 | `SYSLOG_IDENTIFIER` | the program's own name, from the file name in `argv[0]`, or `m6` when that is empty |
 | `MESSAGE` | the whole JSON line, `type` included, without the newline that separates lines on stdout |
 
@@ -269,3 +272,98 @@ Each service's own loop supplies the tick, the token and the stop, in plain sigh
 `Sink::file` in `m6-log/src/sink.rs` remains for a test or a bench that writes a line to a file, and the process logger never calls it.
 
 One stream carries one line shape, a type on every line, and the size budget of Table 3.
+
+## 9. The recovery record
+
+**The start-up record is several `type=startup` lines, and a clean exit adds one `type=shutdown` line.**
+A reader can tell from the log what ran, with what settings, and how it ended.
+The record plus the secrets file reproduces the run, because every other setting is in the record.
+This section gives the line shapes, the run id, the completeness count and the redaction rule.
+
+The record is written once, after logging is open and after every start refusal has passed.
+A service built on `Site` gets it with no call of its own.
+An application with its own config calls `m6_core::startup::Record::emit` once after `log::init`, and `m6_core::startup::shutdown` once on the clean-exit path.
+Table 7 gives the `part` value on each line.
+
+| `part` | lines | what the line carries |
+|---|---|---|
+| `identity` | one | `app`, `version` as the full SemVer string, `tag` as the tag form, and `crates`: one `"<crate> - <semver>"` string per m6 crate in the binary, the binary first |
+| `invocation` | one | `argv`, `flags` and `environment`; every declared flag and variable is listed, and an unset one has a null `value` |
+| `config_file` | one per file | `role` (`config`, `secrets` or `site`), `path`, and `sha256` of the bytes as read |
+| `config_section` | one per table | `section`, the table's dotted path, `file` when the record knows it, and `settings`: every key with its `value` and `source` |
+| `platform` | one | `host`, the platform facts, `limits`, every named limit's `start`, `max` and `source`, and `decided`, the facts the start decided such as the socket it bound |
+| `complete` | one | `lines`, the number of `startup` lines in the record including this one |
+
+**Table 7: the `part` values of the start-up record.**
+
+Every line repeats the keys in Table 8.
+A line is self-contained, so a reader that filters one `part` still knows which application and run it belongs to.
+
+| key | value |
+|---|---|
+| `run_id` | the process start in milliseconds since the Unix epoch, a hyphen, and the pid, for example `1763452800123-4817` |
+| `seq` | the line's position in the record, from 1 |
+| `part` | one of Table 7's words |
+| `app` | the application's name, the same string as the `-` line of `--version-full` |
+| `version` | the full SemVer string, build metadata included |
+| `message` | a fixed phrase such as `startup record: identity` |
+| `type` | `startup`, written last |
+
+**Table 8: the keys every start-up line carries.**
+
+The run id is set once at start.
+A reader groups the lines of one run with one filter:
+
+```sh
+journalctl M6_TYPE=startup -o json | jq -r 'select(.run_id == "1763452800123-4817")'
+```
+
+The start time is used rather than a boot time so the record needs no host read.
+A pid cannot name two processes that started in the same millisecond, so the pair is unique per run.
+
+The completeness line counts itself.
+A reader that received every line has a count equal to the number of `startup` lines it holds.
+A missing line leaves a gap in `seq` and a count larger than the number received.
+
+A config section is one table.
+A `[[route]]` array is one `config_section` line per element, with paths `route[0]`, `route[1]`, so a large route table is many bounded lines rather than one long one.
+An array of scalars is a value in its parent section.
+
+A setting's `source` is one of `file`, `default`, `env` or `flag`, in that order of precedence from weakest to strongest.
+Every key is present, including the keys the file did not set and the application filled in.
+A default is never omitted because it equals the value in use, so a later release that changes a default changes the record, which is the point.
+
+Redaction is by type, and there is no list of names.
+A config field declared `m6_core::Secret<T>` serialises as `<redacted>`, so no writer can pass it to a line.
+A value whose key came from the file named by `secrets_file` is also `<redacted>`, because the file's role is the type.
+A path that names a secret file is a plain setting and is logged, and the bytes of the secret never are.
+
+A declared flag marked secret is `<redacted>` in the invocation line, and its `argv` entry is redacted in place, so the reader still sees that the flag was passed.
+A command line can therefore never carry a password into the record.
+
+A clean exit writes one `shutdown` line with the same `run_id`, `uptime_ms` and `reason`.
+`Lifecycle::complete` writes it with reason `signal`.
+A forced second signal writes it with reason `forced`.
+A process that never wrote a start-up record writes no shutdown line, because there is no run for it to belong to.
+
+Section 9.1 gives a measured record and the size question.
+
+### 9.1 A measured record
+
+Table 9 gives the largest real config measured for this release and the record it produced.
+The record is many lines for exactly this reason: the largest line stays well under `[limits] journal_line`, 64 KiB, and under the 8 KiB default `[limits.log_field]`.
+
+| tree | service and config files | lines | bytes | longest line |
+|---|---|---|---|---|
+| production | m6-file, its service config and the site's `site.toml` | 71 | 40,821 | 2,017 |
+| staging | m6-file, its service config and the site's `site.toml` | 71 | 41,047 | 2,017 |
+| production | m6-monitor, its service config and the site's `site.toml` | 64 | 32,878 | 2,020 |
+| staging | m6-monitor, its service config and the site's `site.toml` | 64 | 33,060 | 2,020 |
+
+**Table 9: the record measured from the largest rendered configs, with the line count and the longest line in bytes.**
+
+The measurement is taken from the rendered tree through the same writer a process uses, so these are bytes the record produces rather than an estimate.
+The largest is 71 lines and 41,047 bytes, and its longest line is 2,017 bytes, which is the platform line.
+Every config section is under 900 bytes.
+The 64 KiB `[limits] journal_line` and the 8 KiB `[limits.log_field]` both have room for a config far larger than the ones measured.
+The line count is the reason the record is many lines: one line per table keeps the largest line at a few percent of the limit however many routes a site declares.

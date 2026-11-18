@@ -60,6 +60,7 @@ pub enum Action {
 /// stop.
 fn handle_terminate(name: &str, socket: Option<&Path>, count: u32) -> Action {
     if count >= 2 {
+        crate::startup::shutdown("forced");
         finish(name, socket, "forced");
         std::process::exit(0);
     }
@@ -102,8 +103,15 @@ impl Lifecycle {
         }
     }
 
-    /// Finish a graceful shutdown: unlink the socket, log the completion line.
+    /// Finish a graceful shutdown: write the shutdown record line, unlink the
+    /// socket, log the completion line.
+    ///
+    /// The shutdown line goes before the completion line so a reader that sees
+    /// `shutdown` knows the process got as far as the clean-exit path even when
+    /// the completion line is lost. It carries the record's run id, so it
+    /// groups with the startup lines of the same run.
     pub fn complete(&self) {
+        crate::startup::shutdown("signal");
         finish(&self.name, self.socket.as_deref(), "complete");
     }
 }

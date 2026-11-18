@@ -46,7 +46,8 @@ The released versions, newest first:
 `--version` prints the tag form, `v1.16.0-rc.1`, and nothing else.
 `--version-full` prints one line per m6 crate in the binary, the binary first, each as `<crate> - <full SemVer>` with that crate's own commit and dirty flag.
 The workspace version moves to `1.16.0-rc.1`, so the version alone says this is a develop build for staging.
-The startup record, the monitor's use of these fields, and the hash deletions are later changes in the same workstream.
+The start-up and shutdown recovery record is in the same release.
+The monitor's use of these fields and the hash deletions are later changes in the same workstream.
 
 ### Added
 
@@ -60,10 +61,26 @@ The startup record, the monitor's use of these fields, and the hash deletions ar
 - The workspace version is `1.16.0-rc.1`. `Cargo.lock` carries the same version for every member, and `cargo metadata --locked` agrees with it.
 - Every m6 binary takes both flags: `m6-http`, `m6-bench`, `m6-bench-detail`, `bench-url-backend`, `m6-perf-ab`, `m6-probe-h1`, `m6-probe-h2`, `m6-probe-h3`, `m6-file`, `m6-html`, `m6-md`, `m6-monitor`, `m6-auth-server` and `m6-auth-cli`. The examples and the site applications adopt the same two lines in a later change.
 
+### Added
+
+- `startup` and `shutdown` as two more values of a log line's `type`, in the JSON and in the journal's `M6_TYPE`.
+- The start-up recovery record: several `type=startup` lines sharing one `run_id`, then one `type=shutdown` line on a clean exit. The parts are the identity (`app`, full version, every m6 crate), the invocation (argv, the declared flags, every declared environment variable), one line per config file with its sha256 as read, one line per config table with every key, its effective value and its source (`file`, `default`, `env` or `flag`), one line for the platform facts and the effective `[limits]`, and a completeness line carrying the number of lines in the record.
+- `m6_core::startup`, the writer. A service built on `Site` gets the record and the shutdown line with no call of its own. An application with its own config calls `startup::Record::emit` once after `log::init` and `startup::shutdown` once on a clean exit. Site applications and examples call `startup_identity!` beside `version_flags!` so the identity line names the binary rather than m6-core.
+- `m6_core::Secret<T>` and `m6_core::config::Secret`, the redaction mechanism. A config field declared with the type serialises as `<redacted>`, and a value supplied by the file named by `secrets_file` is redacted by that file's role. There is no list of secret names.
+- `m6_core::config::load_traced` and `m6_http_lib::config::load_traced`, which return the effective config and the trace of which file, flag or environment variable set each key. `load` keeps its signature and delegates.
+
+### Changed
+
+- A clean exit written through `Lifecycle::complete` now writes one `type=shutdown` line before the completion line. A forced second signal writes it with reason `forced`. A process that never wrote a start-up record writes no shutdown line.
+- Every service start writes the start-up record to the one log stream. An operator who filters `type=event` sees the same operational lines as before. An operator who counts all lines sees the record, which is what a reader needs to recover the run.
+- The record reports an empty `[smtp] password` and any other value the secrets file supplied as `<redacted>`. A path to a secret file is logged as a setting, and the file's bytes never are.
+
 ### Verified
 
 - `cargo test --workspace --no-fail-fast` passes. The two version tests run every shipping binary with both flags. The full string parses as SemVer 2.0.0 with the `rc.1` pre-release and a build metadata identifier that equals the tree's commit or that commit plus `.dirty`.
 - `cargo build --bins` prints no warning, and the tip's `--version` and `--version-full` output are quoted in the worker report.
+- The recovery record is held by `m6-core/tests/startup_record.rs`: every line's shape and type, the run id grouping two records apart, the completeness count against the number of lines, a config full of secrets whose values appear in no line, the four source labels on a real config, and a round trip that writes the record's settings back as a config file and asserts the same effective settings, defaults included.
+- The record from a real binary is quoted in the worker report, and the largest line and line count from the rendered production and staging configs are measured rather than estimated.
 
 ---
 

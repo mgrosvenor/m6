@@ -42,6 +42,7 @@ pub mod response;
 pub mod server;
 pub mod signal;
 pub mod site;
+pub mod startup;
 pub mod telemetry;
 pub mod time_range;
 pub mod tls;
@@ -77,7 +78,7 @@ pub use compress::{brotli_compress, brotli_decompress, gzip_compress, gzip_decom
 pub use conditional::{
     evaluate_preconditions, is_not_modified, not_modified_headers, Precondition,
 };
-pub use config::{RendererConfig, RouteConfig, PAGE_CACHE_CONTROL};
+pub use config::{RendererConfig, RouteConfig, Secret, PAGE_CACHE_CONTROL};
 pub use cookie::{Cookie, SameSite};
 pub use dict::Dict;
 pub use error::{Error, Result};

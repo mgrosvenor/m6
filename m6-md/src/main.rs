@@ -210,6 +210,9 @@ fn main() {
     // `--version` and `--version-full` answer before the input directory is
     // required.
     m6_core::version_flags!(m6_core::build_info::linked());
+    // The start-up record's identity line: the binary first, then each m6
+    // crate it links. The record itself is written once logging is up.
+    m6_core::startup_identity!(m6_core::build_info::linked());
 
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run(args));
@@ -238,8 +241,44 @@ fn run(args: Vec<String>) -> i32 {
         return 1;
     }
 
+    // The build tool has no config file: its invocation is its config, so the
+    // record carries the identity, the flags, the platform facts and the count.
+    {
+        let argv = args.clone();
+        let mut trace = m6_core::startup::ConfigTrace::new();
+        let flags = [
+            m6_core::startup::FlagDecl {
+                name: "--output",
+                takes_value: true,
+                setting: None,
+                secret: false,
+            },
+            m6_core::startup::FlagDecl {
+                name: "--log-level",
+                takes_value: true,
+                setting: None,
+                secret: false,
+            },
+        ];
+        let invocation = m6_core::startup::Invocation::read(&argv, &flags, &[], &mut trace);
+        let (own, linked) = m6_core::startup::app_identity();
+        let record = m6_core::startup::Record::new("m6-md", own, linked, argv)
+            .invocation(invocation, trace)
+            .host(m6_core::startup::HostReport::decided())
+            .limits(m6_core::startup::LimitsReport::read(
+                &m6_core::limits::Limits::default(),
+                &m6_core::startup::ConfigTrace::new(),
+            ));
+        record.emit();
+    }
+
     // Run the one pass, then write everything buffered before this tool exits.
     let result = process(&cli);
+    m6_core::startup::shutdown(if result.is_ok() {
+        "pass complete"
+    } else {
+        "pass failed"
+    });
     if let Err(e) = m6_core::log::stop() {
         eprintln!("logging stop error: {e}");
         return 1;

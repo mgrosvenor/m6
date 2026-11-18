@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde_json::{Map, Value};
 
+use crate::startup::{self, ConfigRole, ConfigTrace, Section};
+
 /// The `Cache-Control` a page gets unless its route says otherwise.
 ///
 /// This is the browser-caching pattern: the browser revalidates on every
@@ -199,6 +201,214 @@ impl RendererConfig {
     }
 }
 
+/// A config value that must never be written to a log.
+///
+/// **This is the mechanism, and it is a type.** A field declared `Secret<String>`
+/// serialises as [`startup::REDACTED`] through every `Serialize` path, so the
+/// start-up record cannot print it even by mistake. The value is read through
+/// [`Secret::expose`] by the code that needs it.
+///
+/// A config type that marks its secrets this way needs no name list anywhere,
+/// and a new secret is a compile-time change with no separate registration to
+/// forget.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Secret<T>(T);
+
+impl<T> Secret<T> {
+    /// Wrap a value that must not be logged.
+    pub const fn new(value: T) -> Secret<T> {
+        Secret(value)
+    }
+
+    /// The value, for the code that acts on it.
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+
+    /// Unwrap the value.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> std::fmt::Debug for Secret<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(startup::REDACTED)
+    }
+}
+
+impl<T> serde::Serialize for Secret<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(startup::REDACTED)
+    }
+}
+
+impl RendererConfig {
+    /// The full effective configuration as JSON, defaults included.
+    ///
+    /// This is the value the start-up record splits into `config_section`
+    /// lines. Every field of [`RendererConfig`] is here, including a section
+    /// the file did not contain, because a reader recovering the run needs the
+    /// value the process actually used.
+    ///
+    /// A value whose key was supplied by the secrets file is redacted by
+    /// [`startup::sections_from_value`], using the trace's provenance. A value
+    /// declared [`Secret`] is already [`startup::REDACTED`] here.
+    pub fn effective_json(&self, site_dir: &Path) -> Value {
+        let mut root = Map::new();
+        // The service's own top-level keys. They are merged at the root, not
+        // under a `user_config` key, so their paths match the config file's.
+        for (key, value) in &self.user_config {
+            root.insert(key.clone(), value.clone());
+        }
+
+        let server = serde_json::json!({
+            "read_timeout_s": self.server.read_timeout.map(|d| d.as_secs()),
+            "socket_mode": format!("{:04o}", self.server.socket_mode),
+        });
+        root.insert("server".to_string(), server);
+        root.insert(
+            "params_cache".to_string(),
+            serde_json::json!({"size": self.params_cache.size}),
+        );
+        root.insert(
+            "log".to_string(),
+            serde_json::json!({"level": self.log.level}),
+        );
+
+        // The minification table is flat in the file: `[minification]` holds
+        // `inline_js` and one `<mime> = true` key per type, so the record and
+        // the rebuilt file use the same shape.
+        let mut minification = Map::new();
+        minification.insert(
+            "inline_js".to_string(),
+            Value::Bool(self.minification.inline_js),
+        );
+        for (mime, on) in &self.minification.enabled {
+            minification.insert(mime.clone(), Value::Bool(*on));
+        }
+        root.insert("minification".to_string(), Value::Object(minification));
+
+        let mut compression = Map::new();
+        for (mime, level) in &self.compression {
+            compression.insert(
+                mime.clone(),
+                serde_json::json!({"brotli": level.brotli, "gzip": level.gzip}),
+            );
+        }
+        root.insert("compression".to_string(), Value::Object(compression));
+
+        let routes: Vec<Value> = self
+            .routes
+            .iter()
+            .map(|route| {
+                let mut table = Map::new();
+                table.insert("path".to_string(), Value::String(route.path.clone()));
+                table.insert("template".to_string(), json_option(&route.template));
+                table.insert(
+                    "params".to_string(),
+                    Value::Array(
+                        route
+                            .params
+                            .iter()
+                            .map(|p| Value::String(p.clone()))
+                            .collect(),
+                    ),
+                );
+                table.insert("status".to_string(), Value::from(route.status));
+                table.insert("cache".to_string(), Value::String(route.cache.clone()));
+                table.insert(
+                    "cache_explicit".to_string(),
+                    Value::Bool(route.cache_explicit),
+                );
+                table.insert(
+                    "methods".to_string(),
+                    match &route.methods {
+                        Some(methods) => {
+                            Value::Array(methods.iter().map(|m| Value::String(m.clone())).collect())
+                        }
+                        None => Value::Null,
+                    },
+                );
+                table.insert(
+                    "headers".to_string(),
+                    Value::Array(
+                        route
+                            .headers
+                            .iter()
+                            .map(|(k, v)| {
+                                Value::Array(vec![
+                                    Value::String(k.clone()),
+                                    Value::String(v.clone()),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                );
+                table.insert("handler".to_string(), json_option(&route.handler));
+                for (key, value) in route.settings.iter() {
+                    table.insert(key.clone(), value.clone());
+                }
+                Value::Object(table)
+            })
+            .collect();
+        root.insert("route".to_string(), Value::Array(routes));
+        root.insert(
+            "global_params".to_string(),
+            Value::Array(
+                self.global_params
+                    .iter()
+                    .map(|p| Value::String(p.clone()))
+                    .collect(),
+            ),
+        );
+        root.insert(
+            "site_toml".to_string(),
+            Value::String(self.resolve_site_toml(site_dir).display().to_string()),
+        );
+        root.insert(
+            "site_size_budget_mb".to_string(),
+            match self.site_size_budget_mb {
+                Some(mb) => Value::from(mb),
+                None => Value::Null,
+            },
+        );
+        Value::Object(root)
+    }
+
+    /// Every effective setting, split into bounded sections for the start-up
+    /// record, with each value's source from `trace`.
+    pub fn startup_sections(&self, site_dir: &Path, trace: &ConfigTrace) -> Vec<Section> {
+        let mut sections = startup::sections_from_value("", &self.effective_json(site_dir), trace);
+        // A route's `cache` value is a default unless the file set it, and
+        // `cache_explicit` is derived from that. Rebuilding a config writes a
+        // default explicitly, which would turn the derived flag true, so the
+        // implicit pair is recorded but not rebuilt: the parser recomputes the
+        // same value.
+        for (index, route) in self.routes.iter().enumerate() {
+            let path = format!("route[{index}]");
+            if let Some(section) = sections.iter_mut().find(|s| s.path == path) {
+                if let Some(setting) = section.settings.get_mut("cache_explicit") {
+                    setting.rebuild = false;
+                }
+                if !route.cache_explicit {
+                    if let Some(setting) = section.settings.get_mut("cache") {
+                        setting.rebuild = false;
+                    }
+                }
+            }
+        }
+        sections
+    }
+}
+
+fn json_option(value: &Option<String>) -> Value {
+    match value {
+        Some(value) => Value::String(value.clone()),
+        None => Value::Null,
+    }
+}
+
 /// Per-MIME-type minification enable flag.
 #[derive(Debug, Clone, Default)]
 pub struct MinificationConfig {
@@ -260,13 +470,21 @@ const FRAMEWORK_KEYS: &[&str] = &[
 
 /// Load and merge config + optional secrets file.
 ///
-/// Returns `(RendererConfig, socket_path)`.
-pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfig> {
+/// Returns the effective config and the trace that says which file, flag or
+/// environment variable set each key. The trace is what the start-up record
+/// needs to label a default as a default.
+pub fn load_traced(
+    config_path: &Path,
+    site_dir: &Path,
+) -> anyhow::Result<(RendererConfig, ConfigTrace)> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
 
     let mut toml_val: toml::Value = toml::from_str(&raw)
         .with_context(|| format!("parsing config {}", config_path.display()))?;
+
+    let mut trace = ConfigTrace::new();
+    trace.add_config_file(config_path, ConfigRole::Config, &raw, &toml_val);
 
     // Optionally merge secrets file.
     if let Some(secrets_path) = toml_val.get("secrets_file").and_then(|v| v.as_str()) {
@@ -276,6 +494,7 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
                 .with_context(|| format!("reading secrets file {}", sp.display()))?;
             let secrets: toml::Value = toml::from_str(&srw)
                 .with_context(|| format!("parsing secrets file {}", sp.display()))?;
+            trace.add_config_file(&sp, ConfigRole::Secrets, &srw, &secrets);
 
             // ONE KEY, ONE OWNER. A key set in both files is refused here.
             //
@@ -334,7 +553,12 @@ pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfi
     )?;
     let mut config = parse_config(toml_val, site_dir)?;
     config.limits = limits;
-    Ok(config)
+    Ok((config, trace))
+}
+
+/// Load the effective config without the source trace.
+pub fn load(config_path: &Path, site_dir: &Path) -> anyhow::Result<RendererConfig> {
+    load_traced(config_path, site_dir).map(|(config, _)| config)
 }
 
 /// The path a setting that names a secret, key or certificate holds, which

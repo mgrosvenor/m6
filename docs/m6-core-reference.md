@@ -114,6 +114,7 @@ Table 3 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
 | | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `Bounded<T>`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
 | | `build_info` | `BuildIdentity`, the `build_identity!` macro, `emit` for a service's `build.rs`, `linked` and `handle_version_flags` for `--version` and `--version-full`. The constants are fixed at build time and the type comes from `m6-platform`. |
+| | `startup` | `Record`, `RunId`, `Section`, `Setting`, `Source`, `ConfigTrace` and `Secret`: the start-up and shutdown recovery record. One call at start and one at a clean exit. `docs/m6-log.md` section 9 gives the line shapes. |
 | | `template` | The Tera implementation of those traits, and the site filters. Feature `templates`. |
 | | `client` | `Upstream`, `Addr`, `TlsClient`, `Reply` and `system_roots`: one outgoing HTTP request a loop drives. `Endpoint` is behind `http-client`. |
 | | `email` | `Relay`, `RelayConfig`, `Smtp` and `SmtpError`: an SMTP client a loop drives. Feature `email`. |
@@ -183,6 +184,8 @@ Take from it that every part is a plain type with methods, and that none of them
 ### 4.2. `config`
 
 `config::load(config_path, site_dir) -> anyhow::Result<RendererConfig>`.
+`config::load_traced(config_path, site_dir) -> anyhow::Result<(RendererConfig, ConfigTrace)>` returns the same config and the trace that says which file, flag or environment variable set each key.
+`config::Secret<T>` is a value that serialises as `<redacted>`, so a config field declared with it cannot reach a log line.
 The struct is:
 
 ```rust
@@ -210,6 +213,9 @@ A service that names a `site_toml` that does not exist, cannot be read or is not
 A `RouteConfig` carries ten fields: `path`, `template`, `params`, `status`, `cache`, `cache_explicit`, `methods`, `headers`, `handler` and `settings`.
 `handler` names a handler the service passes to `Site::load`, and `settings` keeps the per-route keys core does not define.
 `MinificationConfig::is_enabled(mime)` answers the per-type question, and `toml_to_json` converts a TOML value to JSON.
+
+`RendererConfig::effective_json(site_dir)` returns the full effective configuration, defaults included, as the start-up record carries it.
+`RendererConfig::startup_sections(site_dir, trace)` splits that value into one section per table, with each setting's `source`.
 
 `[server] read_timeout_s` is the read deadline applied to every accepted connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30).
 `0` means no timeout.
@@ -382,6 +388,31 @@ One connection per call, with `Connection: close`, so there is no idle list.
 Section 5 turns to the objects a handler receives and returns.
 
 ---
+
+### 4.9. `startup`
+
+**The start-up record is several `type=startup` lines, and a clean exit adds one `type=shutdown` line.**
+`m6_core::startup::Record` builds it, `Record::emit` writes it through the operational log, and `startup::shutdown(reason)` writes the exit line.
+A service built on `Site` gets both with no call of its own: `Site::prepare` writes the record, and `Lifecycle::complete` writes the shutdown line.
+
+An application with its own config and loop makes two calls.
+The identity line names the binary rather than m6-core only when the binary registers itself, which is one line beside the version call:
+
+```rust
+m6_core::version_flags!(m6_core::build_info::linked());
+m6_core::startup_identity!(m6_core::build_info::linked());
+```
+
+The record takes the effective config as sections and a `ConfigTrace` that labels each setting `file`, `default`, `env` or `flag`.
+`ConfigTrace::add_config_file` records a file's path, its role and its sha256 as read.
+`Invocation::read` reads the declared flags and environment variables and records the settings they replaced.
+`LimitsReport::read` records every named limit's start, max and source.
+`HostReport::decided` is the platform line's host block.
+
+A value the secrets file supplied is `<redacted>`.
+A field declared `Secret<T>` is `<redacted>` wherever it appears.
+Neither mechanism carries a list of names.
+
 
 ## 5. Request and response
 

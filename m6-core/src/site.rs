@@ -20,6 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::log::{error, warn};
+use crate::startup::{
+    ConfigRole, ConfigTrace, EnvDecl, FlagDecl, HostReport, Invocation as StartupInvocation,
+    LimitsReport, Record as StartupRecord,
+};
 use anyhow::Context;
 use serde_json::{Map, Value};
 
@@ -399,10 +403,27 @@ impl Site {
         } = invocation;
         let cli_log_level = cli_log_level.as_deref();
 
-        // Load config.
-        let config = match config {
-            Some(config) => config,
-            None => crate::config::load(&config_path, &site_dir)
+        // Load config, with the trace that says which file set each key.
+        //
+        // The trace is what lets the record label a value `file` rather than
+        // `default`, so it is read on the same pass the config is. A service
+        // that hands its own parsed config in still gets a trace of the bytes
+        // on disk, which is a second read of a file it already read and the
+        // only way to know what that file set.
+        let (config, mut trace) = match config {
+            Some(config) => {
+                let mut trace = ConfigTrace::new();
+                if let Ok(raw) = std::fs::read_to_string(&config_path) {
+                    match toml::from_str::<toml::Value>(&raw) {
+                        Ok(value) => {
+                            trace.add_config_file(&config_path, ConfigRole::Config, &raw, &value)
+                        }
+                        Err(_) => trace.add_unparsed(&config_path, ConfigRole::Config, &raw),
+                    }
+                }
+                (config, trace)
+            }
+            None => crate::config::load_traced(&config_path, &site_dir)
                 .map_err(|e| (format!("Config error: {e}"), 2))?,
         };
 
@@ -414,6 +435,22 @@ impl Site {
 
         let site_toml = validate_startup(&config, &site_dir, &config_path)
             .map_err(|msg| (format!("Config error: {msg}"), 2))?;
+        // site.toml is the second config file a service reads. Its values are
+        // recorded as file-sourced sections: core parses the file's shape and
+        // every key, and the service decides what each means.
+        let site_value = match std::fs::read_to_string(&site_toml) {
+            Ok(text) => match toml::from_str::<toml::Value>(&text) {
+                Ok(value) => {
+                    trace.add_config_file(&site_toml, ConfigRole::Site, &text, &value);
+                    Some(value)
+                }
+                Err(_) => {
+                    trace.add_unparsed(&site_toml, ConfigRole::Site, &text);
+                    None
+                }
+            },
+            Err(_) => None,
+        };
 
         // Logging: site.toml base, the service's `[log]`, then `--log-level`.
         let level = resolve_log(&site_toml, &config.log, cli_log_level)
@@ -436,6 +473,60 @@ impl Site {
         }
 
         let socket_path = crate::socket_path_from_config(&config_path);
+
+        // The recovery record: one call, after logging is up. It is built here
+        // while the config is owned here, and emitted after every start
+        // refusal has passed, so a refused start writes none of it.
+        let startup_record = if mode == StartMode::Service {
+            let argv: Vec<String> = std::env::args().collect();
+            let invocation = StartupInvocation::read(&argv, SITE_FLAGS, SITE_ENV, &mut trace);
+            let (own, linked) = crate::startup::app_identity();
+            let mut sections = config.startup_sections(&site_dir, &trace);
+            for section in &mut sections {
+                section.file = Some(config_path.display().to_string());
+            }
+            // The effective log level is the one the process is using, not the
+            // one the service config's table happens to carry: site.toml and
+            // --log-level are later in the order.
+            if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
+                log_section.set(
+                    "level",
+                    crate::startup::Setting::new(
+                        level.text().to_ascii_lowercase(),
+                        trace.source("log.level"),
+                    ),
+                );
+            }
+            // The socket path is a decided fact, derived from the config path
+            // unless the environment replaced it. Its source is how an operator
+            // tells the two apart.
+            if let Some(server) = sections.iter_mut().find(|s| s.path == "server") {
+                server.set(
+                    "socket_path",
+                    crate::startup::Setting::decided(
+                        socket_path.display().to_string(),
+                        trace.source("server.socket_path"),
+                    ),
+                );
+            }
+            if let Some(site_value) = &site_value {
+                let mut from_site = crate::startup::sections_from_toml("", site_value, &trace);
+                for section in &mut from_site {
+                    section.file = Some(site_toml.display().to_string());
+                }
+                sections.append(&mut from_site);
+            }
+            Some(
+                StartupRecord::new(name, own, linked, argv)
+                    .invocation(invocation, trace.clone())
+                    .sections(sections)
+                    .host(HostReport::decided())
+                    .limits(LimitsReport::read(&config.limits, &trace))
+                    .decision("socket_path", socket_path.display().to_string()),
+            )
+        } else {
+            None
+        };
 
         let code_signatures: Vec<(String, RouteMethod)> = code.to_vec();
         let state = FrameworkState::build(config, site_dir.clone(), &code_signatures, renderer)
@@ -479,6 +570,9 @@ impl Site {
             .enumerate()
             .map(|(i, name)| (name.clone(), i))
             .collect();
+        if let Some(record) = &startup_record {
+            record.emit();
+        }
         Ok(Site {
             state,
             config_path,
@@ -2542,6 +2636,74 @@ pub(crate) enum DumpHandling {
 /// `dump` says who answers the flag. The shared parser answers it for a service
 /// with no start checks of its own, and records it for a service that parses a
 /// config of its own with [`Site::load_deferring_dump`].
+/// The flags every service parses, as the record declares them.
+///
+/// A service adds none: the flags are core's, so a service that reads no flag
+/// of its own still records what it was started with.
+const SITE_FLAGS: &[FlagDecl] = &[
+    FlagDecl {
+        name: "--log-level",
+        takes_value: true,
+        setting: Some("log.level"),
+        secret: false,
+    },
+    FlagDecl {
+        name: "--dump-config",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+    FlagDecl {
+        name: "--version",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+    FlagDecl {
+        name: "--version-full",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+];
+
+/// The environment variables core reads that change a service's behaviour.
+///
+/// Declaration, not discovery. A variable no code reads cannot appear here,
+/// and a new one is added beside the code that reads it.
+const SITE_ENV: &[EnvDecl] = &[
+    EnvDecl {
+        name: "M6_SOCKET_OVERRIDE",
+        why: "replaces the service's socket path",
+        setting: Some("server.socket_path"),
+    },
+    EnvDecl {
+        name: "M6_CHECK_SOCKET_OVERRIDE",
+        why: "replaces the auth-check socket path",
+        setting: Some("auth.check_socket_path"),
+    },
+    EnvDecl {
+        name: "XDG_RUNTIME_DIR",
+        why: "the journal socket's directory for a user service",
+        setting: None,
+    },
+    EnvDecl {
+        name: "JOURNAL_STREAM",
+        why: "whether stdout is systemd's journal",
+        setting: None,
+    },
+    EnvDecl {
+        name: "STATE_DIRECTORY",
+        why: "the service manager's writable state directory",
+        setting: None,
+    },
+    EnvDecl {
+        name: "TMPDIR",
+        why: "the temporary directory for scratch paths",
+        setting: None,
+    },
+];
+
 pub(crate) fn parse_invocation(
     routes: &[(String, RouteMethod)],
     handlers: &[String],

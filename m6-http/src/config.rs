@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use m6_core::config::secret_path;
 use m6_core::site::Methods;
+use m6_core::startup::{self, ConfigRole, ConfigTrace, Section};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// The one `[log]` type, owned by m6-core. Re-exported so this crate's `Config`
 /// uses the same type every other service uses, and `[log]` in site.toml is
@@ -1187,9 +1189,15 @@ fn is_one_file(site_toml: &Path, system_config: &Path) -> bool {
     }
 }
 
-/// Load and merge configs. Returns Config on success. Returns error with
-/// message suitable for exit-2 on any validation failure.
-pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config> {
+/// Load and merge configs, with the trace that says which file set each key.
+///
+/// The trace is what the start-up record needs to label a default as a
+/// default. It is built from the same two parses the load uses, so the record
+/// and the config cannot disagree about what a file contained.
+pub fn load_traced(
+    site_dir: &Path,
+    system_config_path: &Path,
+) -> anyhow::Result<(Config, ConfigTrace)> {
     let site_toml_path = site_dir.join("site.toml");
 
     let site_raw = std::fs::read_to_string(&site_toml_path)
@@ -1201,6 +1209,22 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .with_context(|| format!("reading {}", system_config_path.display()))?;
     let system_table: toml::Table = toml::from_str(&system_raw)
         .map_err(|e| anyhow::anyhow!("parsing {}: {e}", system_config_path.display()))?;
+
+    let mut trace = ConfigTrace::new();
+    trace.add_config_file(
+        &site_toml_path,
+        ConfigRole::Site,
+        &site_raw,
+        &toml::Value::Table(site_table.clone()),
+    );
+    if !is_one_file(&site_toml_path, system_config_path) {
+        trace.add_config_file(
+            system_config_path,
+            ConfigRole::Config,
+            &system_raw,
+            &toml::Value::Table(system_table.clone()),
+        );
+    }
 
     let one_file = is_one_file(&site_toml_path, system_config_path);
 
@@ -1659,6 +1683,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     // absolute and writable by this process: a probe file is created and
     // removed at start, so an unwritable mount fails the start rather than
     // every later write.
+    let cache_was_set = raw_cache.is_some();
     let cache_dir = match raw_cache {
         None => None,
         Some(raw) => {
@@ -1684,31 +1709,70 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         }
     };
 
-    Ok(Config {
-        site: SiteConfig {
-            name: site_name,
-            domain: site_domain,
-            redirect_www: raw_site.redirect_www.unwrap_or(true),
-            describedby: raw_site.describedby.unwrap_or_default(),
+    if cache_was_set {
+        trace.mark_file("cache_dir");
+    }
+    Ok((
+        Config {
+            site: SiteConfig {
+                name: site_name,
+                domain: site_domain,
+                redirect_www: raw_site.redirect_www.unwrap_or(true),
+                describedby: raw_site.describedby.unwrap_or_default(),
+            },
+            node,
+            server,
+            log,
+            analytics,
+            stats,
+            health,
+            rate_limit,
+            errors,
+            security,
+            auth,
+            genid,
+            cache_dir,
+            limits,
+            backends,
+            routes,
+            route_groups,
+            site_dir: site_dir.to_path_buf(),
         },
-        node,
-        server,
-        log,
-        analytics,
-        stats,
-        health,
-        rate_limit,
-        errors,
-        security,
-        auth,
-        genid,
-        cache_dir,
-        limits,
-        backends,
-        routes,
-        route_groups,
-        site_dir: site_dir.to_path_buf(),
-    })
+        trace,
+    ))
+}
+
+/// Load the effective config without the source trace.
+pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config> {
+    load_traced(site_dir, system_config_path).map(|(config, _)| config)
+}
+
+impl Config {
+    /// The effective config as JSON, every default included.
+    ///
+    /// The array keys are renamed to the TOML key each one came from, so a
+    /// section path in the record is the path an operator can search the file
+    /// for: `backend.0`, `route.3`, `route_group.0`.
+    pub fn effective_json(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| Value::Object(Map::new()));
+        if let Value::Object(table) = &mut value {
+            for (from, to) in [
+                ("backends", "backend"),
+                ("routes", "route"),
+                ("route_groups", "route_group"),
+            ] {
+                if let Some(field) = table.remove(from) {
+                    table.insert(to.to_string(), field);
+                }
+            }
+        }
+        value
+    }
+
+    /// Every effective setting, split into bounded sections for the record.
+    pub fn startup_sections(&self, trace: &ConfigTrace) -> Vec<Section> {
+        startup::sections_from_value("", &self.effective_json(), trace)
+    }
 }
 
 /// Keys that are this node's own state. They belong in the system config.

@@ -7112,10 +7112,92 @@ fn probe_deadline_error() -> std::io::Error {
     )
 }
 
+/// The flags m6-http parses, as the start-up record declares them.
+const STARTUP_FLAGS: &[m6_core::startup::FlagDecl] = &[
+    m6_core::startup::FlagDecl {
+        name: "--log-level",
+        takes_value: true,
+        setting: Some("log.level"),
+        secret: false,
+    },
+    m6_core::startup::FlagDecl {
+        name: "--dump-config",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+    m6_core::startup::FlagDecl {
+        name: "--version",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+    m6_core::startup::FlagDecl {
+        name: "--version-full",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+];
+
+/// The environment variables m6-http reads that change its behaviour.
+///
+/// A release build does not read the test interval, so it is not declared
+/// there: the record lists what this binary reads, not what a debug build of
+/// it might.
+fn startup_env() -> &'static [m6_core::startup::EnvDecl] {
+    #[cfg(debug_assertions)]
+    const ALL: &[m6_core::startup::EnvDecl] = &[
+        m6_core::startup::EnvDecl {
+            name: "M6_TEST_STATS_INTERVAL_SECS",
+            why: "shortens the stats tick in a test build",
+            setting: Some("stats.interval_s"),
+            secret: false,
+        },
+        m6_core::startup::EnvDecl {
+            name: "XDG_RUNTIME_DIR",
+            why: "the journal socket's directory for a user service",
+            setting: None,
+        },
+        m6_core::startup::EnvDecl {
+            name: "JOURNAL_STREAM",
+            why: "whether stdout is systemd's journal",
+            setting: None,
+        },
+        m6_core::startup::EnvDecl {
+            name: "TMPDIR",
+            why: "the temporary directory for scratch paths",
+            setting: None,
+        },
+    ];
+    #[cfg(not(debug_assertions))]
+    const ALL: &[m6_core::startup::EnvDecl] = &[
+        m6_core::startup::EnvDecl {
+            name: "XDG_RUNTIME_DIR",
+            why: "the journal socket's directory for a user service",
+            setting: None,
+        },
+        m6_core::startup::EnvDecl {
+            name: "JOURNAL_STREAM",
+            why: "whether stdout is systemd's journal",
+            setting: None,
+        },
+        m6_core::startup::EnvDecl {
+            name: "TMPDIR",
+            why: "the temporary directory for scratch paths",
+            setting: None,
+        },
+    ];
+    ALL
+}
+
 fn main() {
     // `--version` and `--version-full` answer from constants fixed at build
     // time, before a config path is required.
     m6_core::version_flags!(m6_core::build_info::linked());
+    // The start-up record's identity line: the binary first, then each m6
+    // crate it links. The record itself is written once logging is up.
+    m6_core::startup_identity!(m6_core::build_info::linked());
 
     // Never hand freed memory back to the OS: the heap grows and does not shrink.
     m6_core::alloc::never_return();
@@ -7166,7 +7248,7 @@ fn run(args: Vec<String>) -> i32 {
     };
 
     // Load config before initialising logging so we can read [log] from site.toml.
-    let config = match config::load(&cli.site_dir, &cli.system_config) {
+    let (config, mut trace) = match config::load_traced(&cli.site_dir, &cli.system_config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -7243,6 +7325,52 @@ fn run(args: Vec<String>) -> i32 {
                 return 1;
             }
         }
+    }
+
+    // The recovery record: one call, after logging is up and after every
+    // start refusal that the config can decide. A redirect process records
+    // itself too, because it is a run an operator has to be able to explain.
+    {
+        let argv = args.clone();
+        let invocation =
+            m6_core::startup::Invocation::read(&argv, STARTUP_FLAGS, startup_env(), &mut trace);
+        trace.set_flag("site_dir", &cli.site_dir.display().to_string());
+        let (own, linked) = m6_core::startup::app_identity();
+        let mut sections = config.startup_sections(&trace);
+        if let Some(log_section) = sections.iter_mut().find(|s| s.path == "log") {
+            log_section.set(
+                "level",
+                m6_core::startup::Setting::new(
+                    level.text().to_ascii_lowercase(),
+                    trace.source("log.level"),
+                ),
+            );
+        }
+        let record = m6_core::startup::Record::new("m6-http", own, linked, argv)
+            .invocation(invocation, trace.clone())
+            .sections(sections)
+            .host(m6_core::startup::HostReport::decided())
+            .limits(m6_core::startup::LimitsReport::read(&config.limits, &trace))
+            .decision("bind", config.server.bind.clone())
+            .decision(
+                "redirect_bind",
+                config
+                    .server
+                    .redirect_bind
+                    .clone()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            )
+            .decision(
+                "h2c_bind",
+                config
+                    .server
+                    .h2c_bind
+                    .clone()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            )
+            .decision("process_index", config.server.process_index.map(u64::from))
+            .decision("lock_memory", config.server.lock_memory);
+        record.emit();
     }
 
     // Redirect mode: this process is the plain-HTTP :80 half of the pair, so

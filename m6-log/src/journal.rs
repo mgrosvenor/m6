@@ -219,6 +219,8 @@ fn kind_of(line: &[u8]) -> Type {
         b"perf" => Type::Perf,
         b"access" => Type::Access,
         b"traffic" => Type::Traffic,
+        b"startup" => Type::Startup,
+        b"shutdown" => Type::Shutdown,
         b"event" => Type::Event,
         _ => Type::Event,
     }
@@ -291,6 +293,8 @@ mod tests {
             ("perf", Type::Perf),
             ("access", Type::Access),
             ("traffic", Type::Traffic),
+            ("startup", Type::Startup),
+            ("shutdown", Type::Shutdown),
         ] {
             let line = format!(
                 "{{\"timestamp\":\"2026-11-17T18:00:00.000000Z\",\"level\":\"INFO\",\"fields\":{{}},\"type\":\"{word}\"}}\n"
