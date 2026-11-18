@@ -660,9 +660,13 @@ mod tests {
     /// fails the way a sandbox's refusal of `/var/tmp` does. The second does
     /// not exist. The third is a writable, executable directory, and it is the
     /// one returned.
+    ///
+    /// The base comes from [`scratch_dir`], the directory the probe has
+    /// already proved executable, so the test holds on a host that mounts
+    /// `/tmp` `noexec`, where the probe correctly refuses a directory under it.
     #[test]
     fn a_scratch_candidate_must_be_writable_not_merely_present() {
-        let base = tempfile::tempdir().expect("tempdir");
+        let base = tempfile::tempdir_in(scratch_dir()).expect("tempdir");
         let not_a_directory = base.path().join("a-file");
         std::fs::write(&not_a_directory, b"").expect("write the file");
         let usable = base.path().join("usable");
