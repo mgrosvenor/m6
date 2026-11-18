@@ -580,34 +580,93 @@ mod spawn {
     use super::*;
     use std::process::{Command, Stdio};
 
-    /// C9. Break: `close_inherited_on_exec` not run (or run after the lock
-    /// was taken). A lock this process holds would then be held by the child
-    /// too, and the second `try_lock` below would fail.
+    /// C9. Break: a child that holds a descriptor above stderr after `exec`, so
+    /// a lock this process holds outlives it.
+    ///
+    /// The child is this binary again, running the ignored helper below, and it
+    /// names the descriptors it holds after `exec`. The parent cannot ask
+    /// itself: `fork` copies the descriptor table before `exec`, so a copy of
+    /// the lock is in the child for the moment between the fork and its `exec`,
+    /// and a `try_lock` from this process in that moment fails whether or not
+    /// the descriptor would survive `exec`. The contract is about the table a
+    /// child starts with, which is the one the child reports.
+    ///
+    /// Rust marks a descriptor it opens close-on-exec itself, so a missing
+    /// sweep is not what this separates. It separates a child that holds the
+    /// lock after `exec` from one that does not.
     #[test]
     fn a_spawned_child_inherits_no_descriptor_above_stderr() {
         let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("lock");
         let held = std::fs::File::create(&path).expect("create");
         held.try_lock().expect("this process takes the lock");
-        // The harness's start-time sweep, here after the lock so it is the
-        // sweep and not Rust's own close-on-exec that the test holds.
+        // The harness's start-time sweep, as a service runs it at start.
         process::close_inherited_on_exec().expect("sweep");
-        let mut child = process::spawn(
-            Command::new("sleep")
-                .arg("30")
+        let exe = std::env::current_exe().expect("current_exe");
+        let child = process::spawn(
+            Command::new(exe)
+                .args([
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "spawn::a_spawned_child_reports_what_it_inherited",
+                ])
+                .env("M6_TEST_INHERITED_LOCK", &path)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null()),
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
         )
         .expect("spawn");
         drop(held);
-        let again = std::fs::File::open(&path).expect("open");
-        let free = again.try_lock().is_ok();
-        child.kill().expect("kill");
-        child.wait().expect("wait");
-        assert!(
-            free,
-            "the child held the lock it should never have inherited"
+        let out = child.wait_with_output().expect("the child's report");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
+        assert!(out.status.success(), "{text}");
+        assert!(
+            text.contains("no descriptor above stderr refers to the lock"),
+            "the child must report the table it holds: {text}"
+        );
+    }
+
+    /// The child half of C9: after `exec`, name every descriptor that is the
+    /// lock file. One is the failure the test is named for.
+    ///
+    /// The inode is the identity both targets agree on. macOS `/dev/fd` is its
+    /// own filesystem and reports a device of its own for an entry there, while
+    /// the inode is the file's, so a device comparison would miss every
+    /// descriptor on macOS.
+    #[test]
+    #[ignore = "run by a_spawned_child_inherits_no_descriptor_above_stderr in its own process"]
+    fn a_spawned_child_reports_what_it_inherited() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::var_os("M6_TEST_INHERITED_LOCK").expect("the lock file");
+        let path = std::path::Path::new(&path);
+        let want = std::fs::metadata(path).expect("stat the lock");
+        let ino = want.ino();
+        let mut held = Vec::new();
+        for entry in std::fs::read_dir("/dev/fd").expect("/dev/fd") {
+            let Ok(entry) = entry else { continue };
+            let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            if fd <= 2 {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() && meta.ino() == ino {
+                held.push(fd);
+            }
+        }
+        assert!(
+            held.is_empty(),
+            "the child held the lock it should never have inherited: {held:?}"
+        );
+        println!("no descriptor above stderr refers to the lock");
     }
 
     /// C10. Break: a harness that puts its servers in another process group,
@@ -825,17 +884,59 @@ mod sockets {
         std::net::TcpStream::connect(addr).expect("reachable");
     }
 
-    /// U8. Break: a stale file refused.
+    /// U8. Break: a stale file refused, or a live listener's file unlinked.
+    ///
+    /// The file is made by another process that binds it and exits, which is
+    /// what leaves a stale socket behind. Binding it here and closing it would
+    /// leave the same file, but `fork` copies this process's descriptor table
+    /// before the child execs, and a fork that caught the listener between its
+    /// `bind` and the `close` here answers `connect`, so the file reads as live
+    /// to the bind below. A process that has exited holds no descriptor at all.
     #[test]
     fn a_stale_socket_file_is_replaced_at_bind() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir_in(platform::socket_scratch_root()).expect("tempdir");
         let path = dir.path().join("nested").join("m6.sock");
-        drop(net::bind_unix(&path, 0o660).expect("first bind creates the parent"));
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "sockets::a_stale_socket_file_is_left_by_a_process_that_is_gone",
+            ])
+            .env("M6_TEST_STALE_SOCKET", &path)
+            .output()
+            .expect("run the process that leaves the socket");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{text}");
         assert!(path.exists(), "the socket file is left behind");
-        drop(net::bind_unix(&path, 0o660).expect("a stale socket is replaced"));
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o660);
+        let stale = std::fs::metadata(&path).expect("stat the stale file");
+        assert!(
+            stale.file_type().is_socket(),
+            "the file a gone process left is a socket"
+        );
+        let (stale_dev, stale_ino) = (stale.dev(), stale.ino());
+
+        let replaced = net::bind_unix(&path, 0o660).expect("a stale socket is replaced");
+        let fresh = std::fs::metadata(&path).expect("stat the socket just bound");
+        assert!(
+            (fresh.dev(), fresh.ino()) != (stale_dev, stale_ino),
+            "the stale socket file is replaced, not reused"
+        );
+        assert_eq!(fresh.permissions().mode() & 0o777, 0o660);
+        drop(replaced);
+    }
+
+    /// The process half of U8: bind the socket, create its parent, and exit,
+    /// which is the state a killed service leaves.
+    #[test]
+    #[ignore = "run by a_stale_socket_file_is_replaced_at_bind in a process that then exits"]
+    fn a_stale_socket_file_is_left_by_a_process_that_is_gone() {
+        let path = std::env::var_os("M6_TEST_STALE_SOCKET").expect("the socket path");
+        let path = std::path::Path::new(&path);
+        drop(net::bind_unix(path, 0o660).expect("first bind creates the parent"));
+        println!("left {}", path.display());
     }
 
     /// U10. Break: `bind_unix` unlinking whatever is at the path, so a second
