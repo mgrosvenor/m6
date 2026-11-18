@@ -19,9 +19,11 @@
 //! instead. m6 refuses it, because a refused line is visible in the dropped
 //! count and a second transport is not.
 //!
-//! A send that fails leaves the line to stdout, which under systemd is the
-//! same journal. The Sink switches to stdout for the rest of the process, so
-//! no line is dropped and none is sent twice.
+//! A send that would block keeps the line buffered, and the next flush sends
+//! it again. A send that fails for any other reason, such as a socket that is
+//! gone, leaves the line to stdout, which under systemd is the same journal.
+//! The Sink then switches to stdout for the rest of the process, so no line is
+//! dropped and none is sent twice.
 
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -52,7 +54,11 @@ pub(crate) enum Outcome {
     /// The datagram needed `needed` bytes, over [`DATAGRAM_MAX`]. The line is
     /// refused.
     Refused { needed: usize },
-    /// The send failed. The line goes to stdout.
+    /// The journal's queue is full. The line stays buffered for the next
+    /// flush, as a line on a full stdout does.
+    Full,
+    /// The send failed for good: the socket is gone or refuses. The line goes
+    /// to stdout.
     Failed,
 }
 
@@ -64,6 +70,16 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
+    /// A journal on an already connected, non-blocking socket, for a test.
+    #[cfg(test)]
+    pub(crate) fn on(socket: UnixDatagram) -> Journal {
+        Journal {
+            socket,
+            identifier: "m6-test".to_string(),
+            datagram: Vec::with_capacity(DATAGRAM_MAX),
+        }
+    }
+
     /// The open journal socket, or `None` when this process does not write to
     /// the journal.
     ///
@@ -86,8 +102,8 @@ impl Journal {
             }
         };
         // The loop must never wait on a full socket, the same rule stdout
-        // follows. A send that would block is a failed send, and the line
-        // goes to stdout.
+        // follows. A send that would block keeps the line buffered for the
+        // next flush.
         if let Err(error) = socket.set_nonblocking(true) {
             eprintln!(
                 "m6-log: the journal socket at {} could not be made non-blocking: {error}; writing to stdout",
@@ -122,6 +138,7 @@ impl Journal {
         }
         match self.socket.send(&self.datagram) {
             Ok(sent) if sent == self.datagram.len() => Outcome::Sent,
+            Err(error) if m6_platform::fd::send_would_retry(&error) => Outcome::Full,
             _ => Outcome::Failed,
         }
     }

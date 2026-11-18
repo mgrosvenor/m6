@@ -61,3 +61,16 @@ pub fn dup2_stdout(fd: &impl AsFd) -> io::Result<()> {
 pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(nix::unistd::pipe()?)
 }
+
+/// Whether a failed send on a non-blocking socket is a full receiver that
+/// will drain, so the same bytes may be sent again later.
+///
+/// `EAGAIN` and `EINTR` on every system, and `ENOBUFS`, which is what macOS
+/// returns for a unix datagram socket whose receiver's queue is full where
+/// Linux returns `EAGAIN`.
+pub fn send_would_retry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(nix::errno::Errno::ENOBUFS as i32)
+}

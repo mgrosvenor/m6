@@ -537,10 +537,13 @@ impl Sink {
 
     /// One pass over the complete lines as journal datagrams.
     ///
-    /// Answers true when every complete line left the buffer. Answers false
-    /// when a send failed, after switching the sink to stdout: the lines that
-    /// were not sent are still buffered, and the caller writes them to stdout
-    /// as bytes.
+    /// Answers true when the journal handled the pass: every complete line
+    /// left the buffer, or the journal's queue was full and the rest stay
+    /// buffered for the next flush. The socket is not watched for
+    /// writability, so the loop's next flush or a later line retries. Answers
+    /// false when a send failed for good, after switching the sink to stdout:
+    /// the lines that were not sent are still buffered, and the caller writes
+    /// them to stdout as bytes.
     fn write_journal(&mut self) -> bool {
         let mut sent = 0;
         let mut lost = 0u64;
@@ -567,6 +570,7 @@ impl Sink {
                     refused = needed;
                     sent = end;
                 }
+                Outcome::Full => break,
                 Outcome::Failed => {
                     // The same bytes go to stdout, which under systemd is the
                     // same journal. Nothing is dropped and nothing is sent
@@ -660,5 +664,68 @@ impl Sink {
         self.buf.copy_within(self.commit..self.len, 0);
         self.len -= self.commit;
         self.commit = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::line::{Level, Line};
+    use std::os::unix::net::UnixDatagram;
+
+    /// A file sink with a journal on one end of a datagram pair, the other
+    /// end returned for the test to read, and the file's path.
+    fn journal_sink(dir: &Path) -> (Sink, UnixDatagram, std::path::PathBuf) {
+        let (sender, receiver) = UnixDatagram::pair().expect("a datagram pair");
+        sender.set_nonblocking(true).expect("non-blocking");
+        receiver.set_nonblocking(true).expect("non-blocking");
+        let path = dir.join("stdout.log");
+        let sink = Sink::file(&path)
+            .expect("the file sink")
+            .with_journal(Journal::on(sender));
+        (sink, receiver, path)
+    }
+
+    /// Every datagram waiting on `receiver`.
+    fn drain(receiver: &UnixDatagram) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; DATAGRAM_MAX];
+        while let Ok(n) = receiver.recv(&mut buf) {
+            out.push(buf[..n].to_vec());
+        }
+        out
+    }
+
+    /// A full journal queue is a wait, never a failure. The sink once
+    /// treated the first `EAGAIN` as a failed send and wrote to stdout for
+    /// the rest of the process.
+    #[test]
+    fn a_full_journal_keeps_the_lines_and_the_journal() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let (mut sink, receiver, path) = journal_sink(dir.path());
+        let lines = 3000;
+        for i in 0..lines {
+            Line::begin(&mut sink, Level::Info, "a line")
+                .str("n", &i.to_string())
+                .end();
+            sink.flush();
+        }
+        assert!(
+            sink.commit > 0,
+            "the test never filled the journal's queue, so it measured nothing"
+        );
+        assert!(
+            sink.journal.is_some(),
+            "a full queue switched the sink to stdout"
+        );
+        let mut received = drain(&receiver).len();
+        while sink.commit > 0 {
+            sink.flush();
+            received += drain(&receiver).len();
+        }
+        assert_eq!(received, lines, "every line reached the journal once");
+        assert_eq!(sink.dropped(), 0);
+        let file = std::fs::read(&path).expect("the stdout file");
+        assert!(file.is_empty(), "{} bytes went to stdout", file.len());
     }
 }
