@@ -403,6 +403,7 @@ m6_core::version_flags!(m6_core::build_info::linked());
 ```
 
 `Record::new(app, argv)` starts the record with the identity `version_flags!` registered, the host from `HostReport::decided`, and the default limits.
+`Record::node_name(name)` states the application's configured node name on every line, which is `[node] name` for m6-http, so two instances on one host stay two nodes.
 The record takes the effective config as sections and a `ConfigTrace` that labels each setting `file`, `default`, `env` or `flag`.
 `ConfigTrace::add_config_file` records a file's path, its role and its sha256 as read.
 `Invocation::read` reads the declared flags and environment variables and records the settings they replaced.
@@ -410,7 +411,8 @@ The record takes the effective config as sections and a `ConfigTrace` that label
 `record_log_level` writes the level the process runs at into the `log` section, because `site.toml` and `--log-level` come after the config file.
 `HostReport::decided` is the platform line's host block, from `m6_core::platform::host_facts()`.
 The tagged shape is kept: a fact is `{"known": value}` or `{"unknown": reason}`, so an unknown fact is never an absent key.
-The record reads the same facts' `hostname` once, when the report is built, and writes it as `node` on every start-up line and on the shutdown line.
+The record writes one `node` on every start-up line and on the shutdown line, fixed once when the record is built.
+It is the application's configured node name when `Record::node_name` was given one, and the same facts' `hostname` otherwise, and `node_source` says `configured`, `hostname` or `none` so a reader can tell a claimed identity from an inferred one.
 A host that did not name itself writes an empty `node` and the reason in `node_unknown`, so the key is present and the run is not mistaken for one written before the field existed.
 
 A value the secrets file supplied is `<redacted>`.

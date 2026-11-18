@@ -30,14 +30,19 @@
 //!
 //! # The node
 //!
-//! Every line carries `node`, the machine the run happened on. It is read once,
-//! from the host facts' `hostname`, when the record's [`HostReport`] is built,
-//! and every line of the run writes that one value: a host renamed while the
-//! run is in progress cannot make the run's lines disagree. The shutdown line
-//! carries the same value.
+//! Every line carries `node`, the node the run happened on. It is fixed once,
+//! when the record is built, and every line of the run writes that one value: a
+//! host renamed while the run is in progress cannot make the run's lines
+//! disagree. The shutdown line carries the same value.
 //!
-//! A host that did not name itself writes `node` as the empty string and the
-//! reason in `node_unknown`. Both keys are present, because an empty value
+//! The name is the application's configured node name when it has one, which
+//! [`Record::node_name`] states, and the host facts' `hostname` otherwise. Two
+//! instances on one host that name themselves differently are two nodes, which
+//! is the case a hostname alone merges. [`Node::source`] says `configured` or
+//! `hostname`, so a reader can tell a claimed identity from an inferred one.
+//!
+//! A host that did not name itself either writes `node` as the empty string and
+//! the reason in `node_unknown`. Both keys are present, because an empty value
 //! cannot be mistaken for a real node and a missing key would look like a
 //! record written before this field existed.
 //!
@@ -680,25 +685,67 @@ fn inline_value<'a>(arg: &'a str, name: &str) -> Option<&'a str> {
 
 // ── The node ────────────────────────────────────────────────────────────────
 
+/// Where a run's [`Node`] came from.
+///
+/// The distinction is the point of the field: a configured name is the identity
+/// the deployment claimed, and a hostname is one this process read off the
+/// machine. Two instances on one host give the same hostname and different
+/// configured names, so a reader that sees `hostname` knows the key rests on the
+/// machine rather than on a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeSource {
+    /// The application's own configuration named the node.
+    Configured,
+    /// The application's configuration names no node, so the platform facts'
+    /// `hostname` is the name.
+    Hostname,
+    /// No name at all: the host did not name itself either.
+    None,
+}
+
+impl NodeSource {
+    /// The word the record writes as `node_source`.
+    pub fn text(self) -> &'static str {
+        match self {
+            NodeSource::Configured => "configured",
+            NodeSource::Hostname => "hostname",
+            NodeSource::None => "none",
+        }
+    }
+}
+
 /// The machine a run happened on: the `node` every line of the record states.
 ///
-/// It is read once, from the host facts' `hostname`, when the [`HostReport`] is
-/// built, and every line of one run writes the same value. A host that did not
-/// name itself has an empty [`Node::name`] and a [`Node::reason`]: an empty
-/// value cannot be mistaken for a real node, and the key is still present so a
-/// reader can tell it from a record written before the field existed.
+/// It is read once, when the [`HostReport`] is built, and every line of one run
+/// writes the same value. The application's configured node name is used when
+/// it has one ([`Record::node_name`]), and the host facts' `hostname` otherwise.
+/// A host that did not name itself has an empty [`Node::name`] and a
+/// [`Node::reason`]: an empty value cannot be mistaken for a real node, and the
+/// key is still present so a reader can tell it from a record written before the
+/// field existed. [`Node::source`] says which of the three a reader is holding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     name: String,
     reason: Option<String>,
+    source: NodeSource,
 }
 
 impl Node {
-    /// The node the host named.
+    /// A node the application's configuration named.
     pub fn named(name: impl Into<String>) -> Node {
         Node {
             name: name.into(),
             reason: None,
+            source: NodeSource::Configured,
+        }
+    }
+
+    /// A node named from the platform facts' hostname.
+    pub fn host(name: impl Into<String>) -> Node {
+        Node {
+            name: name.into(),
+            reason: None,
+            source: NodeSource::Hostname,
         }
     }
 
@@ -707,6 +754,7 @@ impl Node {
         Node {
             name: String::new(),
             reason: Some(reason.into()),
+            source: NodeSource::None,
         }
     }
 
@@ -718,7 +766,7 @@ impl Node {
                 return if name.is_empty() {
                     Node::unknown("the host reported an empty hostname")
                 } else {
-                    Node::named(name)
+                    Node::host(name)
                 };
             }
             if let Some(reason) = hostname.get("unknown").and_then(Value::as_str) {
@@ -740,6 +788,16 @@ impl Node {
     /// Why the node is unnamed, or `None` when it is named.
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
+    }
+
+    /// Where this name came from: the application's config or the hostname.
+    pub fn source(&self) -> NodeSource {
+        self.source
+    }
+
+    /// The word the record writes as `node_source`.
+    pub fn source_text(&self) -> &'static str {
+        self.source.text()
     }
 }
 
@@ -792,6 +850,16 @@ impl HostReport {
             serde_json::to_value(crate::platform::host_facts())
                 .unwrap_or_else(|_| json!({"unknown": "host facts did not serialise"})),
         )
+    }
+
+    /// Replace the node the facts would name with the application's own.
+    ///
+    /// The facts stay exactly as the platform read them, so the platform line
+    /// still reports the machine's hostname. Only the identity every line
+    /// states changes, and its [`NodeSource`] says the application chose it.
+    fn with_node(mut self, node: Node) -> HostReport {
+        self.node = node;
+        self
     }
 }
 
@@ -891,10 +959,25 @@ impl Record {
         &self.app
     }
 
-    /// The node every line of this record states, read once from the host
-    /// facts when the record's [`HostReport`] was attached.
+    /// The node every line of this record states, fixed when the record was
+    /// built from the host facts, or when [`Record::node_name`] replaced it.
     pub fn node(&self) -> &Node {
         self.host.node()
+    }
+
+    /// State the application's configured node name on every line.
+    ///
+    /// An application whose config names its node passes that name, so two
+    /// instances on one host stay two nodes. The host facts still report the
+    /// machine's hostname, and the `node_source` key says the name was
+    /// configured rather than read from the host. An empty name, or no call at
+    /// all, leaves the hostname in place, marked `hostname`.
+    pub fn node_name(mut self, name: impl Into<String>) -> Record {
+        let name = name.into();
+        if !name.is_empty() {
+            self.host = self.host.with_node(Node::named(name));
+        }
+        self
     }
 
     /// Use an explicit run id, for a reader or a test.
@@ -1066,6 +1149,7 @@ impl Record {
             .str("app", &self.app)
             .str("version", &self.own.full())
             .str("node", node.name())
+            .str("node_source", node.source_text())
             .opt_str("node_unknown", node.reason())
     }
 
@@ -1131,6 +1215,7 @@ pub fn write_shutdown_into(
         .str("app", app)
         .str("version", version)
         .str("node", node.name())
+        .str("node_source", node.source_text())
         .opt_str("node_unknown", node.reason())
         .u64("uptime_ms", uptime_ms)
         .str("reason", reason)

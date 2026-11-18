@@ -7322,6 +7322,7 @@ fn run(args: Vec<String>) -> i32 {
         let mut sections = config.startup_sections(&trace);
         m6_core::startup::record_log_level(&mut sections, level, &trace);
         let record = m6_core::startup::Record::new("m6-http", argv)
+            .node_name(config.node.name.clone())
             .invocation(invocation, trace.clone())
             .sections(sections)
             .limits(m6_core::startup::LimitsReport::read(&config.limits, &trace))

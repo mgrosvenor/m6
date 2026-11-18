@@ -68,6 +68,8 @@ A start-up record's node is read from the record, never from `_HOSTNAME`.
 The record's own `node` field is used when a line carries one.
 Every line a record written by this release emits carries it, so the platform-line fallback is for records already in the journal.
 Otherwise the node is the hostname on the record's own platform line, which is the machine it runs on.
+That field is the app's configured node name when its config has one, and the platform facts' hostname otherwise, and the record's `node_source` says which.
+Two instances on one host that name themselves differently are therefore two nodes here, which is the case the hostname alone would merge.
 The app is the record's own `app` field.
 The key the report shows is the node and the app, and the deploy's expectation file uses the same key (section 5.1).
 A record that reports no hostname is attributed to its app alone, and the check warns that a second host running the same app would then be merged with it.

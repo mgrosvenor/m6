@@ -313,18 +313,22 @@ A line is self-contained, so a reader that filters one `part` still knows which 
 | `part` | one of Table 7's words |
 | `app` | the application's name, the same string as the `-` line of `--version-full` |
 | `version` | the full SemVer string, build metadata included |
-| `node` | the machine the run is on: the platform facts' `hostname`, read once at start. The empty string when the host did not name itself |
-| `node_unknown` | present only when `node` is empty: the reason the host did not name itself |
+| `node` | the node the run is on: the app's configured node name when it has one, and the platform facts' `hostname` otherwise, read once at start. The empty string when neither names one |
+| `node_source` | `configured` when the app's config named the node, `hostname` when the platform facts did, and `none` when neither did |
+| `node_unknown` | present only when `node` is empty: the reason no name was available |
 | `message` | a fixed phrase such as `startup record: identity` |
 | `type` | `startup`, written last |
 
 **Table 8: the keys every start-up line carries.**
 
-The node is read once, when the platform line's host facts are read, and every line of the run writes that one value.
+The node is read once at start, and every line of the run writes that one value.
 A host renamed while the run is in progress therefore cannot make the run's lines disagree.
-A host that did not name itself writes an empty `node` and the reason in `node_unknown`.
-Both keys are present, so a reader can tell an unnamed host from a record written before the field existed.
-The value is the platform facts' `hostname`, so two services on one host report one node.
+The app's configured node name is the node when the app has one, which is `[node] name` in m6-http's system config, and the platform facts' `hostname` is the fallback.
+`node_source` says which of the two a reader is holding, so a claimed identity is never mistaken for an inferred one.
+Two instances on one host that name themselves differently are two nodes, because each states its own name.
+Two that name themselves not at all share the hostname, and their `node_source` says `hostname` rather than `configured`.
+A host that did not name itself either writes an empty `node` and the reason in `node_unknown`.
+The keys are present, so a reader can tell an unnamed host from a record written before the field existed.
 
 The run id is set once at start.
 A reader groups the lines of one run with one filter:

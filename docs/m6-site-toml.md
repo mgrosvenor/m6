@@ -756,7 +756,7 @@ Take from it that the name is required, and that it comes from the config of one
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line and the analytics record. System config only |
+| `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line, the analytics record and the start-up record's `node`, where `node_source` says `configured`. System config only |
 
 **Table 17: the `[node]` key.**
 

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use m6_core::startup::{
     self, ConfigRole, ConfigTrace, EnvDecl, FlagDecl, HostReport, Invocation, LimitsReport, Node,
-    Record, RunId, Setting, Source,
+    NodeSource, Record, RunId, Setting, Source,
 };
 use m6_core::Secret;
 use serde_json::Value;
@@ -577,12 +577,17 @@ fn every_part_of_a_record_states_the_one_node_read_from_the_platform_facts() {
             hostname,
             "every part carries the platform facts' hostname: {line}"
         );
+        assert_eq!(
+            field(line, "node_source"),
+            "hostname",
+            "the application named no node, so the source says the host did: {line}"
+        );
         assert!(
             line["fields"].get("node_unknown").is_none(),
             "a named node carries no reason: {line}"
         );
     }
-    assert_eq!(record.node(), &Node::named("origin"));
+    assert_eq!(record.node(), &Node::host("origin"));
 
     // The shutdown line carries the same node the start-up lines did. The
     // process's own shutdown reads it from the run's identity, which is fixed
@@ -608,6 +613,7 @@ fn every_part_of_a_record_states_the_one_node_read_from_the_platform_facts() {
         "the shutdown line carries the node the start-up lines carried"
     );
     assert_eq!(field(&shutdown, "node"), "origin");
+    assert_eq!(field(&shutdown, "node_source"), "hostname");
 }
 
 /// A host that did not name itself still writes the key, with an empty value
@@ -657,6 +663,10 @@ fn a_host_the_platform_could_not_name_still_writes_the_node_key() {
                 fields["node_unknown"], reason,
                 "the line says why the node is unnamed: {text}"
             );
+            assert_eq!(
+                fields["node_source"], "none",
+                "an unnamed node has no source: {text}"
+            );
         }
         let path = dir.path().join(format!("shutdown-{index}.jsonl"));
         let mut sink = m6_core::log::Sink::file(&path).unwrap();
@@ -674,6 +684,7 @@ fn a_host_the_platform_could_not_name_still_writes_the_node_key() {
             serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
         assert_eq!(field(&shutdown, "node"), "");
         assert_eq!(field(&shutdown, "node_unknown"), reason);
+        assert_eq!(field(&shutdown, "node_source"), "none");
     }
 }
 
@@ -683,6 +694,87 @@ fn host_facts_with_hostname(hostname: Value) -> HostReport {
         "hostname": hostname,
         "kernel": {"known": {"release": "6.11.0-1", "version": "#1"}},
     }))
+}
+
+/// The application's configured node name is the node every line states, and
+/// the hostname is only the fallback, marked as such. Two services on one host
+/// that name themselves differently therefore stay two nodes, which is exactly
+/// the case a hostname alone merges.
+#[test]
+fn two_services_on_one_host_report_two_configured_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, config, trace) = fixture(dir.path(), CONFIG);
+    let mut reported = Vec::new();
+    for name in ["edge-a", "edge-b"] {
+        let record = record_from(
+            "m6-service",
+            dir.path(),
+            &config,
+            &trace,
+            &["m6-service".to_string()],
+            &[],
+            &[],
+        )
+        .host(host_named("one-host"))
+        .node_name(name);
+        assert_eq!(record.node(), &Node::named(name));
+        assert_eq!(
+            record.node().source(),
+            NodeSource::Configured,
+            "a configured name is marked configured"
+        );
+
+        let (lines, text) = write(&record);
+        for line in &lines {
+            assert_eq!(
+                field(line, "node"),
+                name,
+                "every part states the configured name: {text}"
+            );
+            assert_eq!(
+                field(line, "node_source"),
+                "configured",
+                "the source says the application named it: {text}"
+            );
+            assert!(
+                line["fields"].get("node_unknown").is_none(),
+                "a configured node carries no reason: {text}"
+            );
+        }
+
+        // The platform line still reports the one machine both services run
+        // on. Only the identity differs, which is what keeps them apart.
+        let platform = lines.iter().find(|l| part(l) == "platform").unwrap();
+        assert_eq!(
+            field(platform, "host")["hostname"]["known"],
+            "one-host",
+            "the host facts are the machine's: {text}"
+        );
+
+        let path = dir.path().join(format!("shutdown-{name}.jsonl"));
+        let mut sink = m6_core::log::Sink::file(&path).unwrap();
+        startup::write_shutdown_into(
+            &mut sink,
+            record.run_id(),
+            record.app(),
+            &m6_core::build_info::identity().full(),
+            record.node(),
+            32,
+            "signal",
+        );
+        sink.finish().unwrap();
+        let shutdown: Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(field(&shutdown, "node"), name, "the shutdown line agrees");
+        assert_eq!(field(&shutdown, "node_source"), "configured");
+
+        reported.push(field(&lines[0], "node").as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        reported,
+        vec!["edge-a".to_string(), "edge-b".to_string()],
+        "one host, two nodes"
+    );
 }
 
 #[test]
