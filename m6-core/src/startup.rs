@@ -79,7 +79,7 @@ pub const REDACTED: &str = "<redacted>";
 // ── The application's identity ──────────────────────────────────────────────
 
 /// The identity of the binary that is running, registered by
-/// [`startup_identity!`] beside the version call.
+/// `startup_identity!` beside the version call.
 ///
 /// m6-core cannot know the application's own package name and version, and the
 /// record needs it: the first identity line is the binary, then each m6 crate
@@ -90,7 +90,7 @@ static APP_IDENTITY: OnceLock<(BuildIdentity, Vec<BuildIdentity>)> = OnceLock::n
 
 /// Register the running binary's identity and the m6 crates it links.
 ///
-/// Called by [`startup_identity!`], which expands the binary's own build
+/// Called by `startup_identity!`, which expands the binary's own build
 /// constants at the call site.
 pub fn set_app_identity(own: BuildIdentity, linked: Vec<BuildIdentity>) {
     let _ = APP_IDENTITY.set((own, linked));
