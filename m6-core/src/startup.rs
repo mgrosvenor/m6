@@ -1270,7 +1270,7 @@ pub fn sections_from_value(prefix: &str, value: &Value, trace: &ConfigTrace) -> 
 
 /// Split a TOML value into sections.
 pub fn sections_from_toml(prefix: &str, value: &toml::Value, trace: &ConfigTrace) -> Vec<Section> {
-    let as_json = toml_to_json(value);
+    let as_json = crate::config::toml_to_json(value);
     sections_from_value(prefix, &as_json, trace)
 }
 
@@ -1345,26 +1345,6 @@ pub fn names_a_secret(key: &str) -> bool {
         return false;
     }
     SECRET_WORDS.iter().any(|word| key.contains(word)) || key.contains("privatekey")
-}
-
-/// Convert a TOML value to the JSON value a record carries.
-pub fn toml_to_json(value: &toml::Value) -> Value {
-    match value {
-        toml::Value::String(s) => Value::String(s.clone()),
-        toml::Value::Integer(i) => Value::Number((*i).into()),
-        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        toml::Value::Boolean(b) => Value::Bool(*b),
-        toml::Value::Datetime(d) => Value::String(d.to_string()),
-        toml::Value::Array(items) => Value::Array(items.iter().map(toml_to_json).collect()),
-        toml::Value::Table(table) => Value::Object(
-            table
-                .iter()
-                .map(|(key, child)| (key.clone(), toml_to_json(child)))
-                .collect(),
-        ),
-    }
 }
 
 // ── Paths ───────────────────────────────────────────────────────────────────
