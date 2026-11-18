@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use m6_core::startup::{
-    self, ConfigRole, ConfigTrace, EnvDecl, FlagDecl, HostReport, Invocation, LimitsReport, Record,
-    RunId, Setting, Source,
+    self, ConfigRole, ConfigTrace, EnvDecl, FlagDecl, HostReport, Invocation, LimitsReport, Node,
+    Record, RunId, Setting, Source,
 };
 use m6_core::Secret;
 use serde_json::Value;
@@ -520,6 +520,7 @@ fn a_shutdown_line_shares_the_run_id_and_carries_uptime_and_reason() {
         run,
         "m6-service",
         "1.16.0-rc.1+abc",
+        &Node::named("origin"),
         1_234,
         "signal",
     );
@@ -530,8 +531,167 @@ fn a_shutdown_line_shares_the_run_id_and_carries_uptime_and_reason() {
     assert_eq!(field(&line, "run_id"), "1700000000000-42");
     assert_eq!(field(&line, "app"), "m6-service");
     assert_eq!(field(&line, "version"), "1.16.0-rc.1+abc");
+    assert_eq!(field(&line, "node"), "origin");
     assert_eq!(field(&line, "uptime_ms"), 1_234);
     assert_eq!(field(&line, "reason"), "signal");
+}
+
+/// A host report whose platform facts name `name`.
+fn host_named(name: &str) -> HostReport {
+    HostReport::new(serde_json::json!({
+        "hostname": {"known": name},
+        "kernel": {"known": {"release": "6.11.0-1", "version": "#1"}},
+    }))
+}
+
+/// The record's node is read once from the platform facts' hostname, and every
+/// part, the shutdown line included, states that same value.
+#[test]
+fn every_part_of_a_record_states_the_one_node_read_from_the_platform_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, config, trace) = fixture(dir.path(), CONFIG);
+    let record = record_from(
+        "m6-service",
+        dir.path(),
+        &config,
+        &trace,
+        &["m6-service".to_string()],
+        &[],
+        &[],
+    )
+    .host(host_named("origin"));
+
+    let (lines, _) = write(&record);
+
+    let platform = lines.iter().find(|l| part(l) == "platform").unwrap();
+    let hostname = field(platform, "host")["hostname"]["known"]
+        .as_str()
+        .expect("the platform line names the host");
+    assert_eq!(hostname, "origin");
+    let parts: std::collections::BTreeSet<&str> = lines.iter().map(part).collect();
+    let expected: std::collections::BTreeSet<&str> = [
+        "identity",
+        "invocation",
+        "config_file",
+        "config_section",
+        "platform",
+        "complete",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(parts, expected, "every part is held");
+    for line in &lines {
+        assert_eq!(
+            field(line, "node"),
+            hostname,
+            "every part carries the platform facts' hostname: {line}"
+        );
+        assert!(
+            line["fields"].get("node_unknown").is_none(),
+            "a named node carries no reason: {line}"
+        );
+    }
+    assert_eq!(record.node(), &Node::named("origin"));
+
+    // The shutdown line carries the same node the start-up lines did. The
+    // process's own shutdown reads it from the run's identity, which is fixed
+    // by the record's first write.
+    let path = dir.path().join("shutdown.jsonl");
+    let mut sink = m6_core::log::Sink::file(&path).unwrap();
+    startup::write_shutdown_into(
+        &mut sink,
+        record.run_id(),
+        record.app(),
+        &m6_core::build_info::identity().full(),
+        record.node(),
+        32,
+        "signal",
+    );
+    sink.finish().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let shutdown: Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(field(&shutdown, "type"), "shutdown");
+    assert_eq!(
+        field(&shutdown, "node"),
+        field(&lines[0], "node"),
+        "the shutdown line carries the node the start-up lines carried"
+    );
+    assert_eq!(field(&shutdown, "node"), "origin");
+}
+
+/// A host that did not name itself still writes the key, with an empty value
+/// and the reason, so a reader can tell it from a record written before the
+/// field existed.
+#[test]
+fn a_host_the_platform_could_not_name_still_writes_the_node_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, config, trace) = fixture(dir.path(), CONFIG);
+
+    // The complete facts with one unknown fact, which is what a real host that
+    // hides its name produces, and the facts themselves unknown.
+    let records = [
+        (
+            host_facts_with_hostname(serde_json::json!({"unknown": "cannot read the host name"})),
+            "cannot read the host name",
+        ),
+        (
+            HostReport::unknown("a test host knows nothing"),
+            "a test host knows nothing",
+        ),
+    ];
+    for (index, (host, reason)) in records.into_iter().enumerate() {
+        let record = record_from(
+            "m6-service",
+            dir.path(),
+            &config,
+            &trace,
+            &["m6-service".to_string()],
+            &[],
+            &[],
+        )
+        .host(host);
+        let (lines, text) = write(&record);
+        assert_eq!(record.node(), &Node::unknown(reason));
+        for line in &lines {
+            let fields = line["fields"].as_object().expect("a line has fields");
+            assert!(
+                fields.contains_key("node"),
+                "the node key is present even when the host is unnamed: {text}"
+            );
+            assert_eq!(
+                fields["node"], "",
+                "an unnamed node is the empty string, not a name: {text}"
+            );
+            assert_eq!(
+                fields["node_unknown"], reason,
+                "the line says why the node is unnamed: {text}"
+            );
+        }
+        let path = dir.path().join(format!("shutdown-{index}.jsonl"));
+        let mut sink = m6_core::log::Sink::file(&path).unwrap();
+        startup::write_shutdown_into(
+            &mut sink,
+            record.run_id(),
+            record.app(),
+            &m6_core::build_info::identity().full(),
+            record.node(),
+            32,
+            "signal",
+        );
+        sink.finish().unwrap();
+        let shutdown: Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(field(&shutdown, "node"), "");
+        assert_eq!(field(&shutdown, "node_unknown"), reason);
+    }
+}
+
+/// A complete host-facts value whose only interesting fact is `hostname`.
+fn host_facts_with_hostname(hostname: Value) -> HostReport {
+    HostReport::new(serde_json::json!({
+        "hostname": hostname,
+        "kernel": {"known": {"release": "6.11.0-1", "version": "#1"}},
+    }))
 }
 
 #[test]

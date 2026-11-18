@@ -1107,4 +1107,37 @@ mod tests {
             "the shutdown attaches to the same run"
         );
     }
+
+    /// The record's own `node` field names the node when a line carries one.
+    /// The platform line's hostname is the fallback for a record written
+    /// before the field existed, and is kept for the peer comparison.
+    #[test]
+    fn a_node_field_the_record_carries_wins_over_the_platform_hostname() {
+        let mut latest = Latest::new();
+        let run_id = format!("{}-82", latest.startup.started_ms() + 1_000);
+        let mut identity = startup(&run_id, 1, "identity");
+        identity["fields"]["node"] = serde_json::json!("edge-a");
+        latest.ingest(&line(identity));
+        let mut platform = startup(&run_id, 2, "platform");
+        platform["fields"]["node"] = serde_json::json!("edge-a");
+        platform["fields"]["host"] = serde_json::json!({"hostname": {"known": "host-1"}});
+        platform["fields"]["decided"] = serde_json::json!({});
+        latest.ingest(&line(platform));
+        let mut complete = startup(&run_id, 3, "complete");
+        complete["fields"]["node"] = serde_json::json!("edge-a");
+        complete["fields"]["lines"] = serde_json::json!(3);
+        latest.ingest(&line(complete));
+
+        let views = latest.startup.views(m6_core::platform::now());
+        assert_eq!(views.len(), 1, "one record, one run id");
+        assert_eq!(
+            views[0].node, "edge-a",
+            "the record's own node field wins over the platform hostname"
+        );
+        assert_eq!(
+            views[0].hostname.as_deref(),
+            Some("host-1"),
+            "the platform line's hostname is still kept for the peer comparison"
+        );
+    }
 }

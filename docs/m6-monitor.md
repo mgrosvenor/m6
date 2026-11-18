@@ -66,6 +66,7 @@ The same `ingest` call hands a `startup` or `shutdown` line to `journal::Startup
 
 A start-up record's node is read from the record, never from `_HOSTNAME`.
 The record's own `node` field is used when a line carries one.
+Every line a record written by this release emits carries it, so the platform-line fallback is for records already in the journal.
 Otherwise the node is the hostname on the record's own platform line, which is the machine it runs on.
 The app is the record's own `app` field.
 The key the report shows is the node and the app, and the deploy's expectation file uses the same key (section 5.1).

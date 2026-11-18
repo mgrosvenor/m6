@@ -409,6 +409,8 @@ The record takes the effective config as sections and a `ConfigTrace` that label
 `LimitsReport::read` records every named limit's start, max and source.
 `HostReport::decided` is the platform line's host block, from `m6_core::platform::host_facts()`.
 The tagged shape is kept: a fact is `{"known": value}` or `{"unknown": reason}`, so an unknown fact is never an absent key.
+The record reads the same facts' `hostname` once, when the report is built, and writes it as `node` on every start-up line and on the shutdown line.
+A host that did not name itself writes an empty `node` and the reason in `node_unknown`, so the key is present and the run is not mistaken for one written before the field existed.
 
 A value the secrets file supplied is `<redacted>`.
 A field declared `Secret<T>` is `<redacted>` wherever it appears.

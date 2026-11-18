@@ -1,8 +1,8 @@
 //! The start-up and shutdown recovery record.
 //!
 //! **The record is several `type=startup` lines, not one.** Each line is
-//! self-contained, carries the same `run_id`, the application name and its full
-//! version, and a `part` that says what it holds. A reader filters
+//! self-contained, carries the same `run_id`, the node, the application name
+//! and its full version, and a `part` that says what it holds. A reader filters
 //! `type=startup` (or `journalctl M6_TYPE=startup`) and groups by `run_id`. The
 //! last line is `part=complete` and carries `lines`, the number of startup
 //! lines in the record including itself, so a reader that counts the lines it
@@ -27,6 +27,19 @@
 //!
 //! A clean exit writes one `type=shutdown` line with the same `run_id`, the
 //! uptime and the reason.
+//!
+//! # The node
+//!
+//! Every line carries `node`, the machine the run happened on. It is read once,
+//! from the host facts' `hostname`, when the record's [`HostReport`] is built,
+//! and every line of the run writes that one value: a host renamed while the
+//! run is in progress cannot make the run's lines disagree. The shutdown line
+//! carries the same value.
+//!
+//! A host that did not name itself writes `node` as the empty string and the
+//! reason in `node_unknown`. Both keys are present, because an empty value
+//! cannot be mistaken for a real node and a missing key would look like a
+//! record written before this field existed.
 //!
 //! # Redaction is by type, not by name
 //!
@@ -175,6 +188,7 @@ struct ShutdownIdentity {
     run_id: RunId,
     app: String,
     version: String,
+    node: Node,
 }
 
 /// The process's run id, set once at start.
@@ -686,6 +700,71 @@ fn flag_value(argv: &[String], decl: &FlagDecl) -> Option<String> {
     }
 }
 
+// ── The node ────────────────────────────────────────────────────────────────
+
+/// The machine a run happened on: the `node` every line of the record states.
+///
+/// It is read once, from the host facts' `hostname`, when the [`HostReport`] is
+/// built, and every line of one run writes the same value. A host that did not
+/// name itself has an empty [`Node::name`] and a [`Node::reason`]: an empty
+/// value cannot be mistaken for a real node, and the key is still present so a
+/// reader can tell it from a record written before the field existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    name: String,
+    reason: Option<String>,
+}
+
+impl Node {
+    /// The node the host named.
+    pub fn named(name: impl Into<String>) -> Node {
+        Node {
+            name: name.into(),
+            reason: None,
+        }
+    }
+
+    /// A node the host did not name, and why.
+    pub fn unknown(reason: impl Into<String>) -> Node {
+        Node {
+            name: String::new(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// Read the node from the serialised host facts, whose `hostname` is
+    /// `{"known": name}` or `{"unknown": reason}`.
+    pub fn from_host_facts(facts: &Value) -> Node {
+        if let Some(hostname) = facts.get("hostname") {
+            if let Some(name) = hostname.get("known").and_then(Value::as_str) {
+                return if name.is_empty() {
+                    Node::unknown("the host reported an empty hostname")
+                } else {
+                    Node::named(name)
+                };
+            }
+            if let Some(reason) = hostname.get("unknown").and_then(Value::as_str) {
+                return Node::unknown(reason);
+            }
+            return Node::unknown("the hostname is tagged as neither known nor unknown");
+        }
+        if let Some(reason) = facts.get("unknown").and_then(Value::as_str) {
+            return Node::unknown(reason);
+        }
+        Node::unknown("the host facts carry no hostname")
+    }
+
+    /// The node's name, empty when the host did not name itself.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Why the node is unnamed, or `None` when it is named.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
 // ── The decided host facts and limits ───────────────────────────────────────
 
 /// The host facts the record reports.
@@ -698,21 +777,29 @@ fn flag_value(argv: &[String], decl: &FlagDecl) -> Option<String> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostReport {
     pub facts: Value,
+    /// The node these facts name, read once when the report was built.
+    node: Node,
 }
 
 impl HostReport {
     /// A host report from a value the platform layer produced.
     pub fn new(facts: impl Into<Value>) -> HostReport {
+        let facts = facts.into();
         HostReport {
-            facts: facts.into(),
+            node: Node::from_host_facts(&facts),
+            facts,
         }
     }
 
     /// A report from a host that knows nothing, with the reason.
     pub fn unknown(reason: &str) -> HostReport {
-        HostReport {
-            facts: json!({"unknown": reason}),
-        }
+        HostReport::new(json!({"unknown": reason}))
+    }
+
+    /// The node these facts name. It is fixed when the report is built, so
+    /// every line of a run states the same value.
+    pub fn node(&self) -> &Node {
+        &self.node
     }
 
     /// The report for this host, from the platform layer's one reader.
@@ -829,6 +916,12 @@ impl Record {
         &self.app
     }
 
+    /// The node every line of this record states, read once from the host
+    /// facts when the record's [`HostReport`] was attached.
+    pub fn node(&self) -> &Node {
+        self.host.node()
+    }
+
     /// Use an explicit run id, for a reader or a test.
     pub fn with_run_id(mut self, run_id: RunId) -> Record {
         self.run_id = run_id;
@@ -933,6 +1026,7 @@ impl Record {
             run_id: self.run_id,
             app: self.app.clone(),
             version: self.own.full(),
+            node: self.host.node().clone(),
         });
         STARTED.get_or_init(crate::platform::now);
 
@@ -1022,6 +1116,7 @@ impl Record {
     }
 
     fn base<'a>(&self, sink: &'a mut Sink, seq: u64, part: &str) -> Line<'a> {
+        let node = self.host.node();
         Line::empty(sink, crate::log::Level::Info)
             .kind(Type::Startup)
             .str("run_id", &self.run_id.to_string())
@@ -1029,6 +1124,8 @@ impl Record {
             .str("part", part)
             .str("app", &self.app)
             .str("version", &self.own.full())
+            .str("node", node.name())
+            .opt_str("node_unknown", node.reason())
     }
 
     fn crate_lines(&self) -> Vec<String> {
@@ -1065,6 +1162,7 @@ pub fn shutdown(reason: &str) {
             identity.run_id,
             &identity.app,
             &identity.version,
+            &identity.node,
             uptime_ms,
             reason,
         );
@@ -1073,14 +1171,16 @@ pub fn shutdown(reason: &str) {
 
 /// Write one shutdown line into `sink`.
 ///
-/// The process's own [`shutdown`] calls this into the operational sink. A test
-/// calls it into a file sink, so the line's shape is proven on the bytes an
-/// operator reads rather than on a private builder.
+/// The process's own [`shutdown`] calls this into the operational sink with the
+/// node the start-up record fixed at start, so the two agree. A test calls it
+/// into a file sink, so the line's shape is proven on the bytes an operator
+/// reads rather than on a private builder.
 pub fn write_shutdown_into(
     sink: &mut Sink,
     run_id: RunId,
     app: &str,
     version: &str,
+    node: &Node,
     uptime_ms: u64,
     reason: &str,
 ) {
@@ -1089,6 +1189,8 @@ pub fn write_shutdown_into(
         .str("run_id", &run_id.to_string())
         .str("app", app)
         .str("version", version)
+        .str("node", node.name())
+        .opt_str("node_unknown", node.reason())
         .u64("uptime_ms", uptime_ms)
         .str("reason", reason)
         .str("message", "shutdown")

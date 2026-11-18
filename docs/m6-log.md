@@ -306,10 +306,17 @@ A line is self-contained, so a reader that filters one `part` still knows which 
 | `part` | one of Table 7's words |
 | `app` | the application's name, the same string as the `-` line of `--version-full` |
 | `version` | the full SemVer string, build metadata included |
+| `node` | the machine the run is on: the platform facts' `hostname`, read once at start. The empty string when the host did not name itself |
+| `node_unknown` | present only when `node` is empty: the reason the host did not name itself |
 | `message` | a fixed phrase such as `startup record: identity` |
 | `type` | `startup`, written last |
 
 **Table 8: the keys every start-up line carries.**
+
+The node is read once, when the platform line's host facts are read, and every line of the run writes that one value.
+A host renamed while the run is in progress therefore cannot make the run's lines disagree.
+A host that did not name itself writes an empty `node` and the reason in `node_unknown`.
+Both keys are present, so a reader can tell an unnamed host from a record written before the field existed.
 
 The run id is set once at start.
 A reader groups the lines of one run with one filter:
@@ -346,7 +353,7 @@ A path that names a secret file is a plain setting and is logged, and the bytes 
 A declared flag marked secret is `<redacted>` in the invocation line, and its `argv` entry is redacted in place, so the reader still sees that the flag was passed.
 A command line can therefore never carry a password into the record.
 
-A clean exit writes one `shutdown` line with the same `run_id`, `uptime_ms` and `reason`.
+A clean exit writes one `shutdown` line with the same `run_id`, `node`, `uptime_ms` and `reason`.
 `Lifecycle::complete` writes it with reason `signal`.
 A forced second signal writes it with reason `forced`.
 A process that never wrote a start-up record writes no shutdown line, because there is no run for it to belong to.
