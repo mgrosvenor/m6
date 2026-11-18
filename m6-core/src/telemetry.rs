@@ -379,13 +379,36 @@ pub const INJECTION_MARKERS: &[&str] = &[
     "benchmark(",
 ];
 
-fn matches_any(haystack: &str, needles: &[&str]) -> bool {
-    let h = haystack.to_ascii_lowercase();
-    needles.iter().any(|n| h.contains(n))
+/// One ASCII-case-insensitive automaton per marker list, built on first use.
+///
+/// The traffic report runs every request of the hour through these, so a
+/// match is one pass over the text with no allocation. Lowercasing the text
+/// and calling `contains` once per marker cost about 1 us a path, which at a
+/// full window was most of a 79 ms report.
+fn markers(needles: &[&str]) -> aho_corasick::AhoCorasick {
+    aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(needles)
+        .expect("the marker lists are plain strings")
+}
+
+static BOT: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(BOT_MARKERS));
+static PROBE: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(PROBE_MARKERS));
+static INJECTION: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(INJECTION_MARKERS));
+
+/// Whether `text` matches the automaton as written or, when it carries a
+/// percent escape or a `+`, once decoded by `request::url_decode`.
+fn matches_raw_or_decoded(text: &str, automaton: &aho_corasick::AhoCorasick) -> bool {
+    automaton.is_match(text)
+        || (text.contains(['%', '+'])
+            && automaton.is_match(crate::request::url_decode(text).as_str()))
 }
 
 pub fn claims_to_be_bot(user_agent: &str) -> bool {
-    matches_any(user_agent, BOT_MARKERS)
+    BOT.is_match(user_agent)
 }
 
 // ── Verifying a crawler's claim ───────────────────────────────────────────────
@@ -643,10 +666,7 @@ pub fn verify_crawler(user_agent: &str, ptr: &crate::resolve::Ptr) -> CrawlerVer
 /// Probe shapes, checked raw and decoded, for the same reason as
 /// [`looks_like_injection`]: `..%2F` is a traversal and `%2E%65nv` is `.env`.
 pub fn looks_like_probe(path: &str) -> bool {
-    if matches_any(path, PROBE_MARKERS) {
-        return true;
-    }
-    matches_any(&crate::request::url_decode(path), PROBE_MARKERS)
+    matches_raw_or_decoded(path, &PROBE)
 }
 
 /// Injection shapes, checked against the decoded path.
@@ -658,11 +678,7 @@ pub fn looks_like_probe(path: &str) -> bool {
 /// `request::url_decode` is the one decoder: it reassembles UTF-8 from bytes
 /// rather than mapping each byte to a code point.
 pub fn looks_like_injection(path: &str) -> bool {
-    if matches_any(path, INJECTION_MARKERS) {
-        return true;
-    }
-    let decoded = crate::request::url_decode(path);
-    matches_any(&decoded, INJECTION_MARKERS)
+    matches_raw_or_decoded(path, &INJECTION)
 }
 
 /// What one client address was doing.

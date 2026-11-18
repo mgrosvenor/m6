@@ -67,6 +67,9 @@ http-client = ["dep:url"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+# The traffic report's marker lists, matched in one pass per path. Already in
+# the lockfile through tera and globset, so the build gains no package.
+aho-corasick = "1"
 # The allocator behind `m6_core::alloc::M6Alloc`. The `-sys` crate is named for
 # the option and arena calls that set the heap up in code at start.
 mimalloc = "0.1.52"
