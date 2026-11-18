@@ -545,6 +545,7 @@ impl Sink {
     /// the lines that were not sent are still buffered, and the caller writes
     /// them to stdout as bytes.
     fn write_journal(&mut self) -> bool {
+        let report = self.report;
         let mut sent = 0;
         let mut lost = 0u64;
         let mut refused = 0usize;
@@ -576,6 +577,7 @@ impl Sink {
                     // same journal. Nothing is dropped and nothing is sent
                     // twice: the lines already sent leave the buffer here.
                     self.move_front(sent);
+                    self.advance_report(report, sent);
                     self.dropped += lost;
                     self.journal = None;
                     self.note_datagram_refusal(refused);
@@ -584,6 +586,7 @@ impl Sink {
             }
         }
         self.move_front(sent);
+        self.advance_report(report, sent);
         self.dropped += lost;
         self.note_datagram_refusal(refused);
         self.blocked = false;
@@ -727,5 +730,31 @@ mod tests {
         assert_eq!(sink.dropped(), 0);
         let file = std::fs::read(&path).expect("the stdout file");
         assert!(file.is_empty(), "{} bytes went to stdout", file.len());
+    }
+
+    /// Each refusal gets its own dropped-count line. The journal path never
+    /// cleared the drained report, so every report after the first was lost.
+    #[test]
+    fn each_refused_line_is_reported_on_the_journal() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let (mut sink, receiver, _path) = journal_sink(dir.path());
+        sink.limits.field_max = 2 * DATAGRAM_MAX;
+        let wide = "x".repeat(DATAGRAM_MAX + 1024);
+        for round in 1..=2u64 {
+            Line::begin(&mut sink, Level::Info, "wide")
+                .str("value", &wide)
+                .end();
+            sink.flush();
+            let sent = drain(&receiver);
+            assert_eq!(sent.len(), 1, "round {round}: one dropped-count line");
+            let text = String::from_utf8_lossy(&sent[0]);
+            assert!(text.contains("log lines dropped"), "round {round}: {text}");
+            assert_eq!(sink.dropped(), round);
+            assert_eq!(
+                sink.report, 0,
+                "round {round}: the drained report is cleared"
+            );
+        }
+        assert!(sink.written() > 0, "the journal path counts its bytes");
     }
 }
