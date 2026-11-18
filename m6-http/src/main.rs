@@ -7152,7 +7152,6 @@ fn startup_env() -> &'static [m6_core::startup::EnvDecl] {
             name: "M6_TEST_STATS_INTERVAL_SECS",
             why: "shortens the stats tick in a test build",
             setting: Some("stats.interval_s"),
-            secret: false,
         },
         m6_core::startup::EnvDecl {
             name: "XDG_RUNTIME_DIR",

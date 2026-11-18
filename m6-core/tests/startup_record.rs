@@ -575,7 +575,7 @@ fn a_setting_that_came_from_the_config_file_says_so_even_when_it_equals_the_defa
     let section = sections.iter().find(|s| s.path == "params_cache").unwrap();
     assert_eq!(section.settings["size"].value, 512);
     assert_eq!(section.settings["size"].source, Source::File);
-    assert_eq!(section.settings["size"].rebuild, true);
+    assert!(section.settings["size"].rebuild);
 }
 
 #[test]
@@ -706,7 +706,7 @@ fn measured_record_from_a_rendered_tree() {
             (line.len(), part, section)
         })
         .collect();
-    sizes.sort_by(|a, b| b.0.cmp(&a.0));
+    sizes.sort_by_key(|a| std::cmp::Reverse(a.0));
     println!("config: {}", conf.display());
     println!("site.toml: {}", site_toml.display());
     println!("lines: {}", lines.len());

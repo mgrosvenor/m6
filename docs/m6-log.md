@@ -291,7 +291,7 @@ Table 7 gives the `part` value on each line.
 | `invocation` | one | `argv`, `flags` and `environment`; every declared flag and variable is listed, and an unset one has a null `value` |
 | `config_file` | one per file | `role` (`config`, `secrets` or `site`), `path`, and `sha256` of the bytes as read |
 | `config_section` | one per table | `section`, the table's dotted path, `file` when the record knows it, and `settings`: every key with its `value` and `source` |
-| `platform` | one | `host`, the platform facts, `limits`, every named limit's `start`, `max` and `source`, and `decided`, the facts the start decided such as the socket it bound |
+| `platform` | one | `host`, the machine's facts from `m6_core::platform::host_facts()`, `limits`, every named limit's `start`, `max` and `source`, and `decided`, the facts the process chose such as the socket it bound |
 | `complete` | one | `lines`, the number of `startup` lines in the record including this one |
 
 **Table 7: the `part` values of the start-up record.**
@@ -329,6 +329,11 @@ A config section is one table.
 A `[[route]]` array is one `config_section` line per element, with paths `route[0]`, `route[1]`, so a large route table is many bounded lines rather than one long one.
 An array of scalars is a value in its parent section.
 
+The platform line keeps `host` and `decided` apart because they answer different questions.
+`host` is what the machine is, so a monitor compares it across nodes: a kernel, an OS version or a total memory that differs from its peers is a finding.
+`decided` is what this process chose to do with the machine, so a monitor compares it against the deploy's own record: a socket path, a bind, a process index or a memory lock that differs from what was deployed is a finding.
+One line carries both so a reader of one record sees the machine and the decision together.
+
 A setting's `source` is one of `file`, `default`, `env` or `flag`, in that order of precedence from weakest to strongest.
 Every key is present, including the keys the file did not set and the application filled in.
 A default is never omitted because it equals the value in use, so a later release that changes a default changes the record, which is the point.
@@ -355,15 +360,16 @@ The record is many lines for exactly this reason: the largest line stays well un
 
 | tree | service and config files | lines | bytes | longest line |
 |---|---|---|---|---|
-| production | m6-file, its service config and the site's `site.toml` | 71 | 40,821 | 2,017 |
-| staging | m6-file, its service config and the site's `site.toml` | 71 | 41,047 | 2,017 |
-| production | m6-monitor, its service config and the site's `site.toml` | 64 | 32,878 | 2,020 |
-| staging | m6-monitor, its service config and the site's `site.toml` | 64 | 33,060 | 2,020 |
+| production | m6-file, its service config and the site's `site.toml` | 71 | 43,083 | 4,279 |
+| staging | m6-file, its service config and the site's `site.toml` | 71 | 43,309 | 4,279 |
+| production | m6-monitor, its service config and the site's `site.toml` | 64 | 35,140 | 4,282 |
+| staging | m6-monitor, its service config and the site's `site.toml` | 64 | 35,322 | 4,282 |
 
 **Table 9: the record measured from the largest rendered configs, with the line count and the longest line in bytes.**
 
 The measurement is taken from the rendered tree through the same writer a process uses, so these are bytes the record produces rather than an estimate.
-The largest is 71 lines and 41,047 bytes, and its longest line is 2,017 bytes, which is the platform line.
+The largest is 71 lines and 43,309 bytes, and its longest line is 4,279 bytes, which is the platform line.
 Every config section is under 900 bytes.
-The 64 KiB `[limits] journal_line` and the 8 KiB `[limits.log_field]` both have room for a config far larger than the ones measured.
+The platform line is the longest because a host reports its addresses, kernel and limits, so it is where a record grows first.
+The 64 KiB `[limits] journal_line` holds it with more than 60 KiB to spare.
 The line count is the reason the record is many lines: one line per table keeps the largest line at a few percent of the limit however many routes a site declares.

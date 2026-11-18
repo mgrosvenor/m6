@@ -63,8 +63,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -620,8 +618,10 @@ impl Invocation {
         env: &[EnvDecl],
         trace: &mut ConfigTrace,
     ) -> Invocation {
-        let mut read = Invocation::default();
-        read.argv = argv.to_vec();
+        let mut read = Invocation {
+            argv: argv.to_vec(),
+            ..Invocation::default()
+        };
         for decl in flags {
             let value = flag_value(argv, decl);
             if decl.secret {
@@ -715,21 +715,17 @@ impl HostReport {
         }
     }
 
-    /// The report for the platform layer this build has.
+    /// The report for this host, from the platform layer's one reader.
     ///
-    /// W137 owns `m6_platform::host_facts()`. Until that lands, the record
-    /// says so in one key rather than omitting the line or failing the start.
-    /// The call this becomes is:
-    ///
-    /// ```text
-    /// HostReport::new(m6_platform::host_facts())
-    /// ```
-    ///
-    /// with the contract in the W136 report: `host_facts() -> HostFacts`, never
-    /// fails, every unreadable field a `Fact::Unknown(&'static str)`.
+    /// `m6_core::platform::host_facts()` reads every fact once, at start, and
+    /// never fails. Its serialised form is the tagged shape, so a fact it
+    /// could not read arrives as `{"unknown": "<reason>"}` rather than as a
+    /// missing key. The value is written under `host` and is never flattened:
+    /// a reader must be able to tell "unknown, here is why" from "absent".
     pub fn decided() -> HostReport {
-        HostReport::unknown(
-            "m6_platform::host_facts() is W137's change and is not in this tree yet",
+        HostReport::new(
+            serde_json::to_value(crate::platform::host_facts())
+                .unwrap_or_else(|_| json!({"unknown": "host facts did not serialise"})),
         )
     }
 }

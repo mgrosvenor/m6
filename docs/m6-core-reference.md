@@ -407,7 +407,8 @@ The record takes the effective config as sections and a `ConfigTrace` that label
 `ConfigTrace::add_config_file` records a file's path, its role and its sha256 as read.
 `Invocation::read` reads the declared flags and environment variables and records the settings they replaced.
 `LimitsReport::read` records every named limit's start, max and source.
-`HostReport::decided` is the platform line's host block.
+`HostReport::decided` is the platform line's host block, from `m6_core::platform::host_facts()`.
+The tagged shape is kept: a fact is `{"known": value}` or `{"unknown": reason}`, so an unknown fact is never an absent key.
 
 A value the secrets file supplied is `<redacted>`.
 A field declared `Secret<T>` is `<redacted>` wherever it appears.
