@@ -329,7 +329,7 @@ On a quiet node it reaches back hours and blends idle and busy traffic, which is
 Three fail against the old reset, including `an_emit_does_not_erase_what_perf_reports`, and the other three hold either way.
 The check reinstated the old reset and watched them fail.
 
-End to end, the 05-cms example stack with a perf token took 40 requests, then three scrapes across two emit boundaries with silence between them, the ordering that used to return zeros:
+End to end, the 05-cms example stack took 40 requests, then read the metrics line three times across two emit boundaries with silence between them, the ordering that used to return zeros:
 
 | scrape | hit_samples | hit_p50_ns | hit_p99_ns |
 |---|---:|---:|---:|
