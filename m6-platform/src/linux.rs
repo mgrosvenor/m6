@@ -193,12 +193,10 @@ pub(super) fn udp_recv_batch(
     slot: usize,
     metas: &mut [super::net::RecvMeta],
 ) -> io::Result<usize> {
-    let count = (buf.len() / slot)
-        .min(metas.len())
-        .min(super::net::MAX_BATCH);
-    if count == 0 {
-        return Ok(0);
-    }
+    // `UdpBatch::recv` trims both slices to one count and never calls this with
+    // an empty one, so the metas it hands over are exactly what the call takes
+    // in.
+    let count = metas.len();
 
     let mut iovs = [libc::iovec {
         iov_base: std::ptr::null_mut(),

@@ -415,11 +415,14 @@ impl UdpBatch {
                 "a receive batch needs a nonzero slot",
             ));
         }
+        // The one place the batch count is worked out. The system call gets
+        // slices already trimmed to it, so it has one count to trust and no
+        // count of its own to get wrong.
         let count = (buf.len() / slot).min(metas.len()).min(MAX_BATCH);
         if count == 0 {
             return Ok(0);
         }
-        super::os::udp_recv_batch(socket, buf, slot, metas)
+        super::os::udp_recv_batch(socket, &mut buf[..count * slot], slot, &mut metas[..count])
     }
 }
 

@@ -204,12 +204,12 @@ pub(super) fn udp_recv_batch(
     use nix::errno::Errno;
     use nix::sys::socket::{recvfrom, SockaddrLike, SockaddrStorage};
 
-    let count = (buf.len() / slot)
-        .min(metas.len())
-        .min(super::net::MAX_BATCH);
+    // `UdpBatch::recv` trims both slices to one count and never calls this with
+    // an empty one, so the metas it hands over are exactly what the call takes
+    // in.
     let fd = socket.as_fd().as_raw_fd();
     let mut received = 0;
-    for (i, meta) in metas.iter_mut().take(count).enumerate() {
+    for (i, meta) in metas.iter_mut().enumerate() {
         let start = i * slot;
         match recvfrom::<SockaddrStorage>(fd, &mut buf[start..start + slot]) {
             Ok((len, from)) => {
