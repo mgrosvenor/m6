@@ -188,52 +188,98 @@ fn udp_send_segmented(
 
 /// Receive up to `metas.len()` datagrams in one `recvmmsg`.
 ///
-/// The headers and the addresses are `nix`'s: `MultiHeaders` builds each
-/// `msghdr` with its own builder, which is the only way to write one that
-/// compiles against glibc and musl both, since they declare its fields
-/// differently.
+/// The headers, the iovecs and the address buffers are stack arrays, so a
+/// batch receive allocates nothing. `nix`'s `MultiHeaders` holds the same
+/// structures but can only be built by `preallocate`, which allocates a boxed
+/// header array and a boxed address array on every call, and the iovecs were a
+/// `Vec` beside it. A receive happens on every turn of the loop.
+///
+/// The structures are written here instead of by `MultiHeaders` because its
+/// fields are private and it has no way to be reset: the kernel writes
+/// `msg_namelen` and `msg_len` back, so a reused header array would carry the
+/// last peer's address length into the next call. `libc::msghdr` is rare in
+/// this crate; it is here because `recvmmsg` takes this shape and no safe
+/// wrapper can hand it fresh memory without allocating.
 pub(super) fn udp_recv_batch(
     socket: &impl AsFd,
     buf: &mut [u8],
     slot: usize,
     metas: &mut [super::net::RecvMeta],
 ) -> io::Result<usize> {
-    use nix::sys::socket::{recvmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
-    use std::io::IoSliceMut;
+    use nix::sys::socket::{SockaddrLike, SockaddrStorage};
+    use std::mem::{size_of, MaybeUninit};
 
     // `UdpBatch::recv` trims both slices to one count and never calls this with
     // an empty one, so the metas it hands over are exactly what the call takes
     // in.
     let count = metas.len();
-    // One iovec per datagram, each pointing at that datagram's slot.
-    let mut slots: Vec<[IoSliceMut<'_>; 1]> = buf
-        .chunks_mut(slot)
-        .map(|bytes| [IoSliceMut::new(bytes)])
-        .collect();
-    debug_assert_eq!(slots.len(), count, "one slot per datagram");
-    let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(count, None);
+    debug_assert!(count <= super::net::MAX_BATCH, "one header per slot");
+    let mut headers = [MaybeUninit::<nix::libc::mmsghdr>::uninit(); super::net::MAX_BATCH];
+    let mut iovecs = [MaybeUninit::<nix::libc::iovec>::uninit(); super::net::MAX_BATCH];
+    let mut addresses =
+        [MaybeUninit::<nix::libc::sockaddr_storage>::uninit(); super::net::MAX_BATCH];
 
-    let received = recvmmsg(
-        socket.as_fd().as_raw_fd(),
-        &mut headers,
-        slots.iter_mut(),
-        MsgFlags::MSG_DONTWAIT,
-        None,
-    )?;
-
-    let mut taken = 0;
-    for (index, message) in received.enumerate() {
-        let from = message
-            .address
-            .as_ref()
-            .and_then(super::net::socket_addr_of);
-        metas[index] = super::net::RecvMeta {
-            len: message.bytes,
-            from,
-        };
-        taken = index + 1;
+    for index in 0..count {
+        let start = index * slot;
+        let iovec = iovecs[index].as_mut_ptr();
+        let name = addresses[index].as_mut_ptr();
+        // SAFETY: both pointers are into arrays of `count` initialised
+        // entries, and each is written once before the system call reads it.
+        // The slot is inside `buf`, which the caller owns for the call.
+        unsafe {
+            iovec.write(nix::libc::iovec {
+                iov_base: buf[start..start + slot]
+                    .as_mut_ptr()
+                    .cast::<nix::libc::c_void>(),
+                iov_len: slot,
+            });
+            headers[index].as_mut_ptr().write(nix::libc::mmsghdr {
+                msg_hdr: nix::libc::msghdr {
+                    msg_name: name.cast::<nix::libc::c_void>(),
+                    msg_namelen: size_of::<nix::libc::sockaddr_storage>() as nix::libc::socklen_t,
+                    msg_iov: iovec,
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                },
+                msg_len: 0,
+            });
+        }
     }
-    Ok(taken)
+
+    // SAFETY: `headers` is an array of `count` initialised `mmsghdr`s, each
+    // with a live iovec and address buffer, and the socket is open for the
+    // call. The kernel writes only the entries it reports in the return value.
+    let received = unsafe {
+        nix::libc::recvmmsg(
+            socket.as_fd().as_raw_fd(),
+            headers.as_mut_ptr().cast::<nix::libc::mmsghdr>(),
+            count as nix::libc::c_uint,
+            nix::libc::MSG_DONTWAIT as _,
+            std::ptr::null_mut(),
+        )
+    };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let received = received as usize;
+    for (index, meta) in metas.iter_mut().enumerate().take(received) {
+        // SAFETY: the kernel reported an entry for every index below
+        // `received`, having written its header and address.
+        let header = unsafe { headers[index].assume_init_ref() };
+        let address = unsafe {
+            SockaddrStorage::from_raw(
+                header.msg_hdr.msg_name.cast::<nix::libc::sockaddr>(),
+                Some(header.msg_hdr.msg_namelen),
+            )
+        };
+        *meta = super::net::RecvMeta {
+            len: header.msg_len as usize,
+            from: address.as_ref().and_then(super::net::socket_addr_of),
+        };
+    }
+    Ok(received)
 }
 
 /// The classic BPF program [`steer_reuseport`] attaches: 20 instructions.
