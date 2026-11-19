@@ -1274,10 +1274,15 @@ fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
 }
 
 /// One HTTP/3 GET / on an existing H3 connection. Returns response body.
+///
+/// `recv_info` is the connection's address pair, read once when the socket was
+/// connected. It used to be built from `peer_addr` and `local_addr` for every
+/// received datagram: 796 address lookups for one 485 KB response.
 fn h3_get(
     conn: &mut quiche::Connection,
     h3: &mut quiche::h3::Connection,
     udp: &UdpSocket,
+    recv_info: quiche::RecvInfo,
     path: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let req = vec![
@@ -1301,7 +1306,6 @@ fn h3_get(
         conn.on_timeout();
         quic_flush(conn, udp);
 
-        udp.set_read_timeout(Some(Duration::from_millis(100)))?;
         let n = match udp.recv(&mut buf) {
             Ok(n) => n,
             Err(e)
@@ -1314,10 +1318,6 @@ fn h3_get(
                 continue;
             }
             Err(e) => return Err(e.into()),
-        };
-        let recv_info = quiche::RecvInfo {
-            from: udp.peer_addr()?,
-            to: udp.local_addr()?,
         };
         conn.recv(&mut buf[..n], recv_info)?;
         quic_flush(conn, udp);
@@ -1353,9 +1353,22 @@ fn h3_get(
 fn h3_connect(
     addr: &str,
     cfg: &mut quiche::Config,
-) -> anyhow::Result<(quiche::Connection, quiche::h3::Connection, UdpSocket)> {
+) -> anyhow::Result<(
+    quiche::Connection,
+    quiche::h3::Connection,
+    UdpSocket,
+    quiche::RecvInfo,
+)> {
     let udp = UdpSocket::bind("0.0.0.0:0")?;
     udp.connect(addr)?;
+    // The socket is connected, so both addresses are fixed for its life. One
+    // `getpeername` and one `getsockname` here replace two per datagram.
+    let recv_info = quiche::RecvInfo {
+        from: udp.peer_addr()?,
+        to: udp.local_addr()?,
+    };
+    // The turn's wait, not a deadline per datagram: set once per socket.
+    udp.set_read_timeout(Some(Duration::from_millis(100)))?;
     let scid = new_scid();
     let peer: std::net::SocketAddr = addr.parse()?;
     let local = udp.local_addr()?;
@@ -1399,7 +1412,7 @@ fn h3_connect(
 
     let h3_cfg = quiche::h3::Config::new()?;
     let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_cfg)?;
-    Ok((conn, h3, udp))
+    Ok((conn, h3, udp, recv_info))
 }
 
 // Maximum bidi streams per connection before reconnecting. Stays well under
@@ -1412,32 +1425,40 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
     let mut cfg = make_quiche_client_config(skip_verify);
     let mut latencies = Vec::with_capacity(n);
 
-    let (mut conn, mut h3, mut udp) = h3_connect(addr, &mut cfg)?;
+    let (mut conn, mut h3, mut udp, mut recv_info) = h3_connect(addr, &mut cfg)?;
     let mut reqs: usize = 0; // count requests on this connection
 
     // Warmup: 5 requests
     for _ in 0..5 {
         if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
+            // Tell the server this connection is finished; dropping it would leave it
+            // holding a connection until the idle timeout.
+            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
             udp = u;
+            recv_info = r;
             reqs = 0;
         }
-        let _ = h3_get(&mut conn, &mut h3, &udp, b"/");
+        let _ = h3_get(&mut conn, &mut h3, &udp, recv_info, b"/");
         reqs += 1;
     }
 
     for _ in 0..n {
         if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
+            // Tell the server this connection is finished; dropping it would leave it
+            // holding a connection until the idle timeout.
+            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
             udp = u;
+            recv_info = r;
             reqs = 0;
         }
         let t0 = m6_core::platform::now();
-        h3_get(&mut conn, &mut h3, &udp, b"/")?;
+        h3_get(&mut conn, &mut h3, &udp, recv_info, b"/")?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
         reqs += 1;
     }
@@ -1465,18 +1486,22 @@ fn bench_http3_throughput(
             std::thread::spawn(move || {
                 let mut cfg = make_quiche_client_config(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
-                    let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
+                    let (mut conn, mut h3, mut udp, mut recv_info) = h3_connect(&addr, &mut cfg)?;
                     let mut reqs: usize = 0;
                     while m6_core::platform::now() < deadline {
                         if reqs >= H3_MAX_STREAMS_PER_CONN {
-                            let (c, h, u) = h3_connect(&addr, &mut cfg)?;
+                            // Tell the server this connection is finished; dropping it would leave it
+                            // holding a connection until the idle timeout.
+                            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+                            let (c, h, u, r) = h3_connect(&addr, &mut cfg)?;
                             conn = c;
                             h3 = h;
                             udp = u;
+                            recv_info = r;
                             reqs = 0;
                         }
                         reqs += 1;
-                        match h3_get(&mut conn, &mut h3, &udp, b"/") {
+                        match h3_get(&mut conn, &mut h3, &udp, recv_info, b"/") {
                             Ok(_) => {
                                 count.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1524,18 +1549,22 @@ fn bench_h3_throughput_path(
             std::thread::spawn(move || {
                 let mut cfg = make_quiche_client_config(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
-                    let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
+                    let (mut conn, mut h3, mut udp, mut recv_info) = h3_connect(&addr, &mut cfg)?;
                     let mut reqs: usize = 0;
                     while m6_core::platform::now() < deadline {
                         if reqs >= H3_MAX_STREAMS_PER_CONN {
-                            let (c, h, u) = h3_connect(&addr, &mut cfg)?;
+                            // Tell the server this connection is finished; dropping it would leave it
+                            // holding a connection until the idle timeout.
+                            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+                            let (c, h, u, r) = h3_connect(&addr, &mut cfg)?;
                             conn = c;
                             h3 = h;
                             udp = u;
+                            recv_info = r;
                             reqs = 0;
                         }
                         reqs += 1;
-                        match h3_get(&mut conn, &mut h3, &udp, path.as_bytes()) {
+                        match h3_get(&mut conn, &mut h3, &udp, recv_info, path.as_bytes()) {
                             Ok(_) => {
                                 count.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1772,31 +1801,39 @@ fn bench_h3_path_latency(
     const WARMUP: usize = 5;
     let mut cfg = make_quiche_client_config(skip_verify);
     let mut latencies = Vec::with_capacity(n);
-    let (mut conn, mut h3, mut udp) = h3_connect(addr, &mut cfg)?;
+    let (mut conn, mut h3, mut udp, mut recv_info) = h3_connect(addr, &mut cfg)?;
     let mut reqs: usize = 0;
     let pb = path.as_bytes();
 
     for _ in 0..WARMUP {
         if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
+            // Tell the server this connection is finished; dropping it would leave it
+            // holding a connection until the idle timeout.
+            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
             udp = u;
+            recv_info = r;
             reqs = 0;
         }
-        h3_get(&mut conn, &mut h3, &udp, pb)?;
+        h3_get(&mut conn, &mut h3, &udp, recv_info, pb)?;
         reqs += 1;
     }
     for _ in 0..n {
         if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
+            // Tell the server this connection is finished; dropping it would leave it
+            // holding a connection until the idle timeout.
+            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
             udp = u;
+            recv_info = r;
             reqs = 0;
         }
         let t0 = m6_core::platform::now();
-        h3_get(&mut conn, &mut h3, &udp, pb)?;
+        h3_get(&mut conn, &mut h3, &udp, recv_info, pb)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
         reqs += 1;
     }
