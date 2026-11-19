@@ -139,7 +139,9 @@ Table 2 lists them.
 
 m6 never talks to a service manager and relies on none to create anything.
 No binary reads `CREDENTIALS_DIRECTORY`, `NOTIFY_SOCKET`, `LISTEN_FDS`, `WATCHDOG_USEC`, `INVOCATION_ID`, `STATE_DIRECTORY` or `RUNTIME_DIRECTORY`, and the gate refuses a read of any of them.
-`JOURNAL_STREAM` is read in the platform layer only: `journal_stream()` answers whether systemd wired stdout to the journal, and m6-log writes journald's native socket when it did.
+`JOURNAL_STREAM` is read in the platform layer only.
+`journal_stream()` compares the device and inode systemd wrote to the variable with the ones `fstat` reports for descriptor 1, and answers true only when they match, which is systemd's documented contract for the variable.
+m6-log writes journald's native socket when it did.
 A path a service needs comes from its config, so the same binary runs under either manager.
 
 ## 4. Future ports

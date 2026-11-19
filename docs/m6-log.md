@@ -185,9 +185,9 @@ journalctl M6_TYPE=perf -o json
 `m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=200`, `--output=json` and `--directory <dir>`, and adds `--follow` in the running monitor.
 It filters on `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`, so one child carries the four types.
 
-`journal_stream()` in `m6-platform/src/lib.rs` reads `JOURNAL_STREAM`.
-systemd sets the variable on a unit whose stdout it wired to the journal.
-When it is set, `Journal::open` connects to `$XDG_RUNTIME_DIR/systemd/journal/socket` if that socket exists, and to `/run/systemd/journal/socket` otherwise.
+`journal_stream()` in `m6-platform/src/lib.rs` reads `JOURNAL_STREAM` and compares its device and inode with the ones `fstat` reports for descriptor 1.
+systemd sets the variable on a unit whose stdout it wired to the journal, and a process that inherited the value and then redirected stdout answers false.
+When it matches, `Journal::open` connects to `$XDG_RUNTIME_DIR/systemd/journal/socket` if that socket exists, and to `/run/systemd/journal/socket` otherwise.
 The choice is made once, in `init`.
 
 Outside systemd, m6-log opens no socket and writes to stdout.

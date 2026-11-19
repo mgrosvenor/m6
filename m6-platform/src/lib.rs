@@ -272,15 +272,33 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Whether systemd started this process with its stdout on the journal.
 ///
 /// systemd sets `JOURNAL_STREAM` to `<device>:<inode>` of the descriptor it
-/// wired stdout to, so a process answers this without asking the manager
-/// anything and without reading `/proc`. A launchd plist, a shell and a test
-/// harness set nothing, so the answer is `false` there.
+/// wired stdout to. The variable alone does not answer the question: a process
+/// that inherited it and then sent stdout somewhere else still carries the
+/// value, which is a test that redirects stdout to a file and a child spawned
+/// with a pipe. systemd's documented contract for the variable is that a
+/// process compares the device and inode of its own standard output with the
+/// value, and assumes stdout is the journal only when they match. So this
+/// reads descriptor 1 and answers `false` when the value is absent, malformed
+/// or names a different file. A launchd plist, a shell and a test harness set
+/// nothing, so the answer is `false` there too.
 ///
 /// The variable is a platform fact, so only this layer reads it: the gate
 /// refuses the name anywhere else in the workspace.
 #[inline]
 pub fn journal_stream() -> bool {
-    std::env::var_os("JOURNAL_STREAM").is_some_and(|value| !value.is_empty())
+    let Some(value) = std::env::var_os("JOURNAL_STREAM") else {
+        return false;
+    };
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    let Some((device, inode)) = value.split_once(':') else {
+        return false;
+    };
+    let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
+        return false;
+    };
+    fd::device_and_inode(&io::stdout()).is_ok_and(|(out, node)| out == device && node == inode)
 }
 
 // ── Signals: a shutdown or reload request ────────────────────────────────────
@@ -661,18 +679,52 @@ pub fn create_private(file: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// systemd's own answer, and the empty value systemd never sets.
+    /// systemd's contract: the value is compared with descriptor 1's device
+    /// and inode, and only a match means the journal.
     ///
-    /// The variable is spelled here and nowhere else outside this file, which
-    /// is what the gate enforces: a platform fact is read in the layer.
+    /// The matching value is built from `fstat` on this test's own stdout, so
+    /// the test needs no journal and runs on every target. The different
+    /// value is the case a redirected stdout and a piped child are in, which
+    /// is the case a runner started by systemd puts every test in. The
+    /// variable is spelled here and nowhere else outside this file, which is
+    /// what the gate enforces: a platform fact is read in the layer.
     #[test]
-    fn the_journal_stream_variable_is_the_detection() {
+    fn the_journal_stream_value_is_compared_with_stdout() {
+        let (device, inode) = fd::device_and_inode(&io::stdout()).expect("fstat stdout");
+
         std::env::remove_var("JOURNAL_STREAM");
         assert!(!journal_stream(), "nothing set means no journal");
-        std::env::set_var("JOURNAL_STREAM", "9:1");
-        assert!(journal_stream(), "a device and inode mean the journal");
+
         std::env::set_var("JOURNAL_STREAM", "");
         assert!(!journal_stream(), "an empty value is not a journal");
+
+        std::env::set_var("JOURNAL_STREAM", format!("{device}:{inode}"));
+        assert!(
+            journal_stream(),
+            "the device and inode of stdout mean the journal"
+        );
+
+        std::env::set_var(
+            "JOURNAL_STREAM",
+            format!("{}:{}", device.wrapping_add(1), inode),
+        );
+        assert!(
+            !journal_stream(),
+            "another device is not this process's stdout"
+        );
+
+        std::env::set_var("JOURNAL_STREAM", format!("{device}:{}", inode + 1));
+        assert!(
+            !journal_stream(),
+            "another inode is not this process's stdout, which is what a \
+             redirected stdout and a spawned child with a pipe look like"
+        );
+
+        for malformed in ["9", "9:", ":1", "device:1", "9:1:1"] {
+            std::env::set_var("JOURNAL_STREAM", malformed);
+            assert!(!journal_stream(), "{malformed:?} is not a device and inode");
+        }
+
         std::env::remove_var("JOURNAL_STREAM");
     }
 

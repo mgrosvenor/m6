@@ -45,6 +45,17 @@ pub fn is_nonblocking(fd: &impl AsFd) -> io::Result<bool> {
     Ok(flags.contains(OFlag::O_NONBLOCK))
 }
 
+/// The device and inode `fd` names, as `(st_dev, st_ino)`.
+///
+/// systemd publishes a descriptor's identity as those two numbers, decimal and
+/// colon-separated, so a process compares its own descriptor with the value
+/// the manager wrote. `stat` is POSIX on every supported target, so there is no
+/// arm here.
+pub fn device_and_inode(fd: &impl AsFd) -> io::Result<(u64, u64)> {
+    let stat = nix::sys::stat::fstat(fd)?;
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
 /// A duplicate of `fd`.
 pub fn dup(fd: &impl AsFd) -> io::Result<OwnedFd> {
     Ok(nix::unistd::dup(fd)?)

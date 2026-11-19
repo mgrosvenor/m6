@@ -293,14 +293,6 @@ fn read_both(out: Option<File>, err: Option<File>) -> io::Result<(Vec<u8>, Vec<u
 /// `close_range` before it runs the program, so a descriptor something cleared
 /// the flag on is not inherited either.
 pub fn spawn(cmd: &mut Command, streams: Streams) -> io::Result<Child> {
-    // `JOURNAL_STREAM` says this process stdout is the journal. A child with
-    // its own stdout is told something false, and a service that believes it
-    // writes its log lines to the journal socket, so the parent reading the
-    // pipe sees nothing. A CI runner started by systemd carries the variable
-    // into every test.
-    if streams.stdout != Io::Inherit {
-        cmd.env_remove("JOURNAL_STREAM");
-    }
     let (pid, [stdin, stdout, stderr]) = os::spawn(cmd, streams)?;
     Ok(Child {
         pid,
@@ -439,28 +431,4 @@ pub fn memory_usage(pid: u32) -> io::Result<ProcessMemory> {
 /// it had not already touched. `Err` where the kernel keeps no such report.
 pub fn page_faults(pid: u32) -> io::Result<u64> {
     os::page_faults(pid)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A child with a piped stdout is not told its stdout is the journal. A
-    /// runner started by systemd sets `JOURNAL_STREAM`, and a service that
-    /// believed it would log to the journal socket and leave the pipe empty.
-    /// Break: drop the `env_remove` in `spawn`, and the child reports the value.
-    #[test]
-    fn a_piped_child_is_not_told_its_stdout_is_the_journal() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "printf %s \"${JOURNAL_STREAM-unset}\""])
-            .env("JOURNAL_STREAM", "9:1");
-        let streams = Streams {
-            stdin: Io::Null,
-            stdout: Io::Piped,
-            stderr: Io::Null,
-        };
-        let child = spawn(&mut cmd, streams).expect("spawn");
-        let out = child.wait_with_output().expect("the child report");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
-    }
 }
