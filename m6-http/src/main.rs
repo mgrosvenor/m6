@@ -3568,6 +3568,10 @@ fn drain_udp(
     let mut metas = [RecvMeta::default(); MAX_BATCH];
     let mut received = 0;
     let mut next = 0;
+    // One clock read for the whole drain. This used to be one per datagram,
+    // and a drain is several datagrams: the request and the previous page's
+    // ACKs arrive together.
+    let now = m6_core::platform::now();
     loop {
         if next == received {
             // A batch is the unit the socket took datagrams in, so it is the
@@ -3621,22 +3625,31 @@ fn drain_udp(
                 }
             };
 
-            let conn_id = hdr.dcid.to_vec();
+            let conn_id = &hdr.dcid[..];
 
             // Resolve the stored map key: direct hit, alias, or new connection.
             // quiche::connect() generates a 16-byte Initial DCID.  The server stores
             // connections under a fresh 20-byte SCID so that 1-RTT short-header
             // packets (parsed with MAX_CONN_ID_LEN=20) always match the stored key.
-            let key: Vec<u8> = if connections.contains_key(&conn_id) {
-                conn_id.clone()
-            } else if let Some(k) = conn_id_map.get(&conn_id) {
-                k.clone()
+            //
+            // The key is borrowed wherever it can be. On an established
+            // connection it is the datagram's own DCID or the alias map's entry,
+            // copied into a stack buffer at most 20 bytes wide, so a datagram
+            // that resolves to an existing connection allocates nothing. Only an
+            // Initial that opens a connection builds an owned key.
+            let mut key_buf = [0u8; quiche::MAX_CONN_ID_LEN];
+            let key: &[u8] = if connections.contains_key(conn_id) {
+                key_buf[..conn_id.len()].copy_from_slice(conn_id);
+                &key_buf[..conn_id.len()]
+            } else if let Some(alias) = conn_id_map.get(conn_id) {
+                key_buf[..alias.len()].copy_from_slice(alias);
+                &key_buf[..alias.len()]
             } else if hdr.ty == quiche::Type::Initial {
                 // New connection: generate a fresh 20-byte SCID.
                 let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
                 rand::thread_rng().fill_bytes(&mut scid_bytes);
-                let key = scid_bytes.to_vec();
-                let scid = quiche::ConnectionId::from_vec(key.clone());
+                let scid_key = scid_bytes.to_vec();
+                let scid = quiche::ConnectionId::from_vec(scid_key.clone());
                 let conn = match quiche::accept_with_buf_factory::<BodyBuffers>(
                     &scid,
                     None,
@@ -3651,38 +3664,39 @@ fn drain_udp(
                     }
                 };
                 connections.insert(
-                    key.clone(),
+                    scid_key.clone(),
                     QuicConn {
                         conn,
                         h3_conn: None,
                         pending: HashMap::new(),
                         partial_responses: HashMap::new(),
                         client_addr: from,
-                        last_active: m6_core::platform::now(),
-                        created: m6_core::platform::now(),
+                        last_active: now,
+                        created: now,
                         handshake_recorded: false,
                         blocked: None,
                     },
                 );
                 // Alias the client's Initial DCID → our 20-byte key for retransmits.
-                if conn_id != key {
-                    conn_id_map.insert(conn_id.clone(), key.clone());
+                if conn_id != scid_key.as_slice() {
+                    conn_id_map.insert(conn_id.to_vec(), scid_key.clone());
                 }
-                key
+                key_buf[..scid_key.len()].copy_from_slice(&scid_key);
+                &key_buf[..scid_key.len()]
             } else {
                 debug!("non-initial packet for unknown conn");
                 continue;
             };
 
-            let qconn = match connections.get_mut(&key) {
+            let qconn = match connections.get_mut(key) {
                 Some(c) => c,
                 None => continue,
             };
-            qconn.last_active = m6_core::platform::now();
+            qconn.last_active = now;
             // This connection is flushed once, after the whole batch. Marking it
             // after the lookup means a datagram that found no connection never
             // becomes a flush of one.
-            udp.touched.note(&key);
+            udp.touched.note(key);
 
             let recv_info = quiche::RecvInfo {
                 from,
@@ -3771,7 +3785,7 @@ fn drain_udp(
 
             // Process H3 events
             if qconn.h3_conn.is_some() {
-                process_h3(qconn, &key, state, h3);
+                process_h3(qconn, key, state, h3);
             }
 
             // A packet may have carried the credit a saved response was waiting
