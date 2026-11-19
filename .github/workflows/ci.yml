@@ -282,7 +282,7 @@ jobs:
   # graphs in one run, and the rest is platform-independent.
   build-and-test-macos:
     name: macOS arm64 build and tests
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - id: toolchain
