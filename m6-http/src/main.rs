@@ -796,6 +796,9 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 /// whether it has them at all.
 struct EventLoopIo {
     udp: UdpSocket,
+    /// The QUIC socket's local address, read once when the socket was created.
+    /// Every `RecvInfo` uses it; `getsockname` is not called per datagram.
+    udp_local: SocketAddr,
     tcp: Option<Http11Listener>,
     h2c: Option<H2cListener>,
     signals: Signals,
@@ -2895,6 +2898,7 @@ fn event_loop(
     // is long and reads better against the names it has always used.
     let EventLoopIo {
         udp,
+        udp_local,
         mut tcp,
         mut h2c,
         mut signals,
@@ -3068,7 +3072,10 @@ fn event_loop(
                 TOKEN_LOG => m6_core::log::flush(),
                 TOKEN_UDP => {
                     drain_udp(
-                        &udp,
+                        BoundUdp {
+                            socket: &udp,
+                            local: udp_local,
+                        },
                         &mut recv_buf,
                         &mut connections,
                         &mut conn_id_map,
@@ -3405,8 +3412,18 @@ struct H3Loop<'a> {
     quic_port: u16,
 }
 
+/// The QUIC socket and the local address it was bound to.
+///
+/// The address is read once when the socket is created. It is the `to` of every
+/// `RecvInfo`; asking the kernel for it per datagram was one `getsockname` per
+/// received packet.
+struct BoundUdp<'a> {
+    socket: &'a UdpSocket,
+    local: SocketAddr,
+}
+
 fn drain_udp(
-    udp: &UdpSocket,
+    udp: BoundUdp<'_>,
     // A slice, not `&mut Vec<u8>`: this never grows or shrinks the buffer, it
     // fills it and reslices it to the datagram length.
     recv_buf: &mut [u8],
@@ -3417,7 +3434,7 @@ fn drain_udp(
     h3: &H3Loop,
 ) {
     loop {
-        let (len, from) = match udp.recv_from(recv_buf) {
+        let (len, from) = match udp.socket.recv_from(recv_buf) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -3427,13 +3444,6 @@ fn drain_udp(
         };
 
         let pkt = &mut recv_buf[..len];
-        let local = match udp.local_addr() {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(error = %e, "local_addr error");
-                continue;
-            }
-        };
 
         // Parse QUIC header to get connection ID
         let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
@@ -3460,7 +3470,7 @@ fn drain_udp(
             rand::thread_rng().fill_bytes(&mut scid_bytes);
             let key = scid_bytes.to_vec();
             let scid = quiche::ConnectionId::from_vec(key.clone());
-            let conn = match quiche::accept(&scid, None, local, from, quiche_config) {
+            let conn = match quiche::accept(&scid, None, udp.local, from, quiche_config) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("quiche::accept error: {}", e);
@@ -3496,7 +3506,10 @@ fn drain_udp(
         };
         qconn.last_active = m6_core::platform::now();
 
-        let recv_info = quiche::RecvInfo { from, to: local };
+        let recv_info = quiche::RecvInfo {
+            from,
+            to: udp.local,
+        };
         if let Err(e) = qconn.conn.recv(pkt, recv_info) {
             // REJECTING A PACKET IS NOT THE END OF THE WORK. quiche has already
             // called close() internally and queued a CONNECTION_CLOSE carrying
@@ -3512,7 +3525,7 @@ fn drain_udp(
             // It does not move h3 conformance. The twelve h3spec failures are
             // quiche's and are documented in tools/conformance-scores.txt.
             warn!("conn.recv error: {}", e);
-            flush_conn(udp, qconn);
+            flush_conn(udp.socket, qconn);
             continue;
         }
 
@@ -3557,7 +3570,7 @@ fn drain_udp(
                 Ok(c) => c,
                 Err(e) => {
                     warn!("h3 Config::new error: {}", e);
-                    flush_conn(udp, qconn);
+                    flush_conn(udp.socket, qconn);
                     continue;
                 }
             };
@@ -3571,7 +3584,7 @@ fn drain_udp(
                 }
                 Err(e) => {
                     warn!("h3 init error: {}", e);
-                    flush_conn(udp, qconn);
+                    flush_conn(udp.socket, qconn);
                     continue;
                 }
             }
@@ -3589,7 +3602,7 @@ fn drain_udp(
         }
 
         // Send any pending QUIC packets
-        flush_conn(udp, qconn);
+        flush_conn(udp.socket, qconn);
     }
 }
 
@@ -7529,6 +7542,15 @@ fn run(args: Vec<String>) -> i32 {
         eprintln!("set_nonblocking error: {e}");
         return 2;
     }
+    // A bound socket's local address cannot change, and the QUIC receive path
+    // needs it for every `RecvInfo`. Read it once here, not once per datagram.
+    let udp_local = match m6_http_lib::h3::LocalAddr::read(&udp) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("local_addr error: {e}");
+            return 2;
+        }
+    };
 
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http", None);
     lifecycle.started();
@@ -7823,6 +7845,7 @@ fn run(args: Vec<String>) -> i32 {
     let code = event_loop(
         EventLoopIo {
             udp,
+            udp_local: udp_local.get(),
             tcp: tcp_listener,
             h2c: h2c_listener,
             signals,

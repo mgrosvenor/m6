@@ -12,6 +12,7 @@ pub mod genid;
 pub mod h2_client;
 pub mod h2c_client;
 pub mod h2s_client;
+pub mod h3;
 pub mod health;
 pub mod http11;
 pub mod http2;
