@@ -665,19 +665,10 @@ jobs:
     name: the examples build and work
     runs-on: ubuntu-latest
     steps:
-      # SIBLING CHECKOUTS, and the layout is load-bearing. The example renderer
-      # crates depend on m6 by relative path (`../../../../m6/m6-core`), so
-      # m6-examples and m6 have to sit beside each other. Checking either one out
-      # at the workspace root breaks the path and the error is a missing
-      # Cargo.toml several directories away from the cause.
+      # The examples are examples/ in this repository, their own Cargo
+      # workspace. The renderer crates depend on m6-core by relative path, so
+      # they build against the m6 in this same checkout.
       - uses: actions/checkout@v4
-        with:
-          path: m6
-
-      - uses: actions/checkout@v4
-        with:
-          repository: mgrosvenor/m6-examples
-          path: m6-examples
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -686,12 +677,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            m6
-            m6-examples
+            .
+            examples
 
       - name: Build m6
         id: build_m6
-        working-directory: m6
         run: |
           cargo build --workspace --release
           echo "$PWD/target/release" >> "$GITHUB_PATH"
@@ -700,7 +690,7 @@ jobs:
       # copies from these.
       - name: Examples build, zero warnings
         id: build_examples
-        working-directory: m6-examples
+        working-directory: examples
         run: |
           status=0
           cargo build --release > build.log 2>&1 || status=$?
@@ -714,7 +704,7 @@ jobs:
 
       - name: Examples clippy, silent
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
-        working-directory: m6-examples
+        working-directory: examples
         run: |
           status=0
           cargo clippy --workspace --all-targets --release > clippy.log 2>&1 || status=$?
@@ -727,22 +717,22 @@ jobs:
 
       # The examples are the platform layer's users too: no example names an
       # OS in a cfg or links mio, nix, rustix or libc. The same rule the gate
-      # test holds for m6, as a grep here because this job checks out both.
+      # test holds for m6, as a grep here because the examples are a separate workspace.
       - name: Examples name no platform
         if: ${{ !cancelled() }}
-        working-directory: m6-examples
+        working-directory: examples
         run: |
-          if grep -rnE --include='*.rs' 'target_os|cfg\(unix|cfg\(windows|\b(mio|nix|rustix|libc)::|^\s*use (mio|nix|rustix|libc)\b' examples; then
+          if grep -rnE --include='*.rs' --exclude-dir=target 'target_os|cfg\(unix|cfg\(windows|\b(mio|nix|rustix|libc)::|^\s*use (mio|nix|rustix|libc)\b' .; then
             echo "::error::an example names the operating system or an OS crate: that belongs in m6-platform"; exit 1
           fi
-          if grep -nE '^\s*(mio|nix|rustix|libc)\s*=' examples/*/*/Cargo.toml examples/*/Cargo.toml 2>/dev/null; then
+          if grep -nE '^\s*(mio|nix|rustix|libc)\s*=' */*/Cargo.toml */Cargo.toml 2>/dev/null; then
             echo "::error::an example declares an OS crate"; exit 1
           fi
           echo "no example names the operating system"
 
       - name: Examples unit tests
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
-        working-directory: m6-examples
+        working-directory: examples
         run: |
           # Example 05's end-to-end test makes its own certificate, keys and
           # auth database in a temporary directory, so it runs here with the
@@ -769,24 +759,24 @@ jobs:
       # example with neither a config nor a reason recorded here fails the job.
       # A FRESH CHECKOUT HAS NO CERTIFICATES, and the config parse needs them:
       # m6-http validates that tls_cert exists. The development keys live in
-      # /tmp/m6/dev, written by examples/dev-keys.sh, which the config parse
+      # /tmp/m6/dev, written by ./dev-keys.sh, which the config parse
       # below needs, so this step runs it ahead of the parse.
       - name: Generate development certificates
         id: certs
         if: ${{ !cancelled() }}
-        working-directory: m6-examples
+        working-directory: examples
         run: |
-          examples/dev-keys.sh
+          ./dev-keys.sh
 
       - name: Every example's config parses
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
-        working-directory: m6-examples
+        working-directory: examples
         run: |
           bad=0 unexplained=0
-          for d in examples/*/; do
+          for d in */; do
             name=$(basename "$d")
             case "$name" in
-              data) continue ;;
+              data|target) continue ;;
               06-systemd) echo "  $name  not parsed: systemd units only, no site config"; continue ;;
               09-global-deployment) echo "  $name  not parsed: per-node configs, no single system-dev.toml; its integration test covers it"; continue ;;
             esac
@@ -816,13 +806,13 @@ jobs:
       # on step one of the README, and it is checked here rather than assumed.
       - name: Example 05, end to end over the running stack
         if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
-        working-directory: m6-examples/examples/05-cms
+        working-directory: examples/05-cms
         run: |
           # m6-http pins its memory at start (`[server] lock_memory`, on by default),
           # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
           # processes it starts inherit the limit, so the m6-http the tests start can pin.
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
+          M6="$GITHUB_WORKSPACE" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
           dev_pid=$!
           dev_start=$(ps -o lstart= -p "$dev_pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
           printf '%s\t%s\n' "$dev_pid" "${dev_start:--}" > .ci-dev.pid
@@ -841,11 +831,11 @@ jobs:
           # only way to tell a broken example from a broken backend. Without this,
           # 33 failures showing 502s said nothing about WHICH service was down.
           ./test.sh || { echo "--- service logs ---"; tail -30 logs/*.log 2>/dev/null; exit 1; }
-          (cd "$GITHUB_WORKSPACE/m6-examples" && cargo test -p render-cms --test integration)
+          (cd "$GITHUB_WORKSPACE/examples" && cargo test -p render-cms --test integration)
 
       - name: Stop the stack
         if: always()
-        working-directory: m6-examples/examples/05-cms
+        working-directory: examples/05-cms
         run: |
           # Stop the dev.sh this job started, and only that pid. The run step
           # wrote the pid and its start time here when it started dev.sh. A pid

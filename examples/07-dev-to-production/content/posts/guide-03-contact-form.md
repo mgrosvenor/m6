@@ -47,7 +47,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-core    = { path = "../../../../m6/m6-core", features = ["email"] }
+m6-core    = { path = "../../../m6-core", features = ["email"] }
 anyhow     = "1"
 serde_json = "1"
 ```

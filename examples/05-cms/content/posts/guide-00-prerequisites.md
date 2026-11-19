@@ -60,8 +60,8 @@ You do not need to run `mkcert localhost` yourself. Each example's `dev.sh` runs
 ## Clone the examples
 
 ```bash
-git clone https://github.com/m6/m6-examples
-cd m6-examples
+git clone https://github.com/mgrosvenor/m6
+cd m6/examples
 ```
 
 Now you have all five examples ready to run. Each is self-contained: its own `site.toml`, its own configs, its own templates and data. Each reads its TLS certificate from `dev/` in that same private directory, written by `examples/dev-keys.sh`.

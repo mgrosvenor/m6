@@ -6,9 +6,9 @@
 #   ./tools/check-kill-safety.sh --tree <dir> # check another checkout
 #   ./tools/check-kill-safety.sh --self-test  # prove the scan catches a plant
 #
-# `--tree` is how m6-examples runs this script from the sibling m6 checkout it
-# already has in CI. The path is resolved from the caller's directory, before
-# the scan changes into the tree.
+# `--tree` checks another checkout. The path is resolved from the caller's
+# directory, before the scan changes into the tree. This repository's own
+# scan covers examples/, which is tracked here.
 #
 # Why this exists. On 2026-11-15 four example scripts tore down with
 # `lsof -ti :8443 | xargs kill -9`, three `dev.sh` scripts with

@@ -202,7 +202,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-core        = { path = "../../../../m6/m6-core" }
+m6-core        = { path = "../../../m6-core" }
 serde_json     = "1"
 comrak         = { version = "0.21", default-features = false }
 base64         = "0.22"

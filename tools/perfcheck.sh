@@ -46,11 +46,11 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # on a hardened build host.
 WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck-$(id -un)}"
 
-# The examples repository, checked out beside this one, holds the committed
-# bytes both arms render. PERFCHECK_EXAMPLES overrides its location.
+# The examples directory of this repository holds the committed bytes both arms
+# render. PERFCHECK_EXAMPLES overrides its location.
 # PERFCHECK_SITE still points the whole check at a deployment instead, for a
 # deployment that wants to measure its own content.
-EXAMPLES="${PERFCHECK_EXAMPLES:-$(cd "$ROOT/.." 2>/dev/null && pwd)/m6-examples}"
+EXAMPLES="${PERFCHECK_EXAMPLES:-$ROOT/examples}"
 SITE="${PERFCHECK_SITE:-}"
 HISTORY="${PERFCHECK_HISTORY:-$HERE/perf-history.jsonl}"
 
@@ -82,7 +82,7 @@ usage: tools/perfcheck.sh --base-bin PATH [options]
   --max-ci-width PCT    interval width that marks a run not measured (default 10)
 
 Environment:
-  PERFCHECK_EXAMPLES      examples checkout (default: a sibling m6-examples)
+  PERFCHECK_EXAMPLES      examples directory (default: examples/ in this repository)
   PERFCHECK_SITE          measure a deployment's render:capabilities instead
   PERFCHECK_WORK          work directory
   PERFCHECK_HISTORY       history file (default tools/perf-history.jsonl)
@@ -316,7 +316,7 @@ target_rows() {
 arm_site() {
   local arm="$1" subdir="$2" ex
   if [[ "$arm" == "base" ]]; then ex="$BASE_EXAMPLES_DIR"; else ex="$EXAMPLES"; fi
-  echo "$ex/examples/$subdir"
+  echo "$ex/$subdir"
 }
 
 run_round() {

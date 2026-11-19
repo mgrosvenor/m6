@@ -28,8 +28,8 @@ The `mkcert` command writes `localhost+1.pem` and `localhost+1-key.pem` in the c
 ## Clone the examples
 
 ```bash
-git clone https://github.com/m6/m6-examples
-cd m6-examples/examples/01-static
+git clone https://github.com/mgrosvenor/m6
+cd m6/examples/01-static
 ```
 
 ## Start the site

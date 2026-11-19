@@ -1,18 +1,12 @@
-# m6-examples
+# m6 examples
 
 Eleven examples for the [m6](https://github.com/mgrosvenor/m6) web server framework, each building on the last.
 
 ## Prerequisites
 
-**Clone m6 beside this repository, not inside it.** The custom renderer crates
-reach m6-core by relative path (`../../../../m6/m6-core`), so the two checkouts
-have to be siblings:
-
-```
-~/code/
-├── m6/
-└── m6-examples/
-```
+The examples live in the m6 repository, in `examples/`. Their custom renderer
+crates reach m6-core by relative path (`../../../m6-core`), so they build from
+the same commit as the m6 crates they use.
 
 ```bash
 # m6's binaries, from source. They are not on crates.io.
@@ -27,8 +21,8 @@ mkcert -install
 Each example's `dev.sh` runs `examples/dev-keys.sh`, which writes the development
 certificate and auth keys to `dev/` in a private per-user directory on first run,
 so there is nothing to place or symlink by hand. The directory is
-`${XDG_RUNTIME_DIR:-${TMPDIR:-$HOME/.cache}}/m6`, created with mode 700; set
-`M6_DEV_HOME` to use another. Each example's configs name it as `@M6_DEV_HOME@`,
+`${XDG_RUNTIME_DIR:-${TMPDIR:-$HOME/.cache}}/m6`, created with mode 700.
+Set `M6_DEV_HOME` to use another. Each example's configs name it as `@M6_DEV_HOME@`,
 and its `dev.sh` writes a copy with the real path for m6 to read.
 
 ### Check the install
@@ -38,8 +32,9 @@ Run that before anything else, and a failure is then a real answer about your
 install rather than a puzzle several examples later:
 
 ```bash
+cd examples
 cargo build --release        # the custom renderers
-cd examples/05-cms
+cd 05-cms
 ./dev.sh                     # one terminal
 ./test.sh                    # another
 #   96 passed  0 failed  (96 checks)

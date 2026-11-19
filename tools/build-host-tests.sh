@@ -33,9 +33,8 @@
 #   M6_BUILD_ROOT      optional remote directory, relative to the login
 #                      directory unless absolute. Default m6-build.
 #   M6_ALLOW_DIRTY     optional. Skip the clean-tree guard, for local iteration.
-#   M6_EXAMPLES        optional path to the m6-examples checkout. Default: a
-#                      sibling directory named m6-examples. Set M6_SKIP_EXAMPLES=1
-#                      to run without it, knowing what that leaves unchecked.
+#   M6_SKIP_EXAMPLES   optional. Set to 1 to skip the examples (examples/ in this
+#                      repository), knowing what that leaves unchecked.
 #
 # THE BUILD HOST IS ASSUMED NOT TO BE BACKED UP. Nothing may exist only there, so
 # this refuses to run against a dirty tree: whatever it tested is then always
@@ -43,7 +42,7 @@
 #
 # ── Why the examples are built here ──────────────────────────────────────────
 #
-# m6-examples is the first place an m6 API change shows up, and for weeks nothing
+# The examples are the first place an m6 API change shows up, and for weeks nothing
 # built it. By 2026-09-14 it did not compile at all: every renderer crate still
 # pointed at `m6-render`, a crate m6 had deleted, and the binaries left in
 # `target/release` from before the deletion meant running an example still looked
@@ -128,51 +127,28 @@ copy_back() {
 
 # ── Where the examples are ───────────────────────────────────────────────────
 #
-# The renderer crates reach m6 by relative path (`../../../../m6/m6-core`), which
-# resolves to a sibling directory. They are synced as siblings on the build host
-# for the same reason, so the path holds there without editing any manifest.
-EXAMPLES="${M6_EXAMPLES:-$(cd "$ROOT/.." 2>/dev/null && pwd)/m6-examples}"
+# examples/ in this repository, its own Cargo workspace. It is synced with the
+# rest of the tree, so the renderer crates reach m6-core by the same relative
+# path on the build host as here.
+EXAMPLES="$ROOT/examples"
 if [[ -n "${M6_SKIP_EXAMPLES:-}" ]]; then
     EXAMPLES=""
-elif [[ ! -f "$EXAMPLES/Cargo.toml" ]]; then
-    die "cannot find the examples repository at '$EXAMPLES'.
-
-  m6-examples is where m6's own interfaces are actually used, and it is the first
-  place an API change breaks. It went unbuilt long enough to stop compiling
-  entirely, so it is checked here rather than trusted.
-
-      export M6_EXAMPLES=/path/to/m6-examples
-
-  To run without it, knowing that leaves every example unchecked:
-
-      export M6_SKIP_EXAMPLES=1"
 fi
 
 # ── The git guard ────────────────────────────────────────────────────────────
+# The logs and generated data files the examples write while running are noise
+# rather than work, so they do not count as uncommitted changes.
+EXAMPLES_NOISE='^.. examples/.*(logs/|\.db(-shm|-wal)?$|/data/posts\.json$|/content/drafts/)'
 if [[ -z "${M6_ALLOW_DIRTY:-}" ]]; then
     # The history file is exempt: the host's copy is regenerated from the checkout
     # on every sync, so the gate can be rerun before the new record is committed.
-    [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl')" ]] || {
+    [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' | grep -vE "$EXAMPLES_NOISE" || true)" ]] || {
         echo "${RED}ERROR:${RESET} $ROOT has uncommitted changes." >&2
-        git -C "$ROOT" status --short -- . ':!tools/perf-history.jsonl' | head -10 >&2
+        git -C "$ROOT" status --short -- . ':!tools/perf-history.jsonl' | grep -vE "$EXAMPLES_NOISE" | head -10 >&2
         echo "  The build host is assumed not to be backed up. Commit first, or" >&2
         echo "  set M6_ALLOW_DIRTY=1." >&2
         exit 1; }
     ok "tree is clean (nothing will exist only on the build host)"
-
-    # The examples get the same guard: whatever ran there has to be recoverable
-    # from git too, and the logs and generated data files these examples write
-    # while running are noise rather than work, so they are excluded.
-    if [[ -n "$EXAMPLES" ]]; then
-        dirty=$(git -C "$EXAMPLES" status --porcelain 2>/dev/null \
-            | grep -vE '(logs/|\.db(-shm|-wal)?$|/data/posts\.json$|/content/drafts/)' || true)
-        [[ -z "$dirty" ]] || {
-            echo "${RED}ERROR:${RESET} $EXAMPLES has uncommitted changes." >&2
-            printf '%s\n' "$dirty" | head -10 >&2
-            echo "  Commit them, or set M6_ALLOW_DIRTY=1." >&2
-            exit 1; }
-        ok "examples tree is clean"
-    fi
 fi
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
@@ -189,18 +165,6 @@ rsync -az -e "ssh $SSH_OPTS" --delete --exclude 'target/' --exclude '.git/' \
 ssh $SSH_OPTS "$BUILD_HOST" \
     "find $BUILD_ROOT/m6 \\( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \\) -exec touch {} +"
 ok "source synced and restamped"
-
-if [[ -n "$EXAMPLES" ]]; then
-    info "syncing examples to $BUILD_HOST:$BUILD_ROOT/m6-examples"
-    # shellcheck disable=SC2086
-    rsync -az -e "ssh $SSH_OPTS" --delete --exclude 'target/' --exclude '.git/' \
-        --exclude 'logs/' "$EXAMPLES/" "$BUILD_HOST:$BUILD_ROOT/m6-examples/" \
-        || die "rsync of examples failed"
-    # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$BUILD_HOST" \
-        "find $BUILD_ROOT/m6-examples \\( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \\) -exec touch {} +"
-    ok "examples synced and restamped"
-fi
 
 # ── The performance base ─────────────────────────────────────────────────────
 #
@@ -394,9 +358,9 @@ fi
 # tree just synced, so this is the check that an m6 change did not break the
 # code that uses m6.
 if [[ -n "$EXAMPLES" ]]; then
-    info "m6-examples: build, warnings, clippy, tests, and the CMS end-to-end suite"
+    info "examples: build, warnings, clippy, tests, and the CMS end-to-end suite"
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$BUILD_HOST" "EG_DIR=$BUILD_ROOT/m6-examples M6_DIR=$BUILD_ROOT/m6 bash -s" \
+    ssh $SSH_OPTS "$BUILD_HOST" "EG_DIR=$BUILD_ROOT/m6/examples M6_DIR=$BUILD_ROOT/m6 bash -s" \
         > "$EXAMPLES_LOG" 2>&1 <<'REMOTE_EG' || true
 set -uo pipefail
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
@@ -450,9 +414,9 @@ grep -E '^test result:' $T/eg-tests.log || true
 sed -n '/^failures:/,$p' $T/eg-tests.log | head -40
 
 echo "### development certificates"
-# A fresh checkout has no keys: examples/dev-keys.sh writes them to /tmp/m6/dev,
+# A fresh checkout has no keys: dev-keys.sh writes them to /tmp/m6/dev,
 # which the config parse below needs.
-examples/dev-keys.sh
+./dev-keys.sh
 echo "certificates present"
 
 echo "### every example's config parses"
@@ -466,7 +430,7 @@ echo "### every example's config parses"
 # nine of eleven and read exactly like eleven of eleven.
 EG_CONFIG_BAD=0
 EG_CONFIG_UNEXPLAINED=0
-for d in examples/*/; do
+for d in */; do
     name=$(basename "$d")
     case "$name" in
         data) continue ;;   # shared fixtures, not an example
@@ -477,7 +441,7 @@ for d in examples/*/; do
             # It holds one system config per node and one site config per role,
             # so it has no single configs/system-dev.toml for this loop to parse.
             # Its own integration test in
-            # examples/09-global-deployment/integration-test covers it instead,
+            # 09-global-deployment/integration-test covers it instead,
             # and that test ran above.
             printf '  %-24s not parsed: per-node configs, no single system-dev.toml; its integration test covers it\n' "$name"
             continue ;;
@@ -510,7 +474,7 @@ echo "### 05-cms end-to-end"
 cargo build --release -p render-cms 2>&1 | tail -1
 (cd "$M6_DIR" && cargo build --workspace --release 2>&1 | tail -1)
 
-cd examples/05-cms || exit 1
+cd 05-cms || exit 1
 
 # ── The port has to be ours ───────────────────────────────────────────────────
 #
