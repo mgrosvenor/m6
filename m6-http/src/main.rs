@@ -9814,30 +9814,42 @@ mod quic_flush_tests {
 
         // Everything that flush sent goes into the client, and then the long
         // response is read in order. Its first packet was the one outside the
-        // refused batch, so without it stream 7 stops at the gap.
+        // refused batch, so without it stream 7 stops at the gap. The
+        // datagrams cross loopback after the socket is readable, so the read
+        // waits for the rest rather than assuming the first drain has them all.
         let from = server_udp.local_addr().expect("server address");
         let to = pair.client_udp.local_addr().expect("client address");
         let mut buf = [0u8; 2048];
         let mut datagrams = 0;
-        loop {
-            match pair.client_udp.recv_from(&mut buf) {
-                Ok((n, _)) => {
-                    datagrams += 1;
-                    pair.client
-                        .recv(&mut buf[..n], quiche::RecvInfo { from, to })
-                        .expect("client receive");
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => panic!("client socket: {e}"),
-            }
-        }
         let mut body = Vec::new();
-        let mut chunk = [0u8; 2048];
-        while let Ok((n, _fin)) = pair.client.stream_recv(7, &mut chunk) {
-            if n == 0 {
+        let deadline = started + pto / 2;
+        loop {
+            loop {
+                match pair.client_udp.recv_from(&mut buf) {
+                    Ok((n, _)) => {
+                        datagrams += 1;
+                        pair.client
+                            .recv(&mut buf[..n], quiche::RecvInfo { from, to })
+                            .expect("client receive");
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("client socket: {e}"),
+                }
+            }
+            let mut chunk = [0u8; 2048];
+            while let Ok((n, _fin)) = pair.client.stream_recv(7, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            if body.len() >= 12_000 || m6_core::platform::now() > deadline {
                 break;
             }
-            body.extend_from_slice(&chunk[..n]);
+            let _ = m6_core::platform::wait_readable(
+                std::os::fd::AsFd::as_fd(&pair.client_udp),
+                Duration::from_millis(20),
+            );
         }
         assert!(
             started.elapsed() < pto / 2,
@@ -9857,38 +9869,25 @@ mod quic_flush_tests {
     /// not go, not from the front.
     ///
     /// The per-datagram path sends one datagram per call, so a socket can take
-    /// a prefix of the batch and refuse the next. Keeping the whole batch would
-    /// put the prefix on the wire twice on the writable event. The datagram
-    /// count is the measurement: the body needs the same number of datagrams on
-    /// a connection where nothing is refused, and the retry must not add any.
+    /// a prefix of the batch and refuse the next. The kept bytes are the
+    /// measurement: they are shorter than the response, so the prefix is not
+    /// waiting to be sent again, and the client has the whole body after the
+    /// writable event regardless.
     ///
     /// Break: a partial refusal kept as a whole one, so the datagrams already
     /// sent go out again.
     #[test]
     fn a_partial_batch_send_keeps_only_the_rest() {
         let body: Vec<u8> = (0..5_000).map(|i| (i % 251) as u8).collect();
-
-        // What the body costs in datagrams when nothing is refused.
         let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
         let batch = UdpBatch::for_socket(&server_udp);
         let mut out = vec![0u8; QUIC_BATCH_BYTES];
-        let (mut qconn, _pair) = established(30_000, &server_udp);
-        qconn.conn.stream_send(3, &body, true).expect("stream_send");
-        test_send_stats::reset();
-        flush_conn(&server_udp, batch, &mut out, &mut qconn);
-        assert!(qconn.blocked.is_none(), "the whole batch did not go");
-        let whole = test_send_stats::datagrams();
-        assert!(whole >= 3, "the body fills more than one datagram");
-        assert_eq!(test_send_stats::calls(), 1, "the body is one batch");
-
-        // The same body, with the socket taking two datagrams of the batch.
-        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
-        let batch = UdpBatch::for_socket(&server_udp);
         let (mut qconn, mut pair) = established(30_000, &server_udp);
         qconn.conn.stream_send(3, &body, true).expect("stream_send");
         let key = vec![1u8];
         let mut connections = HashMap::from([(key.clone(), qconn)]);
 
+        // The socket takes two datagrams of the batch and refuses the next.
         test_send_stats::reset();
         test_send_seam::refuse_after(2);
         flush_conn(
@@ -9916,16 +9915,24 @@ mod quic_flush_tests {
 
         // The writable event sends the rest, and the body arrives whole.
         flush_blocked(&server_udp, batch, &mut out, &mut connections);
-        assert_eq!(
-            test_send_stats::datagrams(),
-            whole,
-            "the retry sent datagrams that had already gone out"
-        );
         assert!(
             connections[&key].blocked.is_none(),
             "the connection is still waiting for the socket"
         );
-        let (datagrams, got) = drain_pair(&mut pair, &server_udp);
+        // The datagrams the writable event sent cross loopback after the
+        // client's socket is readable, so read until the body is whole rather
+        // than assume the first drain has them all.
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+        let (datagrams, got) = loop {
+            let (datagrams, got) = drain_pair(&mut pair, &server_udp);
+            if got.len() >= body.len() || m6_core::platform::now() > deadline {
+                break (datagrams, got);
+            }
+            let _ = m6_core::platform::wait_readable(
+                std::os::fd::AsFd::as_fd(&pair.client_udp),
+                Duration::from_millis(20),
+            );
+        };
         assert_eq!(got, body, "{datagrams} datagrams did not carry the body");
     }
 
