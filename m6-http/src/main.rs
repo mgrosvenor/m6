@@ -223,8 +223,40 @@ fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
 
 // ── Per-connection state ──────────────────────────────────────────────────────
 
+/// The buffer factory a QUIC listener connection is built over.
+///
+/// A response body here is a cached [`Bytes`], and `Bytes` is
+/// `Clone + AsRef<[u8]>` and splits without copying, so `send_body_zc` puts a
+/// reference to the cached body on the stream's send queue instead of copying
+/// the body into it. The clone is one reference count. The page cache buffer
+/// keeps its address and stays alive for as long as quiche holds it, so an
+/// entry evicted while a response is still being sent cannot pull the bytes out
+/// from under the connection. Nothing in this factory moves a cached buffer.
+///
+/// `buf_from_slice` is the fallback quiche uses for storage it makes itself
+/// (received stream data, a send queue that could not take a whole buffer), and
+/// it copies exactly as the default factory does.
+#[derive(Clone, Debug, Default)]
+struct BodyBuffers;
+
+impl quiche::BufFactory for BodyBuffers {
+    type Buf = Bytes;
+    type DgramBuf = Vec<u8>;
+
+    fn buf_from_slice(buf: &[u8]) -> Bytes {
+        Bytes::copy_from_slice(buf)
+    }
+
+    fn dgram_buf_from_slice(buf: &[u8]) -> Vec<u8> {
+        buf.to_vec()
+    }
+}
+
+/// The server end of one QUIC connection.
+type QuicTransport = quiche::Connection<BodyBuffers>;
+
 struct QuicConn {
-    conn: quiche::Connection,
+    conn: QuicTransport,
     h3_conn: Option<quiche::h3::Connection>,
     /// Pending streams: stream_id -> accumulated request state
     pending: HashMap<u64, PendingRequest>,
@@ -3605,7 +3637,13 @@ fn drain_udp(
                 rand::thread_rng().fill_bytes(&mut scid_bytes);
                 let key = scid_bytes.to_vec();
                 let scid = quiche::ConnectionId::from_vec(key.clone());
-                let conn = match quiche::accept(&scid, None, udp.local, from, quiche_config) {
+                let conn = match quiche::accept_with_buf_factory::<BodyBuffers>(
+                    &scid,
+                    None,
+                    udp.local,
+                    from,
+                    quiche_config,
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         warn!("quiche::accept error: {}", e);
@@ -4633,18 +4671,25 @@ fn send_h3_response(
         }
     }
     if !body.is_empty() {
-        match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
-            Ok(written) if written == body.len() => {}
-            Ok(written) => {
-                // Partial write — store remainder, retry on conn.writable()
+        // The length is taken before the call because a partial write leaves
+        // `buf` holding only the unsent remainder, and its length is not the
+        // written count.
+        let total = body.len();
+        let mut buf = body;
+        match h3.send_body_zc(&mut qconn.conn, stream_id, &mut buf, true) {
+            Ok(written) if written == total => {}
+            Ok(_) => {
+                // Partial write. `buf` now holds exactly the bytes the stream
+                // did not take, so the retry starts at offset 0.
                 qconn
                     .partial_responses
-                    .insert(stream_id, PendingH3Response::Body(body, written));
+                    .insert(stream_id, PendingH3Response::Body(buf, 0));
             }
             Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
+                // Nothing was written and `buf` still holds the whole body.
                 qconn
                     .partial_responses
-                    .insert(stream_id, PendingH3Response::Body(body, 0));
+                    .insert(stream_id, PendingH3Response::Body(buf, 0));
             }
             Err(e) => warn!("h3 send_body error: {}", e),
         }
@@ -7513,20 +7558,22 @@ fn drain_writable(qconn: &mut QuicConn) {
                 }
             }
             PendingH3Response::Body(body, offset) => {
-                let remaining = &body[offset..];
-                match h3.send_body(&mut qconn.conn, stream_id, remaining, true) {
-                    Ok(written) => {
-                        let new_offset = offset + written;
-                        if new_offset < body.len() {
-                            qconn
-                                .partial_responses
-                                .insert(stream_id, PendingH3Response::Body(body, new_offset));
-                        }
+                // A slice of `Bytes` is a reference count bump, so the retry
+                // hands quiche the same cached bytes the first attempt did.
+                let mut remaining = body.slice(offset..);
+                let total = remaining.len();
+                match h3.send_body_zc(&mut qconn.conn, stream_id, &mut remaining, true) {
+                    Ok(written) if written == total => {}
+                    Ok(_) => {
+                        // `remaining` holds the part the stream did not take.
+                        qconn
+                            .partial_responses
+                            .insert(stream_id, PendingH3Response::Body(remaining, 0));
                     }
                     Err(quiche::h3::Error::Done) | Err(quiche::h3::Error::StreamBlocked) => {
                         qconn
                             .partial_responses
-                            .insert(stream_id, PendingH3Response::Body(body, offset));
+                            .insert(stream_id, PendingH3Response::Body(remaining, 0));
                     }
                     Err(e) => {
                         warn!("h3 drain_writable send_body error: {}", e);
@@ -9389,10 +9436,10 @@ mod quic_flush_tests {
     /// A zero delay is what a loopback pump is. A real path's round trip is the
     /// size of the wait a stalled flush would serve, so a test that bounds that
     /// wait gives the handshake one.
-    fn pump(
-        a: &mut quiche::Connection,
+    fn pump<A: quiche::BufFactory, B: quiche::BufFactory>(
+        a: &mut quiche::Connection<A>,
         a_addr: SocketAddr,
-        b: &mut quiche::Connection,
+        b: &mut quiche::Connection<B>,
         b_addr: SocketAddr,
         delay: Duration,
     ) {
@@ -9481,8 +9528,14 @@ mod quic_flush_tests {
             &mut client_cfg,
         )
         .expect("connect");
-        let mut server =
-            quiche::accept(&cid, None, server_addr, client_addr, &mut server_cfg).expect("accept");
+        let mut server = quiche::accept_with_buf_factory::<BodyBuffers>(
+            &cid,
+            None,
+            server_addr,
+            client_addr,
+            &mut server_cfg,
+        )
+        .expect("accept");
         pump(&mut client, client_addr, &mut server, server_addr, delay);
         assert!(client.is_established() && server.is_established());
         let now = m6_core::platform::now();
