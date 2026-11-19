@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 // ── binary locations ──────────────────────────────────────────────────────────
 
 fn m6_root() -> PathBuf {
-    // integration-test/  →  09-global-deployment/  →  examples/  →  m6-examples/  →  m6/
+    // integration-test/  →  09-global-deployment/  →  examples/  →  m6/
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../m6")
+        .join("../../..")
         .canonicalize()
         .expect("m6 workspace root")
 }
@@ -44,9 +44,9 @@ fn m6_bin(name: &str) -> Option<PathBuf> {
 }
 
 fn render_cms_bin() -> Option<PathBuf> {
-    // integration-test/ → 09-global-deployment/ → examples/ → m6-examples/target/release/
+    // integration-test/ → 09-global-deployment/ → examples/target/release/
     let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/release/render-cms")
+        .join("../../target/release/render-cms")
         .canonicalize();
     if let Ok(p) = bin {
         if p.exists() {
@@ -70,7 +70,7 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 fn site07_dir() -> PathBuf {
-    // integration-test/  →  09-global-deployment/  →  examples/07-dev-to-production/
+    // integration-test/  →  09-global-deployment/  →  07-dev-to-production/
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../07-dev-to-production")
         .canonicalize()

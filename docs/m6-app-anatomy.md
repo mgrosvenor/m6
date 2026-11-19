@@ -769,10 +769,11 @@ Everything in this section arrives by linking one crate, and §9 is how to link 
 **A service outside this repository reaches core by path or by git revision.**
 This section gives both and says what each one costs.
 
-A relative path is what `m6-examples` uses.
+A relative path is the simplest form.
+The crates in `examples/` use it, inside this repository.
 
 ```toml
-m6-core = { path = "../../../../m6/m6-core" }
+m6-core = { path = "../m6/m6-core" }
 ```
 
 That is a directory layout across a repository boundary.

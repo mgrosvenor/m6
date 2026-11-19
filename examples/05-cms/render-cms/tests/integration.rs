@@ -31,9 +31,9 @@ use rustls::pki_types::ServerName;
 // ── locate binaries ───────────────────────────────────────────────────────────
 
 fn m6_root() -> PathBuf {
-    // render-cms/  →  05-cms/  →  examples/  →  m6-examples/  →  m6/
+    // render-cms/  →  05-cms/  →  examples/  →  m6/
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../m6")
+        .join("../../..")
         .canonicalize()
         .expect("m6 workspace root")
 }

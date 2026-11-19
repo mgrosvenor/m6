@@ -15,9 +15,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-EXAMPLES_DIR="$SCRIPT_DIR/examples"
+EXAMPLES_DIR="$SCRIPT_DIR"
 M6_RUN="$SCRIPT_DIR/m6-run-eg"
-M6_DIR="${M6:-$(cd "$SCRIPT_DIR/../m6" 2>/dev/null && pwd || echo "")}"
+M6_DIR="${M6:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 KEEP=0
 PASS=0
@@ -213,7 +213,7 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
 fi
 
 echo ""
-bold "=== m6-examples integration tests ==="; echo ""
+bold "=== m6 examples integration tests ==="; echo ""
 echo ""
 
 for n in "${TARGETS[@]}"; do

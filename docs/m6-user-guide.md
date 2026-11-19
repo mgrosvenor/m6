@@ -27,7 +27,7 @@ The examples need a release build of m6, a certificate tool and the m6 checkout,
 [`README.md`](../README.md) section 1, steps 1 to 3, gives the commands.
 Step 1 puts `target/release` on `PATH`, which makes every m6 binary available, including `m6-md`, which Example 02 uses.
 Rust 1.89 or newer provides the compiler and Cargo.
-The two checkouts must sit side by side, because the renderer crates reach m6 through the relative path `../../../../m6/m6-core`.
+The renderer crates reach m6 through the relative path `../../../m6-core`, inside this repository.
 
 m6-http serves the public site over *TLS* (Transport Layer Security), so every site needs a certificate.
 `mkcert` issues a development certificate that a browser trusts.
@@ -202,8 +202,8 @@ cd examples/01-static
 ./dev.sh
 ```
 
-The script looks for the m6 checkout beside this repository, at `../../../m6`.
-Set `M6` to a different path when the two checkouts are not siblings.
+The script finds the m6 checkout it sits in, at `../..`.
+Set `M6` to a different path to use another checkout.
 
 [`m6-site-toml.md`](m6-site-toml.md) owns every config key.
 [`m6-file.md`](m6-file.md) owns the handler and wildcard rules.
@@ -350,7 +350,7 @@ cd examples/03-contact
 ### 4.1. `render-contact/Cargo.toml`
 
 `render-contact` is a Rust crate in the `examples/` workspace.
-Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that supplies the *SMTP* client a service's loop drives.
+Its manifest depends on m6-core by the relative path `../../../m6-core`, with the `email` feature that supplies the *SMTP* client a service's loop drives.
 `anyhow` and `serde_json` handle errors and JSON.
 
 ```toml
@@ -360,7 +360,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-core    = { path = "../../../../m6/m6-core", features = ["email"] }
+m6-core    = { path = "../../../m6-core", features = ["email"] }
 anyhow     = "1"
 serde_json = "1"
 ```
@@ -833,7 +833,7 @@ The publisher and reader tokens come from `setup.sh`, and section 7.14 gives the
 ### 6.3. `render-cms/Cargo.toml`
 
 `render-cms` is a Rust crate in the `examples/` workspace.
-Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), on `base64` for the editor transport, and on `rustls` and `rustls-pemfile` for the TLS connection that carries `POST /genid`.
+Its manifest depends on m6-core by the relative path `../../../m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), on `base64` for the editor transport, and on `rustls` and `rustls-pemfile` for the TLS connection that carries `POST /genid`.
 
 ```toml
 [package]
@@ -842,7 +842,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-core    = { path = "../../../../m6/m6-core" }
+m6-core    = { path = "../../../m6-core" }
 serde_json = "1"
 comrak     = { version = "0.21", default-features = false }
 base64     = "0.22"

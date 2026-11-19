@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-m6-core    = { path = "../../../../m6/m6-core" }
+m6-core    = { path = "../../../m6-core" }
 genid-publisher = { path = "../../common/genid-publisher" }
 serde_json = "1"

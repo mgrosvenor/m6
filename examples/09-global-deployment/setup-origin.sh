@@ -27,7 +27,7 @@ if [ ! -f /etc/m6/auth.pem ]; then
     # curve parameters where OpenSSL writes the prime256v1 OID, and the token signer
     # only accepts the named form. Without it every login on a Mac fails with
     # "JWT encode error: InvalidEcdsaKey" even with the right password. The long
-    # version is in examples/05-cms/setup.sh.
+    # version is in 05-cms/setup.sh.
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out /etc/m6/auth.pem
     openssl pkey -in /etc/m6/auth.pem -pubout -out /etc/m6/auth.pub
     chmod 600 /etc/m6/auth.pem

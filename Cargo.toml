@@ -22,6 +22,10 @@ members = [
     "m6-http/tests/backends/rust-plain",
     "m6-http/tests/backends/rust-m6core",
 ]
+# The examples are their own workspace (examples/Cargo.toml): they build the
+# renderers that depend on m6-core by path, with their own lock file and target
+# directory, and nothing here compiles them.
+exclude = ["examples"]
 resolver = "2"
 
 # Shared by every crate in the workspace, so they cannot drift apart. Each

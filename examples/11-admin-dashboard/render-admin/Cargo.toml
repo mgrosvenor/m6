@@ -12,7 +12,7 @@ name = "render-admin"
 path = "src/main.rs"
 
 [dependencies]
-m6-core     = { path = "../../../../m6/m6-core" }
+m6-core     = { path = "../../../m6-core" }
 genid-publisher = { path = "../../common/genid-publisher" }
 sysinfo     = "0.31"
 serde_json  = "1"

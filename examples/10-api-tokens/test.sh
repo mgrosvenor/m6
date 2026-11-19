@@ -4,7 +4,7 @@
 set -e
 
 SITE="$(cd "$(dirname "$0")" && pwd)"
-M6="${M6:-$(cd "$SITE/../../../m6" && pwd)}"
+M6="${M6:-$(cd "$SITE/../.." && pwd)}"
 export PATH="$M6/target/release:$PATH"
 
 BASE="https://localhost:8443"

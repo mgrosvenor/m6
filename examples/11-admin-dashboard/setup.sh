@@ -3,8 +3,8 @@
 set -e
 
 SITE="$(cd "$(dirname "$0")" && pwd)"
-M6="$(cd "$SITE/../../../m6" && pwd)"
-export PATH="$M6/target/release:$SITE/../../../m6-examples/target/release:$PATH"
+M6="$(cd "$SITE/../.." && pwd)"
+export PATH="$M6/target/release:$SITE/../target/release:$PATH"
 
 echo "=== 11-admin-dashboard setup ==="
 

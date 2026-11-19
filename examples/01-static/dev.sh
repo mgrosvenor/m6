@@ -3,7 +3,7 @@
 set -e
 
 SITE="$(cd "$(dirname "$0")" && pwd)"
-M6="${M6:-$(cd "$SITE/../../.." && pwd)/m6}"
+M6="${M6:-$(cd "$SITE/../.." && pwd)}"
 export PATH="$M6/target/release:$PATH"
 
 # Development keys and state: a private per-user directory, see dev-home.sh.

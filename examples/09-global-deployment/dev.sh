@@ -17,8 +17,8 @@ set -e
 
 SITE09="$(cd "$(dirname "$0")" && pwd)"
 SITE07="$(cd "$SITE09/../07-dev-to-production" && pwd)"
-M6="${M6:-$(cd "$SITE09/../../../m6" && pwd)}"
-EXAMPLES="${EXAMPLES:-$(cd "$SITE09/../.." && pwd)}"
+M6="${M6:-$(cd "$SITE09/../.." && pwd)}"
+EXAMPLES="${EXAMPLES:-$(cd "$SITE09/.." && pwd)}"
 export PATH="$M6/target/release:$PATH"
 
 # Development keys and state: a private per-user directory, see dev-home.sh.
@@ -28,7 +28,7 @@ export PATH="$M6/target/release:$PATH"
 # ── Require 07 to have been set up first ─────────────────────────────────────
 if [ ! -f $M6_DEV_HOME/07-dev-to-production/auth.db ]; then
     echo "ERROR: $M6_DEV_HOME/07-dev-to-production/auth.db not found."
-    echo "Run examples/07-dev-to-production/dev.sh first to set up the auth database." >&2
+    echo "Run 07-dev-to-production/dev.sh first to set up the auth database." >&2
     exit 1
 fi
 

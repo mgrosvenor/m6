@@ -3,7 +3,7 @@
 set -e
 
 SITE="$(cd "$(dirname "$0")" && pwd)"
-M6="${M6:-$(cd "$SITE/../../.." && pwd)/m6}"
+M6="${M6:-$(cd "$SITE/../.." && pwd)}"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RESET='\033[0m'
 info() { echo -e "${YELLOW}----${RESET} $1"; }

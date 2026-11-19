@@ -133,7 +133,7 @@ if $PUSH_BINARY; then
     echo "==> Pushing binary to origin..."
     # shellcheck disable=SC2086
     rsync -az $SSH_OPTS \
-        "$SCRIPT_DIR/../../target/release/render-cms" \
+        "$SCRIPT_DIR/../target/release/render-cms" \
         "$ORIGIN:$SITE_DIR/bin/"
     # shellcheck disable=SC2086
     ssh $SSH_OPTS "$ORIGIN" "systemctl restart render-cms 2>/dev/null || true"

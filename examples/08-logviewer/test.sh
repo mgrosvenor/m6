@@ -10,7 +10,7 @@
 set -e
 
 SITE="$(cd "$(dirname "$0")" && pwd)"
-M6="${M6:-$(cd "$SITE/../../.." && pwd)/m6}"  # sibling repo; override with M6=/path
+M6="${M6:-$(cd "$SITE/../.." && pwd)}"  # this repository; override with M6=/path
 
 # ── Flags ──────────────────────────────────────────────────────────────────────
 RUN_SUITE_B=true

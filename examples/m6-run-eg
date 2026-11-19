@@ -13,14 +13,14 @@
 # Flags (can appear anywhere):
 #   --no-browser                        don't open the browser after start
 #
-# Examples live in examples/<NN>-<name>/dev.sh
+# Examples live in <NN>-<name>/dev.sh
 # Each dev stack owns a pgid stored in /tmp/m6-eg/<NN>.pgid
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-EXAMPLES_DIR="$SCRIPT_DIR/examples"
-M6_DIR="${M6:-$(cd "$SCRIPT_DIR/../m6" 2>/dev/null && pwd || echo "")}"
+EXAMPLES_DIR="$SCRIPT_DIR"
+M6_DIR="${M6:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PGID_DIR="/tmp/m6-eg"
 OPEN_BROWSER=1
 
@@ -315,7 +315,7 @@ rebuild_eg() {
         pkg_name=$(grep '^name' "$cargo_toml" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
         if [ -n "$pkg_name" ]; then
             echo "running: cargo build --release -p $pkg_name"
-            (cd "$EXAMPLES_DIR/.." && cargo build --release -p "$pkg_name")
+            (cd "$EXAMPLES_DIR" && cargo build --release -p "$pkg_name")
             built=1
         fi
     done < <(find "$dir" -maxdepth 2 -name "Cargo.toml" ! -path "$dir/Cargo.toml")
