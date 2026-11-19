@@ -8731,7 +8731,7 @@ mod flush_due_tests {
             quiche::accept(&cid, None, server_addr, client_addr, &mut server_cfg).expect("accept");
         pump(&mut client, client_addr, &mut server, server_addr);
         assert!(client.is_established() && server.is_established());
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         let qconn = QuicConn {
             conn: server,
             h3_conn: None,
@@ -8754,8 +8754,8 @@ mod flush_due_tests {
     /// Wait for a datagram on the client's socket, or report there is none.
     fn datagram_arrived(udp: &UdpSocket) -> bool {
         let mut buf = [0u8; 2048];
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline {
+        let deadline = m6_core::platform::now() + Duration::from_millis(500);
+        while m6_core::platform::now() < deadline {
             if udp.recv_from(&mut buf).is_ok() {
                 return true;
             }
@@ -8783,11 +8783,11 @@ mod flush_due_tests {
             .timeout_instant()
             .expect("a timer is armed");
         // quiche reads the real clock, so the timer has to really pass.
-        while Instant::now() < at {
+        while m6_core::platform::now() < at {
             std::hint::spin_loop();
         }
         assert!(!connections[&vec![1u8]].conn.is_closed());
-        flush_due(&server_udp, &mut connections, Instant::now());
+        flush_due(&server_udp, &mut connections, m6_core::platform::now());
         assert!(
             connections[&vec![1u8]].conn.is_closed(),
             "a connection past its idle timeout was not driven"
@@ -8808,10 +8808,10 @@ mod flush_due_tests {
         assert!(idle_at > due_at, "the idle connection's timer is later");
         let mut connections = HashMap::from([(vec![1u8], idle), (vec![2u8], due)]);
 
-        while Instant::now() < due_at {
+        while m6_core::platform::now() < due_at {
             std::hint::spin_loop();
         }
-        flush_due(&server_udp, &mut connections, Instant::now());
+        flush_due(&server_udp, &mut connections, m6_core::platform::now());
 
         assert!(
             connections[&vec![2u8]].conn.is_closed(),
