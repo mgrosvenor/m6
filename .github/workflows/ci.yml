@@ -702,6 +702,11 @@ jobs:
           echo "examples release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building the examples"; exit 1; }
 
+      - name: Examples rustfmt
+        if: ${{ !cancelled() }}
+        working-directory: examples
+        run: cargo fmt --all --check
+
       - name: Examples clippy, silent
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: examples
@@ -747,6 +752,38 @@ jobs:
           fi
           [ "$status" -eq 0 ] || { tail -60 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
 
+      # A guide that shows m6-http must show a command that starts: m6-http takes a
+      # site directory and a system config. A renewal hook that touches a system
+      # config only works when that file is the one m6-http is started with, so
+      # every `touch` path must be one the same file passes to m6-http. Reads
+      # the guides and the unit files.
+      - name: Guides start m6-http with two arguments, and hooks touch its config
+        working-directory: examples
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          files = subprocess.check_output(
+              ["git", "ls-files", "*.md", "*.service", ":!*posts.json"], text=True).split()
+          bad = []
+          for f in files:
+              text = open(f, encoding="utf-8").read().replace("\\\n", " ")
+              configs = set()
+              for m in re.finditer(r"^ExecStart=\S*/m6-http\s+(.*)$", text, re.M):
+                  args = m.group(1).split()
+                  if len(args) < 2:
+                      bad.append(f"{f}: m6-http ExecStart passes {len(args)} argument(s), needs 2: {m.group(0)}")
+                  else:
+                      configs.add(args[1])
+              for m in re.finditer(r"NODE_CONFIG=(\S+)", text):
+                  configs.add(m.group(1))
+                  configs.add("${NODE_CONFIG}")
+              for m in re.finditer(r"^touch (/etc/m6/\S+\.toml)\s*$", text, re.M):
+                  if m.group(1) not in configs:
+                      bad.append(f"{f}: a hook touches {m.group(1)}, which m6-http is not started with here")
+          print("\n".join(bad) if bad else f"{len(files)} files checked")
+          sys.exit(1 if bad else 0)
+          PY
+
       # m6-file's config schema changed on 2026-09-12 and ten example configs
       # were left naming no handler, so the service exited 2 before binding and
       # every asset in every example returned 502 for two days. Parsing each
@@ -776,7 +813,7 @@ jobs:
           for d in */; do
             name=$(basename "$d")
             case "$name" in
-              data|target) continue ;;
+              data|common|target) continue ;;
               06-systemd) echo "  $name  not parsed: systemd units only, no site config"; continue ;;
               09-global-deployment) echo "  $name  not parsed: per-node configs, no single system-dev.toml; its integration test covers it"; continue ;;
             esac
@@ -786,7 +823,10 @@ jobs:
               echo "  $name  NO CONFIG and no reason recorded for that"
               unexplained=$((unexplained + 1)); continue
             fi
-            if out=$(m6-http "$(cd "$d" && pwd)" "$(cd "$(dirname "$sys")" && pwd)/$(basename "$sys")" --dump-config 2>&1 >/dev/null) && [ -z "$out" ]; then
+            # The checked-in config names the key directory as @M6_DEV_HOME@;
+            # m6 reads the copy with the real path filled in.
+            sys=$(. ./dev-home.sh && m6_conf "$sys")
+            if out=$(m6-http "$(cd "$d" && pwd)" "$sys" --dump-config 2>&1 >/dev/null) && [ -z "$out" ]; then
               echo "  $name  ok"
             else
               echo "  $name  $(echo "$out" | head -1)"
