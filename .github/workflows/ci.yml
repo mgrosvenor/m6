@@ -906,6 +906,39 @@ jobs:
             kill -9 "$pid" 2>/dev/null || true
           fi
 
+      # Examples 03 and 04 each have a test.sh: 03 drives the contact form against
+      # a scripted mail relay it starts itself, and 04 drives the auth server
+      # (login, refresh, logout, the throttle). They share port 8443 with 05, so
+      # this runs after 05's stack is stopped, and each stack here is stopped, by
+      # the pid this step recorded, before the next one starts.
+      - name: Examples 03 and 04, end to end
+        if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
+        working-directory: examples
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          status=0
+          for ex in 03-contact 04-auth; do
+            echo "=== $ex ==="
+            M6="$GITHUB_WORKSPACE" "$ex/dev.sh" > "$ex/dev.log" 2>&1 &
+            dev_pid=$!
+            code=000
+            for _ in $(seq 1 120); do
+              code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
+              [ "$code" = "200" ] && break
+              sleep 1
+            done
+            if [ "$code" = "200" ]; then
+              "$ex/test.sh" || { echo "--- $ex service logs ---"; tail -30 "$ex"/logs/*.log 2>/dev/null; status=1; }
+            else
+              echo "--- $ex dev.sh ---"; tail -40 "$ex/dev.log"
+              echo "::error::the $ex stack never answered in 120s"
+              status=1
+            fi
+            kill "$dev_pid" 2>/dev/null || true
+            wait "$dev_pid" 2>/dev/null || true
+          done
+          [ "$status" -eq 0 ] || { echo "::error::an example test.sh failed"; exit 1; }
+
   changelog:
     name: the release says what changed and m6's docs say what is true
     # Only for a release: a pull request into main IS the release now, so this is

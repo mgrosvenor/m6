@@ -105,7 +105,7 @@ cache    = "no-store"
 
 [smtp]
 host     = "localhost"
-port     = 1025
+port     = 2525
 username = ""
 password = ""
 from     = "dev@localhost"
@@ -240,7 +240,7 @@ For template, data and content changes: `./deploy.sh`, then one `POST /genid` (t
 | `m6-http` invocation | `m6-http $SITE "$(m6_conf $SITE/configs/system-dev.toml)"` | `m6-http /var/www/my-blog /etc/m6/my-blog.toml` |
 | `[server] bind` | `127.0.0.1:8443` | `0.0.0.0:443` |
 | TLS cert | `@M6_DEV_HOME@/dev/dev.pem` | `/run/credentials/m6-http.service/tls-cert.pem` |
-| SMTP | `localhost:1025` (mock) | `smtp.postmarkapp.com:587` |
+| SMTP | `localhost:2525` (mock) | `smtp.postmarkapp.com:587` |
 | SMTP credentials | inline in renderer config | `/etc/m6/contact-secrets.toml` via `secrets_file` |
 | `[auth] backend` | `m6-auth-check` | `m6-auth-check` |
 | publisher token (`[genid] token_file` in the renderer config) | `@M6_DEV_HOME@/07-dev-to-production/genid-write.token` | `/run/credentials/render-cms.service/genid-write.token` |

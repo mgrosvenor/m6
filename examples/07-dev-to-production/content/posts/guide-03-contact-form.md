@@ -127,7 +127,7 @@ cache    = "no-store"
 # deleted from here: a key set in both files is refused at start.
 [smtp]
 host     = "localhost"
-port     = 1025
+port     = 2525
 # The development relay speaks plain SMTP, which m6-core allows only to
 # localhost. Production relays take STARTTLS: delete this line.
 starttls = false
