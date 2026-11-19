@@ -285,6 +285,13 @@ impl Fixture {
             // and not the other. The interval is the debug build's documented
             // test channel, and this only pushes the first emit past any run.
             .env("M6_TEST_STATS_INTERVAL_SECS", "3600")
+            // The once-a-second accounting tick is not request work either: it
+            // flushes the log, checks the heap's growth and reads one host
+            // source. One tick's calls depend on which source it steps, so a
+            // slow runner, whose runs cross more ticks, would see a per-run
+            // cost arrive in this per-request figure. Pushing the tick past the
+            // run leaves the count with the requests alone.
+            .env("M6_TEST_ACCOUNTING_TICK_SECS", "3600")
             .current_dir(self.dir.path());
         let mut svc = Service::spawn("m6-http-allocations", &mut cmd);
         svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);

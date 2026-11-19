@@ -2991,6 +2991,16 @@ fn event_loop(
     ]);
     let mut last = m6_core::platform::now();
     let mut last_log_tick = last;
+    // The accounting tick: flush the log buffers, check the heap's growth and
+    // read one host source, once a second. A debug build reads
+    // `M6_TEST_ACCOUNTING_TICK_SECS` to move it, so a test that counts
+    // allocations over a run can keep this periodic work out of its window. It
+    // is not request work, its cost depends on which host source the tick
+    // steps, and a longer run crosses more ticks, so leaving it in a window
+    // turns a per-run cost into a per-request figure that moves with the
+    // runner's speed.
+    let accounting_tick = test_accounting_tick();
+
     let mut accepting = tcp.is_some() || h2c.is_some();
     // Set by a disk slice that found nothing it could do; see the slice below.
     let mut disk_slice_stalled = false;
@@ -3365,7 +3375,7 @@ fn event_loop(
 
         // The accounting tick: flush the log buffers once a second, next to
         // the loop trace's own accounting.
-        if now2.duration_since(last_log_tick) >= std::time::Duration::from_secs(1) {
+        if now2.duration_since(last_log_tick) >= accounting_tick {
             m6_core::log::tick(m6_core::platform::wall());
             m6_core::alloc::note_growth();
             // One host source a tick: one small file, never the whole block.
@@ -7815,16 +7825,23 @@ const STARTUP_FLAGS: &[m6_core::startup::FlagDecl] = &[
 
 /// The environment variables m6-http reads that change its behaviour.
 ///
-/// A release build does not read the test interval, so it is not declared
+/// A release build does not read the test intervals, so they are not declared
 /// there: the record lists what this binary reads, not what a debug build of
 /// it might.
 fn startup_env() -> &'static [m6_core::startup::EnvDecl] {
     #[cfg(debug_assertions)]
-    const ALL: &[m6_core::startup::EnvDecl] = &[m6_core::startup::EnvDecl {
-        name: "M6_TEST_STATS_INTERVAL_SECS",
-        why: "shortens the stats tick in a test build",
-        setting: Some("stats.interval_s"),
-    }];
+    const ALL: &[m6_core::startup::EnvDecl] = &[
+        m6_core::startup::EnvDecl {
+            name: "M6_TEST_STATS_INTERVAL_SECS",
+            why: "shortens the stats tick in a test build",
+            setting: Some("stats.interval_s"),
+        },
+        m6_core::startup::EnvDecl {
+            name: "M6_TEST_ACCOUNTING_TICK_SECS",
+            why: "moves the accounting tick in a test build",
+            setting: None,
+        },
+    ];
     #[cfg(not(debug_assertions))]
     const ALL: &[m6_core::startup::EnvDecl] = &[];
     ALL
@@ -8527,6 +8544,27 @@ fn initial_stats(interval_s: u64, traffic_interval_s: u64) -> Stats {
     }
     Stats::with_interval(std::time::Duration::from_secs(interval_s))
         .with_traffic_interval(std::time::Duration::from_secs(traffic_interval_s))
+}
+
+/// The accounting tick's period for this process.
+///
+/// One second: flush the log buffers, check the heap's growth and read one host
+/// source. That work is not request work, and one tick's own allocations depend
+/// on which host source it steps, so a test that counts allocations across a run
+/// keeps it out of the window by moving the period past the run through
+/// `M6_TEST_ACCOUNTING_TICK_SECS`. This is the same debug-only channel the stats
+/// tick has, and for the same reason: a `#[cfg(test)]` default cannot reach a
+/// spawned process. A release build does not read the variable.
+fn test_accounting_tick() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var("M6_TEST_ACCOUNTING_TICK_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    {
+        return std::time::Duration::from_secs(secs);
+    }
+    std::time::Duration::from_secs(1)
 }
 
 #[cfg(test)]

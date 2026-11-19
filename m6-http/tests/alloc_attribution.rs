@@ -145,6 +145,10 @@ impl Fixture {
             // crossed the ten-second tick would add its allocations to one K
             // and not the other. This pushes the first emit past any run.
             .env("M6_TEST_STATS_INTERVAL_SECS", "3600")
+            // Same reason as `allocations`: the accounting tick reads a host
+            // source every second, and those readings allocate on some
+            // platforms. A slower, longer run would cross more of them.
+            .env("M6_TEST_ACCOUNTING_TICK_SECS", "3600")
             .current_dir(self.dir.path());
         let mut svc = Service::spawn("m6-http-alloc-attribution", &mut cmd);
         svc.wait_for_tcp(self.port.port(), m6_core::testkit::STARTUP_BOUND);

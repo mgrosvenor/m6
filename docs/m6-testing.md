@@ -113,7 +113,7 @@ The scripts do not use `binary`.
 `bench.sh` builds the release binaries it needs itself.
 `bench.sh --handshake` measures handshakes only, and its header documents `BENCH_KEY` and `BENCH_FEATURES`.
 
-### 3.1. The accounting-tick test hook
+### 3.1. The periodic-tick test hooks
 
 `m6-http` writes its accounting stats every ten seconds (`[stats] interval_s`).
 Suites such as `cache_accounting` and `disk_cache` spawn the real binary and set `M6_TEST_STATS_INTERVAL_SECS` to shorten the tick, because a `#[cfg(test)]` default cannot reach a spawned process.
@@ -123,6 +123,13 @@ A debug build reads `M6_TEST_STATS_INTERVAL_SECS` in `initial_stats()` in `m6-ht
 It uses that many seconds for both the stats and traffic intervals when the value parses as a positive integer.
 Exporting the variable before running a debug `m6-http` by hand shortens that process's tick, and every metrics line's trace window with it.
 A release build does not read the variable.
+
+The loop's once-a-second accounting tick is a second period, and it has its own hook.
+That tick flushes the log buffers, checks the heap's growth and reads one host source.
+A source's reading allocates, and how much depends on the source and the platform.
+A test that counts allocations over a run therefore sets `M6_TEST_ACCOUNTING_TICK_SECS` to a value past the run, which keeps the tick out of the window: the counts then hold the requests alone, on a runner of any speed.
+`allocations` and `alloc_attribution` do that.
+`test_accounting_tick()` in `m6-http/src/main.rs` reads the variable, the value is seconds when it parses as a positive integer, and a release build does not read it.
 
 ## 4. Conformance: h1spec, h2spec and h3spec
 
