@@ -292,6 +292,11 @@ pub fn buffer_sizes(sock: &impl AsFd) -> io::Result<(usize, usize)> {
 /// socket without segmentation offload takes, on either target: Linux falls
 /// back to it for a socket that has no `UDP_SEGMENT`, and macOS has nothing
 /// else.
+///
+/// Returns the bytes the socket took. A socket with no room for the next
+/// datagram stops the send with `Ok` and a count below `segments.len()`, so a
+/// caller retries only the datagrams that did not go out. Anything else that
+/// stops the send is an `Err`.
 pub(super) fn udp_send_each(
     socket: &impl AsFd,
     segments: &[u8],
@@ -305,7 +310,21 @@ pub(super) fn udp_send_each(
     let mut sent = 0;
     while sent < segments.len() {
         let len = (segments.len() - sent).min(segment_size);
-        let wrote = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())?;
+        #[cfg(test)]
+        let result = if test_send_blocked::due(sent) {
+            Err(nix::errno::Errno::EAGAIN)
+        } else {
+            sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())
+        };
+        #[cfg(not(test))]
+        let result = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty());
+        let wrote = match result {
+            Ok(wrote) => wrote,
+            // The datagrams before this one are on the wire. Reporting the
+            // count keeps them from being sent again by the retry.
+            Err(e) if io::Error::from(e).kind() == io::ErrorKind::WouldBlock => return Ok(sent),
+            Err(e) => return Err(e.into()),
+        };
         if wrote != len {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -315,6 +334,37 @@ pub(super) fn udp_send_each(
         sent += wrote;
     }
     Ok(sent)
+}
+
+/// A socket that fills part way through a batch, forced by a test.
+///
+/// A loopback socket's send buffer cannot be made to fill, so the one
+/// condition the partial send exists for has to be produced here. A release
+/// build compiles neither this module nor its call.
+#[cfg(test)]
+mod test_send_blocked {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Refuse a send once this many bytes have gone, on this thread.
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Refuse this thread's next send once `bytes` have been taken.
+    pub(super) fn fail_after_bytes(bytes: usize) {
+        AFTER.with(|a| a.set(Some(bytes)));
+    }
+
+    /// Whether this send is the one to refuse, taking the request off.
+    pub(super) fn due(sent: usize) -> bool {
+        AFTER.with(|a| match a.get() {
+            Some(after) if sent >= after => {
+                a.set(None);
+                true
+            }
+            _ => false,
+        })
+    }
 }
 
 /// The most datagrams one [`UdpBatch::recv`] call takes in.
@@ -373,9 +423,13 @@ impl UdpBatch {
     /// Send `segments`, packed back to back, to `dest`.
     ///
     /// Every segment is exactly `segment_size` bytes and the last is at most
-    /// `segment_size`, which is the shape a QUIC flush produces. Returns the
-    /// bytes sent, which is `segments.len()`. A batch of one segment, or a
-    /// socket without segmentation offload, sends one datagram per segment.
+    /// `segment_size`, which is the shape a QUIC flush produces. A batch of one
+    /// segment, or a socket without segmentation offload, sends one datagram
+    /// per segment.
+    ///
+    /// Returns the bytes the socket took. It is below `segments.len()` only
+    /// when the socket refused the next datagram with `WouldBlock` part way
+    /// through the batch, and then the caller sends only the rest.
     pub fn send(
         &self,
         socket: &impl AsFd,
@@ -477,4 +531,57 @@ fn domain_of(addr: SocketAddr) -> socket2::Domain {
 /// refusing the connection.
 pub fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
     super::os::limit_send_queue(fd, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A send the socket stops part way reports the datagrams it took, and the
+    /// retry sends only the rest: every datagram arrives once, in order.
+    ///
+    /// Break: a partial send reported as an error with no count, so the caller
+    /// cannot know what is already on the wire and sends it again.
+    #[test]
+    fn a_blocked_send_reports_what_it_took() {
+        const SEG: usize = 100;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender.set_nonblocking(true).expect("nonblocking");
+        let dest = receiver.local_addr().expect("receiver address");
+        let batch = UdpBatch::without_gso();
+        let payload: Vec<u8> = (0..500).map(|i| (i % 200) as u8).collect();
+
+        test_send_blocked::fail_after_bytes(2 * SEG);
+        let taken = batch
+            .send(&sender, &payload, SEG, dest)
+            .expect("the count a blocked send reports");
+        assert_eq!(taken, 2 * SEG, "the datagrams the socket took");
+
+        let rest = batch
+            .send(&sender, &payload[taken..], SEG, dest)
+            .expect("the rest");
+        assert_eq!(rest, payload.len() - taken);
+
+        let mut buf = [0u8; SEG];
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.len() < payload.len() && std::time::Instant::now() < deadline {
+            match receiver.recv_from(&mut buf) {
+                Ok((n, _)) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // The datagrams cross loopback to the receiver's queue, so
+                    // wait on the descriptor rather than assume the send has
+                    // landed.
+                    let _ = crate::wait_readable(
+                        receiver.as_fd(),
+                        std::time::Duration::from_millis(50),
+                    );
+                }
+                Err(e) => panic!("receiver: {e}"),
+            }
+        }
+        assert_eq!(got, payload, "every datagram once, in order");
+    }
 }

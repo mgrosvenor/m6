@@ -7008,6 +7008,16 @@ enum Flush {
     Blocked,
 }
 
+/// What one [`flush_batch`] did with the batch it was given.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SendOutcome {
+    /// Every byte of the batch went on the wire.
+    Sent,
+    /// The socket took the first `sent` bytes and refused the next datagram,
+    /// so the rest is what a retry has to send.
+    Blocked { sent: usize },
+}
+
 /// One packed batch the socket refused, kept until the socket will take it.
 struct PendingChunk {
     /// The packed datagrams, back to back, packed at `segment_size`.
@@ -7055,18 +7065,21 @@ impl PendingBatch {
     /// retry sends them in the order quiche made them.
     fn flush(&mut self, udp: &UdpSocket, batch: UdpBatch) -> Flush {
         let mut sent = 0;
-        for chunk in &self.chunks {
-            if flush_batch(
+        while let Some(chunk) = self.chunks.get_mut(sent) {
+            match flush_batch(
                 udp,
                 batch,
                 &chunk.bytes,
                 chunk.segment_size,
                 Some(chunk.dest),
-            ) == Flush::Blocked
-            {
-                break;
+            ) {
+                SendOutcome::Sent => sent += 1,
+                SendOutcome::Blocked { sent: taken } => {
+                    // Only the datagrams the socket did not take are retried.
+                    chunk.bytes.drain(..taken);
+                    break;
+                }
             }
-            sent += 1;
         }
         self.chunks.drain(..sent);
         if self.chunks.is_empty() {
@@ -7283,12 +7296,18 @@ fn send_pack(
     if pack.len == 0 {
         return Flush::Sent;
     }
-    if flush_batch(udp, batch, &out[..pack.len], pack.seg, pack.dest) == Flush::Blocked {
-        keep_batch(qconn, &out[..pack.len], pack.seg, pack.dest);
-        return Flush::Blocked;
+    match flush_batch(udp, batch, &out[..pack.len], pack.seg, pack.dest) {
+        SendOutcome::Sent => {
+            *pack = Pack::default();
+            Flush::Sent
+        }
+        SendOutcome::Blocked { sent } => {
+            // The datagrams before `sent` are on the wire; keeping them would
+            // send them a second time on the writable event.
+            keep_batch(qconn, &out[sent..pack.len], pack.seg, pack.dest);
+            Flush::Blocked
+        }
     }
-    *pack = Pack::default();
-    Flush::Sent
 }
 
 /// Keep the batch the socket refused, so the retry sends the datagrams quiche
@@ -7297,6 +7316,12 @@ fn keep_batch(qconn: &mut QuicConn, bytes: &[u8], segment_size: usize, dest: Opt
     let Some(dest) = dest else {
         return;
     };
+    if bytes.is_empty() {
+        return;
+    }
+    // A remainder that holds only the short last datagram of a batch is packed
+    // at its own length, which is the single-segment shape.
+    let segment_size = segment_size.min(bytes.len());
     qconn
         .blocked
         .get_or_insert_with(PendingBatch::default)
@@ -7323,8 +7348,10 @@ fn flush_blocked(
 }
 
 /// Send one packed batch, or one datagram per segment where the socket does not
-/// segment. A batch the socket would not take is [`Flush::Blocked`], which
-/// leaves it for the writable event.
+/// segment. A batch the socket would not take is a [`SendOutcome::Blocked`],
+/// which leaves it for the writable event, and the count says how much of it
+/// went: on the per-datagram path the socket can take a prefix and refuse the
+/// rest, and only the rest is worth sending again.
 ///
 /// The `cfg(test)` arm is a seam, not a second path: it reports the refusal the
 /// kernel reports when its send buffer is full, before the count moves. A
@@ -7335,22 +7362,36 @@ fn flush_batch(
     buf: &[u8],
     segment_size: usize,
     dest: Option<SocketAddr>,
-) -> Flush {
+) -> SendOutcome {
     let Some(dest) = dest else {
-        return Flush::Sent;
+        return SendOutcome::Sent;
     };
     #[cfg(test)]
     if test_send_seam::refuse() {
-        return Flush::Blocked;
+        return SendOutcome::Blocked { sent: 0 };
+    }
+    #[cfg(test)]
+    if let Some(datagrams) = test_send_seam::partial_after() {
+        // The socket took the first `datagrams` and refused the next: what
+        // the per-datagram path does when its buffer fills part way through.
+        let sent = (datagrams * segment_size).min(buf.len());
+        if sent > 0 {
+            let _ = batch.send(udp, &buf[..sent], segment_size, dest);
+        }
+        test_send_stats::record(sent, segment_size);
+        return SendOutcome::Blocked { sent };
     }
     #[cfg(test)]
     test_send_stats::record(buf.len(), segment_size);
     match batch.send(udp, buf, segment_size, dest) {
-        Ok(_) => Flush::Sent,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Flush::Blocked,
+        Ok(sent) if sent == buf.len() => SendOutcome::Sent,
+        Ok(sent) => SendOutcome::Blocked { sent },
+        // A socket that segments takes the batch or none of it, so a refusal
+        // here has sent nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => SendOutcome::Blocked { sent: 0 },
         Err(e) => {
             warn!("udp batch send error: {}", e);
-            Flush::Sent
+            SendOutcome::Sent
         }
     }
 }
@@ -7368,11 +7409,23 @@ mod test_send_seam {
     thread_local! {
         /// How many of this thread's next batch sends are refused.
         static REFUSE: Cell<usize> = const { Cell::new(0) };
+        /// The datagram count this thread's next batch send stops at.
+        static PARTIAL: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
     /// Refuse this thread's next `count` batch sends.
     pub(super) fn refuse_next_batches(count: usize) {
         REFUSE.with(|left| left.set(count));
+    }
+
+    /// Refuse this thread's next batch send after `datagrams` datagrams.
+    pub(super) fn refuse_after(datagrams: usize) {
+        PARTIAL.with(|p| p.set(Some(datagrams)));
+    }
+
+    /// The datagram count this send stops at, taking the request off.
+    pub(super) fn partial_after() -> Option<usize> {
+        PARTIAL.with(|p| p.take())
     }
 
     /// Whether this send is refused, taking one off the count.
@@ -9821,6 +9874,88 @@ mod quic_flush_tests {
             "{datagrams} datagrams arrived and stream 7 got {} bytes: the packet outside the refused batch is missing",
             body.len()
         );
+    }
+
+    /// A batch the socket takes part of is retried from the datagram that did
+    /// not go, not from the front.
+    ///
+    /// The per-datagram path sends one datagram per call, so a socket can take
+    /// a prefix of the batch and refuse the next. Keeping the whole batch would
+    /// put the prefix on the wire twice on the writable event. The datagram
+    /// count is the measurement: the body needs the same number of datagrams on
+    /// a connection where nothing is refused, and the retry must not add any.
+    ///
+    /// Break: a partial refusal kept as a whole one, so the datagrams already
+    /// sent go out again.
+    #[test]
+    fn a_partial_batch_send_keeps_only_the_rest() {
+        let body: Vec<u8> = (0..5_000).map(|i| (i % 251) as u8).collect();
+
+        // What the body costs in datagrams when nothing is refused.
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, _pair) = established(30_000, &server_udp);
+        qconn.conn.stream_send(3, &body, true).expect("stream_send");
+        test_send_stats::reset();
+        assert_eq!(
+            flush_conn(&server_udp, batch, &mut out, &mut qconn),
+            Flush::Sent,
+            "the whole batch went"
+        );
+        let whole = test_send_stats::datagrams();
+        assert!(whole >= 3, "the body fills more than one datagram");
+        assert_eq!(test_send_stats::calls(), 1, "the body is one batch");
+
+        // The same body, with the socket taking two datagrams of the batch.
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let (mut qconn, mut pair) = established(30_000, &server_udp);
+        qconn.conn.stream_send(3, &body, true).expect("stream_send");
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+        let mut blocked = BlockedSends::default();
+
+        test_send_stats::reset();
+        test_send_seam::refuse_after(2);
+        let flush = flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        assert_eq!(flush, Flush::Blocked, "the partial send was not reported");
+        assert_eq!(
+            test_send_stats::datagrams(),
+            2,
+            "the socket took two datagrams"
+        );
+        blocked.record(&key);
+        let kept = connections
+            .get_mut(&key)
+            .expect("connection")
+            .blocked
+            .as_ref()
+            .expect("the rest was not kept");
+        assert_eq!(kept.chunks.len(), 1, "one batch is waiting");
+        assert!(
+            kept.chunks[0].bytes.len() < body.len(),
+            "the whole batch was kept, so the retry sends the prefix twice"
+        );
+
+        // The writable event sends the rest, and the body arrives whole.
+        flush_blocked(&server_udp, batch, &mut out, &mut connections, &mut blocked);
+        assert_eq!(
+            test_send_stats::datagrams(),
+            whole,
+            "the retry sent datagrams that had already gone out"
+        );
+        assert!(
+            blocked.is_empty(),
+            "the connection is still waiting for the socket"
+        );
+        let (datagrams, got) = drain_pair(&mut pair, &server_udp);
+        assert_eq!(got, body, "{datagrams} datagrams did not carry the body");
     }
 
     /// Drain every datagram the server sent `pair`, feed it to the client and
