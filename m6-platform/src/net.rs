@@ -285,6 +285,38 @@ pub fn buffer_sizes(sock: &impl AsFd) -> io::Result<(usize, usize)> {
     Ok((s.send_buffer_size()?, s.recv_buffer_size()?))
 }
 
+/// Send `segments` one datagram at a time, in order.
+///
+/// Every datagram before the last is `segment_size` bytes and the last is at
+/// most that, which is the shape a QUIC flush produces. This is the path a
+/// socket without segmentation offload takes, on either target: Linux falls
+/// back to it for a socket that has no `UDP_SEGMENT`, and macOS has nothing
+/// else.
+pub(super) fn udp_send_each(
+    socket: &impl AsFd,
+    segments: &[u8],
+    segment_size: usize,
+    dest: SocketAddr,
+) -> io::Result<usize> {
+    use nix::sys::socket::{sendto, MsgFlags, SockaddrStorage};
+
+    let dst = SockaddrStorage::from(dest);
+    let fd = socket.as_fd().as_raw_fd();
+    let mut sent = 0;
+    while sent < segments.len() {
+        let len = (segments.len() - sent).min(segment_size);
+        let wrote = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())?;
+        if wrote != len {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "a UDP send took part of a datagram",
+            ));
+        }
+        sent += wrote;
+    }
+    Ok(sent)
+}
+
 /// The most datagrams one [`UdpBatch::recv`] call takes in.
 pub const MAX_BATCH: usize = 16;
 

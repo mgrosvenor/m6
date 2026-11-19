@@ -154,7 +154,7 @@ pub(super) fn udp_send_batch(
     if gso && segment_size < segments.len() {
         return udp_send_segmented(socket, segments, segment_size, dest);
     }
-    udp_send_each(socket, segments, segment_size, dest)
+    super::net::udp_send_each(socket, segments, segment_size, dest)
 }
 
 fn udp_send_segmented(
@@ -184,31 +184,6 @@ fn udp_send_segmented(
         Some(&dst),
     )
     .map_err(io::Error::from)
-}
-
-fn udp_send_each(
-    socket: &impl AsFd,
-    segments: &[u8],
-    segment_size: usize,
-    dest: SocketAddr,
-) -> io::Result<usize> {
-    use nix::sys::socket::{sendto, MsgFlags, SockaddrStorage};
-
-    let dst = SockaddrStorage::from(dest);
-    let fd = socket.as_fd().as_raw_fd();
-    let mut sent = 0;
-    while sent < segments.len() {
-        let len = (segments.len() - sent).min(segment_size);
-        let wrote = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())?;
-        if wrote != len {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "a UDP send took part of a datagram",
-            ));
-        }
-        sent += wrote;
-    }
-    Ok(sent)
 }
 
 /// Receive up to `metas.len()` datagrams in one `recvmmsg`.

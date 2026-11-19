@@ -182,7 +182,8 @@ pub(super) fn udp_gso_supported(_socket: &impl AsFd) -> bool {
     false
 }
 
-/// Send `segments` one datagram at a time, in order.
+/// Send `segments` one datagram at a time, in order: macOS has no
+/// segmentation offload, so the shared fallback is the whole path here.
 pub(super) fn udp_send_batch(
     socket: &impl AsFd,
     segments: &[u8],
@@ -190,23 +191,7 @@ pub(super) fn udp_send_batch(
     dest: SocketAddr,
     _gso: bool,
 ) -> io::Result<usize> {
-    use nix::sys::socket::{sendto, MsgFlags, SockaddrStorage};
-
-    let dst = SockaddrStorage::from(dest);
-    let fd = socket.as_fd().as_raw_fd();
-    let mut sent = 0;
-    while sent < segments.len() {
-        let len = (segments.len() - sent).min(segment_size);
-        let wrote = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())?;
-        if wrote != len {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "a UDP send took part of a datagram",
-            ));
-        }
-        sent += wrote;
-    }
-    Ok(sent)
+    super::net::udp_send_each(socket, segments, segment_size, dest)
 }
 
 /// Receive up to `metas.len()` datagrams, one `recvfrom` each.
