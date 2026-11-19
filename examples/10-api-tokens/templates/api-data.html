@@ -1,0 +1,22 @@
+{% extends "templates/base.html" %}
+{% block title %}API Data · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>Protected API Endpoint</h1>
+  <p>Caller: <strong>{{ auth_username }}</strong>
+     (roles: {{ auth_roles | join(sep=", ") }})</p>
+
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Value</th><th>Timestamp</th></tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td>{{ item.id }}</td>
+        <td>{{ item.value }}</td>
+        <td>{{ item.timestamp }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

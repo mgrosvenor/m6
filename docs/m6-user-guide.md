@@ -1,7 +1,7 @@
 # m6 user guide
 
 Eleven examples build one website, from a static page to a global fleet.
-Each example lives in the `m6-examples` repository and adds one capability to the last.
+Each example lives in `examples/` in the m6 repository and adds one capability to the last.
 This guide explains what each example adds and which file does the work.
 Sections 2 to 12 walk Examples 01 to 11 in order.
 
@@ -23,7 +23,7 @@ Sections 2 to 12 walk Examples 01 to 11 in order.
 
 ## 1. Before you start
 
-The examples need a release build of m6, a certificate tool and the `m6-examples` checkout.
+The examples need a release build of m6, a certificate tool and the m6 checkout, which holds `examples/`.
 [`README.md`](../README.md) section 1, steps 1 to 3, gives the commands.
 Step 1 puts `target/release` on `PATH`, which makes every m6 binary available, including `m6-md`, which Example 02 uses.
 Rust 1.89 or newer provides the compiler and Cargo.
@@ -349,7 +349,7 @@ cd examples/03-contact
 
 ### 4.1. `render-contact/Cargo.toml`
 
-`render-contact` is a Rust crate in the m6-examples workspace.
+`render-contact` is a Rust crate in the `examples/` workspace.
 Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, with the `email` feature that supplies the *SMTP* client a service's loop drives.
 `anyhow` and `serde_json` handle errors and JSON.
 
@@ -553,7 +553,7 @@ M6_SOCKET_OVERRIDE=/tmp/m6/render-contact.sock \
     "$EXAMPLES/target/release/render-contact" "$SITE" "$SITE/configs/render-contact.conf" &
 ```
 
-`$EXAMPLES` is the m6-examples checkout root.
+`$EXAMPLES` is the `examples/` directory of the m6 checkout.
 
 [`m6-app-anatomy.md`](m6-app-anatomy.md) owns the custom renderer guide, its §4 owns the renderer config keys, §5.3 owns where state lives (a plain value in `main`), and [`m6-site-toml.md`](m6-site-toml.md) §3.2 owns `secrets_file`.
 [`m6-site-toml.md`](m6-site-toml.md) owns the `[[backend]]` and `[[route]]` keys.
@@ -832,7 +832,7 @@ The publisher and reader tokens come from `setup.sh`, and section 7.14 gives the
 
 ### 6.3. `render-cms/Cargo.toml`
 
-`render-cms` is a Rust crate in the m6-examples workspace.
+`render-cms` is a Rust crate in the `examples/` workspace.
 Its manifest depends on m6-core by the relative path `../../../../m6/m6-core`, on `serde_json` for JSON, on `comrak` to render Markdown to *HTML* (HyperText Markup Language), on `base64` for the editor transport, and on `rustls` and `rustls-pemfile` for the TLS connection that carries `POST /genid`.
 
 ```toml

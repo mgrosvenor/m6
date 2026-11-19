@@ -23,7 +23,7 @@ Only the first runs fully on a laptop.
 |---|---|---|
 | unit and integration tests | m6's code does what m6 intends | laptop, build host, *CI* (continuous integration) |
 | conformance, h1spec h2spec h3spec | m6 does what the *RFC* (Request for Comments) documents say | build host and CI, needs the testers installed |
-| the examples | m6's interfaces work for code outside m6 | build host and CI, needs the `m6-examples` checkout |
+| the examples | m6's interfaces work for code outside m6 | build host and CI, built from `examples/` in the same checkout |
 | performance | a change did not cost latency | build host, needs a quiet machine |
 
 **Table 1: the four layers, what each proves, and where each runs.**
@@ -237,7 +237,7 @@ m6-http's holds `site/site.toml` and `system.toml`, because m6-http takes both a
 
 ## 6. End to end
 
-The end-to-end suite is example 05 in `m6-examples`, and its `test.sh` checks the whole running stack.
+The end-to-end suite is example 05 in `examples/05-cms`, and its `test.sh` checks the whole running stack.
 CI runs it on every pull request, and `tools/build-host-tests.sh` runs it on the build host.
 [`m6-user-guide.md`](m6-user-guide.md) section 6 describes the example, and a failure in `test.sh` is diagnosed by starting the stack with `setup.sh` and `dev.sh` from `examples/05-cms` and requesting the routes by hand.
 

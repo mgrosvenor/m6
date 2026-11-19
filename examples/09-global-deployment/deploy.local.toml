@@ -1,0 +1,23 @@
+# deploy.local.toml — local demo topology (loopback ports, no SSH).
+# Used with: ./deploy.sh deploy.local.toml
+#
+# "SSH" targets use localhost so rsync/ssh hits the local machine.
+# site_dir points to 07-dev-to-production so changes to content/ are
+# immediately visible through the running dev stack.
+
+[deploy]
+# localhost SSH (requires: ssh localhost to work, i.e. key in authorized_keys)
+# Alternatively run: ssh-copy-id localhost
+origin   = "localhost"
+site_dir = "../07-dev-to-production"
+ssh_opts = "-o StrictHostKeyChecking=no -o ConnectTimeout=5"
+
+[cache_nodes]
+# Cache nodes run as separate m6-http instances from the same site-cache dir.
+# There is no separate content to push — they all proxy to origin H2C.
+# Leave these empty or comment out to skip cache propagation.
+# edge-a = "localhost"   # no-op: cache nodes share site-cache/ at runtime
+# edge-b = "localhost"
+# edge-c = "localhost"
+# edge-d = "localhost"
+# edge-e = "localhost"

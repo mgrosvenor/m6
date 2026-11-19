@@ -194,7 +194,7 @@ Say what you did, what you expected, and what happened.
 A packet capture, a log line with its timestamp, or a `curl -v` output is worth more than a description.
 If the bug involves the edge, say which role: origin, edge cache or monitor.
 
-Reproduce the bug against something any reader can run: `m6-examples`, example 05's end-to-end suite, or h2spec and h3spec against a loopback instance.
+Reproduce the bug against something any reader can run: the examples in `examples/`, example 05's end-to-end suite, or h2spec and h3spec against a loopback instance.
 Evidence from a private deployment cannot be re-run by anyone else, so it is an assertion.
 
 Security issues go to [`SECURITY.md`](SECURITY.md).

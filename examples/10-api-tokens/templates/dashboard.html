@@ -1,0 +1,23 @@
+{% extends "templates/base.html" %}
+{% block title %}Dashboard · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>Dashboard</h1>
+  <p>You are logged in as <strong>{{ auth_username }}</strong>
+     (roles: {{ auth_roles | join(sep=", ") }}).</p>
+
+  <h2>Manage API tokens</h2>
+  <p>Use the CLI to create, list, and revoke tokens:</p>
+  <pre><code># List tokens for your account
+m6-auth-cli configs/m6-auth.conf token ls {{ auth_username }}
+
+# Create a new token (30-day TTL)
+m6-auth-cli configs/m6-auth.conf token create {{ auth_username }} \
+    --name my-script --ttl-days 30
+
+# Revoke a token by ID
+m6-auth-cli configs/m6-auth.conf token revoke &lt;token-id&gt;</code></pre>
+
+  <form method="post" action="/auth/logout">
+    <button type="submit">Logout</button>
+  </form>
+{% endblock %}

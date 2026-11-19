@@ -1,0 +1,23 @@
+[Unit]
+Description=m6-http cache node
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+# NODE_CONFIG is set in /etc/m6/node-config — e.g. /etc/m6/cache-edge-a.toml
+EnvironmentFile=-/etc/m6/node-config
+ExecStart=/usr/local/bin/m6-http \
+    /var/www/my-blog \
+    ${NODE_CONFIG}
+
+LoadCredential=tls-cert.pem:/etc/letsencrypt/live/example.com/fullchain.pem
+LoadCredential=tls-key.pem:/etc/letsencrypt/live/example.com/privkey.pem
+# A token with the `genid-read` role: the node follows the origin's generation with it
+LoadCredential=genid-read:/etc/m6/genid-read
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

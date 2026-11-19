@@ -37,7 +37,7 @@ a reproduction any reader can run.
 against a private production instance is **unreproducible by anyone else**, so it
 is not evidence, only an assertion that looks authoritative. "Verified means
 measured against something running" is satisfied without touching anyone's fleet:
-`m6-examples`, example 05's end-to-end suite, h2spec and h3spec against a
+the examples in `examples/`, example 05's end-to-end suite, h2spec and h3spec against a
 loopback instance, and `tools/build-host-tests.sh`. Use those.
 
 **How this was broken, so it is not repeated.** By 2026-09-26 this public
@@ -141,7 +141,7 @@ M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 | h1, h2, h3 conformance | at or above the recorded scores | `tools/conformance.sh` |
 | performance | no consistent slowdown against the base build, interleaved A/B on the build host | `tools/perfcheck.sh` |
 | cargo-deny | advisories, licences and sources | `cargo deny check` |
-| the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
+| the examples build | zero warnings, clippy silent, their tests pass, every config parses | `examples/`, built from the same commit |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
 
 Rustdoc runs a second time with `--all-features`, because `testkit`, `sqlite`, `email`, `multipart` and the allocation counters are off by default and the docs behind them are built by nothing else.
@@ -153,11 +153,10 @@ same ground plus the two things a shared runner cannot do: the performance check
 which needs a quiet machine, and conformance against a real h2spec/h3spec install.
 Run it before opening the pull request when the change could touch either.
 
-**The examples are not a courtesy.** `m6-examples` is the only code in the
-checks that uses m6's interfaces, and until 2026-09-14 nothing built it: it had
-stopped compiling entirely, and five more defects were sitting underneath that
-where nobody could see them. A change to m6 lands with the examples building, or
-it does not land.
+**The examples live in `examples/` in this repository.** They are the only code
+in the checks that uses m6's interfaces, and CI builds them from the same commit
+as the crates they use. A change to m6 lands with the examples building, or it
+does not land.
 
 ### Why the build host and not the laptop
 
@@ -312,6 +311,6 @@ address, node name, artefact hash or deployment state in this repository.
 And note what that rules out, because it is the trap this repository walked into
 19 issues deep: **evidence measured against a private production instance is
 unreproducible by anyone else**, so it is not evidence. "Verified means measured
-against something running" is satisfied by `m6-examples`, example 05's
+against something running" is satisfied by the examples in `examples/`, example 05's
 end-to-end suite, h2spec and h3spec against a loopback instance, and
 `tools/build-host-tests.sh`. Use those.

@@ -1,0 +1,138 @@
+# example 11 — admin dashboard
+# All /api/admin/* routes are protected by "role:admin".
+
+[site]
+name   = "m6 Admin Dashboard"
+domain = "localhost"
+
+[server]
+# m6-http validates the request method before routing, cache lookup or backend
+# dispatch, and the default is GET, HEAD, POST only: anything else is answered
+# 405 with an `Allow` header and never reaches a backend.
+#
+# This example's renderer registers a PUT route, so it has to be declared here
+# too. Without this line every PUT was answered 405 by the edge while the
+# handler behind it was registered and working, which looks exactly like a
+# missing route and is not one.
+allowed_methods = ["GET", "HEAD", "POST", "PUT"]
+
+[errors]
+mode             = "internal"
+verbose_fallback = true
+
+[log]
+level  = "debug"
+
+[[backend]]
+name    = "render-admin"
+sockets = "/tmp/m6/render-admin.sock"
+
+[[backend]]
+name    = "auth"
+sockets = "/tmp/m6/m6-auth-admin.sock"
+
+[[backend]]
+name    = "auth-check"
+sockets = "/tmp/m6/check-m6-auth-admin.sock"
+
+[[backend]]
+name    = "static"
+sockets = "/tmp/m6/m6-file-admin.sock"
+
+[[route]]
+path    = "/"
+backend = "static"
+
+# Login redirect target — serves the SPA which has its own login overlay.
+[[route]]
+path    = "/login"
+backend = "static"
+
+# Admin API routes — all require role:admin
+[[route]]
+path    = "/api/admin/perf"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/routes"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/system"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/bench"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/bench/{id}"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/logs"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/config"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/publish"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/cache/flush"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/services/{name}/restart"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/backends"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/backends/{name}/sample"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/backends/{name}/alltime"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/m6http/sample"
+backend = "render-admin"
+require = "role:admin"
+
+[[route]]
+path    = "/api/admin/m6http/alltime"
+backend = "render-admin"
+require = "role:admin"
+
+# Auth endpoints
+[[route]]
+path    = "/auth/login"
+backend = "auth"
+
+[[route]]
+path    = "/auth/logout"
+backend = "auth"
+
+[[route]]
+path    = "/auth/refresh"
+backend = "auth"

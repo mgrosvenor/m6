@@ -1,0 +1,84 @@
+#logviewer {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 8rem);
+}
+
+.lv-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.lv-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.lv-controls label,
+.lv-controls button {
+  font-size: 0.875rem;
+}
+
+.lv-controls button {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid #aaa;
+  border-radius: 4px;
+  cursor: pointer;
+  background: #fff;
+}
+
+#lv-table {
+  flex: 1;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  font-family: 'Menlo', 'Consolas', monospace;
+  overflow-y: auto;
+  display: block;
+}
+
+#lv-table thead {
+  position: sticky;
+  top: 0;
+  background: #1a1a2e;
+  color: #fff;
+  z-index: 1;
+}
+
+#lv-table th,
+#lv-table td {
+  padding: 0.2rem 0.5rem;
+  text-align: left;
+  border-bottom: 1px solid #e0e0e0;
+  white-space: nowrap;
+}
+
+.col-msg { white-space: pre-wrap; word-break: break-word; }
+
+.col-time   { width: 14rem; }
+.col-level  { width: 5rem; }
+.col-target { width: 16rem; }
+
+/* Level colour coding */
+tr.lv-info  { background: #fff; }
+tr.lv-debug { background: #f0f4ff; color: #555; }
+tr.lv-trace { background: #f5f5f5; color: #888; }
+tr.lv-warn  { background: #fff8e1; }
+tr.lv-error { background: #fff0f0; font-weight: 600; }
+tr.lv-plain { background: #f8f8f8; color: #888; font-style: italic; }
+
+td.col-level { font-weight: 700; }
+tr.lv-info  td.col-level { color: #2e7d32; }
+tr.lv-debug td.col-level { color: #1565c0; }
+tr.lv-warn  td.col-level { color: #e65100; }
+tr.lv-error td.col-level { color: #b71c1c; }
+tr.lv-trace td.col-level { color: #999; }
+
+#lv-status {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #666;
+}

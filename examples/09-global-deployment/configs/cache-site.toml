@@ -1,0 +1,112 @@
+# cache-site.toml — shared site config for all cache nodes (edge-a through edge-e).
+# Every cache node runs this exact file unchanged. The only per-node difference is the system
+# config (cache-<node>.toml) which sets the bind address and TLS cert paths via /etc/m6/node-config.
+#
+# All requests are proxied upstream to the origin over WireGuard using H2C. The WireGuard tunnel
+# provides encryption, so no TLS is needed on the 10.0.0.x backbone.
+#
+# Auth is NOT enforced on cache nodes — headers are forwarded to origin which validates JWTs.
+# This is safe because cache nodes are only reachable on the WireGuard private network for
+# admin routes, and the origin is the single source of truth for auth and state.
+
+[site]
+name   = "My Blog"
+domain = "example.com"
+
+[errors]
+mode = "internal"
+
+[log]
+level  = "info"
+
+# ── Backend — origin over WireGuard H2C ────────────────────────────────
+
+[[backend]]
+name = "origin"
+url  = "h2c://10.0.0.1:80"
+
+# ── Public routes — no auth ────────────────────────────────────────────────────
+
+[[route]]
+path    = "/"
+backend = "origin"
+
+[[route]]
+path    = "/about"
+backend = "origin"
+
+[[route]]
+path    = "/blog"
+backend = "origin"
+
+[[route]]
+path    = "/blog/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/assets/{*relpath}"
+backend = "origin"
+
+[[route]]
+path    = "/_errors"
+backend = "origin"
+
+# ── Contact — public ──────────────────────────────────────────────────────────
+
+[[route]]
+path    = "/contact"
+backend = "origin"
+
+# ── Auth endpoints — public ───────────────────────────────────────────────────
+# Auth traffic is forwarded to origin. Tokens are validated on origin; the cache
+# node passes through auth headers transparently.
+
+[[route]]
+path    = "/login"
+backend = "origin"
+
+[[route]]
+path    = "/auth/login"
+backend = "origin"
+
+[[route]]
+path    = "/auth/logout"
+backend = "origin"
+
+[[route]]
+path    = "/auth/refresh"
+backend = "origin"
+
+# ── CMS — all protected ─────────────────────────────────────────
+
+[[route]]
+path    = "/cms"
+backend = "origin"
+
+[[route]]
+path    = "/cms/edit/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/cms/new"
+backend = "origin"
+
+[[route]]
+path    = "/api/drafts"
+backend = "origin"
+
+[[route]]
+path    = "/api/drafts/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/api/publish/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/api/unpublish/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/api/posts/{stem}"
+backend = "origin"

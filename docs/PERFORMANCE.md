@@ -39,7 +39,7 @@ Four rules govern every figure below, and Table 2 states them.
 | conditions with every number | the machine and the method. CPU, core count, memory, load and the config that produced the figure all belong here. A laptop figure and a build-host figure never share a column |
 | an unmeasured change says so | "structural" means the reasoning is sound and nobody has put a number on it |
 | comparisons are paired and interleaved | run A, B, A, B against a fixed baseline, so drift hits both sides equally |
-| reproducible sources | a figure comes from a loopback instance, `m6-examples` or the build host, described by its hardware and with no host, domain or node name |
+| reproducible sources | a figure comes from a loopback instance, `examples/` or the build host, described by its hardware and with no host, domain or node name |
 
 **Table 2: the four rules every number in this document follows.**
 Take from it that a figure carries its hardware, its config and its method.

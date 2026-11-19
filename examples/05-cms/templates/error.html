@@ -1,0 +1,7 @@
+{% extends "templates/base.html" %}
+{% block title %}{{ query.status }} · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>{{ query.status }} — {{ query.reason }}</h1>
+  <p>The page <code>{{ query.path }}</code> could not be found.</p>
+  <a href="/">Return home</a>
+{% endblock %}

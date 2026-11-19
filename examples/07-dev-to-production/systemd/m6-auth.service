@@ -1,0 +1,34 @@
+[Unit]
+Description=m6-auth service
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+ExecStart=/usr/local/bin/m6-auth-server \
+    /var/www/my-blog \
+    /etc/m6/m6-auth.conf
+
+LoadCredential=auth.pem:/etc/m6/auth.pem
+LoadCredential=auth.pub:/etc/m6/auth.pub
+StateDirectory=m6-auth
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m6-auth
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6
+ReadOnlyPaths=/var/www/my-blog /etc/m6
+
+[Install]
+WantedBy=multi-user.target

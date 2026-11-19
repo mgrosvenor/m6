@@ -53,13 +53,12 @@ brew install mkcert        # or your package manager's equivalent
 mkcert -install
 ```
 
-**3. The examples.** They live in their own repository, checked out beside this one, because the renderer crates reach m6 by relative path:
+**3. The examples.** They live in `examples/` in this repository, and their renderer crates use the m6 crates beside them:
 
 ```sh
-cd ..
-git clone https://github.com/mgrosvenor/m6-examples
-cd m6-examples
+cd examples
 cargo build --release      # the custom renderers
+cd ..
 ```
 
 **4. Run the whole stack and check it.**
@@ -399,7 +398,7 @@ Backends must start before m6-http (in systemd, `After=` on the backend units in
 A backend that restarts on the same socket path serves again on its next connect.
 
 ```bash
-# Development (see m6-examples/m6-run-eg)
+# Development (see examples/m6-run-eg)
 m6-auth-server  $SITE_DIR $AUTH_CONF &
 m6-html         $SITE_DIR $HTML_CONF &
 m6-file         $SITE_DIR $FILE_CONF &

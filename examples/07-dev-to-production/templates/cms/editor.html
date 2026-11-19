@@ -1,0 +1,60 @@
+{% extends "templates/base.html" %}
+{% block title %}{% if new %}New Post{% else %}Edit · {{ title | default(value=stem) }}{% endif %} · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>{% if new %}New Post{% else %}Edit: {{ title | default(value=stem) }}{% endif %}</h1>
+  <form id="editor">
+    <input type="hidden" id="stem" name="stem" value="{{ stem | default(value='') }}">
+    <label>Title
+      <input type="text" id="title" name="title" value="{{ title | default(value='') }}" required>
+    </label>
+    <label>Body
+      <textarea id="body" name="body" rows="24">{{ body | default(value='') }}</textarea>
+    </label>
+    <button type="button" onclick="save()">Save Draft</button>
+    {% if stem %}<button type="button" onclick="publish()">Publish</button>{% endif %}
+    {% if stem and not new %}
+      <button type="button" onclick="unpublish()" style="background:#c00">Unpublish</button>
+    {% endif %}
+    <a href="/cms" style="margin-left:1rem">← Dashboard</a>
+  </form>
+
+  <script>
+  const stemEl  = document.getElementById('stem');
+  const titleEl = document.getElementById('title');
+  const bodyEl  = document.getElementById('body');
+
+  async function save() {
+    const stem   = stemEl.value;
+    const url    = stem ? `/api/drafts/${stem}` : '/api/drafts';
+    const method = stem ? 'PATCH' : 'POST';
+    const r = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: titleEl.value, body: bodyEl.value }),
+    });
+    if (r.ok) {
+      const d = await r.json();
+      if (!stem && d.stem) stemEl.value = d.stem;
+      alert('Saved.');
+    } else {
+      alert('Save failed: ' + r.status);
+    }
+  }
+
+  async function publish() {
+    const stem = stemEl.value;
+    if (!stem) { alert('Save the draft first.'); return; }
+    const r = await fetch(`/api/publish/${stem}`, { method: 'POST' });
+    if (r.ok) { const d = await r.json(); window.location = d.path; }
+    else alert('Publish failed: ' + r.status);
+  }
+
+  async function unpublish() {
+    const stem = stemEl.value;
+    if (!stem) return;
+    const r = await fetch(`/api/unpublish/${stem}`, { method: 'POST' });
+    if (r.ok) window.location = '/cms';
+    else alert('Unpublish failed: ' + r.status);
+  }
+  </script>
+{% endblock %}

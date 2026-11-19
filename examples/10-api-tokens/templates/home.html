@@ -1,0 +1,34 @@
+{% extends "templates/base.html" %}
+{% block title %}{{ site_name }}{% endblock %}
+{% block content %}
+<div class="home-hero">
+  <h1>{{ site_name }}</h1>
+  <p class="lead">{{ site_tagline }}</p>
+</div>
+
+<div class="home-info">
+  <h2>What is an API token?</h2>
+  <p>API tokens are long-lived JWTs that allow scripts and services to call protected endpoints
+     without a browser session. Unlike session cookies (which expire in minutes), an API token
+     can be valid for days or months.</p>
+
+  <h2>How it works</h2>
+  <ol>
+    <li>An admin creates a token with <code>m6-auth-cli token create</code>.</li>
+    <li>The token is a signed JWT. Copy it once — it is never stored in plain text.</li>
+    <li>Pass it as <code>Authorization: Bearer &lt;token&gt;</code> in each request.</li>
+    <li>m6-http verifies the signature and enforces the <code>require</code> rule.</li>
+    <li>When the token is no longer needed, revoke it with <code>m6-auth-cli token revoke</code>.</li>
+  </ol>
+
+  <h2>Try it</h2>
+  <pre><code># Create a token for the 'api' user (created by setup.sh)
+m6-auth-cli configs/m6-auth.conf token create api --name mytoken
+
+# Call the protected endpoint
+curl -sk https://localhost:8443/api/data \
+     -H "Authorization: Bearer &lt;paste token here&gt;"</code></pre>
+
+  <p><a href="/login">Login with browser</a> &nbsp;|&nbsp; <a href="/dashboard">Dashboard</a></p>
+</div>
+{% endblock %}

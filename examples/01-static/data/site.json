@@ -1,0 +1,8 @@
+{
+  "site_name": "My Site",
+  "site_tagline": "A minimal static site built with m6.",
+  "nav": [
+    { "label": "Home",  "path": "/" },
+    { "label": "About", "path": "/about" }
+  ]
+}

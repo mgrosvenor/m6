@@ -1,0 +1,33 @@
+{% extends "templates/base.html" %}
+{% block title %}CMS Dashboard · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>CMS Dashboard</h1>
+  <p>Welcome, <strong>{{ author }}</strong>. <a href="/auth/logout" style="font-size:0.875rem">Logout</a></p>
+
+  <h2>Drafts</h2>
+  {% if drafts %}
+    <ul>
+    {% for d in drafts %}
+      <li><a href="/cms/edit/{{ d.stem }}">{{ d.title | default(value=d.stem) }}</a></li>
+    {% endfor %}
+    </ul>
+  {% else %}
+    <p>No drafts.</p>
+  {% endif %}
+
+  <h2>Published</h2>
+  {% if published %}
+    <ul>
+    {% for p in published %}
+      <li>
+        <a href="/blog/{{ p.stem }}">{{ p.title | default(value=p.stem) }}</a>
+        — <a href="/cms/edit/{{ p.stem }}">edit</a>
+      </li>
+    {% endfor %}
+    </ul>
+  {% else %}
+    <p>No published posts.</p>
+  {% endif %}
+
+  <p><a href="/cms/new" class="btn">New post</a></p>
+{% endblock %}

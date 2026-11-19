@@ -1,0 +1,23 @@
+{% extends "templates/base.html" %}
+{% block title %}Contact · {{ site_name }}{% endblock %}
+{% block content %}
+  <div class="form-card">
+    <h1>Contact</h1>
+    {% if sent %}
+      <p>Message sent. Thanks, <strong>{{ name }}</strong>!</p>
+    {% else %}
+      <form method="post" action="/contact">
+        <label>Name
+          <input type="text" name="name" required autofocus>
+        </label>
+        <label>Email
+          <input type="email" name="email" required>
+        </label>
+        <label>Message
+          <textarea name="message" required></textarea>
+        </label>
+        <button type="submit">Send message</button>
+      </form>
+    {% endif %}
+  </div>
+{% endblock %}
