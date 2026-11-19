@@ -716,13 +716,14 @@ The traffic line is the one cost here that scales with traffic.
 
 ## 10. What is not measured
 
-Four gaps remain, listed in Table 23.
+Five gaps remain, listed in Table 23.
 
 | gap | what is missing |
 |---|---|
 | throughput and concurrency | `m6-file` and `m6-auth-server` have no throughput or concurrency figure |
 | conformance-side timing | h2spec and h3spec are correctness gates. h3spec deliberately opens stalled and malformed connections, so it cannot generate load: it once reported an h3 handshake p50 of 113 ms on loopback, where the probe reads 1.1 ms (Table 12) |
 | the render figures after the release profile | Table 3 predates the `[profile.release]` change of 2026-09-27, which cut the gated render targets by 13.7% and 18.5%, and the gate now compares the candidate against a base build |
+| the ACK share of the QUIC gap | the pinned quiche has no `draft-ietf-quic-ack-frequency` support. `grep -rn "ACK_FREQUENCY\|ack_frequency" quiche/src` finds nothing, the `Frame` enum carries RFC 9000's `ACK` only (`quiche/src/frame.rs:58-72`), and `TransportParams` carries the two RFC 9000 ack parameters and no other (`quiche/src/transport_params.rs:176-179`). `Config` exposes `set_ack_delay_exponent` (`quiche/src/lib.rs:1084`) and `set_max_ack_delay` (`quiche/src/lib.rs:1089-1093`), and both write the parameters this endpoint advertises to the peer. This endpoint's own ack is decided at `quiche/src/lib.rs:4620-4621` by the peer's packets, and its ack delay comes from the peer's `max_ack_delay` at `quiche/src/lib.rs:8058`. rc.1 therefore adds no ack-frequency control and claims no figure for that share |
 | other machines | Table 3 is one laptop, and no other machine has a copy-removal figure |
 
 **Table 23: what this document does not cover.**
@@ -730,3 +731,4 @@ Take from it that throughput has no number at all, and that `tools/perfcheck.sh`
 
 The measured position is that core's per-request copying fell by a factor of 280, the static file path allocates nothing for bytes it does not send, the cache lookup costs 125 ns and is flat, and the QUIC handshake completes in one round trip at a conforming amplification factor.
 The template engine's 143 µs context build is measured and accepted, and throughput has no measurement.
+The ACK share of the QUIC gap has no figure: the pinned quiche offers no ack-frequency control, so rc.1 adds none.
