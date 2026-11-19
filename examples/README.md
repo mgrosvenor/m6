@@ -25,6 +25,9 @@ so there is nothing to place or symlink by hand. The directory is
 Set `M6_DEV_HOME` to use another. Each example's configs name it as `@M6_DEV_HOME@`,
 and its `dev.sh` writes a copy with the real path for m6 to read.
 
+The scripts use `lsof` to see whether a port is held and whether a backend socket
+is listening, so `lsof` must be on `PATH`.
+
 ### Check the install
 
 Example 05 runs the whole stack, and its test suite makes 96 checks against it.
