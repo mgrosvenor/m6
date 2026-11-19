@@ -7115,17 +7115,20 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
     );
     let out = &mut out[..capacity];
     let mut pack = Pack::default();
-    // The congestion controller's burst for one turn. A batch stops here too,
-    // so one send never puts more datagrams on the wire than the controller
-    // allows at once. It is zero before a path is active, and then the buffer
-    // is the only cap.
-    let burst = qconn.conn.send_quantum().min(capacity);
 
     loop {
-        // Leave room for the largest datagram quiche can write into this batch.
-        if (pack.len + MAX_DATAGRAM_SIZE > capacity
-            || (burst > 0 && pack.len + MAX_DATAGRAM_SIZE > burst)
-            || pack.count == QUIC_BATCH_SEGMENTS)
+        // Leave room for the largest datagram quiche can write into this
+        // batch. That room, and the segment count, are the only caps: the
+        // congestion window already bounds what `conn.send` yields.
+        //
+        // `conn.send_quantum()` used to be a third cap here. This quiche's
+        // legacy congestion module sets it to the initial window when the
+        // connection is made and never updates it, so the cap stayed at the
+        // 10-packet initial window while the congestion window on loopback
+        // grew to 72 packets. A batch therefore stopped at a seventh of what
+        // the window allowed, and no GSO send ever carried more than 13,500
+        // bytes.
+        if batch_is_full(&pack, capacity)
             && send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked
         {
             return Flush::Blocked;
@@ -7183,6 +7186,16 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
         return Flush::Blocked;
     }
     Flush::Sent
+}
+
+/// Whether the batch has to be sent before another packet can join it.
+///
+/// Two limits, both the send's: the buffer holds at most `capacity` bytes, and
+/// one UDP GSO send carries at most [`QUIC_BATCH_SEGMENTS`] segments. A packet
+/// may be up to [`MAX_DATAGRAM_SIZE`], so room for one more is what keeps the
+/// pack from cutting a packet in half.
+fn batch_is_full(pack: &Pack, capacity: usize) -> bool {
+    pack.len + MAX_DATAGRAM_SIZE > capacity || pack.count == QUIC_BATCH_SEGMENTS
 }
 
 /// The bytes one flush has packed into a batch, and how they are packed.
@@ -7341,18 +7354,23 @@ mod test_send_stats {
         static CALLS: Cell<usize> = const { Cell::new(0) };
         /// Datagrams those sends carried.
         static DATAGRAMS: Cell<usize> = const { Cell::new(0) };
+        /// Datagrams in the largest single send.
+        static LARGEST: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Start counting this thread's sends from zero.
     pub(super) fn reset() {
         CALLS.with(|c| c.set(0));
         DATAGRAMS.with(|c| c.set(0));
+        LARGEST.with(|c| c.set(0));
     }
 
     /// Record one send of `bytes`, packed as segments of `segment_size`.
     pub(super) fn record(bytes: usize, segment_size: usize) {
+        let datagrams = bytes.div_ceil(segment_size);
         CALLS.with(|c| c.set(c.get() + 1));
-        DATAGRAMS.with(|c| c.set(c.get() + bytes.div_ceil(segment_size)));
+        DATAGRAMS.with(|c| c.set(c.get() + datagrams));
+        LARGEST.with(|c| c.set(c.get().max(datagrams)));
     }
 
     /// Batch sends recorded since the last [`reset`].
@@ -7363,6 +7381,11 @@ mod test_send_stats {
     /// Datagrams recorded since the last [`reset`].
     pub(super) fn datagrams() -> usize {
         DATAGRAMS.with(|c| c.get())
+    }
+
+    /// Datagrams in the largest send since the last [`reset`].
+    pub(super) fn largest() -> usize {
+        LARGEST.with(|c| c.get())
     }
 }
 
@@ -9221,11 +9244,7 @@ mod quic_flush_tests {
         client_udp: UdpSocket,
     }
 
-    fn config(server: bool, idle_ms: u64, dir: &std::path::Path) -> quiche::Config {
-        config_with(server, idle_ms, dir, MAX_DATAGRAM_SIZE, 10)
-    }
-
-    /// The same config, with the UDP payload size and the initial congestion
+    /// A config with the UDP payload size and the initial congestion
     /// window the test needs. The server's real config sets both, so a test
     /// that asks a connection to fill a batch has to as well.
     fn config_with(
@@ -9335,13 +9354,25 @@ mod quic_flush_tests {
 
     /// The same, with the handshake's flights held for `delay` each way.
     fn established_over(idle_ms: u64, delay: Duration, server_udp: &UdpSocket) -> (QuicConn, Pair) {
+        established_with(idle_ms, delay, server_udp, MAX_DATAGRAM_SIZE, 10)
+    }
+
+    /// The same, with the server's UDP payload size and initial congestion
+    /// window the test needs.
+    fn established_with(
+        idle_ms: u64,
+        delay: Duration,
+        server_udp: &UdpSocket,
+        payload: usize,
+        cwnd_packets: usize,
+    ) -> (QuicConn, Pair) {
         let dir = tempfile::tempdir().expect("tempdir");
         let client_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
         client_udp.set_nonblocking(true).expect("nonblocking");
         let client_addr = client_udp.local_addr().expect("addr");
         let server_addr = server_udp.local_addr().expect("addr");
-        let mut server_cfg = config(true, idle_ms, dir.path());
-        let mut client_cfg = config(false, idle_ms, dir.path());
+        let mut server_cfg = config_with(true, idle_ms, dir.path(), payload, cwnd_packets);
+        let mut client_cfg = config_with(false, idle_ms, dir.path(), MAX_DATAGRAM_SIZE, 10);
         let cid = quiche::ConnectionId::from_ref(&[1u8; quiche::MAX_CONN_ID_LEN]);
         let client_cid = quiche::ConnectionId::from_ref(&[2u8; quiche::MAX_CONN_ID_LEN]);
         let mut client = quiche::connect(
@@ -9717,5 +9748,216 @@ mod quic_flush_tests {
         );
         assert_eq!(first_got, first_body, "the first body is byte for byte");
         assert_eq!(second_got, second_body, "the second body is byte for byte");
+    }
+
+    /// The batch caps are the send's, and the send quantum is not one of them.
+    ///
+    /// This quiche sets `send_quantum` to the initial congestion window when
+    /// the connection is made and never writes it again, so a cap on it stops
+    /// every batch at 10 packets for the connection's life while the window
+    /// grows. The two limits here are the kernel's: one UDP payload holds at
+    /// most 65,507 bytes, and one GSO send carries at most 64 segments.
+    ///
+    /// Break: a third cap, a cap on `send_quantum`, or a cap that lets a
+    /// packet straddle the end of the buffer.
+    #[test]
+    fn the_batch_caps_are_the_gso_limits() {
+        assert_eq!(QUIC_BATCH_SEGMENTS, 64, "one GSO send takes 64 segments");
+        assert_eq!(
+            QUIC_BATCH_BYTES, 65_507,
+            "one UDP payload holds 65,507 bytes"
+        );
+
+        // Room for exactly one more packet is not full. One byte less, or a
+        // packet taken whole, is.
+        let mut pack = Pack {
+            len: QUIC_BATCH_BYTES - MAX_DATAGRAM_SIZE,
+            ..Pack::default()
+        };
+        assert!(!batch_is_full(&pack, QUIC_BATCH_BYTES));
+        pack.len = QUIC_BATCH_BYTES - 1;
+        assert!(
+            batch_is_full(&pack, QUIC_BATCH_BYTES),
+            "a batch that cannot take a whole packet is full"
+        );
+
+        // The segment cap closes a batch that still has bytes left.
+        let mut pack = Pack {
+            len: MAX_DATAGRAM_SIZE,
+            count: QUIC_BATCH_SEGMENTS - 1,
+            ..Pack::default()
+        };
+        assert!(!batch_is_full(&pack, QUIC_BATCH_BYTES));
+        pack.count = QUIC_BATCH_SEGMENTS;
+        assert!(
+            batch_is_full(&pack, QUIC_BATCH_BYTES),
+            "64 segments is full whatever the byte count"
+        );
+    }
+
+    /// A batch passes the connection's send quantum, and stops at the byte cap.
+    ///
+    /// The connection is made with a 10-packet window, so its send quantum is
+    /// 10 packets and never moves. The test then runs a real ACK-driven
+    /// transfer: each flush sends what the window allows, the client ACKs over
+    /// the socket, and the window grows. The batch has to follow the window
+    /// past the quantum, and it has to stop at 65,507 bytes when the window is
+    /// wider than that.
+    ///
+    /// Break: a cap on `send_quantum` (no send would carry more than 10
+    /// packets, however far the window grew), a cap that packs past 65,507
+    /// bytes, or a flush that drops the packets after the cap.
+    #[test]
+    fn a_batch_passes_the_send_quantum_and_stops_at_the_byte_cap() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        server_udp.set_nonblocking(true).expect("nonblocking");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, mut pair) = established(30_000, &server_udp);
+        let server_addr = server_udp.local_addr().expect("server address");
+        let client_addr = pair.client_udp.local_addr().expect("client address");
+        let quantum = qconn.conn.send_quantum();
+        assert_eq!(
+            quantum,
+            10 * MAX_DATAGRAM_SIZE,
+            "the quantum is the initial window"
+        );
+
+        // 240 packets: enough for the window to grow past the byte cap.
+        let body: Vec<u8> = (0..240).flat_map(|i| [i as u8; 1350]).collect();
+
+        test_send_stats::reset();
+        let mut buf = [0u8; 2048];
+        let mut got = Vec::with_capacity(body.len());
+        let mut queued = 0;
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+        while got.len() < body.len() {
+            assert!(
+                m6_core::platform::now() < deadline,
+                "the transfer stalled at {} of {} bytes",
+                got.len(),
+                body.len()
+            );
+            // Queue what the window has room for. `stream_send` stops at the
+            // congestion window, so the rest is queued on a later turn, the
+            // same way a real response body is.
+            if queued < body.len() {
+                match qconn.conn.stream_send(3, &body[queued..], true) {
+                    Ok(n) => queued += n,
+                    Err(quiche::Error::Done) => {}
+                    Err(e) => panic!("stream_send: {e}"),
+                }
+            }
+            // The server sends what the window allows.
+            let _ = flush_conn(&server_udp, batch, &mut out, &mut qconn);
+            // The client takes the flight and answers it.
+            loop {
+                match pair.client_udp.recv_from(&mut buf) {
+                    Ok((n, _)) => {
+                        pair.client
+                            .recv(
+                                &mut buf[..n],
+                                quiche::RecvInfo {
+                                    from: server_addr,
+                                    to: client_addr,
+                                },
+                            )
+                            .expect("client receive");
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("client socket: {e}"),
+                }
+            }
+            loop {
+                match pair.client.send(&mut buf) {
+                    Ok((n, _)) => {
+                        pair.client_udp
+                            .send_to(&buf[..n], server_addr)
+                            .expect("client ACK");
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => panic!("client send: {e}"),
+                }
+            }
+            // The server reads the ACKs, which is what moves its window.
+            loop {
+                match server_udp.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        qconn
+                            .conn
+                            .recv(
+                                &mut buf[..n],
+                                quiche::RecvInfo {
+                                    from,
+                                    to: server_addr,
+                                },
+                            )
+                            .expect("server receive");
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("server socket: {e}"),
+                }
+            }
+            let mut chunk = [0u8; 2048];
+            while let Ok((n, _fin)) = pair.client.stream_recv(3, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        assert_eq!(got, body, "the body is byte for byte");
+        let largest = test_send_stats::largest();
+        assert!(
+            largest > quantum / MAX_DATAGRAM_SIZE,
+            "the largest send was {largest} packets, the quantum allowed {}",
+            quantum / MAX_DATAGRAM_SIZE
+        );
+        assert_eq!(
+            largest,
+            QUIC_BATCH_BYTES / MAX_DATAGRAM_SIZE,
+            "the window passed the byte cap and the batch stopped at it"
+        );
+        assert!(
+            test_send_stats::datagrams() >= 240,
+            "every packet of the body went"
+        );
+        assert!(
+            test_send_stats::calls() < 24,
+            "240 packets took {} sends",
+            test_send_stats::calls()
+        );
+    }
+
+    /// A batch smaller than the cap is sent as it comes: one send, no wait to
+    /// fill the buffer.
+    #[test]
+    fn a_batch_smaller_than_the_cap_is_sent_as_it_comes() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, _pair) = established(30_000, &server_udp);
+        qconn
+            .conn
+            .stream_send(3, &[7u8; 3_000], true)
+            .expect("queue a short body");
+
+        test_send_stats::reset();
+        assert_eq!(
+            flush_conn(&server_udp, batch, &mut out, &mut qconn),
+            Flush::Sent
+        );
+        assert_eq!(test_send_stats::calls(), 1, "a short batch is one send");
+        assert!(test_send_stats::datagrams() > 1, "and it carries packets");
+        assert_eq!(
+            test_send_stats::largest(),
+            test_send_stats::datagrams(),
+            "the one send carried the whole short batch"
+        );
+        assert!(
+            test_send_stats::datagrams() < QUIC_BATCH_SEGMENTS,
+            "the short batch stayed under the cap"
+        );
     }
 }
