@@ -187,76 +187,53 @@ fn udp_send_segmented(
 }
 
 /// Receive up to `metas.len()` datagrams in one `recvmmsg`.
+///
+/// The headers and the addresses are `nix`'s: `MultiHeaders` builds each
+/// `msghdr` with its own builder, which is the only way to write one that
+/// compiles against glibc and musl both, since they declare its fields
+/// differently.
 pub(super) fn udp_recv_batch(
     socket: &impl AsFd,
     buf: &mut [u8],
     slot: usize,
     metas: &mut [super::net::RecvMeta],
 ) -> io::Result<usize> {
+    use nix::sys::socket::{recvmmsg, MsgFlags, MultiHeaders, SockaddrStorage};
+    use std::io::IoSliceMut;
+
     // `UdpBatch::recv` trims both slices to one count and never calls this with
     // an empty one, so the metas it hands over are exactly what the call takes
     // in.
     let count = metas.len();
+    // One iovec per datagram, each pointing at that datagram's slot.
+    let mut slots: Vec<[IoSliceMut<'_>; 1]> = buf
+        .chunks_mut(slot)
+        .map(|bytes| [IoSliceMut::new(bytes)])
+        .collect();
+    debug_assert_eq!(slots.len(), count, "one slot per datagram");
+    let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(count, None);
 
-    let mut iovs = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; super::net::MAX_BATCH];
-    let mut addresses =
-        [std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit(); super::net::MAX_BATCH];
-    let mut headers = [std::mem::MaybeUninit::<libc::mmsghdr>::uninit(); super::net::MAX_BATCH];
-    for i in 0..count {
-        let start = i * slot;
-        iovs[i] = libc::iovec {
-            iov_base: buf[start..start + slot].as_mut_ptr().cast(),
-            iov_len: slot,
-        };
-        headers[i].write(libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: addresses[i].as_mut_ptr().cast(),
-                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-                msg_iov: std::ptr::from_mut(&mut iovs[i]),
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        });
-    }
+    let received = recvmmsg(
+        socket.as_fd().as_raw_fd(),
+        &mut headers,
+        slots.iter_mut(),
+        MsgFlags::MSG_DONTWAIT,
+        None,
+    )?;
 
-    // SAFETY: each header points at the live address and the slot of `buf` it
-    // names, the arrays hold `count` initialised headers, and `count` is at
-    // most the array length.
-    let received = unsafe {
-        libc::recvmmsg(
-            socket.as_fd().as_raw_fd(),
-            headers.as_mut_ptr().cast(),
-            count as libc::c_uint,
-            libc::MSG_DONTWAIT,
-            std::ptr::null_mut(),
-        )
-    };
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let received = received as usize;
-    for (i, meta) in metas.iter_mut().take(received).enumerate() {
-        // SAFETY: `recvmmsg` wrote the first `received` headers and their
-        // addresses.
-        let header = unsafe { headers[i].assume_init_ref() };
-        let from = if header.msg_hdr.msg_namelen == 0 {
-            None
-        } else {
-            // SAFETY: `recvmmsg` filled this slot's address.
-            unsafe { super::net::socket_addr_from_raw(addresses[i].as_ptr().cast()) }
-        };
-        *meta = super::net::RecvMeta {
-            len: header.msg_len as usize,
+    let mut taken = 0;
+    for (index, message) in received.enumerate() {
+        let from = message
+            .address
+            .as_ref()
+            .and_then(super::net::socket_addr_of);
+        metas[index] = super::net::RecvMeta {
+            len: message.bytes,
             from,
         };
+        taken = index + 1;
     }
-    Ok(received)
+    Ok(taken)
 }
 
 /// The classic BPF program [`steer_reuseport`] attaches: 20 instructions.

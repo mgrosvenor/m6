@@ -202,7 +202,7 @@ pub(super) fn udp_recv_batch(
     metas: &mut [super::net::RecvMeta],
 ) -> io::Result<usize> {
     use nix::errno::Errno;
-    use nix::sys::socket::{recvfrom, SockaddrLike, SockaddrStorage};
+    use nix::sys::socket::{recvfrom, SockaddrStorage};
 
     // `UdpBatch::recv` trims both slices to one count and never calls this with
     // an empty one, so the metas it hands over are exactly what the call takes
@@ -213,10 +213,7 @@ pub(super) fn udp_recv_batch(
         let start = i * slot;
         match recvfrom::<SockaddrStorage>(fd, &mut buf[start..start + slot]) {
             Ok((len, from)) => {
-                // SAFETY: `recvfrom` filled the address for this datagram.
-                let from = from.and_then(|address| unsafe {
-                    super::net::socket_addr_from_raw(address.as_ptr())
-                });
+                let from = from.as_ref().and_then(super::net::socket_addr_of);
                 *meta = super::net::RecvMeta { len, from };
                 received += 1;
             }

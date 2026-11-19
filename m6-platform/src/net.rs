@@ -426,37 +426,29 @@ impl UdpBatch {
     }
 }
 
-/// Turn the kernel's address for a received datagram into a `SocketAddr`,
-/// `None` for an address family m6 does not use.
+/// The address a received datagram came from, `None` for an address family m6
+/// does not use.
 ///
-/// # Safety
-/// `address` is null or points at a live address structure the kernel filled
-/// for a received datagram, large enough for the family it names.
-pub(super) unsafe fn socket_addr_from_raw(address: *const libc::sockaddr) -> Option<SocketAddr> {
+/// `SockaddrStorage` checks the family and the length before it hands out the
+/// inner structure, so this replaces the hand-written cast that used to repeat
+/// both checks in `unsafe`.
+pub(super) fn socket_addr_of(address: &nix::sys::socket::SockaddrStorage) -> Option<SocketAddr> {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-    if address.is_null() {
-        return None;
+    if let Some(inet) = address.as_sockaddr_in() {
+        let inet: &nix::libc::sockaddr_in = inet.as_ref();
+        return Some(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::from(inet.sin_addr.s_addr.to_ne_bytes()),
+            u16::from_be(inet.sin_port),
+        )));
     }
-    match unsafe { (*address).sa_family as libc::c_int } {
-        libc::AF_INET => {
-            let inet = unsafe { &*address.cast::<libc::sockaddr_in>() };
-            Some(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(inet.sin_addr.s_addr.to_ne_bytes()),
-                u16::from_be(inet.sin_port),
-            )))
-        }
-        libc::AF_INET6 => {
-            let inet6 = unsafe { &*address.cast::<libc::sockaddr_in6>() };
-            Some(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(inet6.sin6_addr.s6_addr),
-                u16::from_be(inet6.sin6_port),
-                inet6.sin6_flowinfo,
-                inet6.sin6_scope_id,
-            )))
-        }
-        _ => None,
-    }
+    let inet6: &nix::libc::sockaddr_in6 = address.as_sockaddr_in6()?.as_ref();
+    Some(SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::from(inet6.sin6_addr.s6_addr),
+        u16::from_be(inet6.sin6_port),
+        inet6.sin6_flowinfo,
+        inet6.sin6_scope_id,
+    )))
 }
 
 /// The index of the network interface named `name`, for a link-local IPv6
