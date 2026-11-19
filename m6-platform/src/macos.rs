@@ -2,8 +2,10 @@
 //! `platform.rs`, so it is the same code on arm64 and x86_64.
 //!
 //! Every `pub(super)` item here has a twin of the same name in `linux.rs`, and
-//! `tests/platform_gate.rs` holds the two lists equal. No tests live here: the
-//! layer's tests are shared and run unchanged on every target. A port to
+//! `tests/platform_gate.rs` holds the two lists equal. The layer's tests are
+//! shared and run unchanged on every target; the one exception is the test that
+//! drives [`test_recv_error`], because the per-datagram receive it holds is the
+//! part of the receive this file owns and Linux does not have. A port to
 //! another kqueue system (FreeBSD, OpenBSD) starts from this file.
 
 use std::io;
@@ -211,7 +213,16 @@ pub(super) fn udp_recv_batch(
     let mut received = 0;
     for (i, meta) in metas.iter_mut().enumerate() {
         let start = i * slot;
-        match recvfrom::<SockaddrStorage>(fd, &mut buf[start..start + slot]) {
+        #[cfg(test)]
+        let read = if test_recv_error::due(received) {
+            // The error a connected socket reports for a peer that is gone.
+            Err(Errno::ECONNREFUSED)
+        } else {
+            recvfrom::<SockaddrStorage>(fd, &mut buf[start..start + slot])
+        };
+        #[cfg(not(test))]
+        let read = recvfrom::<SockaddrStorage>(fd, &mut buf[start..start + slot]);
+        match read {
             Ok((len, from)) => {
                 let from = from.as_ref().and_then(super::net::socket_addr_of);
                 *meta = super::net::RecvMeta { len, from };
@@ -219,14 +230,116 @@ pub(super) fn udp_recv_batch(
             }
             Err(Errno::EAGAIN) if received == 0 => return Err(Errno::EAGAIN.into()),
             Err(Errno::EAGAIN) => break,
-            // An error after one or more datagrams were read keeps them. The
+            // An error after one or more datagrams were read keeps them: the
             // count is what this call took in, and returning the error here
-            // would drop them, so the next call reports it instead.
+            // would drop them. macOS clears a socket error once `recvfrom`
+            // reports it, so the error is consumed here and the next call is
+            // not told it again.
             Err(_) if received > 0 => break,
             Err(e) => return Err(e.into()),
         }
     }
     Ok(received)
+}
+
+/// A socket error a test asks the receive below to meet after `after`
+/// datagrams.
+///
+/// The real error cannot be produced to order: the kernel reports it at the
+/// next receive, not between two dequeues, so a test that waits for one is
+/// testing the network. This module is `cfg(test)`, and a release build
+/// contains neither it nor its call.
+#[cfg(test)]
+mod test_recv_error {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Fail this thread's next batch receive after this many datagrams.
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Fail this thread's next batch receive after `after` datagrams.
+    pub(crate) fn fail_after(after: usize) {
+        AFTER.with(|a| a.set(Some(after)));
+    }
+
+    /// Whether this receive is the one to fail, taking the request off.
+    pub(crate) fn due(received: usize) -> bool {
+        AFTER.with(|a| match a.get() {
+            Some(after) if received >= after => {
+                a.set(None);
+                true
+            }
+            _ => false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket error that arrives after a datagram was read keeps that
+    /// datagram, and the error is not reported again: macOS clears it once
+    /// `recvfrom` reports it, so the call that met it returns the datagrams.
+    ///
+    /// Break: a receive that returns the error after it has read a datagram,
+    /// and so drops what it read.
+    #[test]
+    fn a_socket_error_after_a_datagram_keeps_it() {
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver.set_nonblocking(true).expect("nonblocking");
+        let to = receiver.local_addr().expect("receiver address");
+        sender.send_to(b"one", to).expect("send one");
+        sender.send_to(b"two", to).expect("send two");
+        // The datagrams have to be in the receiver's queue before the seam can
+        // stop the receive between them. Wait for the first rather than assume
+        // the send has landed: a loaded machine queues it a moment later.
+        assert!(
+            crate::wait_readable(receiver.as_fd(), std::time::Duration::from_secs(5))
+                .expect("wait for the receiver"),
+            "the datagrams did not arrive"
+        );
+        let mut buf = [0u8; 2 * 64];
+        let mut metas = [super::super::net::RecvMeta::default(); 2];
+
+        test_recv_error::fail_after(1);
+        let got = udp_recv_batch(&receiver, &mut buf, 64, &mut metas)
+            .expect("the datagram read before the error is kept");
+        assert_eq!(got, 1, "the datagram the batch read was dropped");
+        assert_eq!(&buf[..3], b"one", "the bytes the batch read");
+
+        // The failing call reported the error and cleared it, so the next call
+        // takes the next datagram rather than reporting the error again. The
+        // two datagrams cross loopback one at a time, so wait for the second
+        // rather than assume it is already queued.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let got = loop {
+            match udp_recv_batch(&receiver, &mut buf, 64, &mut metas) {
+                Ok(n) => break n,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    assert!(crate::wait_readable(
+                        receiver.as_fd(),
+                        std::time::Duration::from_millis(50)
+                    )
+                    .expect("wait for the receiver"));
+                }
+                Err(e) => panic!("the next call: {e}"),
+            }
+        };
+        assert_eq!(got, 1, "the datagram behind the error");
+        assert_eq!(&buf[..3], b"two", "the bytes the next call read");
+        assert_eq!(
+            udp_recv_batch(&receiver, &mut buf, 64, &mut metas)
+                .expect_err("nothing is waiting")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 /// The hard limit reads as unlimited and the kernel enforces

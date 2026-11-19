@@ -1460,8 +1460,8 @@ mod udp_batches {
         );
     }
 
-    /// U-B5. A receive that hits an error after one or more datagrams were read
-    /// returns them, and the next call reports the error.
+    /// U-B5. An error on the socket does not lose a datagram that is already
+    /// queued, and it is reported once.
     ///
     /// The error is the kernel's: a connected socket that sends to a port with
     /// no listener is answered with ICMP port unreachable, which the socket
@@ -1469,8 +1469,21 @@ mod udp_batches {
     /// delivers that error, so a host that does not fails here rather than
     /// passing on nothing.
     ///
-    /// Break: a batch that returns `Err` for an error it meets part way
-    /// through, and so drops the datagrams it had already read.
+    /// The two platforms report the error in different places. Linux checks it
+    /// before the queue, so a call with the error pending returns `Err` having
+    /// read nothing and the datagram waits for the next call; an error met
+    /// after a datagram was read is returned as the count and stored back on
+    /// the socket, so the next call reports it. macOS reports it from the
+    /// `recvfrom` that meets it and clears it there, so with a datagram
+    /// queued first the batch returns that datagram and the error is not
+    /// reported again.
+    ///
+    /// Break: a batch that returns `Err` for an error it meets after it has
+    /// read a datagram, and so drops what it read. On macOS that is the order
+    /// this test takes, because its `recvfrom` for the datagram runs before
+    /// the one that meets the error. Linux cannot produce that order here:
+    /// with the error already pending its `recvmmsg` returns the error before
+    /// it reads anything.
     #[test]
     fn an_error_does_not_discard_a_datagram_the_batch_read() {
         const SLOT: usize = 64;
@@ -1517,6 +1530,12 @@ mod udp_batches {
             Ok(count) => {
                 assert_eq!(count, 1, "the datagram the batch read");
                 assert_eq!(&buf[..3], b"one", "the bytes the batch read");
+                // The error was met after the datagram was read, and this call
+                // returned the datagram instead of the error. What the next
+                // call reports is the platform's: Linux stores the error back
+                // and reports it, macOS clears it where it was reported. The
+                // macOS arm holds the clearing in
+                // `macos::tests::a_socket_error_after_a_datagram_keeps_it`.
             }
             // The error came first, so nothing had been read and nothing can
             // have been lost: the datagram is still there for the next call.
