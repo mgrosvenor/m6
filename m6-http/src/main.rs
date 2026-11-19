@@ -3276,8 +3276,9 @@ fn event_loop(
             accepting = true;
         }
 
-        // Drive connection timeouts and flush pending sends.
-        flush_all(&udp, &mut connections);
+        // Drive the QUIC connections whose timer is due. The ones that received
+        // a packet this turn were flushed in drain_udp; an idle one needs nothing.
+        flush_due(&udp, &mut connections, now2);
 
         // Remove closed/timed-out connections.
         connections.retain(|_, c| !c.conn.is_closed());
@@ -3579,6 +3580,12 @@ fn drain_udp(
         // Process H3 events
         if qconn.h3_conn.is_some() {
             process_h3(qconn, &key, state, h3);
+        }
+
+        // A packet may have carried the credit a saved response was waiting
+        // for: this is the one place that connection is driven this turn.
+        if !qconn.partial_responses.is_empty() {
+            drain_writable(qconn);
         }
 
         // Send any pending QUIC packets
@@ -6876,11 +6883,23 @@ fn drain_writable(qconn: &mut QuicConn) {
     }
 }
 
-fn flush_all(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>) {
+/// Drive the connections whose quiche timer has expired: fire the timer, resume
+/// any response that was waiting for credit, and send what that produced.
+///
+/// Only those. A connection that received a packet this turn was driven and
+/// flushed in `drain_udp`, and an idle connection with a timer in the future
+/// has nothing to send. Driving every connection every turn (`on_timeout`,
+/// `drain_writable` and a `send` that returns `Done`) cost about half a
+/// microsecond per idle connection per turn, and a QUIC connection idles for
+/// 30 s after its client went away: with a thousand of them each loop turn
+/// spent longer sweeping than serving.
+fn flush_due(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>, now: Instant) {
     for qconn in connections.values_mut() {
-        qconn.conn.on_timeout();
-        drain_writable(qconn);
-        flush_conn(udp, qconn);
+        if qconn.conn.timeout_instant().is_some_and(|at| at <= now) {
+            qconn.conn.on_timeout();
+            drain_writable(qconn);
+            flush_conn(udp, qconn);
+        }
     }
 }
 
@@ -8594,5 +8613,198 @@ mod cache_warm_tests {
         );
         // Any other policy is cacheable as far as this decision goes.
         assert!(is_warmable("/contact", Some("private, max-age=0"), None));
+    }
+}
+
+#[cfg(test)]
+mod flush_due_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// One server-side QUIC connection in the loop's table, with the client end
+    /// and the socket the client reads from.
+    struct Pair {
+        _client: quiche::Connection,
+        client_udp: UdpSocket,
+    }
+
+    fn config(server: bool, idle_ms: u64, dir: &std::path::Path) -> quiche::Config {
+        let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        if server {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("certificate");
+            std::fs::write(dir.join("cert.pem"), cert.cert.pem()).expect("write cert");
+            std::fs::write(dir.join("key.pem"), cert.key_pair.serialize_pem()).expect("write key");
+            cfg.load_cert_chain_from_pem_file(dir.join("cert.pem").to_str().unwrap())
+                .expect("cert chain");
+            cfg.load_priv_key_from_pem_file(dir.join("key.pem").to_str().unwrap())
+                .expect("key");
+        } else {
+            cfg.verify_peer(false);
+        }
+        cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .expect("alpn");
+        cfg.set_max_idle_timeout(idle_ms);
+        cfg.set_initial_max_data(1_000_000);
+        cfg.set_initial_max_stream_data_uni(100_000);
+        cfg.set_initial_max_streams_uni(10);
+        cfg.grease(false);
+        cfg
+    }
+
+    /// Hand every packet either end has queued to the other, in memory, until
+    /// neither has any.
+    fn pump(
+        a: &mut quiche::Connection,
+        a_addr: SocketAddr,
+        b: &mut quiche::Connection,
+        b_addr: SocketAddr,
+    ) {
+        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
+        loop {
+            let mut moved = false;
+            while let Ok((n, _)) = a.send(&mut buf) {
+                let info = quiche::RecvInfo {
+                    from: a_addr,
+                    to: b_addr,
+                };
+                b.recv(&mut buf[..n], info).expect("recv");
+                moved = true;
+            }
+            while let Ok((n, _)) = b.send(&mut buf) {
+                let info = quiche::RecvInfo {
+                    from: b_addr,
+                    to: a_addr,
+                };
+                a.recv(&mut buf[..n], info).expect("recv");
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+    }
+
+    /// An established connection the server end of which is a `QuicConn`.
+    fn established(idle_ms: u64, server_udp: &UdpSocket) -> (QuicConn, Pair) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        client_udp.set_nonblocking(true).expect("nonblocking");
+        let client_addr = client_udp.local_addr().expect("addr");
+        let server_addr = server_udp.local_addr().expect("addr");
+        let mut server_cfg = config(true, idle_ms, dir.path());
+        let mut client_cfg = config(false, idle_ms, dir.path());
+        let cid = quiche::ConnectionId::from_ref(&[1u8; quiche::MAX_CONN_ID_LEN]);
+        let client_cid = quiche::ConnectionId::from_ref(&[2u8; quiche::MAX_CONN_ID_LEN]);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &client_cid,
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect");
+        let mut server =
+            quiche::accept(&cid, None, server_addr, client_addr, &mut server_cfg).expect("accept");
+        pump(&mut client, client_addr, &mut server, server_addr);
+        assert!(client.is_established() && server.is_established());
+        let now = Instant::now();
+        let qconn = QuicConn {
+            conn: server,
+            h3_conn: None,
+            pending: HashMap::new(),
+            partial_responses: HashMap::new(),
+            client_addr,
+            last_active: now,
+            created: now,
+            handshake_recorded: true,
+        };
+        (
+            qconn,
+            Pair {
+                _client: client,
+                client_udp,
+            },
+        )
+    }
+
+    /// Wait for a datagram on the client's socket, or report there is none.
+    fn datagram_arrived(udp: &UdpSocket) -> bool {
+        let mut buf = [0u8; 2048];
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if udp.recv_from(&mut buf).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn queue_data(qconn: &mut QuicConn) {
+        qconn
+            .conn
+            .stream_send(3, b"queued and not yet sent", false)
+            .expect("stream_send");
+    }
+
+    /// A connection whose timer has passed is driven: its idle timeout fires
+    /// and the connection closes. Without the drive it would stay in the table
+    /// for ever.
+    #[test]
+    fn a_connection_whose_timer_is_due_is_driven() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let (qconn, _pair) = established(100, &server_udp);
+        let mut connections = HashMap::from([(vec![1u8], qconn)]);
+        let at = connections[&vec![1u8]]
+            .conn
+            .timeout_instant()
+            .expect("a timer is armed");
+        // quiche reads the real clock, so the timer has to really pass.
+        while Instant::now() < at {
+            std::hint::spin_loop();
+        }
+        assert!(!connections[&vec![1u8]].conn.is_closed());
+        flush_due(&server_udp, &mut connections, Instant::now());
+        assert!(
+            connections[&vec![1u8]].conn.is_closed(),
+            "a connection past its idle timeout was not driven"
+        );
+    }
+
+    /// A turn drives the connection whose timer is due and leaves the idle
+    /// ones alone: the idle connection's queued data is not sent, and it has
+    /// not been closed or had its timer fired.
+    #[test]
+    fn idle_connections_whose_timer_is_not_due_are_not_touched() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let (mut idle, idle_pair) = established(30_000, &server_udp);
+        let (due, _due_pair) = established(100, &server_udp);
+        queue_data(&mut idle);
+        let due_at = due.conn.timeout_instant().expect("a timer is armed");
+        let idle_at = idle.conn.timeout_instant().expect("a timer is armed");
+        assert!(idle_at > due_at, "the idle connection's timer is later");
+        let mut connections = HashMap::from([(vec![1u8], idle), (vec![2u8], due)]);
+
+        while Instant::now() < due_at {
+            std::hint::spin_loop();
+        }
+        flush_due(&server_udp, &mut connections, Instant::now());
+
+        assert!(
+            connections[&vec![2u8]].conn.is_closed(),
+            "the connection whose timer was due was not driven"
+        );
+        let idle = connections.get_mut(&vec![1u8]).expect("idle connection");
+        assert!(!idle.conn.is_closed());
+        assert_eq!(idle.conn.timeout_instant(), Some(idle_at));
+        assert!(
+            !datagram_arrived(&idle_pair.client_udp),
+            "an idle connection sent on a turn its timer was not due"
+        );
+        let mut out = [0u8; MAX_DATAGRAM_SIZE];
+        assert!(
+            idle.conn.send(&mut out).is_ok(),
+            "the idle connection's queued data was consumed without a send"
+        );
     }
 }

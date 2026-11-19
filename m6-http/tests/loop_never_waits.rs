@@ -1128,6 +1128,19 @@ fn a_large_response_to_a_slow_reader_is_resumed_by_write_readiness() {
     assert_eq!(fast_body, FAST_BODY);
 }
 
+/// A 4 MiB HTTP/3 response is larger than the 1 MB the client lets one stream
+/// hold, so the server parks the rest until the client's reads grant more
+/// credit. The turn that receives that credit resumes it, though the loop no
+/// longer visits every connection on every turn: the body arrives whole.
+#[test]
+fn a_parked_h3_response_completes_when_credit_arrives() {
+    let fx = Fixture::start(1, 30, "h3park");
+    let (status, body) = h3_get(fx.port(), "/large", Duration::from_secs(20))
+        .unwrap_or_else(|e| panic!("{e}\n--- m6-http ---\n{}", fx.service.output()));
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), LARGE_BODY.len(), "the 4 MiB body arrived whole");
+}
+
 /// A 1 MiB request body over TLS arrives whole: the turn drains rustls's
 /// plaintext buffer and reads on, rather than stopping at the 16 KiB limit.
 #[test]
