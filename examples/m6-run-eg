@@ -27,6 +27,9 @@ M6_DIR="${M6:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PGID_DIR="/tmp/m6-eg/$(printf '%s' "$SCRIPT_DIR" | cksum | cut -d' ' -f1)"
 . "$SCRIPT_DIR/own.sh"
 OPEN_BROWSER=1
+# The longest a start waits for the stack to answer, in seconds. A cold build is
+# most of it.
+STARTUP_BOUND=600
 
 # Ensure m6 binaries are on PATH for dev.sh scripts that don't set it themselves.
 [ -n "$M6_DIR" ] && export PATH="$M6_DIR/target/release:$PATH"
@@ -251,18 +254,42 @@ start_eg() {
 
     local port
     port=$(example_port "$1")
-    echo "pgid $pg — log: /tmp/m6-eg-${num}.log"
+    local log="/tmp/m6-eg-${num}.log"
+    echo "pgid $pg — log: $log"
     echo "waiting for port $port..."
-    local i=0
-    while ! lsof -ti ":$port" &>/dev/null && [ $i -lt 50 ]; do
-        sleep 0.2; i=$((i+1))
+
+    # Up means the stack answers an HTTPS request on its port, not a duration
+    # that has elapsed. dev.sh builds first, so a fixed ten seconds reported a
+    # stack that was still building as not started. `STARTUP_BOUND` is the
+    # ceiling for a stack that never answers, and a dev.sh that exits ends the
+    # wait at once, so a stack that died is reported in seconds.
+    local started=$SECONDS
+    local deadline=$((started + STARTUP_BOUND))
+    local up=0
+    while :; do
+        if curl -sk --http1.1 -m 2 -o /dev/null "https://127.0.0.1:$port/"; then
+            up=1; break
+        fi
+        if ! kill -0 "$pg" 2>/dev/null || [ "$SECONDS" -ge "$deadline" ]; then
+            break
+        fi
+        sleep 0.2
     done
-    if lsof -ti ":$port" &>/dev/null; then
-        echo "up. $(date '+%H:%M:%S')"
+
+    if [ "$up" -eq 1 ]; then
+        echo "up. after $((SECONDS - started))s, $(date '+%H:%M:%S')"
         [ "$OPEN_BROWSER" = "1" ] && open_browser "$1" || true
-    else
-        echo "port $port not open after 10s — check /tmp/m6-eg-${num}.log"
+        return 0
     fi
+
+    if kill -0 "$pg" 2>/dev/null; then
+        echo "error: example $num did not answer within ${STARTUP_BOUND}s and dev.sh is still running." >&2
+    else
+        echo "error: example $num's dev.sh exited before the stack answered." >&2
+    fi
+    echo "       $log, last 20 lines:" >&2
+    tail -20 "$log" 2>/dev/null | sed 's/^/         /' >&2
+    return 1
 }
 
 # Detect the port from an example's dev.sh comment or site.toml (defaults to 8443).
