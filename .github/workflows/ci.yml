@@ -742,6 +742,9 @@ jobs:
           # Example 05's end-to-end test makes its own certificate, keys and
           # auth database in a temporary directory, so it runs here with the
           # rest (it needed dev.sh's state before the platform layer).
+          # Examples 05 and 09 start m6-http, which pins its memory at start, and
+          # a runner account's RLIMIT_MEMLOCK is 8 MiB, as in the test jobs above.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           status=0
           cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
