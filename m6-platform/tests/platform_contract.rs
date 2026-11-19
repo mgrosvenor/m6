@@ -987,6 +987,12 @@ mod sockets {
         );
         let (stale_dev, stale_ino) = (stale.dev(), stale.ino());
 
+        // A second name keeps the stale inode allocated. Unlinking the only
+        // name frees it, and a filesystem may give the same number to the next
+        // file, which says nothing about whether the bind replaced the file.
+        let keep = dir.path().join("nested").join("stale-kept");
+        std::fs::hard_link(&path, &keep).expect("keep the stale inode allocated");
+
         let replaced = net::bind_unix(&path, 0o660).expect("a stale socket is replaced");
         let fresh = std::fs::metadata(&path).expect("stat the socket just bound");
         assert!(
@@ -1739,7 +1745,12 @@ mod limits {
         assert_eq!(hard, 64, "the shell lowered the hard limit");
         let n = process::raise_fd_limit().expect("raise under a low hard limit");
         assert_eq!(n, 64 - FD_MARGIN);
-        let open_already = process::open_descriptors(std::process::id()).expect("count");
+        // The limit is on descriptor numbers: the kernel refuses number 64 and
+        // grants every free number below it. The test therefore checks the
+        // numbers it was granted. A count of open descriptors would also
+        // include any the parent passed down above 64, which the limit does
+        // not touch, and a runner can pass some.
+        use std::os::fd::AsRawFd;
         let mut held = Vec::new();
         loop {
             match std::fs::File::open("/dev/null") {
@@ -1751,10 +1762,14 @@ mod limits {
             }
             assert!(held.len() < 1000, "the limit is enforced");
         }
+        let highest = held
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .max()
+            .expect("one opened");
         assert_eq!(
-            open_already + held.len(),
-            64,
-            "every descriptor up to the limit opened"
+            highest, 63,
+            "descriptor 63 opened and 64 was refused, so the limit is exactly 64"
         );
         println!("inner: ok");
     }
