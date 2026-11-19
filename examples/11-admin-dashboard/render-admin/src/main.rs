@@ -482,6 +482,10 @@ impl Conn {
 /// A client's token is twice its slot's number, and the slot's publish
 /// connection is the odd token after it.
 fn main() -> io::Result<()> {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any argument, site directory or configuration is read.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Block the termination signals before anything can start a thread.
     m6_core::signal::block();
 

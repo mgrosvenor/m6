@@ -20,5 +20,8 @@ toml        = "0.8"
 anyhow      = "1"
 uuid        = { version = "1", features = ["v4"] }
 
+[build-dependencies]
+m6-platform = { path = "../../../m6-platform" }
+
 [dev-dependencies]
 tempfile = "3"

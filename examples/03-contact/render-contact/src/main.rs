@@ -180,6 +180,10 @@ impl Conn {
 }
 
 fn main() -> io::Result<()> {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any argument, site directory or configuration is read.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     // Block the termination signals before anything can start a thread.
     m6_core::signal::block();
 

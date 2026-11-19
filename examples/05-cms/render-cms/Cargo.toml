@@ -10,6 +10,9 @@ comrak     = { version = "0.21", default-features = false }
 base64     = "0.22"
 genid-publisher = { path = "../../common/genid-publisher" }
 
+[build-dependencies]
+m6-platform = { path = "../../../m6-platform" }
+
 [dev-dependencies]
 rcgen         = "0.13"
 rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
