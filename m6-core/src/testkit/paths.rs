@@ -147,25 +147,33 @@ pub fn exec_scratch_root() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// The profile directory is the one the running test executable is in.
+    /// The profile directory is the one above the running test executable's
+    /// `deps` (the old cargo layout, `<profile>/deps/<exe>`) or `build` (the
+    /// new build-dir layout, `<profile>/build/<pkg>/<hash>/out/<exe>`).
     ///
     /// This is what `binary()` joins a cross-package binary name onto, so it
-    /// has to be `<target>/<profile>` and not `<target>` or a `deps` directory.
+    /// has to be `<target>/<profile>` and not `<target>`, `deps` or `build`.
     #[test]
     fn the_profile_directory_is_the_one_holding_the_test_binary() {
         let dir = profile_dir();
         let exe = std::env::current_exe().unwrap();
-        let deps = exe.parent().expect("the test executable has a directory");
-        assert_eq!(
-            deps.file_name().and_then(|s| s.to_str()),
-            Some("deps"),
-            "the test executable is at {}",
+        assert!(
+            exe.starts_with(&dir),
+            "{} is not above the test executable {}",
+            dir.display(),
             exe.display()
         );
-        assert_eq!(dir, deps.parent().expect("deps has a parent"));
+        let below = exe
+            .strip_prefix(&dir)
+            .unwrap()
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str());
         assert!(
-            dir.join("deps").is_dir(),
-            "{} is not a profile directory",
+            matches!(below, Some("deps" | "build")),
+            "the test executable {} is not under {}/deps or {}/build",
+            exe.display(),
+            dir.display(),
             dir.display()
         );
     }
