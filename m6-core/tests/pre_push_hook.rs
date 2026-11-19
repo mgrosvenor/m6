@@ -433,7 +433,16 @@ fn scripts_named(line: &str) -> Vec<String> {
 /// finish without making one.
 #[test]
 fn the_hook_runs_no_content_checks() {
-    let dir = tempfile::tempdir().unwrap();
+    // Under `target/`, because the hook EXECUTES this stub if it calls cargo,
+    // and a hardened host mounts `/tmp` `noexec`. That refusal would pass
+    // silently here: the test asserts the stub was not run, so an exec refused
+    // with "Permission denied" leaves the marker absent and the test passes for
+    // the wrong reason. `CARGO_TARGET_TMPDIR` is under `target/`, which is
+    // exec-capable wherever the build ran.
+    let dir = tempfile::Builder::new()
+        .prefix("m6-pre-push-path-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
     let marker = dir.path().join("cargo-called");
     let cargo = dir.path().join("cargo");
     std::fs::write(

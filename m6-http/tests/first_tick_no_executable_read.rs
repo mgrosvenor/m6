@@ -3,7 +3,9 @@
 //! The identity used to be the md5 of the bytes the process started from, read
 //! once at start. This test still proves the placement without a timer. It runs
 //! its own copy of `m6-http`, removes that copy once the listener is up, then
-//! waits for the first metrics line. The line must carry the full SemVer with
+//! waits for the first metrics line. The copy lives under the directory cargo
+//! names for integration tests, because it is executed and the host's `/tmp`
+//! may be mounted `noexec`. The line must carry the full SemVer with
 //! the commit in its build metadata. The executable those bytes would have come
 //! from is gone, so this pins the identity to compile-time constants.
 
@@ -71,7 +73,17 @@ fn perf_lines(output: &str) -> usize {
 
 #[test]
 fn the_first_tick_reads_no_executable() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    // Under `target/tmp`, because the copy below is EXECUTED and a hardened
+    // host mounts `/tmp` `noexec`, where the spawn fails with "Permission
+    // denied" that names the binary rather than the mount. `CARGO_TARGET_TMPDIR`
+    // is cargo's `<target>/tmp` for integration tests, created before they run
+    // and on the same filesystem as `<target>/<profile>/deps`, which this test
+    // binary was exec'd from, so exec permission there is a fact. No unix
+    // socket goes under here, so the longer path is fine.
+    let dir = tempfile::Builder::new()
+        .prefix("m6-first-tick-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir under CARGO_TARGET_TMPDIR");
     let d = dir.path();
     let (cert_pem, key_pem) = keypair();
     std::fs::write(d.join("cert.pem"), cert_pem).expect("cert");
