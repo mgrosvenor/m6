@@ -1273,6 +1273,17 @@ fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
     }
 }
 
+/// Close the connection and put the close on the wire before dropping it.
+///
+/// Dropping a connection without this leaves the peer holding it until its idle
+/// timeout, and the bench client reconnects every [`H3_MAX_STREAMS_PER_CONN`]
+/// requests, so one idle connection per reconnect piles up on the server. A
+/// connection the peer already closed is not a failure to close.
+fn close_and_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
+    let _ = conn.close(true, 0x100, b"");
+    quic_flush(conn, udp);
+}
+
 /// One HTTP/3 GET / on an existing H3 connection. Returns response body.
 ///
 /// `recv_info` is the connection's address pair, read once when the socket was
@@ -1433,7 +1444,7 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
         if reqs >= H3_MAX_STREAMS_PER_CONN {
             // Tell the server this connection is finished; dropping it would leave it
             // holding a connection until the idle timeout.
-            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            close_and_flush(&mut conn, &udp);
             let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
@@ -1449,7 +1460,7 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
         if reqs >= H3_MAX_STREAMS_PER_CONN {
             // Tell the server this connection is finished; dropping it would leave it
             // holding a connection until the idle timeout.
-            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            close_and_flush(&mut conn, &udp);
             let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
@@ -1492,7 +1503,7 @@ fn bench_http3_throughput(
                         if reqs >= H3_MAX_STREAMS_PER_CONN {
                             // Tell the server this connection is finished; dropping it would leave it
                             // holding a connection until the idle timeout.
-                            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+                            close_and_flush(&mut conn, &udp);
                             let (c, h, u, r) = h3_connect(&addr, &mut cfg)?;
                             conn = c;
                             h3 = h;
@@ -1555,7 +1566,7 @@ fn bench_h3_throughput_path(
                         if reqs >= H3_MAX_STREAMS_PER_CONN {
                             // Tell the server this connection is finished; dropping it would leave it
                             // holding a connection until the idle timeout.
-                            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+                            close_and_flush(&mut conn, &udp);
                             let (c, h, u, r) = h3_connect(&addr, &mut cfg)?;
                             conn = c;
                             h3 = h;
@@ -1809,7 +1820,7 @@ fn bench_h3_path_latency(
         if reqs >= H3_MAX_STREAMS_PER_CONN {
             // Tell the server this connection is finished; dropping it would leave it
             // holding a connection until the idle timeout.
-            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            close_and_flush(&mut conn, &udp);
             let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
@@ -1824,7 +1835,7 @@ fn bench_h3_path_latency(
         if reqs >= H3_MAX_STREAMS_PER_CONN {
             // Tell the server this connection is finished; dropping it would leave it
             // holding a connection until the idle timeout.
-            m6_http_lib::h3::close_and_flush(&mut conn, &udp)?;
+            close_and_flush(&mut conn, &udp);
             let (c, h, u, r) = h3_connect(addr, &mut cfg)?;
             conn = c;
             h3 = h;
@@ -2770,5 +2781,106 @@ mod tests {
         assert_eq!(percentile(v.clone(), 50), 50.0);
         assert_eq!(percentile(v.clone(), 99), 90.0);
         assert_eq!(percentile(v.clone(), 100), 100.0);
+    }
+
+    /// A close reaches the socket through the flush that follows it, which is
+    /// what stops a reconnect from leaving the server an idle connection until
+    /// its timeout.
+    ///
+    /// A connection with no authenticated packet from its peer sends no close
+    /// at all: quiche closes it locally, because there is nobody it can
+    /// authenticate the close to. So the closing end here is a real quiche
+    /// server that has read a client's Initial, and the check is that the
+    /// client, fed whatever the flush put on the wire, sees the connection
+    /// closed.
+    ///
+    /// Break: a close that quiche queues and nothing sends.
+    #[test]
+    fn a_close_reaches_the_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+        std::fs::write(dir.path().join("cert.pem"), cert.cert.pem()).expect("cert file");
+        std::fs::write(dir.path().join("key.pem"), cert.key_pair.serialize_pem())
+            .expect("key file");
+
+        let client_sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        client_sock.set_nonblocking(true).expect("nonblocking");
+        let client_addr = client_sock.local_addr().expect("client address");
+        let server_sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        server_sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+        let server_addr = server_sock.local_addr().expect("server address");
+        client_sock.connect(server_addr).expect("connect");
+
+        let mut client_cfg = make_quiche_client_config(true);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &new_scid(),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect");
+        let mut buf = [0u8; 65535];
+        let (n, _) = client.send(&mut buf).expect("the client's Initial");
+        client_sock.send(&buf[..n]).expect("send the Initial");
+
+        let mut server_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        server_cfg
+            .load_cert_chain_from_pem_file(dir.path().join("cert.pem").to_str().expect("path"))
+            .expect("cert chain");
+        server_cfg
+            .load_priv_key_from_pem_file(dir.path().join("key.pem").to_str().expect("path"))
+            .expect("private key");
+        server_cfg
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .expect("alpn");
+        let (n, from) = server_sock
+            .recv_from(&mut buf)
+            .expect("the Initial arrived");
+        let mut server =
+            quiche::accept(&new_scid(), None, server_addr, from, &mut server_cfg).expect("accept");
+        server
+            .recv(
+                &mut buf[..n],
+                quiche::RecvInfo {
+                    from,
+                    to: server_addr,
+                },
+            )
+            .expect("server read the Initial");
+        server_sock
+            .connect(from)
+            .expect("connect the server socket");
+
+        close_and_flush(&mut server, &server_sock);
+
+        // Feed the client whatever arrives, including any of the handshake
+        // flight still queued when the close was made, and wait for the close
+        // itself to reach it.
+        let mut buf = [0u8; 2048];
+        let deadline = m6_core::platform::now() + Duration::from_millis(500);
+        while m6_core::platform::now() < deadline && !(client.is_closed() || client.is_draining()) {
+            match client_sock.recv(&mut buf) {
+                Ok(n) => {
+                    client
+                        .recv(
+                            &mut buf[..n],
+                            quiche::RecvInfo {
+                                from: server_addr,
+                                to: client_addr,
+                            },
+                        )
+                        .ok();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert!(
+            client.is_closed() || client.is_draining(),
+            "the peer saw the connection closed"
+        );
     }
 }
