@@ -9421,6 +9421,14 @@ mod quic_flush_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let client_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
         client_udp.set_nonblocking(true).expect("nonblocking");
+        // A test client reads only after its own flush, so a whole batch can
+        // outrun the socket's default receive buffer: Linux's
+        // `net.core.rmem_default` is 212,992 bytes, a 324,000-byte response
+        // overruns it, and nothing in these tests fires a loss timer to send
+        // the tail again. One megabyte holds the largest batch they send.
+        socket2::SockRef::from(&client_udp)
+            .set_recv_buffer_size(1 << 20)
+            .expect("client receive buffer");
         let client_addr = client_udp.local_addr().expect("addr");
         let server_addr = server_udp.local_addr().expect("addr");
         let mut server_cfg = config_with(true, idle_ms, dir.path(), payload, cwnd_packets);
