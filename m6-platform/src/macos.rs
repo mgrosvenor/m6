@@ -237,6 +237,10 @@ pub(super) fn udp_recv_batch(
             }
             Err(Errno::EAGAIN) if received == 0 => return Err(Errno::EAGAIN.into()),
             Err(Errno::EAGAIN) => break,
+            // An error after one or more datagrams were read keeps them. The
+            // count is what this call took in, and returning the error here
+            // would drop them, so the next call reports it instead.
+            Err(_) if received > 0 => break,
             Err(e) => return Err(e.into()),
         }
     }

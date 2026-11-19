@@ -367,6 +367,9 @@ impl UdpBatch {
     /// Takes in at most `metas.len()` datagrams and at most `buf.len() / slot`.
     /// `WouldBlock` means no datagram was waiting. A datagram longer than
     /// `slot` is truncated to the slot, as one `recv_from` would truncate it.
+    /// A receive that fails after taking in one or more datagrams returns what
+    /// it took in, and the next call reports the error: a batch never drops a
+    /// datagram it has read.
     pub fn recv(
         &self,
         socket: &impl AsFd,

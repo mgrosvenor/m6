@@ -1459,6 +1459,79 @@ mod udp_batches {
             io::ErrorKind::WouldBlock
         );
     }
+
+    /// U-B5. A receive that hits an error after one or more datagrams were read
+    /// returns them, and the next call reports the error.
+    ///
+    /// The error is the kernel's: a connected socket that sends to a port with
+    /// no listener is answered with ICMP port unreachable, which the socket
+    /// reports on a receive. The first part of the test proves the host
+    /// delivers that error, so a host that does not fails here rather than
+    /// passing on nothing.
+    ///
+    /// Break: a batch that returns `Err` for an error it meets part way
+    /// through, and so drops the datagrams it had already read.
+    #[test]
+    fn an_error_does_not_discard_a_datagram_the_batch_read() {
+        const SLOT: usize = 64;
+
+        /// Bind a socket on loopback, non-blocking, connected to `peer`.
+        fn connected(peer: SocketAddr) -> std::net::UdpSocket {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+            socket.set_nonblocking(true).expect("nonblocking");
+            socket.connect(peer).expect("connect");
+            socket
+        }
+
+        // 1. The mechanism: a send to a closed port is reported on a receive.
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind closed");
+        let closed_addr = closed.local_addr().expect("closed address");
+        drop(closed);
+        let probe = connected(closed_addr);
+        probe.send(b"probe").expect("probe");
+        std::thread::sleep(Duration::from_millis(50));
+        let batch = net::UdpBatch::without_gso();
+        let mut buf = vec![0u8; 2 * SLOT];
+        let mut metas = [net::RecvMeta::default(); 2];
+        let refused = batch.recv(&probe, &mut buf, SLOT, &mut metas);
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused),
+            "this host does not report a closed port on a receive: {refused:?}"
+        );
+
+        // 2. One datagram queued, then the peer goes away and the socket is told
+        // so. Whichever order the kernel reports the two in, the datagram that
+        // a call read must not be lost.
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let receiver = connected(sender.local_addr().expect("sender address"));
+        let receiver_addr = receiver.local_addr().expect("receiver address");
+        sender.send_to(b"one", receiver_addr).expect("send");
+        // The datagram is in the receiver's queue before the peer goes away.
+        std::thread::sleep(Duration::from_millis(20));
+        drop(sender);
+        receiver.send(b"probe").expect("probe the closed peer");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut metas = [net::RecvMeta::default(); 2];
+        match batch.recv(&receiver, &mut buf, SLOT, &mut metas) {
+            Ok(count) => {
+                assert_eq!(count, 1, "the datagram the batch read");
+                assert_eq!(&buf[..3], b"one", "the bytes the batch read");
+            }
+            // The error came first, so nothing had been read and nothing can
+            // have been lost: the datagram is still there for the next call.
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+                assert_eq!(
+                    batch
+                        .recv(&receiver, &mut buf, SLOT, &mut metas)
+                        .expect("the next call takes the datagram"),
+                    1,
+                    "the datagram was dropped by a call that read nothing"
+                );
+            }
+        }
+    }
 }
 
 // ── 5. Clock ─────────────────────────────────────────────────────────────────
