@@ -379,6 +379,35 @@ fn publish_genid(addr: &str, token: &str, tls: Arc<rustls::ClientConfig>) -> Res
 
 // ── wait helpers ──────────────────────────────────────────────────────────────
 
+/// A handle on `<dir>/<name>.log` for a child's stdout or stderr, so a stack that fails to
+/// start can show why.
+fn log_file(dir: &Path, name: &str) -> Stdio {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{name}.log")))
+        .expect("open child log");
+    Stdio::from(file)
+}
+
+/// Print every child's log: called when the stack did not start.
+fn dump_logs(dir: &Path) {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    for f in files {
+        eprintln!(
+            "---- {} ----\n{}",
+            f.display(),
+            std::fs::read_to_string(&f).unwrap_or_default()
+        );
+    }
+}
+
 fn wait_tcp(addr: &str, timeout: Duration) -> bool {
     let dl = Instant::now() + timeout;
     while Instant::now() < dl {
@@ -575,6 +604,8 @@ impl GlobalStack {
             );
             std::fs::write(file, token).ok()?;
         }
+        let logs = w.join("logs");
+        std::fs::create_dir_all(&logs).ok()?;
         let state = w.join("state");
         std::fs::create_dir_all(&state).ok()?;
 
@@ -648,8 +679,8 @@ impl GlobalStack {
                 .arg("--log-level")
                 .arg("warn")
                 .env("M6_SOCKET_OVERRIDE", &html_sock)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(log_file(&logs, "m6-html"))
+                .stderr(log_file(&logs, "m6-html"))
                 .spawn()
                 .ok()?,
         );
@@ -661,8 +692,8 @@ impl GlobalStack {
                 .arg("--log-level")
                 .arg("warn")
                 .env("M6_SOCKET_OVERRIDE", &file_sock)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(log_file(&logs, "m6-file"))
+                .stderr(log_file(&logs, "m6-file"))
                 .spawn()
                 .ok()?,
         );
@@ -674,8 +705,8 @@ impl GlobalStack {
                 .arg("--log-level")
                 .arg("warn")
                 .env("M6_SOCKET_OVERRIDE", &auth_sock)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(log_file(&logs, "m6-auth"))
+                .stderr(log_file(&logs, "m6-auth"))
                 .spawn()
                 .ok()?,
         );
@@ -687,8 +718,8 @@ impl GlobalStack {
                 .arg("--log-level")
                 .arg("warn")
                 .env("M6_SOCKET_OVERRIDE", &cms_sock)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(log_file(&logs, "render-cms"))
+                .stderr(log_file(&logs, "render-cms"))
                 .spawn()
                 .ok()?,
         );
@@ -697,6 +728,7 @@ impl GlobalStack {
         for sock in [&html_sock, &file_sock, &auth_sock, &check_sock, &cms_sock] {
             if !wait_socket(sock, to) {
                 eprintln!("SKIP: socket {} not ready", sock.display());
+                dump_logs(&logs);
                 return None;
             }
         }
@@ -709,18 +741,20 @@ impl GlobalStack {
                 .arg("--log-level")
                 .arg("warn")
                 .env("STATE_DIRECTORY", &state)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(log_file(&logs, "origin"))
+                .stderr(log_file(&logs, "origin"))
                 .spawn()
                 .ok()?,
         );
 
         if !wait_tcp(&origin_tls_addr, to) {
             eprintln!("SKIP: origin TLS not ready on {origin_tls_addr}");
+            dump_logs(&logs);
             return None;
         }
         if !wait_tcp(&origin_h2c_addr, to) {
             eprintln!("SKIP: origin H2C not ready on {origin_h2c_addr}");
+            dump_logs(&logs);
             return None;
         }
 
@@ -739,8 +773,8 @@ impl GlobalStack {
                     .arg(&sys)
                     .arg("--log-level")
                     .arg("warn")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stdout(log_file(&logs, &format!("cache-{i}")))
+                    .stderr(log_file(&logs, &format!("cache-{i}")))
                     .spawn()
                     .ok()?,
             );
@@ -749,6 +783,7 @@ impl GlobalStack {
         for addr in &cache_addrs {
             if !wait_tcp(addr, to) {
                 eprintln!("SKIP: cache node not ready on {addr}");
+                dump_logs(&logs);
                 return None;
             }
         }
