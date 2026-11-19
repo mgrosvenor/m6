@@ -926,16 +926,19 @@ jobs:
             M6="$GITHUB_WORKSPACE" "$ex/dev.sh" > "$ex/dev.log" 2>&1 &
             dev_pid=$!
             code=000
-            for _ in $(seq 1 120); do
+            # As for 05: dev.sh may build before it starts, so wait for the stack,
+            # for dev.sh to exit, or for 15 minutes.
+            for _ in $(seq 1 900); do
               code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
               [ "$code" = "200" ] && break
+              kill -0 "$dev_pid" 2>/dev/null || break
               sleep 1
             done
             if [ "$code" = "200" ]; then
               "$ex/test.sh" || { echo "--- $ex service logs ---"; tail -30 "$ex"/logs/*.log 2>/dev/null; status=1; }
             else
               echo "--- $ex dev.sh ---"; tail -40 "$ex/dev.log"
-              echo "::error::the $ex stack never answered in 120s"
+              echo "::error::the $ex stack never answered"
               status=1
             fi
             kill "$dev_pid" 2>/dev/null || true
