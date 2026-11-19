@@ -3000,6 +3000,9 @@ fn event_loop(
     // The connections a flush found the socket would not take a batch for.
     // While it holds any, the QUIC socket is watched for writability.
     let mut blocked = BlockedSends::default();
+    // The connections one `recvmmsg` batch fed. It is cleared when each batch
+    // is flushed, so its capacity survives the whole run.
+    let mut touched: Vec<Vec<u8>> = Vec::new();
 
     // Count this thread's allocations from the first iteration. The
     // counter is read once at stop, after the loop, where ordinary logging may
@@ -3120,6 +3123,7 @@ fn event_loop(
                                 recv_buf: &mut recv_buf,
                                 flush_buf: &mut flush_buf,
                                 blocked: &mut blocked,
+                                touched: &mut touched,
                             },
                             &mut connections,
                             &mut conn_id_map,
@@ -3529,6 +3533,11 @@ struct BoundUdp<'a> {
     /// The connections whose batch the socket refused, so a flush in this turn
     /// records the ones it must retry on the writable event.
     blocked: &'a mut BlockedSends,
+    /// The connections the receive batch being consumed has fed, in first-seen
+    /// order. Each is flushed once after the batch, not once per datagram.
+    /// Reused across batches, so steady state allocates nothing for the common
+    /// case of one connection.
+    touched: &'a mut Vec<Vec<u8>>,
 }
 
 fn drain_udp(
@@ -3548,6 +3557,20 @@ fn drain_udp(
     let mut next = 0;
     loop {
         if next == received {
+            // A batch is the unit the socket took datagrams in, so it is the
+            // unit one flush covers. In steady state each datagram is an ACK
+            // that frees one packet; flushing after every datagram sent that
+            // packet as a send of its own. `flush_conn` packs all the packets
+            // one batch frees into one batch send instead.
+            flush_received(
+                udp.socket,
+                udp.batch,
+                &mut *udp.flush_buf,
+                connections,
+                udp.blocked,
+                udp.touched,
+            );
+            udp.touched.clear();
             received = match udp
                 .batch
                 .recv(udp.socket, &mut *udp.recv_buf, slot, &mut metas)
@@ -3635,6 +3658,10 @@ fn drain_udp(
             None => continue,
         };
         qconn.last_active = m6_core::platform::now();
+        // This connection is flushed once, after the whole batch. Marking it
+        // after the lookup means a datagram that found no connection never
+        // becomes a flush of one.
+        note_touched(udp.touched, &key);
 
         let recv_info = quiche::RecvInfo {
             from,
@@ -3740,10 +3767,45 @@ fn drain_udp(
         if !qconn.partial_responses.is_empty() {
             drain_writable(qconn);
         }
+    }
+}
 
-        // Send any pending QUIC packets
-        if flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn) == Flush::Blocked {
-            udp.blocked.record(&key);
+/// Remember that `key` took a datagram in this receive batch.
+///
+/// The list is small (one connection is the steady state), so it is checked
+/// linearly. A connection that appears in a batch sixteen times still appears
+/// once here.
+fn note_touched(touched: &mut Vec<Vec<u8>>, key: &[u8]) {
+    if !touched.iter().any(|seen| seen == key) {
+        touched.push(key.to_vec());
+    }
+}
+
+/// Flush every connection one receive batch fed, once each.
+///
+/// This is the only flush on the steady-state receive path. It runs after the
+/// batch's datagrams have all gone to `conn.recv`, so the packets they freed
+/// leave in one packed batch per connection instead of one send per datagram.
+///
+/// A refused batch goes to [`BlockedSends`] and is retried on the writable
+/// event, which is the same mechanism the timer and error paths use: the
+/// request is in `flush_conn`, the retry is in `flush_blocked`, and a
+/// connection that is both in this batch and in that set is flushed by both
+/// without sending a packet twice, because the refused bytes are held on the
+/// connection until one of them sends them.
+fn flush_received(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+    blocked: &mut BlockedSends,
+    touched: &[Vec<u8>],
+) {
+    for key in touched {
+        if let Some(qconn) = connections.get_mut(key) {
+            if flush_conn(udp, batch, out, qconn) == Flush::Blocked {
+                blocked.record(key);
+            }
         }
     }
 }
@@ -7214,6 +7276,8 @@ fn flush_batch(
     if test_send_seam::refuse() {
         return Flush::Blocked;
     }
+    #[cfg(test)]
+    test_send_stats::record(buf.len(), segment_size);
     match batch.send(udp, buf, segment_size, dest) {
         Ok(_) => Flush::Sent,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Flush::Blocked,
@@ -7254,6 +7318,51 @@ mod test_send_seam {
             left.set(count - 1);
             true
         })
+    }
+}
+
+/// Count the platform sends one thread made, so a test can hold a batch to the
+/// number of send calls it costs.
+///
+/// The count is taken at the one call site that reaches `UdpBatch::send`, so a
+/// call here is a send call on every target: one `sendmsg` on Linux where the
+/// socket segments, one `sendto` per datagram on macOS where it does not. A
+/// datagram count is kept beside it, because M6's two targets make different
+/// calls for the same datagrams.
+///
+/// Thread-local because the test crate runs tests in parallel: a test reads its
+/// own thread's count, and no other test's sends can land in it.
+#[cfg(test)]
+mod test_send_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Batch sends this thread has made.
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        /// Datagrams those sends carried.
+        static DATAGRAMS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Start counting this thread's sends from zero.
+    pub(super) fn reset() {
+        CALLS.with(|c| c.set(0));
+        DATAGRAMS.with(|c| c.set(0));
+    }
+
+    /// Record one send of `bytes`, packed as segments of `segment_size`.
+    pub(super) fn record(bytes: usize, segment_size: usize) {
+        CALLS.with(|c| c.set(c.get() + 1));
+        DATAGRAMS.with(|c| c.set(c.get() + bytes.div_ceil(segment_size)));
+    }
+
+    /// Batch sends recorded since the last [`reset`].
+    pub(super) fn calls() -> usize {
+        CALLS.with(|c| c.get())
+    }
+
+    /// Datagrams recorded since the last [`reset`].
+    pub(super) fn datagrams() -> usize {
+        DATAGRAMS.with(|c| c.get())
     }
 }
 
@@ -9113,6 +9222,19 @@ mod quic_flush_tests {
     }
 
     fn config(server: bool, idle_ms: u64, dir: &std::path::Path) -> quiche::Config {
+        config_with(server, idle_ms, dir, MAX_DATAGRAM_SIZE, 10)
+    }
+
+    /// The same config, with the UDP payload size and the initial congestion
+    /// window the test needs. The server's real config sets both, so a test
+    /// that asks a connection to fill a batch has to as well.
+    fn config_with(
+        server: bool,
+        idle_ms: u64,
+        dir: &std::path::Path,
+        payload: usize,
+        cwnd_packets: usize,
+    ) -> quiche::Config {
         let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
         if server {
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -9129,8 +9251,14 @@ mod quic_flush_tests {
         cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .expect("alpn");
         cfg.set_max_idle_timeout(idle_ms);
-        cfg.set_initial_max_data(1_000_000);
-        cfg.set_initial_max_stream_data_uni(100_000);
+        cfg.set_max_recv_udp_payload_size(payload);
+        cfg.set_max_send_udp_payload_size(payload);
+        cfg.set_initial_congestion_window_packets(cwnd_packets);
+        cfg.set_initial_max_data(10_000_000);
+        cfg.set_initial_max_stream_data_bidi_local(1_000_000);
+        cfg.set_initial_max_stream_data_bidi_remote(1_000_000);
+        cfg.set_initial_max_stream_data_uni(1_000_000);
+        cfg.set_initial_max_streams_bidi(10);
         cfg.set_initial_max_streams_uni(10);
         cfg.grease(false);
         cfg
@@ -9482,5 +9610,112 @@ mod quic_flush_tests {
             events.iter().next().is_none(),
             "an empty set still watches writability"
         );
+    }
+
+    /// Drain every datagram the server sent `pair`, feed it to the client and
+    /// return the datagram count and the client's stream 3.
+    fn drain_pair(pair: &mut Pair, server_udp: &UdpSocket) -> (usize, Vec<u8>) {
+        let from = server_udp.local_addr().expect("server address");
+        let to = pair.client_udp.local_addr().expect("client address");
+        let mut datagrams = 0;
+        let mut buf = [0u8; 2048];
+        loop {
+            match pair.client_udp.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    datagrams += 1;
+                    pair.client
+                        .recv(&mut buf[..n], quiche::RecvInfo { from, to })
+                        .expect("client receive");
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("client socket: {e}"),
+            }
+        }
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while let Ok((n, _fin)) = pair.client.stream_recv(3, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        (datagrams, body)
+    }
+
+    /// One receive batch flushes each connection it fed once, not once per
+    /// datagram, and every byte still arrives in order.
+    ///
+    /// The touched list is what `drain_udp` builds from one `recvmmsg` batch:
+    /// the same connection sixteen times is sixteen ACK datagrams. The defect
+    /// flushed inside the per-datagram loop, so this list cost one send per
+    /// entry. Flushing per batch costs one send per connection, here two.
+    ///
+    /// Break: a flush inside the per-datagram loop (calls would be 19), a
+    /// batch that drops a connection (a body would be short or missing), or a
+    /// batch whose segments are packed wrong (the bytes would differ).
+    #[test]
+    fn a_receive_batch_flushes_each_connection_once() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut first, mut first_pair) = established(30_000, &server_udp);
+        let (mut second, mut second_pair) = established(30_000, &server_udp);
+        let first_body: Vec<u8> = (0..12_000).map(|i| (i % 251) as u8).collect();
+        let second_body: Vec<u8> = (0..5_000).map(|i| (i % 199) as u8).collect();
+        assert_eq!(
+            first
+                .conn
+                .stream_send(3, &first_body, true)
+                .expect("queue the first body"),
+            first_body.len()
+        );
+        assert_eq!(
+            second
+                .conn
+                .stream_send(3, &second_body, true)
+                .expect("queue the second body"),
+            second_body.len()
+        );
+
+        let first_key = vec![1u8];
+        let second_key = vec![2u8];
+        let mut connections =
+            HashMap::from([(first_key.clone(), first), (second_key.clone(), second)]);
+        // Sixteen datagrams for the first connection and three for the second,
+        // which is what one full batch of ACKs and a short one look like.
+        let mut touched = vec![first_key; 16];
+        touched.extend(std::iter::repeat_n(second_key, 3));
+        let mut blocked = BlockedSends::default();
+
+        test_send_stats::reset();
+        flush_received(
+            &server_udp,
+            batch,
+            &mut out,
+            &mut connections,
+            &mut blocked,
+            &touched,
+        );
+        let calls = test_send_stats::calls();
+        let datagrams = test_send_stats::datagrams();
+        assert_eq!(
+            calls, 2,
+            "a batch of 19 datagrams over two connections took {calls} sends"
+        );
+        assert!(
+            datagrams > 10,
+            "the two sends carried only {datagrams} datagrams"
+        );
+        assert!(blocked.is_empty(), "the loopback socket refused a batch");
+
+        let (first_datagrams, first_got) = drain_pair(&mut first_pair, &server_udp);
+        let (second_datagrams, second_got) = drain_pair(&mut second_pair, &server_udp);
+        assert_eq!(
+            first_datagrams + second_datagrams,
+            datagrams,
+            "the client read a different number of datagrams than the sends carried"
+        );
+        assert_eq!(first_got, first_body, "the first body is byte for byte");
+        assert_eq!(second_got, second_body, "the second body is byte for byte");
     }
 }
