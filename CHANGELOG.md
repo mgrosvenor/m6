@@ -47,7 +47,7 @@ Every log line carries a `type`, and under systemd each line is one datagram on 
 A config that still names a removed key stops the service at start with exit 2.
 This release also fixes the cache storage rule and the refresh-token lifetime, and gives every auth token a kind, an audience and an id.
 Migration lists the nine changes an operator makes, and Removed lists every removal.
-The examples moved into `examples/` in this repository and are built from the same commit as the crates they use.
+The examples moved into `examples/` in this repository and are built from the same commit as the crates they use. The old m6-examples repository is archived.
 
 **Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit. That refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
 
