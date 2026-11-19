@@ -7034,13 +7034,14 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
     // A batch refused last time goes first, so the packets leave in the order
     // quiche made them.
     if let Some(pending) = qconn.blocked.take() {
-        if !flush_batch(
+        if flush_batch(
             udp,
             batch,
             &pending.bytes,
             pending.segment_size,
             Some(pending.dest),
-        ) {
+        ) == Flush::Blocked
+        {
             qconn.blocked = Some(pending);
             return Flush::Blocked;
         }
@@ -7051,12 +7052,7 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
         "a flush buffer holds one packet"
     );
     let out = &mut out[..capacity];
-    let mut filled = 0;
-    // Every datagram before the last in a batch is this size; the last is at
-    // most this size. That is the shape UDP_SEGMENT requires.
-    let mut segment_size = 0;
-    let mut segments = 0;
-    let mut dest: Option<SocketAddr> = None;
+    let mut pack = Pack::default();
     // The congestion controller's burst for one turn. A batch stops here too,
     // so one send never puts more datagrams on the wire than the controller
     // allows at once. It is zero before a path is active, and then the buffer
@@ -7065,21 +7061,15 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
 
     loop {
         // Leave room for the largest datagram quiche can write into this batch.
-        if filled + MAX_DATAGRAM_SIZE > capacity
-            || (burst > 0 && filled + MAX_DATAGRAM_SIZE > burst)
-            || segments == QUIC_BATCH_SEGMENTS
+        if (pack.len + MAX_DATAGRAM_SIZE > capacity
+            || (burst > 0 && pack.len + MAX_DATAGRAM_SIZE > burst)
+            || pack.count == QUIC_BATCH_SEGMENTS)
+            && send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked
         {
-            if !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
-                keep_batch(qconn, &out[..filled], segment_size, dest);
-                return Flush::Blocked;
-            }
-            filled = 0;
-            segment_size = 0;
-            segments = 0;
-            dest = None;
+            return Flush::Blocked;
         }
 
-        let (written, send_info) = match qconn.conn.send(&mut out[filled..]) {
+        let (written, send_info) = match qconn.conn.send(&mut out[pack.len..]) {
             Ok(v) => v,
             Err(quiche::Error::Done) => break,
             Err(e) => {
@@ -7088,45 +7078,86 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
             }
         };
 
-        if segments == 0 {
-            dest = Some(send_info.to);
-            segment_size = written;
-            filled = written;
-            segments = 1;
-        } else if Some(send_info.to) == dest && written == segment_size {
-            filled += written;
-            segments += 1;
-        } else if Some(send_info.to) == dest && written < segment_size {
-            // The packet after a short one cannot be part of the same batch,
-            // and this one is its last segment.
-            filled += written;
-            if !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
-                keep_batch(qconn, &out[..filled], segment_size, dest);
-                return Flush::Blocked;
+        // One decision for the packet just written: start a batch, join it,
+        // close it, or end the packed batch and start another with this packet.
+        match pack.count {
+            0 => {
+                pack.dest = Some(send_info.to);
+                pack.seg = written;
+                pack.len = written;
+                pack.count = 1;
             }
-            filled = 0;
-            segment_size = 0;
-            segments = 0;
-            dest = None;
-        } else {
-            // Another destination, or a packet larger than the batch's
-            // segment: send what is packed and start the batch with this one.
-            if !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
-                keep_batch(qconn, &out[..filled], segment_size, dest);
-                return Flush::Blocked;
+            _ if Some(send_info.to) == pack.dest && written == pack.seg => {
+                pack.len += written;
+                pack.count += 1;
             }
-            out.copy_within(filled..filled + written, 0);
-            filled = written;
-            segment_size = written;
-            segments = 1;
-            dest = Some(send_info.to);
+            _ if Some(send_info.to) == pack.dest && written < pack.seg => {
+                // The packet after a short one cannot be part of the same
+                // batch, and this one is its last segment.
+                pack.len += written;
+                if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
+                    return Flush::Blocked;
+                }
+            }
+            _ => {
+                // Another destination, or a packet larger than the batch's
+                // segment: send what is packed and start the batch with this
+                // one. The copy is needed because the send leaves `out` alone
+                // and the new packet sits after the bytes just sent.
+                let packed = pack.len;
+                if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
+                    return Flush::Blocked;
+                }
+                out.copy_within(packed..packed + written, 0);
+                pack.len = written;
+                pack.seg = written;
+                pack.count = 1;
+                pack.dest = Some(send_info.to);
+            }
         }
     }
 
-    if filled > 0 && !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
-        keep_batch(qconn, &out[..filled], segment_size, dest);
+    if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
         return Flush::Blocked;
     }
+    Flush::Sent
+}
+
+/// The bytes one flush has packed into a batch, and how they are packed.
+///
+/// A flush packs while the packets have one destination and one size, then
+/// sends them as one batch. `Pack::default()` is the empty batch, so starting
+/// the next one is the same statement in every branch.
+#[derive(Default)]
+struct Pack {
+    /// Bytes packed into the flush buffer, back to back.
+    len: usize,
+    /// Every datagram before the last is this size. That is the shape
+    /// `UDP_SEGMENT` requires.
+    seg: usize,
+    /// Datagrams packed.
+    count: usize,
+    /// Where the batch is for. `None` while nothing is packed.
+    dest: Option<SocketAddr>,
+}
+
+/// Send what `pack` holds and clear it. A batch the socket refuses stays in
+/// `pack` and is kept on the connection for the writable event.
+fn send_pack(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &[u8],
+    pack: &mut Pack,
+    qconn: &mut QuicConn,
+) -> Flush {
+    if pack.len == 0 {
+        return Flush::Sent;
+    }
+    if flush_batch(udp, batch, &out[..pack.len], pack.seg, pack.dest) == Flush::Blocked {
+        keep_batch(qconn, &out[..pack.len], pack.seg, pack.dest);
+        return Flush::Blocked;
+    }
+    *pack = Pack::default();
     Flush::Sent
 }
 
@@ -7163,8 +7194,8 @@ fn flush_blocked(
 }
 
 /// Send one packed batch, or one datagram per segment where the socket does not
-/// segment. Returns false when the socket would block, which ends the flush and
-/// leaves the batch for the writable event.
+/// segment. A batch the socket would not take is [`Flush::Blocked`], which
+/// leaves it for the writable event.
 ///
 /// The `cfg(test)` arm is a seam, not a second path: it reports the refusal the
 /// kernel reports when its send buffer is full, before the count moves. A
@@ -7175,21 +7206,20 @@ fn flush_batch(
     buf: &[u8],
     segment_size: usize,
     dest: Option<SocketAddr>,
-) -> bool {
-    let dest = match dest {
-        Some(dest) => dest,
-        None => return true,
+) -> Flush {
+    let Some(dest) = dest else {
+        return Flush::Sent;
     };
     #[cfg(test)]
     if test_send_seam::refuse() {
-        return false;
+        return Flush::Blocked;
     }
     match batch.send(udp, buf, segment_size, dest) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Ok(_) => Flush::Sent,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Flush::Blocked,
         Err(e) => {
             warn!("udp batch send error: {}", e);
-            true
+            Flush::Sent
         }
     }
 }
