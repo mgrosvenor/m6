@@ -49,7 +49,7 @@ Read a row left to right: the contract is what every target guarantees, and the 
 | `ChildExit` | a readable descriptor when the child exits, at once when it already has, and `reap` returns at once | `pidfd_open`, which needs Linux 5.3 | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
 | `net::connect_unix` | a refused connect is a listener that is gone, a missing file is `NotFound`, and a full queue fails at once with `WouldBlock` and does not wait | `EAGAIN` for a full queue | `ECONNREFUSED` for a full queue too, so it reads as a listener that is gone |
 | `net::connect_tcp` | `Connected` or `InProgress`, and `EINPROGRESS` is reported as `InProgress` | `WouldBlock` | the raw errno |
-| `net::UdpBatch` | one `send` puts a buffer packed as segments of one size on the wire as those datagrams in order, the last at most the segment size, and one `recv` takes in up to `MAX_BATCH` datagrams with each length and source. A socket without segmentation offload sends one datagram per segment, with the same bytes in the same order | `sendmsg` with a `UDP_SEGMENT` control message and `recvmmsg`, probed once at setup with `getsockopt(UDP_SEGMENT)` | a loop of one `sendto` and one `recvfrom` per datagram |
+| `net::UdpBatch` | one `send` puts a buffer packed as segments of one size on the wire as those datagrams in order, the last at most the segment size, and one `recv` takes in up to `MAX_BATCH` datagrams with each length and source. A socket without segmentation offload sends one datagram per segment, with the same bytes in the same order | `sendmsg` with a `UDP_SEGMENT` control message and `recvmmsg`, probed once at setup with a set of `UDP_SEGMENT` and a read-back | a loop of one `sendto` and one `recvfrom` per datagram |
 | `net::listen_shared` | a TCP listener and a UDP socket bound to one address with `SO_REUSEPORT`, so several processes serve one port, every connection is answered, and stopping one process leaves the port served | `SO_REUSEPORT` set before bind, and a hash of the 4-tuple chooses the socket, or with a group size a socket filter (`SO_ATTACH_REUSEPORT_CBPF`) chooses by the source address alone | `SO_REUSEPORT` set before bind, and the socket bound last receives every connection and datagram |
 | sockets | every socket the layer makes gives `BrokenPipe` on a write to a closed peer and raises no signal | the runtime ignores `SIGPIPE` | the same, and `SO_NOSIGPIPE` on every socket |
 | `MAX_SOCKET_PATH` | a path too long to bind fails at start naming the path and the limit | 108 | 104 |
@@ -106,12 +106,18 @@ The redirect listener, the internal h2c listener and the backend sockets do not 
 The health endpoints are served on that shared listener, and with `[server] status_bind` each process also serves them on a TLS listener of its own, which does not use `listen_shared`.
 Section 6 lists the tests that hold every item of Table 1.
 
-`net::UdpBatch` is the one place a datagram batch reaches the kernel.
-`UdpBatch::for_socket` asks once, at socket setup, whether the kernel segments a batch.
-A socket that answers no takes the same call down the loop of single sends, so the bytes and their order do not depend on the answer.
-`UdpBatch::without_gso` is that path on a socket that answered yes, and the shared contract suite runs both paths over loopback and compares the datagrams they deliver.
-That comparison runs on a host with segmentation offload, which is how the fallback is tested as a fallback and the Linux segmented path is compared with it on one machine.
-On macOS the two paths are the same loop, and the suite still holds the bytes and the order.
+### 2.1 The UDP batch
+
+`net::UdpBatch` is the one place a datagram batch reaches the kernel, and it states a batch in a service's terms.
+`UdpBatch::for_socket` probes a socket once at setup, `send` sends a buffer packed as segments of one size, and `recv` takes up to `MAX_BATCH`, 16, datagrams into one contiguous buffer, one per slot, with the length and source of each in a `RecvMeta`.
+On Linux the send is one `sendmsg` carrying a `UDP_SEGMENT` control message, so the kernel cuts the packed buffer into the datagrams the caller described, and the receive is one `recvmmsg`.
+The receive side takes the caller's buffer and a slot size, so a caller reuses the buffer it already has and the call allocates nothing.
+The probe sets the option and reads it back, because a bare `getsockopt` reports zero on every kernel, and it clears the option afterwards so an ordinary send on that socket stays one datagram per call.
+`UdpBatch::without_gso` is the fallback path on a socket that has segmentation, and the shared contract suite runs both paths over loopback and compares the datagrams they deliver.
+That comparison runs on a host with segmentation offload, which is how the fallback is tested as a fallback and how the Linux segmented path is compared with it on one machine.
+On macOS the batch is that same fallback, so the same `send` and `recv` run, one `sendto` or one `recvfrom` per datagram, with the same bytes and the same order.
+A platform without `UDP_SEGMENT` therefore runs the code path the Linux host tested rather than a second implementation, so the bytes and their order do not depend on the answer.
+Four tests in `platform_contract` run unchanged on every target: four segments with a short last one, the fallback against the path a socket takes by default, a batch of one datagram, and a malformed batch refused before any system call.
 
 ## 3. Service managers
 
@@ -157,7 +163,7 @@ Table 3 maps them.
 
 | suite | file | holds |
 |---|---|---|
-| the contract | `m6-platform/tests/platform_contract.rs` | readiness, child exit, what a spawned child inherits, sockets, clock, limits, host and process facts (including the start-up facts), directories |
+| the contract | `m6-platform/tests/platform_contract.rs` | readiness, child exit, what a spawned child inherits, sockets (including the UDP batch), clock, limits, host and process facts (including the start-up facts), directories |
 | signals | `m6-platform/tests/platform_signals.rs` | the 8 signal cases, in a test with its own `main` (`harness = false`) so the mask is set before any thread |
 | process facts | `m6-platform/tests/platform_process_facts.rs` | thread and descriptor counts, run in a child process so nothing else moves them |
 | child exit | `m6-platform/tests/platform_child_exit_leak.rs` | that a dropped `ChildExit` leaks no descriptor |
