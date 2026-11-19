@@ -28,6 +28,12 @@
 //! The origin is a unix socket in this process and counts its requests, so a
 //! run whose hits were really misses is caught rather than measured.
 //!
+//! Not run under AddressSanitizer. Its runtime intercepts `mlockall` and returns
+//! success without locking anything, so `VmLck` stays 0, and its shadow memory
+//! maps 20 TiB, so the resident set is not the server's. The sanitiser job sets
+//! `M6_SANITISER` and this test says so and returns. The sanitiser job checks
+//! memory safety, and the plain jobs measure residency.
+//!
 //! Linux only. macOS reports no resident set for another process and has
 //! nothing to pin, so there is no number to assert.
 //!
@@ -99,6 +105,13 @@ Cache-Control: public, max-age=3600\r\nContent-Length: 4096\r\nConnection: close
 
 #[test]
 fn a_warm_server_is_resident_within_its_reservation() {
+    if let Some(sanitiser) = std::env::var_os("M6_SANITISER") {
+        eprintln!(
+            "not measured under {sanitiser:?}: the sanitiser runtime turns `mlockall` into a \
+             no-op and maps shadow memory, so neither VmLck nor the resident set describes m6-http"
+        );
+        return;
+    }
     if std::env::consts::OS != "linux" {
         return;
     }
