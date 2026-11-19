@@ -650,6 +650,17 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
     cfg.set_initial_max_streams_uni(100);
     cfg.set_disable_active_migration(true);
 
+    // quiche starts a connection at 10 packets, so the first response needs a
+    // round trip for every 10 packets of it and a 52 KB page needs four. At 32
+    // the page needs two, and the 485 KB image is unchanged. Measured on macOS
+    // loopback, one fresh connection per request, 200 requests per run and
+    // three runs per value, p50 of the 52 KB page: 271.8 us at 10, 249.6 us at
+    // 32, 241.9 us at 64. The image at the same values: 1747.6, 1742.5 and
+    // 1699.0 us. 32 takes almost all of the page's win without the burst a
+    // 64-packet window allows. Loss on a path with a real round trip was not
+    // measured here; the release's Linux A/B is the check.
+    cfg.set_initial_congestion_window_packets(32);
+
     // NO amplification factor override. quiche's conforming default of 3 stands.
     //
     // 1.2.0 and 1.3.0 carried `set_max_amplification_factor(4)` because the
