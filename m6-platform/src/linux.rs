@@ -91,6 +91,11 @@ pub(super) fn child_exit_supported() -> io::Result<()> {
 /// `sockaddr_un::sun_path` is 108 bytes on Linux.
 pub(super) const MAX_SOCKET_PATH: usize = 108;
 
+/// Linux has UDP receive coalescing. A socket still has to ask for it, and a
+/// kernel older than the option refuses, which the receive path handles by
+/// reading one datagram at a time.
+pub(super) const RECV_COALESCING: bool = true;
+
 /// Nothing to set: the runtime ignores `SIGPIPE`, so a write to a closed peer
 /// is already an error.
 pub(super) fn prepare_socket(_sock: &socket2::Socket) -> io::Result<()> {
@@ -141,6 +146,24 @@ pub(super) fn udp_gso_supported(socket: &impl AsFd) -> bool {
     stored
 }
 
+/// Whether `socket` coalesces several datagrams into one receive, and turn it
+/// on when it does.
+///
+/// The proof is the set, then a read-back, as [`udp_gso_supported`] proves
+/// segmentation. Unlike the send option this one is left on: it is the receive
+/// path's, and every receive on the socket then reports the run it took in and
+/// its `gso_size`. A kernel that refuses the option is not an error. The socket
+/// reads one datagram at a time, which is exactly the path it took before.
+pub(super) fn udp_gro_supported(socket: &impl AsFd) -> bool {
+    use nix::sys::socket::sockopt::UdpGroSegment;
+    use nix::sys::socket::{getsockopt, setsockopt};
+
+    if setsockopt(socket, UdpGroSegment, &true).is_err() {
+        return false;
+    }
+    getsockopt(socket, UdpGroSegment).unwrap_or(false)
+}
+
 /// Send `segments` as one `sendmsg` with the segment size in a `UDP_SEGMENT`
 /// control message, or one datagram at a time when `gso` is false or there is
 /// only one segment.
@@ -186,13 +209,21 @@ fn udp_send_segmented(
     .map_err(io::Error::from)
 }
 
-/// Receive up to `metas.len()` datagrams in one `recvmmsg`.
+/// Receive up to `metas.len()` receives in one `recvmmsg`.
 ///
-/// The headers, the iovecs and the address buffers are stack arrays, so a
-/// batch receive allocates nothing. `nix`'s `MultiHeaders` holds the same
-/// structures but can only be built by `preallocate`, which allocates a boxed
-/// header array and a boxed address array on every call, and the iovecs were a
-/// `Vec` beside it. A receive happens on every turn of the loop.
+/// A receive is one datagram, or a run of datagrams the kernel coalesced from
+/// one sender with `UDP_GRO`. The kernel reports the run's `gso_size` in a
+/// `UDP_GRO` control message, which becomes the receive's `stride`, and the
+/// caller splits the run with [`RecvMeta::datagrams`]. A socket that never
+/// enabled the option sends no control message, so every receive is one
+/// datagram and the per-datagram path is the one it took before.
+///
+/// The headers, the iovecs, the address buffers and the control buffers are
+/// stack arrays, so a batch receive allocates nothing. `nix`'s `MultiHeaders`
+/// holds the same structures but can only be built by `preallocate`, which
+/// allocates a boxed header array and a boxed address array on every call, and
+/// the iovecs were a `Vec` beside it. A receive happens on every turn of the
+/// loop.
 ///
 /// The structures are written here instead of by `MultiHeaders` because its
 /// fields are private and it has no way to be reset: the kernel writes
@@ -209,6 +240,15 @@ pub(super) fn udp_recv_batch(
     use nix::sys::socket::{SockaddrLike, SockaddrStorage};
     use std::mem::{size_of, MaybeUninit};
 
+    /// Room for the one `UDP_GRO` message the kernel writes, carrying its
+    /// `gso_size` as a `c_int`.
+    const GRO_CMSG_SPACE: usize = nix::sys::socket::cmsg_space::<nix::libc::c_int>();
+
+    /// A control buffer aligned for the `cmsghdr` written into it. A bare
+    /// `[u8; GRO_CMSG_SPACE]` is aligned to one byte.
+    #[repr(align(8))]
+    struct CmsgBuf([u8; GRO_CMSG_SPACE]);
+
     // `UdpBatch::recv` trims both slices to one count and never calls this with
     // an empty one, so the metas it hands over are exactly what the call takes
     // in.
@@ -218,14 +258,18 @@ pub(super) fn udp_recv_batch(
     let mut iovecs = [MaybeUninit::<nix::libc::iovec>::uninit(); super::net::MAX_BATCH];
     let mut addresses =
         [MaybeUninit::<nix::libc::sockaddr_storage>::uninit(); super::net::MAX_BATCH];
+    let mut cmsgs: [CmsgBuf; super::net::MAX_BATCH] =
+        std::array::from_fn(|_| CmsgBuf([0; GRO_CMSG_SPACE]));
 
     for index in 0..count {
         let start = index * slot;
         let iovec = iovecs[index].as_mut_ptr();
         let name = addresses[index].as_mut_ptr();
-        // SAFETY: both pointers are into arrays of `count` initialised
-        // entries, and each is written once before the system call reads it.
-        // The slot is inside `buf`, which the caller owns for the call.
+        let control = cmsgs[index].0.as_mut_ptr();
+        // SAFETY: all pointers are into arrays of `count` initialised entries,
+        // and each is written once before the system call reads it. The slot is
+        // inside `buf` and the control buffer beside it, both owned by the
+        // caller for the call.
         unsafe {
             iovec.write(nix::libc::iovec {
                 iov_base: buf[start..start + slot]
@@ -239,8 +283,8 @@ pub(super) fn udp_recv_batch(
                     msg_namelen: size_of::<nix::libc::sockaddr_storage>() as nix::libc::socklen_t,
                     msg_iov: iovec,
                     msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
+                    msg_control: control.cast::<nix::libc::c_void>(),
+                    msg_controllen: GRO_CMSG_SPACE,
                     msg_flags: 0,
                 },
                 msg_len: 0,
@@ -249,8 +293,9 @@ pub(super) fn udp_recv_batch(
     }
 
     // SAFETY: `headers` is an array of `count` initialised `mmsghdr`s, each
-    // with a live iovec and address buffer, and the socket is open for the
-    // call. The kernel writes only the entries it reports in the return value.
+    // with a live iovec, address buffer and control buffer, and the socket is
+    // open for the call. The kernel writes only the entries it reports in the
+    // return value.
     let received = unsafe {
         nix::libc::recvmmsg(
             socket.as_fd().as_raw_fd(),
@@ -277,9 +322,54 @@ pub(super) fn udp_recv_batch(
         *meta = super::net::RecvMeta {
             len: header.msg_len as usize,
             from: address.as_ref().and_then(super::net::socket_addr_of),
+            stride: gro_stride(&header.msg_hdr, header.msg_len as usize),
         };
     }
     Ok(received)
+}
+
+/// The size of every datagram in a coalesced receive but the last, or zero when
+/// the kernel coalesced nothing.
+///
+/// The kernel attaches one `UDP_GRO` control message to a receive it coalesced,
+/// whose `c_int` payload is the run's `gso_size`. A receive without the message
+/// is one datagram. A `gso_size` that is not below the bytes received describes
+/// one datagram too, and so does an option a socket never enabled.
+fn gro_stride(header: &nix::libc::msghdr, len: usize) -> usize {
+    // The kernel wrote the control messages into the buffer the receive
+    // supplied, and `msg_controllen` bounds every step of the walk below.
+    let mut cmsg = unsafe { nix::libc::CMSG_FIRSTHDR(header) };
+    while !cmsg.is_null() {
+        // SAFETY: `cmsg` points at a header the kernel wrote into that buffer.
+        let is_gro = unsafe {
+            (*cmsg).cmsg_level == nix::libc::SOL_UDP
+                && (*cmsg).cmsg_type == nix::libc::UDP_GRO
+                && (*cmsg).cmsg_len
+                    >= nix::libc::CMSG_LEN(
+                        std::mem::size_of::<nix::libc::c_int>() as nix::libc::c_uint
+                    ) as usize
+        };
+        if is_gro {
+            let mut gso: nix::libc::c_int = 0;
+            // SAFETY: the length was just checked to hold one `c_int`, which
+            // is what the kernel wrote there.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    nix::libc::CMSG_DATA(cmsg),
+                    std::ptr::from_mut(&mut gso).cast::<u8>(),
+                    std::mem::size_of::<nix::libc::c_int>(),
+                );
+            }
+            return usize::try_from(gso)
+                .ok()
+                .filter(|gso| *gso < len)
+                .unwrap_or(0);
+        }
+        // SAFETY: `cmsg` is inside the buffer the kernel filled, and the next
+        // header is bounded by the same `msg_controllen`.
+        cmsg = unsafe { nix::libc::CMSG_NXTHDR(header, cmsg) };
+    }
+    0
 }
 
 /// The classic BPF program [`steer_reuseport`] attaches: 20 instructions.

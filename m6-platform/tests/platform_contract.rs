@@ -1280,7 +1280,9 @@ mod udp_batches {
     }
 
     /// Receive `want` datagrams through the batch API, retrying until they
-    /// arrive or the deadline passes.
+    /// arrive or the deadline passes. A receive that the kernel coalesced is
+    /// split with [`net::RecvMeta::datagrams`], so this returns datagrams
+    /// whatever the socket did.
     ///
     /// Break: a receive that loses a datagram, returns them in another order,
     /// or reports a length the kernel did not deliver.
@@ -1291,16 +1293,21 @@ mod udp_batches {
     ) -> Vec<(Vec<u8>, Option<SocketAddr>)> {
         let deadline = Instant::now() + SOON;
         let mut got = Vec::with_capacity(want);
-        const SLOT: usize = 4096;
-        let mut buf = vec![0u8; SLOT * net::MAX_BATCH];
+        let slot = net::RECV_SLOT;
+        let mut buf = vec![0u8; slot * net::MAX_BATCH];
         let mut metas = [net::RecvMeta::default(); net::MAX_BATCH];
         while got.len() < want && Instant::now() < deadline {
-            match batch.recv(socket, &mut buf, SLOT, &mut metas) {
+            match batch.recv(socket, &mut buf, slot, &mut metas) {
                 Ok(0) => {}
                 Ok(n) => {
                     for (i, meta) in metas.iter().enumerate().take(n) {
-                        let start = i * SLOT;
-                        got.push((buf[start..start + meta.len].to_vec(), meta.from));
+                        let start = i * slot;
+                        for (offset, len) in meta.datagrams() {
+                            got.push((
+                                buf[start + offset..start + offset + len].to_vec(),
+                                meta.from,
+                            ));
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1343,6 +1350,97 @@ mod udp_batches {
         let from = sender.local_addr().expect("sender addr");
         for (_, source) in &got {
             assert_eq!(*source, Some(from), "each datagram reports its source");
+        }
+    }
+
+    /// U-B1a. A receiver with UDP GRO enabled takes a segmented send as one
+    /// coalesced read, and the API splits it back into the four datagrams that
+    /// were sent, with their lengths, bytes and order. The last is short, which
+    /// is the shape a QUIC flush ends with.
+    ///
+    /// On macOS the receiver answers no to coalescing and the sender no to
+    /// segmentation, so the same four datagrams arrive one at a time and the
+    /// assertions above the offload check are the whole test. On Linux a kernel
+    /// that has the options must accept them, and the test requires the kernel
+    /// to coalesce the run.
+    ///
+    /// Break: a receive that reports a coalesced run as one 337-byte datagram,
+    /// a split that drops the short last datagram, or a stride taken from the
+    /// wrong control message.
+    #[test]
+    fn a_coalesced_receive_is_the_datagrams_that_were_sent() {
+        let (sender, receiver, dest) = pair();
+        // The receiver is the socket the datagrams arrive on, so it is the one
+        // that has to enable coalescing.
+        let receiver_batch = net::UdpBatch::for_socket(&receiver);
+        let sender_batch = net::UdpBatch::for_socket(&sender);
+        let payload = payload();
+        sender_batch
+            .send(&sender, &payload, 100, dest)
+            .expect("send the batch");
+
+        let deadline = Instant::now() + SOON;
+        let slot = net::RECV_SLOT;
+        let mut buf = vec![0u8; slot * net::MAX_BATCH];
+        let mut metas = [net::RecvMeta::default(); net::MAX_BATCH];
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut coalesced = false;
+        while got.len() < segments().len() && Instant::now() < deadline {
+            match receiver_batch.recv(&receiver, &mut buf, slot, &mut metas) {
+                Ok(0) => {}
+                Ok(n) => {
+                    for (i, meta) in metas.iter().enumerate().take(n) {
+                        let start = i * slot;
+                        if meta.stride != 0 {
+                            coalesced = true;
+                            assert_eq!(meta.stride, 100, "the segment size the kernel reported");
+                        }
+                        for (offset, len) in meta.datagrams() {
+                            got.push(buf[start + offset..start + offset + len].to_vec());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("batch receive: {e}"),
+            }
+        }
+        assert_eq!(
+            got.iter().map(Vec::len).collect::<Vec<_>>(),
+            segments(),
+            "the lengths of the coalesced run, in order"
+        );
+        assert_eq!(
+            got.concat(),
+            payload,
+            "the bytes of the coalesced run, in order"
+        );
+
+        // A target that has coalescing at all must answer yes for the socket:
+        // a Linux kernel that refuses `UDP_GRO` would otherwise take the
+        // fallback path and pass a test that measured nothing. macOS has no
+        // coalescing to ask for, and the per-datagram assertions above are the
+        // whole check there.
+        if net::RECV_COALESCING {
+            assert!(
+                receiver_batch.gro(),
+                "this kernel has UDP_GRO and refused it on a receiving socket"
+            );
+            assert!(
+                sender_batch.gso(),
+                "this kernel has UDP_SEGMENT and refused it on a sending socket"
+            );
+        }
+
+        // Only the pair of a receiver that answered yes and a sender that
+        // segments one flush makes the kernel deliver one run. Anywhere else
+        // the per-datagram assertions above are the whole check.
+        if receiver_batch.gro() && sender_batch.gso() {
+            assert!(
+                coalesced,
+                "GRO was enabled on the receiver and GSO on the sender, and the batch still arrived one datagram per receive"
+            );
         }
     }
 

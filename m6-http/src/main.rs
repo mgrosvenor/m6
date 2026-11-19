@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::Context;
 use bytes::Bytes;
 use m6_core::log::{debug, error, info, warn};
-use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH};
+use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH, RECV_SLOT};
 use quiche::h3::NameValue;
 use rand::RngCore;
 
@@ -2974,7 +2974,11 @@ fn event_loop(
 
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut recv_buf = vec![0u8; 65536];
+    // One slot per receive, and a slot is sized for a coalesced read: Linux
+    // UDP GRO can hand back up to 64 KB in one `recvmmsg` entry, and a smaller
+    // slot would truncate it. A socket without GRO fills the same slots one
+    // datagram at a time.
+    let mut recv_buf = vec![0u8; MAX_BATCH * RECV_SLOT];
     // One batch buffer for every flush in the loop. A flush packs into this
     // and sends it once; reusing it keeps a flush free of allocation and of a
     // 64 KB clear.
@@ -3515,9 +3519,10 @@ fn drain_udp(
     h3: &H3Loop,
 ) {
     // One readiness event drains the socket. Each receive takes in up to
-    // MAX_BATCH datagrams, one per slot, and `next` walks them before the next
-    // call.
-    let slot = udp.recv_buf.len() / MAX_BATCH;
+    // MAX_BATCH receives, one per slot, and `next` walks them before the next
+    // call. A receive is one datagram, or on Linux with UDP GRO a coalesced run
+    // from one sender, and every datagram in it goes to `conn.recv` on its own.
+    let slot = RECV_SLOT;
     let mut metas = [RecvMeta::default(); MAX_BATCH];
     let mut received = 0;
     let mut next = 0;
@@ -3554,173 +3559,178 @@ fn drain_udp(
         }
         let index = next;
         next += 1;
-        let len = metas[index].len;
         let from = match metas[index].from {
             Some(from) => from,
             None => continue,
         };
         let start = index * slot;
-        let pkt = &mut udp.recv_buf[start..start + len];
+        // A coalesced receive holds a run of datagrams that were separate on
+        // the wire. quiche's `recv` takes one QUIC packet, so each goes to it
+        // on its own, in the order it was sent.
+        for (offset, len) in metas[index].datagrams() {
+            let pkt = &mut udp.recv_buf[start + offset..start + offset + len];
 
-        // Parse QUIC header to get connection ID
-        let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
-            Ok(h) => h,
-            Err(e) => {
-                debug!("bad quic header: {}", e);
+            // Parse QUIC header to get connection ID
+            let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
+                Ok(h) => h,
+                Err(e) => {
+                    debug!("bad quic header: {}", e);
+                    continue;
+                }
+            };
+
+            let conn_id = hdr.dcid.to_vec();
+
+            // Resolve the stored map key: direct hit, alias, or new connection.
+            // quiche::connect() generates a 16-byte Initial DCID.  The server stores
+            // connections under a fresh 20-byte SCID so that 1-RTT short-header
+            // packets (parsed with MAX_CONN_ID_LEN=20) always match the stored key.
+            let key: Vec<u8> = if connections.contains_key(&conn_id) {
+                conn_id.clone()
+            } else if let Some(k) = conn_id_map.get(&conn_id) {
+                k.clone()
+            } else if hdr.ty == quiche::Type::Initial {
+                // New connection: generate a fresh 20-byte SCID.
+                let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+                rand::thread_rng().fill_bytes(&mut scid_bytes);
+                let key = scid_bytes.to_vec();
+                let scid = quiche::ConnectionId::from_vec(key.clone());
+                let conn = match quiche::accept(&scid, None, udp.local, from, quiche_config) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("quiche::accept error: {}", e);
+                        continue;
+                    }
+                };
+                connections.insert(
+                    key.clone(),
+                    QuicConn {
+                        conn,
+                        h3_conn: None,
+                        pending: HashMap::new(),
+                        partial_responses: HashMap::new(),
+                        client_addr: from,
+                        last_active: m6_core::platform::now(),
+                        created: m6_core::platform::now(),
+                        handshake_recorded: false,
+                        blocked: None,
+                    },
+                );
+                // Alias the client's Initial DCID → our 20-byte key for retransmits.
+                if conn_id != key {
+                    conn_id_map.insert(conn_id.clone(), key.clone());
+                }
+                key
+            } else {
+                debug!("non-initial packet for unknown conn");
+                continue;
+            };
+
+            let qconn = match connections.get_mut(&key) {
+                Some(c) => c,
+                None => continue,
+            };
+            qconn.last_active = m6_core::platform::now();
+            // This connection is flushed once, after the whole batch. Marking it
+            // after the lookup means a datagram that found no connection never
+            // becomes a flush of one.
+            udp.touched.note(&key);
+
+            let recv_info = quiche::RecvInfo {
+                from,
+                to: udp.local,
+            };
+            if let Err(e) = qconn.conn.recv(pkt, recv_info) {
+                // REJECTING A PACKET IS NOT THE END OF THE WORK. quiche has already
+                // called close() internally and queued a CONNECTION_CLOSE carrying
+                // the right wire code, and the only way it reaches the peer is
+                // conn.send(), which here is flush_conn. This path used to
+                // `continue` straight past it.
+                //
+                // The close was not lost: the timer path calls on_timeout() and
+                // then flush_conn, so it went out one tick late. That is still a
+                // needless delay on the one packet whose job is to say why the
+                // connection is ending, so it goes out here instead.
+                //
+                // It does not move h3 conformance. The twelve h3spec failures are
+                // quiche's and are documented in tools/conformance-scores.txt.
+                warn!("conn.recv error: {}", e);
+                flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
                 continue;
             }
-        };
 
-        let conn_id = hdr.dcid.to_vec();
-
-        // Resolve the stored map key: direct hit, alias, or new connection.
-        // quiche::connect() generates a 16-byte Initial DCID.  The server stores
-        // connections under a fresh 20-byte SCID so that 1-RTT short-header
-        // packets (parsed with MAX_CONN_ID_LEN=20) always match the stored key.
-        let key: Vec<u8> = if connections.contains_key(&conn_id) {
-            conn_id.clone()
-        } else if let Some(k) = conn_id_map.get(&conn_id) {
-            k.clone()
-        } else if hdr.ty == quiche::Type::Initial {
-            // New connection: generate a fresh 20-byte SCID.
-            let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-            rand::thread_rng().fill_bytes(&mut scid_bytes);
-            let key = scid_bytes.to_vec();
-            let scid = quiche::ConnectionId::from_vec(key.clone());
-            let conn = match quiche::accept(&scid, None, udp.local, from, quiche_config) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("quiche::accept error: {}", e);
-                    continue;
-                }
-            };
-            connections.insert(
-                key.clone(),
-                QuicConn {
-                    conn,
-                    h3_conn: None,
-                    pending: HashMap::new(),
-                    partial_responses: HashMap::new(),
-                    client_addr: from,
-                    last_active: m6_core::platform::now(),
-                    created: m6_core::platform::now(),
-                    handshake_recorded: false,
-                    blocked: None,
-                },
-            );
-            // Alias the client's Initial DCID → our 20-byte key for retransmits.
-            if conn_id != key {
-                conn_id_map.insert(conn_id.clone(), key.clone());
+            // The QUIC handshake is complete exactly here, the first time this is
+            // true. Guarded by a flag because this branch is reached on every packet
+            // for the life of the connection, and recording unguarded would turn one
+            // handshake into thousands of samples of a steadily growing duration.
+            if qconn.conn.is_established() && !qconn.handshake_recorded {
+                qconn.handshake_recorded = true;
+                // Resumed handshakes are counted apart from full ones. With 0-RTT
+                // enabled this is now the common case for a returning visitor, and a
+                // blended figure would drop as the returning share grew while neither
+                // cost had changed.
+                let resumed = qconn.conn.is_resumed();
+                state.stats.record_handshake(
+                    qconn.created.elapsed().as_nanos() as u64,
+                    Channel::new(
+                        HttpVersion::Http3,
+                        health::peer_iface(qconn.client_addr.ip()),
+                    ),
+                    resumed,
+                );
             }
-            key
-        } else {
-            debug!("non-initial packet for unknown conn");
-            continue;
-        };
 
-        let qconn = match connections.get_mut(&key) {
-            Some(c) => c,
-            None => continue,
-        };
-        qconn.last_active = m6_core::platform::now();
-        // This connection is flushed once, after the whole batch. Marking it
-        // after the lookup means a datagram that found no connection never
-        // becomes a flush of one.
-        udp.touched.note(&key);
-
-        let recv_info = quiche::RecvInfo {
-            from,
-            to: udp.local,
-        };
-        if let Err(e) = qconn.conn.recv(pkt, recv_info) {
-            // REJECTING A PACKET IS NOT THE END OF THE WORK. quiche has already
-            // called close() internally and queued a CONNECTION_CLOSE carrying
-            // the right wire code, and the only way it reaches the peer is
-            // conn.send(), which here is flush_conn. This path used to
-            // `continue` straight past it.
+            // Establish the H3 connection once the QUIC handshake is complete, OR as
+            // soon as early data arrives.
             //
-            // The close was not lost: the timer path calls on_timeout() and
-            // then flush_conn, so it went out one tick late. That is still a
-            // needless delay on the one packet whose job is to say why the
-            // connection is ending, so it goes out here instead.
+            // The early-data half is what makes 0-RTT reach the application at all.
+            // With `is_established()` alone the requests in a client's first flight
+            // were accepted by QUIC and then had nowhere to go, because the h3
+            // connection that parses them did not exist until a round trip later --
+            // so the round trip 0-RTT exists to save was still being paid.
             //
-            // It does not move h3 conformance. The twelve h3spec failures are
-            // quiche's and are documented in tools/conformance-scores.txt.
-            warn!("conn.recv error: {}", e);
-            flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
-            continue;
-        }
-
-        // The QUIC handshake is complete exactly here, the first time this is
-        // true. Guarded by a flag because this branch is reached on every packet
-        // for the life of the connection, and recording unguarded would turn one
-        // handshake into thousands of samples of a steadily growing duration.
-        if qconn.conn.is_established() && !qconn.handshake_recorded {
-            qconn.handshake_recorded = true;
-            // Resumed handshakes are counted apart from full ones. With 0-RTT
-            // enabled this is now the common case for a returning visitor, and a
-            // blended figure would drop as the returning share grew while neither
-            // cost had changed.
-            let resumed = qconn.conn.is_resumed();
-            state.stats.record_handshake(
-                qconn.created.elapsed().as_nanos() as u64,
-                Channel::new(
-                    HttpVersion::Http3,
-                    health::peer_iface(qconn.client_addr.ip()),
-                ),
-                resumed,
-            );
-        }
-
-        // Establish the H3 connection once the QUIC handshake is complete, OR as
-        // soon as early data arrives.
-        //
-        // The early-data half is what makes 0-RTT reach the application at all.
-        // With `is_established()` alone the requests in a client's first flight
-        // were accepted by QUIC and then had nowhere to go, because the h3
-        // connection that parses them did not exist until a round trip later --
-        // so the round trip 0-RTT exists to save was still being paid.
-        //
-        // quiche permits this: `h3::Connection::with_transport` gates on
-        // established-or-early-data for CLIENTS only, and this is the server.
-        //
-        // `handle_h3_request` decides what may actually be ANSWERED this early.
-        // Parsing a request in early data is not the risk; acting on it is.
-        if (qconn.conn.is_established() || qconn.conn.is_in_early_data()) && qconn.h3_conn.is_none()
-        {
-            let mut h3_config = match quiche::h3::Config::new() {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("h3 Config::new error: {}", e);
-                    flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
-                    continue;
-                }
-            };
-            // RFC 9114 4.2.2: the field section bound is advertised and the
-            // local decoder enforces it. It is the same number every other
-            // protocol uses.
-            h3_config.set_max_field_section_size(m6_core::headers::MAX_REQUEST_HEAD as u64);
-            match quiche::h3::Connection::with_transport(&mut qconn.conn, &h3_config) {
-                Ok(h3) => {
-                    qconn.h3_conn = Some(h3);
-                }
-                Err(e) => {
-                    warn!("h3 init error: {}", e);
-                    flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
-                    continue;
+            // quiche permits this: `h3::Connection::with_transport` gates on
+            // established-or-early-data for CLIENTS only, and this is the server.
+            //
+            // `handle_h3_request` decides what may actually be ANSWERED this early.
+            // Parsing a request in early data is not the risk; acting on it is.
+            if (qconn.conn.is_established() || qconn.conn.is_in_early_data())
+                && qconn.h3_conn.is_none()
+            {
+                let mut h3_config = match quiche::h3::Config::new() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("h3 Config::new error: {}", e);
+                        flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
+                        continue;
+                    }
+                };
+                // RFC 9114 4.2.2: the field section bound is advertised and the
+                // local decoder enforces it. It is the same number every other
+                // protocol uses.
+                h3_config.set_max_field_section_size(m6_core::headers::MAX_REQUEST_HEAD as u64);
+                match quiche::h3::Connection::with_transport(&mut qconn.conn, &h3_config) {
+                    Ok(h3) => {
+                        qconn.h3_conn = Some(h3);
+                    }
+                    Err(e) => {
+                        warn!("h3 init error: {}", e);
+                        flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
+                        continue;
+                    }
                 }
             }
-        }
 
-        // Process H3 events
-        if qconn.h3_conn.is_some() {
-            process_h3(qconn, &key, state, h3);
-        }
+            // Process H3 events
+            if qconn.h3_conn.is_some() {
+                process_h3(qconn, &key, state, h3);
+            }
 
-        // A packet may have carried the credit a saved response was waiting
-        // for: this is the one place that connection is driven this turn.
-        if !qconn.partial_responses.is_empty() {
-            drain_writable(qconn);
+            // A packet may have carried the credit a saved response was waiting
+            // for: this is the one place that connection is driven this turn.
+            if !qconn.partial_responses.is_empty() {
+                drain_writable(qconn);
+            }
         }
     }
 }

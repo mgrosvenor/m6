@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH};
+use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH, RECV_SLOT};
 use m6_http_lib::probe;
 use rand::Rng;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -1285,10 +1285,13 @@ fn close_and_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
     quic_flush(conn, udp);
 }
 
-/// One receive slot in the bench client's batch. The server sends QUIC
-/// packets of at most 1,350 bytes, so a slot holds one datagram with room to
-/// spare.
-const H3_RECV_SLOT: usize = 2048;
+/// One receive slot in the bench client's batch.
+///
+/// A slot is sized for a coalesced read, not for one datagram: the server's
+/// socket segments a flush, and a Linux client with `UDP_GRO` takes the whole
+/// run in one slot. The slot is one datagram on macOS, which has no
+/// coalescing, and the room is unused there.
+const H3_RECV_SLOT: usize = RECV_SLOT;
 
 /// How long one turn waits for a datagram before the connection's timer is
 /// driven. This was the socket's read timeout before the receive was batched.
@@ -1404,10 +1407,12 @@ struct H3Client {
     recv_info: quiche::RecvInfo,
     /// The socket's batch receive.
     batch: UdpBatch,
-    /// The turn's receive slots, [`MAX_BATCH`] datagrams of [`H3_RECV_SLOT`]
-    /// bytes each. Allocated once per connection, not per request.
+    /// The turn's receive slots, [`MAX_BATCH`] receives of [`H3_RECV_SLOT`]
+    /// bytes each. A receive is one datagram, or a coalesced run that
+    /// [`RecvMeta::datagrams`] splits. Allocated once per connection, not per
+    /// request.
     recv_buf: Vec<u8>,
-    /// One length and source per receive slot.
+    /// One length, source and split per receive slot.
     recv_metas: [RecvMeta; MAX_BATCH],
     /// Requests this connection has carried, which is what fills it up.
     reqs: usize,
@@ -1478,9 +1483,16 @@ impl H3Client {
                 Some(n) => {
                     for i in 0..n {
                         let start = i * H3_RECV_SLOT;
-                        let len = self.recv_metas[i].len;
-                        self.conn
-                            .recv(&mut self.recv_buf[start..start + len], self.recv_info)?;
+                        // A coalesced receive holds several datagrams that
+                        // were one run on the wire. quiche's `recv` takes one
+                        // QUIC packet, so each goes to it on its own, in the
+                        // order the server sent it.
+                        for (offset, len) in self.recv_metas[i].datagrams() {
+                            self.conn.recv(
+                                &mut self.recv_buf[start + offset..start + offset + len],
+                                self.recv_info,
+                            )?;
+                        }
                     }
                     // One flush covers the whole batch: every packet the batch
                     // answered is acknowledged in this send, not one per read.

@@ -367,24 +367,83 @@ mod test_send_blocked {
     }
 }
 
-/// The most datagrams one [`UdpBatch::recv`] call takes in.
+/// The most receives one [`UdpBatch::recv`] call takes in.
+///
+/// A receive is one datagram on a socket without receive coalescing. On Linux
+/// with `UDP_GRO` enabled the kernel may hand back one buffer holding a run of
+/// datagrams from one sender, and [`RecvMeta::datagrams`] splits that run.
 pub const MAX_BATCH: usize = 16;
 
-/// One datagram a batch receive took in: the bytes stored for it and the
-/// address it came from.
+/// The bytes one receive slot must hold to take a coalesced read whole.
+///
+/// Linux UDP GRO coalesces the datagrams from one sender into one buffer of up
+/// to 64 KB, the largest UDP payload, so a smaller slot would truncate it. A
+/// socket without coalescing writes one datagram per slot, and a QUIC packet is
+/// far below this, so the room is unused there.
+pub const RECV_SLOT: usize = 64 * 1024;
+
+/// Whether this target has UDP receive coalescing at all.
+///
+/// Linux has it and macOS does not. A Linux socket still asks for it, and a
+/// kernel older than the option refuses, so [`UdpBatch::gro`] is the answer for
+/// one socket.
+pub const RECV_COALESCING: bool = super::os::RECV_COALESCING;
+
+/// One receive a batch took in: the bytes stored for it, the address they came
+/// from, and how to split them back into datagrams.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecvMeta {
-    /// Bytes stored in the caller's buffer for this datagram.
+    /// Bytes stored in the caller's buffer for this receive.
+    ///
+    /// With a zero [`stride`](Self::stride) this is one datagram. Otherwise the
+    /// kernel coalesced several datagrams from one sender into this many bytes,
+    /// and [`datagrams`](Self::datagrams) gives each of them.
     pub len: usize,
     /// The peer address the datagram came from. `None` only when the kernel
-    /// reported no address, which a UDP receive does not do.
+    /// reported no address, which a UDP receive does not do. Every datagram in
+    /// a coalesced receive came from this one address.
     pub from: Option<SocketAddr>,
+    /// Zero when the receive is one datagram. Otherwise the size of every
+    /// datagram in it but the last, which may be shorter: the `gso_size` the
+    /// kernel reported for a `UDP_GRO` read.
+    pub stride: usize,
+}
+
+impl RecvMeta {
+    /// The datagrams this receive holds, as `(offset, length)` within the slot
+    /// the caller gave the receive.
+    ///
+    /// A receive that was not coalesced is one entry of `(0, len)`, including
+    /// the zero-length datagram UDP allows. A coalesced one is `stride` bytes
+    /// at a time, in the order the sender sent them, with the last at most
+    /// `stride`.
+    pub fn datagrams(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let len = self.len;
+        let stride = self.stride;
+        let mut offset = 0;
+        let mut sent_empty = false;
+        std::iter::from_fn(move || {
+            if offset < len {
+                let width = if stride == 0 { len } else { stride };
+                let end = len.min(offset.saturating_add(width));
+                let at = offset;
+                offset = end;
+                return Some((at, end - at));
+            }
+            // A zero-length datagram is one datagram, not none.
+            if len == 0 && !sent_empty {
+                sent_empty = true;
+                return Some((0, 0));
+            }
+            None
+        })
+    }
 }
 
 /// A socket's UDP batch send and receive.
 ///
 /// One [`send`](Self::send) sends a buffer packed with segments of one size.
-/// One [`recv`](Self::recv) takes in up to [`MAX_BATCH`] datagrams. On Linux
+/// One [`recv`](Self::recv) takes in up to [`MAX_BATCH`] receives. On Linux
 /// the send is one `sendmsg` carrying the segment size as a `UDP_SEGMENT`
 /// control message, so the kernel splits the buffer into the datagrams the
 /// caller packed, and the receive is one `recvmmsg`. On macOS there is no
@@ -392,32 +451,57 @@ pub struct RecvMeta {
 /// datagram at a time, in the order given, with the same bytes and the same
 /// results.
 ///
+/// On Linux a receive can also be coalesced. With `UDP_GRO` on, the kernel
+/// hands back one buffer holding a run of datagrams from one sender, and
+/// reports the run's `gso_size` in a control message. [`RecvMeta`] carries that
+/// size as `stride`, and [`RecvMeta::datagrams`] splits the run into the
+/// datagrams that were sent. macOS has no such option, and every receive there
+/// is one datagram.
+///
 /// [`for_socket`](Self::for_socket) asks the kernel once, at socket setup,
-/// whether segmentation offload is available. A socket without it sends a
-/// batch as single datagrams. [`without_gso`](Self::without_gso) is that path
-/// on a socket that has it, so a test can hold both paths to the same bytes on
-/// one machine.
+/// whether either offload is available. A socket without segmentation offload
+/// sends a batch as single datagrams, and a socket without receive coalescing
+/// reads one datagram per call. [`without_gso`](Self::without_gso) is the send
+/// path on a socket that has segmentation offload, so a test can hold both
+/// paths to the same bytes on one machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpBatch {
     gso: bool,
+    gro: bool,
 }
 
 impl UdpBatch {
-    /// Probe `socket` once, at setup, for segmentation offload.
+    /// Ask `socket` once, at setup, for both offloads.
+    ///
+    /// Segmentation offload is probed and left off, so an ordinary send stays
+    /// one datagram and only a batch asks the kernel to split one buffer.
+    /// Receive coalescing is enabled and left on where the kernel accepts it,
+    /// because every receive then reports what it took in. A kernel that
+    /// refuses it is not an error: the socket reads one datagram at a time,
+    /// which is the path it took before.
     pub fn for_socket(socket: &impl AsFd) -> UdpBatch {
         UdpBatch {
             gso: super::os::udp_gso_supported(socket),
+            gro: super::os::udp_gro_supported(socket),
         }
     }
 
     /// The path a socket without segmentation offload takes, on any socket.
     pub fn without_gso() -> UdpBatch {
-        UdpBatch { gso: false }
+        UdpBatch {
+            gso: false,
+            gro: false,
+        }
     }
 
     /// Whether this socket sends a batch as one segmented `sendmsg`.
     pub fn gso(&self) -> bool {
         self.gso
+    }
+
+    /// Whether this socket coalesces several datagrams into one receive.
+    pub fn gro(&self) -> bool {
+        self.gro
     }
 
     /// Send `segments`, packed back to back, to `dest`.
@@ -446,13 +530,17 @@ impl UdpBatch {
         super::os::udp_send_batch(socket, segments, segment_size, dest, self.gso)
     }
 
-    /// Receive up to [`MAX_BATCH`] datagrams into `buf`, one per `slot` bytes,
-    /// storing datagram `i` at `buf[i * slot..(i + 1) * slot]` and its length
-    /// and source in `metas[i]`.
+    /// Receive up to [`MAX_BATCH`] receives into `buf`, one per `slot` bytes,
+    /// storing receive `i` at `buf[i * slot..(i + 1) * slot]` and its length,
+    /// source and split in `metas[i]`.
     ///
-    /// Takes in at most `metas.len()` datagrams and at most `buf.len() / slot`.
-    /// `WouldBlock` means no datagram was waiting. A datagram longer than
-    /// `slot` is truncated to the slot, as one `recv_from` would truncate it.
+    /// A receive is one datagram whose length is `metas[i].len`, or on Linux a
+    /// coalesced run of datagrams that [`RecvMeta::datagrams`] splits. Size the
+    /// slot to [`RECV_SLOT`] so a coalesced run arrives whole.
+    ///
+    /// Takes in at most `metas.len()` receives and at most `buf.len() / slot`.
+    /// `WouldBlock` means no datagram was waiting. A receive longer than `slot`
+    /// is truncated to the slot, as one `recv_from` would truncate it.
     /// A batch never drops a datagram it has read: an error met after a
     /// datagram returns that count. Whether the same error is reported again
     /// is the platform's. Linux stores it back on the socket and the next call
@@ -583,5 +671,52 @@ mod tests {
             }
         }
         assert_eq!(got, payload, "every datagram once, in order");
+    }
+
+    /// A coalesced receive splits at its stride, and the last datagram may be
+    /// shorter. A receive that was not coalesced stays one datagram, including
+    /// the zero-length one UDP allows.
+    ///
+    /// This is the arithmetic every caller of `recv` now runs. It is checked on
+    /// the host that has no GRO, so the Linux contract test that exercises the
+    /// kernel's control message is not the only thing holding the split.
+    ///
+    /// Break: a split that drops the short last datagram, walks past `len`, or
+    /// reports a zero-length receive as no datagram at all.
+    #[test]
+    fn a_coalesced_receive_splits_into_the_datagrams_that_were_sent() {
+        let coalesced = RecvMeta {
+            len: 337,
+            stride: 100,
+            ..RecvMeta::default()
+        };
+        assert_eq!(
+            coalesced
+                .datagrams()
+                .map(|(offset, len)| {
+                    assert!(offset + len <= coalesced.len);
+                    len
+                })
+                .collect::<Vec<_>>(),
+            [100, 100, 100, 37],
+            "the run splits at its stride and the last datagram is short"
+        );
+
+        let single = RecvMeta {
+            len: 1200,
+            ..RecvMeta::default()
+        };
+        assert_eq!(
+            single.datagrams().collect::<Vec<_>>(),
+            [(0, 1200)],
+            "a receive without a stride is one datagram"
+        );
+
+        let empty = RecvMeta::default();
+        assert_eq!(
+            empty.datagrams().collect::<Vec<_>>(),
+            [(0, 0)],
+            "a zero-length datagram is one datagram, not none"
+        );
     }
 }

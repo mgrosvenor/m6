@@ -158,6 +158,9 @@ pub(super) fn child_exit_supported() -> io::Result<()> {
 /// `sockaddr_un::sun_path` is 104 bytes on macOS.
 pub(super) const MAX_SOCKET_PATH: usize = 104;
 
+/// macOS has no UDP receive coalescing, so every receive is one datagram.
+pub(super) const RECV_COALESCING: bool = false;
+
 /// `SO_NOSIGPIPE`, so a write to a closed peer is an error and never a
 /// signal, whatever the process's disposition. An accepted socket inherits it
 /// from its listener.
@@ -181,6 +184,13 @@ pub(super) fn steer_reuseport(_fd: RawFd, _group_size: u32) -> io::Result<()> {
 
 /// macOS has no segmentation offload, so a batch is never one segmented send.
 pub(super) fn udp_gso_supported(_socket: &impl AsFd) -> bool {
+    false
+}
+
+/// macOS has no UDP receive coalescing. `recvfrom` returns one datagram per
+/// call, so there is nothing to enable and nothing to report: every receive is
+/// one datagram, which is the path the socket already takes.
+pub(super) fn udp_gro_supported(_socket: &impl AsFd) -> bool {
     false
 }
 
@@ -225,7 +235,13 @@ pub(super) fn udp_recv_batch(
         match read {
             Ok((len, from)) => {
                 let from = from.as_ref().and_then(super::net::socket_addr_of);
-                *meta = super::net::RecvMeta { len, from };
+                // One `recvfrom` is one datagram, so every receive has no
+                // stride to split it by.
+                *meta = super::net::RecvMeta {
+                    len,
+                    from,
+                    stride: 0,
+                };
                 received += 1;
             }
             Err(Errno::EAGAIN) if received == 0 => return Err(Errno::EAGAIN.into()),
