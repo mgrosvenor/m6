@@ -101,6 +101,9 @@ jobs:
           # to build the services, so that build gets the same treatment.
           CARGO_BUILD_TARGET: ${{ env.SANITISER_TARGET }}
         run: |
+          # m6-http pins its memory at start ([server] lock_memory, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB, as in ci.yml.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
           # The workspace binaries first: testkit::binary() reads them from
           # <target>/<profile>, which a test-only build does not fill.
           cargo +nightly build --workspace --bins
