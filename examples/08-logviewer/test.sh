@@ -26,7 +26,7 @@ CURL="$(command -v /opt/homebrew/opt/curl/bin/curl 2>/dev/null || echo curl)"
 BASE_OPTS="-sk"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
+GREEN='\033[0;32m'; RED='\033[0;31m'; RESET='\033[0m'
 
 # ── 1. Unit tests ─────────────────────────────────────────────────────────────
 echo "=== Running m6-file unit tests ==="
@@ -59,7 +59,7 @@ M6_SOCKET_OVERRIDE=/tmp/m6/m6-file.sock \
     m6-file "$SITE" "$SITE/configs/m6-file.conf" >> "$SITE/logs/m6-file.log" 2>&1 &
 
 echo -n "Waiting for backend sockets"
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     if [[ -S /tmp/m6/m6-html.sock && -S /tmp/m6/m6-file.sock ]]; then
         echo " ready."
         break
@@ -69,11 +69,10 @@ for i in $(seq 1 20); do
 done
 
 m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" >> "$SITE/logs/m6-http.log" 2>&1 &
-HTTP_PID=$!
 
 # Wait for server readiness via HTTP/1.1 (always available)
 echo -n "Waiting for server"
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
     code=$($CURL $BASE_OPTS --http1.1 -o /dev/null -w "%{http_code}" https://localhost:8443/ 2>/dev/null || true)
     if [[ "$code" == "200" ]]; then
         echo " ready."

@@ -42,7 +42,7 @@ AUTH_PID=$!
 trap 'kill $HTML_PID $FILE_PID $AUTH_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     [ -S /tmp/m6/m6-html-api.sock ] && \
     [ -S /tmp/m6/m6-file-api.sock ] && \
     [ -S /tmp/m6/m6-auth-api.sock ] && [ -S /tmp/m6/check-m6-auth-api.sock ] && break

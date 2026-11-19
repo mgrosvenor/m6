@@ -22,6 +22,7 @@ unset _m6_base
 # a real directory owned by this user with exactly that mode.
 m6_private_dir() {
     local d="$1" mode
+    # shellcheck disable=SC2174  # only the deepest directory needs 700; the parents are shared
     mkdir -p -m 700 "$d" 2>/dev/null || true
     mode=$(stat -c %a "$d" 2>/dev/null || stat -f %Lp "$d" 2>/dev/null || echo unknown)
     if [ -L "$d" ] || [ ! -d "$d" ] || [ ! -O "$d" ] || [ "$mode" != 700 ]; then

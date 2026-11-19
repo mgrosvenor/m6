@@ -36,7 +36,7 @@ RENDER_PID=$!
 trap 'kill $HTML_PID $FILE_PID $RENDER_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     [ -S /tmp/m6/m6-html.sock ] && \
     [ -S /tmp/m6/m6-file.sock ] && \
     [ -S /tmp/m6/render-contact.sock ] && break

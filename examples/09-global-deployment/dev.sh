@@ -79,7 +79,7 @@ ALL_PIDS="$HTML_PID $FILE_PID $AUTH_PID $RENDER_PID"
 
 # Wait for backend sockets
 echo "Waiting for backend services..."
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
     [ -S /tmp/m6/m6-html.sock ] && \
     [ -S /tmp/m6/m6-file.sock ] && \
     [ -S /tmp/m6/m6-auth.sock ] && \
@@ -111,7 +111,7 @@ ALL_PIDS="$ALL_PIDS $!"
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-e.toml")" &
 ALL_PIDS="$ALL_PIDS $!"
 
-trap "kill $ALL_PIDS 2>/dev/null; wait 2>/dev/null" EXIT
+trap 'kill $ALL_PIDS 2>/dev/null; wait 2>/dev/null' EXIT
 
 echo ""
 echo "┌─────────────────────────────────────────────────────────────┐"

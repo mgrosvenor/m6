@@ -44,9 +44,9 @@ rm -f /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock
 
 # Truncate log files so each run starts fresh (avoids serving stale megabytes
 # on the first tail poll from a previous session's accumulated log).
-> "$SITE/logs/m6-html.log"
-> "$SITE/logs/m6-file.log"
-> "$SITE/logs/m6-http.log"
+: > "$SITE/logs/m6-html.log"
+: > "$SITE/logs/m6-file.log"
+: > "$SITE/logs/m6-http.log"
 
 # ── Start services ────────────────────────────────────────────────────────────
 info "Starting m6-html..."
@@ -63,7 +63,7 @@ trap 'echo ""; info "Stopping (PIDs: $HTML_PID $FILE_PID $HTTP_PID)..."; kill $H
 
 # Wait for backend sockets
 echo -n "Waiting for backend sockets"
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     if [[ -S /tmp/m6/m6-html.sock && -S /tmp/m6/m6-file.sock ]]; then
         echo " ready."
         break
@@ -80,7 +80,7 @@ HTTP_PID=$!
 CURL="$(command -v /opt/homebrew/opt/curl/bin/curl 2>/dev/null || echo curl)"
 echo -n "Waiting for server"
 READY=false
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
     code=$($CURL -sk --http1.1 -o /dev/null -w "%{http_code}" https://localhost:8443/ 2>/dev/null || true)
     if [[ "$code" == "200" ]]; then
         echo " ready."

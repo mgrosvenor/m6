@@ -29,7 +29,6 @@ export PATH="$M6/target/release:$PATH"
 "$SITE/../dev-keys.sh"
 
 # ── Start stack (if not already listening) ────────────────────────────────────
-STACK_STARTED=false
 if ! nc -z localhost 8443 2>/dev/null; then
     info "Starting m6 stack..."
     mkdir -p "$SITE/logs"
@@ -37,7 +36,6 @@ if ! nc -z localhost 8443 2>/dev/null; then
     rm -f /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock
 
     trap 'kill $(jobs -p) 2>/dev/null; wait 2>/dev/null' EXIT
-    STACK_STARTED=true
 
     M6_SOCKET_OVERRIDE=/tmp/m6/m6-html.sock \
         m6-html "$SITE" "$SITE/configs/m6-html.conf" >> "$SITE/logs/m6-html.log" 2>&1 &
@@ -45,7 +43,7 @@ if ! nc -z localhost 8443 2>/dev/null; then
         m6-file "$SITE" "$SITE/configs/m6-file.conf" >> "$SITE/logs/m6-file.log" 2>&1 &
 
     echo -n "Waiting for backend sockets"
-    for i in $(seq 1 20); do
+    for _ in $(seq 1 20); do
         if [[ -S /tmp/m6/m6-html.sock && -S /tmp/m6/m6-file.sock ]]; then echo " ready."; break; fi
         echo -n "."; sleep 0.25
     done
@@ -55,7 +53,7 @@ if ! nc -z localhost 8443 2>/dev/null; then
     # Wait for readiness using HTTP/1.1
     CURL="$(command -v /opt/homebrew/opt/curl/bin/curl 2>/dev/null || echo curl)"
     echo -n "Waiting for server"
-    for i in $(seq 1 40); do
+    for _ in $(seq 1 40); do
         code=$($CURL -sk --http1.1 -o /dev/null -w "%{http_code}" https://localhost:8443/ 2>/dev/null || true)
         if [[ "$code" == "200" ]]; then echo " ready."; break; fi
         echo -n "."; sleep 0.5

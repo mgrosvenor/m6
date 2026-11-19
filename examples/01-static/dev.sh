@@ -28,7 +28,7 @@ FILE_PID=$!
 trap 'kill $HTML_PID $FILE_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     [ -S /tmp/m6/m6-html.sock ] && [ -S /tmp/m6/m6-file.sock ] && break
     sleep 0.2
 done

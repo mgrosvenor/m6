@@ -55,7 +55,7 @@ trap 'kill $AUTH_PID $ADMIN_PID $FILE_PID $HTTP_PID 2>/dev/null; wait 2>/dev/nul
 
 # ── Wait for backend sockets ──────────────────────────────────────────────────
 printf "waiting for backends"
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
     [ -S /tmp/m6/m6-auth-admin.sock ] && \
     [ -S /tmp/m6/check-m6-auth-admin.sock ] && \
     [ -S /tmp/m6/render-admin.sock  ] && \

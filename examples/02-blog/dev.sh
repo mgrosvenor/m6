@@ -59,7 +59,7 @@ trap 'echo ""; info "Stopping..."; kill $HTML_PID $FILE_PID $HTTP_PID 2>/dev/nul
 
 # Wait for backend sockets
 echo -n "Waiting for backend sockets"
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     if [[ -S /tmp/m6/m6-html.sock && -S /tmp/m6/m6-file.sock ]]; then
         echo " ready."
         break
@@ -76,7 +76,7 @@ HTTP_PID=$!
 CURL="$(command -v /opt/homebrew/opt/curl/bin/curl 2>/dev/null || echo curl)"
 echo -n "Waiting for server"
 READY=false
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
     code=$($CURL -sk --http1.1 -o /dev/null -w "%{http_code}" https://127.0.0.1:8443/ 2>/dev/null || true)
     if [[ "$code" == "200" ]]; then
         echo " ready."
