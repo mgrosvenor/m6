@@ -154,7 +154,10 @@ jobs:
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           status=0
-          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          # Cargo's build-dir layout leaves a binary built only for tests out of
+          # <target>/<profile>, and testkit::binary() reads it from there, so
+          # the workspace binaries are built first, as the harness documents.
+          { cargo build --workspace --bins && cargo test --workspace --no-run; } > testbuild.log 2>&1 || status=$?
           cat testbuild.log
           # The suite needs the tests to compile, not to compile without
           # warnings, so it runs on this output and a warning cannot hide it.
@@ -309,7 +312,10 @@ jobs:
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           status=0
-          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          # Cargo's build-dir layout leaves a binary built only for tests out of
+          # <target>/<profile>, and testkit::binary() reads it from there, so
+          # the workspace binaries are built first, as the harness documents.
+          { cargo build --workspace --bins && cargo test --workspace --no-run; } > testbuild.log 2>&1 || status=$?
           cat testbuild.log
           [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
           [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
@@ -419,7 +425,10 @@ jobs:
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           status=0
-          cargo test --workspace --no-run > testbuild.log 2>&1 || status=$?
+          # Cargo's build-dir layout leaves a binary built only for tests out of
+          # <target>/<profile>, and testkit::binary() reads it from there, so
+          # the workspace binaries are built first, as the harness documents.
+          { cargo build --workspace --bins && cargo test --workspace --no-run; } > testbuild.log 2>&1 || status=$?
           cat testbuild.log
           [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
           [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }

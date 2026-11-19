@@ -101,4 +101,7 @@ jobs:
           # to build the services, so that build gets the same treatment.
           CARGO_BUILD_TARGET: ${{ env.SANITISER_TARGET }}
         run: |
+          # The workspace binaries first: testkit::binary() reads them from
+          # <target>/<profile>, which a test-only build does not fill.
+          cargo +nightly build --workspace --bins
           time cargo +nightly test --workspace -- --test-threads=1
