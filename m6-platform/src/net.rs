@@ -285,6 +285,142 @@ pub fn buffer_sizes(sock: &impl AsFd) -> io::Result<(usize, usize)> {
     Ok((s.send_buffer_size()?, s.recv_buffer_size()?))
 }
 
+/// The most datagrams one [`UdpBatch::recv`] call takes in.
+pub const MAX_BATCH: usize = 16;
+
+/// One datagram a batch receive took in: the bytes stored for it and the
+/// address it came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecvMeta {
+    /// Bytes stored in the caller's buffer for this datagram.
+    pub len: usize,
+    /// The peer address the datagram came from. `None` only when the kernel
+    /// reported no address, which a UDP receive does not do.
+    pub from: Option<SocketAddr>,
+}
+
+/// A socket's UDP batch send and receive.
+///
+/// One [`send`](Self::send) sends a buffer packed with segments of one size.
+/// One [`recv`](Self::recv) takes in up to [`MAX_BATCH`] datagrams. On Linux
+/// the send is one `sendmsg` carrying the segment size as a `UDP_SEGMENT`
+/// control message, so the kernel splits the buffer into the datagrams the
+/// caller packed, and the receive is one `recvmmsg`. On macOS there is no
+/// segmentation offload and no `recvmmsg`: the same calls send and receive one
+/// datagram at a time, in the order given, with the same bytes and the same
+/// results.
+///
+/// [`for_socket`](Self::for_socket) asks the kernel once, at socket setup,
+/// whether segmentation offload is available. A socket without it sends a
+/// batch as single datagrams. [`without_gso`](Self::without_gso) is that path
+/// on a socket that has it, so a test can hold both paths to the same bytes on
+/// one machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpBatch {
+    gso: bool,
+}
+
+impl UdpBatch {
+    /// Probe `socket` once, at setup, for segmentation offload.
+    pub fn for_socket(socket: &impl AsFd) -> UdpBatch {
+        UdpBatch {
+            gso: super::os::udp_gso_supported(socket),
+        }
+    }
+
+    /// The path a socket without segmentation offload takes, on any socket.
+    pub fn without_gso() -> UdpBatch {
+        UdpBatch { gso: false }
+    }
+
+    /// Whether this socket sends a batch as one segmented `sendmsg`.
+    pub fn gso(&self) -> bool {
+        self.gso
+    }
+
+    /// Send `segments`, packed back to back, to `dest`.
+    ///
+    /// Every segment is exactly `segment_size` bytes and the last is at most
+    /// `segment_size`, which is the shape a QUIC flush produces. Returns the
+    /// bytes sent, which is `segments.len()`. A batch of one segment, or a
+    /// socket without segmentation offload, sends one datagram per segment.
+    pub fn send(
+        &self,
+        socket: &impl AsFd,
+        segments: &[u8],
+        segment_size: usize,
+        dest: SocketAddr,
+    ) -> io::Result<usize> {
+        if segments.is_empty() || segment_size == 0 || segment_size > segments.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a batch needs a segment size within its bytes",
+            ));
+        }
+        super::os::udp_send_batch(socket, segments, segment_size, dest, self.gso)
+    }
+
+    /// Receive up to [`MAX_BATCH`] datagrams into `buf`, one per `slot` bytes,
+    /// storing datagram `i` at `buf[i * slot..(i + 1) * slot]` and its length
+    /// and source in `metas[i]`.
+    ///
+    /// Takes in at most `metas.len()` datagrams and at most `buf.len() / slot`.
+    /// `WouldBlock` means no datagram was waiting. A datagram longer than
+    /// `slot` is truncated to the slot, as one `recv_from` would truncate it.
+    pub fn recv(
+        &self,
+        socket: &impl AsFd,
+        buf: &mut [u8],
+        slot: usize,
+        metas: &mut [RecvMeta],
+    ) -> io::Result<usize> {
+        if slot == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a receive batch needs a nonzero slot",
+            ));
+        }
+        let count = (buf.len() / slot).min(metas.len()).min(MAX_BATCH);
+        if count == 0 {
+            return Ok(0);
+        }
+        super::os::udp_recv_batch(socket, buf, slot, metas)
+    }
+}
+
+/// Turn the kernel's address for a received datagram into a `SocketAddr`,
+/// `None` for an address family m6 does not use.
+///
+/// # Safety
+/// `address` is null or points at a live address structure the kernel filled
+/// for a received datagram, large enough for the family it names.
+pub(super) unsafe fn socket_addr_from_raw(address: *const libc::sockaddr) -> Option<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    if address.is_null() {
+        return None;
+    }
+    match unsafe { (*address).sa_family as libc::c_int } {
+        libc::AF_INET => {
+            let inet = unsafe { &*address.cast::<libc::sockaddr_in>() };
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(inet.sin_addr.s_addr.to_ne_bytes()),
+                u16::from_be(inet.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let inet6 = unsafe { &*address.cast::<libc::sockaddr_in6>() };
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(inet6.sin6_addr.s6_addr),
+                u16::from_be(inet6.sin6_port),
+                inet6.sin6_flowinfo,
+                inet6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
 /// The index of the network interface named `name`, for a link-local IPv6
 /// scope. `NotFound` when there is no such interface.
 pub fn interface_index(name: &str) -> io::Result<u32> {

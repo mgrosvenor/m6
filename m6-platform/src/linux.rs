@@ -6,7 +6,8 @@
 //! layer's tests are shared and run unchanged on every target.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::net::SocketAddr;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use super::facts::{self, ClockFacts, CpuFacts, CpuLimit, Fact, Limits, MemoryFacts, OsFacts};
@@ -116,6 +117,173 @@ pub(super) fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Whether `socket` can send a batch as one `sendmsg` with `UDP_SEGMENT`.
+///
+/// The proof is the set, then a read-back. A kernel without the option fails
+/// the set, and a kernel that accepts a value and discards it fails the
+/// read-back. The option is cleared before returning, so an ordinary send on
+/// this socket stays one datagram per call and only a batch asks the kernel to
+/// split one buffer.
+pub(super) fn udp_gso_supported(socket: &impl AsFd) -> bool {
+    use nix::sys::socket::sockopt::UdpGsoSegment;
+    use nix::sys::socket::{getsockopt, setsockopt};
+
+    // The value only has to be one a datagram can hold. The call is the test.
+    let probe: libc::c_int = 1200;
+    if setsockopt(socket, UdpGsoSegment, &probe).is_err() {
+        return false;
+    }
+    let stored = getsockopt(socket, UdpGsoSegment).is_ok_and(|size| size == probe);
+    let off: libc::c_int = 0;
+    let _ = setsockopt(socket, UdpGsoSegment, &off);
+    stored
+}
+
+/// Send `segments` as one `sendmsg` with the segment size in a `UDP_SEGMENT`
+/// control message, or one datagram at a time when `gso` is false or there is
+/// only one segment.
+pub(super) fn udp_send_batch(
+    socket: &impl AsFd,
+    segments: &[u8],
+    segment_size: usize,
+    dest: SocketAddr,
+    gso: bool,
+) -> io::Result<usize> {
+    if gso && segment_size < segments.len() {
+        return udp_send_segmented(socket, segments, segment_size, dest);
+    }
+    udp_send_each(socket, segments, segment_size, dest)
+}
+
+fn udp_send_segmented(
+    socket: &impl AsFd,
+    segments: &[u8],
+    segment_size: usize,
+    dest: SocketAddr,
+) -> io::Result<usize> {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
+    use std::io::IoSlice;
+
+    let size = u16::try_from(segment_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a segment is larger than the 65535 bytes UDP_SEGMENT holds",
+        )
+    })?;
+    let iov = [IoSlice::new(segments)];
+    let cmsgs = [ControlMessage::UdpGsoSegments(&size)];
+    let dst = SockaddrStorage::from(dest);
+
+    sendmsg(
+        socket.as_fd().as_raw_fd(),
+        &iov,
+        &cmsgs,
+        MsgFlags::empty(),
+        Some(&dst),
+    )
+    .map_err(io::Error::from)
+}
+
+fn udp_send_each(
+    socket: &impl AsFd,
+    segments: &[u8],
+    segment_size: usize,
+    dest: SocketAddr,
+) -> io::Result<usize> {
+    use nix::sys::socket::{sendto, MsgFlags, SockaddrStorage};
+
+    let dst = SockaddrStorage::from(dest);
+    let fd = socket.as_fd().as_raw_fd();
+    let mut sent = 0;
+    while sent < segments.len() {
+        let len = (segments.len() - sent).min(segment_size);
+        let wrote = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())?;
+        if wrote != len {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "a UDP send took part of a datagram",
+            ));
+        }
+        sent += wrote;
+    }
+    Ok(sent)
+}
+
+/// Receive up to `metas.len()` datagrams in one `recvmmsg`.
+pub(super) fn udp_recv_batch(
+    socket: &impl AsFd,
+    buf: &mut [u8],
+    slot: usize,
+    metas: &mut [super::net::RecvMeta],
+) -> io::Result<usize> {
+    let count = (buf.len() / slot)
+        .min(metas.len())
+        .min(super::net::MAX_BATCH);
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; super::net::MAX_BATCH];
+    let mut addresses =
+        [std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit(); super::net::MAX_BATCH];
+    let mut headers = [std::mem::MaybeUninit::<libc::mmsghdr>::uninit(); super::net::MAX_BATCH];
+    for i in 0..count {
+        let start = i * slot;
+        iovs[i] = libc::iovec {
+            iov_base: buf[start..start + slot].as_mut_ptr().cast(),
+            iov_len: slot,
+        };
+        headers[i].write(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: addresses[i].as_mut_ptr().cast(),
+                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                msg_iov: std::ptr::from_mut(&mut iovs[i]),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        });
+    }
+
+    // SAFETY: each header points at the live address and the slot of `buf` it
+    // names, the arrays hold `count` initialised headers, and `count` is at
+    // most the array length.
+    let received = unsafe {
+        libc::recvmmsg(
+            socket.as_fd().as_raw_fd(),
+            headers.as_mut_ptr().cast(),
+            count as libc::c_uint,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let received = received as usize;
+    for (i, meta) in metas.iter_mut().take(received).enumerate() {
+        // SAFETY: `recvmmsg` wrote the first `received` headers and their
+        // addresses.
+        let header = unsafe { headers[i].assume_init_ref() };
+        let from = if header.msg_hdr.msg_namelen == 0 {
+            None
+        } else {
+            // SAFETY: `recvmmsg` filled this slot's address.
+            unsafe { super::net::socket_addr_from_raw(addresses[i].as_ptr().cast()) }
+        };
+        *meta = super::net::RecvMeta {
+            len: header.msg_len as usize,
+            from,
+        };
+    }
+    Ok(received)
 }
 
 /// The classic BPF program [`steer_reuseport`] attaches: 20 instructions.

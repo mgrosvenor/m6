@@ -1253,6 +1253,214 @@ mod sockets {
     }
 }
 
+// ── 4b. UDP batches ──────────────────────────────────────────────────────────
+
+mod udp_batches {
+    use super::*;
+
+    /// A sender and a receiver on loopback, both non-blocking.
+    fn pair() -> (std::net::UdpSocket, std::net::UdpSocket, SocketAddr) {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        receiver
+            .set_nonblocking(true)
+            .expect("receiver nonblocking");
+        let dest = receiver.local_addr().expect("receiver addr");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        sender.set_nonblocking(true).expect("sender nonblocking");
+        (sender, receiver, dest)
+    }
+
+    /// A payload whose bytes say where they are: `[100, 100, 100, 37]`.
+    fn payload() -> Vec<u8> {
+        (0..337).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    fn segments() -> [usize; 4] {
+        [100, 100, 100, 37]
+    }
+
+    /// Receive `want` datagrams through the batch API, retrying until they
+    /// arrive or the deadline passes.
+    ///
+    /// Break: a receive that loses a datagram, returns them in another order,
+    /// or reports a length the kernel did not deliver.
+    fn receive(
+        batch: &net::UdpBatch,
+        socket: &std::net::UdpSocket,
+        want: usize,
+    ) -> Vec<(Vec<u8>, Option<SocketAddr>)> {
+        let deadline = Instant::now() + SOON;
+        let mut got = Vec::with_capacity(want);
+        const SLOT: usize = 4096;
+        let mut buf = vec![0u8; SLOT * net::MAX_BATCH];
+        let mut metas = [net::RecvMeta::default(); net::MAX_BATCH];
+        while got.len() < want && Instant::now() < deadline {
+            match batch.recv(socket, &mut buf, SLOT, &mut metas) {
+                Ok(0) => {}
+                Ok(n) => {
+                    for (i, meta) in metas.iter().enumerate().take(n) {
+                        let start = i * SLOT;
+                        got.push((buf[start..start + meta.len].to_vec(), meta.from));
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("batch receive: {e}"),
+            }
+        }
+        assert_eq!(got.len(), want, "the batch did not arrive");
+        got
+    }
+
+    /// U-B1. Send four segments in one call, receive four datagrams in one
+    /// call, and get the same lengths, bytes and order. The last segment is
+    /// short, which is the shape a QUIC flush ends with.
+    ///
+    /// Break: a send that splits on the wrong boundary, a receive that treats
+    /// the last datagram as a full segment, or a batch that reorders.
+    #[test]
+    fn a_batch_arrives_as_the_segments_that_were_sent() {
+        let (sender, receiver, dest) = pair();
+        let batch = net::UdpBatch::for_socket(&sender);
+        let payload = payload();
+        let sent = batch
+            .send(&sender, &payload, 100, dest)
+            .expect("send batch");
+        assert_eq!(sent, payload.len(), "the whole batch was sent");
+
+        let got = receive(&batch, &receiver, segments().len());
+        assert_eq!(
+            got.iter().map(|(bytes, _)| bytes.len()).collect::<Vec<_>>(),
+            segments(),
+            "the datagram lengths follow the segment boundaries"
+        );
+        let flat: Vec<u8> = got.iter().flat_map(|(bytes, _)| bytes.clone()).collect();
+        assert_eq!(
+            flat, payload,
+            "the received bytes are the sent bytes in order"
+        );
+        let from = sender.local_addr().expect("sender addr");
+        for (_, source) in &got {
+            assert_eq!(*source, Some(from), "each datagram reports its source");
+        }
+    }
+
+    /// U-B2. The fallback sends the same bytes in the same order as the path
+    /// this socket would take by default.
+    ///
+    /// On macOS both arms are the fallback, and the test holds its receive to
+    /// the packed bytes. On Linux the first arm is the segmented `sendmsg` and
+    /// this is the comparison of one against the other, on one machine, over
+    /// the same payload.
+    ///
+    /// Break: a fallback that sends the segments in another order, drops the
+    /// short last datagram, or merges two segments into one.
+    #[test]
+    fn the_fallback_takes_the_same_bytes_in_the_same_order() {
+        assert!(!net::UdpBatch::without_gso().gso());
+
+        let payload = payload();
+
+        let (sender, receiver, dest) = pair();
+        let native = net::UdpBatch::for_socket(&sender);
+        native
+            .send(&sender, &payload, 100, dest)
+            .expect("native send");
+        let native_got = receive(&native, &receiver, segments().len());
+
+        let (sender, receiver, dest) = pair();
+        let fallback = net::UdpBatch::without_gso();
+        fallback
+            .send(&sender, &payload, 100, dest)
+            .expect("fallback send");
+        let fallback_got = receive(&fallback, &receiver, segments().len());
+
+        let bytes = |got: Vec<(Vec<u8>, Option<SocketAddr>)>| {
+            got.into_iter().map(|(bytes, _)| bytes).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bytes(fallback_got),
+            bytes(native_got),
+            "the fallback sends the same datagrams in the same order"
+        );
+    }
+
+    /// U-B3. A batch of one datagram is one datagram, on either path.
+    ///
+    /// Break: a segment size equal to the buffer length split into two
+    /// datagrams, or a single send refused.
+    #[test]
+    fn a_batch_of_one_is_one_datagram() {
+        let (probe, _, _) = pair();
+        let native = net::UdpBatch::for_socket(&probe);
+        for batch in [native, net::UdpBatch::without_gso()] {
+            let (sender, receiver, dest) = pair();
+            let payload = &payload()[..100];
+            let sent = batch.send(&sender, payload, 100, dest).expect("send");
+            assert_eq!(sent, payload.len());
+            let got = receive(&batch, &receiver, 1);
+            assert_eq!(got[0].0, payload);
+        }
+    }
+
+    /// U-B4. A batch with no bytes, a zero segment size, a segment larger than
+    /// the bytes, or a zero receive slot is refused before a system call. A
+    /// receive with no room for a datagram takes nothing in.
+    ///
+    /// Break: a zero segment size dividing by zero, or a zero slot dividing a
+    /// buffer by it.
+    #[test]
+    fn a_malformed_batch_is_refused() {
+        let (sender, receiver, dest) = pair();
+        let batch = net::UdpBatch::without_gso();
+        assert_eq!(
+            batch
+                .send(&sender, &[], 100, dest)
+                .expect_err("empty")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            batch
+                .send(&sender, &[0u8; 10], 0, dest)
+                .expect_err("zero segment")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            batch
+                .send(&sender, &[0u8; 10], 11, dest)
+                .expect_err("segment past the bytes")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut buf = [0u8; 64];
+        let mut metas = [net::RecvMeta::default(); net::MAX_BATCH];
+        assert_eq!(
+            batch
+                .recv(&receiver, &mut buf, 0, &mut metas)
+                .expect_err("zero slot")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            batch
+                .recv(&receiver, &mut buf, 65, &mut [],)
+                .expect("no room"),
+            0
+        );
+        assert_eq!(
+            batch
+                .recv(&receiver, &mut buf, 64, &mut metas)
+                .expect_err("nothing is waiting")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+}
+
 // ── 5. Clock ─────────────────────────────────────────────────────────────────
 
 mod clock {

@@ -7,6 +7,7 @@
 //! another kqueue system (FreeBSD, OpenBSD) starts from this file.
 
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
@@ -174,6 +175,72 @@ pub(super) fn limit_send_queue(_fd: RawFd, _bytes: usize) -> io::Result<()> {
 /// already reaches one process.
 pub(super) fn steer_reuseport(_fd: RawFd, _group_size: u32) -> io::Result<()> {
     Ok(())
+}
+
+/// macOS has no segmentation offload, so a batch is never one segmented send.
+pub(super) fn udp_gso_supported(_socket: &impl AsFd) -> bool {
+    false
+}
+
+/// Send `segments` one datagram at a time, in order.
+pub(super) fn udp_send_batch(
+    socket: &impl AsFd,
+    segments: &[u8],
+    segment_size: usize,
+    dest: SocketAddr,
+    _gso: bool,
+) -> io::Result<usize> {
+    use nix::sys::socket::{sendto, MsgFlags, SockaddrStorage};
+
+    let dst = SockaddrStorage::from(dest);
+    let fd = socket.as_fd().as_raw_fd();
+    let mut sent = 0;
+    while sent < segments.len() {
+        let len = (segments.len() - sent).min(segment_size);
+        let wrote = sendto(fd, &segments[sent..sent + len], &dst, MsgFlags::empty())?;
+        if wrote != len {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "a UDP send took part of a datagram",
+            ));
+        }
+        sent += wrote;
+    }
+    Ok(sent)
+}
+
+/// Receive up to `metas.len()` datagrams, one `recvfrom` each.
+pub(super) fn udp_recv_batch(
+    socket: &impl AsFd,
+    buf: &mut [u8],
+    slot: usize,
+    metas: &mut [super::net::RecvMeta],
+) -> io::Result<usize> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{recvfrom, SockaddrLike, SockaddrStorage};
+
+    let count = (buf.len() / slot)
+        .min(metas.len())
+        .min(super::net::MAX_BATCH);
+    let fd = socket.as_fd().as_raw_fd();
+    let mut received = 0;
+    for (i, meta) in metas.iter_mut().take(count).enumerate() {
+        let start = i * slot;
+        match recvfrom::<SockaddrStorage>(fd, &mut buf[start..start + slot]) {
+            Ok((len, from)) => {
+                // SAFETY: `recvfrom` filled the address for this datagram.
+                let from = from.and_then(|address| unsafe {
+                    super::net::socket_addr_from_raw(address.as_ptr())
+                });
+                *meta = super::net::RecvMeta { len, from };
+                received += 1;
+            }
+            Err(Errno::EAGAIN) if received == 0 => return Err(Errno::EAGAIN.into()),
+            Err(Errno::EAGAIN) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(received)
 }
 
 /// The hard limit reads as unlimited and the kernel enforces
