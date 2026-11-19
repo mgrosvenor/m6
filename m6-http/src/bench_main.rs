@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH};
 use m6_http_lib::probe;
 use rand::Rng;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -1284,80 +1285,38 @@ fn close_and_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
     quic_flush(conn, udp);
 }
 
-/// One HTTP/3 GET / on an existing H3 connection. Returns response body.
+/// One receive slot in the bench client's batch. The server sends QUIC
+/// packets of at most 1,350 bytes, so a slot holds one datagram with room to
+/// spare.
+const H3_RECV_SLOT: usize = 2048;
+
+/// How long one turn waits for a datagram before the connection's timer is
+/// driven. This was the socket's read timeout before the receive was batched.
+const H3_TURN_WAIT: Duration = Duration::from_millis(100);
+
+/// One turn's receive: wait up to `wait` for the socket, then take every
+/// datagram already queued, up to [`MAX_BATCH`].
 ///
-/// `recv_info` is the connection's address pair, read once when the socket was
-/// connected. It used to be built from `peer_addr` and `local_addr` for every
-/// received datagram: 796 address lookups for one 485 KB response.
-fn h3_get(
-    conn: &mut quiche::Connection,
-    h3: &mut quiche::h3::Connection,
+/// `Ok(None)` is a read that timed out with no datagram, which is the only
+/// answer that drives the connection's timer. A turn that read anything has
+/// already driven the connection through `conn.recv`.
+fn receive_turn(
     udp: &UdpSocket,
-    recv_info: quiche::RecvInfo,
-    path: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"GET"),
-        quiche::h3::Header::new(b":path", path),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"localhost"),
-    ];
-    // Use the stream ID assigned by quiche (not a manually tracked counter).
-    let stream_id = h3.send_request(conn, &req, true)?;
-    quic_flush(conn, udp);
-
-    let mut body = Vec::new();
-    let mut buf = [0u8; 65535];
-    let deadline = m6_core::platform::now() + Duration::from_secs(5);
-
-    loop {
-        if m6_core::platform::now() > deadline {
-            anyhow::bail!("HTTP/3 request timed out");
-        }
-        conn.on_timeout();
-        quic_flush(conn, udp);
-
-        let n = match udp.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                if conn.is_closed() {
-                    break;
-                }
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        conn.recv(&mut buf[..n], recv_info)?;
-        quic_flush(conn, udp);
-
-        // Poll H3 events. Use the actual sid from each event to drain the
-        // correct stream; only accumulate body / return when it's our stream.
-        loop {
-            match h3.poll(conn) {
-                Ok((sid, quiche::h3::Event::Data)) => {
-                    while let Ok(read) = h3.recv_body(conn, sid, &mut buf) {
-                        if sid == stream_id {
-                            body.extend_from_slice(&buf[..read]);
-                        }
-                    }
-                }
-                Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
-                    return Ok(body);
-                }
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        if conn.is_closed() {
-            break;
-        }
+    batch: &UdpBatch,
+    buf: &mut [u8],
+    metas: &mut [RecvMeta],
+    wait: Duration,
+) -> io::Result<Option<usize>> {
+    if !m6_core::platform::wait_readable(udp.as_fd(), wait)? {
+        return Ok(None);
     }
-    Ok(body)
+    match batch.recv(udp, buf, H3_RECV_SLOT, metas) {
+        Ok(n) => Ok(Some(n)),
+        // Readable and empty: a wake with nothing behind it. This is not a
+        // timeout, so the caller does not drive the timer on it.
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Some(0)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Establish one QUIC+H3 connection to addr.
@@ -1423,6 +1382,9 @@ fn h3_connect(
 
     let h3_cfg = quiche::h3::Config::new()?;
     let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_cfg)?;
+    // The handshake waits on a read timeout, one datagram at a time. From here
+    // the receive is a non-blocking batch taken after one readiness wait.
+    udp.set_nonblocking(true)?;
     Ok((conn, h3, udp, recv_info))
 }
 
@@ -1440,6 +1402,13 @@ struct H3Client {
     h3: quiche::h3::Connection,
     udp: UdpSocket,
     recv_info: quiche::RecvInfo,
+    /// The socket's batch receive.
+    batch: UdpBatch,
+    /// The turn's receive slots, [`MAX_BATCH`] datagrams of [`H3_RECV_SLOT`]
+    /// bytes each. Allocated once per connection, not per request.
+    recv_buf: Vec<u8>,
+    /// One length and source per receive slot.
+    recv_metas: [RecvMeta; MAX_BATCH],
     /// Requests this connection has carried, which is what fills it up.
     reqs: usize,
 }
@@ -1447,11 +1416,15 @@ struct H3Client {
 impl H3Client {
     fn connect(addr: &str, cfg: &mut quiche::Config) -> anyhow::Result<Self> {
         let (conn, h3, udp, recv_info) = h3_connect(addr, cfg)?;
+        let batch = UdpBatch::for_socket(&udp);
         Ok(Self {
             conn,
             h3,
             udp,
             recv_info,
+            batch,
+            recv_buf: vec![0u8; MAX_BATCH * H3_RECV_SLOT],
+            recv_metas: [RecvMeta::default(); MAX_BATCH],
             reqs: 0,
         })
     }
@@ -1470,14 +1443,86 @@ impl H3Client {
     }
 
     /// One GET on this connection.
+    ///
+    /// A turn reads a whole receive batch, feeds every datagram to the
+    /// connection, and flushes once. quiche coalesces the ACKs for the batch
+    /// into that one send, so the client answers sixteen datagrams with one
+    /// ACK datagram. The connection's timer is driven only by a read that
+    /// actually timed out.
     fn get(&mut self, path: &[u8]) -> anyhow::Result<Vec<u8>> {
-        h3_get(
-            &mut self.conn,
-            &mut self.h3,
-            &self.udp,
-            self.recv_info,
-            path,
-        )
+        let req = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":path", path),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+        ];
+        // Use the stream ID assigned by quiche (not a manually tracked counter).
+        let stream_id = self.h3.send_request(&mut self.conn, &req, true)?;
+        quic_flush(&mut self.conn, &self.udp);
+
+        let mut body = Vec::new();
+        let mut buf = [0u8; 65535];
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+
+        loop {
+            if m6_core::platform::now() > deadline {
+                anyhow::bail!("HTTP/3 request timed out");
+            }
+            match receive_turn(
+                &self.udp,
+                &self.batch,
+                &mut self.recv_buf,
+                &mut self.recv_metas,
+                H3_TURN_WAIT,
+            )? {
+                Some(n) => {
+                    for i in 0..n {
+                        let start = i * H3_RECV_SLOT;
+                        let len = self.recv_metas[i].len;
+                        self.conn
+                            .recv(&mut self.recv_buf[start..start + len], self.recv_info)?;
+                    }
+                    // One flush covers the whole batch: every packet the batch
+                    // answered is acknowledged in this send, not one per read.
+                    quic_flush(&mut self.conn, &self.udp);
+                }
+                None => {
+                    // The read timed out, so the timer is the only thing that
+                    // can move the connection now.
+                    self.conn.on_timeout();
+                    quic_flush(&mut self.conn, &self.udp);
+                    if self.conn.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            // Poll H3 events. Use the actual sid from each event to drain the
+            // correct stream; only accumulate body / return when it's our stream.
+            loop {
+                match self.h3.poll(&mut self.conn) {
+                    Ok((sid, quiche::h3::Event::Data)) => {
+                        while let Ok(read) = self.h3.recv_body(&mut self.conn, sid, &mut buf) {
+                            if sid == stream_id {
+                                body.extend_from_slice(&buf[..read]);
+                            }
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
+                        return Ok(body);
+                    }
+                    Ok(_) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            if self.conn.is_closed() {
+                break;
+            }
+        }
+        Ok(body)
     }
 }
 
@@ -2868,6 +2913,55 @@ mod tests {
         assert!(
             client.is_closed() || client.is_draining(),
             "the peer saw the connection closed"
+        );
+    }
+
+    /// One turn takes every datagram already queued, and a read with nothing
+    /// behind it is reported as the timeout that happened.
+    ///
+    /// The client's whole receive loop is this function. Its `Some` arm feeds
+    /// the batch to the connection and flushes once, and its `None` arm is the
+    /// only place `on_timeout` is called.
+    ///
+    /// Break: a receive that takes one datagram per call (the count would be
+    /// 1), a read with nothing queued reported as a batch of zero (the timer
+    /// would never be driven), or a datagram dropped from the batch.
+    #[test]
+    fn a_receive_turn_takes_the_whole_batch_and_reports_a_timed_out_read() {
+        let a = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        a.set_nonblocking(true).expect("nonblocking");
+        let b = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let to = a.local_addr().expect("a address");
+        let batch = UdpBatch::without_gso();
+        let mut buf = vec![0u8; MAX_BATCH * H3_RECV_SLOT];
+        let mut metas = [RecvMeta::default(); MAX_BATCH];
+        for i in 0..3u8 {
+            b.send_to(&[i; 100], to).expect("send");
+        }
+
+        let n = receive_turn(&a, &batch, &mut buf, &mut metas, H3_TURN_WAIT)
+            .expect("receive")
+            .expect("a datagram was queued");
+        assert_eq!(n, 3, "one turn took all three datagrams");
+        for (i, meta) in metas.iter().take(3).enumerate() {
+            let start = i * H3_RECV_SLOT;
+            assert_eq!(meta.len, 100);
+            assert_eq!(&buf[start..start + 100], &[i as u8; 100]);
+            assert_eq!(meta.from, Some(b.local_addr().expect("b address")));
+        }
+
+        // Nothing is queued: the wait ends with no datagram, which is the one
+        // answer that drives the connection's timer.
+        let started = m6_core::platform::now();
+        let none = receive_turn(&a, &batch, &mut buf, &mut metas, Duration::from_millis(20))
+            .expect("receive");
+        assert_eq!(
+            none, None,
+            "an empty read is a timed-out read, not a batch of zero"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(15),
+            "the wait did not wait for the timeout it reported"
         );
     }
 }

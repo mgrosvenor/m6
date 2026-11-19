@@ -270,6 +270,11 @@ sockets = "{}"
 [[route]]
 path    = "/image"
 backend = "image"
+
+[[route_group]]
+glob    = "assets/**/*"
+path    = "/assets/{{relpath}}"
+backend = "image"
 "#,
                 socket.display()
             ),
@@ -333,4 +338,44 @@ fn a_485_kib_body_arrives_byte_for_byte_over_h3() {
         "the body length is the backend's Content-Length"
     );
     assert_eq!(reply.body, expected_body(), "the body bytes are in order");
+}
+
+/// The bench client carries the same 485 KB image over the same server.
+///
+/// This is the client the performance records run, so it is the one place the
+/// batched receive meets a body of many packets. The row it reports is the
+/// image path's, and a batch that dropped or misordered a datagram would time
+/// the request out or fail the poll before the row printed.
+///
+/// Break: a receive loop that reads one datagram per turn and stops early, a
+/// batch that feeds only its first datagram to `conn.recv`, or a timer driven
+/// on a read that did not time out in a way that stalls the request.
+#[test]
+fn the_bench_client_carries_the_485_kib_image_over_h3() {
+    let stack = Stack::start();
+    let addr = format!("127.0.0.1:{}", stack.port);
+    let out = Command::new(binary("m6-bench"))
+        .args([
+            "--addr",
+            &addr,
+            "--http3-only",
+            "--path-only",
+            "--latency-n",
+            "20",
+            "--p99-limit-us",
+            "10000000",
+            "--skip-verify",
+        ])
+        .output()
+        .expect("run m6-bench");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "m6-bench failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("cache-hit→m6-file"),
+        "the image row did not run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
