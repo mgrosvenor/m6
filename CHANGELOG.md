@@ -60,6 +60,10 @@ The platform layer supplies the record's host facts and the process facts, and t
 The release also deletes the executable hash and moves the monitor's build-drift check onto the commit in the version string.
 Three gaps remain, and the Not measured section lists each.
 
+**HTTP/3 no longer visits every idle QUIC connection on every loop turn.** The loop fired the timer, retried parked responses and tried to send on every QUIC connection each turn, at about half a microsecond per connection. A client that leaves connections behind (each stays for its 30 s idle timeout) made the sweep longer than the work: with about a thousand idle connections, throughput at two concurrent clients fell below the previous release. The loop now drives only the connections whose timer has passed. A connection that received a packet is already driven in the turn it arrives, and that turn now also resumes a response that was waiting for flow-control credit. Tests: `a_connection_whose_timer_is_due_is_driven` and `idle_connections_whose_timer_is_not_due_are_not_touched` in `m6-http/src/main.rs`, and `a_parked_h3_response_completes_when_credit_arrives` in `m6-http/tests/loop_never_waits.rs`.
+
+**The HTTP/2 send queue starts at 64 KiB, not 16 KiB.** At 16 KiB a 484 KB response took 30 writes and 30 TLS records, and bandwidth on large bodies at four connections fell 8 to 16 percent below the previous release. `[limits.h2_send] start` is now 64 KiB. On Linux it is also the kernel's unsent-bytes mark, so a more urgent stream on the same connection waits behind at most 64 KiB. A site that serves large bodies and cares more about bandwidth than that ordering can raise it in the system config.
+
 ### Migration
 
 An operator makes nine changes.
