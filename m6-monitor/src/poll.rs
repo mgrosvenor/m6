@@ -730,8 +730,7 @@ impl Poller {
             return Step::Done;
         }
         let role = &self.readings[node].role;
-        for i in from..self.header_checks.len() {
-            let hc = &self.header_checks[i];
+        for (i, hc) in self.header_checks.iter().enumerate().skip(from) {
             if hc.roles.is_empty() || hc.roles.iter().any(|r| r == role) {
                 return Step::Header(i);
             }
