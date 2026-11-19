@@ -5,7 +5,7 @@
 // OpenOnload/ExaSock at deployment. No async runtime, no threads.
 #![deny(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -109,8 +109,6 @@ struct CompletionCtx<'a> {
     batch: UdpBatch,
     out: &'a mut [u8],
     connections: &'a mut HashMap<Vec<u8>, QuicConn>,
-    /// Connections a completion flushed whose batch the socket refused.
-    blocked: &'a mut BlockedSends,
     now: Instant,
 }
 
@@ -129,7 +127,6 @@ impl<'a> CompletionCtx<'a> {
         batch: UdpBatch,
         out: &'a mut [u8],
         connections: &'a mut HashMap<Vec<u8>, QuicConn>,
-        blocked: &'a mut BlockedSends,
         now: Instant,
     ) -> Self {
         CompletionCtx {
@@ -142,7 +139,6 @@ impl<'a> CompletionCtx<'a> {
             batch,
             out,
             connections,
-            blocked,
             now,
         }
     }
@@ -1676,9 +1672,7 @@ fn write_waiter(
                     method.eq_ignore_ascii_case("HEAD"),
                     genid,
                 );
-                if flush_conn(cx.udp, cx.batch, &mut cx.out[..], qconn) == Flush::Blocked {
-                    cx.blocked.record(&conn_id);
-                }
+                flush_conn(cx.udp, cx.batch, &mut cx.out[..], qconn);
             }
         }
         Waiter::Background => {
@@ -2098,7 +2092,6 @@ fn complete_h2_streams(
     batch: UdpBatch,
     out: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
-    blocked: &mut BlockedSends,
 ) {
     for c in completions {
         if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
@@ -2112,7 +2105,6 @@ fn complete_h2_streams(
                 batch,
                 out,
                 connections,
-                blocked,
                 m6_core::platform::now(),
             );
             complete_waiter(c.result, ctx, waiter, &mut cx);
@@ -2998,9 +2990,10 @@ fn event_loop(
     let mut accepting = tcp.is_some() || h2c.is_some();
     // Set by a disk slice that found nothing it could do; see the slice below.
     let mut disk_slice_stalled = false;
-    // The connections a flush found the socket would not take a batch for.
-    // While it holds any, the QUIC socket is watched for writability.
-    let mut blocked = BlockedSends::default();
+    // Whether the QUIC socket is registered for writability because some
+    // connection is holding a batch the socket refused. Kept so the interest
+    // changes only when it has to: `reregister_fd` always issues the call.
+    let mut watching = false;
     // The connections one `recvmmsg` batch fed. It is cleared when each batch
     // is flushed, so its capacity survives the whole run.
     let mut touched = Touched::default();
@@ -3123,7 +3116,6 @@ fn event_loop(
                                 batch: udp_batch,
                                 recv_buf: &mut recv_buf,
                                 flush_buf: &mut flush_buf,
-                                blocked: &mut blocked,
                                 touched: &mut touched,
                             },
                             &mut connections,
@@ -3139,13 +3131,7 @@ fn event_loop(
                     // The socket buffer has room again: send what the batch it
                     // refused left behind, and nothing on any other socket.
                     if ev.is_writable() {
-                        flush_blocked(
-                            &udp,
-                            udp_batch,
-                            &mut flush_buf,
-                            &mut connections,
-                            &mut blocked,
-                        );
+                        flush_blocked(&udp, udp_batch, &mut flush_buf, &mut connections);
                     }
                 }
                 TOKEN_TLS_LISTENER => {
@@ -3206,7 +3192,6 @@ fn event_loop(
                             udp_batch,
                             &mut flush_buf,
                             &mut connections,
-                            &mut blocked,
                         );
                     }
                     Source::H2sUpstream => {
@@ -3227,7 +3212,6 @@ fn event_loop(
                             udp_batch,
                             &mut flush_buf,
                             &mut connections,
-                            &mut blocked,
                         );
                     }
                     Source::Upstream(slot) => {
@@ -3244,7 +3228,6 @@ fn event_loop(
                                 udp_batch,
                                 &mut flush_buf,
                                 &mut connections,
-                                &mut blocked,
                                 now,
                             );
                             drive_upstream_one(Token(k), &mut cx);
@@ -3280,7 +3263,6 @@ fn event_loop(
                 udp_batch,
                 &mut flush_buf,
                 &mut connections,
-                &mut blocked,
                 now,
             );
             expire_upstream(token, &mut cx);
@@ -3296,7 +3278,6 @@ fn event_loop(
                 udp_batch,
                 &mut flush_buf,
                 &mut connections,
-                &mut blocked,
                 now,
             );
             expire_upstream(token, &mut cx);
@@ -3319,7 +3300,6 @@ fn event_loop(
             udp_batch,
             &mut flush_buf,
             &mut connections,
-            &mut blocked,
         );
         let (dead, completions) = state.h2s_pool.expire(now2, poll.registry());
         for token in dead {
@@ -3338,7 +3318,6 @@ fn event_loop(
             udp_batch,
             &mut flush_buf,
             &mut connections,
-            &mut blocked,
         );
 
         // The change sequence a POST asked for, and a sequence whose members
@@ -3355,7 +3334,6 @@ fn event_loop(
                 udp_batch,
                 &mut flush_buf,
                 &mut connections,
-                &mut blocked,
                 now,
             );
             genid_pump(&mut cx);
@@ -3370,26 +3348,16 @@ fn event_loop(
 
         // Drive the QUIC connections whose timer is due. The ones that received
         // a packet this turn were flushed in drain_udp; an idle one needs nothing.
-        flush_due(
-            &udp,
-            udp_batch,
-            &mut flush_buf,
-            &mut connections,
-            &mut blocked,
-            now2,
-        );
+        flush_due(&udp, udp_batch, &mut flush_buf, &mut connections, now2);
 
-        // Remove closed/timed-out connections.
+        // Remove closed/timed-out connections. A connection that closed while
+        // it waited for the socket therefore stops holding the writable
+        // interest without anything to forget.
         connections.retain(|_, c| !c.conn.is_closed());
-        // A connection that closed while it waited for the socket will never be
-        // flushed, so it must not hold the writable interest.
-        blocked.retain_live(&connections);
-        // Watch the socket for writability exactly while a connection is waiting
-        // for room in it, so an idle socket never wakes the loop and a refused
-        // batch never waits for the loss timer.
-        if let Err(e) = blocked.sync(&udp, poll.registry()) {
-            error!(error = %e, "watching the QUIC socket for writability");
-        }
+        // A refused batch never waits for the loss timer, and an idle socket
+        // never wakes the loop. The interest is reregistered only when the
+        // answer changes.
+        watch_blocked(&udp, poll.registry(), &connections, &mut watching);
 
         // The accounting tick: flush the log buffers once a second, next to
         // the loop trace's own accounting.
@@ -3531,9 +3499,6 @@ struct BoundUdp<'a> {
     recv_buf: &'a mut [u8],
     /// The batch a flush packs before one send.
     flush_buf: &'a mut [u8],
-    /// The connections whose batch the socket refused, so a flush in this turn
-    /// records the ones it must retry on the writable event.
-    blocked: &'a mut BlockedSends,
     /// The connections the receive batch being consumed has fed, in first-seen
     /// order. Each is flushed once after the batch, not once per datagram.
     /// Reused across batches, so steady state allocates nothing for the common
@@ -3568,7 +3533,6 @@ fn drain_udp(
                 udp.batch,
                 &mut *udp.flush_buf,
                 connections,
-                udp.blocked,
                 udp.touched,
             );
             udp.touched.clear();
@@ -3683,9 +3647,7 @@ fn drain_udp(
             // It does not move h3 conformance. The twelve h3spec failures are
             // quiche's and are documented in tools/conformance-scores.txt.
             warn!("conn.recv error: {}", e);
-            if flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn) == Flush::Blocked {
-                udp.blocked.record(&key);
-            }
+            flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
             continue;
         }
 
@@ -3730,11 +3692,7 @@ fn drain_udp(
                 Ok(c) => c,
                 Err(e) => {
                     warn!("h3 Config::new error: {}", e);
-                    if flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn)
-                        == Flush::Blocked
-                    {
-                        udp.blocked.record(&key);
-                    }
+                    flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
                     continue;
                 }
             };
@@ -3748,11 +3706,7 @@ fn drain_udp(
                 }
                 Err(e) => {
                     warn!("h3 init error: {}", e);
-                    if flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn)
-                        == Flush::Blocked
-                    {
-                        udp.blocked.record(&key);
-                    }
+                    flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
                     continue;
                 }
             }
@@ -3822,25 +3776,22 @@ impl Touched {
 /// batch's datagrams have all gone to `conn.recv`, so the packets they freed
 /// leave in one packed batch per connection instead of one send per datagram.
 ///
-/// A refused batch goes to [`BlockedSends`] and is retried on the writable
+/// A refused batch stays on its connection and is retried on the writable
 /// event, which is the same mechanism the timer and error paths use: the
 /// request is in `flush_conn`, the retry is in `flush_blocked`, and a
-/// connection that is both in this batch and in that set is flushed by both
-/// without sending a packet twice, because the refused bytes are held on the
-/// connection until one of them sends them.
+/// connection that is both in this batch and holding a refused batch is
+/// flushed by both without sending a packet twice, because the refused bytes
+/// are held on the connection until one of them sends them.
 fn flush_received(
     udp: &UdpSocket,
     batch: UdpBatch,
     out: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
-    blocked: &mut BlockedSends,
     touched: &Touched,
 ) {
     for key in touched.keys() {
         if let Some(qconn) = connections.get_mut(key) {
-            if flush_conn(udp, batch, out, qconn) == Flush::Blocked {
-                blocked.record(key);
-            }
+            flush_conn(udp, batch, out, qconn);
         }
     }
 }
@@ -7032,16 +6983,6 @@ fn finalize_url_response_inner(
 
 // ── QUIC packet flush helpers ─────────────────────────────────────────────────
 
-/// What a [`flush_conn`] left behind.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Flush {
-    /// Every packet quiche had queued is on its way.
-    Sent,
-    /// The socket would not take a batch. The bytes it refused are kept on the
-    /// connection and go out when the socket reports writable.
-    Blocked,
-}
-
 /// What one [`flush_batch`] did with the batch it was given.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum SendOutcome {
@@ -7096,8 +7037,9 @@ impl PendingBatch {
 
     /// Send the batches in order, dropping each one the socket takes. A batch
     /// the socket refuses stays, and so does every batch behind it, so the
-    /// retry sends them in the order quiche made them.
-    fn flush(&mut self, udp: &UdpSocket, batch: UdpBatch) -> Flush {
+    /// retry sends them in the order quiche made them. Returns whether every
+    /// byte went.
+    fn flush(&mut self, udp: &UdpSocket, batch: UdpBatch) -> bool {
         let mut sent = 0;
         while let Some(chunk) = self.chunks.get_mut(sent) {
             match flush_batch(
@@ -7116,67 +7058,7 @@ impl PendingBatch {
             }
         }
         self.chunks.drain(..sent);
-        if self.chunks.is_empty() {
-            Flush::Sent
-        } else {
-            Flush::Blocked
-        }
-    }
-}
-
-/// The connections whose last batch the socket refused, and whether the QUIC
-/// socket is watched for writability because of them.
-///
-/// A batch that returns `WouldBlock` leaves packets unsent. Without this set
-/// the only retries were the next incoming packet and the loss timer, so a
-/// response could stall for a PTO. While the set is non-empty the socket
-/// carries `WRITABLE` interest, and that event flushes exactly these
-/// connections. It is dropped as soon as the set empties.
-#[derive(Default)]
-struct BlockedSends {
-    conns: HashSet<Vec<u8>>,
-    /// Whether the socket is registered for writability. Kept so the interest
-    /// is changed only when it has to be: `reregister_fd` always issues the
-    /// system call.
-    watching: bool,
-}
-
-impl BlockedSends {
-    /// Remember a connection the socket refused a batch for.
-    fn record(&mut self, key: &[u8]) {
-        self.conns.insert(key.to_vec());
-    }
-
-    /// Whether no connection is waiting for the socket.
-    fn is_empty(&self) -> bool {
-        self.conns.is_empty()
-    }
-
-    /// Forget a connection that has left the table, so one that closed between
-    /// the refusal and the writable event does not hold the interest for ever.
-    fn retain_live(&mut self, connections: &HashMap<Vec<u8>, QuicConn>) {
-        self.conns.retain(|key| connections.contains_key(key));
-    }
-
-    /// Ask for writability exactly while a connection waits for the socket, and
-    /// drop it as soon as none does.
-    fn sync(
-        &mut self,
-        udp: &UdpSocket,
-        registry: &m6_core::platform::Registry,
-    ) -> std::io::Result<()> {
-        let want = !self.is_empty();
-        if want == self.watching {
-            return Ok(());
-        }
-        let interest = if want {
-            Interest::READABLE | Interest::WRITABLE
-        } else {
-            Interest::READABLE
-        };
-        registry.reregister_fd(udp.as_raw_fd(), TOKEN_UDP, interest)?;
-        self.watching = want;
-        Ok(())
+        self.chunks.is_empty()
     }
 }
 
@@ -7193,13 +7075,13 @@ impl BlockedSends {
 /// system call. The copies it does make are of the batches the socket refused,
 /// which the connection keeps for the writable event: the batch it packed, and
 /// in the `_` arm also the packet quiche handed over after it.
-fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut QuicConn) -> Flush {
+fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut QuicConn) {
     // A batch refused last time goes first, so the packets leave in the order
     // quiche made them.
     if let Some(mut pending) = qconn.blocked.take() {
-        if pending.flush(udp, batch) == Flush::Blocked {
+        if !pending.flush(udp, batch) {
             qconn.blocked = Some(pending);
-            return Flush::Blocked;
+            return;
         }
     }
     let capacity = out.len().min(QUIC_BATCH_BYTES);
@@ -7222,10 +7104,8 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
         // grew to 72 packets. A batch therefore stopped at a seventh of what
         // the window allowed, and no GSO send ever carried more than 13,500
         // bytes.
-        if batch_is_full(&pack, capacity)
-            && send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked
-        {
-            return Flush::Blocked;
+        if batch_is_full(&pack, capacity) && !send_pack(udp, batch, out, &mut pack, qconn) {
+            return;
         }
 
         let (written, send_info) = match qconn.conn.send(&mut out[pack.len..]) {
@@ -7254,8 +7134,8 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
                 // The packet after a short one cannot be part of the same
                 // batch, and this one is its last segment.
                 pack.len += written;
-                if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
-                    return Flush::Blocked;
+                if !send_pack(udp, batch, out, &mut pack, qconn) {
+                    return;
                 }
             }
             _ => {
@@ -7266,14 +7146,14 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
                 // send keeps the packed batch, and this packet too: it is
                 // outside the batch, so nothing else would send it.
                 let packed = pack.len;
-                if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
+                if !send_pack(udp, batch, out, &mut pack, qconn) {
                     keep_batch(
                         qconn,
                         &out[packed..packed + written],
                         written,
                         Some(send_info.to),
                     );
-                    return Flush::Blocked;
+                    return;
                 }
                 out.copy_within(packed..packed + written, 0);
                 pack.len = written;
@@ -7284,10 +7164,7 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
         }
     }
 
-    if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
-        return Flush::Blocked;
-    }
-    Flush::Sent
+    send_pack(udp, batch, out, &mut pack, qconn);
 }
 
 /// Whether the batch has to be sent before another packet can join it.
@@ -7318,28 +7195,28 @@ struct Pack {
     dest: Option<SocketAddr>,
 }
 
-/// Send what `pack` holds and clear it. A batch the socket refuses stays in
-/// `pack` and is kept on the connection for the writable event.
+/// Send what `pack` holds and clear it. A batch the socket refuses stays on
+/// the connection for the writable event. Returns whether every byte went.
 fn send_pack(
     udp: &UdpSocket,
     batch: UdpBatch,
     out: &[u8],
     pack: &mut Pack,
     qconn: &mut QuicConn,
-) -> Flush {
+) -> bool {
     if pack.len == 0 {
-        return Flush::Sent;
+        return true;
     }
     match flush_batch(udp, batch, &out[..pack.len], pack.seg, pack.dest) {
         SendOutcome::Sent => {
             *pack = Pack::default();
-            Flush::Sent
+            true
         }
         SendOutcome::Blocked { sent } => {
             // The datagrams before `sent` are on the wire; keeping them would
             // send them a second time on the writable event.
             keep_batch(qconn, &out[sent..pack.len], pack.seg, pack.dest);
-            Flush::Blocked
+            false
         }
     }
 }
@@ -7363,21 +7240,48 @@ fn keep_batch(qconn: &mut QuicConn, bytes: &[u8], segment_size: usize, dest: Opt
 }
 
 /// Flush the connections whose batch the socket refused, on the writable
-/// event. One that blocks again stays in the set, and the interest stays with
-/// it.
+/// event. One that blocks again keeps its batch, and the writable interest
+/// stays with it.
 fn flush_blocked(
     udp: &UdpSocket,
     batch: UdpBatch,
     out: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
-    blocked: &mut BlockedSends,
 ) {
-    for key in std::mem::take(&mut blocked.conns) {
-        if let Some(qconn) = connections.get_mut(&key) {
-            if flush_conn(udp, batch, out, qconn) == Flush::Blocked {
-                blocked.conns.insert(key);
-            }
+    for qconn in connections.values_mut() {
+        if qconn.blocked.is_some() {
+            flush_conn(udp, batch, out, qconn);
         }
+    }
+}
+
+/// Ask the poller for writability exactly while a connection holds a batch the
+/// socket refused, and drop it once none does.
+///
+/// The answer is read from the connections each turn, which is where the
+/// refused batch lives: a connection that closed, or one whose retry went out,
+/// stops holding the interest without anything to forget. `watching` is the
+/// answer of the previous turn, so the interest is reregistered only when it
+/// changes: `reregister_fd` always issues the system call, and this runs on
+/// every turn of the loop.
+fn watch_blocked(
+    udp: &UdpSocket,
+    registry: &m6_core::platform::Registry,
+    connections: &HashMap<Vec<u8>, QuicConn>,
+    watching: &mut bool,
+) {
+    let any_blocked = connections.values().any(|c| c.blocked.is_some());
+    if any_blocked == *watching {
+        return;
+    }
+    let interest = if any_blocked {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
+    match registry.reregister_fd(udp.as_raw_fd(), TOKEN_UDP, interest) {
+        Ok(()) => *watching = any_blocked,
+        Err(e) => error!(error = %e, "watching the QUIC socket for writability"),
     }
 }
 
@@ -7628,16 +7532,13 @@ fn flush_due(
     batch: UdpBatch,
     out: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
-    blocked: &mut BlockedSends,
     now: Instant,
 ) {
-    for (key, qconn) in connections.iter_mut() {
+    for qconn in connections.values_mut() {
         if qconn.conn.timeout_instant().is_some_and(|at| at <= now) {
             qconn.conn.on_timeout();
             drain_writable(qconn);
-            if flush_conn(udp, batch, out, qconn) == Flush::Blocked {
-                blocked.record(key);
-            }
+            flush_conn(udp, batch, out, qconn);
         }
     }
 }
@@ -9586,7 +9487,6 @@ mod quic_flush_tests {
             batch,
             &mut out,
             &mut connections,
-            &mut BlockedSends::default(),
             m6_core::platform::now(),
         );
         assert!(
@@ -9619,7 +9519,6 @@ mod quic_flush_tests {
             batch,
             &mut out,
             &mut connections,
-            &mut BlockedSends::default(),
             m6_core::platform::now(),
         );
 
@@ -9690,19 +9589,16 @@ mod quic_flush_tests {
         queue_data(&mut qconn);
         let key = vec![1u8];
         let mut connections = HashMap::from([(key.clone(), qconn)]);
-        let mut blocked = BlockedSends::default();
 
         // The socket refuses the batch: nothing goes on the wire, and the
         // datagrams it refused are held on the connection.
         test_send_seam::refuse_next_batches(1);
-        let flush = flush_conn(
+        flush_conn(
             &server_udp,
             batch,
             &mut out,
             connections.get_mut(&key).expect("connection"),
         );
-        assert_eq!(flush, Flush::Blocked, "the refused batch was not reported");
-        blocked.record(&key);
         let qconn = connections.get_mut(&key).expect("connection");
         assert!(
             qconn.blocked.is_some(),
@@ -9725,9 +9621,12 @@ mod quic_flush_tests {
         poll.registry()
             .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
             .expect("register");
-        blocked
-            .sync(&server_udp, poll.registry())
-            .expect("watch writable");
+        let mut watching = false;
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(
+            watching,
+            "the blocked connection did not ask for writability"
+        );
         let mut events = Events::with_capacity(8);
         poll.poll(&mut events, Some(Duration::from_secs(5)))
             .expect("poll");
@@ -9743,7 +9642,7 @@ mod quic_flush_tests {
         );
 
         let started = m6_core::platform::now();
-        flush_blocked(&server_udp, batch, &mut out, &mut connections, &mut blocked);
+        flush_blocked(&server_udp, batch, &mut out, &mut connections);
         let packet = datagram_within(&pair.client_udp, pto / 2)
             .expect("the refused batch did not go out on the writable event");
         assert!(
@@ -9753,7 +9652,7 @@ mod quic_flush_tests {
             pto / 2
         );
         assert!(
-            blocked.is_empty(),
+            connections[&key].blocked.is_none(),
             "the connection is still waiting for the socket"
         );
 
@@ -9772,15 +9671,59 @@ mod quic_flush_tests {
         assert_eq!(&got[..n], b"queued and not yet sent");
 
         // Nothing is waiting, so the socket stops being watched for writability.
-        blocked
-            .sync(&server_udp, poll.registry())
-            .expect("drop the writable interest");
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(!watching, "an empty set still asks for writability");
         let mut events = Events::with_capacity(8);
         poll.poll(&mut events, Some(Duration::from_millis(100)))
             .expect("poll");
         assert!(
             events.iter().next().is_none(),
             "an empty set still watches writability"
+        );
+    }
+
+    /// The turn end changes the writable interest only when the answer
+    /// changes: with a refused batch and `watching` already true, it makes no
+    /// call at all.
+    ///
+    /// The socket is writable, so a reregister would report it at once. The
+    /// poll that finds nothing is the proof the call was skipped.
+    ///
+    /// Break: a reregister on every turn, which is a system call on every turn
+    /// for as long as one connection is blocked.
+    #[test]
+    fn watching_is_unchanged_when_nothing_changed() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, _pair) = established(30_000, &server_udp);
+        queue_data(&mut qconn);
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+
+        test_send_seam::refuse_next_batches(1);
+        flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        assert!(connections[&key].blocked.is_some(), "no batch is waiting");
+
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+            .expect("register");
+        // As the previous turn left it: watching, with a batch waiting.
+        let mut watching = true;
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(watching);
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::from_millis(100)))
+            .expect("poll");
+        assert!(
+            events.iter().next().is_none(),
+            "the interest was reregistered with nothing changed"
         );
     }
 
@@ -9821,17 +9764,14 @@ mod quic_flush_tests {
 
         let key = vec![1u8];
         let mut connections = HashMap::from([(key.clone(), qconn)]);
-        let mut blocked = BlockedSends::default();
 
         test_send_seam::refuse_next_batches(1);
-        let flush = flush_conn(
+        flush_conn(
             &server_udp,
             batch,
             &mut out,
             connections.get_mut(&key).expect("connection"),
         );
-        assert_eq!(flush, Flush::Blocked, "the refused batch was not reported");
-        blocked.record(&key);
         let qconn = connections.get_mut(&key).expect("connection");
         let pto = qconn
             .conn
@@ -9850,9 +9790,12 @@ mod quic_flush_tests {
         poll.registry()
             .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
             .expect("register");
-        blocked
-            .sync(&server_udp, poll.registry())
-            .expect("watch writable");
+        let mut watching = false;
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(
+            watching,
+            "the blocked connection did not ask for writability"
+        );
         let mut events = Events::with_capacity(8);
         poll.poll(&mut events, Some(Duration::from_secs(5)))
             .expect("poll");
@@ -9863,9 +9806,9 @@ mod quic_flush_tests {
         );
 
         let started = m6_core::platform::now();
-        flush_blocked(&server_udp, batch, &mut out, &mut connections, &mut blocked);
+        flush_blocked(&server_udp, batch, &mut out, &mut connections);
         assert!(
-            blocked.is_empty(),
+            connections[&key].blocked.is_none(),
             "the connection is still waiting for the socket"
         );
 
@@ -9932,11 +9875,8 @@ mod quic_flush_tests {
         let (mut qconn, _pair) = established(30_000, &server_udp);
         qconn.conn.stream_send(3, &body, true).expect("stream_send");
         test_send_stats::reset();
-        assert_eq!(
-            flush_conn(&server_udp, batch, &mut out, &mut qconn),
-            Flush::Sent,
-            "the whole batch went"
-        );
+        flush_conn(&server_udp, batch, &mut out, &mut qconn);
+        assert!(qconn.blocked.is_none(), "the whole batch did not go");
         let whole = test_send_stats::datagrams();
         assert!(whole >= 3, "the body fills more than one datagram");
         assert_eq!(test_send_stats::calls(), 1, "the body is one batch");
@@ -9948,23 +9888,20 @@ mod quic_flush_tests {
         qconn.conn.stream_send(3, &body, true).expect("stream_send");
         let key = vec![1u8];
         let mut connections = HashMap::from([(key.clone(), qconn)]);
-        let mut blocked = BlockedSends::default();
 
         test_send_stats::reset();
         test_send_seam::refuse_after(2);
-        let flush = flush_conn(
+        flush_conn(
             &server_udp,
             batch,
             &mut out,
             connections.get_mut(&key).expect("connection"),
         );
-        assert_eq!(flush, Flush::Blocked, "the partial send was not reported");
         assert_eq!(
             test_send_stats::datagrams(),
             2,
             "the socket took two datagrams"
         );
-        blocked.record(&key);
         let kept = connections
             .get_mut(&key)
             .expect("connection")
@@ -9978,14 +9915,14 @@ mod quic_flush_tests {
         );
 
         // The writable event sends the rest, and the body arrives whole.
-        flush_blocked(&server_udp, batch, &mut out, &mut connections, &mut blocked);
+        flush_blocked(&server_udp, batch, &mut out, &mut connections);
         assert_eq!(
             test_send_stats::datagrams(),
             whole,
             "the retry sent datagrams that had already gone out"
         );
         assert!(
-            blocked.is_empty(),
+            connections[&key].blocked.is_none(),
             "the connection is still waiting for the socket"
         );
         let (datagrams, got) = drain_pair(&mut pair, &server_udp);
@@ -10114,17 +10051,9 @@ mod quic_flush_tests {
             touched.note(&second_key);
         }
         assert_eq!(touched.keys().len(), 2, "one entry per connection");
-        let mut blocked = BlockedSends::default();
 
         test_send_stats::reset();
-        flush_received(
-            &server_udp,
-            batch,
-            &mut out,
-            &mut connections,
-            &mut blocked,
-            &touched,
-        );
+        flush_received(&server_udp, batch, &mut out, &mut connections, &touched);
         let calls = test_send_stats::calls();
         let datagrams = test_send_stats::datagrams();
         assert_eq!(
@@ -10135,7 +10064,10 @@ mod quic_flush_tests {
             datagrams > 10,
             "the two sends carried only {datagrams} datagrams"
         );
-        assert!(blocked.is_empty(), "the loopback socket refused a batch");
+        assert!(
+            connections.values().all(|c| c.blocked.is_none()),
+            "the loopback socket refused a batch"
+        );
 
         let (first_datagrams, first_got) = drain_pair(&mut first_pair, &server_udp);
         let (second_datagrams, second_got) = drain_pair(&mut second_pair, &server_udp);
@@ -10247,7 +10179,7 @@ mod quic_flush_tests {
                 }
             }
             // The server sends what the window allows.
-            let _ = flush_conn(&server_udp, batch, &mut out, &mut qconn);
+            flush_conn(&server_udp, batch, &mut out, &mut qconn);
             // The client takes the flight and answers it.
             loop {
                 match pair.client_udp.recv_from(&mut buf) {
@@ -10342,10 +10274,8 @@ mod quic_flush_tests {
             .expect("queue a short body");
 
         test_send_stats::reset();
-        assert_eq!(
-            flush_conn(&server_udp, batch, &mut out, &mut qconn),
-            Flush::Sent
-        );
+        flush_conn(&server_udp, batch, &mut out, &mut qconn);
+        assert!(qconn.blocked.is_none(), "the short batch did not go out");
         assert_eq!(test_send_stats::calls(), 1, "a short batch is one send");
         assert!(test_send_stats::datagrams() > 1, "and it carries packets");
         assert_eq!(
