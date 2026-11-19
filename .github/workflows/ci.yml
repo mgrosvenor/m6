@@ -859,15 +859,19 @@ jobs:
           dev_pid=$!
           dev_start=$(ps -o lstart= -p "$dev_pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
           printf '%s\t%s\n' "$dev_pid" "${dev_start:--}" > .ci-dev.pid
-          for _ in $(seq 1 180); do
+          # dev.sh builds m6 and render-cms in release before it starts the
+          # stack, which can take minutes on a cold runner. Wait for the stack
+          # to answer, for dev.sh to exit (a failed start), or for 15 minutes.
+          for _ in $(seq 1 900); do
             code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
             [ "$code" = "200" ] && break
+            kill -0 "$dev_pid" 2>/dev/null || break
             sleep 1
           done
           if [ "$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null)" != "200" ]; then
             echo "--- dev.sh ---"; tail -40 dev.log
             echo "--- services ---"; tail -20 logs/*.log 2>/dev/null || true
-            echo "::error::the 05-cms stack never answered in 180s"
+            echo "::error::the 05-cms stack never answered"
             exit 1
           fi
           # `|| { dump; exit 1; }` — when the suite fails, the service logs are the
